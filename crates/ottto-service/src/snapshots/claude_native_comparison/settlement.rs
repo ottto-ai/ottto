@@ -400,6 +400,14 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
+        // Cold usage pending: the page's families first; Unknown refuses.
+        let unknown = crate::source_rotation::LocalRefusal("usage_pending_unknown");
+        let roots = scan
+            .snapshots
+            .iter()
+            .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+            .collect();
+        super::super::state_v2::load_usage(index, Some(&roots)).map_err(|_| unknown)?;
         let counts = super::super::evidence_owed::stamped(
             index,
             &scan.snapshots,

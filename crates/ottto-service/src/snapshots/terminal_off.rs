@@ -787,14 +787,21 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
         // All newly refused pending remains unmodified; old carry still owns
         // its replay and is refunded by the ordinary resume guard next tick.
     } else {
+        // Cold: a carried family's evidence is cleared, so it is loaded
+        // first; an Unknown family (counted) is not carried.
+        let _ = state_v2::load_usage(index, Some(&new_carry.roots));
         let carry = &mut index.claude_stale_family_carry;
         for root in new_carry.roots {
-            if let Some(pending) = index.claude_usage_family_pending.get_mut(&root) {
-                pending.member_occurrences.clear();
-                pending
-                    .member_request_id_hashes
-                    .values_mut()
-                    .for_each(BTreeSet::clear);
+            match index.claude_usage_family_pending.family_mut(&root) {
+                Ok(Some(pending)) => {
+                    pending.member_occurrences.clear();
+                    pending
+                        .member_request_id_hashes
+                        .values_mut()
+                        .for_each(BTreeSet::clear);
+                }
+                Ok(None) => {}
+                Err(_) => continue,
             }
             carry.roots.insert(root);
         }

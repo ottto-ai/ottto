@@ -9384,7 +9384,10 @@ fn claude_owned_start_eligible(
             if uncertified_roots.contains(root_session_id) {
                 return None;
             }
-            let pending = index.claude_usage_family_pending.get(root_session_id)?;
+            let pending = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(root_session_id)?;
             if pending.invalid || pending.census_window_end != census_window_end {
                 return None;
             }
@@ -9458,6 +9461,29 @@ fn apply_claude_reported_usage_with_negative_dependencies(
     negative_dependencies_complete: bool,
 ) -> ClaudeUsageAuthorityDisposition {
     if !index.persistence_available() {
+        return ClaudeUsageAuthorityDisposition {
+            quarantined_source_session_ids: snapshots
+                .iter()
+                .map(|s| s.source_session_id.clone())
+                .collect(),
+            ..Default::default()
+        };
+    }
+    // Cold usage pending: this page's own families, and every family before
+    // a terminal join. Unknown refuses the whole page, before anything is
+    // applied; its families stay discoverable for the next pass.
+    let page_roots = snapshots
+        .iter()
+        .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+        .collect::<BTreeSet<_>>();
+    let loaded_all = census_complete;
+    if state_v2::load_usage(index, Some(&page_roots))
+        .and_then(|()| match census_complete {
+            true => state_v2::load_usage(index, None),
+            false => Ok(()),
+        })
+        .is_err()
+    {
         return ClaudeUsageAuthorityDisposition {
             quarantined_source_session_ids: snapshots
                 .iter()
@@ -9635,7 +9661,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
     if census_complete && reports_healthy {
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
-            &index.claude_usage_family_pending,
+            index.claude_usage_family_pending.loaded_all(),
             legacy_request_owners.as_ref(),
         );
         // Evidence owed ON: owed evidence, including a re-stamp under the
@@ -9645,7 +9671,11 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             if uncertified_roots.contains(root_session_id) || owed_roots.contains(root_session_id) {
                 continue;
             }
-            let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
+            let Some(base_pending) = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(root_session_id)
+            else {
                 continue;
             };
             let mut pending = base_pending.clone();
@@ -9878,7 +9908,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
     // Stable native copies deliberately veto every due suppression (SOURCE).
     let native_duplicate_request_owners = if census_complete {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if pending.census_window_end != census_window_end {
                 continue;
             }
@@ -10324,7 +10354,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 owners.retain(|owner| current_owner_universe.contains(owner));
             }
         }
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if pending.invalid || pending.census_window_end != census_window_end {
                 if pending.invalid && pending.census_window_end == census_window_end {
                     duplicate_census.invalid_current_window_family_count = duplicate_census
@@ -10456,7 +10486,11 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 latch.quarantine_exempt_families += exempt.len() as u64;
             });
             for root in &exempt {
-                if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+                if let Some(pending) = index
+                    .claude_usage_family_pending
+                    .loaded_all_mut()
+                    .get_mut(root)
+                {
                     pending.contract_unproven = true;
                 }
             }
@@ -10747,6 +10781,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             let current_member_owns_changed_request = !fence_stays_closed
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(&root_session_id)
                     .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
                     .is_some_and(|request_hashes| {
@@ -10841,6 +10876,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         let guard = evidence_owed::enabled();
         index
             .claude_usage_family_pending
+            .loaded_all_mut()
             .retain(|root_session_id, pending| {
                 (guard
                     && evidence_owed::owed_at_completion(
@@ -10973,6 +11009,9 @@ fn apply_claude_reported_usage_with_negative_dependencies(
     disposition.rearm_full_suppressed = rearm_full_suppressed;
     #[cfg(test)]
     CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
+    if loaded_all {
+        state_v2::settle_usage(index, &page_roots);
+    }
     disposition
 }
 
@@ -12587,6 +12626,7 @@ fn claude_unchanged_proof_roots<'p>(
                     })
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(root_session_id)
                     .is_some_and(|pending| {
                         !pending.invalid
@@ -12625,6 +12665,7 @@ fn claude_unchanged_proof_roots<'p>(
             if *unchanged
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(*root_session_id)
                     .is_some_and(|pending| {
                         pending
@@ -12644,7 +12685,7 @@ fn claude_unchanged_proof_roots<'p>(
     // a legacy fork or takeover successor can derive its copied-prefix
     // exclusion only while the owner's root sequence is in the same window.
     if let Some(request_owners) = legacy_request_owners {
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if proven.contains_key(root_session_id)
                 || !complete_families.contains_key(root_session_id)
                 || pending.invalid
@@ -12692,6 +12733,7 @@ fn claude_unchanged_proof_roots<'p>(
             ))
             && index
                 .claude_usage_family_pending
+                .loaded_all()
                 .get(&root_session_id)
                 .is_some_and(|pending| {
                     pending
@@ -12732,13 +12774,14 @@ fn claude_dormant_owner_successors(
             .contains_key(root_session_id)
             && !index
                 .claude_usage_family_pending
+                .loaded_all()
                 .get(root_session_id)
                 .is_some_and(|pending| pending.census_window_end == census_window_end)
     };
     let census_unix_seconds = rfc3339_unix_seconds(census_window_end);
     let mut counts = ClaudeFirstProofHoldCounts::default();
     let mut oldest_age_seconds = None::<u64>;
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
+    for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
         if proven.contains_key(root_session_id)
             || !complete_families.contains_key(root_session_id)
             || pending.invalid
@@ -12801,6 +12844,7 @@ fn claude_fence_held_only_by_witnessed_families(
     };
     index
         .claude_usage_family_pending
+        .loaded_all()
         .iter()
         .all(|(root_session_id, pending)| {
             !pending.invalid
@@ -12812,7 +12856,10 @@ fn claude_fence_held_only_by_witnessed_families(
             else {
                 return true;
             };
-            let pending = index.claude_usage_family_pending.get(&root_session_id);
+            let pending = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(&root_session_id);
             (witnessed(&root_session_id)
                 && !pending.is_some_and(|pending| pending.census_window_end == census_window_end))
                 || index.confirmed_empty_files.contains(index_key.as_str())
@@ -43215,10 +43262,19 @@ fn ensure_bounded_traversal(
         // witnessed, accepted families and compacts their pending to member
         // keys: it credits no evidence, keeps that census invalid so the fence
         // stays closed, and the next complete census retires it.
+        // Cold usage pending: the carry joins every family's requests, so
+        // every family is loaded first. Unknown defers this retry, counted.
+        if state_v2::load_usage(index, None).is_err() {
+            index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
+            index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
+            index.claude_full_rearm_progress.held_family_roots = prior_held_family_roots;
+            eprintln!("local snapshot census deferred a stale Claude retry: stored usage pending is unknown; no fingerprints cleared");
+            return TraversalProgress::Resumed;
+        }
         let stale_pending_roots = index
             .claude_usage_family_pending
-            .iter()
-            .filter(|(_, pending)| pending.census_window_end != collected_at)
+            .views()
+            .filter(|(_, pending)| pending.window() != collected_at)
             .filter(|(root, _)| {
                 !index
                     .claude_usage_authority_quarantine
@@ -43357,6 +43413,7 @@ fn ensure_bounded_traversal(
                         index.claude_full_rearm_progress.held_family_roots =
                             prior_held_family_roots;
                         eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
+                        state_v2::settle_usage(index, &BTreeSet::new());
                         return TraversalProgress::Resumed;
                     }
                 }
@@ -43438,7 +43495,11 @@ fn ensure_bounded_traversal(
             replay
         };
         for root_session_id in carried_roots.iter().chain(&capped_roots) {
-            if let Some(pending) = index.claude_usage_family_pending.get_mut(root_session_id) {
+            if let Some(pending) = index
+                .claude_usage_family_pending
+                .loaded_all_mut()
+                .get_mut(root_session_id)
+            {
                 pending.member_occurrences.clear();
                 pending
                     .member_request_id_hashes
@@ -43572,6 +43633,7 @@ fn ensure_bounded_traversal(
             capped_roots,
             replay,
         };
+        state_v2::settle_usage(index, &BTreeSet::new());
     }
     if source == SnapshotSource::ClaudeCode {
         index.claude_full_rearm_progress.complete_rebuild_read = None;
