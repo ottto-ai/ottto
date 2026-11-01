@@ -4910,18 +4910,16 @@ fn owed_evidence_contract_stamp_restamps_under_the_latch_and_keeps_the_vetoes() 
 /// [regress] Owed Fulls were limited only by the page budget; they now share
 /// ONE per-page allowance
 /// (the paced history-upgrade re-read budget). Past it an owed read is
-/// deferred, counted, and requeued as a non-member re-read, still owed. A
-/// must-read revision (a fold correction) never re-stamps.
+/// deferred, counted, and requeued as a non-member re-read, still owed.
 #[test]
-fn owed_evidence_reads_are_capped_per_page_and_must_reads_never_restamp() {
+fn owed_evidence_reads_are_capped_per_page() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let _owed = evidence_owed::EvidenceOwedForTest::on();
     let (mut fixture, window) = owed_rearmed(3, true);
-    for entry in fixture.index.files.values_mut() {
-        entry.owed_read = entry.evidence_owed;
-    }
+    // No pending to re-stamp from and requests in the record: each must read.
+    fixture.index.claude_usage_family_pending.clear();
     let mut index = fixture.index.clone();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let parsed = owed_selected_parses(
@@ -4931,7 +4929,10 @@ fn owed_evidence_reads_are_capped_per_page_and_must_reads_never_restamp() {
         &window,
     );
     let counts = scope.finish().contract.evidence_owed;
-    assert_eq!((parsed, counts.read_required, counts.restamped), (3, 3, 0));
+    assert_eq!(
+        (parsed, counts.read, counts.refused_no_pending, counts.restamped),
+        (3, 3, 3, 0)
+    );
 
     let queued = fixture.index.traversal.as_ref().unwrap().pending_candidates.len();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);

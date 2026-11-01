@@ -6865,7 +6865,6 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
                 evidence_owed: false,
-                owed_read: false,
             },
         );
         index

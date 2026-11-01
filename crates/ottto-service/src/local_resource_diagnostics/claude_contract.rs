@@ -48,7 +48,7 @@ counters!(EvidenceOwed {
     restamped_from_record,
     restamped_under_latch,
     read,
-    read_required,
+    selected_by_other_reason,
     deferred_page_cap,
     owed_waiting_cap,
     changed,

@@ -52,22 +52,13 @@ pub(crate) fn owes(cause: rearm_cause::Cause) -> bool {
         )
 }
 
-/// What an owed revision needs to resolve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    /// Census-window evidence only: a bound re-stamp resolves it.
-    Evidence,
-    /// The clearing site needs this revision read (a correction to emit, a
-    /// witness or account proof to rebuild): restore or one paced Full.
-    Read,
-}
-
-/// Every census fingerprint clear goes through here. OFF (or an
-/// already cleared entry): main's clear. ON: keep the revision, owe it.
-pub(crate) fn clear(entry: &mut ScanIndexEntry, kind: Kind) {
+/// Every census-window fingerprint clear goes through here: debt a bound
+/// re-stamp can resolve. OFF (or an already cleared entry): main's clear. ON:
+/// keep the revision, owe it. A site that needs the revision read keeps
+/// main's clear instead, so an older reader still sees that debt.
+pub(crate) fn clear(entry: &mut ScanIndexEntry) {
     if enabled() && !entry.source_file_fingerprint.is_empty() {
         entry.evidence_owed = true;
-        entry.owed_read |= kind == Kind::Read;
     } else {
         entry.source_file_fingerprint.clear();
     }
@@ -177,19 +168,19 @@ pub(super) fn context_change_owes(
 pub(super) fn reoffer_clears(entry: &mut ScanIndexEntry) {
     if entry.evidence_owed {
         entry.evidence_owed = false;
-        entry.owed_read = false;
         entry.source_file_fingerprint.clear();
     }
 }
 
 /// A reverted (held) entry keeps the working entry's re-arm debt: main clears
-/// the fingerprint, an owed working entry marks the retained one owed.
+/// the fingerprint, an owed working entry marks the retained one owed. Owed
+/// debt is census-window debt only (a needed read is main's clear), so the
+/// retained entry may later re-stamp.
 pub(super) fn carry_debt(retained: &mut ScanIndexEntry, working: &ScanIndexEntry) {
     if working.source_file_fingerprint.is_empty() {
         retained.source_file_fingerprint.clear();
     } else if working.evidence_owed {
         retained.evidence_owed = true;
-        retained.owed_read |= working.owed_read;
     }
 }
 
@@ -446,14 +437,15 @@ pub(super) fn resolve(
         return;
     }
     if *decision != CandidateDecision::Skip {
-        // Otherwise selected: the parse records a fresh entry.
+        // Selected by another obligation (forced family, authority, audit,
+        // upload context, adoption): that selection owns the read, outside
+        // this page's owed-read cap. The parse records a fresh entry.
         if enabled() {
-            claude_contract::note(|c| c.evidence_owed.read += 1);
+            claude_contract::note(|c| c.evidence_owed.selected_by_other_reason += 1);
         }
         return;
     }
-    let must_read = entry.owed_read;
-    if let Some((root, member)) = family.filter(|_| enabled() && !must_read) {
+    if let Some((root, member)) = family.filter(|_| enabled()) {
         if empty_from_record(index, &key, &root) {
             claude_contract::note(|c| c.evidence_owed.restamped_from_record += 1);
             if let Some(entry) = index.files.get_mut(&key) {
@@ -496,7 +488,6 @@ pub(super) fn resolve(
     };
     let member = claude_index_path_member_ref(&candidate.path).map(|member| member.root);
     let kept = enabled()
-        && !must_read
         && member.is_some_and(|root| {
             index
                 .claude_usage_family_pending
@@ -538,7 +529,6 @@ pub(super) fn resolve(
     }
     if enabled() {
         claude_contract::note(|c| match arm {
-            Arm::Read if must_read => c.evidence_owed.read_required += 1,
             Arm::Read => c.evidence_owed.read += 1,
             // Re-examined at every visit: read once its requests fit the cap.
             Arm::KeptOwed => c.evidence_owed.owed_waiting_cap += 1,
@@ -712,7 +702,7 @@ pub(super) fn owed_roots(index: &ScanIndex) -> BTreeSet<String> {
 fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     let mut prefixes = hashes
         .iter()
-        .map(|hash| u64::from_str_radix(hash.get(..16)?, 16).ok())
+        .map(|hash| claude_request_census::claude_request_hash_from_pending_key(hash))
         .collect::<Option<Vec<_>>>()?;
     prefixes.sort_unstable();
     prefixes.dedup();
@@ -879,29 +869,19 @@ mod tests {
         assert_eq!(owed.observed_fingerprint(), "revision");
     }
 
-    /// [behaviour] Every census clear site goes through `clear`. OFF
-    /// it is main's clear; ON it keeps the revision owed, and a `Read` site
-    /// also marks it must-read (never re-stamped).
+    /// [behaviour] Every census-window clear site goes through `clear`. OFF
+    /// it is main's clear; ON it keeps the revision owed.
     #[test]
     fn census_clear_sites_owe_on_and_clear_off() {
-        for kind in [Kind::Evidence, Kind::Read] {
-            let mut off = entry();
-            clear(&mut off, kind);
-            assert!(off.source_file_fingerprint.is_empty() && !off.evidence_owed && !off.owed_read);
-            let _on = EvidenceOwedForTest::on();
-            let mut on = entry();
-            clear(&mut on, kind);
-            assert_eq!(on.source_file_fingerprint, "revision");
-            assert!(on.evidence_owed && on.rearmed());
-            assert_eq!(on.owed_read, kind == Kind::Read);
-            assert_eq!(on.observed_fingerprint(), "");
-            clear(&mut on, Kind::Evidence);
-            assert_eq!(
-                on.owed_read,
-                kind == Kind::Read,
-                "a later evidence clear keeps must-read"
-            );
-        }
+        let mut off = entry();
+        clear(&mut off);
+        assert!(off.source_file_fingerprint.is_empty() && !off.evidence_owed);
+        let _on = EvidenceOwedForTest::on();
+        let mut on = entry();
+        clear(&mut on);
+        assert_eq!(on.source_file_fingerprint, "revision");
+        assert!(on.evidence_owed && on.rearmed());
+        assert_eq!(on.observed_fingerprint(), "");
     }
 
     fn pending(window: &str) -> ClaudeUsageFamilyPending {
@@ -1098,5 +1078,48 @@ mod tests {
         assert_eq!(value["source_file_fingerprint"], "revision");
         let back: ScanIndexEntry = serde_json::from_slice(&bytes).unwrap();
         assert!(back.evidence_owed && back.rearmed());
+
+        // A read the file really needs (here an authority normalization of an
+        // unbound record) clears the fingerprint as main does, even on an owed
+        // entry: a reader that drops the new fields still selects it for a read.
+        let _on = EvidenceOwedForTest::on();
+        let root = "d0000000-1111-4111-8111-111111111111";
+        let path = PathBuf::from(format!("/synthetic/{root}.jsonl"));
+        let key = local_index_key(&path);
+        let revision = "1".repeat(64);
+        let mut index = ScanIndex::default();
+        let mut owed = entry();
+        owed.source_file_fingerprint = revision.clone();
+        clear(&mut owed);
+        index.files.insert(key.clone(), owed);
+        index.insert_unproven_terminal_claude_authority_for_test(root, &revision);
+        index.claude_usage_family_witnesses.remove(root);
+        index.drop_unbound_claude_authority_records("test");
+        let mut value = serde_json::to_value(&index.files[&key]).unwrap();
+        value.as_object_mut().unwrap().remove("evidence_owed");
+        let mut older = ScanIndex::default();
+        older
+            .files
+            .insert(key.clone(), serde_json::from_value(value).unwrap());
+        assert!(older.files[&key].source_file_fingerprint.is_empty());
+        let candidate = CandidateFile {
+            physical_identity: None,
+            scan_root: PathBuf::from("/synthetic"),
+            path,
+            size_bytes: 1,
+            modified_unix_seconds: 2,
+            modified_unix_nanos: 0,
+            source_file_fingerprint: revision.clone(),
+            legacy_source_file_fingerprint: revision,
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        assert_eq!(
+            older.candidate_decision_with_reason_at(&candidate, 0).0,
+            CandidateDecision::Parse
+        );
     }
 }

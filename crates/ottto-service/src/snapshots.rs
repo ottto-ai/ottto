@@ -4595,17 +4595,14 @@ pub struct ScanIndexEntry {
     /// Local-only exact current-context acceptance. Appended for old readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upload_context_receipt: Option<upload_context_receipt::Receipt>,
-    /// Evidence owed ON: a re-arm kept `source_file_fingerprint`
-    /// and owes this file's request evidence to the current census window.
-    /// Older binaries drop it and see the kept fingerprint: their own re-arm
-    /// clears it again. Never set while the switch is OFF.
+    /// Evidence owed ON: a census re-arm kept `source_file_fingerprint` and
+    /// owes this file's request evidence to the current census window. Only
+    /// census-window debt is kept this way; a read the file really needs
+    /// clears the fingerprint as main does. Never set while the switch is OFF.
+    /// Downgrade from ON state means a fresh walk: an older binary drops the
+    /// bit and treats the kept revision as observed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
-    /// With `evidence_owed`: the site that owed it needs this revision read
-    /// (a correction to emit, a witness to rebuild): restore or one paced
-    /// Full, never a re-stamp. Same switch, same downgrade rule.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) owed_read: bool,
 }
 // Verify the EXISTING native entry-layout contract during compile-only checks.
 // No budget, whitelist or substitute bound is changed.
@@ -8794,7 +8791,7 @@ pub fn apply_claude_effort_evidence_with_index(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::AccountReproof,
                     !entry.source_file_fingerprint.is_empty(),
                 );
-                evidence_owed::clear(entry, evidence_owed::Kind::Read);
+                entry.source_file_fingerprint.clear();
             }
         }
         index
@@ -8844,7 +8841,7 @@ pub fn apply_claude_effort_evidence_with_index(
                     .get(&root_session_id)
                     .is_some_and(|members| members.contains(&source_session_id))
             {
-                evidence_owed::clear(entry, evidence_owed::Kind::Read);
+                entry.source_file_fingerprint.clear();
             }
         }
         index
@@ -8965,7 +8962,7 @@ pub fn apply_claude_effort_evidence_with_index(
                 // Earlier pages uploaded an honest NULL before the terminal
                 // census could prove the family. Reparse them once so the new
                 // durable witness emits the correction on the next pass.
-                evidence_owed::clear(entry, evidence_owed::Kind::Read);
+                entry.source_file_fingerprint.clear();
             }
         }
     }
@@ -10139,7 +10136,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
                     !entry.source_file_fingerprint.is_empty(),
                 );
-                evidence_owed::clear(entry, evidence_owed::Kind::Read);
+                entry.source_file_fingerprint.clear();
             }
         }
     }
@@ -10765,20 +10762,20 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 // once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
-                // Evidence owed ON: owe instead of clearing. A census-only
-                // re-arm is resolved by a bound re-stamp; a changed witness or
-                // duplicate owner must be read.
-                evidence_owed::clear(
-                    entry,
-                    if invalidated_witness_roots.contains(&root_session_id)
-                        || changed_duplicate_owner
-                        || current_member_owns_changed_request
-                    {
-                        evidence_owed::Kind::Read
-                    } else {
-                        evidence_owed::Kind::Evidence
-                    },
-                );
+                // Evidence owed ON: a census-only re-arm owes instead of
+                // clearing and is resolved by a bound re-stamp. A changed
+                // witness or duplicate owner, or an identity-contract change,
+                // must be read: main's clear, so an older reader still sees
+                // the debt and older-contract pending never re-stamps.
+                if identity_contract_rearm
+                    || invalidated_witness_roots.contains(&root_session_id)
+                    || changed_duplicate_owner
+                    || current_member_owns_changed_request
+                {
+                    entry.source_file_fingerprint.clear();
+                } else {
+                    evidence_owed::clear(entry);
+                }
                 rearmed_bytes = rearmed_bytes.saturating_add(entry.size_bytes);
             } else if proof_candidate && negative {
                 rearm.suppressed = rearm.suppressed.saturating_add(1);
@@ -50957,19 +50954,13 @@ impl ScanIndex {
                     .file_snapshot_fingerprints
                     .get(key)
                     .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held));
-            let owed = self
-                .files
-                .get(key)
-                .filter(|entry| entry.evidence_owed)
-                .map(|entry| entry.owed_read);
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
                     if reparse {
                         committed.source_file_fingerprint.clear();
-                    } else if let Some(read) = owed {
-                        committed.evidence_owed = true;
-                        committed.owed_read |= read;
+                    } else if let Some(working) = self.files.get(key) {
+                        evidence_owed::carry_debt(&mut committed, working);
                     }
                     result.files.insert(key.clone(), committed);
                 }
@@ -51119,11 +51110,6 @@ impl ScanIndex {
                     .get(key)
                     .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
                     && !self.claude_account_deferred_holds.contains_key(key);
-            let owed = self
-                .files
-                .get(key)
-                .filter(|entry| entry.evidence_owed)
-                .map(|entry| entry.owed_read);
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
@@ -51141,9 +51127,8 @@ impl ScanIndex {
                     }
                     if reparse {
                         committed.source_file_fingerprint.clear();
-                    } else if let Some(read) = owed {
-                        committed.evidence_owed = true;
-                        committed.owed_read |= read;
+                    } else if let Some(working) = self.files.get(key) {
+                        evidence_owed::carry_debt(&mut committed, working);
                     }
                     result.files.insert(key.clone(), committed);
                 }
@@ -51264,11 +51249,6 @@ impl ScanIndex {
                     .get(key)
                     .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
                     && !self.claude_account_deferred_holds.contains_key(key);
-            let owed = self
-                .files
-                .get(key)
-                .filter(|entry| entry.evidence_owed)
-                .map(|entry| entry.owed_read);
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
@@ -51286,9 +51266,8 @@ impl ScanIndex {
                     }
                     if reparse {
                         committed.source_file_fingerprint.clear();
-                    } else if let Some(read) = owed {
-                        committed.evidence_owed = true;
-                        committed.owed_read |= read;
+                    } else if let Some(working) = self.files.get(key) {
+                        evidence_owed::carry_debt(&mut committed, working);
                     }
                     self.files.insert(key.clone(), committed);
                 }
@@ -52877,7 +52856,6 @@ impl ScanIndex {
                     .files
                     .get(&key)
                     .is_some_and(|entry| entry.evidence_owed),
-                owed_read: self.files.get(&key).is_some_and(|entry| entry.owed_read),
             },
         );
     }
@@ -52941,7 +52919,6 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.upload_context_receipt.clone()),
                 evidence_owed: false,
-                owed_read: false,
             },
         );
         match parse_outcome {
@@ -56602,7 +56579,6 @@ mod tests {
                     opened_birth_nanos: 0,
                     upload_context_receipt: None,
                     evidence_owed: false,
-                    owed_read: false,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -57060,7 +57036,6 @@ mod tests {
                     opened_birth_nanos: 0,
                     upload_context_receipt: None,
                     evidence_owed: false,
-                    owed_read: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -79566,7 +79541,6 @@ mod tests {
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
                 evidence_owed: false,
-                owed_read: false,
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
@@ -81051,7 +81025,6 @@ mod tests {
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
                 evidence_owed: false,
-                owed_read: false,
             },
         );
         let a = binding(&home_a, "account-a");
@@ -82804,7 +82777,6 @@ mod tests {
             opened_birth_nanos: 0,
             upload_context_receipt: None,
             evidence_owed: false,
-            owed_read: false,
         }
     }
 
@@ -83494,7 +83466,6 @@ mod tests {
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
                 evidence_owed: false,
-                owed_read: false,
             },
         );
         let manifest = index
@@ -84407,7 +84378,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed, owed_read);
+crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, context_inputs);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; codex_roster_refresh_visited, codex_roster_growth_enqueued, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);

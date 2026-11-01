@@ -432,7 +432,12 @@ fn e2_pipeline_admission_drop_drains_to_the_cold_full() {
         .find(|key| key.contains("/subagents/"))
         .cloned()
         .unwrap();
-    index.files.get_mut(&child_key).unwrap().owed_read = true;
+    index
+        .files
+        .get_mut(&child_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
 
     let mut dropped = 0;
     let mut reemitted = BTreeSet::new();
@@ -460,27 +465,136 @@ fn e2_pipeline_admission_drop_drains_to_the_cold_full() {
     );
     assert_eq!(latest.len(), cold.len());
     for item in &cold {
-        let got = &latest[&item.source_session_id];
-        assert_eq!(e2_login_counts(got), e2_login_counts(item));
-        let (got, want) = (
-            serde_json::to_value(got).unwrap(),
-            serde_json::to_value(item).unwrap(),
+        e2_assert_same_money(&latest[&item.source_session_id], item);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Same totals and per-login placement.
+fn e2_assert_same_money(got: &SnapshotItem, want: &SnapshotItem) {
+    assert_eq!(e2_login_counts(got), e2_login_counts(want));
+    let (got, want) = (
+        serde_json::to_value(got).unwrap(),
+        serde_json::to_value(want).unwrap(),
+    );
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+        "cost",
+        "usage_buckets",
+        "model_usage",
+    ] {
+        assert_eq!(got.get(field), want.get(field), "{field}");
+    }
+}
+
+/// [money] Both re-stamp arms equal a real Full of the same bytes. The first
+/// complete census's re-arm owes every family file; the next walk re-stamps
+/// the root and child from pending and a confirmed-empty member from its
+/// census record, reading nothing. The same walk with main's clear instead
+/// reads and folds the same bytes: the family pending and census records
+/// match, and its re-emitted bodies carry the cold totals and per-login
+/// placement the re-stamp leaves standing.
+#[test]
+fn e2_pipeline_owed_restamp_equals_a_full_of_the_same_bytes() {
+    let (dir, root, _) = claude_account_family_fixture(false);
+    let empty = dir
+        .join(&root)
+        .join("subagents")
+        .join("agent-b4d1585d310070d0f.jsonl");
+    fs::write(
+        &empty,
+        format!(
+            "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"user\",\"sessionId\":\"{root}\",\"agentId\":\"b4d1585d310070d0f\",\"isSidechain\":true,\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    let empty_key = local_index_key(&empty);
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    api[4].account_identifier_hash = Some("b".repeat(64));
+    e2_resign(&mut api[4]);
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let roots = std::slice::from_ref(&dir);
+    let (cold, _, failed) = e2_page(roots, &support, &mut ScanIndex::default());
+    assert!(!failed);
+    assert_eq!(cold.len(), 2);
+
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let mut owed = ScanIndex {
+        claude_duplicate_request_witness_overflowed: true,
+        claude_duplicate_fence_next_full_rearm_unix_seconds: Some(1),
+        ..ScanIndex::default()
+    };
+    let (first, _, _) = e2_page(roots, &support, &mut owed);
+    owed.record_accepted_snapshot_fingerprints(
+        &first
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    assert!(owed.confirmed_empty_files.contains(&empty_key));
+    let family = owed
+        .files
+        .keys()
+        .filter(|key| {
+            !key.contains("/support/")
+                && claude_index_path_family_member(Path::new(key)).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(family.len(), 3);
+    assert!(family.iter().all(|key| owed.files[key].evidence_owed));
+    let mut full = owed.clone();
+    for key in &family {
+        let entry = full.files.get_mut(key).unwrap();
+        entry.evidence_owed = false;
+        entry.source_file_fingerprint.clear();
+    }
+
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let (restamped, _, failed) = e2_page(roots, &support, &mut owed);
+    let counts = scope.finish().contract.evidence_owed;
+    assert!(!failed);
+    assert!(restamped.is_empty(), "a re-stamp reads nothing");
+    assert_eq!(
+        (counts.restamped, counts.restamped_from_record, counts.read),
+        (2, 1, 0)
+    );
+    assert!(family.iter().all(|key| !owed.files[key].evidence_owed));
+
+    let (reread, _, failed) = e2_page(roots, &support, &mut full);
+    assert!(!failed);
+    assert_eq!(
+        owed.claude_usage_family_pending,
+        full.claude_usage_family_pending
+    );
+    for key in &family {
+        assert_eq!(
+            owed.claude_request_census.get(key),
+            full.claude_request_census.get(key),
+            "{key}"
         );
-        for field in [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_creation_5m_tokens",
-            "cache_creation_1h_tokens",
-            "reasoning_output_tokens",
-            "unattributed_total_tokens",
-            "request_count",
-            "cost",
-            "usage_buckets",
-            "model_usage",
-        ] {
-            assert_eq!(got.get(field), want.get(field), "{field}");
-        }
+    }
+    assert_eq!(reread.len(), cold.len());
+    for item in &cold {
+        let got = reread
+            .iter()
+            .find(|got| got.source_session_id == item.source_session_id)
+            .unwrap();
+        e2_assert_same_money(got, item);
     }
     fs::remove_dir_all(dir).unwrap();
 }

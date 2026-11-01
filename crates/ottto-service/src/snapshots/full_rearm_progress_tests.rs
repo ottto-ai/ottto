@@ -191,7 +191,6 @@ impl Rearm {
                 rearmed_bytes += entry.size_bytes;
                 entry.source_file_fingerprint = source.clone();
                 entry.evidence_owed = false;
-                entry.owed_read = false;
             }
         }
         Terminal {
@@ -466,7 +465,8 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 /// [regress] A complete census under the recorded cycle contract with no
 /// older-window evidence left clears the identity-contract latch before its
 /// contract re-arm (no re-read, counted). Older valid evidence of an indexed
-/// family still blocks the clear and takes main's re-arm. Older evidence of a family
+/// family still blocks the clear and takes main's re-arm (main's clear, never
+/// owed). Older evidence of a family
 /// held in authority quarantine no longer blocks the clear: it is kept, not
 /// invalidated, and its family is marked `contract_unproven` (counted).
 #[test]
@@ -503,7 +503,12 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
         },
     );
     let mut quarantined = older.clone();
-    let latched = rearm.terminal(&mut older, &rearm.items);
+    older.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+    let disposition = rearm.fold(&mut older, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    // Main's clear, never owed: an older reader still sees the read, and the
+    // older-window pending cannot re-stamp an unread file.
+    assert!(older.files.values().all(|entry| !entry.evidence_owed));
+    let latched = rearm.reread(&mut older, &disposition);
     assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
 
     // A quarantine binds the member's real (sha256-shaped) revision.

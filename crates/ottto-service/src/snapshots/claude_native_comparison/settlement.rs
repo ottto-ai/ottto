@@ -1372,7 +1372,7 @@ impl SelectedFallback {
         traversal.pending_candidates = priority;
         for target in &self.targets {
             if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                super::super::evidence_owed::clear(entry, super::super::evidence_owed::Kind::Read);
+                entry.source_file_fingerprint.clear();
             }
         }
         index.mark_bounded_sweep_unsettled();

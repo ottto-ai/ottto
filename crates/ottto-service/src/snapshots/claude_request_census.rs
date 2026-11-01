@@ -793,6 +793,12 @@ pub(crate) fn claude_request_hash(request_id: &str) -> u64 {
     u64::from_be_bytes(prefix)
 }
 
+/// `claude_request_hash` from a pending key (the full SHA-256 hex of the
+/// request id): its first 16 hex digits. None for a malformed key.
+pub(crate) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u64> {
+    u64::from_str_radix(sha256_hex.get(..16)?, 16).ok()
+}
+
 /// `ScanIndex::claude_request_census`: every record by index key, with the
 /// hash total kept in step so the budget check never walks the map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
