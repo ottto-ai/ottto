@@ -1020,11 +1020,10 @@ fn server_named_items(error: &anyhow::Error, indices: &[usize]) -> Option<BTreeS
             .snapshot_indexes
             .as_ref()?,
     };
-    let held = named
+    named
         .iter()
         .map(|index| indices.get(*index).copied())
-        .collect::<Option<BTreeSet<_>>>()?;
-    (!held.is_empty()).then_some(held)
+        .collect()
 }
 
 /// Process-local, content-free count of records the attempt-count ladder made
@@ -11670,42 +11669,29 @@ where
                 }
             }
             Err(error) if server_named_items(&error, &indices).is_some() => {
-                let mut held = server_named_items(&error, &indices).expect("named items");
+                let held = server_named_items(&error, &indices).expect("named items");
                 // The server named these items: a validation rejection, or an
                 // identity deferral that waits for its identity only. Hold
                 // them; their siblings and later batches continue this pass.
-                let identity_deferral = error.downcast_ref::<UploadShed>().copied();
-                let (status, reason, identity_retry_at) = match identity_deferral {
-                    Some(shed) => {
-                        // The deferral is per session: hold every item of a
-                        // named session left in this pass, so its revisions
-                        // never land out of order.
-                        let sessions = held
-                            .iter()
-                            .filter_map(|index| session_id(&items[*index]))
-                            .collect::<BTreeSet<_>>();
-                        let of_held_session = |index: &usize| {
-                            session_id(&items[*index])
-                                .is_some_and(|session| sessions.contains(session))
-                        };
-                        held.extend(indices.iter().copied().filter(of_held_session));
-                        for (queued, _) in batches.iter_mut() {
-                            held.extend(queued.iter().copied().filter(of_held_session));
-                            queued.retain(|index| !of_held_session(index));
-                        }
-                        let retry_at = current_unix_seconds()
-                            .saturating_add(shed_backoff(shed.retry_after).as_secs());
-                        (shed.status, "identity_deferred", Some(retry_at))
-                    }
-                    None => (
-                        error
-                            .downcast_ref::<BatchRejected>()
-                            .expect("typed rejection")
-                            .status,
-                        "validation_reject",
-                        None,
-                    ),
-                };
+                let (status, reason, identity_retry_at) =
+                    match error.downcast_ref::<UploadShed>().copied() {
+                        Some(shed) => (
+                            shed.status,
+                            "identity_deferred",
+                            Some(
+                                current_unix_seconds()
+                                    .saturating_add(shed_backoff(shed.retry_after).as_secs()),
+                            ),
+                        ),
+                        None => (
+                            error
+                                .downcast_ref::<BatchRejected>()
+                                .expect("typed rejection")
+                                .status,
+                            "validation_reject",
+                            None,
+                        ),
+                    };
                 let before = progress.clone();
                 for index in &held {
                     let item_fingerprint = fingerprint(&items[*index]);

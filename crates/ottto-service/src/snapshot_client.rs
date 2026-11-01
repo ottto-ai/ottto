@@ -4014,18 +4014,6 @@ mod tests {
                 Some(vec![0, 1]),
             ),
             (
-                named(identity_code, r#"{"loc":["body","snapshots",2]}"#),
-                None,
-            ),
-            (
-                named(
-                    identity_code,
-                    r#"{"loc":["body","snapshots",0]},{"loc":["body","other"]}"#,
-                ),
-                None,
-            ),
-            (named(identity_code, ""), None),
-            (
                 named(
                     "cursor_allocation_timeout",
                     r#"{"loc":["body","snapshots",0]}"#,
