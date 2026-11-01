@@ -16361,7 +16361,9 @@ fn run_codex_app_server_rate_limits_for_home(
             .ok()
             .flatten()
             .and_then(|credentials| credentials.last_refresh)
-            .is_none_or(|last| OffsetDateTime::now_utc() - last >= TimeDuration::days(1));
+            .map_or(true, |last| {
+                OffsetDateTime::now_utc() - last >= TimeDuration::days(1)
+            });
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
