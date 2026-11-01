@@ -18,8 +18,8 @@ an existing Claude retry admission. Terminal effects are allowed, and the
 identity latch retains every original OFF condition. No serialized field or
 version changes.
 
-Remove ON-only diagnostics and test counters. Retain the always-zero
-`rearm_full_suppressed` field for debug diagnostics; serialized output omits it.
+Remove ON-only diagnostics and test counters, including the always-zero
+`rearm_full_suppressed` field, which serialization already skipped at zero.
 No diagnostic slots are renumbered. The money oracle and money-equivalence
 sources and expectations remain unchanged. Local validation is formatting and
 package clippy only; runtime and money checks belong to Linux CI. The PR records

@@ -9318,9 +9318,6 @@ pub struct ClaudeLocalEvidenceStats {
     )]
     pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
-    /// Local withheld full re-arms; omitted from serialized output while zero.
-    #[serde(skip_serializing_if = "claude_rearm_full_suppressed_is_zero")]
-    pub rearm_full_suppressed: u64,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
     /// RetryPending families whose returning root retains a retirement
     /// tombstone, separate from all other RetryPending causes. Local only.
@@ -9334,10 +9331,6 @@ pub struct ClaudeLocalEvidenceStats {
     /// the counts line and snapshot-audit stay unchanged.
     #[serde(skip)]
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
-}
-
-fn claude_rearm_full_suppressed_is_zero(value: &u64) -> bool {
-    *value == 0
 }
 
 struct PreparedTraceRead {
@@ -10300,7 +10293,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
-    stats.rearm_full_suppressed = disposition.rearm_full_suppressed;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);

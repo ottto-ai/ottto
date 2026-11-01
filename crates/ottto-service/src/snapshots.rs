@@ -5264,8 +5264,6 @@ pub(crate) struct ClaudeAuthorityRecordForTest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
     pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
-    /// Local withheld full re-arms; zero with terminal effects allowed.
-    pub(crate) rearm_full_suppressed: u64,
     pub(crate) first_proof_hold: ClaudeFirstProofHoldCounts,
     pub(crate) full_rearm_suppression: ClaudeFullRearmSuppressionCounts,
     /// Local counters for how this fold's Claude scalars were decided.
@@ -9374,7 +9372,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         }),
     };
     duplicate_census.census_complete = census_complete;
-    let rearm_full_suppressed = 0_u64;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     // The canonical ownership reducer validates semantic evidence too (row
@@ -10819,7 +10816,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     }
     duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
     disposition.duplicate_census = duplicate_census;
-    disposition.rearm_full_suppressed = rearm_full_suppressed;
     #[cfg(test)]
     CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
     disposition
