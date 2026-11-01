@@ -1425,7 +1425,6 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                         growth: None,
                     },
                     true,
-                    sampled_scan::now_seconds(),
                     None,
                 )
                 .is_some());
