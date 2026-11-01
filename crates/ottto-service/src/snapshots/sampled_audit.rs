@@ -2167,15 +2167,27 @@ pub(super) const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
 pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
     let files = &index.files;
     let Some(v2) = index.v2.as_mut() else { return };
-    let before = v2.growth_retention.len();
-    v2.growth_retention.retain(|key, state| {
-        files.contains_key(key)
+    let reclaimed = reclaim_growth(&mut v2.growth_retention, |key| files.contains_key(key), now);
+    if growth_active(index) {
+        note_growth_reclaimed(reclaimed);
+    }
+}
+fn reclaim_growth(
+    retention: &mut BTreeMap<String, GrowthRetention>,
+    has_file: impl Fn(&str) -> bool,
+    now: u64,
+) -> usize {
+    let before = retention.len();
+    retention.retain(|key, state| {
+        has_file(key)
             || state
                 .last_growth_full_unix
                 .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
     });
-    let reclaimed = before - v2.growth_retention.len();
-    if reclaimed > 0 && growth_active(index) {
+    before - retention.len()
+}
+fn note_growth_reclaimed(reclaimed: usize) {
+    if reclaimed > 0 {
         crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
             "growth_claim_reclaimed": reclaimed
         }));
@@ -2256,6 +2268,10 @@ fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> 
 /// Called by save while the checkpoint lock still protects this publication.
 /// A same-generation replacement must not become a claim-lineage CAS bypass.
 pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Result<()> {
+    publish_growth_receipt_at(index, path, index.generation)
+}
+/// The lineage's own claim commit at `generation`, under the same lock.
+fn publish_growth_receipt_at(index: &ScanIndex, path: &Path, generation: u64) -> Result<()> {
     let context = index
         .v2()
         .growth_claim_context
@@ -2267,15 +2283,12 @@ pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Re
         "growth claim owner changed"
     );
     let stamp = state_v2::confirmed_growth_stamp(index, path)?;
-    anyhow::ensure!(
-        stamp.0 == index.generation,
-        "growth claim publication changed"
-    );
+    anyhow::ensure!(stamp.0 == generation, "growth claim publication changed");
     *context
         .receipt
         .lock()
         .map_err(|_| anyhow::anyhow!("growth claim receipt unavailable"))? =
-        Some((index.generation, stamp));
+        Some((generation, stamp));
     Ok(())
 }
 
@@ -2294,13 +2307,18 @@ pub(super) fn merge_growth_claims(
     }
 }
 
+fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
+    state
+        .last_growth_full_unix
+        .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+}
+
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
-    let recent = |state: &GrowthRetention| {
-        state
-            .last_growth_full_unix
-            .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
-    };
-    if index.v2().growth_retention.get(key).is_some_and(recent)
+    if index
+        .v2()
+        .growth_retention
+        .get(key)
+        .is_some_and(|state| growth_claim_recent(state, now))
         || index.decode_holds.contains("growth_retention", key)
     {
         return Ok(false);
@@ -2310,12 +2328,82 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .growth_claim_context
         .clone()
         .context("growth Full needs a committed scan index")?;
+    if let Some(admitted) = claim_growth_row(index, &context, key, now)? {
+        return Ok(admitted);
+    }
+    claim_growth_hydrated(index, &context, key, now)
+}
+
+/// v2 route: the claim is one store transaction CAS'd on this lineage's G,
+/// with the same decisions as the hydrate path and no committed graph decode.
+fn claim_growth_row(
+    index: &mut ScanIndex,
+    context: &GrowthClaimContext,
+    key: &str,
+    now: u64,
+) -> Result<Option<bool>> {
+    if index.v2().persistence_v2.is_none() {
+        return Ok(None);
+    }
+    let _lock = CheckpointLock::acquire(&context.path)?;
+    authenticate_growth_generation(index, &context.path)?;
+    let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
+    // The committed graph shares this lineage's normalization; only claim
+    // rows differ, so its availability is this graph's.
+    index.require_persistence_available()?;
+    let mut claim = index
+        .v2()
+        .growth_retention
+        .get(key)
+        .cloned()
+        .unwrap_or_default();
+    claim.last_growth_full_unix = Some(now);
+    let decide =
+        |rows: &mut BTreeMap<String, GrowthRetention>, held: bool, files: &BTreeSet<String>| {
+            if held
+                || rows
+                    .get(key)
+                    .is_some_and(|state| growth_claim_recent(state, now))
+            {
+                return false;
+            }
+            // The save's merge keeps the larger claim; this one is not recent,
+            // so the committed claim is older. The save's pruning then applies.
+            rows.insert(key.to_owned(), claim);
+            note_growth_reclaimed(reclaim_growth(
+                rows,
+                |name| files.contains(name),
+                sampled_scan::now_seconds(),
+            ));
+            true
+        };
+    let Some((admitted, committed)) =
+        state_v2::claim_growth_locked(&context.path, index, expected, key, decide)?
+    else {
+        return Ok(None);
+    };
+    if admitted {
+        let generation = expected.checked_add(1).context("growth claim generation")?;
+        publish_growth_receipt_at(index, &context.path, generation)?;
+    }
+    merge_growth_claims(&mut index.v2_mut().growth_retention, &committed);
+    Ok(Some(admitted))
+}
+
+/// v1 or no v2 route: claim through one committed load and a claim-only save.
+pub(super) fn claim_growth_hydrated(
+    index: &mut ScanIndex,
+    context: &Arc<GrowthClaimContext>,
+    key: &str,
+    now: u64,
+) -> Result<bool> {
+    let recent = |state: &GrowthRetention| growth_claim_recent(state, now);
     // Decode the committed index, not the working page: persisting a claim
     // must never publish unaccepted bodies, progress or census changes.
     authenticate_growth_generation(index, &context.path)?;
     let mut committed = ScanIndex::load(&context.path)?;
     anyhow::ensure!(
-        growth_owner_matches(&committed, &context),
+        growth_owner_matches(&committed, context),
         "growth claim owner changed"
     );
     authenticate_growth_generation(index, &context.path)?;

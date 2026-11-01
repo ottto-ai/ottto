@@ -3,7 +3,7 @@
 use super::*;
 use anyhow::{bail, ensure, Context};
 use import::{Mapper, Pace, Pause};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -674,6 +674,20 @@ fn save_with_custody(
         }
         save_result
     }));
+    let result = settle_failed_save(path, claim_only, stale_graph, result);
+    if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
+        super::super::sampled_audit::renew_growth_claims(index, path);
+    }
+    result
+}
+/// A failed save keeps its pressure hold and reopens the session; a graph
+/// refused as stale before any write leaves the healthy session alone.
+fn settle_failed_save<T>(
+    path: &Path,
+    claim_only: bool,
+    stale_graph: bool,
+    mut result: Result<T>,
+) -> Result<T> {
     if let Err(error) = &result {
         if stale_graph {
             return result;
@@ -715,10 +729,142 @@ fn save_with_custody(
             result = Err(hold.into());
         }
     }
-    if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
-        super::super::sampled_audit::renew_growth_claims(index, path);
-    }
     result
+}
+
+pub(in super::super) type GrowthRows =
+    BTreeMap<String, super::super::sampled_audit::GrowthRetention>;
+/// Claim-only growth write without a graph hydrate. The caller holds
+/// CheckpointLock and has authenticated `expected` as its lineage's G. One
+/// BEGIN IMMEDIATE transaction reads the committed growth rows, the key's raw
+/// hold and which of those keys still have a file row; `decide` updates the
+/// rows and says whether to write. The rows then commit as G+1 through the
+/// save's own row writer, so row caps, erasure marks and the gauge apply.
+/// `None`: no v2 route, so the caller keeps the hydrate path.
+pub(in super::super) fn claim_growth_locked(
+    path: &Path,
+    index: &ScanIndex,
+    expected: u64,
+    key: &str,
+    decide: impl FnOnce(&mut GrowthRows, bool, &BTreeSet<String>) -> bool,
+) -> Result<Option<(bool, GrowthRows)>> {
+    let (Some(binding), Some(runtime)) = (binding(path), index.v2().persistence_v2.clone()) else {
+        return Ok(None);
+    };
+    let _save_window = telemetry::Window::begin("save");
+    let mut stale_graph = false;
+    let result = held(with_state(path, |state| {
+        let (identity, _) =
+            fence::reconcile(path, &binding, state.latched)?.ok_or(Hold::FenceLost)?;
+        state.latched = true;
+        let mut session = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = session.as_mut().ok_or(Hold::DbUnavailable)?;
+        ensure!(
+            !session.reload && session.identity == identity && session.path == path,
+            Hold::ForeignBinding
+        );
+        telemetry::baseline(path);
+        let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
+        if expected != session.stamp.0 {
+            stale_graph = true;
+            bail!(Hold::ReloadRequired);
+        }
+        let claimed = crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+            super::ack::ProgressRecovery::recover_route_locked(
+                &identity,
+                session.stamp.0,
+                path,
+                owner,
+            )?;
+            #[cfg(test)]
+            if tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take) {
+                let tx = session.db.begin(TxnMode::Write)?;
+                ensure!(
+                    tx.commit(expected, expected + 1)
+                        == DurableCommitOutcome::Committed(expected + 1),
+                    "synthetic concurrent commit"
+                );
+            }
+            let claimed = growth_claim_txn(&mut session.db, &identity, expected, key, decide)?;
+            if claimed.0 {
+                session.stamp = session.db.stamp()?;
+                // As after a claim-only save, the next save reads its baseline.
+                state.save_digests = None;
+            }
+            Ok(claimed)
+        });
+        if claimed.is_err() {
+            if let Some(hold) = session.db.save_failure() {
+                return Err(hold.into());
+            }
+        }
+        claimed
+    }));
+    settle_failed_save(path, true, stale_graph, result).map(Some)
+}
+fn growth_claim_txn(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    expected: u64,
+    key: &str,
+    decide: impl FnOnce(&mut GrowthRows, bool, &BTreeSet<String>) -> bool,
+) -> Result<(bool, GrowthRows)> {
+    const KIND: &str = "file.growth_retention";
+    let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
+    let started = Instant::now();
+    let before = db.save_row_attempts();
+    db.validate_save(identity, expected)?;
+    let mut tx = db.begin(TxnMode::Write)?;
+    let mut old = mapper::Digests::new();
+    let mut rows: GrowthRows = mapper::read_map(&mut tx, KIND, None, Some(&mut old))?;
+    let held = tx
+        .get(&RowKey::record(
+            "raw_hold.growth_retention",
+            key.as_bytes(),
+            0,
+        )?)?
+        .is_some();
+    let mut files = BTreeSet::new();
+    for name in rows.keys().map(String::as_str).chain([key]) {
+        if tx.get(&mapper::key("file.progress", name, 1)?)?.is_some() {
+            files.insert(name.to_owned());
+        }
+    }
+    if !decide(&mut rows, held, &files) {
+        return Ok((false, rows));
+    }
+    let mut writer = mapper::Rows {
+        tx: Some(&mut tx as &mut dyn Transaction),
+        old,
+        ..Default::default()
+    };
+    writer.map(KIND, &rows)?;
+    writer.finish()?;
+    // COMMIT re-checks the generation control against G inside this write.
+    let outcome = tx.commit(expected, next);
+    let (span_outcome, generation) = match outcome {
+        DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => {
+            ("committed", next)
+        }
+        DurableCommitOutcome::NotPublished => ("not_published", expected),
+        DurableCommitOutcome::Ambiguous => ("ambiguous", next),
+    };
+    let after = db.save_row_attempts();
+    telemetry::event(
+        "save_span",
+        &serde_json::json!({
+            "duration_ms": started.elapsed().as_millis(), "outcome": span_outcome,
+            "generation": generation, "rows_put": after.0.saturating_sub(before.0),
+            "rows_removed": after.1.saturating_sub(before.1)
+        }),
+    );
+    match outcome {
+        DurableCommitOutcome::Committed(generation) if generation == next => Ok((true, rows)),
+        DurableCommitOutcome::NotPublished => {
+            bail!(db.save_failure().unwrap_or(Hold::ReloadRequired))
+        }
+        _ => bail!(Hold::ReloadRequired),
+    }
 }
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, published(path)?)? {

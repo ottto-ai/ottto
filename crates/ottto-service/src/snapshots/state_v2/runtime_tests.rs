@@ -40,6 +40,10 @@ thread_local! {
     /// That session connection's stamps around the delete.
     pub(super) static RACED_STAMPS: std::cell::Cell<RacedStamps> =
         const { std::cell::Cell::new(None) };
+    /// Commit G+1 on the session connection after the next growth claim
+    /// authenticated G, before its write transaction begins.
+    pub(super) static COMMIT_BEFORE_GROWTH_CLAIM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 
