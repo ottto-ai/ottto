@@ -9105,6 +9105,7 @@ pub fn apply_claude_reported_usage_with_index(
 
 /// As above; with contract-5 evidence, each rebuilt item's requests are also
 /// classified and grouped as the rebuild places them.
+#[cfg(test)]
 pub(crate) fn apply_claude_reported_usage_with_identity(
     snapshots: &mut [SnapshotItem],
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -9127,6 +9128,7 @@ pub(crate) fn apply_claude_reported_usage_with_identity(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_claude_reported_usage_with_index_and_limits(
     snapshots: &mut [SnapshotItem],
@@ -35558,6 +35560,7 @@ fn claude_birth_seconds(created_unix_seconds: u64) -> Option<u64> {
     (created_unix_seconds > CLAUDE_BIRTH_FLOOR_UNIX_SECONDS).then_some(created_unix_seconds)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn parse_opened_jsonl_file(
     file: File,
