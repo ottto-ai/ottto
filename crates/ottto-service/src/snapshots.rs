@@ -12986,7 +12986,7 @@ fn derive_claude_legacy_usage_exclusions(
             .iter()
             .take_while(|request_hash| {
                 request_owners
-                    .get(*request_hash)
+                    .get(request_hash)
                     .is_some_and(|owner| owner.root_session_id != *child_root)
             })
             .count();

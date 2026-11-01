@@ -328,6 +328,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// One side of a compared enrichment: the page, its accepted buckets and the
+/// API sidecar opens its fold made.
+type ComparedSide<'p> = (
+    &'p Page,
+    Option<&'p crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    usize,
+);
+
 /// What the compared enrichments exercised, so the arm cannot pass vacuously.
 #[derive(Clone, Copy, Debug, Default)]
 struct StreamedChecks {
@@ -348,16 +356,8 @@ impl StreamedChecks {
     fn compare(
         &mut self,
         terminal: bool,
-        whole: (
-            &Page,
-            Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-            usize,
-        ),
-        streamed: (
-            &Page,
-            Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-            usize,
-        ),
+        whole: ComparedSide<'_>,
+        streamed: ComparedSide<'_>,
     ) {
         use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
         let ((whole, whole_accepted, whole_reads), (streamed, accepted, reads)) = (whole, streamed);

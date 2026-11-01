@@ -5,7 +5,7 @@
 //! gives: the same rows, the same sorted root order, the same first refusal.
 
 use super::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
-use super::claude_request_identity::{add_root_memberships, RequestRootIndex};
+use super::claude_request_identity::{prove_membership, unique_by_request, RequestRootIndex};
 use super::{claude_earliest_request, ClaudeLegacyRequestOwners, SnapshotItem};
 use crate::claude_local_otel::{
     claude_pair_generation, ClaudeLocalOtelEvidence, ClaudePairGeneration,
@@ -90,7 +90,9 @@ impl CrossRootEvidence {
                 .map(|row| row.request_id.as_str())
                 .chain(trace_rows.iter().map(|row| row.request_id.as_str())),
         );
-        add_root_memberships(root, api_rows, &mut self.memberships);
+        for row in unique_by_request(api_rows).into_values().flatten() {
+            prove_membership(row, root, &mut self.memberships);
+        }
         if let Some(api) = api {
             self.legacy_request_owners.add_root(root, api, trace);
         }

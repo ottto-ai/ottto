@@ -4448,7 +4448,7 @@ pub(crate) struct ScanEvidence<'a> {
 /// under several roots name it. Rows are keyed by trace root, so this is how a
 /// fork or resume copy under another root sees that the request already has
 /// an owner. A root's API and trace rows of one request are one claim: each
-/// root's ids are deduplicated before the collapse, never after.
+/// root's ids are deduplicated as the root is added, before the collapse.
 #[derive(Default)]
 pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
 
@@ -4468,7 +4468,6 @@ impl RequestRootIndex {
     /// Once every root is in: sort, then collapse ids held by several roots.
     pub(crate) fn finish(&mut self) {
         self.0.sort_unstable();
-        self.0.dedup();
         self.0.dedup_by(|later, kept| {
             if later.0 != kept.0 {
                 return false;
@@ -4488,14 +4487,10 @@ impl RequestRootIndex {
     }
 }
 
-/// Adds the (login, org) pairs one root's API rows prove, as `ScanEvidence::new`
-/// does over every root: only a row unique for its request within the root,
-/// passing `valid_login`, with a complete org.
-pub(crate) fn add_root_memberships(
-    root: &str,
+/// One root's API rows by request id: the row, or `None` when several name it.
+pub(crate) fn unique_by_request(
     rows: &[ClaudeLocalOtelEvidence],
-    memberships: &mut BTreeMap<String, BTreeSet<String>>,
-) {
+) -> BTreeMap<&str, Option<&ClaudeLocalOtelEvidence>> {
     let mut unique = BTreeMap::new();
     for row in rows {
         unique
@@ -4503,14 +4498,22 @@ pub(crate) fn add_root_memberships(
             .and_modify(|entry| *entry = None)
             .or_insert(Some(row));
     }
-    for row in unique.into_values().flatten() {
-        if let (Some(login), Some(org)) = (valid_login(row, root), complete_org(row)) {
-            memberships
-                .entry(login.to_string())
-                .or_default()
-                .insert(org.to_string());
-        }
+    unique
+}
+
+/// Only a unique row that passes the same integrity checks `classify` applies
+/// may establish a (login, org) pair. `false`: its login is invalid.
+pub(crate) fn prove_membership(
+    row: &ClaudeLocalOtelEvidence,
+    root: &str,
+    memberships: &mut BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let login = valid_login(row, root);
+    if let (Some(login), Some(org)) = (login, complete_org(row)) {
+        let orgs = memberships.entry(login.to_string()).or_default();
+        orgs.insert(org.to_string());
     }
+    login.is_some()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4533,28 +4536,14 @@ impl<'a> ScanEvidence<'a> {
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
-            for row in rows {
-                evidence
-                    .requests
-                    .entry((root.as_str(), row.request_id.as_str()))
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some(row));
+            for (request_id, row) in unique_by_request(rows) {
+                evidence.requests.insert((root.as_str(), request_id), row);
             }
         }
-        // Only unique rows that pass the same integrity checks `classify`
-        // applies may establish a (login, org) pair.
         for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
-            let Some(login) = valid_login(row, key.0) else {
+            if !prove_membership(row, key.0, &mut evidence.memberships) {
                 evidence.invalid_logins.insert(key);
-                continue;
-            };
-            if let Some(org) = complete_org(row) {
-                evidence
-                    .memberships
-                    .entry(login.to_string())
-                    .or_default()
-                    .insert(org.to_string());
             }
         }
         for (root, rows) in &trace.evidence {
