@@ -93,18 +93,18 @@ def fixture_test(tree, name, env, marker=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--r1", required=True, help="exact current R1/main commit (before archive intake)")
+    parser.add_argument("--base", required=True, help="pre-archive main commit")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise SystemExit("CI Linux only; do not execute on a developer machine")
-    if not re.fullmatch(r"[0-9a-f]{40}", args.r1):
-        raise SystemExit("--r1 must be a full commit SHA")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.base):
+        raise SystemExit("--base must be a full commit SHA")
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="zst-downgrade-", dir=os.environ["RUNNER_TEMP"]) as tmp:
         root = Path(tmp)
         env = dict(os.environ, OTTTO_ZST_DOWNGRADE_FIXTURE_DIR=str(root / "fixtures"))
         fixture_test(repo, "codex_compressed_input::tests::write_codex_zst_downgrade_fixture", env)
-        for label, sha in [("stable", STABLE), ("r1", args.r1)]:
+        for label, sha in [("stable", STABLE), ("r1", args.base)]:
             if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], cwd=repo).returncode:
                 run(["git", "fetch", "--no-tags", "origin", sha], cwd=repo)
             tree = root / label
@@ -114,7 +114,7 @@ def main():
             run(["tar", "-xf", str(archive), "-C", str(tree)])
             source = tree / "crates/ottto-service/src/snapshots.rs"
             text = source.read_text()
-            # Fail if the chosen R1 already knows these fields: that requires a
+            # Fail if the chosen base already knows these fields: that requires a
             # new label/membership contract, not silently weaker comparisons.
             entry = text.split("pub struct ScanIndexEntry {", 1)[1].split("\n}", 1)[0]
             if "codex_compressed_hold" in entry or "archive:" in entry:
@@ -126,7 +126,7 @@ def main():
                          "ZST_OLD_DECODER_VERIFIED " + label)
         fixture_test(repo, "codex_compressed_input::tests::verify_codex_zst_downgrade_roundtrip", env)
         fixture_test(repo, "codex_compressed_input::tests::historical_census_saved_singleton_schedules_a1_on_reupgrade", env)
-        print(json.dumps({"status": "VERIFIED", "stable": STABLE, "r1": args.r1}))
+        print(json.dumps({"status": "VERIFIED", "stable": STABLE, "base": args.base}))
 
 
 if __name__ == "__main__":
