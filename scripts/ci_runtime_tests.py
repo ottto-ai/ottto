@@ -106,22 +106,38 @@ def listed_tests(output: str) -> list[str]:
     return [line[: -len(": test")] for line in output.splitlines() if line.endswith(": test")]
 
 
-def serial_group(lib_tests: list[str], serial_fns: set[str], all_tests: list[str]) -> list[str]:
-    """The lib tests to run in the serial group, checked against every target."""
+def serial_group(lib_tests: list[str], serial_fns: set[str]) -> list[str]:
+    """The ottto-service lib tests to run in the serial group."""
     selected = [name for name in lib_tests if name.rsplit("::", 1)[-1] in serial_fns]
     if not selected:
         raise SetupError("no listed ottto-service lib test matches a #[serial] function")
-    # --skip with --exact applies to every test target, so a serial lib test's
-    # full name must not also name a test in another target.
-    wanted = set(selected)
+    return selected
+
+
+def require_unique(skipped: list[str], all_tests: list[str]) -> None:
+    """--skip with --exact applies to every test target, so a skipped lib test's
+    full name must not also name a test in another target."""
+    wanted = set(skipped)
     counts: dict[str, int] = {}
     for name in all_tests:
         if name in wanted:
             counts[name] = counts.get(name, 0) + 1
-    clashes = sorted(name for name in selected if counts.get(name, 0) != 1)
+    clashes = sorted(name for name in wanted if counts.get(name, 0) != 1)
     if clashes:
-        raise SetupError(f"serial test names also used by another test target: {clashes[:5]}")
-    return selected
+        raise SetupError(f"skipped lib test names also used by another test target: {clashes[:5]}")
+
+
+def shard_of(names: list[str], shard: tuple[int, int]) -> list[str]:
+    """Round-robin share `index` of `count` (1-based), so slow neighbours spread out."""
+    index, count = shard
+    return names[index - 1::count]
+
+
+def parse_shard(value: str) -> tuple[int, int]:
+    index, _, count = value.partition("/")
+    if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):
+        raise argparse.ArgumentTypeError("--shard must be I/N with 1 <= I <= N")
+    return int(index), int(count)
 
 
 def check_counts(name: str, summary: tuple[int, ...] | None, ran: int, filtered: int) -> list[str]:
@@ -254,6 +270,10 @@ def main() -> int:
         help="seconds without output from either group before both are dumped and killed",
     )
     parser.add_argument(
+        "--shard", type=parse_shard, default=(1, 1), metavar="I/N",
+        help="run share I of N of the ottto-service lib tests; share 1 also runs every other target",
+    )
+    parser.add_argument(
         "--require-pass", action="append", default=[], metavar="TEST",
         help="exact test name that must print `test <name> ... ok` (repeatable)",
     )
@@ -270,12 +290,24 @@ def main() -> int:
         all_tests = listed_tests(
             capture([cargo, "test", "--workspace", "--locked", "--tests", "--", "--list", "--format", "terse"])
         )
-        serial = serial_group(lib_tests, serial_fns, all_tests)
+        serial_all = serial_group(lib_tests, serial_fns)
+        serial = shard_of(serial_all, args.shard)
+        serial_set = set(serial_all)
+        main_all = [name for name in lib_tests if name not in serial_set]
+        mine = shard_of(main_all, args.shard)
+        if not mine:
+            raise SetupError(f"shard {args.shard[0]}/{args.shard[1]} owns no lib test")
+        first = args.shard[0] == 1
+        # Share 1 runs the whole workspace minus every lib test it does not own;
+        # the other shares run only their own lib tests.
+        skipped = [name for name in lib_tests if name not in set(mine)] if first else []
+        require_unique(skipped, all_tests)
     except (SetupError, subprocess.CalledProcessError) as error:
         print(f"ci_runtime_tests: {error}", file=sys.stderr)
         return 2
     print(
-        f"ci_runtime_tests: {len(serial)} of {len(lib_tests)} ottto-service lib tests are #[serial]; "
+        f"ci_runtime_tests: shard {args.shard[0]}/{args.shard[1]}: {len(serial)} of {len(serial_all)} #[serial] "
+        f"and {len(mine)} of {len(main_all)} other ottto-service lib tests; "
         f"serial group 1 process x {args.serial_threads} thread(s), main group x {args.threads}",
         flush=True,
     )
@@ -289,11 +321,12 @@ def main() -> int:
         out_lock,
         last_output,
     )
-    skips = [arg for name in serial for arg in ("--skip", name)]
+    skips = [arg for name in skipped for arg in ("--skip", name)]
+    scope = ["--workspace"] if first else ["-p", "ottto-service", "--lib"]
     main_run = start(
         "main group",
-        [cargo, "test", "--workspace", "--locked", *(["--no-fail-fast"] if args.no_fail_fast else []), "--",
-         "--nocapture", f"--test-threads={args.threads}", "--exact", *skips],
+        [cargo, "test", *scope, "--locked", *(["--no-fail-fast"] if args.no_fail_fast else []), "--",
+         "--nocapture", f"--test-threads={args.threads}", "--exact", *skips, *([] if first else mine)],
         out_lock,
         last_output,
     )
@@ -311,7 +344,7 @@ def main() -> int:
     main_summary = libtest_log.lib_summary(main_run[2], "ottto_service")
     # A fail-fast main group can stop before the lib target when an earlier one fails.
     if "main group" not in killed and (main_summary is not None or main_run[0].returncode == 0):
-        problems += check_counts("main group", main_summary, len(lib_tests) - len(serial), len(serial))
+        problems += check_counts("main group", main_summary, len(mine), len(lib_tests) - len(mine))
     problems += require_passed(args.require_pass, main_run[2] + serial_run[2])
     for problem in problems:
         print(f"ci_runtime_tests: {problem}", file=sys.stderr)

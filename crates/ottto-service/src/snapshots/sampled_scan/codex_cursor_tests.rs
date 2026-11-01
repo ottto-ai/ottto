@@ -762,6 +762,7 @@ thread_local! {
     pub(in crate::snapshots) static EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(in crate::snapshots) static GROUP_EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_EOF_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NARROW_MISSES_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 // Build certified fixture evidence through the same constructor and header
 // steps as an ordinary scan, without retaining evidence from a completed scan.
@@ -790,6 +791,17 @@ pub(in crate::snapshots) fn constrain_eof_park(job: &mut OwnedActiveFile) {
         let charge = paused_charge(job).expect("bounded EOF job");
         job.parser.restore_live_reduction_inputs(inputs);
         TEST_STATE_BUDGET.with(|limit| limit.set(Some(charge - 1)));
+    }
+}
+/// While `NARROW_MISSES_ROW` is set, the narrowed view disagrees with its
+/// page's full view (a conflict row the full view lacks).
+pub(in crate::snapshots) fn constrain_narrowed(codex: &mut CodexTitleMetadata, path: &Path) {
+    if NARROW_MISSES_ROW.with(std::cell::Cell::get) {
+        codex.identity_conflicts.extend(
+            codex_session_id_candidates_from_path(path)
+                .iter()
+                .map(|id| resolve_codex_identity(id)),
+        );
     }
 }
 fn carry(root: &Path, scan: &mut SourceScanResult) {
@@ -3277,18 +3289,27 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
 }
 
-/// The production-shaped 2,800-member revalidation backlog must not spend
-/// the byte budget before a new session or an appended, processed session.
-/// A persisted yield then gives the census a whole ordinary page even when
+/// [regress #789] A large revalidation backlog of owed old census re-reads
+/// must not spend the byte budget before fresh data. Each page's singleton
+/// budget is four fixture files, and the fresh bypass triggers once the
+/// pending bytes exceed it, so `MEMBERS` only has to dwarf a few pages.
+/// Two discovery arms share one warm fixture:
+/// (a) a new session and an appended, processed session (hinted). A
+/// persisted yield then gives the census a whole ordinary page even when
 /// fresh data continues to arrive. No upload fingerprints or totals change.
+/// (b) a new Codex day is a new date directory. Retained-roster refresh
+/// finds it with no watcher hint; its rollout must still reach the
+/// post-policy upload set within two ordinary pages.
 #[test]
-fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
+fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    const MEMBERS: usize = 300;
     const NEW: &str = "019fa111-2222-7333-8444-888888888888";
     const NEXT: &str = "019fa111-2222-7333-8444-888888888889";
-    let ids = (0..2800)
+    const NEW_DAY: &str = "019fa111-2222-7333-8444-888888888890";
+    let ids = (0..MEMBERS)
         .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
         .collect::<Vec<_>>();
     let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
@@ -3296,7 +3317,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     let fixture = ScanRoot::with_sessions(&sessions);
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 1);
     for id in &ids {
         index
             .files
@@ -3334,8 +3355,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         assert!(!scan.census_complete);
         let window = scan.census_window_end.clone();
         let old_pending = index.traversal.as_ref().unwrap().pending_candidates.len();
-        assert!(old_pending > 2700);
+        assert!(old_pending > MEMBERS - 100);
 
+        // Arm (a): hinted append plus a new session.
         let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
             "type": "session_meta", "payload": {"id": NEW}}));
         body.extend(token_line(1));
@@ -3389,13 +3411,48 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         );
         assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
-        let (_, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
+        let (next, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
+        index = next;
         let published = fresh
             .snapshots
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
+
+        // Pay the owed ordinary turn so arm (b) starts, like a cold backlog,
+        // with no freshness yield pending.
+        let (next, ordinary) = published_scan(&fixture, &cache, index, &collected_at(4), &[]);
+        index = next;
+        assert!(
+            ordinary.snapshots.is_empty(),
+            "unchanged-output revalidation"
+        );
+        assert!(!ordinary.census_complete);
+        assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > MEMBERS - 100);
+
+        // Arm (b): an unhinted new date directory.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_dated_rollout(&fixture, "2026/10/08", NEW_DAY);
+        cache.clear();
+        let mut published = BTreeSet::new();
+        for page in 1..=2 {
+            let (next, scan) =
+                published_scan(&fixture, &cache, index, &collected_at(4 + page), &[]);
+            index = next;
+            assert_eq!(scan.census_window_end, window, "same open generation");
+            assert!(!scan.census_complete);
+            published.extend(
+                scan.snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.clone()),
+            );
+            if published.contains(NEW_DAY) {
+                break;
+            }
+        }
+        assert_eq!(published, BTreeSet::from([NEW_DAY.to_string()]));
     });
 }
 
@@ -3540,78 +3597,6 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         .is_empty());
     assert_eq!(flags(&index, &new), Some((true, true, true)));
     assert_eq!(flags(&index, &old), Some((true, false, false)));
-}
-
-/// A new Codex day is a new date directory. Retained-roster refresh finds it
-/// with no watcher hint; its rollout must still reach the post-policy upload
-/// set within two ordinary pages instead of waiting behind 2,800 owed old
-/// census members.
-#[test]
-fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    const NEW: &str = "019fa111-2222-7333-8444-888888888890";
-    let ids = (0..2800)
-        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
-        .collect::<Vec<_>>();
-    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
-    sessions.push((SESSION, 4));
-    let fixture = ScanRoot::with_sessions(&sessions);
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
-    for id in &ids {
-        index
-            .files
-            .get_mut(&local_index_key(&fixture.file(id)))
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-    }
-    ensure_bounded_traversal(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        &mut index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-    );
-    advance_bounded_directory_traversal(
-        SnapshotSource::Codex,
-        &mut index,
-        BACKFILL_WINDOW_DAYS,
-        None,
-    );
-    let budget = fixture.len(SESSION) * 4;
-    cache.clear();
-    with_test_limits(2048, budget, 64, || {
-        let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
-        index = next;
-        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
-        assert!(!scan.census_complete);
-        let window = scan.census_window_end.clone();
-        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > 2700);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        write_dated_rollout(&fixture, "2026/10/08", NEW);
-        cache.clear();
-        let mut published = BTreeSet::new();
-        for page in 1..=2 {
-            let (next, scan) = published_scan(&fixture, &cache, index, &collected_at(page), &[]);
-            index = next;
-            assert_eq!(scan.census_window_end, window, "same open generation");
-            assert!(!scan.census_complete);
-            published.extend(
-                scan.snapshots
-                    .iter()
-                    .map(|item| item.source_session_id.clone()),
-            );
-            if published.contains(NEW) {
-                break;
-            }
-        }
-        assert_eq!(published, BTreeSet::from([NEW.to_string()]));
-    });
 }
 
 /// G1 carry: a census that closes while a re-read is still waiting hands it
@@ -4343,6 +4328,18 @@ impl CreatedThreadHome {
         state_source: &str,
         spawn_parent: Option<&str>,
     ) -> Self {
+        Self::with_lineage_aged(written, fork, state_source, spawn_parent, 0)
+    }
+
+    /// `with_lineage` whose content and state row are `age_ms` older than the
+    /// rollout file's birth: a copied or recreated rollout.
+    fn with_lineage_aged(
+        written: usize,
+        fork: bool,
+        state_source: &str,
+        spawn_parent: Option<&str>,
+        age_ms: i64,
+    ) -> Self {
         let fixture = ScanRoot::with_sessions(&[]);
         let now = i64::try_from(
             SystemTime::now()
@@ -4351,7 +4348,7 @@ impl CreatedThreadHome {
                 .as_millis(),
         )
         .unwrap();
-        let base_ms = now - now % 1_000;
+        let base_ms = now - now % 1_000 - age_ms;
         let at = |offset: i64| bounded_rfc3339_millis(base_ms + offset).unwrap();
         let second = |offset: i64| u64::try_from(base_ms / 1_000 + offset).unwrap();
         let turn = |n: u64| format!("{}-5000-7000-8000-{n:012}", &CREATED[..8]);
@@ -4903,6 +4900,57 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     );
     assert_oracle(&home, &cache, &index, &cured, 3, true, &[]);
     assert_admitted_once(&home, &cache, index, &cured, 4);
+}
+
+/// [regress] A copied created thread: its header matches the state row's
+/// creation time, but the rollout file was born days later. A state-declared
+/// created thread proves its creation from that header, not from file birth,
+/// so the curing append binds it and credits its usage once, equal in totals
+/// and placement to a cold Full. A thread the state row does not classify as
+/// created (rollout-declared, spawn parent) keeps the file-birth check and
+/// stays held, as on main.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
+fn copied_created_thread_binds_from_its_header_not_file_birth() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    const COPIED_DAYS_LATER_MS: i64 = 5 * 86_400_000;
+    for (state_source, spawn_parent, admitted) in [
+        ("agent_created_thread", None, true),
+        ("user", Some(SPAWN_PARENT), false),
+    ] {
+        let home = CreatedThreadHome::with_lineage_aged(
+            3,
+            false,
+            state_source,
+            spawn_parent,
+            COPIED_DAYS_LATER_MS,
+        );
+        let cache = Arc::new(SharedCache::default());
+        let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+        assert!(created_usage(&held).is_empty(), "{state_source}");
+        home.flush_from(3);
+        let (index, cured) = home.generation(index, &cache, 1);
+        if !admitted {
+            assert!(created_usage(&cured).is_empty(), "{state_source}");
+            assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+            continue;
+        }
+        assert_eq!(
+            created_usage(&cured),
+            vec![(200, 3)],
+            "{state_source}: {}",
+            counters(&cache)
+        );
+        let (cold_index, cold) = home.oracle(1);
+        money_oracle::assert_equivalent(
+            &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+            &scan_money(SnapshotSource::Codex, &index, &cured),
+        );
+        assert_admitted_once(&home, &cache, index, &cured, 2);
+    }
 }
 
 /// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by
@@ -11396,6 +11444,185 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
     });
 }
 
+/// The continuation mints of one page, as their `continuation_mint` counts.
+fn mint_counts(rows: &[Value]) -> Vec<Value> {
+    rows.iter()
+        .filter(|row| row["stage"] == "codex_continuation_mint")
+        .map(|row| row["counts"].clone())
+        .collect()
+}
+
+/// A state database with SESSION's thread row and `edges` (parent, child).
+fn write_thread_state(fixture: &ScanRoot, edges: &[(String, String)]) {
+    let state =
+        rusqlite::Connection::open(fixture.root.parent().unwrap().join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "CREATE TABLE threads (\
+                id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                rollout_path TEXT\
+            );\
+            CREATE TABLE thread_spawn_edges (\
+                parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO threads VALUES (?1, 'Thread', 1, 'user', 'Summarize', ?2, ?3)",
+            rusqlite::params![
+                SESSION,
+                1_791_367_200_000_i64,
+                fixture.file(SESSION).to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    for (parent, child) in edges {
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![parent, child],
+            )
+            .unwrap();
+    }
+}
+
+/// [regress] A paused job's ticket carried its page's whole join evidence,
+/// whose lineage rows alone exceed the ticket's bounded walk, so every mint
+/// on a realistic Codex home was `over_bound` and no continuation page ran.
+/// The job's own share now fits; the continuation pages resume and read the
+/// job contiguously, and it publishes the unpaged read's output.
+#[test]
+fn a_realistic_home_mints_the_jobs_share_and_continuation_reads_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let edges = (0..2_500)
+        .map(|n| {
+            (
+                format!("019fb000-0000-7000-8000-{n:012}"),
+                format!("019fc000-0000-7000-8000-{n:012}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_thread_state(&fixture, &edges);
+    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+        std::slice::from_ref(&fixture.root),
+        &BTreeSet::from([fixture.file(SESSION).to_string_lossy().into_owned()]),
+    );
+    assert!(
+        crate::heap_layout_bound::bound(&whole, 8 << 20).is_none(),
+        "the page's whole evidence exceeds the ticket's walk"
+    );
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert!(mint_counts(&rows).is_empty(), "no refusal at the mint");
+        let share = CARRIED.with(|v| {
+            v.borrow()
+                .get(&fixture.root)
+                .map(|evidence| crate::heap_layout_bound::bound(evidence, 8 << 20))
+        });
+        assert!(
+            matches!(share, Some(Some(_))),
+            "the job's share fits the ticket's walk"
+        );
+        let paused_at = NATIVE_RANGES.with(|v| v.borrow().as_ref().unwrap().last().unwrap().end);
+        let mut published = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                Some(secs(600)),
+                |_| {},
+            );
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert!(scan.snapshots.is_empty());
+            if parked_eof(&cache) {
+                let (_, ordinary) = page(&fixture, index, Some(Arc::clone(&cache)));
+                published = Some(ordinary);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert!(end > paused_at, "the continuation pages advanced the job");
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert!(!published.snapshots.is_empty());
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
+    });
+}
+
+/// [behaviour] A narrowed view that cannot reproduce its page's reduction
+/// fingerprint mints nothing (`not_mintable`, no evidence carried), and the
+/// next ordinary pages resume the same job where it paused, reading no byte
+/// twice, to the unpaged read's output.
+#[test]
+fn an_unproven_share_mints_nothing_and_ordinary_pages_resume_the_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NARROW_MISSES_ROW.with(|v| v.set(false));
+        }
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    let _reset = Reset;
+    NARROW_MISSES_ROW.with(|v| v.set(true));
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert_eq!(
+            mint_counts(&rows),
+            vec![json!({"continuation_mint": {"not_mintable": 1}})]
+        );
+        assert!(carried(&fixture.root).is_none(), "no continuation inputs");
+        let mut published = None;
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if !scan.snapshots.is_empty() {
+                published = Some(scan);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
+    });
+}
+
 // Stage 1 integration (StateMissing, under c22's K5/K6/K7/W9 rulings): the
 // leased deadline and capture lines, the no-save continuation contract and a
 // worker panic's next ordinary page. New tests only.
@@ -12655,4 +12882,219 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         Some(&1)
     );
     assert_eq!(durable.restored, 0);
+}
+
+/// A rollout whose header names its creator pair, with `lines` usage records.
+fn write_account_rollout(fixture: &ScanRoot, session: &str, account: &str, lines: u64) {
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": session,
+        "timestamp": "2026-10-07T09:59:00Z",
+        "creator_user_id": format!("synthetic-user-{account}"),
+        "creator_account_id": format!("synthetic-workspace-{account}")}}));
+    for n in 1..=lines {
+        body.extend(token_line(n));
+    }
+    fs::write(fixture.file(session), body).unwrap();
+}
+
+/// [money] A job continued on its minted share publishes what a cold read
+/// publishes, in totals and in placement, across two accounts (the positive
+/// control: swapping their evidence fails the comparator). Each row pauses the
+/// job and checks one part of its share first: a job with a spawn parent and
+/// child mints with the rows its fingerprint reads; a decided job keeps no
+/// parent ledger and an undecided one keeps all; an owner-file change holds the
+/// continuation and an unrelated roster file's change does not.
+#[test]
+fn a_continued_job_on_its_share_keeps_money_and_placement() {
+    use crate::snapshots::sampled_scan::transition_fixture::{
+        money_oracle, scan_money, RouteResult,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "spawned",
+        "ledger_decided",
+        "ledger_undecided",
+        "owner_file_changed",
+        "roster_file_changed",
+    ] {
+        let fixture = ScanRoot::with_sessions(&[]);
+        write_account_rollout(&fixture, SESSION, "a", 80);
+        write_account_rollout(&fixture, SESSION_B, "b", 1);
+        let roots = std::slice::from_ref(&fixture.root);
+        let job_path = fixture.file(SESSION);
+        if case == "spawned" {
+            write_thread_state(
+                &fixture,
+                &[
+                    (SPAWN_PARENT.to_owned(), SESSION.to_owned()),
+                    (SESSION.to_owned(), CHILD.to_owned()),
+                ],
+            );
+            let whole = CodexTitleMetadata::load_from_roots(roots);
+            let narrowed = whole.narrowed_to(&job_path);
+            assert_eq!(
+                narrowed.spawn_parents.get(SESSION).map(String::as_str),
+                Some(SPAWN_PARENT),
+                "the job's parent edge"
+            );
+            assert_eq!(
+                narrowed.spawn_parents.get(CHILD).map(String::as_str),
+                Some(SESSION),
+                "the job's child edge"
+            );
+            assert_eq!(
+                narrowed.path_reduction_fingerprint(&job_path),
+                whole.path_reduction_fingerprint(&job_path)
+            );
+            assert_ne!(
+                CodexTitleMetadata::default().path_reduction_fingerprint(&job_path),
+                whole.path_reduction_fingerprint(&job_path),
+                "the fingerprint reads the job's rows"
+            );
+        }
+        let settled =
+            |mut index: ScanIndex, cache: &Arc<SharedCache>, scan: &mut SourceScanResult| {
+                for _ in 0..4 {
+                    let (next, later) = page(&fixture, index, Some(Arc::clone(cache)));
+                    index = next;
+                    scan.snapshots.extend(later.snapshots);
+                }
+                scan.snapshots
+                    .sort_by(|a, b| a.snapshot_fingerprint.cmp(&b.snapshot_fingerprint));
+                scan.snapshots
+                    .dedup_by(|a, b| a.snapshot_fingerprint == b.snapshot_fingerprint);
+                scan.snapshots
+                    .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+                index
+            };
+        let cold_cache = Arc::new(SharedCache::default());
+        let (cold_index, mut cold) = page(
+            &fixture,
+            ScanIndex::default(),
+            Some(Arc::clone(&cold_cache)),
+        );
+        let cold_index = settled(cold_index, &cold_cache, &mut cold);
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let ((mut index, first), rows) = crate::local_resource_diagnostics::capture(|| {
+                page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)))
+            });
+            assert!(mint_counts(&rows).is_empty(), "{case}: no refusal");
+            assert_eq!(counter(&cache, |c| c.jobs_paused), 1, "{case}");
+            let carried_share = |read: &dyn Fn(&crate::snapshots::CodexContinuationEvidence)| {
+                CARRIED.with(|v| read(v.borrow().get(&fixture.root).expect("a minted share")));
+            };
+            carried_share(&|share| {
+                assert_eq!(share.inventory.headers.len(), 1, "{case}: only the job");
+                assert_eq!(share.inventory.directories.local_diagnostic_counts().1, 0);
+                assert!(share.content_unchanged(), "{case}");
+            });
+            match case {
+                "ledger_decided" | "ledger_undecided" => {
+                    let undecided = case == "ledger_undecided";
+                    let boundary = |to: Option<CodexOwnershipBoundary>| {
+                        cache
+                            .with_cursor(|cursor| match &mut cursor.slot {
+                                Slot::Paused(job) => {
+                                    let held = &mut job.parser.accumulator.codex_ownership_boundary;
+                                    let was = *held;
+                                    *held = to.unwrap_or(was);
+                                    was
+                                }
+                                _ => panic!("the job is paused"),
+                            })
+                            .unwrap()
+                    };
+                    let decided = boundary(None);
+                    assert_ne!(decided, CodexOwnershipBoundary::Undetermined, "header read");
+                    if undecided {
+                        boundary(Some(CodexOwnershipBoundary::Undetermined));
+                    }
+                    let mut whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+                        roots,
+                        &BTreeSet::from([job_path.to_string_lossy().into_owned()]),
+                    );
+                    whole.ledgers = Some(Arc::new(Mutex::new(BTreeMap::from([
+                        (PARENT.to_owned(), Default::default()),
+                        (GRANDPARENT.to_owned(), Default::default()),
+                    ]))));
+                    let share = whole
+                        .for_paused_job(Some(&*cache), first.continuation_ticket().unwrap())
+                        .expect("the job's share");
+                    let kept = share.ledgers.unwrap().lock().unwrap().len();
+                    assert_eq!(kept, if undecided { 2 } else { 0 }, "{case}");
+                    boundary(Some(decided));
+                }
+                "owner_file_changed" => {
+                    fixture.append(SESSION, &token_line(81));
+                    carried_share(&|share| assert!(!share.content_unchanged(), "holds"));
+                    return;
+                }
+                "roster_file_changed" => {
+                    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+                        roots,
+                        &BTreeSet::from([
+                            job_path.to_string_lossy().into_owned(),
+                            fixture.file(SESSION_B).to_string_lossy().into_owned(),
+                        ]),
+                    );
+                    fixture.append(SESSION_B, &token_line(2));
+                    assert!(!whole.content_unchanged(), "the whole roster would hold");
+                    carried_share(&|share| assert!(share.content_unchanged(), "no hold"));
+                    return;
+                }
+                _ => {}
+            }
+            let mut published = None;
+            for _ in 0..64 {
+                let (next, _) = continuation_page_in(
+                    &fixture.root,
+                    index,
+                    &cache,
+                    "cursor-fixture",
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    Some(secs(600)),
+                    |_| {},
+                );
+                index = next;
+                if parked_eof(&cache) {
+                    published = Some(page(&fixture, index, Some(Arc::clone(&cache))));
+                    break;
+                }
+            }
+            let (index, mut published) =
+                published.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
+            published.snapshots.extend(first.snapshots);
+            let index = settled(index, &cache, &mut published);
+            assert_eq!(
+                counter(&cache, |c| c.jobs_invalidated),
+                0,
+                "{case}: no restart"
+            );
+            let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold);
+            let continued = scan_money(SnapshotSource::Codex, &index, &published);
+            money_oracle::assert_equivalent(&cold, &continued);
+            if case != "spawned" {
+                let evidence = |route: &RouteResult, session: &str| {
+                    route.snapshots[session]["session_account_evidence"].clone()
+                };
+                let (a, b) = (evidence(&cold, SESSION), evidence(&cold, SESSION_B));
+                assert!(a.is_object() && b.is_object(), "{case}: placement evidence");
+                assert_ne!(a, b, "{case}: two accounts");
+                let mut wrong = continued.clone();
+                wrong.snapshots.get_mut(SESSION).unwrap()["session_account_evidence"] = b;
+                wrong.snapshots.get_mut(SESSION_B).unwrap()["session_account_evidence"] = a;
+                assert!(
+                    std::panic::catch_unwind(|| {
+                        money_oracle::assert_placement_equivalent(&cold, &wrong)
+                    })
+                    .is_err(),
+                    "{case}: the comparator sees swapped accounts"
+                );
+            }
+        });
+    }
 }

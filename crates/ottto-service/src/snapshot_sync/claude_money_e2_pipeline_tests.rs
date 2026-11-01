@@ -239,11 +239,10 @@ impl Page {
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred);
-        crate::snapshots::apply_upload_policy_with_item_limit(
+        crate::snapshots::apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
             SnapshotUploadPolicy::default(),
-            wire_budget.max_item_bytes,
         );
         let backfill = crate::backfill::load_backfill_state(&corpus.support);
         apply_backfill_cutoff_with_claude_corrections(

@@ -509,8 +509,8 @@ pub(crate) struct Grouping {
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
     /// Bucket rows sent with `copy_invalidated`,
-    /// by bucket start. Empty unless the copy-prefix switch is on and the
-    /// receiver advertised option (ii) retention.
+    /// by bucket start. Empty unless the receiver advertised option (ii)
+    /// retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
@@ -1750,7 +1750,7 @@ pub(crate) struct CopyInvalidation {
 
 /// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
-/// markers lent to that very row's requests (ones the copy-prefix switch
+/// markers lent to that very row's requests (ones copy-prefix dedupe
 /// re-derived without them) is copy-derived: it is treated as never accepted
 /// (fresh own tags or untagged, never a refusal or marker). Other changed
 /// rows keep #909's refusal, and rows their own evidence still proves are
@@ -2350,9 +2350,9 @@ fn set_row(
 }
 
 /// Money identity outranks display data (#909 P0): an over-cap tagged body
-/// first sheds context-curve points, then cache observations from the end of
-/// the patch, and only then may the selector strip tags. Returns the pre-shed component bytes
-/// (counts only) and the bytes after shedding.
+/// first sheds cache observations from the end of the patch, and only then
+/// may the selector strip tags. Returns the pre-shed component bytes (counts
+/// only) and the bytes after shedding.
 fn shed_display_leaves(
     item: &mut SnapshotItem,
     grouping: &Grouping,
@@ -2370,13 +2370,6 @@ fn shed_display_leaves(
     let rest = grouping.item_bytes(&probe);
     drop(probe);
     let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= max_item_bytes;
-    if without_curve > max_item_bytes {
-        // No curve can fit: go straight to the unavailable curve without
-        // measuring the whole body once per pruned point.
-        super::fit_context_curve(item, |_| false);
-    } else {
-        super::fit_context_curve(item, fits);
-    }
     while !fits(item) {
         let Some(cache) = item.cache_observations.as_mut() else {
             break;
@@ -2675,6 +2668,8 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
     if item.activity_summary.is_some() {
         component_hashes.insert("activity_summary", hash.clone());
     }
+    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash, forced_full_rescan) =
+        item.cache_handshake();
     let mut envelope = super::SnapshotSemanticEnvelope {
         component_contract_version: super::SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
         revision_contract_version: super::SNAPSHOT_REVISION_CONTRACT_VERSION,
@@ -2688,20 +2683,10 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
         revision_v2_hash: hash.clone(),
         content_hash: hash,
         hash_epoch: super::SNAPSHOT_CONTENT_HASH_EPOCH,
-        base_head_etag: item
-            .cache_conflict_answer
-            .is_none()
-            .then(|| item.cache_base_head_etag.clone())
-            .flatten(),
-        conflict_head_challenge: item
-            .cache_conflict_answer
-            .as_ref()
-            .map(|(challenge, _)| challenge.clone()),
-        rescan_from_revision_hash: item
-            .cache_conflict_answer
-            .as_ref()
-            .map(|(_, revision)| revision.clone()),
-        forced_full_rescan: item.cache_conflict_answer.is_some(),
+        base_head_etag,
+        conflict_head_challenge,
+        rescan_from_revision_hash,
+        forced_full_rescan,
     };
     if envelope.base_head_etag.is_none()
         && envelope.conflict_head_challenge.is_none()

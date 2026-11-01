@@ -77,22 +77,25 @@ impl Budget {
             index.context_read_counts.transport_reservation_refused = true;
             return false;
         }
-        // Oversized Codex singletons keep their existing resumable cursor;
-        // each page pays only its bounded chunk. Claude legal files fit 1GiB.
-        let available = self
-            .native_limit
-            .saturating_sub(self.native_read)
-            .saturating_sub(self.native_reserved);
+        // Oversized Codex singletons keep their resumable cursor: each page's
+        // chunk is bounded by the cursor's own page allowance, never by this
+        // room, on its start and resume pages alike (`PageBudget`, B_s = B).
+        // Claude legal files fit 1GiB.
         let size = candidates.iter().fold(0u64, |sum, candidate| {
             sum.saturating_add(candidate.size_bytes)
         });
-        let cursor = source == SnapshotSource::Codex
-            && size > sampled_scan::codex_cursor::Limits::current().singleton();
-        let read = if cursor { size.min(available) } else { size };
-        if read == 0 || read > available {
-            return false;
+        if source != SnapshotSource::Codex
+            || size <= sampled_scan::codex_cursor::Limits::current().singleton()
+        {
+            let available = self
+                .native_limit
+                .saturating_sub(self.native_read)
+                .saturating_sub(self.native_reserved);
+            if size == 0 || size > available {
+                return false;
+            }
+            self.native_reserved = self.native_reserved.saturating_add(size);
         }
-        self.native_reserved = self.native_reserved.saturating_add(read);
         for candidate in candidates {
             let key = local_index_key(&candidate.path);
             if self.admitted.insert(key.clone()) {
@@ -146,7 +149,15 @@ impl Budget {
             }
         }
     }
-    pub(super) fn record(&mut self, index: &mut ScanIndex, candidate: &CandidateFile, bytes: u64) {
+    /// A cursor job's bytes are bounded by its own cursor allowance and never
+    /// charge this page's room.
+    pub(super) fn record(
+        &mut self,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+        cursor: bool,
+        bytes: u64,
+    ) {
         if bytes == 0 || !index.file_upload_context_enabled {
             return;
         }
@@ -160,15 +171,20 @@ impl Budget {
                 }
             });
         }
-        if self.admitted.contains(&key) {
+        let admitted = self.admitted.contains(&key);
+        if admitted {
             if first {
                 index.context_read_counts.files += 1;
             }
             index.context_read_counts.local_bytes =
                 index.context_read_counts.local_bytes.saturating_add(bytes);
-            self.native_reserved = self.native_reserved.saturating_sub(bytes);
         }
-        self.native_read = self.native_read.saturating_add(bytes);
+        if !cursor {
+            if admitted {
+                self.native_reserved = self.native_reserved.saturating_sub(bytes);
+            }
+            self.native_read = self.native_read.saturating_add(bytes);
+        }
     }
     pub(super) fn charge_cursor_ordinary(
         &mut self,

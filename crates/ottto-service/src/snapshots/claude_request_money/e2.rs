@@ -3890,7 +3890,7 @@ fn record_decided(held: bool, counts: Counts) {
     }
 }
 
-/// Copy-prefix switch on: the identity row of each request a copied marker
+/// The identity row of each request a copied marker
 /// had lent an account to, as `visit_identity_rows` builds rows:
 /// (bucket start, row, lent account).
 pub(crate) fn copied_marker_lent_rows(

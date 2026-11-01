@@ -179,12 +179,7 @@ pub(super) fn merge_cas_at(
         .map(|(_, key, ..)| key.to_owned())
         .collect();
     let roots = super::super::lenient_decode::cas_hold_roots(&custody);
-    kinds_accounts::hydrate_filtered(
-        tx,
-        &mut custody,
-        &mut KindCx::default(),
-        Some((&roots, false)),
-    )?;
+    kinds_accounts::hydrate_filtered(tx, &mut custody, &mut KindCx::default(), Some(&roots))?;
     kinds_census::hydrate_cas_families(tx, &mut custody, &roots)?;
     super::super::lenient_decode::post_decode_hydrated(&mut custody, "cas", "claude_code")?;
 
@@ -215,12 +210,7 @@ pub(super) fn merge_cas_at(
             }
             let one = BTreeSet::from([root]);
             let mut family = ScanIndex::default();
-            kinds_accounts::hydrate_filtered(
-                tx,
-                &mut family,
-                &mut KindCx::default(),
-                Some((&one, true)),
-            )?;
+            kinds_accounts::hydrate_filtered(tx, &mut family, &mut KindCx::default(), Some(&one))?;
             super::super::lenient_decode::post_decode_hydrated(&mut family, "cas", "claude_code")?;
             super::super::lenient_decode::add_cas_provenance(&mut custody, &family);
         }

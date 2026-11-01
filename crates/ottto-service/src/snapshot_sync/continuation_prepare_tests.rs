@@ -148,12 +148,12 @@ impl ContinuationFixture {
             activity_hint: continuation_hint(true),
             receipt_window_days: 30,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
                 codex_home_bindings: vec![],
-            }),
+            })),
             attribution_context: attribution.then(|| {
                 SessionAttributionContext::from_activity_hint(
                     SnapshotSource::Codex,
@@ -176,7 +176,6 @@ impl ContinuationFixture {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "ordinary".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
@@ -248,20 +247,53 @@ pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
     ContinuationFixture::quiescent("continuation-mint-finish").preparation(true)
 }
 
+/// An ordinary preparation at a real machine's size: its status collection
+/// alone exceeds a ticket's walk, with five scan homes and 120 schedules.
+pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation {
+    let fixture = ContinuationFixture::quiescent("continuation-mint-realistic");
+    for n in 0..120 {
+        let schedule = fixture.home.join(format!(".codex/automations/schedule-{n}"));
+        std::fs::create_dir_all(&schedule).unwrap();
+        std::fs::write(
+            schedule.join("automation.toml"),
+            format!(
+                "id = \"schedule-{n}\"\nname = \"Synthetic\"\n\
+                 prompt = \"Inspect the landing queue and report safe results {n}.\"\n\
+                 rrule = \"FREQ=HOURLY\"\nstatus = \"ACTIVE\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let mut preparation = fixture.preparation(true);
+    let status = test_agent_status(SourceKind::Codex);
+    preparation.scan_agent_status_collection = Some(std::sync::Arc::new(AgentStatusCollection {
+        snapshots: vec![status.clone(); 1_000],
+        source_health_snapshot: status,
+        codex_scan_homes: (0..5)
+            .map(|n| fixture.home.join(format!("scan-home-{n}")))
+            .collect(),
+        codex_home_bindings: vec![],
+    }));
+    preparation
+}
+
 /// K2: cached inputs for the continuation tests, with a drop sentinel (the
-/// status collection's `Arc`, whose count falls back to one when the inputs,
-/// and the context with them, are dropped).
+/// prelude feed's `Arc`, whose count falls back to one when the inputs, and
+/// the context with them, are dropped).
 pub(super) fn continuation_inputs_for_test(
     attribution: bool,
-) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
+) -> (
+    ContinuationInputs,
+    std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
+    let sentinel = std::sync::Arc::default();
     let inputs = take_continuation_inputs(
         &mut preparation,
-        &std::sync::Arc::default(),
+        &sentinel,
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
-    let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
 }
@@ -275,9 +307,10 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
+    let sentinel = std::sync::Arc::default();
     let inputs = take_continuation_inputs(
         &mut preparation,
-        &std::sync::Arc::default(),
+        &sentinel,
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
     assert!(
@@ -289,11 +322,10 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         inputs.activity_hint.session_attribution_hmac_key.is_none(),
         "the cached hint holds no raw key"
     );
-    let sentinel = &preparation.scan_agent_status_collection;
-    assert_eq!(std::sync::Arc::strong_count(sentinel), 2);
+    assert_eq!(std::sync::Arc::strong_count(&sentinel), 2);
     drop(inputs);
     assert_eq!(
-        std::sync::Arc::strong_count(sentinel),
+        std::sync::Arc::strong_count(&sentinel),
         1,
         "dropped, with its context"
     );
@@ -328,10 +360,16 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         prepared.cache_observations_enabled,
         minted.cache_observations_enabled
     );
-    assert!(std::sync::Arc::ptr_eq(
-        &prepared.scan_agent_status_collection,
-        &minted.scan_agent_status_collection
-    ));
+    // A continuation page never finishes: its scan roots came from the homes.
+    assert!(prepared.scan_agent_status_collection.is_none());
+    assert_eq!(
+        inputs.codex_scan_homes,
+        minted
+            .scan_agent_status_collection
+            .as_ref()
+            .unwrap()
+            .codex_scan_homes
+    );
     assert_eq!(prepared.upload_policy, minted.upload_policy);
     assert_eq!(
         prepared.upload_destination_namespace,
@@ -385,7 +423,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         &mut progress,
     );
     let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
-    assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
         &mut progress,

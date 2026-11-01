@@ -31,6 +31,10 @@ impl Fixture {
                 json!({"type":"session_meta","payload":{"id":SESSION}}),
                 json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12,"output_tokens":4}}}}),
             ],
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":SESSION,"timestamp":"2026-10-29T10:00:00Z"}),
+                json!({"type":"message_end","message":{"responseId":"synthetic-response","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":12,"output":4}}}),
+            ],
             _ => vec![
                 json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:00:01Z","requestId":"synthetic-request","message":{"id":"synthetic-message","model":"claude-sonnet-4-6","usage":{"input_tokens":12,"output_tokens":4}}}),
             ],
@@ -658,6 +662,104 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     }
 }
 
+/// [behaviour] Pi writes the shared per-file receipt from its exact ACK under
+/// the active context, while its read and resend decisions stay main's.
+#[test]
+fn pi_exact_ack_writes_the_shared_file_receipt() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone().unwrap();
+    assert_eq!(receipt.context_fingerprint, "d".repeat(64));
+    assert_eq!(receipt.source_witness, f.entry().source_file_fingerprint);
+    assert_eq!(
+        f.entry().last_upload_body_witness.as_ref(),
+        Some(&receipt.body_witness)
+    );
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0), "no context resend");
+    // Write-only: Pi still follows the source-wide context gate.
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [behaviour] A confirmed-empty file gets a local proof of its context and
+/// source witness, which is never ACK evidence and changes no selection.
+#[test]
+fn empty_file_proof_is_local_and_never_ack_evidence() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let base = "b".repeat(64);
+    let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    f.index
+        .activate_file_upload_context(f.source, local_on.clone());
+    fs::write(&f.path, "").unwrap();
+    assert_eq!(f.walk(true).0.scanned_file_count, 1);
+    assert!(f.index.confirmed_empty_files.contains(&f.key()));
+    let proof = f.entry().upload_context_receipt.clone().unwrap();
+    assert!(proof.body_witness.is_empty());
+    assert_eq!(proof.context_fingerprint, local_on);
+    assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index
+        .set_copy_prefix_base_upload_context(Some(base.clone()));
+    assert_eq!(f.index.copy_prefix_base_upload_context, Some(base));
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [format] An old decoder drops the per-entity stamp. Missing means owed, and
+/// the file receipt beside it is untouched.
+#[test]
+fn entity_stamp_dropped_by_old_decoder_is_owed() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let entity = "b".repeat(64);
+    f.index
+        .codex_state_only_snapshot_fingerprints
+        .insert("state-only".into(), entity.clone());
+    f.index.stamp_entity_upload_context_acks(
+        &"a".repeat(64),
+        &BTreeMap::from([(entity.clone(), "c".repeat(64))]),
+        &BTreeMap::from([(entity.clone(), "d".repeat(64))]),
+    );
+    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 0);
+    let saved_path = f._scratch.join("entity-stamp-index.json");
+    f.index.save(&saved_path).unwrap();
+    let mut encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+    assert!(encoded["upload_context_proof"]["entity_stamps"]
+        .get(&entity)
+        .is_some());
+    encoded
+        .as_object_mut()
+        .unwrap()
+        .remove("upload_context_proof");
+    fs::write(&saved_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+    f.index = ScanIndex::load(&saved_path).unwrap();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 1);
+    assert!(f.entry().upload_context_receipt.is_some());
+}
+
+/// [behaviour] Local pacing debt is labelled apart from backend conflicts. It
+/// keeps today's Deferred outcome until receipts are authoritative.
+#[test]
+fn local_budget_deferral_is_labelled_apart_from_server_conflicts() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let (scan, _) = f.walk(true);
+    assert!(!scan.snapshots.is_empty());
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(
+        f.uploader.deferral_counts(),
+        (scan.snapshots.len() as u64, 0)
+    );
+}
+
 fn legacy_round_trip(version: &str) {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
@@ -792,7 +894,7 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
 fn upload_context_legacy_activation_preserves_identical_body_noop() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
-    // The legacy/Pi activation path does not enable file receipts.
+    // The legacy/Pi activation path does not decide from file receipts.
     f.index.file_upload_context_enabled = false;
     f.index.activate_upload_context("e".repeat(64));
     let (scan, _) = f.walk(true);
@@ -1441,6 +1543,153 @@ fn real_scan_reads_forty_small_context_files_in_one_page() {
         .unwrap();
     assert_eq!(files, 40, "every file earns its receipt in the same pass");
     assert_eq!(receipted(&f.index, &"e".repeat(64)), 40);
+}
+
+/// [regress] cursor resume zeroes context-read room (census drain,
+/// 2026-11-01: 63 of 95 pages resumed a cursor job, at least 48 of them a
+/// context-only one; ~4.6k context-only members drained at ~3.5/h). A
+/// resumed cursor job, new or context-only, is bounded by its own
+/// allowance; the same page still reads context-only members, and each
+/// earns its receipt and leaves the queue.
+#[test]
+fn cursor_resume_leaves_context_read_room_for_census_members() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let limit = 4096;
+    for large_context_only in [false, true] {
+        sampled_scan::codex_cursor::with_test_limits(limit, limit, 64, || {
+            let mut f = Fixture::new(source);
+            let template = fs::read_to_string(&f.path).unwrap();
+            let mut members = vec![f.path.clone()];
+            for n in 1..4 {
+                let session = format!("019fa111-2222-7333-8444-{n:012}");
+                let path = f
+                    .root
+                    .join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+                fs::write(&path, template.replace(SESSION, &session)).unwrap();
+                members.push(path);
+            }
+            // A file larger than both allowances: new, or already read and
+            // receipted under "d" (context-only after the switch to "e").
+            let large_session = "019fa111-2222-7333-8444-999999999999";
+            let large = f
+                .root
+                .join(format!("rollout-2026-10-29T10-00-00-{large_session}.jsonl"));
+            let mut body = format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":large_session}})
+            );
+            for n in 1..=160u64 {
+                body.push_str(&format!(
+                    "{}\n",
+                    json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12 * n,"output_tokens":4 * n}}}})
+                ));
+            }
+            if large_context_only {
+                fs::write(&large, &body).unwrap();
+            }
+            let receipted = |index: &ScanIndex, paths: &[PathBuf], context: &str| {
+                paths
+                    .iter()
+                    .filter(|path| {
+                        index
+                            .files
+                            .get(&local_index_key(path))
+                            .and_then(|entry| entry.upload_context_receipt.as_ref())
+                            .is_some_and(|receipt| receipt.context_fingerprint == context)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let mut first = members.clone();
+            if large_context_only {
+                first.push(large.clone());
+            }
+            for _ in 0..32 {
+                let previous = f.index.clone();
+                let (scan, _) = f.walk_with_file_limit(true, 64, false);
+                f.uploader.activate(source, "d".repeat(64), &mut f.index);
+                f.uploader
+                    .send(source, &mut f.index, &previous, &scan.snapshots)
+                    .unwrap();
+                if receipted(&f.index, &first, &"d".repeat(64)).len() == first.len() {
+                    break;
+                }
+            }
+            assert_eq!(receipted(&f.index, &first, &"d".repeat(64)), first);
+            assert_eq!(f.cache.cursor_job_key(), None);
+            if !large_context_only {
+                fs::write(&large, &body).unwrap();
+            }
+            assert!(fs::metadata(&large).unwrap().len() > 3 * limit);
+            // Under "e" the members (and a receipted large file) are
+            // unchanged context-only reads; none keeps a retained copy.
+            f.index.activate_file_upload_context(source, "e".repeat(64));
+            for path in members.iter().chain([&large]) {
+                let _ = f.cache.take(&local_index_key(path));
+            }
+            ensure_bounded_traversal(
+                source,
+                std::slice::from_ref(&f.root),
+                &mut f.index,
+                "2026-10-29T12:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+            );
+            advance_bounded_directory_traversal(source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
+            f.index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .make_contiguous()
+                .sort_by_key(|pending| pending.path != large);
+            // A one-file page starts the large file's cursor job; it pauses.
+            f.walk_with_file_limit(true, 1, false);
+            assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+            // One ordinary page resumes it.
+            let previous = f.index.clone();
+            crate::snapshots::begin_continuation_read_ranges_for_test();
+            let ((scan, _), per_file) = terminal_contract_retry::source_acquisitions(|| {
+                f.walk_with_file_limit(true, 64, false)
+            });
+            let ranges = crate::snapshots::take_continuation_read_ranges_for_test();
+            let member_max = members
+                .iter()
+                .map(|path| fs::metadata(path).unwrap().len())
+                .max()
+                .unwrap();
+            assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+            assert!(
+                ranges.iter().any(|range| range.start > member_max),
+                "the paused job advanced past its first chunk"
+            );
+            let read = members
+                .iter()
+                .filter(|path| per_file.contains_key(*path))
+                .count();
+            assert!(
+                read >= 1,
+                "the resume page reads context-only members (large_context_only={large_context_only})"
+            );
+            assert_eq!(
+                f.index.context_read_counts.files,
+                (read + usize::from(large_context_only)) as u64,
+                "admitted context-only reads: the members, and a context-only job"
+            );
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            let earned = receipted(&f.index, &members, &"e".repeat(64));
+            assert_eq!(earned.len(), read, "each read earns its receipt");
+            let pending = &f.index.traversal.as_ref().unwrap().pending_candidates;
+            assert!(earned
+                .iter()
+                .all(|path| pending.iter().all(|queued| queued.path != *path)));
+        });
+    }
 }
 
 /// Cold acquisition on every page makes repeated Full reads observable. Each
