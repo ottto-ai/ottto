@@ -878,6 +878,7 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
     }
 }
 
+/// [behaviour] Held and uncertified twins preserve their bodies and counted cause.
 #[test]
 fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     let first = root_file("withheld-a");
@@ -899,36 +900,63 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     };
     // Held (absent twin, uncertified, ...): both paths stay, untouched, and
     // the session is returned so the caller holds it (owed, not settled).
-    let mut items = page();
-    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
-    let before = canonical(&items);
-    let mut reasons = BTreeMap::new();
-    let withheld = finish_page(
-        &mut items,
-        &index,
-        TelemetryRead::Loaded,
-        &mut reasons,
-        &Default::default(),
-    );
-    assert_eq!(reasons, BTreeMap::from([("request_owned_held", 1)]));
-    assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
-    assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
-    assert_eq!(canonical(&items), before);
-    assert!(items
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    // Repeated always-on preparation still holds the exact same bytes.
-    assert_eq!(
-        finish_page(
+    for uncertified in [false, true] {
+        let mut items = page();
+        let mut expected = BTreeMap::new();
+        if uncertified {
+            let occurrence = items[0]
+                .claude_usage_occurrences
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let fold = items[0].claude_money.as_deref_mut().unwrap();
+            let missing = std::sync::Arc::new(claude_request_identity::AuthorityKey {
+                login: Some("missing".into()),
+                org: None,
+                basis: claude_request_identity::TELEMETRY_LOGIN,
+                account_source: None,
+            });
+            place_request_identity(fold, &occurrence, None, Some(missing), None);
+            assert_eq!(
+                fold.entity.certificate_failure,
+                Some(CertificateFailure::IdentityGrain)
+            );
+            expected.insert("uncertified", 1);
+            expected.insert("uncertified_by=identity_grain", 1);
+        } else {
+            items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
+            expected.insert("request_owned_held", 1);
+        }
+        let before = canonical(&items);
+        let mut reasons = BTreeMap::new();
+        let withheld = finish_page(
             &mut items,
             &index,
             TelemetryRead::Loaded,
-            &mut Default::default(),
+            &mut reasons,
             &Default::default(),
-        ),
-        BTreeSet::from([ROOT.to_owned()])
-    );
-    assert_eq!(canonical(&items), before);
+        );
+        assert_eq!(reasons, expected);
+        assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
+        assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
+        assert_eq!(canonical(&items), before);
+        assert!(items
+            .iter()
+            .all(|item| item.usage_accounting_contract.is_none()));
+        // Repeated always-on preparation still holds the exact same bytes.
+        assert_eq!(
+            finish_page(
+                &mut items,
+                &index,
+                TelemetryRead::Loaded,
+                &mut Default::default(),
+                &Default::default(),
+            ),
+            BTreeSet::from([ROOT.to_owned()])
+        );
+        assert_eq!(canonical(&items), before);
+    }
     // Not held: one summed body, nothing withheld.
     let mut items = page();
     let withheld = finish_page(

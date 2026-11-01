@@ -1069,6 +1069,15 @@ fn handle_command(
             status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
+            // Doctor only: ordinary status polls must not walk the store.
+            #[cfg(unix)]
+            if retry_relay_authorization {
+                if let Ok((files, bytes)) =
+                    crate::claude_local_otel::support_health::store_size(&default_support_dir())
+                {
+                    value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
+            }
             Ok(value)
         }
         LocalControlCommand::Receipts {
@@ -17740,7 +17749,7 @@ mod tests {
                 r#"#!/usr/bin/python3
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open({runs:?}, "a") as runs:
     runs.write("run\n")
@@ -17994,7 +18003,7 @@ if args == ["login"]:
     os.rename(path + ".tmp", path)
     sys.stderr.write("Successfully logged in\n")
     sys.exit(0)
-if args != ["app-server", "--stdio"]:
+if args[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open(os.path.join(BIN, "app-server-runs"), "a") as f:
     f.write("run\n")

@@ -393,7 +393,7 @@ impl ReofferPipeline {
             .prepare_cycle(now)
             .unwrap()
             .expect("real due preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         assert_eq!(
             scan.census_complete, complete,
             "synthetic census is complete unless authority debt withholds it"

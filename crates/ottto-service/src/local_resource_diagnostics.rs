@@ -1090,6 +1090,39 @@ pub(crate) fn source_finish<T>(
     });
     result
 }
+/// Named footprint window inside a source stage. One record with empty counts
+/// when dropped normally; unwinding emits nothing, like `source_finish`.
+pub(crate) struct StageWindow {
+    stage: &'static str,
+    source: Source,
+    probe: Probe,
+    footprint: Option<footprint::Stage>,
+}
+impl StageWindow {
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            probe: Probe::start(),
+            footprint: footprint::Stage::begin(),
+        }
+    }
+}
+impl Drop for StageWindow {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: self.stage,
+            source: self.source,
+            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            counts: EmptyCounts {},
+        });
+    }
+}
 /// Point outcome at an existing Codex authority boundary. Two fixed records at
 /// most per completed page, using the existing best-effort stderr carrier.
 /// This is not a completion heartbeat, resource window or ingestion verdict.

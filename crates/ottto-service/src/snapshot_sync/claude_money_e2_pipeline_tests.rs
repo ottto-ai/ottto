@@ -2928,6 +2928,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     }
 }
 
+pub(in crate::snapshot_sync) mod reject_isolation_tests {
+    include!("reject_isolation_tests.rs");
+}
+
 // V2-only fixtures must not enter the cross-build harness transplanted to v1.
 mod state_v2_money_tests {
     include!("state_v2_money_tests.rs");
