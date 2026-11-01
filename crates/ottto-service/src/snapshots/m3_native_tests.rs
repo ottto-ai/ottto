@@ -1,4 +1,4 @@
-//! M3 r6 D3 source split, native side: the Codex strict retained-entry
+//! Write-fault source split, native side: the Codex strict retained-entry
 //! rebind and the held Claude key's discovery, on the real index and
 //! traversal code paths. No store, cache or upload is involved.
 use super::*;
@@ -22,7 +22,7 @@ fn entry(fingerprint: &str, size_bytes: u64) -> ScanIndexEntry {
     .unwrap()
 }
 
-/// A committed index holding one accepted entry with staged #865 debt and
+/// A committed index holding one accepted entry with staged audit debt and
 /// its upload membership.
 fn committed(key: &str) -> ScanIndex {
     let mut index = ScanIndex::default();
@@ -63,7 +63,7 @@ fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
     let (before, after) = (&previous.files[CODEX_KEY], &working.files[CODEX_KEY]);
     assert!(after.source_file_fingerprint.is_empty());
     // Not deleted, not absent, not retired: every other fact is unchanged,
-    // including the #865 marker and deadline and the accepted body witness.
+    // including the audit marker and deadline and the accepted body witness.
     assert_eq!(without_fingerprint(after), without_fingerprint(before));
     assert_eq!(after.unverified_deadline(), Some(DUE));
     assert_eq!(
@@ -175,7 +175,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
     // held completion recorded nothing), so the read bytes past it keep
     // the key a candidate regardless of age, every pass and after restart.
     assert!(discover(&BTreeMap::from([(key.clone(), entry("fp", 16))])));
-    // Its #865 marker alone also keeps it, at the accepted length.
+    // Its audit marker alone also keeps it, at the accepted length.
     let mut marked = committed(&key);
     marked.files.get_mut(&key).unwrap().size_bytes = 64;
     assert!(discover(&marked.files));
@@ -235,7 +235,6 @@ fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
         None,
         None,
         None,
-        false,
         false,
     )
     .unwrap();

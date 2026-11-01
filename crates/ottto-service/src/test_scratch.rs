@@ -61,6 +61,15 @@ pub(crate) fn private_dir(prefix: &str) -> PathBuf {
     panic!("no unique scratch directory name after 16 attempts");
 }
 
+/// [`private_dir`] with symlinks resolved. On macOS `$TMPDIR` sits under the
+/// `/var -> /private/var` symlink, and state v2 refuses a store or original
+/// whose ancestors include a symlink, so tests that open one need this path.
+pub(crate) fn canonical_private_dir(prefix: &str) -> PathBuf {
+    private_dir(prefix)
+        .canonicalize()
+        .expect("canonical scratch directory")
+}
+
 /// Owner-only scratch directory that is removed when it goes out of scope,
 /// including while a failing test unwinds, so a panicking test cannot leave
 /// anything behind for a later run.
@@ -72,6 +81,13 @@ impl ScratchDir {
     pub(crate) fn new(prefix: &str) -> Self {
         Self {
             path: private_dir(prefix),
+        }
+    }
+
+    /// Like [`ScratchDir::new`], rooted at a [`canonical_private_dir`].
+    pub(crate) fn canonical(prefix: &str) -> Self {
+        Self {
+            path: canonical_private_dir(prefix),
         }
     }
 }

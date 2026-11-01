@@ -258,15 +258,6 @@ impl TerminalTraversal {
             .take()
             .map(|traversal| Box::new(Self { traversal }))
     }
-
-    #[cfg(test)]
-    pub(super) fn context_pointer_for_test(&self) -> usize {
-        self.traversal.context_fingerprint.as_ptr() as usize
-    }
-    #[cfg(test)]
-    pub(super) fn contains_observed_for_test(&self, key: &str) -> bool {
-        self.traversal.observed_index_keys.contains(key)
-    }
 }
 crate::heap_layout_bound::fields!(TerminalTraversal; traversal);
 crate::heap_layout_bound::fields!(NativeCensusCompletion; census_window_end);

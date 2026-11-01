@@ -72,6 +72,9 @@ pub(crate) const MAX_BATCH: usize = 32;
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 const RECORD_SUFFIX: &str = ".rec";
 const TEMP_SUFFIX: &str = ".tmp";
+/// Digest payload allowance, independent of the verification memo's key count.
+/// The four-byte PL01/PL?? header is additional to this byte bound.
+const PRIVATE_LABEL_INVENTORY_BYTES: usize = 2 * 1024 * 1024;
 
 /// The fixed envelope size before the body (see `encode`).
 pub(crate) const HEADER_BYTES: usize = 8 // magic
@@ -644,6 +647,8 @@ pub(crate) struct StoreCounters {
     pub(crate) gc_records_deleted: u64,
     /// Verified PL records absent from the committed index, unlinked and dir-synced.
     pub(crate) rec_orphans_erased: u64,
+    /// PL digests beyond the byte allowance; UNKNOWN remains, without an erase failure.
+    pub(crate) private_label_inventory_overflow: u64,
     pub(crate) native_class_retired: u64,
     pub(crate) native_class_parked: u64,
     pub(crate) restore_unavailable_layout_gc: u64,
@@ -717,6 +722,8 @@ pub(crate) struct DurableTailStore {
     private_purge_entries: Option<fs::ReadDir>,
     private_purge_page: Option<PrivateLabelPage>,
     private_purge_dirty: bool,
+    private_purge_overflow: bool,
+    private_purge_after: Option<Digest32>,
     private_purge_kept: BTreeSet<Digest32>,
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
@@ -793,6 +800,8 @@ impl DurableTailStore {
             private_purge_entries: None,
             private_purge_page: None,
             private_purge_dirty: false,
+            private_purge_overflow: false,
+            private_purge_after: None,
             private_purge_kept: BTreeSet::new(),
             pending: BTreeMap::new(),
             resource_pause: None,
@@ -1847,9 +1856,9 @@ impl DurableTailStore {
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        // Native staging and this post-save batch share the pass allowance.
-        // A declined native record must not bypass it through its RAM offer.
-        let mut attempted = self.stream_records + receipt.completed.len();
+        // Only this batch consumes its bounded receipt/ack capacity. Settled
+        // native writes share the byte allowance, not the custody count.
+        let mut attempted = receipt.completed.len();
         let mut encoded_pass_bytes = self.stream_bytes;
         for (record, content, prior, verified_prior) in dirty {
             if attempted >= MAX_BATCH {
@@ -1893,6 +1902,9 @@ impl DurableTailStore {
             {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(key);
+                // This key is fully accounted for by deferred_keys. The
+                // receipt's refusal field gates retirement of written siblings.
+                self.counters.budget_refused += 1;
                 continue;
             }
             let ack_bytes = if self.source == DurableSource::ClaudeCode {
@@ -2165,7 +2177,7 @@ impl DurableTailStore {
                     };
                     // Class exclusion is an explicit owner decision, not restore
                     // or overwrite authority. Retire only a verified native v3
-                    // record, after its #865 debt is carried by the index.
+                    // record, after its audit debt is carried by the index.
                     if header.audit_debt.is_some_and(|due| {
                         !audit_debt.is_some_and(|carrier| carrier > 0 && carrier <= due)
                     }) {
@@ -2303,11 +2315,11 @@ impl DurableTailStore {
         }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
-            .take((4 + 32 * MAX_RECORDS + 1) as u64)
+            .take((4 + PRIVATE_LABEL_INVENTORY_BYTES + 1) as u64)
             .read_to_end(&mut bytes)?;
         if !bytes.starts_with(b"PL01")
             || (bytes.len() - 4) % 32 != 0
-            || bytes.len() > 4 + 32 * MAX_RECORDS
+            || bytes.len() > 4 + PRIVATE_LABEL_INVENTORY_BYTES
         {
             return Ok(None);
         }
@@ -2374,7 +2386,10 @@ impl DurableTailStore {
         self.check_writer(writer)?;
         ensure_private_dir(&self.dir)?;
         let mut bytes = b"PL??".to_vec();
-        if let Some(keys) = keys.filter(|keys| keys.len() <= MAX_RECORDS) {
+        if keys.is_some_and(|keys| keys.len() > PRIVATE_LABEL_INVENTORY_BYTES / 32) {
+            self.counters.private_label_inventory_overflow += 1;
+        }
+        if let Some(keys) = keys.filter(|keys| keys.len() <= PRIVATE_LABEL_INVENTORY_BYTES / 32) {
             bytes = b"PL01".to_vec();
             for key in keys {
                 bytes.extend_from_slice(key);
@@ -2398,13 +2413,21 @@ impl DurableTailStore {
         writer: &W,
         key: Digest32,
     ) -> io::Result<()> {
+        self.check_writer(writer)?;
+        let mut keys = self.private_label_keys().unwrap_or(None);
+        // A key already in the known positive inventory changes nothing: no
+        // rewrite, no sync, and the erase cursor keeps its place.
+        if keys.as_ref().is_some_and(|keys| keys.contains(&key)) {
+            return Ok(());
+        }
         // A newly staged literal invalidates a prior partial no-label sweep,
         // including a new canonical key ordered before its old cursor.
         self.private_purge_entries = None;
         self.private_purge_page = None;
         self.private_purge_dirty = false;
+        self.private_purge_overflow = false;
+        self.private_purge_after = None;
         self.private_purge_kept.clear();
-        let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
             keys.insert(key);
         }
@@ -2422,8 +2445,25 @@ impl DurableTailStore {
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
         let known = self.private_label_keys().unwrap_or(None);
-        let keys = self.private_label_candidates()?;
-        let mut remaining = BTreeSet::new();
+        let mut keys = self.private_label_candidates()?;
+        let mut remaining = known.clone().unwrap_or_default();
+        if known.is_some() {
+            // The byte-sized positive inventory may span many erase passes.
+            // Preserve unprocessed positives and rotate past failures so a
+            // blocked early key cannot starve later keys of their erase turn.
+            keys.retain(|key| !keep.contains(key));
+            let mut page = keys
+                .iter()
+                .filter(|key| self.private_purge_after.map_or(true, |after| **key > after))
+                .take(GC_RECORDS_PER_PASS)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if page.is_empty() {
+                page.extend(keys.iter().take(GC_RECORDS_PER_PASS).copied());
+            }
+            self.private_purge_after = page.last().copied();
+            keys = page;
+        }
         let mut report = PrivateLabelPurge {
             visited: self
                 .private_purge_page
@@ -2439,8 +2479,26 @@ impl DurableTailStore {
         };
         let mut erased = 0;
         for key in &keys {
+            remaining.remove(key);
             if keep.contains(key) {
-                remaining.insert(*key);
+                // Known positives need no read. With an unknown inventory,
+                // exclude only verified label-free bodies; unreadable or
+                // unknown live records may still carry PL, but owe no erase.
+                let may_have_labels = if known.is_some() {
+                    true
+                } else {
+                    report.scanned += 1;
+                    match self.read_known(key, Some(writer), true) {
+                        Ok(Some(verified)) => {
+                            report.verified += 1;
+                            contains(&verified.record.record.body)
+                        }
+                        _ => true,
+                    }
+                };
+                if may_have_labels {
+                    remaining.insert(*key);
+                }
                 continue;
             }
             report.scanned += 1;
@@ -2490,15 +2548,16 @@ impl DurableTailStore {
         }
         if known.is_none() {
             self.private_purge_dirty |= report.refused > 0;
-            // Keep a bounded conservative positive inventory across pages.
-            // A live key is not an erase failure and need not be body-read.
+            // Keep only possible PL positives across bounded pages. Capacity
+            // overflow preserves UNKNOWN and is separate from erase failures.
             for key in &remaining {
-                if self.private_purge_kept.len() < MAX_RECORDS
+                if self.private_purge_kept.len() < PRIVATE_LABEL_INVENTORY_BYTES / 32
                     || self.private_purge_kept.contains(key)
                 {
                     self.private_purge_kept.insert(*key);
                 } else {
-                    self.private_purge_dirty = true;
+                    self.private_purge_overflow = true;
+                    self.counters.private_label_inventory_overflow += 1;
                 }
             }
             let complete = self
@@ -2510,14 +2569,20 @@ impl DurableTailStore {
                 return Ok(report);
             }
             self.private_purge_entries = None;
+            let overflow = std::mem::take(&mut self.private_purge_overflow);
             if std::mem::take(&mut self.private_purge_dirty) {
                 self.private_purge_kept.clear();
-                // Earlier pages may owe retry, but a failure on this page is
-                // already counted. Never count the same refusal twice.
-                report.refused = report.refused.max(1);
+                // Earlier failures were counted on their own page. Preserve
+                // UNKNOWN for retry without counting them again.
                 return Ok(report);
             }
             remaining = std::mem::take(&mut self.private_purge_kept);
+            if overflow {
+                if self.write_private_label_keys(writer, None).is_err() {
+                    report.refused += 1;
+                }
+                return Ok(report);
+            }
         }
         if self
             .write_private_label_keys(writer, Some(&remaining))

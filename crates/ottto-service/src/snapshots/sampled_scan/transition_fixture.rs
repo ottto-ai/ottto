@@ -436,6 +436,8 @@ pub(crate) struct RouteResult {
     pub(crate) normalized: Value,
     pub(crate) snapshots: BTreeMap<String, Value>,
     pub(crate) accepted: BTreeMap<String, Accepted>,
+    /// Observed destination ledger by entity AFTER stored-body ACK; None for scan-only drivers.
+    pub(crate) accepted_identity_buckets: Option<Value>,
     /// Codex drivers collect the REAL index applied/captured receipts, owner
     /// proofs and counting state. Empty only for sources without Codex state.
     pub(crate) codex_evidence: Value,
@@ -515,6 +517,7 @@ impl RouteResult {
             normalized: json!(envelopes),
             snapshots,
             accepted: BTreeMap::new(),
+            accepted_identity_buckets: None,
             codex_evidence: Value::Null,
             io: IoBytes::default(),
             modes: (0, 0, 0),
@@ -608,6 +611,7 @@ pub(crate) mod money_oracle {
         }
     }
     pub(crate) fn assert_equivalent(cold: &RouteResult, other: &RouteResult) {
+        assert_placement_equivalent(cold, other);
         assert_eq!(cold.source, other.source);
         assert!(
             !cold.snapshots.is_empty(),
@@ -670,6 +674,400 @@ pub(crate) mod money_oracle {
             crate::canonical_json::canonicalize(&other.normalized).unwrap(),
             "normalized bytes"
         );
+    }
+
+    // Placement oracle: keep this block beside the existing totals comparator.
+    const COUNTS: &[&str] = &[
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+    ];
+    const COSTS: &[&str] = &[
+        "cost_usd",
+        "input_cost_usd",
+        "output_cost_usd",
+        "cache_read_cost_usd",
+        "cache_creation_cost_usd",
+    ];
+
+    fn placement_row(row: &Value, evidence: &Value) -> Value {
+        let mut row = row.clone();
+        let fields = row.as_object_mut().expect("placement row object");
+        if let Some(reference) = fields.remove("evidence_ref") {
+            let index = reference
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .expect("integer evidence_ref");
+            let resolved = evidence
+                .as_array()
+                .and_then(|entries| entries.get(index))
+                .filter(|entry| entry.is_object())
+                .expect("unresolved evidence_ref");
+            fields.insert("resolved_evidence".into(), resolved.clone());
+        }
+        if let Some(parts) = fields.get_mut("identity_parts") {
+            let parts = parts.as_array_mut().expect("identity_parts array");
+            assert!(!parts.is_empty(), "empty identity_parts");
+            *parts = parts
+                .iter()
+                .map(|part| placement_row(part, evidence))
+                .collect();
+            parts.sort_by_key(Value::to_string);
+        }
+        row
+    }
+
+    fn assert_row_conserved(row: &Value) {
+        let Some(parts) = row.get("identity_parts") else {
+            return;
+        };
+        let parts = parts.as_array().expect("identity_parts array");
+        // Missing evidence is an explicit untagged part, never invented account
+        // credit or a silently computed residual that would mask lost shares.
+        for field in COUNTS {
+            let total = row[*field].as_u64().unwrap_or(0) as u128;
+            let sum: u128 = parts
+                .iter()
+                .map(|part| part[*field].as_u64().expect("part counter present") as u128)
+                .sum();
+            assert_eq!(sum, total, "placement conservation/{field}");
+        }
+        for field in COSTS {
+            let amount = |value: &Value| {
+                let text = value.as_str().expect("present cost string");
+                let (picos, rounded) =
+                    super::super::super::parse_pi_usd_picos(text).expect("valid cost decimal");
+                assert!(!rounded, "sub-pico placement cost");
+                picos
+            };
+            match row.get(*field) {
+                None => assert!(
+                    parts.iter().all(|part| part.get(*field).is_none()),
+                    "placement conservation/{field}: absent row cost has priced parts"
+                ),
+                Some(total) => {
+                    let sum = parts
+                        .iter()
+                        .try_fold(0u128, |sum, part| {
+                            sum.checked_add(amount(part.get(*field).expect("priced part")))
+                        })
+                        .expect("placement cost sum overflow");
+                    assert_eq!(sum, amount(total), "placement conservation/{field}");
+                }
+            }
+        }
+    }
+
+    fn placement_snapshot(snapshot: &Value) -> Value {
+        let evidence = &snapshot["request_evidence"];
+        let rows = |rows: &Value| -> Value {
+            json!(rows
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|row| {
+                    assert_row_conserved(row);
+                    placement_row(row, evidence)
+                })
+                .collect::<Vec<_>>())
+        };
+        let mut entries = evidence.as_array().cloned().unwrap_or_default();
+        entries.sort_by_key(Value::to_string);
+        json!({
+            "session_account_evidence": snapshot.get("session_account_evidence"),
+            "request_evidence": entries,
+            "request_identity_refusals": snapshot.get("request_identity_refusals"),
+            "model_usage": rows(&snapshot["model_usage"]),
+            "usage_buckets": snapshot["usage_buckets"].as_array().into_iter().flatten()
+                .map(|bucket| json!({"bucket_start": bucket["bucket_start"],
+                    "model_usage": rows(&bucket["model_usage"])})).collect::<Vec<_>>()
+        })
+    }
+
+    /// Compare account AND organization placement for every counter/cost in
+    /// every emitted entity. Evidence indexes are local to a body; resolve them
+    /// before comparing. All row fields survive, including billing dimensions,
+    /// retained/copy-invalidated markers and each untagged share.
+    /// ACK drivers attach the actual destination ledger, never a replay inferred
+    /// from emitted bodies. Scan-only drivers cannot prove post-ACK equivalence.
+    pub(crate) fn assert_placement_equivalent(cold: &RouteResult, other: &RouteResult) {
+        assert_eq!(cold.source, other.source);
+        assert!(
+            !cold.snapshots.is_empty(),
+            "empty cold Full is no placement proof"
+        );
+        let mut differences = Vec::new();
+        for entity in cold
+            .snapshots
+            .keys()
+            .chain(other.snapshots.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            match (cold.snapshots.get(entity), other.snapshots.get(entity)) {
+                (Some(a), Some(b)) => diff(
+                    &format!("placement/entity/{entity}"),
+                    &placement_snapshot(a),
+                    &placement_snapshot(b),
+                    &mut differences,
+                ),
+                _ => differences.push(format!("placement/entity/{entity}: missing/extra entity")),
+            }
+        }
+        // Presence matters: a route must not silently lose ACK observations.
+        assert_eq!(
+            cold.accepted_identity_buckets.is_some(),
+            other.accepted_identity_buckets.is_some(),
+            "post-ACK placement observation missing on one route"
+        );
+        if let (Some(a), Some(b)) = (
+            &cold.accepted_identity_buckets,
+            &other.accepted_identity_buckets,
+        ) {
+            for entity in cold.snapshots.keys() {
+                // Held entities are checked by assert_held; compare only emitted
+                // siblings here, exactly like the body portion of this oracle.
+                let (a, b) = (a.get(entity), b.get(entity));
+                assert!(
+                    a.is_some() && b.is_some(),
+                    "post-ACK entity observation missing: {entity}"
+                );
+                diff(
+                    &format!("placement/accepted_identity_buckets/{entity}"),
+                    a.unwrap(),
+                    b.unwrap(),
+                    &mut differences,
+                );
+            }
+        }
+        assert!(
+            differences.is_empty(),
+            "{:?} vs {:?}:\n{}",
+            cold.mode,
+            other.mode,
+            differences.join("\n")
+        );
+    }
+
+    #[cfg(test)]
+    mod placement_tests {
+        use super::*;
+        use crate::snapshots::claude_request_identity::{AcceptedBuckets, COLLECTOR};
+
+        // Synthetic emitted requests in time order: A, switch to B, side call
+        // under B, then an evidence gap. Independent weights expose any move.
+        fn placement_fixture() -> RouteResult {
+            let evidence = json!([
+                {"identity_basis":"telemetry_login", "provider_workspace_hash":"c".repeat(64)},
+                {"identity_basis":"telemetry_login", "provider_workspace_hash":"d".repeat(64)}
+            ]);
+            let share = |weight: u64, account: Option<(&str, u64)>| {
+                let mut row = json!({});
+                for (i, field) in COUNTS.iter().enumerate() {
+                    row[*field] = json!(weight * (i as u64 + 1));
+                }
+                for field in COSTS {
+                    row[*field] = json!(format!("0.{weight:06}"));
+                }
+                if let Some((account, reference)) = account {
+                    row["account_identifier_hash"] = json!(account.repeat(64));
+                    row["evidence_ref"] = json!(reference);
+                }
+                row
+            };
+            let main_parts = vec![
+                share(1, Some(("a", 0))),
+                share(2, Some(("b", 1))),
+                share(4, None),
+            ];
+            let row = |weight, parts: Option<Vec<Value>>, account| {
+                let mut row = share(weight, account);
+                row["model"] = json!("claude-synthetic");
+                row["auth_mode"] = json!("api_key");
+                row["billing_channel"] = json!("api");
+                row["billing_provider"] = json!("anthropic");
+                row["subscription_product"] = json!("synthetic");
+                if let Some(parts) = parts {
+                    row["identity_parts"] = json!(parts);
+                }
+                row
+            };
+            let main = row(7, Some(main_parts.clone()), None);
+            let side = row(3, None, Some(("b", 1)));
+            let mut snapshots = BTreeMap::new();
+            for (entity, total, requests) in [
+                ("main", main, main_parts),
+                ("side-call", side.clone(), vec![side]),
+            ] {
+                snapshots.insert(entity.to_string(), json!({
+                    "source_session_id": entity,
+                    "provenance": {"collector": COLLECTOR},
+                    "session_account_evidence": {"account_identifier_hash":"a".repeat(64),
+                        "provider_workspace_hash":"c".repeat(64), "identity_disposition":"creator"},
+                    "request_evidence": evidence,
+                    "request_identity_refusals": u64::from(entity == "main"),
+                    "model_usage": [total],
+                    "usage_buckets": requests.into_iter().enumerate().map(|(i, mut request)| {
+                        request["model"] = json!("claude-synthetic");
+                        let hour = if entity == "side-call" { 2 } else if i == 2 { 3 } else { i };
+                        json!({"bucket_start": format!("2026-10-31T0{hour}:00:00Z"), "model_usage":[request]})
+                    }).collect::<Vec<_>>()
+                }));
+            }
+            let mut accepted = AcceptedBuckets::for_test();
+            for snapshot in snapshots.values() {
+                accepted.record(snapshot);
+            }
+            let ledger = snapshots
+                .keys()
+                .map(|entity| {
+                    let state = serde_json::to_value(accepted.get(entity).unwrap()).unwrap();
+                    assert!(
+                        !state["shares"].as_array().unwrap().is_empty(),
+                        "nonvacuous accepted shares"
+                    );
+                    (entity.clone(), state)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut result =
+                RouteResult::emitted(Mode::ColdFull, SnapshotSource::ClaudeCode, vec![], &[]);
+            result.snapshots = snapshots;
+            result.accepted_identity_buckets = Some(json!(ledger));
+            result
+        }
+
+        /// [money] Placement detects account/org/share/ACK corruption despite identical totals.
+        #[test]
+        fn money_oracle_placement_positive_control() {
+            let cold = placement_fixture();
+            let tagged = &cold.snapshots["main"]["model_usage"][0]["identity_parts"][0];
+            assert_eq!(tagged["account_identifier_hash"], "a".repeat(64));
+            for mode in [
+                Mode::Ram,
+                Mode::DiskRestore,
+                Mode::Restart,
+                Mode::EvictRetry,
+            ] {
+                let mut route = cold.clone();
+                route.mode = mode;
+                assert_equivalent(&cold, &route);
+                // Reindex evidence and reverse parts without changing placement.
+                for snapshot in route.snapshots.values_mut() {
+                    snapshot["request_evidence"]
+                        .as_array_mut()
+                        .unwrap()
+                        .reverse();
+                    for row in snapshot["model_usage"].as_array_mut().unwrap() {
+                        if let Some(parts) =
+                            row.get_mut("identity_parts").and_then(Value::as_array_mut)
+                        {
+                            for part in parts.iter_mut() {
+                                if let Some(n) = part["evidence_ref"].as_u64() {
+                                    part["evidence_ref"] = json!(1 - n);
+                                }
+                            }
+                            parts.reverse();
+                        }
+                        if let Some(n) = row["evidence_ref"].as_u64() {
+                            row["evidence_ref"] = json!(1 - n);
+                        }
+                    }
+                    for bucket in snapshot["usage_buckets"].as_array_mut().unwrap() {
+                        for row in bucket["model_usage"].as_array_mut().unwrap() {
+                            if let Some(n) = row["evidence_ref"].as_u64() {
+                                row["evidence_ref"] = json!(1 - n);
+                            }
+                        }
+                    }
+                }
+                assert_placement_equivalent(&cold, &route);
+            }
+            let mutations = [
+                (
+                    "/model_usage/0/identity_parts/0/account_identifier_hash",
+                    json!("b".repeat(64)),
+                ),
+                ("/model_usage/0/identity_parts/0/evidence_ref", json!(1)),
+                (
+                    "/request_evidence/0/provider_workspace_hash",
+                    json!("e".repeat(64)),
+                ),
+                ("/model_usage/0/identity_parts/0/input_tokens", json!(9)),
+                (
+                    "/model_usage/0/identity_parts/0/cost_usd",
+                    json!("0.000009"),
+                ),
+                (
+                    "/usage_buckets/0/model_usage/0/account_identifier_hash",
+                    json!("b".repeat(64)),
+                ),
+                ("/request_identity_refusals", json!(0)),
+            ];
+            for (path, value) in mutations {
+                let mut wrong = cold.clone();
+                let snapshot = wrong.snapshots.get_mut("main").unwrap();
+                *snapshot.pointer_mut(path).unwrap() = value;
+                assert!(
+                    std::panic::catch_unwind(|| assert_placement_equivalent(&cold, &wrong))
+                        .is_err(),
+                    "{path}"
+                );
+            }
+            for field in [
+                "identity_retained",
+                "copy_invalidated",
+                "auth_mode",
+                "billing_channel",
+                "billing_provider",
+                "subscription_product",
+            ] {
+                let mut wrong = cold.clone();
+                wrong.snapshots.get_mut("main").unwrap()["model_usage"][0][field] =
+                    json!("changed");
+                assert!(
+                    std::panic::catch_unwind(|| assert_placement_equivalent(&cold, &wrong))
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            for field in COUNTS.iter().chain(COSTS) {
+                let mut wrong = cold.clone();
+                wrong.snapshots.get_mut("main").unwrap()["model_usage"][0]["identity_parts"][0]
+                    [*field] = if COUNTS.contains(field) {
+                    json!(99)
+                } else {
+                    json!("0.000099")
+                };
+                assert!(
+                    std::panic::catch_unwind(|| assert_placement_equivalent(&wrong, &wrong))
+                        .is_err(),
+                    "conservation/{field}"
+                );
+            }
+            let mut wrong = cold.clone();
+            wrong.accepted_identity_buckets = Some(json!({"main": {}, "side-call": {}}));
+            assert!(
+                std::panic::catch_unwind(|| assert_placement_equivalent(&cold, &wrong)).is_err()
+            );
+            wrong.accepted_identity_buckets = None;
+            assert!(
+                std::panic::catch_unwind(|| assert_placement_equivalent(&cold, &wrong)).is_err()
+            );
+            // Even identical routes must fail if their shared allocator lost a
+            // part: conservation is checked against each row's own totals.
+            let mut wrong = cold.clone();
+            wrong.snapshots.get_mut("main").unwrap()["model_usage"][0]["identity_parts"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            assert!(
+                std::panic::catch_unwind(|| assert_placement_equivalent(&wrong, &wrong)).is_err()
+            );
+        }
     }
 
     /// `entity` is held in `other`; every emitted sibling must still equal cold.
@@ -1311,7 +1709,7 @@ pub(crate) mod native_cold {
         file: std::fs::File,
         apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     ) -> OwnedJsonlParser {
-        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
     }
     pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,

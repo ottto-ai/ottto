@@ -77,7 +77,7 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   with the funded 64 KiB stream scratch;
 /// - A0-h custody (spent, P2 witness) and Full-pacing nodes,
 ///   2*513 nodes of <=1024 bytes = 1,050,624 bytes (`RETAIL_RESERVE_BYTES`);
-/// - M3 per-key debt/D3-hold and P1-1 restore-pending maps, 2*257 nodes of
+/// - Per-key debt/hold and restore-pending maps, 2*257 nodes of
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
 /// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
@@ -95,13 +95,13 @@ pub(crate) const STORES_RESIDENT_BOUND: usize =
 
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
-/// the receipt-debt/D3-hold map (`owed::KeyDebt`) and the P1-1 restore-pending
+/// the receipt-debt/hold map (`owed::KeyDebt`) and the restore-pending
 /// map. Neither evicts live custody; debt pressure can reclaim idle diagnostics
 /// and expired pacing. Live-capacity overflow keeps the existing safe path.
 pub(crate) const KEY_RESERVE_BYTES: usize = 2 * (store::MAX_RECORDS + 1) * 1024;
 const _: () = assert!(KEY_RESERVE_BYTES == 526_336);
 
-/// P1-1: process Tail grants whose accepted end lies within the restored
+/// Process Tail grants whose accepted end lies within the restored
 /// certificate (no old bytes owed, the write-ahead steady state). They never
 /// take the never-evicted A0-h custody node; a write or receipt at the high
 /// water frees them. Overflow refuses toward the existing paced Full.
@@ -124,7 +124,7 @@ pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut(
     BEFORE_CARRIER_PROBE.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// Pacing cause of a Codex refused stale record's Full (SOURCE cond. 5).
+/// Pacing cause of a Codex refused stale record's Full.
 const STALE_SELECTION_CAUSE: usize = 5;
 
 const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
@@ -414,7 +414,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted,repin]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
-             gc_records_deleted={} rec_orphans_erased={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
+             gc_records_deleted={} rec_orphans_erased={} private_label_inventory_overflow={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              off_v1_invalidated={} off_v1_invalidate_failed={} records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
@@ -463,6 +463,7 @@ impl Counters {
             store.store_write_skipped,
             store.gc_records_deleted,
             store.rec_orphans_erased,
+            store.private_label_inventory_overflow,
             store.gc_records_read,
             store.gc_bytes_read,
             self.gc_keep_peak,
@@ -652,7 +653,7 @@ pub(crate) struct Stores {
     // Source+key only: never clear on passes, scope changes or cache eviction.
     // A node without authority is freed (`release_idle_custody`).
     retail_spent: BTreeMap<store::Digest32, Box<KeyCustody>>,
-    /// P1-1 zero-old-byte process grants, outside `retail_spent`.
+    /// Zero-old-byte process grants, outside `retail_spent`.
     restore_pending: BTreeMap<store::Digest32, RestorePending>,
     /// G3 receipt debt and D3 holds, outside the custody node.
     key_debt: BTreeMap<store::Digest32, Box<owed::KeyDebt>>,
@@ -683,7 +684,7 @@ impl KeyCustody {
     }
 }
 
-/// The high water and grant time a P1-1 process grant would have spent.
+/// The high water and grant time a process grant would have spent.
 #[derive(Clone, Copy)]
 struct RestorePending {
     high: u64,
@@ -829,7 +830,7 @@ impl Stores {
         }
     }
 
-    /// P1-1: a restore owing no old bytes spends a bounded pending grant, never
+    /// A restore owing no old bytes spends a bounded pending grant, never
     /// an A0-h custody node. `Ok(None)` hands over to the spent custody: old
     /// bytes owed, or a re-read behind the pending high water, which is
     /// promoted with its original grant time so the Daily gate stays exact.
@@ -1126,7 +1127,7 @@ fn replay_scope_for(
         } else {
             0
         },
-        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == SnapshotSource::ClaudeCode,
     )
 }
 
@@ -2336,7 +2337,7 @@ impl SharedCache {
     }
 
     /// A grouped member's `durable_full_hold` at job start, also taking its
-    /// once-clamped live-context missing-carrier deadline (Addendum 6). The
+    /// once-clamped live-context missing-carrier deadline. The
     /// group settlement counts it once per member that publishes.
     #[cfg(test)]
     pub(crate) fn durable_member_hold(
@@ -2383,7 +2384,7 @@ impl SharedCache {
         }
     }
 
-    /// R1: an entry-less file whose parked paged job captured no deadline
+    /// An entry-less file whose parked paged job captured no deadline
     /// takes the same live-context, once-clamped debt at settlement, read
     /// only (`carrier_debt`): no hold, T14, breaker or RAM side effect.
     pub(crate) fn durable_carrier_reprobe(
@@ -3683,7 +3684,7 @@ impl SharedCache {
                     .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
-                // SOURCE cond. 5: a record surviving behind a cleared selection
+                // A record surviving behind a cleared selection
                 // (the D3 strict rebind's carrier, no new persisted field) is a
                 // refused stale record. A disabled store cannot prove absence.
                 let Some(slot) = stores.slot(source).as_mut() else {

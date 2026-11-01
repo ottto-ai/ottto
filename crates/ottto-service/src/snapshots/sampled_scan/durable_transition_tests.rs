@@ -203,10 +203,14 @@ impl TransitionDriver for M1 {
         page.enrich(&self.c);
         page.finish();
         fixture::reach(CrashPoint::BeforeAck);
+        let mut progress = e2_progress();
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
         let bodies = if page.scan.snapshots.is_empty() {
             Vec::new()
         } else {
-            let (status, bodies, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
+            let (status, bodies, _) = upload(&page.scan.snapshots, &mut progress, ack);
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             page.index.record_accepted_snapshot_fingerprints(
                 &page
@@ -221,6 +225,23 @@ impl TransitionDriver for M1 {
         fixture::reach(CrashPoint::AfterAck);
         let mut result = RouteResult::emitted(mode, SOURCE, bodies, &page.scan.snapshots);
         result.accepted = self.accepted.clone();
+        result.accepted_identity_buckets = Some(
+            serde_json::to_value(
+                page.scan
+                    .snapshots
+                    .iter()
+                    .map(|item| {
+                        (
+                            &item.source_session_id,
+                            progress
+                                .accepted_identity_buckets
+                                .get(&item.source_session_id),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        );
         // The actual parser consumption is measured; raw head rederive is an
         // independent receipt. Cheap certificate/probe I/O is NOT measured yet.
         result.io = IoBytes {

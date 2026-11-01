@@ -147,7 +147,6 @@ fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
             None,
             &[],
             false,
-            true,
             false,
         );
         NativePublication::carry(

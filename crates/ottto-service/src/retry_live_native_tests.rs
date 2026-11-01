@@ -482,7 +482,7 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
         for step in 0..5 {
             let (mut stream, _) = listener.accept().unwrap();
             let bytes = bounded_native_read(&mut stream);
-            let request = String::from_utf8(bytes).unwrap();
+            let request = decoded_http_request(&bytes);
             if step == 2 {
                 assert!(request.contains("/relay-token "));
                 bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
@@ -709,7 +709,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             let mut trace = Vec::new();
             for body in ["{\"token\":\"fresh\"}", hint.as_str(), ack.as_str()] {
                 let (mut stream, _) = listener.accept().unwrap();
-                trace.push(String::from_utf8_lossy(&bounded_native_read(&mut stream)).into_owned());
+                trace.push(decoded_http_request(&bounded_native_read(&mut stream)));
                 bounded_native_response(&mut stream, "200 OK", body);
             }
             trace

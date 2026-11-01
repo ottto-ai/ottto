@@ -10,42 +10,47 @@ use super::*;
 /// header's `session_meta.payload.timestamp`: 2026-10-26T12:00:00Z. Sessions
 /// whose root header is at or after it, and that no Legacy writer has already
 /// acknowledged, use V2; every earlier session stays Legacy. Frozen once; never
-/// move it. `None` would keep every session on Legacy counting.
-pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: Option<i64> = Some(1_793_016_000_000);
+/// move it.
+pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: i64 = 1_793_016_000_000;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_CUTOVER_UNIX_MS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static TEST_CUTOVER_UNIX_MS: std::cell::Cell<i64> =
+        const { std::cell::Cell::new(CODEX_COUNTING_V2_CUTOVER_UNIX_MS) };
 }
 
 /// The compiled cutover.
 #[cfg(not(test))]
-pub(super) fn cutover_unix_ms() -> Option<i64> {
+pub(super) fn active_cutover_unix_ms() -> i64 {
     CODEX_COUNTING_V2_CUTOVER_UNIX_MS
 }
 
-/// Tests see only a cutover set on their own thread, never the compiled one,
-/// so fixtures stamped with the wall clock cannot switch rule once the
-/// compiled instant passes.
+/// Tests may substitute a real epoch on their own thread. Legacy fixtures
+/// must use pre-cutover headers or Legacy ACK evidence, just as production does.
 #[cfg(test)]
-pub(super) fn cutover_unix_ms() -> Option<i64> {
+pub(super) fn active_cutover_unix_ms() -> i64 {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
-/// Activates a cutover for scan-level tests on this thread until dropped.
+/// Preserve the optional representation at the pinned durable restore boundary.
+#[cfg(unix)]
+pub(super) fn cutover_unix_ms() -> Option<i64> {
+    Some(active_cutover_unix_ms())
+}
+
+/// Substitutes an epoch for scan-level tests on this thread until dropped.
 #[cfg(test)]
-pub(crate) struct TestCutover;
+pub(crate) struct TestCutover(i64);
 #[cfg(test)]
 impl TestCutover {
     pub(crate) fn set(cutover_unix_ms: i64) -> Self {
-        TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(Some(cutover_unix_ms)));
-        Self
+        Self(TEST_CUTOVER_UNIX_MS.with(|cell| cell.replace(cutover_unix_ms)))
     }
 }
 #[cfg(test)]
 impl Drop for TestCutover {
     fn drop(&mut self) {
-        TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(None));
+        TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(self.0));
     }
 }
 
@@ -123,9 +128,8 @@ impl AckEvidence {
 /// `tree_nodes` heap charge is about 1 MiB at capacity (including key/timestamp
 /// buffers), not the serialized payload size or a measured RSS bound.
 /// Overflow prefers V2-only evidence, then intrinsically Legacy pre-cutover
-/// headers, then earlier-generation Legacy evidence. While inactive, known
-/// oldest creation times go first within the Legacy class; unknown times are
-/// most protected. Generation age alone proves no successful walk or absence.
+/// headers, then earlier-generation Legacy evidence. Unknown times are most
+/// protected. Generation age alone proves no successful walk or absence.
 /// Current-generation Legacy evidence that might be post-cutover is retained:
 /// if no safer slot exists, refuse retirement until a later generation.
 pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
@@ -227,14 +231,6 @@ pub(super) fn take_local_receipts(
     receipts: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
 ) -> Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>> {
     let counts = std::mem::take(&mut index.codex_counting_evictions);
-    if receipts.is_none()
-        && cutover_unix_ms().is_none()
-        && counts == [0; 3]
-        && index.codex_counting_tombstones.is_empty()
-        && index.codex_counting_evicted_legacy.is_empty()
-    {
-        return None;
-    }
     let mut receipts = receipts.unwrap_or_default();
     receipts.tombstone_evictions_v2_only = counts[0];
     receipts.tombstone_evictions_pre_cutover_legacy = counts[1];
@@ -312,35 +308,29 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             // V2-only evidence never selects a different version.
             return true;
         }
-        let cutover = cutover_unix_ms();
-        // Order by safety class, then creation time while inactive, then
-        // retirement generation and owner for deterministic ties. Unknown
-        // timestamps sort last. Rewritten owners cannot free a slot.
+        let cutover = active_cutover_unix_ms();
+        // Order by safety class, then retirement generation and owner for
+        // deterministic ties. Unknown timestamps sort last. Rewritten owners
+        // cannot free a slot.
         let mut evictable = tombstones
             .iter()
             .filter(|(owner, _)| !retired.iter().any(|(rewritten, _)| rewritten == *owner))
             .filter_map(|(owner, tombstone)| {
                 let class = if tombstone.evidence != AckEvidence::LegacyAcked {
                     0
-                } else if cutover.is_some_and(|cutover| {
-                    tombstone
-                        .created_unix_ms
-                        .is_some_and(|created| created < cutover)
-                }) {
+                } else if tombstone
+                    .created_unix_ms
+                    .is_some_and(|created| created < cutover)
+                {
                     1
                 } else if tombstone.retired_in != retired_in {
                     2
                 } else {
                     return None;
                 };
-                let created = cutover
-                    .is_none()
-                    .then_some(tombstone.created_unix_ms)
-                    .flatten();
                 Some((
                     class,
                     tombstone.created_unix_ms.is_none(),
-                    created,
                     &tombstone.retired_in,
                     owner,
                 ))
@@ -353,7 +343,7 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
         let evictable = evictable
             .into_iter()
             .take(short)
-            .map(|(class, _, _, _, owner)| (class, owner.clone()))
+            .map(|(class, _, _, owner)| (class, owner.clone()))
             .collect::<Vec<_>>();
         let mut counts = [0usize; 3];
         for (class, owner) in evictable {
@@ -558,9 +548,6 @@ pub(super) fn prepare_moved_evidence(
             .retain(|_| !absorbed.next().unwrap());
     }
     collect_tombstones(index, owners, absence_coverage);
-    if cutover_unix_ms().is_none() {
-        return;
-    }
     let mut by_owner = owners
         .values()
         .map(|owner| (owner.clone(), AckEvidence::None))
@@ -617,9 +604,6 @@ pub(super) fn members_evidence<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> AckEvidence {
-    if cutover_unix_ms().is_none() {
-        return AckEvidence::None;
-    }
     members
         .into_iter()
         .fold(AckEvidence::None, |evidence, member| {
@@ -647,11 +631,8 @@ fn entry_has_ack_evidence(entry: &ScanIndexEntry) -> bool {
 pub(super) fn decide(
     first_owned_record: &Value,
     evidence: AckEvidence,
-    cutover_unix_ms: Option<i64>,
+    cutover_unix_ms: i64,
 ) -> CountingVersion {
-    let Some(cutover) = cutover_unix_ms else {
-        return CountingVersion::Legacy;
-    };
     if !string_eq_at(first_owned_record, &["type"], "session_meta") {
         return CountingVersion::Legacy;
     }
@@ -669,7 +650,7 @@ pub(super) fn decide(
     else {
         return CountingVersion::Legacy;
     };
-    if created_unix_ms < cutover {
+    if created_unix_ms < cutover_unix_ms {
         return CountingVersion::Legacy;
     }
     match evidence {
@@ -686,24 +667,19 @@ pub(super) fn configure_singleton(
     candidate: &CandidateFile,
     index: &ScanIndex,
 ) {
-    // Inactive: no state is allocated and Legacy output is unchanged; the
-    // accumulator keeps only its empty 8-byte slot.
-    let Some(cutover) = cutover_unix_ms() else {
-        return;
-    };
+    let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     configure(&mut parser.accumulator, evidence, Some(cutover));
 }
 
-/// The cursor's view while inactive: no counting state is configured.
-const INACTIVE_VIEW: &str = "legacy";
+/// Historical cursor view for an unconfigured parser. Keep accepting its
+/// persisted bytes even though new scans always configure counting.
+const LEGACY_VIEW: &str = "legacy";
 
 /// The counting view of a singleton's index entry (cursor K8): what
 /// `configure_singleton` would configure now, as the cursor job records it.
 pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
-    let Some(cutover) = cutover_unix_ms() else {
-        return INACTIVE_VIEW.to_owned();
-    };
+    let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
 }
@@ -713,9 +689,7 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
 /// candidate).
 #[cfg(unix)]
 pub(super) fn singleton_view_of_key(key: &str, index: &ScanIndex) -> String {
-    let Some(cutover) = cutover_unix_ms() else {
-        return INACTIVE_VIEW.to_owned();
-    };
+    let cutover = active_cutover_unix_ms();
     view(key_evidence(key, index), cutover)
 }
 
@@ -725,9 +699,7 @@ pub(super) fn group_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
-    let Some(cutover) = cutover_unix_ms() else {
-        return INACTIVE_VIEW.to_owned();
-    };
+    let cutover = active_cutover_unix_ms();
     view(members_evidence(members, index), cutover)
 }
 
@@ -739,7 +711,7 @@ pub(super) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
 /// The one counting reuse predicate for both restore paths, a retained
 /// reduction (`old.filter`) and a paused cursor job: the restored state
 /// continues only under the rule a parser configured now would select.
-/// Both unset while inactive.
+/// Historical unconfigured reductions retain their matching unconfigured view.
 pub(super) fn reusable(
     old: Option<&codex_usage_occurrence::CodexCounting>,
     fresh: Option<&codex_usage_occurrence::CodexCounting>,
@@ -754,7 +726,7 @@ pub(super) fn reusable(
 /// `reusable` against a `singleton_view` instead of a configured parser. An
 /// unrecognised view never continues.
 pub(super) fn reusable_under_view(accumulator: &SnapshotAccumulator, view: &str) -> bool {
-    let fresh = if view == INACTIVE_VIEW {
+    let fresh = if view == LEGACY_VIEW {
         None
     } else {
         let Some((cutover, evidence)) = view.split_once(':') else {
@@ -773,14 +745,10 @@ pub(super) fn reusable_under_view(accumulator: &SnapshotAccumulator, view: &str)
     reusable(accumulator.codex_counting.as_deref(), fresh.as_ref())
 }
 
-/// A joined group's member evidence. Inactive, the member view is never
-/// traversed, so an inactive group scan allocates nothing for counting.
+/// A joined group's member evidence.
 pub(super) fn group_evidence<'a>(
     entries: impl IntoIterator<Item = &'a ScanIndexEntry>,
 ) -> AckEvidence {
-    if cutover_unix_ms().is_none() {
-        return AckEvidence::None;
-    }
     AckEvidence::of_view(entries)
 }
 
@@ -788,9 +756,7 @@ pub(super) fn group_evidence<'a>(
 /// on its fresh accumulator. The accumulator carried across members is never
 /// reconfigured, so no member resets V2 state mid-session.
 pub(super) fn configure_group_once(accumulator: &mut SnapshotAccumulator, evidence: AckEvidence) {
-    let Some(cutover) = cutover_unix_ms() else {
-        return;
-    };
+    let cutover = active_cutover_unix_ms();
     if accumulator.codex_counting.is_none() {
         configure(accumulator, evidence, Some(cutover));
     }

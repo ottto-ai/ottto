@@ -776,7 +776,6 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
                 None,
                 &[],
                 false,
-                true,
             )
         };
         let scan =

@@ -1,4 +1,4 @@
-//! Substrate regression controls, registered by the integration owner's patch.
+//! Write-ahead substrate regression controls.
 use crate::durable_tail_codec::{Enc, Refuse};
 use crate::durable_tail_store::{self as store, tests as fixture};
 use crate::locked_state_dir::{test_locks, LockedStateDir};

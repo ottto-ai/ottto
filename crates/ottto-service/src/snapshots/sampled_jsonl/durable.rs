@@ -582,11 +582,12 @@ pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -
 
 #[cfg(test)]
 pub(crate) fn store_skill_fixture_body() -> Vec<u8> {
-    let mut decoded = decode(
-        &store_fixture_body(SnapshotSource::ClaudeCode, 1, 7),
-        SnapshotSource::ClaudeCode,
-    )
-    .unwrap();
+    store_skill_fixture_body_for_source(SnapshotSource::ClaudeCode)
+}
+
+#[cfg(test)]
+pub(crate) fn store_skill_fixture_body_for_source(source: SnapshotSource) -> Vec<u8> {
+    let mut decoded = decode(&store_fixture_body(source, 1, 7), source).unwrap();
     decoded
         .reduction
         .accumulator

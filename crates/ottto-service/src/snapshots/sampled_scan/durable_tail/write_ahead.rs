@@ -139,7 +139,7 @@ pub(crate) enum DegradedCause {
     /// A proved content change: the surviving predecessor cannot bind.
     PriorUnbindable,
     /// D3 Codex: the native owner must durably save the retained entry with
-    /// its source fingerprint cleared BEFORE ACK, keeping key, #865 debt and
+    /// its source fingerprint cleared BEFORE ACK, keeping key, audit debt and
     /// membership, so no surviving record can bind after restart.
     StrictRebind,
 }
@@ -802,7 +802,7 @@ impl SharedCache {
     }
 
     /// Explicit cleanup outside Stores. The store's shared cleanup backing
-    /// counts verified/failed/fallback outcomes on the #799 carrier.
+    /// counts verified/failed/fallback outcomes on the durable-tail carrier.
     pub(in crate::snapshots) fn discard_prepared(&self, prepared: PreparedRecord) {
         debug_assert!(!stores_held(), "temp cleanup runs outside Stores");
         let _counted = prepared.discard();
@@ -1283,7 +1283,7 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     stores.release_idle_custody(&digest);
 }
 
-// Process-lifetime D3 hold counts on the existing #799 diagnostics line. Store
+// Process-lifetime D3 hold counts on the existing durable-tail diagnostics line. Store
 // faults, degraded publishes, stale refusals and pause seconds are store counters.
 pub(super) const D3_HOLD_GROWTH_BYTES: usize = 0;
 pub(super) const D3_RELEASED_WRITE: usize = 1;
