@@ -571,6 +571,25 @@ enum TelemetryOwner<'r> {
     Several,
 }
 
+/// One loaded telemetry row as the tripwire reads it: its request id's
+/// stable hash, and its sidecar root when the row's session is that root
+/// (`None`: no single owner).
+#[derive(Clone, Copy)]
+pub(super) struct TelemetryRow<'r> {
+    pub(super) request_hash: u64,
+    pub(super) owner: Option<&'r str>,
+}
+
+impl<'r> TelemetryRow<'r> {
+    /// `None` for a row without a request id, which names no request.
+    pub(super) fn of(root: &'r str, session_id: &str, request_id: &str) -> Option<Self> {
+        (!request_id.is_empty()).then(|| Self {
+            request_hash: stable_hash(request_id),
+            owner: (session_id == root).then_some(root),
+        })
+    }
+}
+
 /// API rows of roots whose sidecar pair was missing or incomplete this pass.
 /// Moved out of the strict read before it is narrowed (never cloned) and used
 /// only to veto scalars; usage proof never sees them.
@@ -606,6 +625,33 @@ impl ClaudeTelemetryTripwire {
         trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
         veto_api_rows: &ClaudeVetoApiRows,
     ) -> Self {
+        let rows = || {
+            let api = api_report
+                .evidence
+                .iter()
+                .chain(veto_api_rows)
+                .flat_map(|(root, rows)| {
+                    rows.iter()
+                        .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+                });
+            let trace = trace_report.evidence.iter().flat_map(|(root, rows)| {
+                rows.iter()
+                    .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+            });
+            api.chain(trace)
+                .filter_map(|(root, session_id, request_id)| {
+                    TelemetryRow::of(root, session_id, request_id)
+                })
+        };
+        Self::build_from(items, max_requests, rows)
+    }
+
+    /// `build` over any source of the loaded rows' telemetry rows.
+    pub(super) fn build_from<'r, F, I>(items: &[SnapshotItem], max_requests: usize, rows: F) -> Self
+    where
+        F: Fn() -> I,
+        I: Iterator<Item = TelemetryRow<'r>>,
+    {
         let observed = || {
             items
                 .iter()
@@ -629,36 +675,9 @@ impl ClaudeTelemetryTripwire {
             observed()
                 .filter(move |item| !over_bound.contains(claude_snapshot_family_root_ref(item)))
         };
-        let rows = || {
-            let api = api_report
-                .evidence
-                .iter()
-                .chain(veto_api_rows)
-                .flat_map(|(root, rows)| {
-                    rows.iter().map(move |row| {
-                        (
-                            root.as_str(),
-                            row.session_id.as_str(),
-                            row.request_id.as_str(),
-                        )
-                    })
-                });
-            let trace = trace_report.evidence.iter().flat_map(|(root, rows)| {
-                rows.iter().map(move |row| {
-                    (
-                        root.as_str(),
-                        row.session_id.as_str(),
-                        row.request_id.as_str(),
-                    )
-                })
-            });
-            api.chain(trace)
-                .filter(|(_, _, request_id)| !request_id.is_empty())
-        };
-        let Some(partitions) = telemetry_partitions(
-            || rows().map(|(_, _, request_id)| stable_hash(request_id)),
-            max_requests,
-        ) else {
+        let Some(partitions) =
+            telemetry_partitions(|| rows().map(|row| row.request_hash), max_requests)
+        else {
             return Self {
                 checks: Vec::new(),
                 over_bound_roots,
@@ -676,8 +695,11 @@ impl ClaudeTelemetryTripwire {
         let mut owners = BTreeMap::<u64, TelemetryOwner<'_>>::new();
         for partition in 0..partitions {
             owners.clear();
-            for (root, session_id, request_id) in rows() {
-                let request_hash = stable_hash(request_id);
+            for TelemetryRow {
+                request_hash,
+                owner,
+            } in rows()
+            {
                 if request_hash % partitions != partition {
                     continue;
                 }
@@ -685,16 +707,15 @@ impl ClaudeTelemetryTripwire {
                 // owner. A row whose session disagrees with its sidecar root
                 // has no single owner. Two ids sharing a hash can only merge
                 // into `Several`, which withholds.
-                let reported = if session_id == root {
-                    TelemetryOwner::One(root)
-                } else {
-                    TelemetryOwner::Several
+                let reported = match owner {
+                    Some(root) => TelemetryOwner::One(root),
+                    None => TelemetryOwner::Several,
                 };
                 match owners.get_mut(&request_hash) {
                     None => {
                         owners.insert(request_hash, reported);
                     }
-                    Some(TelemetryOwner::One(first)) if *first == root && session_id == root => {}
+                    Some(TelemetryOwner::One(first)) if Some(*first) == owner => {}
                     Some(existing) => *existing = TelemetryOwner::Several,
                 }
             }

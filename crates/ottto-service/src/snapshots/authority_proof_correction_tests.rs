@@ -2096,7 +2096,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
         &BTreeSet::new(),
         Some(observations),
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     );
     assert!(disposition
         .quarantined_source_session_ids
@@ -2136,7 +2136,7 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
         &BTreeSet::new(),
         None,
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     );
     assert!(
         !index.claude_usage_family_witnesses.contains_key(&root),

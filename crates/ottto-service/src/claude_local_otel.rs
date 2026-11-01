@@ -1038,6 +1038,30 @@ pub(crate) fn claude_trace_read_generation(
         .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
+/// Both sidecars' generations, taken before a strict read so a later reread
+/// of the same pair can prove it read the same bytes. `None` when either
+/// file has no generation witness (missing, not a file, or no unix metadata).
+#[derive(PartialEq, Eq)]
+pub(crate) struct ClaudePairGeneration {
+    api: ApiFileGeneration,
+    trace: ApiFileGeneration,
+}
+
+pub(crate) fn claude_pair_generation(
+    support_dir: &Path,
+    session_id: &str,
+) -> Option<ClaudePairGeneration> {
+    let generation = |path: PathBuf| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|metadata| api_file_generation(&metadata))
+    };
+    Some(ClaudePairGeneration {
+        api: generation(evidence_path(support_dir, session_id))?,
+        trace: generation(trace_evidence_path(support_dir, session_id))?,
+    })
+}
+
 pub(crate) fn load_claude_trace_paid(
     support_dir: &Path,
     root: &str,

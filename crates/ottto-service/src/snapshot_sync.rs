@@ -9969,6 +9969,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// Test seam for the streamed-evidence equality arm: its reference keeps every
+// root's rows and folds them whole, as one pass over every root would.
+#[cfg(test)]
+thread_local! {
+    static WHOLE_CORPUS_EVIDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn whole_corpus_evidence() -> bool {
+    #[cfg(test)]
+    if WHOLE_CORPUS_EVIDENCE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
@@ -10145,9 +10160,20 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
+    // Only the page's own roots keep their rows (both root spellings, so a
+    // page family can never lose its own rows). Every root read adds its
+    // cross-root answers first, so the fold sees the whole corpus's answers.
+    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .chain(scan_result.snapshots.iter().filter_map(|item| {
+            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
+        }))
+        .collect::<BTreeSet<_>>();
+    let mut cross =
+        crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(support_dir);
+    let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
-    // veto (never prove) the file birth rule. Moved, not cloned.
-    let mut veto_api_rows = crate::snapshots::ClaudeVetoApiRows::new();
+    // veto (never prove) the file birth rule.
     let unpaired = api_read
         .evidence
         .keys()
@@ -10156,7 +10182,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     for root in unpaired {
         if let Some(rows) = api_read.evidence.remove(&root) {
-            veto_api_rows.insert(root, rows);
+            cross.add_vetoing_api(&root, &rows);
+            if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                veto_api_rows.insert(root, rows);
+            }
         }
     }
     api_read.retain_roots(&paired_roots);
@@ -10172,6 +10201,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
+        let generation =
+            crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
             Some(read) => read.take_trace(support_dir, &root_session_id),
@@ -10193,7 +10224,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         if !api.health.is_complete() || !trace.is_complete() {
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
-                veto_api_rows.insert(root_session_id.clone(), rows);
+                cross.add_vetoing_api(&root_session_id, &rows);
+                if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                    veto_api_rows.insert(root_session_id.clone(), rows);
+                }
             }
             if builds_evidence || request_owned(&root_session_id) {
                 use crate::snapshots::claude_request_identity::UnhealthyRootReason;
@@ -10248,15 +10282,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
         }
-        if let Some(rows) = api.evidence.remove(&root_session_id) {
-            stats.api_evidence_row_count += rows.len();
-            api_report.evidence.insert(root_session_id.clone(), rows);
+        let api_rows = api.evidence.remove(&root_session_id);
+        let trace_rows = trace.evidence.remove(&root_session_id);
+        cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref());
+        let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        if !keep && (api_rows.is_some() || trace_rows.is_some()) {
+            cross.note_unkept(&root_session_id, generation);
         }
-        if let Some(rows) = trace.evidence.remove(&root_session_id) {
+        if let Some(rows) = api_rows {
+            stats.api_evidence_row_count += rows.len();
+            if keep {
+                api_report.evidence.insert(root_session_id.clone(), rows);
+            }
+        }
+        if let Some(rows) = trace_rows {
             stats.trace_evidence_row_count += rows.len();
-            trace_report.evidence.insert(root_session_id, rows);
+            if keep {
+                trace_report.evidence.insert(root_session_id, rows);
+            }
         }
     }
+    cross.finish();
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(
             &scan_result.census_window_end,
@@ -10291,17 +10337,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
-        crate::snapshots::claude_request_identity::ScanEvidence::new(
+        let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
-        )
-        .with_unhealthy_reasons(unhealthy_reasons)
-        .with_status_coverage(crate::claude_status_coverage::snapshot())
-        .with_native_originals(&originals)
-        .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_budget(wire_budget)
+        );
+        let evidence = match &whole_corpus {
+            Some(_) => evidence,
+            None => evidence.with_cross_root(&cross),
+        };
+        evidence
+            .with_unhealthy_reasons(unhealthy_reasons)
+            .with_status_coverage(crate::claude_status_coverage::snapshot())
+            .with_native_originals(&originals)
+            .with_accepted_buckets(accepted_identity_buckets)
+            .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -10319,9 +10370,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
-        &veto_api_rows,
+        match &whole_corpus {
+            Some(veto_api_rows) => crate::snapshots::ClaudeEvidenceRows::Whole(veto_api_rows),
+            None => crate::snapshots::ClaudeEvidenceRows::Streamed(&cross),
+        },
     );
-    drop(veto_api_rows);
+    drop(whole_corpus);
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -10453,6 +10507,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
+    drop(cross);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
