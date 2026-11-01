@@ -1432,7 +1432,7 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
         grown.result.snapshots[0].source_file_fingerprint.as_deref(),
         Some(entry.source_file_fingerprint.as_str())
     );
-    grown.index.files.insert(moved_key, entry);
+    grown.index.files.insert_shared(moved_key, entry);
     grown
         .index
         .claude_request_census_mut_for_test()
