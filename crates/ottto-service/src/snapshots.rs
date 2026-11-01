@@ -50769,7 +50769,7 @@ impl ScanIndex {
             if let Some(current) = self.files.get_mut(to) {
                 current.carry_sampled_audit(&entry);
             } else {
-                self.files.insert(to.to_owned(), entry);
+                self.files.insert_shared(to.to_owned(), entry);
             }
         }
         if let Some(incidence) = self.file_snapshot_fingerprints.remove(from) {
@@ -50783,7 +50783,7 @@ impl ScanIndex {
                 self.accepted_incidence_pending_census = true;
             } else {
                 self.file_snapshot_fingerprints
-                    .insert(to.to_owned(), incidence);
+                    .insert_shared(to.to_owned(), incidence);
             }
         }
         if let Some(incidence) = self.accepted_rebuild_incidence.remove(from) {

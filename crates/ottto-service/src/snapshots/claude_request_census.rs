@@ -1451,7 +1451,7 @@ impl ClaudeRequestCensus {
     pub(crate) fn take(&mut self, key: &str) -> Option<ClaudeRequestCensusRecord> {
         let old = self.records.remove(key)?;
         self.charge(key, &old, false);
-        Some(old)
+        Some(old.into_inner())
     }
 
     /// Invalidate `key`'s record but keep its first-seen birth in place, so a

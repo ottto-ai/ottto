@@ -1456,7 +1456,7 @@ mod provenance_tests {
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),

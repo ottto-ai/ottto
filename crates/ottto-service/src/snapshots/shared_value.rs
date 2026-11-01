@@ -242,7 +242,8 @@ impl<K: Ord + Clone, V: Clone> SharedMap<K, V> {
             self.insert(key, value());
         }
     }
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    /// Returns the value's handle, so dropping it copies nothing.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<Shared<V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -250,7 +251,7 @@ impl<K: Ord + Clone, V: Clone> SharedMap<K, V> {
         if !self.0.contains_key(key) {
             return None;
         }
-        self.0.make_mut().remove(key).map(Shared::into_inner)
+        self.0.make_mut().remove(key)
     }
     pub fn clear(&mut self) {
         if !self.0.is_empty() {

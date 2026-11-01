@@ -1491,7 +1491,7 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
         .invalidate_keeping_birth_for_test(&grown.base.key);
     let moved = local_index_key(&grown.base.path.with_file_name("physical-other.jsonl"));
     let entry = grown.index.files.remove(&grown.base.key).unwrap();
-    grown.index.files.insert(moved.clone(), entry);
+    grown.index.files.insert_shared(moved.clone(), entry);
     let path = grown.base.fixture.root.join("prefix-index.json");
     grown.index.save(&path).unwrap();
     let mut loaded =

@@ -2394,7 +2394,7 @@ fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
     // A retired owner's witness persists, while its transcript is absent.
     index
         .claude_usage_family_witnesses
-        .insert(DORMANT.to_string(), witness);
+        .insert_shared(DORMANT.to_string(), witness);
     assert!(tombstone_retired_claude_family(
         &mut index.claude_retired_family_tombstones,
         DORMANT,
