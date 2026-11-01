@@ -248,9 +248,6 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
     let (first_index, first) = cold_full(ScanIndex::default());
     let path = f.destination.join("claude_code-scan-index-v3.json");
     let live = state_v2::money_test_support::publish(&first_index, &path, &progress_bytes());
-    let posture = crate::context_posture::cache_path(&f.support);
-    fs::create_dir_all(posture.parent().unwrap()).unwrap();
-    fs::write(&posture, CANARY).unwrap();
     // A finished bootstrap here must not narrow reconnect to the receipt window.
     let namespace = NAMESPACE.repeat(64);
     crate::backfill::update_backfill_state(&f.support, |state| {
@@ -267,7 +264,6 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
     disable_snapshot_source(&f.support, source).unwrap();
     assert_eq!(f.erase(), 0);
     assert!(!path.exists());
-    assert!(!posture.exists());
     let pending = crate::backfill::pending_backfill_sources_for_destination(
         &crate::backfill::load_backfill_state(&f.support),
         &namespace,

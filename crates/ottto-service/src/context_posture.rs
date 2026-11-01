@@ -78,7 +78,7 @@ pub struct ContextPostureCacheRow {
     pub dominant_model: Option<String>,
 }
 
-pub(crate) fn cache_path(support_dir: &Path) -> PathBuf {
+fn cache_path(support_dir: &Path) -> PathBuf {
     support_dir.join("context_posture").join("claude_code.json")
 }
 

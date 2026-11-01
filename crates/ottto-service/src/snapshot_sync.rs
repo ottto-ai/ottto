@@ -12708,15 +12708,12 @@ fn erase_source_files(
     source: SnapshotSource,
     complete: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let posture = (source == SnapshotSource::ClaudeCode)
-        .then(|| crate::context_posture::cache_path(support_dir));
     let others: Vec<PathBuf> = [
         crate::active_sessions::active_session_cache_path(support_dir, source),
         detected_uses_cache_path(support_dir, source),
         crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
-    .chain(posture)
     .flat_map(|path| [path.with_extension("json.tmp"), path])
     .collect();
     let stable = snapshot_index_path(support_dir, source);

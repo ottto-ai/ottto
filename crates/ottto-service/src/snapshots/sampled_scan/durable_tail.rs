@@ -1487,14 +1487,11 @@ impl SharedCache {
         }
     }
 
-    /// After a source's local copy is erased: only its slot and retirements.
-    pub(crate) fn durable_forget_source(&self, snapshot_source: SnapshotSource) {
-        if let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
-        {
+    /// After a source's local copy is erased. The next `durable_begin_pass` sees
+    /// no slot, so it also drops this source's pending retirements.
+    pub(crate) fn durable_forget_source(&self, source: SnapshotSource) {
+        if let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) {
             *stores.slot(source) = None;
-            for pending in &mut stores.retiring {
-                *pending = pending.filter(|pending| pending.source != snapshot_source);
-            }
         }
     }
 
