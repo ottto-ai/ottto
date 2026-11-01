@@ -7520,11 +7520,7 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
-    let roots = crate::snapshot_roots::scan_roots(
-        source,
-        home,
-        &inputs.scan_agent_status_collection.codex_scan_homes,
-    )?;
+    let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
