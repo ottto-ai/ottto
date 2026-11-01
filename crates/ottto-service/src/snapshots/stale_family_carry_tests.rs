@@ -1158,7 +1158,7 @@ fn assert_compacted_and_invalid(index: &ScanIndex, root: &str) {
     assert!(claude_stale_pending_keeps_census_invalid(
         index,
         root,
-        pending,
+        usage_pending::UsageView::Full(pending),
         true,
         &window_indexed_ids(index)
     ));
@@ -2626,7 +2626,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
             &mut fixture.index.claude_usage_family_pending,
             CARRY_FAILED,
             100,
-        );
+        )
+        .unwrap();
         assert!(fixture.index.claude_usage_family_pending[&root].invalid);
         assert!(fixture.index.claude_usage_family_pending[&root]
             .idless_revision
@@ -2660,7 +2661,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
                     &mut fixture.index.claude_usage_family_pending,
                     CARRY_FAILED,
                     100,
-                );
+                )
+                .unwrap();
             }
             "lossy" => {
                 let mut value =
@@ -4562,8 +4564,8 @@ fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
     for candidate in &fixture.candidates {
         let key = local_index_key(&candidate.path);
         let (root, member) = claude_index_path_family_member(&candidate.path).unwrap();
-        let hashes = &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes
-            [&member];
+        let hashes =
+            &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes[&member];
         let record = scoped_retry_record(
             &key,
             serde_json::json!({
@@ -4584,7 +4586,13 @@ fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         assert_eq!(row["rearmed_index_files"], healthy);
     }
-    let window = fixture.index.traversal.as_ref().unwrap().census_window_end.clone();
+    let window = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .census_window_end
+        .clone();
     (fixture, window)
 }
 
@@ -4641,7 +4649,11 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
             assert_eq!(counts, Default::default());
         }
         let owed = fixture.index.files.values().filter(|e| e.evidence_owed);
-        assert_eq!(owed.count(), usize::from(on), "only the changed member stays owed");
+        assert_eq!(
+            owed.count(),
+            usize::from(on),
+            "only the changed member stays owed"
+        );
     }
 }
 
@@ -4674,7 +4686,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         &window,
     );
     assert_eq!(parsed, 0);
-    for (root, pending) in &before {
+    for (root, pending) in before.iter() {
         let full = ClaudeUsageFamilyPending {
             census_window_end: window.clone(),
             ..pending.clone()
@@ -4732,7 +4744,10 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         &window,
     );
     assert_eq!(parsed, 0);
-    assert_eq!(scope.finish().contract.evidence_owed.restamped_from_record, 1);
+    assert_eq!(
+        scope.finish().contract.evidence_owed.restamped_from_record,
+        1
+    );
     assert_eq!(index.claude_usage_family_pending, full);
     assert!(!index.files[&key].evidence_owed);
     assert_eq!(
@@ -4760,7 +4775,11 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     // Cap-invalid: invalid, evidence-free pending from the record's window.
     let (mut fixture, window) = owed_rearmed(1, true);
     let root = fixture.roots[0].clone();
-    let pending = fixture.index.claude_usage_family_pending.get_mut(&root).unwrap();
+    let pending = fixture
+        .index
+        .claude_usage_family_pending
+        .get_mut(&root)
+        .unwrap();
     pending.member_occurrences.clear();
     pending.member_request_id_hashes.clear();
     pending.invalid = true;
@@ -4849,7 +4868,9 @@ fn owed_restamp_equals_a_real_fold_of_the_same_bytes() {
         index.files.insert(key, entry);
         candidates.push(candidate);
     }
-    index.confirmed_empty_files.insert(local_index_key(&paths[2]));
+    index
+        .confirmed_empty_files
+        .insert(local_index_key(&paths[2]));
     let fold = |index: &mut ScanIndex, window: &str| {
         let mut page = items.clone();
         apply_claude_reported_usage_with_index_and_limits(
@@ -4971,14 +4992,17 @@ fn owed_evidence_contract_stamp_restamps_under_the_latch_and_keeps_the_vetoes() 
     let (parsed, counts) = visit(&mut index);
     assert_eq!(parsed, 0);
     assert_eq!((counts.restamped_under_latch, counts.restamped), (2, 0));
-    for (root, pending) in &before {
+    for (root, pending) in before.iter() {
         let full = ClaudeUsageFamilyPending {
             census_window_end: window.clone(),
             ..pending.clone()
         };
         assert_eq!(index.claude_usage_family_pending[root], full);
     }
-    assert!(index.claude_request_identity_contract_changed, "latch untouched");
+    assert!(
+        index.claude_request_identity_contract_changed,
+        "latch untouched"
+    );
     assert!(index.files.values().all(|entry| entry.evidence_owed));
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(&index, &window),
@@ -5055,11 +5079,22 @@ fn owed_evidence_reads_are_capped_per_page() {
     );
     let counts = scope.finish().contract.evidence_owed;
     assert_eq!(
-        (parsed, counts.read, counts.refused_no_pending, counts.restamped),
+        (
+            parsed,
+            counts.read,
+            counts.refused_no_pending,
+            counts.restamped
+        ),
         (3, 3, 3, 0)
     );
 
-    let queued = fixture.index.traversal.as_ref().unwrap().pending_candidates.len();
+    let queued = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .len();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let mut page = evidence_owed::Page {
         read_cap: 1,
@@ -5070,8 +5105,16 @@ fn owed_evidence_reads_are_capped_per_page() {
     assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
     let traversal = fixture.index.traversal.as_ref().unwrap();
     assert_eq!(traversal.pending_candidates.len(), queued + 2);
-    assert!(traversal.pending_candidates.iter().skip(queued).all(|path| !path.census_member));
-    assert!(fixture.index.files.values().all(|entry| entry.evidence_owed));
+    assert!(traversal
+        .pending_candidates
+        .iter()
+        .skip(queued)
+        .all(|path| !path.census_member));
+    assert!(fixture
+        .index
+        .files
+        .values()
+        .all(|entry| entry.evidence_owed));
 }
 
 /// [regress] A persisted unfinished admission vetoed traversal health for
@@ -5139,7 +5182,10 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
                 .is_empty()
         })
         .count();
-    assert_eq!(cleared, 0, "re-armed members stay owed with their fingerprint");
+    assert_eq!(
+        cleared, 0,
+        "re-armed members stay owed with their fingerprint"
+    );
 
     // A healthy start is not completion: while members stay owed they give no
     // fence coverage, no family proof, no retirement and no latch clear.
@@ -5157,9 +5203,14 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
         .collect::<Vec<_>>();
     assert!(!pending.is_empty());
     for (root, pending) in pending {
-        assert!(evidence_owed::owed_at_completion(root, pending, false, &indexed));
+        assert!(evidence_owed::owed_at_completion(
+            root, pending, false, &indexed
+        ));
     }
-    assert_eq!(evidence_owed::latch_clearable(index, &window, &indexed), None);
+    assert_eq!(
+        evidence_owed::latch_clearable(index, &window, &indexed),
+        None
+    );
 }
 
 /// [behaviour] An unfinished admission dropped at an evidence-owed start keeps
@@ -5264,5 +5315,9 @@ fn owed_evidence_drop_keeps_unserved_due_service_once() {
     );
     let state = retained(&fixture.index);
     assert!(state.due_complete && state.complete);
-    assert!(!evidence_owed::due_unoffered(&fixture.index, &state, CARRY_RETRY));
+    assert!(!evidence_owed::due_unoffered(
+        &fixture.index,
+        &state,
+        CARRY_RETRY
+    ));
 }
