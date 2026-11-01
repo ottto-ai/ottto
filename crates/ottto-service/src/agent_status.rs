@@ -4077,6 +4077,15 @@ impl ClaudeDefaultHomeOwner {
         self.proven.is_some() && self.proven_binding() != self.cached
     }
 
+    /// Information only: the default home counts as the token owner's account.
+    fn split_login_diagnostic(&self) -> Option<AgentStatusDiagnostic> {
+        self.split_login().then(|| AgentStatusDiagnostic::source(
+            CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE,
+            AgentDiagnosticSeverity::Warning,
+            "Claude Desktop and the terminal use different accounts in the default Claude folder; it counts as the terminal login's account.",
+        ))
+    }
+
     /// The binding the default slot is verified against when it is not the
     /// one `.claude.json` names: none while unproven, the owner's on a split.
     fn binding_override(&self) -> Option<Option<(String, String)>> {
@@ -4139,8 +4148,7 @@ fn resolve_claude_default_home_owner(
     Some(resolved)
 }
 
-/// The owner check's hashes on the default slot's local status, and the adopt
-/// action on a split login.
+/// The owner check's hashes on the default slot's local status.
 fn apply_claude_default_home_owner(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     owner: Option<&ClaudeDefaultHomeOwner>,
@@ -4154,11 +4162,6 @@ fn apply_claude_default_home_owner(
         status.token_owner_organization_hash,
     ) = owner.proven_binding().unzip();
     status.owner_proven_at = owner.proven.as_ref().map(|owner| owner.proven_at.clone());
-    if owner.split_login() {
-        status.recommended_action =
-            Some(ottto_protocol::ClaudeConfigSlotRecommendedActionV1::ClaudeAdoptDefaultLogin);
-        status.adopt_target_account_hash = status.token_owner_account_hash.clone();
-    }
 }
 
 /// Also returns this pass's exact Claude Desktop folder pairs, read in the same
@@ -4252,13 +4255,7 @@ fn collect_claude_status(
         resolve_claude_default_home_owner(&login_state, stable, known_identities)
     });
     if let Some(owner) = &default_owner {
-        if owner.split_login() {
-            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE,
-                AgentDiagnosticSeverity::Warning,
-                "Claude Desktop and the terminal use different accounts in the default Claude folder; it counts as the terminal login's account.",
-            ));
-        }
+        snapshot.diagnostics.extend(owner.split_login_diagnostic());
         if owner.proven.is_none() {
             stable_default_credential = Err(ClaudeSlotProbeFailure::OwnerUnproven);
         }
@@ -27368,7 +27365,7 @@ for line in sys.stdin:
     /// token's owner is a known Max slot) resolves to that owner with the
     /// split code. [behaviour] Only a valid token whose plan contradicts
     /// `.claude.json` is checked: proven and known → that account's identity,
-    /// adopt action and hashes; proven as the cached account → its identity,
+    /// split code and hashes; proven as the cached account → its identity,
     /// the stale plan dropped; proven but unknown, or a failed check →
     /// unproven (the caller fails closed); a failure is not retried inside its
     /// back-off, and a proven token is not asked again. An expired token or
@@ -27440,19 +27437,19 @@ for line in sys.stdin:
                 status.token_owner_organization_hash.as_deref(),
                 status.cached_account_hash.as_deref(),
                 status.cached_organization_hash.as_deref(),
-                status
-                    .recommended_action
-                    .map(|action| serde_json::to_value(action).expect("action")),
-                status.adopt_target_account_hash.as_deref(),
             ),
             (
                 Some(terminal_account.as_str()),
                 Some(terminal_org.as_str()),
                 Some(desktop_account.as_str()),
                 Some(desktop_org.as_str()),
-                Some(serde_json::json!("claude_adopt_default_login")),
-                Some(terminal_account.as_str()),
             )
+        );
+        assert_eq!(
+            owner
+                .split_login_diagnostic()
+                .map(|diagnostic| diagnostic.code),
+            Some("claude_default_home_split_login".to_string())
         );
         assert!(status.owner_proven_at.is_some());
         let again = resolve(&mut stable("owner-check-token-a"), known);
