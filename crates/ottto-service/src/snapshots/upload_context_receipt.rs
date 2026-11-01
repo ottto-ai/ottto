@@ -11,6 +11,87 @@ pub(crate) struct Receipt {
     pub body_witness: String,
 }
 
+/// One entity's exact stored-body ACK, copied from the upload ledger so it
+/// outlives ACK retirement. Missing or mismatched means owed. It gates no
+/// credit, settlement, retirement, absence or family proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntityStamp {
+    pub context_fingerprint: String,
+    pub body_witness: String,
+    /// The file the entity belonged to at ACK; state-only entities have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_witness: Option<String>,
+}
+
+/// The inputs of the active upload context, digested, so a hash change can
+/// name what changed. Local scheduling data: only booleans reach a log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextInputs {
+    policy: String,
+    namespace: String,
+    cache_observations: bool,
+    copy_contract: bool,
+    resumed_prefix: bool,
+}
+
+impl ContextInputs {
+    pub(crate) fn new(
+        policy: &[u8],
+        namespace: Option<&str>,
+        cache_observations: bool,
+        copy_contract: bool,
+        resumed_prefix: bool,
+    ) -> Self {
+        Self {
+            policy: format!("{:x}", Sha256::digest(policy)),
+            namespace: format!(
+                "{:x}",
+                Sha256::digest(namespace.unwrap_or("none").as_bytes())
+            ),
+            cache_observations,
+            copy_contract,
+            resumed_prefix,
+        }
+    }
+}
+
+/// Per-item upload-context proof kept with the index. Old decoders drop it.
+/// Stamps are bound as a set to one destination and replay generation, and
+/// bounded by live entities not yet covered by their file's receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProofState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<ContextInputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_namespace_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+}
+
+impl ProofState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inputs.is_none() && self.entity_stamps.is_empty()
+    }
+}
+
+/// Measured backlog of entities and files that still owe proof under the
+/// active context. Bytes are local file sizes; state-only entities have none.
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OwedCounts {
+    pub no_proof_entities: u64,
+    pub no_proof_bytes: u64,
+    pub wrong_context_entities: u64,
+    pub wrong_context_bytes: u64,
+    pub empty_pending_files: u64,
+    pub empty_pending_bytes: u64,
+}
+
+const OWED_LOG_INTERVAL_SECONDS: u64 = 3_600;
+static OWED_LOGGED_AT: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Captured from the final admitted bodies under their own context, before POST.
 /// Never serialized. A restored ACK counts only through `prior_acks`: its
 /// durable stamp of this same mode context and exact body (Lead B Q1).
@@ -116,8 +197,7 @@ impl ScanIndex {
     }
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
         self.activate_upload_context(context);
-        self.file_upload_context_enabled =
-            matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
+        self.file_upload_context_enabled = true;
         self.activate_quarantine_witness(source);
     }
 
@@ -164,6 +244,8 @@ impl ScanIndex {
                     .files
                     .values()
                     .filter_map(|entry| entry.upload_context_receipt.as_ref())
+                    // A local empty proof is not ACK evidence.
+                    .filter(|receipt| !receipt.body_witness.is_empty())
                     .any(|receipt| on(&receipt.context_fingerprint))
         };
         self.copy_prefix_base_upload_context = base.filter(|base| enabled || on_evidence(base));
@@ -445,6 +527,7 @@ impl ScanIndex {
                 .map_or(true, |receipt| {
                     receipt.context_fingerprint != candidate.receipt.context_fingerprint
                         || receipt.replay_generation != candidate.receipt.replay_generation
+                        || receipt.body_witness.is_empty()
                 });
             entry.upload_context_receipt = Some(candidate.receipt.clone());
             if rearmed {
@@ -489,7 +572,237 @@ impl ScanIndex {
         self.requeue_split_context_reads(progressed.into_iter());
         counts
     }
+
+    /// Local proof that this empty or suppressed file was evaluated under its
+    /// expected context: nothing was emitted, ACKed or credited. The empty body
+    /// witness never satisfies `receipt_matches`. An ACK receipt of the same
+    /// context stays, as main keeps it through census settlement.
+    pub(super) fn note_empty_file_upload_context(&mut self, key: &str) {
+        if !self.file_upload_context_enabled {
+            return;
+        }
+        let Some(context) = self.file_expected_context(key).cloned() else {
+            return;
+        };
+        let Some(entry) = self.files.get_mut(key) else {
+            return;
+        };
+        if entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                receipt.context_fingerprint == context && !receipt.body_witness.is_empty()
+            })
+        {
+            return;
+        }
+        entry.upload_context_receipt = Some(Receipt {
+            context_fingerprint: context,
+            replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+            source_witness: entry.source_file_fingerprint.clone(),
+            body_witness: String::new(),
+        });
+    }
+
+    /// A file that has bodies again no longer has an empty proof.
+    pub(super) fn clear_empty_file_upload_context(&mut self, key: &str) {
+        if let Some(entry) = self.files.get_mut(key) {
+            if entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.body_witness.is_empty())
+            {
+                entry.upload_context_receipt = None;
+            }
+        }
+    }
+
+    /// Copy exact stored-body ACKs from the ledger, before an index save can
+    /// let them retire. All three sources, including state-only Codex entities.
+    /// A stamp stays until its file's receipt covers it or the entity leaves.
+    pub(crate) fn stamp_entity_upload_context_acks(
+        &mut self,
+        destination: &str,
+        bodies: &BTreeMap<String, String>,
+        contexts: &BTreeMap<String, String>,
+    ) {
+        if contexts.is_empty() && self.upload_context_proof.entity_stamps.is_empty() {
+            return;
+        }
+        let replay = self.historical_replay_generation.clone();
+        let mut stamps = std::mem::take(&mut self.upload_context_proof.entity_stamps);
+        if self
+            .upload_context_proof
+            .destination_namespace_hash
+            .as_deref()
+            != Some(destination)
+            || self.upload_context_proof.replay_generation != replay
+        {
+            stamps.clear();
+            self.upload_context_proof.destination_namespace_hash = Some(destination.to_string());
+            self.upload_context_proof.replay_generation = replay;
+        }
+        for (entity, context) in contexts {
+            let Some(body) = bodies.get(entity) else {
+                continue;
+            };
+            let current = stamps.get(entity).is_some_and(|stamp| {
+                stamp.context_fingerprint == *context && stamp.body_witness == *body
+            });
+            if !current {
+                stamps.insert(
+                    entity.clone(),
+                    EntityStamp {
+                        context_fingerprint: context.clone(),
+                        body_witness: body.clone(),
+                        source_witness: None,
+                    },
+                );
+            }
+        }
+        let live = self
+            .upload_progress_ack_incidence()
+            .collect::<BTreeSet<_>>();
+        stamps.retain(|entity, _| live.contains(entity.as_str()));
+        for (key, members) in &self.file_snapshot_fingerprints {
+            let Some(entry) = self.files.get(key) else {
+                continue;
+            };
+            let proven = self.receipt_matches(key, entry);
+            for member in members {
+                if proven {
+                    stamps.remove(member);
+                } else if let Some(stamp) = stamps.get_mut(member) {
+                    if stamp.source_witness.is_none() {
+                        stamp.source_witness = Some(entry.source_file_fingerprint.clone());
+                    }
+                }
+            }
+        }
+        self.upload_context_proof.entity_stamps = stamps;
+    }
+
+    /// One counts-only line when the active context's inputs change.
+    pub(crate) fn note_upload_context_inputs(
+        &mut self,
+        source: SnapshotSource,
+        inputs: ContextInputs,
+    ) {
+        if let Some(previous) = self
+            .upload_context_proof
+            .inputs
+            .as_ref()
+            .filter(|previous| **previous != inputs)
+        {
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_input_change",
+                source.api_slug(),
+                &BTreeMap::from([
+                    ("policy", previous.policy != inputs.policy),
+                    ("namespace", previous.namespace != inputs.namespace),
+                    (
+                        "cache_flag",
+                        previous.cache_observations != inputs.cache_observations,
+                    ),
+                    (
+                        "copy_contract",
+                        previous.copy_contract != inputs.copy_contract,
+                    ),
+                    (
+                        "resumed_prefix",
+                        previous.resumed_prefix != inputs.resumed_prefix,
+                    ),
+                ]),
+            );
+        }
+        self.upload_context_proof.inputs = Some(inputs);
+    }
+
+    /// Gates nothing: what per-item proof would still owe under this context.
+    pub(crate) fn upload_context_owed_counts(&self) -> OwedCounts {
+        let mut counts = OwedCounts::default();
+        let Some(active) = self.active_upload_context_fingerprint.as_ref() else {
+            return counts;
+        };
+        let stamps = &self.upload_context_proof.entity_stamps;
+        let stamped = |entity: &str| {
+            stamps
+                .get(entity)
+                .is_some_and(|stamp| stamp.context_fingerprint == *active)
+        };
+        for (key, entry) in &self.files {
+            let Some(expected) = self.file_expected_context(key) else {
+                continue;
+            };
+            let receipt = entry.upload_context_receipt.as_ref();
+            if self.confirmed_empty_files.contains(key) {
+                let proven = receipt.is_some_and(|receipt| {
+                    receipt.body_witness.is_empty()
+                        && receipt.context_fingerprint == *expected
+                        && receipt.replay_generation
+                            == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
+                        && receipt.source_witness == entry.source_file_fingerprint
+                });
+                if !proven {
+                    counts.empty_pending_files += 1;
+                    counts.empty_pending_bytes =
+                        counts.empty_pending_bytes.saturating_add(entry.size_bytes);
+                }
+                continue;
+            }
+            let Some(members) = self.file_snapshot_fingerprints.get(key) else {
+                continue;
+            };
+            if members.is_empty() || self.receipt_matches(key, entry) {
+                continue;
+            }
+            let owed = members.iter().filter(|fp| !stamped(fp.as_str())).count() as u64;
+            if receipt.is_some_and(|receipt| {
+                !receipt.body_witness.is_empty() && receipt.context_fingerprint != *expected
+            }) {
+                counts.wrong_context_entities += owed;
+                counts.wrong_context_bytes =
+                    counts.wrong_context_bytes.saturating_add(entry.size_bytes);
+            } else {
+                counts.no_proof_entities += owed;
+                counts.no_proof_bytes = counts.no_proof_bytes.saturating_add(entry.size_bytes);
+            }
+        }
+        for entity in self.codex_state_only_snapshot_fingerprints.values() {
+            match stamps.get(entity) {
+                None => counts.no_proof_entities += 1,
+                Some(stamp) if stamp.context_fingerprint != *active => {
+                    counts.wrong_context_entities += 1;
+                }
+                Some(_) => {}
+            }
+        }
+        counts
+    }
+
+    /// The owed backlog, per source, at most once an hour.
+    pub(crate) fn emit_upload_context_owed(&self, source: SnapshotSource) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let slot = match source {
+            SnapshotSource::ClaudeCode => 0,
+            SnapshotSource::Codex => 1,
+            SnapshotSource::Pi => 2,
+        };
+        let now = sampled_scan::now_seconds();
+        if now.saturating_sub(OWED_LOGGED_AT[slot].load(Relaxed)) < OWED_LOG_INTERVAL_SECONDS {
+            return;
+        }
+        OWED_LOGGED_AT[slot].store(now, Relaxed);
+        crate::local_resource_diagnostics::traversal_point(
+            "upload_context_owed",
+            source.api_slug(),
+            &self.upload_context_owed_counts(),
+        );
+    }
 }
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
+crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness, source_witness);
+crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);

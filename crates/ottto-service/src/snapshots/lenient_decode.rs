@@ -413,6 +413,10 @@ impl Serialize for ScanIndex {
             claude_copy_removals,
             claude_request_money::copy_removals::CopyRemovals::is_unwritten
         );
+        field!(
+            upload_context_proof,
+            upload_context_receipt::ProofState::is_empty
+        );
         map.end()
     }
 }
@@ -506,6 +510,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
+    "upload_context_proof",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2339,6 +2344,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "codex_counting_evicted_legacy" => {
                             index.codex_counting_evicted_legacy =
+                                self.history_scalar(value, Default::default())?
+                        }
+                        "upload_context_proof" => {
+                            // Damage only means owed: the proof is lost, never
+                            // the index.
+                            index.upload_context_proof =
                                 self.history_scalar(value, Default::default())?
                         }
                         "codex_counting_tombstones" => {

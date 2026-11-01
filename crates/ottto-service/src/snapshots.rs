@@ -59,6 +59,7 @@ mod claude_context_file_birth;
 mod upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
+pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
@@ -4103,6 +4104,13 @@ pub struct ScanIndex {
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
+    /// Per-item upload-context proof. Appended for old readers, which drop it;
+    /// missing means owed. Gates no decision yet.
+    #[serde(
+        default,
+        skip_serializing_if = "upload_context_receipt::ProofState::is_empty"
+    )]
+    pub(crate) upload_context_proof: upload_context_receipt::ProofState,
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,
@@ -4319,6 +4327,7 @@ impl Default for ScanIndex {
             claude_request_identity_contract_changed: false,
             claude_desktop_store_inventory: None,
             claude_copy_removals: Default::default(),
+            upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
             claude_desktop_store_cursor: None,
@@ -8637,6 +8646,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             index
                 .confirmed_empty_files
                 .insert(pending.index_key.clone());
+            index.note_empty_file_upload_context(&pending.index_key);
         } else {
             index
                 .file_snapshot_fingerprints
@@ -48722,6 +48732,7 @@ impl ScanIndex {
         for entry in self.files.values_mut() {
             entry.upload_context_receipt = None;
         }
+        self.upload_context_proof.entity_stamps.clear();
         self.upload_context_fingerprint = None;
         // Replay resets delivery authority, not file-owned recovery evidence.
         // Otherwise a missing member or expired trace can silently shrink or
@@ -51634,6 +51645,7 @@ impl ScanIndex {
                 || previous.claude_request_identity_contract_changed,
             claude_desktop_store_inventory: self.claude_desktop_store_inventory.clone(),
             claude_copy_removals: self.claude_copy_removals.clone(),
+            upload_context_proof: self.upload_context_proof.clone(),
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
@@ -52807,9 +52819,11 @@ impl ScanIndex {
                     self.claude_copy_removals
                         .clear_hold(claude_money_birth_store::location_key(&key));
                 }
+                self.note_empty_file_upload_context(&key);
                 self.confirmed_empty_files.insert(key);
             }
             ScanParseOutcome::Snapshot | ScanParseOutcome::Unknown => {
+                self.clear_empty_file_upload_context(&key);
                 self.confirmed_empty_files.remove(&key);
             }
         }

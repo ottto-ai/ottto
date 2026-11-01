@@ -585,6 +585,10 @@ impl Uploader {
         let c = &self.progress.context_resend.counts;
         (c.entities, c.bytes, c.identical, c.changed)
     }
+    pub(crate) fn deferral_counts(&self) -> (u64, u64) {
+        let c = &self.progress.context_resend.counts;
+        (c.budget_deferred, c.server_conflicts)
+    }
     pub(crate) fn fresh_count(&self) -> usize {
         self.progress.fresh_context_body_acks.len()
     }

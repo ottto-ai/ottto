@@ -3740,6 +3740,11 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &progress.split_context_receipt_candidates(),
         &progress.fresh_context_body_acks,
     );
+    committable.stamp_entity_upload_context_acks(
+        &progress.destination_namespace_hash,
+        &progress.accepted_body_witnesses,
+        &progress.accepted_body_contexts,
+    );
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
         .save_with_progress_owner(index_path, read_limit, &progress_owner)
@@ -6919,6 +6924,16 @@ fn prepare_sync_source_inner(
         (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
         resumed_prefix_enabled,
     );
+    index.note_upload_context_inputs(
+        source,
+        crate::snapshots::UploadContextInputs::new(
+            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            checkpoint_namespace.as_deref(),
+            cache_observations_enabled,
+            copy_unproven_enabled,
+            resumed_prefix_enabled,
+        ),
+    );
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.
@@ -9012,6 +9027,11 @@ fn finish_sync_source(
         &upload_progress.split_context_receipt_candidates(),
         &upload_progress.fresh_context_body_acks,
     );
+    index.stamp_entity_upload_context_acks(
+        &upload_progress.destination_namespace_hash,
+        &upload_progress.accepted_body_witnesses,
+        &upload_progress.accepted_body_contexts,
+    );
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
@@ -9057,6 +9077,7 @@ fn finish_sync_source(
     )?;
     scan_result.report_discovery_growth_after_save(&index);
     context_rearm_counts.emit(source);
+    index.emit_upload_context_owed(source);
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
     crate::snapshots::durable_after_save_and_retire(
@@ -9382,11 +9403,7 @@ fn activate_source_upload_context(
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend =
-        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
-            upload_context_resend::Cycle::new(context, index.source_upload_context_matches())
-        } else {
-            upload_context_resend::Cycle::default()
-        };
+        upload_context_resend::Cycle::new(context, index.source_upload_context_matches());
 }
 
 /// Production form of the above: outside a historical replay, due refusal
@@ -11838,6 +11855,14 @@ where
                 .is_some_and(|record| record.body_witness == **body)
         })
         .count();
+    // Labelled apart; both still report Deferred until receipts are authoritative.
+    let resend_counts = &mut progress.context_resend.counts;
+    resend_counts.budget_deferred = resend_counts
+        .budget_deferred
+        .saturating_add(context_budget_deferred as u64);
+    resend_counts.server_conflicts = resend_counts
+        .server_conflicts
+        .saturating_add(conflicted_entities as u64);
     if let Some(error) = deferred_validation_error {
         Err(error)
     } else if conflicted_entities > 0 || context_budget_deferred > 0 {
