@@ -4541,7 +4541,7 @@ fn delivery_wake<'a>(
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        retry.boundary(std::iter::empty(), home, support_dir, daemon);
+        retry.boundary(home, support_dir, daemon);
         retry.wake_before(ordinary)
     }
 }
@@ -5213,12 +5213,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
-    fn serial_fallback(&mut self, source: SnapshotSource) {
-        crate::local_resource_diagnostics::source_rotation_serial_fallback(
-            source.api_slug(),
-            crate::heap_layout_bound::layout_supported(),
-        );
-    }
     fn prepare(
         &mut self,
         source: SnapshotSource,
@@ -5281,9 +5275,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                 scan,
             } => crate::source_rotation::Step::Complete((preparation, index, scan)),
         }
-    }
-    fn bound(&self, frame: &SourcePreparation, limit: usize) -> Option<usize> {
-        crate::heap_layout_bound::bound(frame, limit)
     }
     fn finish(&mut self, mut completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
         completed.0.accept_native_rotation_turn(remaining);
@@ -5386,9 +5377,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             .withheld_memo
             .discard_if_refused();
     }
-    fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
+    fn boundary(&mut self) {
         self.retry
-            .boundary(busy, self.home, self.support_dir, self.daemon);
+            .boundary(self.home, self.support_dir, self.daemon);
     }
 }
 
@@ -6192,30 +6183,10 @@ fn collect_native_preparation_with_rotation(
 fn try_collect_native_preparation_with_rotation(
     frame: SourcePreparation,
 ) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
-    try_collect_native_preparation_with_rotation_observed(frame, false)
-}
-#[cfg(test)]
-fn collect_unparkable_preparation_with_rotation(
-    frame: SourcePreparation,
-) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-    // source_rotation.rs:186-188,293-315: parking is optional overlap; an
-    // unparkable ordinary active frame continues serially with the same owner.
-    // Only the large-history starvation regression selects this adapter.
-    try_collect_native_preparation_with_rotation_observed(frame, true)
-        .expect("ordinary serial owned source completion")
-}
-#[cfg(test)]
-fn try_collect_native_preparation_with_rotation_observed(
-    frame: SourcePreparation,
-    require_parking_refusal: bool,
-) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
     struct Collect {
         frame: Option<SourcePreparation>,
         completed: Option<(SourcePreparation, ScanIndex, SourceScanResult)>,
         failure: Option<anyhow::Error>,
-        require_parking_refusal: bool,
-        parking_refused: bool,
-        parked_frames: usize,
         started: Instant,
         steps: usize,
     }
@@ -6243,26 +6214,11 @@ fn try_collect_native_preparation_with_rotation_observed(
             remaining: Option<usize>,
         ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
             self.steps += 1;
-            // The large serial page visits up to the real 10k-file limit,
-            // including unchanged candidates that each yield a scan step.
-            // Keep the original small-fixture guard for every other caller.
-            let step_limit = if self.require_parking_refusal {
-                1024 + 4 * crate::snapshots::MAX_BACKFILL_FILES_PER_SOURCE
-            } else {
-                1024
-            };
             assert!(
-                self.steps <= step_limit,
+                self.steps <= 1024,
                 "same owned scanner must finish within existing fixture steps"
             );
             frame.accept_native_rotation_turn(remaining);
-            if self.require_parking_refusal && !self.parking_refused {
-                // Evaluate the real Owner::bound on the actual moving frame,
-                // including both indexes and the ordinary candidate queue.
-                self.parking_refused = self
-                    .bound(&frame, crate::source_rotation::PARKED_BUDGET)
-                    .is_none();
-            }
             match frame.step() {
                 SourcePreparationStep::Pending(frame) => {
                     crate::source_rotation::Step::Pending(frame)
@@ -6277,12 +6233,6 @@ fn try_collect_native_preparation_with_rotation_observed(
                     scan,
                 } => crate::source_rotation::Step::Complete((preparation, index, scan)),
             }
-        }
-        fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
-            crate::heap_layout_bound::bound(frame, limit)
-        }
-        fn parked(&mut self, _: usize) {
-            self.parked_frames += 1;
         }
         fn finish(
             &mut self,
@@ -6307,30 +6257,16 @@ fn try_collect_native_preparation_with_rotation_observed(
         frame: Some(frame),
         completed: None,
         failure: None,
-        require_parking_refusal,
-        parking_refused: false,
-        parked_frames: 0,
         started: Instant::now(),
         steps: 0,
     };
-    // The original rotation calculates queue/parked/retained deductions. No
+    // The original rotation calculates queue/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
     let budget =
         tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
     crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
-    }
-    if require_parking_refusal {
-        assert!(
-            owner.parking_refused,
-            "the real source-rotation bound must refuse parking this large frame"
-        );
-        assert_eq!(owner.parked_frames, 0, "the active frame runs serially");
-        eprintln!(
-            "large_history_serial_rotation: actual_bound_refused=true parked_frames=0 steps={}",
-            owner.steps
-        );
     }
     owner.completed.context("owned source completion")
 }
