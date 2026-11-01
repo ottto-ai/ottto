@@ -1235,7 +1235,16 @@ impl TransitionDriver for Codex24b {
 }
 
 fn codex_24b_old_writer_row(require_zero_old_bytes: bool, v2: bool) {
-    let mut c = corpus("transition-codex-24b");
+    let mut c = corpus(if v2 {
+        "transition-codex-24b-state-v2"
+    } else {
+        "transition-codex-24b"
+    });
+    if v2 {
+        // Custody, record store and writer lock share one canonical prefix.
+        c.base = c.base.canonicalize().unwrap();
+        c.support = c.base.join("support");
+    }
     c.root = c.base.join(".codex/sessions");
     std::fs::create_dir_all(&c.root).unwrap();
     let path = c.root.join("rollout.jsonl");
@@ -1252,7 +1261,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool, v2: bool) {
         let (custody, start) = crate::snapshots::StateV2ColdSession::publish(
             crate::snapshots::scan_index_persistence::Source::Codex,
             &ScanIndex::default(),
-            &disk.dir.canonicalize().unwrap(),
+            &disk.dir,
         );
         disk.index = custody.path().to_owned();
         (Some(custody), start)
