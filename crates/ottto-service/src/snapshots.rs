@@ -3334,7 +3334,8 @@ pub(crate) fn begin_continuation_read_ranges_for_test() {
 }
 #[derive(Debug)]
 pub(crate) struct CodexContinuationEvidence {
-    inventory: codex_file_join::HeaderInventory, // Complete roster, including ledger paths.
+    // The page's roster; a minted ticket keeps only the paused job's share.
+    inventory: codex_file_join::HeaderInventory,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     codex: CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
@@ -3346,17 +3347,18 @@ impl CodexContinuationEvidence {
     }
     /// The paused singleton's share of its page's evidence: the rows its
     /// path's reduction fingerprint reads, its owner's headers and the parent
-    /// ledger its read can still look up (all while its header is undecided).
-    /// Traces stay whole for turns not yet read. None, counted `not_mintable`,
-    /// unless the share gives the resume check the full fingerprint, so a
-    /// continuation never fails a check its page's evidence would pass.
+    /// ledgers its read can still look up (all while its header is undecided,
+    /// none after: only the header's decision reads them). Traces stay whole
+    /// for turns not yet read. None, counted `not_mintable`, unless the share
+    /// gives the resume check the full fingerprint, so a continuation never
+    /// fails a check its page's evidence would pass.
     fn for_paused_job(
         mut self,
-        sampling: Option<&sampled_scan::Context>,
+        cache: Option<&sampled_scan::SharedCache>,
         ticket: &sampled_scan::codex_cursor::CodexCursorTicket,
     ) -> Option<Self> {
-        let job = sampling.and_then(|context| context.cache.paused_singleton(ticket));
-        let narrowed = job.and_then(|(path, owner, parent)| {
+        let job = cache.and_then(|cache| cache.paused_singleton(ticket));
+        let narrowed = job.and_then(|(path, owner, decided)| {
             let codex = self.codex.narrowed_to(&path);
             #[cfg(test)]
             let codex = {
@@ -3369,22 +3371,14 @@ impl CodexContinuationEvidence {
             {
                 return None;
             }
-            self.inventory.retain_headers(|header| {
+            self.inventory.keep_job_share(|header| {
                 Some(&header.owner) == owner.as_ref() || header.candidate.path == path
             });
-            let ledgers = match parent {
-                None => self.ledgers,
-                Some(parent) => self.ledgers.map(|shared| {
-                    let kept = shared.lock().ok().and_then(|ledgers| {
-                        let (id, ledger) = ledgers.get_key_value(parent.as_ref()?)?;
-                        Some((id.clone(), ledger.clone()))
-                    });
-                    Arc::new(Mutex::new(kept.into_iter().collect()))
-                }),
-            };
             Some(Self {
                 inventory: self.inventory,
-                ledgers,
+                ledgers: self
+                    .ledgers
+                    .map(|whole| if decided { Arc::default() } else { whole }),
                 codex,
                 traces: self.traces,
             })
@@ -31508,7 +31502,10 @@ impl OwnedSourceScan {
                             traces: codex_turn_traces,
                         })
                         .and_then(|evidence| match continuation_ticket.as_ref() {
-                            Some(ticket) => evidence.for_paused_job(sampling.as_ref(), ticket),
+                            Some(ticket) => evidence.for_paused_job(
+                                sampling.as_ref().map(|context| context.cache.as_ref()),
+                                ticket,
+                            ),
                             None => Some(evidence),
                         })
                         .map(|evidence| Arc::new(Mutex::new(Some(evidence))));
@@ -32338,7 +32335,10 @@ impl OwnedSourceScan {
                 let continuation_evidence = continuation_evidence
                     .zip(continuation_ticket.as_ref())
                     .and_then(|(evidence, ticket)| {
-                        evidence.for_paused_job(sampling.as_ref(), ticket)
+                        evidence.for_paused_job(
+                            sampling.as_ref().map(|context| context.cache.as_ref()),
+                            ticket,
+                        )
                     });
                 let scan = SourceScanResult {
                     census_status,
