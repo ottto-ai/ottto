@@ -42127,11 +42127,22 @@ enum PiUsageRecordShape {
     MessageEnd,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PiUsageDedupState {
     message: BTreeMap<String, usize>,
     message_end: BTreeMap<String, usize>,
     paired_digests: BTreeSet<String>,
+}
+
+/// Counts only: the occurrence digests are unkeyed hashes.
+impl std::fmt::Debug for PiUsageDedupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiUsageDedupState")
+            .field("message", &self.message.len())
+            .field("message_end", &self.message_end.len())
+            .field("paired_digests", &self.paired_digests.len())
+            .finish()
+    }
 }
 
 crate::durable_tail_codec::durable_struct!(PiUsageDedupState {
@@ -42176,7 +42187,7 @@ impl PiUsageDedupState {
 /// state. A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
 /// Claude and Codex leave it empty and never persist it; Pi persists it only
 /// in the Pi record section.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PiLedger {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
     /// Set only for a file whose header names a parent; boxed so other
@@ -42202,6 +42213,16 @@ pub(crate) struct PiFork {
 }
 
 /// Never prints the local header time or `parentSession`.
+/// Counts only: the usage keys are unkeyed hashes.
+impl std::fmt::Debug for PiLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiLedger")
+            .field("usage_keys", &self.usage_keys.len())
+            .field("has_parent", &self.fork_parts().0)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for PiFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PiFork")

@@ -99,6 +99,24 @@ fn verify_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
     result
 }
 
+/// Every key, occurrence count and digest, and the fork values. `Debug`
+/// prints counts only.
+fn ledger_contents(reduction: &CachedJsonlReduction) -> impl PartialEq + std::fmt::Debug {
+    let ledger = &reduction.accumulator.seen_pi_usage_keys;
+    let keys = ledger
+        .iter()
+        .map(|(key, state)| {
+            (
+                key.clone(),
+                state.message.clone(),
+                state.message_end.clone(),
+                state.paired_digests.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    (keys, ledger.fork_parts())
+}
+
 fn take_section(d: &mut Dec<'_>) -> Result<PiSection, Corrupt> {
     PiSection::take(d)
 }
@@ -122,8 +140,8 @@ fn plain_trailing_pi_body_counts_and_round_trips() {
     assert_eq!(verify_without_allocation(&bytes), Ok(()));
     let decoded = take_body(&mut Dec::new(&bytes)).unwrap();
     assert_eq!(
-        format!("{:?}", decoded.reduction.accumulator.seen_pi_usage_keys),
-        format!("{:?}", original.accumulator.seen_pi_usage_keys)
+        ledger_contents(&decoded.reduction),
+        ledger_contents(&original)
     );
     let mut again = Enc::bytes(RECORD_BYTES);
     put(&mut again, &decoded.reduction, &decoded.rederive).unwrap();
