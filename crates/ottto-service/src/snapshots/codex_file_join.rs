@@ -894,6 +894,7 @@ impl TierReplay {
         context.merge(selector.clone());
         context.context.remove("service_tier");
         context.sources.remove("service_tier");
+        context.context.remove(CODEX_THREAD_TIER);
         let mut context_digest = ContentDigest(Sha256::new());
         let _ = serde_json::to_writer(
             &mut context_digest,

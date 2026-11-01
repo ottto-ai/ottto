@@ -724,6 +724,10 @@ enum ProviderPriceLineKind {
     /// Prompt-length tiered: a request strictly over the line bills ALL of
     /// its tokens at the provider's long-context rate.
     Tiered,
+    /// `Tiered`, but only for usage dated from
+    /// `CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS`: a line added after usage
+    /// was accepted without a bucket must not restate that usage on a re-read.
+    TieredForward,
     /// Flat price at every prompt length: the line only separates 1M-window
     /// usage for analysis (the Claude 200K boundary above).
     Analysis,
@@ -733,7 +737,7 @@ enum ProviderPriceLineKind {
 impl ProviderPriceLineKind {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Tiered => "tiered",
+            Self::Tiered | Self::TieredForward => "tiered",
             Self::Analysis => "analysis",
         }
     }
@@ -765,6 +769,16 @@ const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
     ("gpt-6-luna", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-6-sol", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-6-1-sol", 272_000, ProviderPriceLineKind::Tiered),
+    (
+        "gpt-6-1-terra",
+        272_000,
+        ProviderPriceLineKind::TieredForward,
+    ),
+    (
+        "gpt-6-rosalind",
+        272_000,
+        ProviderPriceLineKind::TieredForward,
+    ),
     // Anthropic: every Haiku 5.5 rate 5x above 100K.
     ("claude-haiku-5-5", 100_000, ProviderPriceLineKind::Tiered),
     // Anthropic full 1M window at standard rates.
@@ -889,6 +903,19 @@ fn provider_price_line(model: &str) -> Option<(u64, ProviderPriceLineKind)> {
 /// restating the price split never touches older history.
 const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
 
+/// 2026-11-04T00:00:00Z, provisional: set at the release cut to the 00:00Z
+/// on/after install on every machine. Codex thread-settings tiers and
+/// `TieredForward` lines count only evidence and usage dated from here, so a
+/// request's row is a function of its file's bytes on every read route and
+/// usage accepted before the release keeps exactly the row it had.
+const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+
+fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+    timestamp
+        .and_then(rfc3339_unix_seconds)
+        .is_some_and(|seconds| seconds >= CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
+}
+
 /// One request's bucket from its prompt size, its model and its own usage
 /// timestamp. `None` when the model has no catalog line. A tiered line also
 /// needs a known, non-zero prompt dated on or after the effective date: an
@@ -904,6 +931,11 @@ pub(crate) fn provider_context_bucket(
         && (prompt_tokens == 0
             || observed_at.and_then(rfc3339_unix_seconds)?
                 < PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS)
+    {
+        return None;
+    }
+    if kind == ProviderPriceLineKind::TieredForward
+        && (prompt_tokens == 0 || !in_codex_forward_evidence_epoch(observed_at))
     {
         return None;
     }
@@ -20582,6 +20614,44 @@ impl SnapshotAccumulator {
         priority
     }
 
+    /// Replace the running requested tier from one in-epoch thread-settings
+    /// snapshot. A snapshot without an explicit known tier clears it, so an
+    /// earlier Fast never outlives its replacement. Pre-epoch and undated
+    /// events are ignored: a record saved before the release holds no tier, so
+    /// counting them would make a Full differ from its restored Tail.
+    fn note_codex_thread_settings(&mut self, value: &Value, timestamp: Option<&str>) {
+        if !string_eq_at(value, &["type"], "event_msg")
+            || !string_eq_at(value, &["payload", "type"], "thread_settings_applied")
+            || !in_codex_forward_evidence_epoch(timestamp)
+        {
+            return;
+        }
+        let context = &mut self.current_selector.context;
+        match string_at(value, &["payload", "thread_settings", "service_tier"]).as_deref() {
+            Some("default") => context.insert(CODEX_THREAD_TIER.into(), "standard".into()),
+            Some("fast" | "priority") => {
+                context.insert(CODEX_THREAD_TIER.into(), "priority".into())
+            }
+            Some("flex") => context.insert(CODEX_THREAD_TIER.into(), "flex".into()),
+            _ => context.remove(CODEX_THREAD_TIER),
+        };
+    }
+
+    /// Stamp one in-epoch request with its requested-tier estimate. Runs after
+    /// `logs_2` and the protected replay, whose tiers win; the replay never
+    /// sees this stamp, so it files no applied-tier receipt.
+    fn stamp_codex_thread_tier(&self, selector: &mut SelectorCapture, timestamp: Option<&str>) {
+        let Some(tier) = self.current_selector.context.get(CODEX_THREAD_TIER) else {
+            return;
+        };
+        if in_codex_forward_evidence_epoch(timestamp)
+            && !selector.context.contains_key("service_tier")
+            && !self.current_selector.context.contains_key("service_tier")
+        {
+            selector.insert("service_tier", tier.clone(), "derived_from_thread_settings");
+        }
+    }
+
     fn add_usage_with_selector(
         &mut self,
         model: Option<String>,
@@ -21705,6 +21775,11 @@ fn build_row_identity(
     };
     (row_key, reduced_context, reduced_sources)
 }
+
+/// `current_selector` key of the running Codex requested tier: reducer state
+/// that survives Tail and restore in the record. Not in
+/// `SELECTOR_CONTEXT_ALLOWED`, so it never reaches a row or the wire.
+const CODEX_THREAD_TIER: &str = "codex_thread_tier";
 
 // Mirror of backend SELECTOR_FIELDS (selector_context.py). Daemon-side
 // reduction matches the backend's normalize_selector_context so two rows
@@ -38010,6 +38085,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     );
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
+    accumulator.note_codex_thread_settings(value, timestamp.as_deref());
     if let Some(effort) = codex_reasoning_effort(value) {
         accumulator.latest_reasoning_effort = Some(effort);
     }
@@ -38129,6 +38205,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 accumulator.latest_turn_id.as_deref(),
             )
         });
+        accumulator.stamp_codex_thread_tier(&mut usage_selector, timestamp.as_deref());
         // Stamp this response's long-context price bucket on the same per-line
         // selector, after the tier replay key above (which must not change): a
         // prompt over the model's provider line bills the whole request at the
@@ -75387,6 +75464,14 @@ mod tests {
                 "us.anthropic.claude-opus-4-8-v1:0",
                 (200_000, ProviderPriceLineKind::Analysis),
             ),
+            (
+                "gpt-6.1-terra",
+                (272_000, ProviderPriceLineKind::TieredForward),
+            ),
+            (
+                "gpt-6-rosalind",
+                (272_000, ProviderPriceLineKind::TieredForward),
+            ),
         ] {
             assert_eq!(provider_price_line(model), Some(line), "{model}");
         }
@@ -75425,6 +75510,28 @@ mod tests {
         );
         assert_eq!(provider_context_bucket("gpt-6.1-sol", 400_000, None), None);
         assert_eq!(provider_context_bucket("gpt-6.1-sol", 0, now), None);
+        // Forward lines stamp nothing before their own later date, so a re-read
+        // never restates usage accepted without a bucket.
+        let forward = Some("2026-11-04T00:00:00Z");
+        assert_eq!(
+            forward.and_then(rfc3339_unix_seconds),
+            Some(CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
+        );
+        for model in ["gpt-6.1-terra", "gpt-6-rosalind"] {
+            for (prompt, observed_at, bucket) in [
+                (400_000, Some("2026-11-03T23:59:59Z"), None),
+                (400_000, None, None),
+                (0, forward, None),
+                (272_000, forward, Some("short")),
+                (272_001, forward, Some("long")),
+            ] {
+                assert_eq!(
+                    provider_context_bucket(model, prompt, observed_at),
+                    bucket,
+                    "{model} {prompt} {observed_at:?}"
+                );
+            }
+        }
         // Flat Claude keeps its analysis stamp at any date.
         assert_eq!(
             provider_context_bucket("claude-opus-4-8", 250_000, Some("2026-05-29T09:05:00Z")),
