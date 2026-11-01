@@ -208,11 +208,11 @@ fn never_retried_failure(name: &str) -> anyhow::Error {
     match name {
         "400" => anyhow::Error::new(BatchRejected {
             status: 400,
-            body_excerpt: None,
+            snapshot_indexes: None,
         }),
         "422" => anyhow::Error::new(BatchRejected {
             status: 422,
-            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0]}]}"#.into()),
+            snapshot_indexes: None,
         }),
         "401" => anyhow::Error::new(BatchAuthorizationRejected { status: 401 }),
         "403" => anyhow::Error::new(BatchAuthorizationRejected { status: 403 }),

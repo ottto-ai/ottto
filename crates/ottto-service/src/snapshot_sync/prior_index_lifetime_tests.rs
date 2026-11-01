@@ -65,9 +65,13 @@ fn with_rotation_budget<T>(
     (collected, seen)
 }
 
-struct Guard;
+pub(in crate::snapshot_sync) struct Guard;
 impl Guard {
-    fn new(keep: bool, conflict_path: Option<PathBuf>, retry_clock: Option<u64>) -> Self {
+    pub(in crate::snapshot_sync) fn new(
+        keep: bool,
+        conflict_path: Option<PathBuf>,
+        retry_clock: Option<u64>,
+    ) -> Self {
         HOOK.with(|state| {
             assert!(!state.borrow().enabled);
             *state.borrow_mut() = Hook {
