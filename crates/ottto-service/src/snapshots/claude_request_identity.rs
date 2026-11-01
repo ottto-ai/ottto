@@ -2757,9 +2757,23 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
         revision_v2_hash: hash.clone(),
         content_hash: hash,
         hash_epoch: super::SNAPSHOT_CONTENT_HASH_EPOCH,
-        base_head_etag: item.cache_base_head_etag.clone(),
+        base_head_etag: item
+            .cache_conflict_answer
+            .is_none()
+            .then(|| item.cache_base_head_etag.clone())
+            .flatten(),
+        conflict_head_challenge: item
+            .cache_conflict_answer
+            .as_ref()
+            .map(|(challenge, _)| challenge.clone()),
+        rescan_from_revision_hash: item
+            .cache_conflict_answer
+            .as_ref()
+            .map(|(_, revision)| revision.clone()),
+        forced_full_rescan: item.cache_conflict_answer.is_some(),
     };
     if envelope.base_head_etag.is_none()
+        && envelope.conflict_head_challenge.is_none()
         && (item.cache_observations.is_some()
             || item.cache_observations_state.is_some()
             || !item.cache_requests.is_empty())

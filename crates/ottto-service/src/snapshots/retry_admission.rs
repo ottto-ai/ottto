@@ -526,7 +526,7 @@ fn claude_retry_note_offered(
                         crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
                         !entry.source_file_fingerprint.is_empty(),
                     );
-                    entry.source_file_fingerprint.clear();
+                    evidence_owed::clear(entry);
                 }
             }
         }

@@ -52,6 +52,7 @@ fn ack(items: &[SnapshotItem], rejected: &[(usize, &str, bool)]) -> SnapshotBatc
         })
         .collect::<Vec<_>>();
     SnapshotBatchResponse {
+        conflict_rescans: Default::default(),
         accepted: accepted.len() as u64,
         sessions_reconciled: 0,
         session_ids: Vec::new(),

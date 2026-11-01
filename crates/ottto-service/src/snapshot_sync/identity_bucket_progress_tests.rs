@@ -91,6 +91,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
                     retained_proof_missing: Vec::new(),
                 };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: u64::from(stored),
                     sessions_reconciled: 0,
                     session_ids: vec![],
@@ -281,6 +282,7 @@ fn retained_ack(
                 retained_proof_missing: missing.clone(),
             };
             Ok(crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
                 accepted: 1,
                 sessions_reconciled: 0,
                 session_ids: vec![],
