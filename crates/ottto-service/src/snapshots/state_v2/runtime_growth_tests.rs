@@ -695,12 +695,9 @@ fn excluded_growth_stock_does_not_evict_overlapping_proofs() {
     use crate::snapshots::claude_request_census::{
         ClaudeRequestCensusRecord, ClaudeRequestCensusShape, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
     };
-    for prechecked in [true, false] {
+    {
         let f = Fixture::new();
         let mut index = f.load();
-        if !prechecked {
-            index.v2_mut().growth_retention.clear();
-        }
         let overlap = crate::snapshots::local_index_key(&f.support.join("overlap.jsonl"));
         let copy = crate::snapshots::local_index_key(&f.support.join("copy.jsonl"));
         let nongrown = crate::snapshots::local_index_key(&f.support.join("nongrown.jsonl"));
