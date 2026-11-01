@@ -64,15 +64,24 @@ pub(in super::super) fn delete_row_for_test(db: &Sqlite, key: &RowKey) {
     let values = key.values().unwrap();
     assert_eq!(conn.execute(&sql, params_from_iter(values)).unwrap(), 1);
 }
-/// A committed write from another connection: the data version moves, the
-/// generation does not.
-pub(in super::super) fn commit_elsewhere_for_test(db: &Sqlite) {
-    let conn = Connection::open(&db.path).unwrap();
+/// Delete one row from another connection in one committed transaction: the
+/// data version moves, the generation does not. Returns this connection's
+/// stamp before and after.
+pub(in super::super) fn delete_row_elsewhere_for_test(
+    db: &Sqlite,
+    key: &RowKey,
+) -> ((u64, u64), (u64, u64)) {
+    let before = db.stamp().unwrap();
+    let mut conn = Connection::open(&db.path).unwrap();
     conn.busy_timeout(BUSY).unwrap();
-    let changed = conn
-        .execute("UPDATE control SET value=value WHERE name='generation'", [])
-        .unwrap();
-    assert_eq!(changed, 1);
+    let tx = conn.transaction().unwrap();
+    delete_chunks(&tx, key).unwrap();
+    let table = key.table();
+    let sql = format!("DELETE FROM {} WHERE {}", table.name(), predicate(table));
+    let values = key.values().unwrap();
+    assert_eq!(tx.execute(&sql, params_from_iter(values)).unwrap(), 1);
+    tx.commit().unwrap();
+    (before, db.stamp().unwrap())
 }
 pub(in super::super) fn corrupt_row_header_for_test(db: &Sqlite, key: &RowKey) {
     let table = key.table();

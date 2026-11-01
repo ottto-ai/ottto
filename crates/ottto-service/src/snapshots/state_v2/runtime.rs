@@ -338,8 +338,10 @@ fn load_with_custody<M: Mapper>(
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
                         #[cfg(test)]
-                        if tests::COMMIT_DURING_HYDRATE.with(|commit| commit.replace(false)) {
-                            sqlite::commit_elsewhere_for_test(&session.db);
+                        if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
+                        {
+                            let stamps = sqlite::delete_row_elsewhere_for_test(&session.db, &key);
+                            tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
                         }
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         // The image read must be the stamp this session holds:

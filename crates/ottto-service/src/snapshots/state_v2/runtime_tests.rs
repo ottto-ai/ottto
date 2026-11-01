@@ -30,11 +30,16 @@ fn save_with_mode(
 /// Generation of a freshly imported native fixture store.
 const G: u64 = 1;
 
+/// (generation, data version) before and after a raced delete.
+type RacedStamps = Option<((u64, u64), (u64, u64))>;
 thread_local! {
-    /// Commit from another connection right after the next reused-session
-    /// hydrate, before its stamp is re-read.
-    pub(super) static COMMIT_DURING_HYDRATE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// Delete this row from another connection right after the next
+    /// reused-session hydrate, before its stamp is re-read.
+    pub(super) static DELETE_DURING_HYDRATE: std::cell::Cell<Option<RowKey>> =
+        const { std::cell::Cell::new(None) };
+    /// That session connection's stamps around the delete.
+    pub(super) static RACED_STAMPS: std::cell::Cell<RacedStamps> =
+        const { std::cell::Cell::new(None) };
 }
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 
@@ -437,7 +442,38 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             &BTreeSet::from([fingerprint('4')]),
         );
         assert!(save_with(&f.path, &mut subset).unwrap());
-        COMMIT_DURING_HYDRATE.with(|commit| commit.set(race));
+        if race {
+            // The race: another connection deletes the family's oldest
+            // archived row (outside the endpoint tail) while this session's
+            // load hydrates.
+            let mut oldest = None;
+            with_session_db(&subset, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                let control = mapper::key("account.current", "family", 1).unwrap();
+                let header = tx.get(&control).unwrap().unwrap();
+                let (_, _, ids): (Option<u64>, u64, Vec<u64>) =
+                    mapper::read(&mut tx, &header, None).unwrap();
+                oldest = Some(mapper::key("account_window", "family", ids[0]).unwrap());
+            });
+            DELETE_DURING_HYDRATE.with(|delete| delete.set(oldest));
+            let _ = load_with(&f.path, false, &ClaudeMapper);
+            let (before, after) = RACED_STAMPS.with(std::cell::Cell::take).unwrap();
+            assert_eq!(before.0, after.0, "the generation is unchanged");
+            assert_ne!(before.1, after.1, "the full stamp moved");
+            // Nothing from that hydrate was adopted: the load reopened, so a
+            // graph that outlived it refuses instead of skipping its lineage
+            // over the missing row.
+            working.generation = subset.generation;
+            roll(&mut working, 29);
+            let mut checkpoint = working.committable_subset_with_local_holds(
+                &subset,
+                &BTreeSet::from([fingerprint('4')]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            );
+            assert!(save_with(&f.path, &mut checkpoint).is_err());
+            return None;
+        }
         let mut claim = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         assert_eq!(
             claim.files[A].last_snapshot_fingerprint,
@@ -462,14 +498,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        let saved = save_with(&f.path, &mut checkpoint);
-        if race {
-            // The store moved during that load's hydrate: the load reopened
-            // and carried no lineage, so the graph that outlived it refuses.
-            assert!(saved.is_err());
-            return None;
-        }
-        assert!(saved.unwrap());
+        assert!(save_with(&f.path, &mut checkpoint).unwrap());
         let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         assert_eq!(
             reloaded.files[B].last_snapshot_fingerprint,
