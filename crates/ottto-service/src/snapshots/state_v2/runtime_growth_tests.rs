@@ -416,7 +416,8 @@ fn durable(index: &ScanIndex) -> ScanIndex {
 
 /// [money] One transaction commits exactly the expected growth rows at G+1
 /// (the claim, the save's merge and pruning), publishes the lineage receipt,
-/// paces the next Full, keeps the next save's lineage, and decodes no graph.
+/// paces the next Full, and keeps a no-hydrate save equal to a fresh baseline,
+/// including recreation of an identical reclaimed member.
 #[test]
 fn row_claim_commits_expected_rows_without_a_hydrate() {
     let now = crate::snapshots::sampled_scan::now_seconds();
@@ -432,8 +433,8 @@ fn row_claim_commits_expected_rows_without_a_hydrate() {
     assert!(untouched, "no committed graph was hydrated");
     with_state(&f.path, |state| {
         assert!(
-            state.save_digests.is_none(),
-            "the next save reads its baseline"
+            state.save_digests.as_ref().unwrap().generation == 2,
+            "the claim keeps the committed baseline"
         );
         Ok(())
     })
@@ -456,10 +457,57 @@ fn row_claim_commits_expected_rows_without_a_hydrate() {
     assert_eq!(index.v2().growth_retention, working);
 
     assert!(!admit_without_hydrate(&mut index, &candidate, now + INTERVAL - 1).0);
+    // An identical reclaimed debt must be written again when its file returns.
+    index
+        .files
+        .insert(expired.into(), index.files[&f.key].clone());
+    index.upload_context_fingerprint = Some("synthetic-next-context".into());
+    let desired = index.v2().growth_retention.clone();
+    let durable_rows = |index: &ScanIndex| {
+        let mut rows = BTreeMap::new();
+        super::tests::with_session_db(index, |db| {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for table in Table::ALL {
+                let mut after = None;
+                loop {
+                    let page = tx
+                        .scan_prefix(RowPrefix { table }, after.as_ref(), 128)
+                        .unwrap();
+                    if page.is_empty() {
+                        break;
+                    }
+                    after = page.last().map(|h| h.key.clone());
+                    for h in page {
+                        // Generation alone advances between the two saves.
+                        if h.key != RowKey::Meta("generation".into()) {
+                            let mut value = Vec::new();
+                            tx.read_value(&h, &mut value).unwrap();
+                            rows.insert(h.key, (h.fixed, h.value_version, value));
+                        }
+                    }
+                }
+            }
+        });
+        rows
+    };
+    super::tests::DELETE_DURING_HYDRATE
+        .with(|cell| cell.set(Some(RowKey::Meta("growth_claim_tripwire".into()))));
     index.save(&f.path).unwrap();
+    assert!(
+        super::tests::DELETE_DURING_HYDRATE
+            .with(std::cell::Cell::take)
+            .is_some(),
+        "the next ordinary save did not hydrate"
+    );
+    let saved_rows = durable_rows(&index);
     let committed = durable(&index);
     assert_eq!(committed.generation, 3);
-    assert_eq!(committed.v2().growth_retention, expected);
+    assert_eq!(committed.v2().growth_retention, desired);
+    let mut fresh = f.load();
+    fresh.v2_mut().growth_retention = desired;
+    fresh.save(&f.path).unwrap();
+    assert_eq!(fresh.generation, 4);
+    assert_eq!(saved_rows, durable_rows(&fresh));
 }
 
 /// [money] A stale generation is refused before any write: selection keeps
