@@ -9403,7 +9403,11 @@ fn activate_source_upload_context(
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend =
-        upload_context_resend::Cycle::new(context, index.source_upload_context_matches());
+        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+            upload_context_resend::Cycle::new(context, index.source_upload_context_matches())
+        } else {
+            upload_context_resend::Cycle::default()
+        };
 }
 
 /// Production form of the above: outside a historical replay, due refusal

@@ -197,7 +197,10 @@ impl ScanIndex {
     }
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
         self.activate_upload_context(context);
-        self.file_upload_context_enabled = true;
+        // Receipts are written for every source; until readers switch, only
+        // Claude and Codex decide from them (Pi keeps the source-wide gate).
+        self.file_upload_context_enabled =
+            matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
         self.activate_quarantine_witness(source);
     }
 
@@ -392,9 +395,6 @@ impl ScanIndex {
         &self,
         items: &[SnapshotItem],
     ) -> Vec<Candidate> {
-        if !self.file_upload_context_enabled {
-            return Vec::new();
-        }
         if self.active_upload_context_fingerprint.is_none() {
             return Vec::new();
         }
@@ -578,9 +578,6 @@ impl ScanIndex {
     /// witness never satisfies `receipt_matches`. An ACK receipt of the same
     /// context stays, as main keeps it through census settlement.
     pub(super) fn note_empty_file_upload_context(&mut self, key: &str) {
-        if !self.file_upload_context_enabled {
-            return;
-        }
         let Some(context) = self.file_expected_context(key).cloned() else {
             return;
         };

@@ -90,6 +90,11 @@ impl Cycle {
         &mut self,
         candidates: &[crate::snapshots::UploadContextReceiptCandidate],
     ) {
+        // A cycle with no active context (Pi until readers switch) decides
+        // nothing from receipts; its candidates only write them.
+        if self.active.is_none() {
+            return;
+        }
         self.candidates = candidates
             .iter()
             .flat_map(|c| c.entities().map(|(fp, _)| fp.clone()))

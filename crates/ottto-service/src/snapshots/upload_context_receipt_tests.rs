@@ -709,8 +709,8 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     }
 }
 
-/// [behaviour] Pi earns the shared per-file receipt from its exact ACK, under
-/// the active context, with no Pi exception.
+/// [behaviour] Pi writes the shared per-file receipt from its exact ACK under
+/// the active context, while its read and resend decisions stay main's.
 #[test]
 fn pi_exact_ack_writes_the_shared_file_receipt() {
     let mut f = Fixture::new(SnapshotSource::Pi);
@@ -722,7 +722,9 @@ fn pi_exact_ack_writes_the_shared_file_receipt() {
         f.entry().last_upload_body_witness.as_ref(),
         Some(&receipt.body_witness)
     );
-    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0), "no context resend");
+    // Write-only: Pi still follows the source-wide context gate.
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
 }
 
 /// [behaviour] A confirmed-empty file gets a local proof of its context and
@@ -938,7 +940,7 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
 fn upload_context_legacy_activation_preserves_identical_body_noop() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
-    // The legacy activation path does not enable file receipts.
+    // The legacy/Pi activation path does not decide from file receipts.
     f.index.file_upload_context_enabled = false;
     f.index.activate_upload_context("e".repeat(64));
     let (scan, _) = f.walk(true);
