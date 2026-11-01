@@ -78,7 +78,7 @@ fn synthetic_index(families: usize) -> ScanIndex {
                     )]),
                     invalid: false,
                 },
-                previous_windows: Vec::new(),
+                previous_windows: Default::default(),
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
