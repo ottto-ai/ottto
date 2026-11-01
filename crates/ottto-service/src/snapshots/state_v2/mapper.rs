@@ -201,11 +201,16 @@ pub(super) fn put<T: Serialize + ?Sized>(
     key: &RowKey,
     value: &T,
 ) -> Result<Header> {
-    let mut json = codec::json(value, input_cap(key))?;
     let kind = match key {
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",
     };
+    let mut json = codec::json(value, input_cap(key)).inspect_err(|e| {
+        // Refused while encoding, before its size is known: report it as over.
+        if e.to_string().contains("state_v2_value_admission") {
+            telemetry::row_cap(kind, input_cap(key).saturating_add(1), value_cap(key));
+        }
+    })?;
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {

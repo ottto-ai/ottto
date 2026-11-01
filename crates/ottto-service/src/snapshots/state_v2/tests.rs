@@ -1089,6 +1089,15 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
     assert!(!records
         .iter()
         .any(|r| r.to_string().contains("synthetic-private")));
+
+    // A row refused while encoding still reports, so the refusal is visible.
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        assert!(mapper::put(&mut tx, &key, &"x".repeat(2 * 1024 * 1024)).is_err());
+    });
+    let gauge = serde_json::json!({ "percent": 100, "kind": "file.progress" });
+    assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
+    assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
 }
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
