@@ -38,7 +38,6 @@ fn quick_check_over_budget_still_opens() {
         .unwrap();
     }
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    drop(tx);
     db.finish_import().unwrap();
     // An opened store remains unclean until an explicit clean checkpoint.
     let db = Sqlite::open(&path, &identity).unwrap();
