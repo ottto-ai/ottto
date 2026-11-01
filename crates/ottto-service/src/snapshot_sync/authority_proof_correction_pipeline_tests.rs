@@ -27,6 +27,7 @@
 use super::*;
 
 const APC_DESTINATION: &str = "authority-proof-correction-destination";
+const APC_UPLOAD_CONTEXT: &str = "upload-context-apc";
 const APC_MACHINE_ID: &str = "machine-authority-proof-correction";
 const APC_PAGE_FILES: usize = 2;
 const APC_MAX_PAGES: usize = 8;
@@ -499,7 +500,9 @@ impl ApcFixture {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
         let mut index = before.clone();
-        index.activate_upload_context("upload-context-apc".to_string());
+        // As the service's source prepare: the context also binds the index's
+        // quarantine witness, so refused bodies hold instead of re-reading.
+        index.activate_file_upload_context(SnapshotSource::ClaudeCode, APC_UPLOAD_CONTEXT.into());
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
@@ -604,7 +607,10 @@ impl ApcFixture {
         let mut progress = SnapshotUploadProgress::load(
             &self.progress_path,
             &empty_progress.destination_namespace_hash,
-            empty_progress.active_quarantine_witness.clone().unwrap(),
+            crate::snapshots::snapshot_quarantine_witness_for_context(
+                SnapshotSource::ClaudeCode,
+                APC_UPLOAD_CONTEXT,
+            ),
         )
         .expect("reload exact synthetic upload progress");
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
@@ -839,10 +845,10 @@ impl ApcFixture {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
             ResumableUploadResult::Rejected { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true, None)
             }
             ResumableUploadResult::Deferred { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
             }
             other => panic!("unexpected synthetic upload {other:?}"),
         };
@@ -872,6 +878,21 @@ impl ApcFixture {
             },
         )
         .expect("no paid restore");
+        // As the service finish, after the selected settlement: this page's
+        // exact ACKs earn their file receipts. The synthetic responder answers
+        // count ACKs, which the service never takes as receipt evidence; under
+        // this fixture's one context its exact equivalent is each page body the
+        // upload ledger accepted.
+        let acks: BTreeMap<_, _> =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
+                .into_iter()
+                .filter(|(entity, body)| progress.accepted_body_witnesses.get(entity) == Some(body))
+                .collect();
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &acks,
+        );
         let census_complete = scan.census_complete;
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
@@ -2283,6 +2304,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                     &progress,
                     &holds,
                     outcome == "permanent",
+                    None,
                 )
             };
             assert_eq!(selected.fully_settled, expected_transport);

@@ -158,7 +158,7 @@ impl Budget {
         cursor: bool,
         bytes: u64,
     ) {
-        if bytes == 0 || !index.file_upload_context_enabled {
+        if bytes == 0 || !index.file_upload_context_enabled() {
             return;
         }
         let key = local_index_key(&candidate.path);
@@ -215,7 +215,7 @@ impl ScanIndex {
             .extend(absent.into_values().cloned());
     }
     pub(super) fn context_only_read(&self, candidate: &CandidateFile) -> bool {
-        if !self.file_upload_context_enabled {
+        if !self.file_upload_context_enabled() {
             return false;
         }
         let key = local_index_key(&candidate.path);
@@ -230,6 +230,10 @@ impl ScanIndex {
             .file_snapshot_fingerprints
             .get(&key)
             .is_some_and(|entities| !entities.is_empty())
+            // An account-held key is never context-only, and this ordering
+            // probe runs before the candidate is opened: its decision would
+            // forget the held file's CONTENT memo and force a re-read.
+            && !self.claude_account_deferred_holds.contains_key(&key)
             && self
                 .candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
                 .1

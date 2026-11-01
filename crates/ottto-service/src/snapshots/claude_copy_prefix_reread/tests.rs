@@ -18,11 +18,9 @@ fn prepare(index: &mut ScanIndex, support: &Path, roots: &[PathBuf]) -> Result<V
 
 fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     let (home, root, mut index) = super::super::claude_history_upgrade_tests::families(name, 3);
-    // The shared helper uses a partial-commit subset, which deliberately
-    // preserves the previous (None) source census context even after ACKs.
-    // This fixture models already delivered, fully adopted legacy history;
-    // otherwise unrelated context debt exists BEFORE the mode changes.
-    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
+    // This fixture models already delivered history with per-file receipts;
+    // otherwise unrelated context debt exists BEFORE the switch changes.
+    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     let mut paths = index
         .files
         .keys()
@@ -152,11 +150,15 @@ fn mode_context_reads_only_requested_set_and_matches_estimate() {
         .source_file_fingerprint
         .as_ref()
         .is_some_and(|source| scoped_sources.contains(source))));
+    // Unaffected files keep their base receipt and owe nothing.
     assert!(index
         .files
         .iter()
         .filter(|(key, _)| !paths.contains(&PathBuf::from(key.as_str())))
-        .all(|(key, entry)| entry.upload_context_receipt.is_none()
+        .all(|(key, entry)| entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.context_fingerprint == "ctx-1")
             && !index.file_upload_context_requires_adoption(key)));
     fs::remove_dir_all(home).unwrap();
 }
@@ -261,10 +263,11 @@ fn scoped_mode_budget_preserves_independent_source_refresh() {
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     let key = local_index_key(&pending[0]);
     // A different source witness models changed account/telemetry sidecars;
-    // transcript size and mtime remain exact. Both revision and context are owed.
+    // transcript size and mtime remain exact. The base receipt binds the old
+    // source bytes, so this is an independent refresh, not mode-only debt.
     let stale = "f".repeat(64);
     index.files.get_mut(&key).unwrap().source_file_fingerprint = stale.clone();
-    assert!(index.copy_prefix_base_context_proven(&key));
+    assert!(!index.copy_prefix_base_context_proven(&key));
     let (after, scan, opened) =
         with_body_witness_adoption_byte_budget(1, || walk(&root, index, &pending));
     assert_eq!(
@@ -485,7 +488,7 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
         .map(|s| s.snapshot_fingerprint.clone())
         .collect();
     index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
-    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
+    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }

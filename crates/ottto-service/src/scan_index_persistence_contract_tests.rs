@@ -123,9 +123,9 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    let logical = serde_json::to_value(index).unwrap();
     let entry = index.files.get("synthetic-file").unwrap();
-    let context = logical["upload_context_fingerprint"].as_str();
+    // A freshly decoded index has no active upload context yet.
+    let context = None;
     let binding = durable::Binding {
         source,
         key: durable::key_digest(source, "synthetic-file"),

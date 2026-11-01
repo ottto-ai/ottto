@@ -1893,6 +1893,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         &ledger,
         &holds,
         true,
+        None,
     );
     assert!(!settlement.fully_settled);
     let refusals = PermanentRefusalCounts::of(&ledger);

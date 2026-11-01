@@ -388,17 +388,35 @@ impl HistoryFixture {
             index
         };
         let settlement = if cycle.shed_upload {
-            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
         } else {
             match cycle.upload {
-                PipelineUpload::ServerDeferred => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
-                }
+                PipelineUpload::ServerDeferred => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    false,
+                    None,
+                ),
                 _ => settle_completed_upload(index, &committed_index, &progress, &holds),
             }
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        // The service finish: each exact ACK of this page's sent bodies earns
+        // its file receipt under the active context. The synthetic responder
+        // accepts every sent body; a shed page ACKs none.
+        let acks: BTreeMap<String, String> =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
+                .into_iter()
+                .filter(|(entity, _)| progress.accepted_fingerprints.contains(entity))
+                .collect();
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &acks,
+        );
         index.save(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
@@ -582,8 +600,9 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 
 /// Addendum 1 item 1 (secondary): existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
-/// list. Nothing is emitted, the old upload tuple stays, and the reason
-/// settles: the next cycle reads nothing.
+/// list. Nothing is emitted, the old upload tuple stays, and nothing is read:
+/// the gate would veto every body, so a read could not earn a per-file
+/// receipt. The context debt stays owed and is paid when the hold releases.
 #[test]
 fn upload_context_change_does_not_carry_history_past_the_gate() {
     // Positive control: the current reader uploads the same shape on a fresh destination.
@@ -607,11 +626,20 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(changed.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        // Was one read per held file: the retired global gate settled the
+        // context after that read. A per-file receipt needs an exact ACK of
+        // an emitted body, so the held files are skipped and stay owed.
+        assert_eq!(
+            changed.scan.scanned_file_count, 0,
+            "held history is not read"
+        );
         assert!(changed.uploaded.is_empty(), "{:?}", changed.uploaded);
         for (key, entry) in &changed.index.files {
             let before = &baseline.files[key];
             assert_eq!(entry.effective_upload_body_witness_revision, 1);
+            // Deferred, never credited: the held file keeps its old receipt,
+            // which does not prove it under the new context.
+            assert_eq!(entry.upload_context_receipt, before.upload_context_receipt);
             assert_eq!(
                 entry.last_snapshot_fingerprint,
                 before.last_snapshot_fingerprint
@@ -629,7 +657,10 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(again.scan.scanned_file_count, 0, "parsed at most once");
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "still not read while held"
+        );
         assert!(again.uploaded.is_empty());
     });
 }

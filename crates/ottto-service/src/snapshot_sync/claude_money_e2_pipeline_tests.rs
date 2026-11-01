@@ -6,7 +6,10 @@
 // into future-paging completion just to make those controls pass.
 use super::*;
 use crate::snapshots::claude_request_money::e2;
-use crate::snapshots::e2_pipeline_scan_fixture::{birth_store_bytes, E2ScanFixture};
+use crate::snapshots::e2_pipeline_scan_fixture::{
+    accept_upload_context_acks_for_test, birth_store_bytes, upload_context_owed_diagnosis_for_test,
+    upload_context_receipt_earned_for_test, E2ScanFixture,
+};
 use serde_json::json;
 
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -162,6 +165,7 @@ impl Corpus {
             disposition: Default::default(),
             released: Default::default(),
             unhealthy: Default::default(),
+            delivered: None,
         }
     }
 
@@ -189,6 +193,9 @@ struct Page {
     released: e2::pipeline_test_observer::Released,
     /// #947: requests the last enrichment left Unknown for an unhealthy root.
     unhealthy: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
+    /// Exact ACKs of this page's final bodies, when `ready` delivered them:
+    /// `finish` then earns the file receipts as the service finish does.
+    delivered: Option<BTreeMap<String, String>>,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -274,6 +281,9 @@ impl Page {
         );
         self.index
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
+        if let Some(acks) = &self.delivered {
+            accept_upload_context_acks_for_test(&mut self.index, &self.scan.snapshots, acks);
+        }
         holds
     }
 
@@ -516,14 +526,17 @@ fn ready(
         disposition: p.disposition.clone(),
         released: p.released,
         unhealthy: p.unhealthy,
+        delivered: None,
     };
     send.finish();
-    let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
+    let mut progress = e2_progress();
+    let (result, _, _) = upload(&send.scan.snapshots, &mut progress, ack);
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Completed,
         "real finalized bodies pass batching and entity ACK"
     );
+    p.delivered = Some(std::mem::take(&mut progress.fresh_context_body_acks));
     p
 }
 
@@ -885,6 +898,11 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
                 assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
                 page.index
                     .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+                accept_upload_context_acks_for_test(
+                    &mut page.index,
+                    &page.scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
             }
             pages.push((
                 page.scan.scanned_file_count,
@@ -1676,7 +1694,8 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
                       mut page: Page,
                       progress: &mut SnapshotUploadProgress| {
             page.finish();
-            upload(&page.scan.snapshots, progress, ack).0.unwrap();
+            let sent = page.scan.snapshots.clone();
+            upload(&sent, progress, ack).0.unwrap();
             let holds = LocalHoldSettlement::classify(
                 SnapshotSource::ClaudeCode,
                 &mut page.index,
@@ -1685,6 +1704,11 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             );
             let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
             settle_index_after_upload(&mut settled.index, committed, progress);
+            accept_upload_context_acks_for_test(
+                &mut settled.index,
+                &sent,
+                &progress.fresh_context_body_acks,
+            );
             c.reload(&mut settled.index)
         };
         let old = ScanIndex::default();
@@ -1764,7 +1788,8 @@ fn settle_in(
     index_name: &str,
 ) -> ScanIndex {
     page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let sent = page.scan.snapshots.clone();
+    upload(&sent, progress, ack).0.unwrap();
     let holds = LocalHoldSettlement::classify(
         SnapshotSource::ClaudeCode,
         &mut page.index,
@@ -1773,6 +1798,11 @@ fn settle_in(
     );
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
     c.reload_in(&mut settled.index, index_name)
 }
 
@@ -2669,9 +2699,15 @@ fn settle_captured_holds(
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
     let holds = page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let sent = page.scan.snapshots.clone();
+    upload(&sent, progress, ack).0.unwrap();
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
     c.reload(&mut settled.index)
 }
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;

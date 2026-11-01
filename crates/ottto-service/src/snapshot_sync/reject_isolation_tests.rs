@@ -435,6 +435,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                     &progress,
                     &holds,
                     false,
+                    None,
                 )
                 .index;
                 settle_index_after_upload(&mut settled, &page.committed, &progress);
@@ -566,11 +567,7 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
         .unwrap()
     };
     let [unchanged, sibling, refused, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
-    let mut committed: ScanIndex = serde_json::from_value(json!({
-        "files": {},
-        "upload_context_fingerprint": "prior-context"
-    }))
-    .unwrap();
+    let mut committed: ScanIndex = serde_json::from_value(json!({"files": {}})).unwrap();
     for (key, fingerprint, source) in [("reread", &unchanged, ""), ("refused", &old, "source")] {
         committed
             .files
@@ -580,9 +577,8 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
             .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
         committed.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
     }
-    let mut scanned_state = serde_json::to_value(&committed).unwrap();
-    scanned_state["upload_context_fingerprint"] = json!("scanned-context");
-    let mut scanned: ScanIndex = serde_json::from_value(scanned_state).unwrap();
+    let mut scanned: ScanIndex =
+        serde_json::from_value(serde_json::to_value(&committed).unwrap()).unwrap();
     scanned.activate_upload_context("scanned-context".into());
     for (key, fingerprint) in [
         ("reread", &unchanged),
@@ -666,19 +662,22 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
         progress_blocking: false,
         held_family_roots: None,
     };
-    let settlement =
-        settle_checkpointed_upload(scanned.clone(), &committed, &progress, &no_holds, false);
+    let settlement = settle_checkpointed_upload(
+        scanned.clone(),
+        &committed,
+        &progress,
+        &no_holds,
+        false,
+        None,
+    );
     assert!(
         !settlement.fully_settled,
         "the refused item keeps a follow-up owed"
     );
     let mut settled = settlement.index;
     settle_index_after_upload(&mut settled, &committed, &progress);
-    assert_eq!(
-        serde_json::to_value(&settled).unwrap()["upload_context_fingerprint"],
-        "scanned-context",
-        "the settled census context must not force healthy siblings to reparse"
-    );
+    // Upload-context proof is per file, on the entries: no source-wide
+    // context can force the healthy siblings to reparse.
     for key in ["reread", "sibling"] {
         assert_eq!(
             serde_json::to_value(&settled.files[key]).unwrap(),
@@ -750,6 +749,7 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
                 &progress,
                 holds,
                 other == "rejected",
+                None,
             ),
         };
         let mut index = settlement.index;

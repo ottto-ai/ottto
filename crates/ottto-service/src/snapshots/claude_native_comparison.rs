@@ -405,7 +405,7 @@ impl WindowEligibility {
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
                 }) && skip.upload_context == index.active_upload_context_fingerprint
-                    && index.upload_context_fingerprint == index.active_upload_context_fingerprint
+                    && !index.file_upload_context_requires_adoption(key)
                     && !index.confirmed_empty_files.contains(key)
                     && !index.terminal_jsonl_dispositions.contains_key(key)
                     && !index.claude_account_deferred_holds.contains_key(key)
@@ -1182,7 +1182,7 @@ impl NativePhase {
             || entry.rearmed()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
             || index.active_upload_context_fingerprint.is_none()
-            || index.upload_context_fingerprint != index.active_upload_context_fingerprint
+            || index.file_upload_context_requires_adoption(&key)
         {
             return;
         }

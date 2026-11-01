@@ -213,16 +213,154 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .map(|entry| entry.size_bytes)
 }
 
-/// Establish the completed legacy census precondition after the synthetic
-/// uploader has ACKed every current entity. Partial subsets intentionally
-/// retain the previous context; this creates no per-file receipt or ACK.
-pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) {
+/// Model already delivered history after the synthetic uploader has ACKed
+/// every current entity: each file holds its receipt under `context` (an
+/// empty file its local empty proof). Creates no ACK.
+pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str) {
     let delivered = index.current_snapshot_fingerprints();
     assert!(!delivered.is_empty());
     assert!(delivered
         .iter()
         .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
-    index.upload_context_fingerprint = Some(context.into());
+    for entry in index.files.values_mut() {
+        entry.upload_context_receipt = Some(super::upload_context_receipt::Receipt {
+            context_fingerprint: context.into(),
+            replay_generation: super::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+            source_witness: entry.source_file_fingerprint.clone(),
+            body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
+        });
+    }
+}
+
+/// Each sent item's exact ACK (entity -> upload body witness), as the
+/// synthetic responders answer a fully accepted page.
+pub(crate) fn exact_acks_for_test(items: &[SnapshotItem]) -> BTreeMap<String, String> {
+    items
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect()
+}
+
+/// The production finish of per-file upload-context proof for one page:
+/// the page's final `items` become receipt candidates under the index's
+/// active context, and only exact `acks` earn receipts (`snapshot_sync`
+/// finish and partial checkpoint run the same calls), and the exact ACKs
+/// stamp their entities' durable context proof under the active context in
+/// one fixture destination. Call it after the page's settlement, where the
+/// service does.
+pub(crate) fn accept_upload_context_acks_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) {
+    let candidates = index.file_upload_context_ack_candidates(items);
+    index.accept_file_upload_context_acks(&candidates, acks);
+    let contexts = index
+        .active_upload_context_fingerprint
+        .as_ref()
+        .map(|context| {
+            acks.keys()
+                .map(|entity| (entity.clone(), context.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    index.stamp_entity_upload_context_acks("e2-fixture-destination", acks, &contexts);
+}
+
+/// `path` holds a receipt for its current body under the active context
+/// (its revision may still be cleared for a forced reparse).
+pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &Path) -> bool {
+    index
+        .files
+        .get(&local_index_key(path))
+        .is_some_and(|entry| {
+            entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    index.active_upload_context_fingerprint.as_ref()
+                        == Some(&receipt.context_fingerprint)
+                        && receipt.replay_generation
+                            == super::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                })
+        })
+}
+
+/// Why `path` still owes its upload-context proof after a page whose `items`
+/// were sent and `acks` exact-ACKed (empty when no page was delivered).
+/// `None` when the file is proven. Counts and flags only.
+pub(crate) fn upload_context_owed_diagnosis_for_test(
+    index: &ScanIndex,
+    path: &Path,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) -> Option<String> {
+    let key = local_index_key(path);
+    if !index.file_upload_context_requires_adoption(&key) {
+        return None;
+    }
+    let entry = index.files.get(&key);
+    let source = entry.map_or(String::new(), |entry| entry.source_file_fingerprint.clone());
+    let entities = index
+        .file_snapshot_fingerprints
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    let mine = |item: &&SnapshotItem| entities.contains(&item.snapshot_fingerprint);
+    let receipt = entry.and_then(|entry| entry.upload_context_receipt.as_ref());
+    Some(format!(
+        "entry={} source_empty={} entities={} in_page={} same_source_items={} acked={} \
+         accepted_ledger={} quarantined={} confirmed_empty={} decode_hold={} \
+         account_deferred={} excluded_source={} receipt={} receipt_context_active={} \
+         receipt_source_match={} receipt_body_match={} last_body={} page_candidates={} \
+         active_context={}",
+        entry.is_some(),
+        source.is_empty(),
+        entities.len(),
+        items.iter().filter(mine).count(),
+        items
+            .iter()
+            .filter(|item| item.source_file_fingerprint.as_deref() == Some(source.as_str()))
+            .count(),
+        items
+            .iter()
+            .filter(mine)
+            .filter(|item| {
+                acks.get(&item.snapshot_fingerprint) == Some(&snapshot_upload_body_witness(item))
+            })
+            .count(),
+        entities
+            .iter()
+            .filter(|fp| index.accepted_snapshot_fingerprints.contains(*fp))
+            .count(),
+        entities
+            .iter()
+            .filter(|fp| index.quarantined_snapshot_fingerprints.contains_key(*fp))
+            .count(),
+        index.confirmed_empty_files.contains(&key),
+        index.decode_holds_file(&key),
+        index.claude_account_deferred_holds.contains_key(&key),
+        index
+            .effective_upload_body_witness_revision_excluded_source_files
+            .contains(&source),
+        receipt.is_some(),
+        receipt.is_some_and(|receipt| {
+            index.active_upload_context_fingerprint.as_ref() == Some(&receipt.context_fingerprint)
+        }),
+        receipt.is_some_and(|receipt| receipt.source_witness == source),
+        receipt.zip(entry).is_some_and(|(receipt, entry)| {
+            entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+        }),
+        entry.is_some_and(|entry| entry.last_upload_body_witness.is_some()),
+        index.file_upload_context_ack_candidates(items).len(),
+        index.active_upload_context_fingerprint.is_some(),
+    ))
 }
 
 /// Install the real exclusion input used by ordinary-money fixture families.

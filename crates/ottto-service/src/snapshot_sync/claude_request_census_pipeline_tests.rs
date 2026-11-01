@@ -154,7 +154,15 @@ fn census_pre_hold_bodies_born(
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
-    index.activate_upload_context(cycle.upload_context.to_owned());
+    // The same activation as `PipelineFixture::page`: the hashed context bound
+    // to the index and the ledger, so entity fingerprints match the page's.
+    let mut progress = test_upload_progress();
+    activate_source_upload_context(
+        SnapshotSource::ClaudeCode,
+        format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes())),
+        &mut index,
+        &mut progress,
+    );
     let mut reset_owed_members = 0;
     if cycle.historical_replay {
         let before = index.claude_authority_record_for_test(PIPELINE_SESSIONS[2]);
@@ -228,7 +236,6 @@ fn census_pre_hold_bodies_born(
         &mut scan.snapshots,
         SnapshotUploadPolicy::default(),
     );
-    let progress = test_upload_progress();
     exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
     finalize_scan_after_policy_with_body_witness(
         SnapshotSource::ClaudeCode,

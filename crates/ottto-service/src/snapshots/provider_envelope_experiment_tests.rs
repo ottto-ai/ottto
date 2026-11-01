@@ -374,8 +374,17 @@ impl NativePreparationFixture {
         let native_conjunction = claude_native_comparison::actual_native_conjunction(&disposition);
         assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        index.upload_context_fingerprint = Some("native-preparation-test".into());
-        index.active_upload_context_fingerprint = index.upload_context_fingerprint.clone();
+        index.active_upload_context_fingerprint = Some("native-preparation-test".into());
+        // Model delivered history: each file holds its receipt in this context.
+        let context = index.active_upload_context_fingerprint.clone().unwrap();
+        for entry in index.files.values_mut() {
+            entry.upload_context_receipt = Some(upload_context_receipt::Receipt {
+                context_fingerprint: context.clone(),
+                replay_generation: upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+                source_witness: entry.source_file_fingerprint.clone(),
+                body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
+            });
+        }
         assert!(index.claude_usage_family_witnesses.contains_key(&parent));
         Self {
             native_conjunction,
@@ -1497,6 +1506,12 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
                 .collect::<BTreeSet<_>>()
         );
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+        // Each establishing page is delivered: its exact ACKs earn receipts.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
+        );
         if establishing_pass == 0 {
             assert!(index
                 .files

@@ -1285,9 +1285,9 @@ mod application_cases {
         for bytes in [
             br#"{"schema_version":2,"files":{},"future_money":{"n":1}}"#.as_slice(),
             br#"{"schema_version":2,"files":{},"files":{}}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\q"}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\ud800"}"#,
-            b"{\"schema_version\":2,\"files\":{},\"upload_context_fingerprint\":\"\xff\"}",
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\q"}"#,
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\ud800"}"#,
+            b"{\"schema_version\":2,\"files\":{},\"historical_replay_generation\":\"\xff\"}",
             br#"{"schema_version":2,"files":{},"claude_request_census":{"~lost":{}}}"#,
         ] {
             let c = Corpus::new();

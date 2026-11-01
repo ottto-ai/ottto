@@ -1095,7 +1095,7 @@ fn bound_terminal_hold_skips_until_family_changes() {
         (CandidateDecision::Skip, None)
     );
     let mut context_changed = index.clone();
-    context_changed.upload_context_fingerprint = Some("previous-context".to_string());
+    context_changed.activate_upload_context("next-context".to_string());
     assert_eq!(
         decision(&context_changed, &candidate),
         (CandidateDecision::Skip, None)
