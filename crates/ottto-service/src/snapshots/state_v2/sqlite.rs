@@ -1211,7 +1211,7 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
                 .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
     })
 }
-pub(super) const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {

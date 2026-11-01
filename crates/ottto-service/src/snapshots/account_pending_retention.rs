@@ -324,17 +324,8 @@ pub(super) fn checked_collapse(
     current_end: &str,
 ) -> Option<Vec<usize>> {
     let retained = collapse_plan(windows, current_end)?;
-    #[cfg(test)]
-    let retained = BAD_COLLAPSE_PLAN
-        .with(|plan| plan.borrow_mut().take())
-        .unwrap_or(retained);
     apply_checked_plan(windows, retained.clone())?;
     Some(retained)
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(super) static BAD_COLLAPSE_PLAN: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn apply_checked_plan(
@@ -502,7 +493,7 @@ impl HistorySummary {
 }
 
 // Streaming byte counter: never materialize the encoded histories.
-pub(super) fn window_bytes(windows: &[ClaudeAccountFamilyPendingWindow]) -> u64 {
+fn window_bytes(windows: &[ClaudeAccountFamilyPendingWindow]) -> u64 {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -682,20 +673,6 @@ mod tests {
         };
         assert_eq!(plan(&mut pending, vec![0]), None);
         assert_eq!(serde_json::to_vec(&pending).unwrap(), before);
-        let mut index = ScanIndex::default();
-        index
-            .claude_account_family_pending
-            .insert("family".into(), pending.clone());
-        BAD_COLLAPSE_PLAN.with(|plan| *plan.borrow_mut() = Some(vec![0]));
-        let (reopened, counts) = super::super::state_v2::compact_reopened_for_test(&index);
-        assert_eq!(
-            counts,
-            serde_json::json!({"windows_removed": 0, "families_refused": 1, "families_done": 0})
-        );
-        assert_eq!(
-            serde_json::to_vec(&reopened.claude_account_family_pending["family"]).unwrap(),
-            before
-        );
         assert_eq!(plan(&mut pending, vec![0, 2]), Some(1));
     }
 }

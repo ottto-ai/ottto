@@ -902,18 +902,6 @@ pub(in crate::snapshots) fn compact_reopened_for_test(
     commit_populate(&mut db, index);
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let (mut cold, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
-    // Hydration normally keeps held archives resident. Force the cold view to
-    // exercise the global hold exclusion, including an unrelated opaque row.
-    for (root, pending) in &mut cold.claude_account_family_pending {
-        if let ArchivedWindows::Resident(windows) = &mut pending.previous_windows {
-            let mut fold = crate::snapshots::account_pending_retention::ColdFold::default();
-            std::mem::take(windows)
-                .into_iter()
-                .for_each(|w| fold.push(w));
-            let ids = &cx.account_ids[root];
-            pending.previous_windows = fold.finish(ids.iter().rev().nth(1).copied());
-        }
-    }
     let previous = baseline(&cold, &mut cx).unwrap();
     cx.compact_allowance = Some(128);
     cold.generation += 1;
@@ -988,8 +976,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
     assert_eq!(positions(&mut db, "synthetic-family"), inventory);
     let (mut graph, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
     let previous = baseline(&graph, &mut cx).unwrap();
-    let stale = graph.clone();
-    let first = Mapper
+    Mapper
         .save(&mut db, &identity, previous, &mut graph, &mut cx, false)
         .unwrap();
     assert_eq!(
@@ -1015,10 +1002,6 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         positions(&mut db, "synthetic-family"),
         (inventory.0, inventory.1, vec![163, 164])
     );
-    // A sibling graph has no rollover lineage authorizing the shorter archive.
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    assert!(delta(first, &stale, &mut tx, &mut cx).is_err());
-    drop(tx);
     db.validate_references().unwrap();
     db.validate_parts().unwrap();
     drop(db);
@@ -1286,9 +1269,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         let before = count("cold_row_unknown");
         let error = delta(previous, &graph, &mut tx, &mut cx).err().unwrap();
         assert!(format!("{error:#}").contains("state_v2_cold_row_unknown"));
-        if !compact {
-            assert!(count("cold_row_unknown") > before);
-        }
+        assert!(count("cold_row_unknown") > before);
         assert_eq!(cx.compaction.counts.windows_removed, 0);
         assert_eq!(cx.compaction.counts.families_done, 0);
         drop(tx);

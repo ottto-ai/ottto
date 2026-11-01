@@ -24,9 +24,8 @@ pub(super) struct KindCx {
     /// Outcomes of the store-only rollovers this save writes. A sibling's
     /// committed rollovers are skipped, and a failed save's are discarded.
     pub(super) archived: Archived,
-    /// Ordinary saves only; the cursor is session-local and promoted on commit.
+    /// Archive reads an ordinary save may spend compacting whole families.
     pub(super) compact_allowance: Option<usize>,
-    pub(super) compact_cursor: Option<String>,
     pub(super) compaction: kinds_accounts::Compaction,
     valid: bool,
 }

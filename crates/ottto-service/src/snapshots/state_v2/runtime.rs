@@ -347,7 +347,6 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                             if !session.cx.ambiguous {
                                 cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                             }
-                            cx.compact_cursor = session.cx.compact_cursor.take();
                             session.cx = cx;
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
                             telemetry::event("route", &"v2");
@@ -619,7 +618,6 @@ fn save_with_custody(
                 // Committed rollovers outlive the dropped baseline: a sibling
                 // graph saved after a claim-only save still skips them.
                 cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
-                cx.compact_cursor = session.cx.compact_cursor.take();
                 session.cx = cx;
                 digests
             }

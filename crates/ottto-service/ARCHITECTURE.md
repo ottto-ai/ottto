@@ -34,9 +34,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   saved atomically under the state directory's single-writer lock.
 - **Account history.** Ordinary Claude state-v2 saves compact stored account-window
   runs after custody merge and retirement, using the same checked summary as resident
-  retention. Work stops between whole families at the archive-read or byte allowance;
-  a session-local rotating key prevents refused families blocking others. Queued
-  rollovers and opaque decode holds defer compaction. Row deletion and exact cold
+  retention. Families go in key order and work stops between whole families once
+  the archive-read allowance is spent. Queued rollovers and opaque decode holds
+  defer compaction. Row deletion and exact cold
   metadata publish together; loading stays read-only and idle maintenance owns reclaim.
 - **Record store** (`durable_tail_store.rs`, `durable_tail_codec.rs`): one record per retained
   transcript entry with its running reduction, so a restart can continue from where the RAM cache

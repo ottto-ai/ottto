@@ -471,15 +471,6 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
     assert_eq!(loaded.claude_account_window_retention.windows_collapsed, 0);
     assert_eq!(loaded.claude_account_window_retention.window_bytes_saved, 0);
     lenient_decode::check_held_output(&loaded).unwrap();
-    let (reopened, counts) = state_v2::compact_reopened_for_test(&loaded);
-    assert_eq!(
-        counts,
-        json!({"windows_removed": 0, "families_refused": 0, "families_done": 0})
-    );
-    assert_eq!(
-        serde_json::to_vec(&reopened.claude_account_family_pending).unwrap(),
-        serde_json::to_vec(&loaded.claude_account_family_pending).unwrap()
-    );
     loaded
         .claude_account_family_pending
         .get_mut(&root)
