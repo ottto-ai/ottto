@@ -350,6 +350,9 @@ struct StreamedChecks {
     dropped: usize,
     /// Enrichments whose terminal proof reread a pair the page did not keep.
     reread: usize,
+    /// Enrichments whose bodies, both ways, carry L2 and its org forward to
+    /// root A's own request that has no telemetry row.
+    carried: usize,
 }
 
 impl StreamedChecks {
@@ -403,6 +406,14 @@ impl StreamedChecks {
                 }
             }
         }
+        let carried = [whole, streamed].map(|page| carried_forward(&page.scan.snapshots));
+        assert_eq!(carried[0], carried[1], "carried accounts");
+        self.carried += usize::from(carried[1].contains(&(
+            ROOT.to_owned(),
+            Some("2".repeat(64)),
+            Some("8".repeat(64)),
+            1,
+        )));
         let page_roots = claude_evidence_root_session_ids(&streamed.scan.snapshots).len();
         self.dropped += usize::from(streamed.stats.complete_sidecar_root_count > page_roots);
         self.reread += usize::from(terminal && reads > whole_reads);
@@ -420,6 +431,37 @@ fn api_reads(read: impl FnOnce()) -> usize {
     let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
     read();
     crate::claude_local_otel::evidence_read_counts_for_test().0 - before
+}
+
+/// (session, login, org, requests) of every share placed by a carried-forward
+/// account.
+fn carried_forward(snapshots: &[SnapshotItem]) -> Vec<(String, Option<String>, Option<String>, u64)> {
+    let mut carried = Vec::new();
+    for item in snapshots {
+        let evidence = |at: Option<u16>| at.map(|at| &item.request_evidence[usize::from(at)]);
+        for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+            let shares = match &row.identity_parts {
+                Some(parts) => parts
+                    .iter()
+                    .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                    .collect(),
+                None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+            };
+            for (login, at, requests) in shares {
+                if let Some(evidence) = evidence(at).filter(|evidence| {
+                    evidence.account_source == Some(crate::snapshots::AccountSource::CarriedForward)
+                }) {
+                    carried.push((
+                        item.source_session_id.clone(),
+                        login.clone(),
+                        evidence.provider_workspace_hash.clone(),
+                        requests,
+                    ));
+                }
+            }
+        }
+    }
+    carried
 }
 
 /// Runs `fixtures` with every enrichment compared both ways.
@@ -478,8 +520,10 @@ const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const LOGINS: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const MALFORMED: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
-/// Five roots swept one file per page, then again after the page root grows:
-/// root A (side call, a login-only switch from L1 to L2 mid-stream), legacy
+/// Five roots swept one file per page, then again after the page root grows,
+/// with the account-source capability on: root A (side call, a switch from
+/// login-only L1 to L2 with a complete org mid-stream, then an own request
+/// with no telemetry row that carries L2 forward), legacy
 /// fork F of A, resume copy C of A with no rows of its own, D (L1's complete
 /// org, and C's own request reported under D: the tripwire and a foreign
 /// owner), and U with a malformed sidecar. `multi_root`: F also claims A's
@@ -491,14 +535,15 @@ fn five_root_sweep(multi_root: bool) {
             ROOT,
             &(line(ROOT, "shared", AT, 10)
                 + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)
-                + &line(ROOT, "switch", "2026-08-02T07:02:00Z", 25)),
+                + &line(ROOT, "switch", "2026-08-02T07:02:00Z", 25)
+                + &line(ROOT, "gap", "2026-08-02T07:02:30Z", 12)),
         );
         c.evidence_for(
             ROOT,
             &[
                 api_login(ROOT, "shared", 10, '1', None),
                 api_login(ROOT, "parent", 20, '1', None),
-                api_login(ROOT, "switch", 25, '2', None),
+                api_login(ROOT, "switch", 25, '2', Some('8')),
                 api_for(ROOT, "side", 4, 40),
             ],
             &[
@@ -557,6 +602,8 @@ fn five_root_sweep(multi_root: bool) {
         );
         let scanner = E2ScanFixture::default();
         let mut index = ScanIndex::default();
+        let mut accepted = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+        accepted.set_account_source_enabled(true);
         for sweep in 0..2 {
             if sweep == 1 {
                 append(&a, &line(ROOT, "later", "2026-08-02T07:08:00Z", 6));
@@ -565,7 +612,7 @@ fn five_root_sweep(multi_root: bool) {
                     &[
                         api_login(ROOT, "shared", 10, '1', None),
                         api_login(ROOT, "parent", 20, '1', None),
-                        api_login(ROOT, "switch", 25, '2', None),
+                        api_login(ROOT, "switch", 25, '2', Some('8')),
                         api_for(ROOT, "side", 4, 40),
                         api_login(ROOT, "later", 6, '2', None),
                     ],
@@ -580,7 +627,7 @@ fn five_root_sweep(multi_root: bool) {
             }
             for _ in 0..12 {
                 let mut page = c.raw(&scanner, index, 1, true, &[]);
-                page.enrich(&c);
+                page.enrich_with(&c, Some(&mut accepted));
                 page.finish();
                 index = c.reload(&mut page.index);
                 if page.scan.census_complete {
@@ -630,8 +677,13 @@ fn streamed_evidence_equals_whole_corpus() {
         e2_pipeline_legacy_fork_prefix_is_removed_exactly_once();
     });
     assert!(
-        checks.non_terminal > 0 && checks.terminal > 0 && checks.dropped > 0 && checks.reread > 0,
-        "the arm must compare non-terminal and terminal passes that drop and reread rows: {checks:?}"
+        checks.non_terminal > 0
+            && checks.terminal > 0
+            && checks.dropped > 0
+            && checks.reread > 0
+            && checks.carried > 0,
+        "the arm must compare non-terminal and terminal passes that drop and reread rows \
+         and carry an account forward: {checks:?}"
     );
 }
 
