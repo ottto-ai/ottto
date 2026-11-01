@@ -617,7 +617,8 @@ pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revisio
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
-pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Receiver request cap: one largest advertised item plus the batch envelope.
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
 const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
@@ -1365,6 +1366,15 @@ impl SnapshotSource {
             SnapshotSource::Codex => "codex",
             SnapshotSource::ClaudeCode => "claude_code",
             SnapshotSource::Pi => "pi",
+        }
+    }
+
+    /// The index of a process-local per-source array.
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            SnapshotSource::Codex => 0,
+            SnapshotSource::ClaudeCode => 1,
+            SnapshotSource::Pi => 2,
         }
     }
 
@@ -29334,7 +29344,7 @@ impl OwnedSourceScan {
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
                 // A Tail/Unchanged singleton, or a grown Full with an owned
-                // finish bound (`prove_release` refuses a legacy one), also decides,
+                // finish bound (a legacy one takes the plain walk), also decides,
                 // under blocking locks, whether a release of lower-ranked
                 // residents would make its copy fit; that release is deferred
                 // into its retention, after
@@ -51464,6 +51474,22 @@ impl ScanIndex {
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        self.committable_subset_with_refusals(previous, accepted, quarantined, locally_held, None)
+    }
+
+    /// With `isolated_refusals`, the upload sent every batch and refused only
+    /// those items: every other entity not locally held settled exactly as
+    /// on a clean page, including unchanged ones this pass did not resend.
+    /// Refused and held entities keep their committed revision and stay owed.
+    /// Without it, only this pass's ACKs and quarantines settle.
+    pub(crate) fn committable_subset_with_refusals(
+        &self,
+        previous: &ScanIndex,
+        accepted: &BTreeSet<String>,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
+        locally_held: &BTreeSet<String>,
+        isolated_refusals: Option<&BTreeSet<String>>,
+    ) -> ScanIndex {
         if !self.persistence_available() || !previous.persistence_available() {
             let mut held = self.clone();
             held.retain_persistence_baseline_from(previous);
@@ -51473,7 +51499,11 @@ impl ScanIndex {
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
-                && (accepted.contains(fingerprint) || quarantined.contains_key(fingerprint))
+                && (accepted.contains(fingerprint)
+                    || quarantined.contains_key(fingerprint)
+                    || isolated_refusals.is_some_and(|refused| {
+                        !refused.contains(fingerprint) && !locally_held.contains(fingerprint)
+                    }))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.decode_holds_file(key) {
@@ -51897,17 +51927,24 @@ impl ScanIndex {
             }
         }
         for (key, working) in &self.files {
+            // `get_mut` deep-copies an entry still shared with `self` or
+            // `previous`, so take it only for an entry a carry changes.
+            if !result.files.get(key).is_some_and(|retained| {
+                evidence_owed::carry_debt_changes(retained, working)
+                    || retained.carry_sampled_audit_changes(working)
+            }) {
+                continue;
+            }
+            let Some(retained) = result.files.get_mut(key) else {
+                continue;
+            };
             // A cleared source witness is outstanding reparse work, not a new
             // accepted body. Reverting an unsettled entry must keep that debt;
             // otherwise a partial save can undo a census/fence correction.
             if working.rearmed() {
-                if let Some(retained) = result.files.get_mut(key) {
-                    evidence_owed::carry_debt(retained, working);
-                }
+                evidence_owed::carry_debt(retained, working);
             }
-            if let Some(retained) = result.files.get_mut(key) {
-                retained.carry_sampled_audit(working);
-            }
+            retained.carry_sampled_audit(working);
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
@@ -81959,7 +81996,7 @@ mod tests {
         for index in 0..40 {
             let mut item = batch.snapshots[0].clone();
             item.source_session_id = format!("large-session-{index}");
-            item.session_display_name = Some("y".repeat(110 * 1024));
+            item.session_display_name = Some("y".repeat(300 * 1024));
             item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
             items.push(item);
         }
@@ -82493,6 +82530,117 @@ mod tests {
         assert!(committable.files.is_empty());
     }
 
+    /// One upload page that ended in a refused item: a re-read sibling whose
+    /// unchanged entity was not resent (its committed witness was cleared),
+    /// a sibling accepted this pass, and the refused item's file.
+    fn refused_item_page() -> (ScanIndex, ScanIndex, BTreeSet<String>, BTreeSet<String>) {
+        let mut committed = ScanIndex::default();
+        let mut cleared = manifest_index_entry(Some("unchanged"));
+        cleared.source_file_fingerprint.clear();
+        committed.files.insert("reread.jsonl".into(), cleared);
+        committed
+            .files
+            .insert("refused.jsonl".into(), manifest_index_entry(Some("old")));
+        for (key, fingerprint) in [("reread.jsonl", "unchanged"), ("refused.jsonl", "old")] {
+            committed
+                .file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::from([fingerprint.to_string()]));
+            committed
+                .accepted_snapshot_fingerprints
+                .insert(fingerprint.to_string());
+        }
+        let mut scanned = committed.clone();
+        for (key, fingerprint) in [
+            ("reread.jsonl", "unchanged"),
+            ("accepted.jsonl", "accepted"),
+            ("refused.jsonl", "refused"),
+        ] {
+            scanned
+                .files
+                .insert(key.into(), manifest_index_entry(Some(fingerprint)));
+            scanned
+                .file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::from([fingerprint.to_string()]));
+        }
+        (
+            committed,
+            scanned,
+            BTreeSet::from(["accepted".to_string()]),
+            BTreeSet::from(["refused".to_string()]),
+        )
+    }
+
+    /// [regress] A page ending in one refused item kept only this pass's
+    /// ACKs, so its re-read siblings returned to their cleared witnesses and
+    /// were read again next pass. Only the refused file stays owed now.
+    #[test]
+    fn refused_item_keeps_only_its_own_file_owed() {
+        let (committed, scanned, accepted, refused) = refused_item_page();
+        let no_holds = BTreeSet::new();
+        let ack_only = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &no_holds,
+            None,
+        );
+        assert!(ack_only.files["reread.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+
+        let scoped = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &no_holds,
+            Some(&refused),
+        );
+        assert_eq!(
+            scoped.files["reread.jsonl"].source_file_fingerprint,
+            "source"
+        );
+        assert_eq!(
+            scoped.files["refused.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old"),
+            "the refused item keeps its committed entry, so the next scan retries it"
+        );
+    }
+
+    /// [money] Siblings of a refused item commit exactly as on a clean page;
+    /// the refused entity gets no credit and its file keeps its prior debt.
+    #[test]
+    fn refused_item_siblings_commit_as_a_clean_page() {
+        let (committed, scanned, accepted, refused) = refused_item_page();
+        let mut clean = scanned.clone();
+        clean.record_accepted_snapshot_fingerprints(&accepted);
+        let scoped = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(&refused),
+        );
+        let entry = |index: &ScanIndex, key: &str| {
+            (
+                serde_json::to_value(&index.files[key]).unwrap(),
+                index.file_snapshot_fingerprints[key].clone(),
+            )
+        };
+        for key in ["reread.jsonl", "accepted.jsonl"] {
+            assert_eq!(entry(&scoped, key), entry(&clean, key), "{key}");
+        }
+        assert_eq!(
+            entry(&scoped, "refused.jsonl"),
+            entry(&committed, "refused.jsonl")
+        );
+        let mut credited = scoped.accepted_snapshot_fingerprints.clone();
+        assert!(credited.remove("old"), "the prior acceptance stays");
+        assert!(!credited.contains("refused"));
+        assert_eq!(credited, clean.accepted_snapshot_fingerprints);
+    }
+
     #[test]
     fn partial_commit_preserves_rearm_debt_without_accepting_held_revision() {
         let key = "/opaque/rearmed.jsonl".to_string();
@@ -82550,6 +82698,101 @@ mod tests {
             ordinary.files[&key].source_file_fingerprint,
             previous.files[&key].source_file_fingerprint
         );
+    }
+
+    /// A held-page subset copies no file entry that no carry changes: safe
+    /// and restored entries keep the source's shared handle.
+    #[test]
+    fn held_page_subset_shares_every_entry_no_carry_changes() {
+        let mut previous = ScanIndex::default();
+        for n in 0..3 {
+            let key = format!("/opaque/{n}.jsonl");
+            let entity = format!("entity-{n}");
+            previous
+                .files
+                .insert(key.clone(), manifest_index_entry(Some(entity.as_str())));
+            previous
+                .file_snapshot_fingerprints
+                .insert(key, BTreeSet::from([entity]));
+        }
+        let mut scanned = previous.clone();
+        let held = scanned.files.get_mut("/opaque/0.jsonl").unwrap();
+        held.last_snapshot_fingerprint = Some("held-entity".into());
+        held.size_bytes = 42;
+        scanned.file_snapshot_fingerprints.insert(
+            "/opaque/0.jsonl".into(),
+            BTreeSet::from(["held-entity".to_string()]),
+        );
+
+        let subset = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::from(["entity-1".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held-entity".to_string()]),
+        );
+        assert_eq!(subset.files.len(), 3);
+        for (key, entry) in subset.files.iter_shared() {
+            assert!(
+                Shared::ptr_eq(entry, previous.files.get_shared(key).unwrap()),
+                "{key} was copied"
+            );
+        }
+    }
+
+    /// The subset still applies both carries where they change an entry,
+    /// with today's values, and copies no entry its carry leaves equal.
+    #[test]
+    fn held_page_subset_applies_debt_and_audit_carries() {
+        let _on = evidence_owed::EvidenceOwedForTest::on();
+        let mut previous = ScanIndex::default();
+        let mut add = |key: &str, version: String| {
+            let mut entry = manifest_index_entry(Some(format!("{key}-entity").as_str()));
+            entry.scan_identity_version = Some(version);
+            previous.files.insert(key.into(), entry);
+        };
+        add("owed", "semantic_sync:v1".into());
+        add("v1", "semantic_sync:v2+sampled_unverified:v1:500".into());
+        add("v2-earlier", sampled_audit::marker(300));
+        add("v2-same", sampled_audit::marker(200));
+        let mut scanned = previous.clone();
+        let owed = scanned.files.get_mut("owed").unwrap();
+        owed.evidence_owed = true;
+        owed.last_snapshot_fingerprint = Some("held-owed".into());
+        let earlier = scanned.files.get_mut("v2-earlier").unwrap();
+        earlier.scan_identity_version = Some(sampled_audit::marker(200));
+        earlier.last_snapshot_fingerprint = Some("held-v2".into());
+
+        let subset = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held-owed".to_string(), "held-v2".to_string()]),
+        );
+        let owed = &subset.files["owed"];
+        assert!(owed.evidence_owed);
+        assert_eq!(owed.source_file_fingerprint, "source");
+        assert_eq!(
+            owed.last_snapshot_fingerprint.as_deref(),
+            Some("owed-entity")
+        );
+        assert_eq!(
+            subset.files["v1"].scan_identity_version.as_deref(),
+            Some("semantic_sync:v2+sampled_unverified:v2:500:p")
+        );
+        assert_eq!(
+            subset.files["v2-earlier"].scan_identity_version.as_deref(),
+            Some("semantic_sync:v2+sampled_unverified:v2:200:c")
+        );
+        assert_eq!(
+            subset.files["v2-earlier"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("v2-earlier-entity")
+        );
+        assert!(Shared::ptr_eq(
+            subset.files.get_shared("v2-same").unwrap(),
+            previous.files.get_shared("v2-same").unwrap()
+        ));
     }
 
     /// R11/R12: an exact refusal re-offer lease re-reads an unchanged,

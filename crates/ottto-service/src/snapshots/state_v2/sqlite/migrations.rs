@@ -4,7 +4,7 @@
 use super::*;
 
 pub(super) const REVISION: u32 = 1;
-pub(super) const WRITER_CAPABILITY: u64 = 1;
+pub(super) const WRITER_CAPABILITY: u64 = 2;
 struct Step {
     to: u32,
     apply: fn(&Connection) -> Result<()>,

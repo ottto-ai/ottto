@@ -780,11 +780,7 @@ impl ScanIndex {
     /// The owed backlog, per source, at most once an hour.
     pub(crate) fn emit_upload_context_owed(&self, source: SnapshotSource) {
         use std::sync::atomic::Ordering::Relaxed;
-        let slot = match source {
-            SnapshotSource::ClaudeCode => 0,
-            SnapshotSource::Codex => 1,
-            SnapshotSource::Pi => 2,
-        };
+        let slot = source.slot();
         let now = sampled_scan::now_seconds();
         if now.saturating_sub(OWED_LOGGED_AT[slot].load(Relaxed)) < OWED_LOG_INTERVAL_SECONDS {
             return;

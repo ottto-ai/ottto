@@ -74,10 +74,13 @@ pub(super) fn hydrate_txn(
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
-            let h = tx
-                .get(&mapper::key($kind, "", 0)?)?
-                .context("state_v2_census_missing")?;
-            index.$f = mapper::read(tx, &h, Some(&mut cx.digests))?;
+            index.$f = mapper::field_read(
+                tx,
+                $kind,
+                mapper::Members::Field,
+                Some(&mut cx.digests),
+                || ScanIndex::default().$f,
+            )?;
         };
         ($($t:tt)*) => {};
     }

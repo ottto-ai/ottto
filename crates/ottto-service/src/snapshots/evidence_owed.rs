@@ -70,6 +70,15 @@ pub(crate) fn keep_or_clear(entry: &mut ScanIndexEntry, owe: bool) {
     }
 }
 
+/// Whether `keep_or_clear(entry, owe)` would change `entry`.
+fn keep_or_clear_changes(entry: &ScanIndexEntry, owe: bool) -> bool {
+    if owe && !entry.source_file_fingerprint.is_empty() {
+        !entry.evidence_owed
+    } else {
+        !entry.source_file_fingerprint.is_empty()
+    }
+}
+
 /// What a Claude traversal started under, persisted on its checkpoint (ON
 /// only) so a later context change can be classified: the backfill days, the
 /// active upload-context fingerprint, the context fingerprint without roots
@@ -177,6 +186,12 @@ pub(super) fn carry_debt(retained: &mut ScanIndexEntry, working: &ScanIndexEntry
     if working.rearmed() {
         keep_or_clear(retained, !working.source_file_fingerprint.is_empty());
     }
+}
+
+/// Whether `carry_debt(retained, working)` would change `retained`.
+pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexEntry) -> bool {
+    working.rearmed()
+        && keep_or_clear_changes(retained, !working.source_file_fingerprint.is_empty())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

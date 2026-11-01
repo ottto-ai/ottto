@@ -493,6 +493,7 @@ fn control_name(name: &str) -> bool {
         name,
         "identity"
             | "schema_version"
+            | "catalogue_layout"
             | "generation"
             | "phase"
             | "erasure_success"

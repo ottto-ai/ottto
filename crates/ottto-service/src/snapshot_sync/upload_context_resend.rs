@@ -139,12 +139,14 @@ impl Cycle {
             || self.counts.budget_deferred > 0
             || self.counts.server_conflicts > 0
             || !held.is_empty()
+            || !self.deferred.is_empty()
         {
             crate::local_resource_diagnostics::traversal_point(
                 "upload_context",
                 source,
                 &serde_json::json!({
                     "upload_context_resend": self.counts,
+                    "context_budget_deferred": self.deferred.len(),
                     "upload_context_not_stored": {"files":self.not_stored_files(), "bytes":held.iter().map(|(_, bytes)| *bytes).sum::<u64>()}
                 }),
             );
