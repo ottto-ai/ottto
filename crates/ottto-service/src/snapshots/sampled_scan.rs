@@ -726,17 +726,10 @@ pub(super) fn borrows_only_retained_reduction(active: &OwnedActiveFile) -> bool 
 }
 
 /// A completion that may release lower-ranked residents for its copy
-/// (`tail_completion_budget`): shape F, or a sampled Full singleton, which
-/// would otherwise never get back into a full cache and so reads Full on every
-/// growth. A side read retains nothing, so it proves nothing.
+/// (`tail_completion_budget`): shape F only. A Full's copy is never admitted by
+/// evicting residents: each evicted file then misses and reads Full in turn.
 pub(super) fn releases_at_completion(active: &OwnedActiveFile) -> bool {
     borrows_only_retained_reduction(active)
-        || (active
-            .sampling
-            .as_ref()
-            .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
-            && active.side_origin.is_none()
-            && sampled_singleton(active))
 }
 
 /// One file on its own plan: no comparison, cursor job, group, alias, receipt
@@ -1452,7 +1445,7 @@ pub(super) struct DeferredRelease {
     /// limit, so the insert's entry and key bounds cannot refuse it (e).
     pub(super) entry_limit: usize,
     /// M-a's churn bound: at most `|P_C|` victims (`prove_release`); `None`
-    /// on the legacy path and for a Full (`proven_release`).
+    /// on the legacy path.
     max_victims: Option<usize>,
 }
 impl DeferredRelease {
@@ -1537,7 +1530,6 @@ pub(super) fn tail_completion_budget(
         return measured;
     };
     let continued = file.retained_hint.is_some();
-    let full = matches!(file.mode, ReadMode::Full(_));
     let finalization_prev = file.retained_finalization_charge;
     let taken_usage = file.retained_usage;
     let key_len = file.key.len();
@@ -1605,8 +1597,8 @@ pub(super) fn tail_completion_budget(
     if clone > entry_limit {
         return (granted, step, None);
     }
-    // 3. The re-admission rank, once; a continued copy or a Full, with a plan.
-    if !continued && !full {
+    // 3. The re-admission rank, once; only a continued copy with a plan.
+    if !continued {
         return (granted, step, None);
     }
     let Some(modified) = active.parser.planned_modified_hint() else {
@@ -1630,7 +1622,6 @@ pub(super) fn tail_completion_budget(
             clone,
             finalization_prev,
             usage_grew,
-            full,
             rank,
             modified,
             entry_limit,
@@ -1655,8 +1646,6 @@ pub(super) struct ReleaseProof {
     finalization_prev: usize,
     /// This read added usage since the take (Q-PR15 (b)).
     usage_grew: bool,
-    /// A Full completion (`prove_release`, `proven_release`).
-    full: bool,
     rank: (i64, i64),
     modified: (i64, i64),
     entry_limit: usize,
@@ -1726,7 +1715,6 @@ pub(super) fn prove_release(
         return granted;
     };
     match x_out {
-        XOut::Legacy if proof.full => granted,
         XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget, decode_peak),
         XOut::Refused => granted,
         XOut::Bound(x_out) => {
@@ -1869,7 +1857,7 @@ fn proven_release(
     };
     #[cfg(test)]
     test_hooks::probe(|probe| probe.prefixes = Some((victims, copy_only)));
-    if !proof.full && victims > copy_only {
+    if victims > copy_only {
         return None;
     }
     // The copy is admitted against its share, its decode peak reserved
@@ -1884,7 +1872,7 @@ fn proven_release(
             rank: proof.rank,
             modified: proof.modified,
             entry_limit: proof.entry_limit,
-            max_victims: (!proof.full).then_some(copy_only),
+            max_victims: Some(copy_only),
         },
     })
 }

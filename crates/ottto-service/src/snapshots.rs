@@ -29321,18 +29321,7 @@ impl OwnedSourceScan {
                         None,
                     )
                 } else if active.sampling.is_some() {
-                    let full = active.sampling.as_ref().is_some_and(|sampling| {
-                        matches!(
-                            sampling.mode,
-                            crate::transcript_acquisition::ReadMode::Full(_)
-                        )
-                    });
-                    let legacy_full = full
-                        && matches!(
-                            sampled_scan::x_out_for(source, || None),
-                            sampled_scan::XOut::Legacy
-                        );
-                    if sampled_scan::releases_at_completion(&active) && !legacy_full {
+                    if sampled_scan::releases_at_completion(&active) {
                         sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
                     } else {
                         let (budget, measure) = sampled_scan::copy_budget_step(

@@ -1494,18 +1494,13 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
     );
 }
 
-/// [regress] A long-lived daemon's cache full of small idle residents locked
-/// out every later Full: its copy budget beside a full cache is zero, only a
-/// Tail or Unchanged read could release, so a growing file read Full on every
-/// page. A Full singleton now releases at completion: only residents ranked
-/// strictly below its plan's mtime leave, and a later page takes the copy as a
-/// Tail. With residents of equal or newer rank nothing leaves, the copy is
-/// refused and the next page is Full again. Small residents keep `|P*|` above
-/// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
-/// Full has no X_out (ruling 5), so nothing proves its output fits and it
-/// evicts nothing, whatever the residents' rank.
+/// [regress] A completed Full singleton beside a full cache of idle residents
+/// evicts none of them, whatever their rank or the source: its copy is refused
+/// and its next page is Full again. Releasing older residents to admit a Full's
+/// copy made each evicted file miss and read Full in turn, a churn seen live as
+/// a whole-corpus re-read.
 #[test]
-fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
+fn cache_policy_full_singleton_keeps_older_residents() {
     if unexecuted("full_singleton_release") {
         return;
     }
@@ -1513,12 +1508,7 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     let file_modified = now - 600;
     let newer_modified = now - 300;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for (idle_modified, older) in [
-            (now - OLD_SECONDS, true),
-            (file_modified, false),
-            (newer_modified, false),
-        ] {
-            let releases = older && source == SnapshotSource::ClaudeCode;
+        for idle_modified in [now - OLD_SECONDS, file_modified, newer_modified] {
             let label = format!("{source:?} idle_modified={idle_modified}");
             let cache = Arc::new(sampled_scan::SharedCache::default());
             let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
@@ -1595,25 +1585,14 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
                     "{label}: {key} was not strictly older"
                 );
             }
-            if releases {
-                assert!(!left.is_empty(), "{label}: older residents leave");
-            } else {
-                assert!(left.is_empty(), "{label}: every resident stays");
-                assert!(!admitted, "{label}: the copy is refused");
-            }
+            assert!(left.is_empty(), "{label}: every resident stays");
+            assert!(!admitted, "{label}: the copy is refused");
 
             grown.append(&usage(source, 182, 2, MODEL));
             grown.set_modified(file_modified + 1);
             let next = observed_scan(&grown, source, full.index, &cache);
-            if admitted {
-                assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is a Tail");
-            } else {
-                assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
-                assert_eq!(next.state_missing(), 1, "{label}");
-            }
-            if releases {
-                assert!(admitted, "{label}: X_out proves the copy is admitted");
-            }
+            assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
+            assert_eq!(next.state_missing(), 1, "{label}");
         }
     }
 }
