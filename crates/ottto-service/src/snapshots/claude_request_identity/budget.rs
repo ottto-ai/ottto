@@ -234,16 +234,8 @@ fn evidence_bytes(evidence: &BTreeSet<EvidenceKey>, refusals: u64) -> Option<usi
     if !evidence.is_empty() {
         fields.insert(
             "request_evidence".into(),
-            serde_json::to_value(
-                evidence
-                    .iter()
-                    .map(|key| SnapshotRequestEvidence {
-                        identity_basis: key.basis.into(),
-                        provider_workspace_hash: key.org.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .ok()?,
+            serde_json::to_value(evidence.iter().map(EvidenceKey::wire).collect::<Vec<_>>())
+                .ok()?,
         );
     }
     if refusals > 0 {

@@ -366,7 +366,10 @@ impl ArchiveEvidence {
     }
     pub(super) fn matches(&self, file: &File) -> bool {
         file.metadata()
-            .and_then(crate::transcript_acquisition::FileStamp::capture)
+            .is_ok_and(|metadata| self.matches_metadata(&metadata))
+    }
+    pub(super) fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
+        crate::transcript_acquisition::FileStamp::capture(metadata.clone())
             .is_ok_and(|s| self.stamp.as_ref().is_some_and(|old| old.same_content(&s)))
     }
     pub(super) fn finish(&mut self, owner: Option<&str>, parsed: &super::ParsedJsonlFile) -> bool {

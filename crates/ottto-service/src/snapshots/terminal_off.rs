@@ -427,11 +427,14 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
     // Existing queue is durable demand; re-list metadata without throwing it
     // away, changing the frozen window or minting a new native owner.
     for root in &traversal.scan_roots {
-        if !traversal
+        if let Some(position) = traversal
             .pending_directories
             .iter()
-            .any(|p| p.path == *root)
+            .position(|p| p.path == *root)
         {
+            // A pending re-listing root becomes this full rediscovery walk.
+            traversal.pending_directories[position].census_member = true;
+        } else {
             traversal.pending_directories.push_back(ScanTraversalPath {
                 scan_root: root.clone(),
                 path: root.clone(),
