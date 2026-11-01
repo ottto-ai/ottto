@@ -1623,7 +1623,16 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::FIELDS
             .iter()
             .copied()
-            .filter(|name| !matches!(*name, "reread_guard" | "claude_desktop_store_inventory"))
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "reread_guard"
+                        | "claude_desktop_store_inventory"
+                        | "context_curve_capability_enabled"
+                        | "context_curve_replay_epoch"
+                        | "completed_context_curve_replay_generation"
+                )
+            })
             .collect()
     );
     let decoded =
@@ -1951,7 +1960,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 None,
                 &[],
                 false,
-                true,
             );
             if source == SnapshotSource::ClaudeCode {
                 // An owed family reparse bypasses the ordinary candidate
@@ -1996,7 +2004,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     None,
                     &[],
                     false,
-                    true,
                 );
                 let mut reached_queue = false;
                 for _ in 0..1000 {
@@ -2091,7 +2098,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                         None,
                         &[],
                         false,
-                        true,
                     );
                     restarted.traversal = context.index.traversal.take();
                     let traversal = restarted.traversal.as_mut().unwrap();
@@ -2379,11 +2385,8 @@ fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
     ))
     .unwrap();
     index.claude_duplicate_request_witness_overflowed = true;
-    // A replay and a curve replay this index had already completed.
+    // A replay this index had already completed.
     index.historical_replay_generation = Some("replay-generation".into());
-    index.context_curve_capability_enabled = true;
-    index.context_curve_replay_epoch = 3;
-    index.completed_context_curve_replay_generation = Some("curve-generation".into());
     assert!(!index.accepted_snapshot_fingerprints.is_empty());
     index
 }
@@ -2435,14 +2438,8 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         index.historical_replay_generation, seed.historical_replay_generation,
         "{context}"
     );
-    assert!(index.context_curve_capability_enabled, "{context}");
-    assert_eq!(index.context_curve_replay_epoch, 3, "{context}");
-    // The completed replays stay complete: no spurious replay preparation
+    // The completed replay stays complete: no spurious replay preparation
     // clears the carried acknowledgements or owned-start census.
-    assert!(
-        !index.context_curve_replay_needed("curve-generation"),
-        "{context}"
-    );
     let mut replayed = index.clone();
     assert!(
         !replayed.prepare_historical_replay("replay-generation".into()),
@@ -3843,6 +3840,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
         item.request_evidence.push(SnapshotRequestEvidence {
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
+            account_source: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
@@ -4184,7 +4182,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// Retired evidence cannot reset live census, move slots or select another read.
+/// [format] Retired evidence cannot reset live census, move slots or select
+/// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     let seed = every_persisted_field_fixture();
@@ -4219,6 +4218,10 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         "terminal_zero_snapshot_usage_evidence_count",
         "unchanged_reread_admitted",
         "reread_budget_refused",
+        "causes",
+        "caps",
+        "codex_roster_refresh_visited",
+        "codex_roster_growth_enqueued",
     ];
     let mut old = serde_json::to_value(&seed).unwrap();
     old["reread_guard"] = serde_json::json!({
@@ -4228,12 +4231,19 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     });
     old["traversal"]["counts"]["unchanged_reread_admitted"] = serde_json::json!(41);
     old["traversal"]["counts"]["reread_budget_refused"] = serde_json::json!(43);
+    old["traversal"]["counts"]["codex_roster_refresh_visited"] = serde_json::json!(45);
+    old["traversal"]["counts"]["codex_roster_growth_enqueued"] = serde_json::json!(47);
     let mut forms = vec![serde_json::to_string(&old).unwrap()];
-    // Full nested counter sequence, including nonzero retired slots 20/21.
+    // Full nested counter sequence, including nonzero retired slots 20/21
+    // and 24/25 (the seed's causes and caps are empty).
     old["traversal"]["counts"] = Value::Array(
         count_fields
             .iter()
-            .map(|name| old["traversal"]["counts"][*name].clone())
+            .map(|name| match *name {
+                "causes" => serde_json::to_value(ownership::Counts::default()).unwrap(),
+                "caps" => serde_json::to_value(CapCounts::default()).unwrap(),
+                _ => old["traversal"]["counts"][*name].clone(),
+            })
             .collect(),
     );
     forms.push(
@@ -4331,6 +4341,8 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                 "reread_guard",
                 "unchanged_reread_admitted",
                 "reread_budget_refused",
+                "codex_roster_refresh_visited",
+                "codex_roster_growth_enqueued",
             ] {
                 assert!(!saved.contains(&format!("\"{retired}\":")));
             }

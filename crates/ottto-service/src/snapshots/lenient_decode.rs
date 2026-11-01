@@ -376,9 +376,6 @@ impl Serialize for ScanIndex {
         field!(claude_stale_family_carry, ClaudeStaleFamilyCarry::is_empty);
         field!(scan_residue_witness, Option::is_none);
         field!(historical_replay_generation, Option::is_none);
-        field!(context_curve_capability_enabled, is_false);
-        field!(context_curve_replay_epoch, is_zero_u64);
-        field!(completed_context_curve_replay_generation, Option::is_none);
         field!(confirmed_empty_files, BTreeSet::is_empty);
         field!(file_snapshot_fingerprints, BTreeMap::is_empty);
         field!(snapshot_activity_at, BTreeMap::is_empty);
@@ -410,7 +407,7 @@ impl Serialize for ScanIndex {
         );
         field!(
             claude_copy_removals,
-            claude_request_money::copy_removals::CopyRemovals::is_empty
+            claude_request_money::copy_removals::CopyRemovals::is_unwritten
         );
         map.end()
     }
@@ -479,9 +476,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_stale_family_carry",
     "scan_residue_witness",
     "historical_replay_generation",
-    "context_curve_capability_enabled",
-    "context_curve_replay_epoch",
-    "completed_context_curve_replay_generation",
+    "context_curve_capability_enabled", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "context_curve_replay_epoch", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "completed_context_curve_replay_generation", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "confirmed_empty_files",
     "file_snapshot_fingerprints",
     "snapshot_activity_at",
@@ -583,9 +580,6 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
-    "context_curve_capability_enabled",
-    "context_curve_replay_epoch",
-    "completed_context_curve_replay_generation",
 ];
 #[derive(Default)]
 struct Counts {
@@ -2332,15 +2326,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "historical_replay_generation" => {
                             index.historical_replay_generation = self.typed(value)?
                         }
-                        "context_curve_capability_enabled" => {
-                            index.context_curve_capability_enabled = self.typed(value)?
-                        }
-                        "context_curve_replay_epoch" => {
-                            index.context_curve_replay_epoch = self.typed(value)?
-                        }
-                        "completed_context_curve_replay_generation" => {
-                            index.completed_context_curve_replay_generation = self.typed(value)?
-                        }
+                        // TOMBSTONE: decode-and-drop (retired context-curve replay).
+                        "context_curve_capability_enabled"
+                        | "context_curve_replay_epoch"
+                        | "completed_context_curve_replay_generation" => {}
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
                         }
@@ -2486,9 +2475,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            // An empty undamaged store is never written: absence is an empty
+            // store, not lost metadata (Lead B F4). Damage is `missing`.
             if !seen.contains("claude_copy_removals") {
-                index.claude_copy_removals =
-                    claude_request_money::copy_removals::CopyRemovals::missing();
+                index.claude_copy_removals = Default::default();
             }
             migrate_carried_ack_debt(&mut index)?;
             let authority_span = self

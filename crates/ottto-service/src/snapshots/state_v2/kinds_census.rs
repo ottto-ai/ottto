@@ -3,59 +3,47 @@ use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::{ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
-pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    delta(&ScanIndex::default(), index, tx, cx)
-}
-pub(super) fn delta(
-    prev: &ScanIndex,
-    next: &ScanIndex,
-    tx: &mut dyn Transaction,
-    _: &mut KindCx,
-) -> Result<()> {
-    mapper::map_delta(
-        tx,
-        "file.census",
-        prev.claude_request_census.storage_records(),
-        next.claude_request_census.storage_records(),
-    )?;
-    mapper::map_delta(
-        tx,
+pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
+    rows.map("file.census", next.claude_request_census.storage_records())?;
+    rows.map(
         "tombstone.claude_retired_family_tombstones",
-        &prev.claude_retired_family_tombstones.entries,
         &next.claude_retired_family_tombstones.entries,
     )?;
     macro_rules! save_map {
         ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
+            rows.map($kind, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save_map);
     macro_rules! save {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::put(tx, &mapper::key($kind, "", 0)?, &next.$f)?;
+            rows.put(mapper::key($kind, "", 0)?, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    // The separate ownership manifest proves census-owned membership accompanies
-    // the account pending row. Its values remain deduplicated by the shared hook.
-    let members = |index: &ScanIndex| {
-        index
-            .claude_usage_family_pending
-            .iter()
-            .map(|(k, v)| (k.clone(), v.member_request_id_hashes.len()))
-            .collect::<BTreeMap<_, _>>()
-    };
-    mapper::map_delta(tx, "family.requests", &members(prev), &members(next))?;
+    // Census owns the membership cardinality, derived once from selected usage.
+    rows.put(
+        mapper::key("family.requests", "", 0)?,
+        &next.claude_usage_family_pending.len(),
+    )?;
+    for (root, pending) in &next.claude_usage_family_pending {
+        rows.put(
+            mapper::key("family.requests", root, 1)?,
+            &pending.member_request_id_hashes.len(),
+        )?;
+    }
     Ok(())
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
-    _: &mut KindCx,
+    cx: &mut KindCx,
 ) -> Result<()> {
-    let raw: BTreeMap<String, serde_json::Value> = mapper::read_map(tx, "file.census", None)?;
+    // Census rows decode as untyped JSON, whose serialization is not the
+    // typed record's: the seed computes their digests itself.
+    let raw: BTreeMap<String, serde_json::Value> = mapper::read_map(tx, "file.census", None, None)?;
     for (name, value) in raw {
         let singleton = serde_json::json!({name.clone():value});
         let census: super::super::claude_request_census::ClaudeRequestCensus =
@@ -73,25 +61,30 @@ pub(super) fn hydrate_txn(
     }
     macro_rules! load_map {
         ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, None)?;
+            index.$f = mapper::read_map(tx, $kind, None, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load_map);
-    index.claude_retired_family_tombstones.entries =
-        mapper::read_map(tx, "tombstone.claude_retired_family_tombstones", None)?;
+    index.claude_retired_family_tombstones.entries = mapper::read_map(
+        tx,
+        "tombstone.claude_retired_family_tombstones",
+        None,
+        Some(&mut cx.digests),
+    )?;
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
             let h = tx
                 .get(&mapper::key($kind, "", 0)?)?
                 .context("state_v2_census_missing")?;
-            index.$f = mapper::read(tx, &h)?;
+            index.$f = mapper::read(tx, &h, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    let members: BTreeMap<String, usize> = mapper::read_map(tx, "family.requests", None)?;
+    let members: BTreeMap<String, usize> =
+        mapper::read_map(tx, "family.requests", None, Some(&mut cx.digests))?;
     ensure!(
         members.len() == index.claude_usage_family_pending.len(),
         "state_v2_census_membership"
@@ -113,6 +106,7 @@ pub(super) fn hydrate_cas_controls(tx: &mut dyn Transaction, index: &mut ScanInd
         tx,
         "tombstone.claude_retired_family_tombstones",
         Some(&BTreeSet::new()),
+        None,
     )?;
     index.claude_retired_family_tombstones.decoded = true;
     let h = tx
@@ -122,7 +116,7 @@ pub(super) fn hydrate_cas_controls(tx: &mut dyn Transaction, index: &mut ScanInd
             0,
         )?)?
         .context("state_v2_census_missing")?;
-    index.claude_retired_family_tombstones_initialized = mapper::read(tx, &h)?;
+    index.claude_retired_family_tombstones_initialized = mapper::read(tx, &h, None)?;
     Ok(())
 }
 pub(super) fn hydrate_cas_families(
@@ -130,7 +124,8 @@ pub(super) fn hydrate_cas_families(
     index: &mut ScanIndex,
     roots: &BTreeSet<String>,
 ) -> Result<()> {
-    let members: BTreeMap<String, usize> = mapper::read_map(tx, "family.requests", Some(roots))?;
+    let members: BTreeMap<String, usize> =
+        mapper::read_map(tx, "family.requests", Some(roots), None)?;
     for (root, count) in members {
         ensure!(
             index

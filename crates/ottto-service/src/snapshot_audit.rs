@@ -238,7 +238,6 @@ pub fn run_snapshot_audit<W: Write>(
         true,
         Some(&attribution_context),
         options.claude_support_dir.as_deref(),
-        true,
         &[],
         false,
     )?;

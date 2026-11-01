@@ -962,7 +962,6 @@ fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> Owned
         None,
         &[],
         false,
-        true,
     )
 }
 
@@ -1723,7 +1722,6 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
             Some(&support),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         // No active file: the release takes its conservative full path.
@@ -1808,7 +1806,6 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
             Some(&support),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         claude.sidecar_census_complete = false;
@@ -2185,9 +2182,10 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
     });
 }
 
-/// E2 (R2-B1): a resume whose evidence is unavailable is tried at most once
-/// per page and ends after `UNAVAILABLE_RESUMES` such pages, freeing the
-/// slot. The trigger is R1-M1's: an untrusted census plus a changed scope.
+/// [regress] E2 (R2-B1): a resume whose evidence is unavailable is tried at
+/// most once per page and ends after `UNAVAILABLE_RESUMES` such pages,
+/// freeing the slot. The trigger: an untrusted census plus reduction
+/// dependencies that cannot be computed (the existing refusal hook).
 /// Before E2 the deferred job was resumed again on the next step of the
 /// same scan object, forever; every page here must finish within a bound.
 #[test]
@@ -2199,9 +2197,16 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     let fixture = ScanRoot::new(40);
     let path = fixture.file(SESSION);
     let cache = Arc::new(SharedCache::default());
+    struct ResetDependencies;
+    impl Drop for ResetDependencies {
+        fn drop(&mut self) {
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+        }
+    }
+    let _reset = ResetDependencies;
     let flipped = |scan: &mut OwnedSourceScan| {
         scan.sidecar_census_complete = false;
-        scan.context_curve_enabled = !scan.context_curve_enabled;
+        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(true));
     };
     with_test_limits(2048, 1024, 64, || {
         let (mut index, _, _) = page_steps(
@@ -3045,7 +3050,6 @@ fn hinted_page_limited(
         None,
         hints,
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     loop {
@@ -3268,7 +3272,6 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         None,
         &[fixture.file(SESSION_B)],
         false,
-        true,
     );
     assert_eq!(scan.identified_candidates.len(), 2);
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
@@ -3416,7 +3419,6 @@ fn published_scan(
         None,
         hints,
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     loop {
@@ -4086,7 +4088,6 @@ fn accumulator_heap_bound_at_measured_event_counts() {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         // The pause charge is the completed walk (N3); it must exist.
@@ -10519,7 +10520,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 }
 
 /// One continuation page of the paused job whose member index keys are
-/// `members`, over `root` (`days`, `curve` as the ordinary pages used),
+/// `members`, over `root` (`days` as the ordinary pages used),
 /// standing for `ordinary` of the ordinary cadence (§6).
 #[allow(clippy::too_many_arguments)]
 fn continuation_page_in(
@@ -10529,7 +10530,6 @@ fn continuation_page_in(
     namespace: &str,
     collected_at: &str,
     days: u64,
-    curve: bool,
     ordinary: Option<std::time::Duration>,
     tweak: impl Fn(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
@@ -10540,7 +10540,6 @@ fn continuation_page_in(
         days,
         10,
         false,
-        curve,
         ordinary,
         carried(root),
     );
@@ -10564,7 +10563,6 @@ fn continuation_page(
         "cursor-fixture",
         NOW,
         BACKFILL_WINDOW_DAYS,
-        true,
         None,
         tweak,
     )
@@ -10715,7 +10713,6 @@ fn continuation_prepares_no_group_attempt() {
                 None,
                 &[],
                 false,
-                false,
             )
             .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into())),
         )
@@ -10780,7 +10777,6 @@ fn continuation_prepares_no_group_attempt() {
                     "group-fixture",
                     AT,
                     7,
-                    false,
                     None,
                     |_| {},
                 )
@@ -10994,7 +10990,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11218,7 +11213,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         None,
         &[],
         false,
-        false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("ns".into()));
     let context = scan.sampling.as_ref().unwrap();
@@ -11344,7 +11338,6 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 BACKFILL_WINDOW_DAYS,
                 10,
                 false,
-                true,
                 Some(secs(600)),
                 carried(&fixture.root),
             )
@@ -11431,7 +11424,6 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |scan| scan.codex_page.set_continuation_deadline(t0 + secs(5)),
             )
@@ -11452,7 +11444,6 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11503,7 +11494,6 @@ fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11921,7 +11911,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                     "cursor-fixture",
                     NOW,
                     BACKFILL_WINDOW_DAYS,
-                    true,
                     Some(secs(600)),
                     |_| {},
                 );
@@ -12042,7 +12031,6 @@ fn eof_park_state_bound_keeps_prior_body_and_discloses_without_rereading() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             );

@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct LocalCounts {
     pub files: u64,
     pub local_bytes: u64,
+    pub transport_reservation_refused: bool,
     /// This page's admitted reads by index key, with their selection flags
     /// (RAM-only), so a file whose context ACK set split can be re-queued.
     read_paths: BTreeMap<String, ScanTraversalPath>,
@@ -73,6 +74,7 @@ impl Budget {
             .saturating_add(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES.saturating_add(3))
             > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
         {
+            index.context_read_counts.transport_reservation_refused = true;
             return false;
         }
         // Oversized Codex singletons keep their existing resumable cursor;
@@ -241,7 +243,7 @@ pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<P
     let order = TEST_READ_ORDER.with(|order| order.replace(None).unwrap());
     (result, order)
 }
-crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, read_paths);
+crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, transport_reservation_refused, read_paths);
 crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, page_wire_counted, admitted, read_files, cursor_ordinary_charged, deferred);
 
 #[cfg(test)]

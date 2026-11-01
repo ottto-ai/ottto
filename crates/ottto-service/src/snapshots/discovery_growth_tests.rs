@@ -100,13 +100,31 @@ impl Fixture {
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_at(source, index, &now)
+        self.page_with(source, index, &now, &[])
+    }
+    fn page_hinted(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        self.page_with(source, index, &now, hints)
     }
     fn page_at(
         &self,
         source: SnapshotSource,
+        index: ScanIndex,
+        now: &str,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        self.page_with(source, index, now, &[])
+    }
+    fn page_with(
+        &self,
+        source: SnapshotSource,
         mut index: ScanIndex,
         now: &str,
+        hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
@@ -120,9 +138,8 @@ impl Fixture {
                 10,
                 false,
                 None,
-                &[],
+                hints,
                 false,
-                true,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -656,7 +673,6 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         None,
         &[],
         false,
-        true,
     );
     let (cold_index, cold) = loop {
         match cold_scan.step(None) {
@@ -686,8 +702,475 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     assert!(reads.0.lock().unwrap().0.is_empty());
 }
 
-/// [money] F3: a known default-home rollout append with no directory move or
-/// watcher hint is Tail-read once and emits the same whole money body as Full.
+/// One usage record (with the session header first) in each source's format.
+fn usage_records(source: SnapshotSource, session: &str, n: u64, header: bool) -> String {
+    let at = "2026-10-06T10:00:00Z";
+    let (head, line) = match source {
+        SnapshotSource::ClaudeCode => (
+            None,
+            json!({"type":"assistant", "sessionId":session, "uuid":format!("{session}-{n}"),
+            "cwd":"/synthetic", "timestamp":at, "requestId":format!("req_{session}_{n}"),
+            "message": {"id":format!("msg_{session}_{n}"), "model":"claude-opus-4-8",
+            "role":"assistant", "usage":{"input_tokens":10,"output_tokens":20}}}),
+        ),
+        SnapshotSource::Codex => (
+            Some(json!({"type":"session_meta", "timestamp":at, "payload":{"id":session}})),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"token_count",
+            "info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":10 * n,"output_tokens":10 * n},
+            "last_token_usage":{"input_tokens":10,"output_tokens":10}}}}),
+        ),
+        SnapshotSource::Pi => (
+            Some(json!({"type":"session", "session_id":session, "cwd":"/work", "timestamp":at})),
+            json!({"type":"message_end", "message":{"provider":"openai", "model":"gpt-5.4",
+            "api":"responses", "timestamp":1_791_280_800_000_u64 + n,
+            "usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0}}}),
+        ),
+    };
+    let head = head.filter(|_| header).map(|head| format!("{head}\n"));
+    format!("{}{line}\n", head.unwrap_or_default())
+}
+
+fn append_records(path: &Path, text: &str) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+const UNCHANGED: &str = "0a000000-0000-4000-8000-00000000000a";
+const GROWN: &str = "0b000000-0000-4000-8000-00000000000b";
+const CREATED: &str = "0c000000-0000-4000-8000-00000000000c";
+const REARMED: &str = "0d000000-0000-4000-8000-00000000000d";
+const NESTED: &str = "0e000000-0000-4000-8000-00000000000e";
+/// Root entries once CREATED exists: four files and the `nested` directory.
+const ROOT_ENTRIES: usize = 5;
+
+/// A kept generation whose first walk has finished and whose members were
+/// all served, over four read files (one in `nested/`); `listing_due`
+/// backdates its walk.
+fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> ScanIndex {
+    for session in [UNCHANGED, GROWN, REARMED] {
+        let path = f.root.join(format!("{session}.jsonl"));
+        append_records(&path, &usage_records(source, session, 1, true));
+    }
+    fs::create_dir_all(f.root.join("nested")).unwrap();
+    append_records(
+        &f.root.join("nested").join(format!("{NESTED}.jsonl")),
+        &usage_records(source, NESTED, 1, true),
+    );
+    let (mut index, _, reads, _) = f.page(source, ScanIndex::default());
+    assert_eq!(
+        reads.0.lock().unwrap().0.len(),
+        4,
+        "{source:?}: first reads"
+    );
+    let now = OffsetDateTime::now_utc();
+    let collected_at = now.format(&Rfc3339).unwrap();
+    ensure_bounded_traversal(
+        source,
+        std::slice::from_ref(&f.root),
+        &mut index,
+        &collected_at,
+        7,
+    );
+    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    let traversal = index.traversal.as_mut().unwrap();
+    assert!(traversal.pending_directories.is_empty());
+    traversal.pending_candidates.clear();
+    let due = now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60;
+    traversal.listing_started_unix_seconds = Some(if listing_due {
+        due
+    } else {
+        now.unix_timestamp() as u64
+    });
+    index
+}
+
+fn modes(reads: &Reads) -> Vec<String> {
+    let mut modes = reads
+        .0
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .map(|mode| format!("{mode:?}"))
+        .collect::<Vec<_>>();
+    modes.sort();
+    modes
+}
+
+/// Pages until the generation has nothing queued (or retired).
+struct Run {
+    scans: Vec<SourceScanResult>,
+    modes: Vec<String>,
+    starts: usize,
+}
+
+fn run_pages(f: &Fixture, source: SnapshotSource, mut index: ScanIndex) -> Run {
+    let mut run = Run {
+        scans: Vec::new(),
+        modes: Vec::new(),
+        starts: 0,
+    };
+    for _ in 0..8 {
+        let (next, scan, reads, rows) = f.page(source, index);
+        index = next;
+        run.modes.extend(modes(&reads));
+        run.starts += rows
+            .iter()
+            .filter(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            })
+            .count();
+        run.scans.push(scan);
+        if index.traversal.as_ref().map_or(true, |traversal| {
+            traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
+        }) {
+            run.modes.sort();
+            return run;
+        }
+    }
+    panic!("{source:?}: the re-listing pass must drain within 8 pages");
+}
+
+/// Census completion and every loss count a page reports.
+fn census(scan: &SourceScanResult) -> Value {
+    json!([
+        scan.census_complete,
+        scan.symlink_rejected_count,
+        scan.directory_entry_cap_exceeded_count,
+        scan.unreadable_path_count,
+        scan.oversized_file_count,
+        scan.disappeared_file_count,
+        scan.malformed_json_line_count,
+        scan.invalid_utf8_line_count,
+        scan.over_line_cap_count,
+        scan.recognized_usage_drop_count,
+        scan.ownership_incomplete_file_count,
+        scan.zero_snapshot_usage_evidence_count,
+        scan.dropped_usage_record_count,
+    ])
+}
+
+/// [behaviour] A kept generation's re-listing pass reads exactly the files
+/// that changed (grown by acquisition's growth mode, created by Full) and
+/// nothing settled, for every source, whether the pass fits one page or spans
+/// pages (directory budget below the entry count). It starts no generation,
+/// adds no ownership-incomplete count and leaves census completion and every
+/// loss count equal to the same generation without a pass. After a restart a
+/// pass over a quiet corpus reads zero bytes and emits nothing.
+#[test]
+fn listing_repass_reads_only_changed_files_for_every_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let change = |f: &Fixture| {
+            append_records(
+                &f.root.join(format!("{GROWN}.jsonl")),
+                &usage_records(source, GROWN, 2, false),
+            );
+            append_records(
+                &f.root.join(format!("{CREATED}.jsonl")),
+                &usage_records(source, CREATED, 1, true),
+            );
+        };
+        let f = Fixture::new();
+        let index = kept_generation(&f, source, false);
+        change(&f);
+        let without_pass = run_pages(&f, source, index);
+        // Acquisition keeps the read mode: Pi re-reads a grown session in
+        // Full; only what is queued is under test here.
+        let grown_mode = match source {
+            SnapshotSource::Pi => DeliveryMode::Full,
+            _ => growth_mode(),
+        };
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{grown_mode:?}"),
+        ];
+        expected.sort();
+        for budget in [MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK, ROOT_ENTRIES] {
+            let f = Fixture::new();
+            let index = kept_generation(&f, source, true);
+            change(&f);
+            let run = with_test_directory_entries(budget, || run_pages(&f, source, index));
+            assert_eq!(run.modes, expected, "{source:?} budget {budget}");
+            assert_eq!(
+                run.starts, 0,
+                "{source:?} budget {budget}: no new generation"
+            );
+            assert!(
+                budget == MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK || run.scans.len() > 1,
+                "{source:?}: the small budget spans pages"
+            );
+            assert!(run
+                .scans
+                .iter()
+                .all(|scan| scan.ownership_incomplete_file_count == 0));
+            assert_eq!(
+                census(run.scans.last().unwrap()),
+                census(without_pass.scans.last().unwrap()),
+                "{source:?} budget {budget}"
+            );
+        }
+
+        // Quiet corpus after a restart: saved index, no retained checkpoint.
+        let mut f = Fixture::new();
+        let mut index = kept_generation(&f, source, true);
+        let path = f.root.join("index.json");
+        index.save(&path).unwrap();
+        let index = ScanIndex::load(&path).unwrap();
+        f.cache = Arc::new(sampled_scan::SharedCache::default());
+        let opens = all_transcript_opens_for_test();
+        let ((quiet_index, scan, reads, rows), consumed) =
+            sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+        // The reloaded generation ran its due pass; no first walk replaced it.
+        assert!(!rows.iter().any(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        }));
+        if let Some(traversal) = quiet_index.traversal.as_ref() {
+            assert!(traversal.counts.listing_generations >= 1, "{source:?}");
+        }
+        assert!(scan.snapshots.is_empty(), "{source:?}");
+        assert_eq!(scan.scanned_file_count, 0, "{source:?}");
+        // Zero opens measures zero identity, cheap and other reads.
+        let measured = (all_transcript_opens_for_test() == opens).then_some(0);
+        let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
+            sampled_scan::transition_fixture::Mode::Restart,
+            source,
+            Vec::new(),
+            &[],
+        );
+        quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
+        quiet.io = sampled_scan::transition_fixture::IoBytes {
+            consumed,
+            cheap_checks: measured,
+            anchor_reads: measured,
+            other_reads: measured,
+            ..Default::default()
+        };
+        sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    }
+}
+
+/// [regress] A re-armed (owed) file whose stamp is unchanged stays
+/// schedulable through the re-listing pass and through the watcher-hint
+/// filter, and a pass queues it as the hint rule does (a census member for
+/// Claude/Pi). A settled file with a metadata-only change and its hint is
+/// never read. Before the fix both paths skipped the owed file on its stamp.
+#[test]
+fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for hinted in [false, true] {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, !hinted);
+            // A restart: no retained acquisition checkpoint.
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let rearmed = f.root.join(format!("{REARMED}.jsonl"));
+            let unchanged = f.root.join(format!("{UNCHANGED}.jsonl"));
+            let key = local_index_key(&rearmed);
+            index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+            // Metadata-only changes (ctime).
+            for path in [&rearmed, &unchanged] {
+                let original = fs::metadata(path).unwrap().permissions();
+                let mut read_only = original.clone();
+                read_only.set_readonly(true);
+                fs::set_permissions(path, read_only).unwrap();
+                fs::set_permissions(path, original).unwrap();
+            }
+            if !hinted {
+                let mut walked = index.clone();
+                let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+                start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
+                advance_bounded_directory_traversal(source, &mut walked, 7, None);
+                let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
+                let owed = queued
+                    .iter()
+                    .find(|pending| pending.path == rearmed)
+                    .expect("the owed file is queued");
+                assert_eq!(owed.census_member, source != SnapshotSource::Codex);
+                assert!(!queued.iter().any(|pending| pending.path == unchanged));
+            }
+            let hints = if hinted {
+                vec![rearmed.clone(), unchanged.clone()]
+            } else {
+                Vec::new()
+            };
+            let (index, scan, reads, _) = f.page_hinted(source, index, &hints);
+            assert_eq!(
+                modes(&reads),
+                vec![format!("{:?}", DeliveryMode::Full)],
+                "{source:?} hinted {hinted}"
+            );
+            assert_eq!(scan.scanned_file_count, 1, "{source:?} hinted {hinted}");
+            assert!(
+                !index.files[&key].source_file_fingerprint.is_empty(),
+                "{source:?} hinted {hinted}: the owed work resolved"
+            );
+        }
+    }
+}
+
+/// [regress] An owed file whose stamp stays unchanged (a held revert keeps
+/// clearing its fingerprint) is queued by the re-listing pass at most once
+/// per file per six hours, counted apart from changed files; a pass inside
+/// the interval leaves it alone, and the queued offer reads Full once.
+#[test]
+fn owed_unchanged_file_is_requeued_once_per_six_hours() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let rearmed = f.root.join(format!("{REARMED}.jsonl"));
+        let key = local_index_key(&rearmed);
+        let queued = |index: &ScanIndex| {
+            let traversal = index.traversal.as_ref().unwrap();
+            (
+                traversal
+                    .pending_candidates
+                    .iter()
+                    .filter(|pending| pending.path == rearmed)
+                    .count(),
+                traversal.counts.listing_owed_requeued,
+                traversal.counts.listing_changes_without_hint,
+            )
+        };
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 1, 0), "{source:?}: first offer");
+        let offer = index.clone();
+        // Its read is out of scope here; the fingerprint stays cleared.
+        for _ in 0..3 {
+            index.traversal.as_mut().unwrap().pending_candidates.clear();
+            relist(source, &mut index);
+            assert_eq!(queued(&index), (0, 1, 0), "{source:?}: paced");
+        }
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_candidates.clear();
+        *traversal
+            .listing_owed_requeued_unix_seconds
+            .get_mut(&key)
+            .unwrap() -= LISTING_OWED_PACE_SECONDS;
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 2, 0), "{source:?}: after six hours");
+
+        f.cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, scan, reads, _) = f.page(source, offer);
+        assert_eq!(
+            modes(&reads),
+            vec![format!("{:?}", DeliveryMode::Full)],
+            "{source:?}"
+        );
+        assert_eq!(scan.scanned_file_count, 1, "{source:?}");
+    }
+}
+
+/// [format] The owed re-queue pacing map is scheduling evidence only. Through
+/// the production loader an absent, valid, malformed or over-cap map keeps the
+/// traversal (census, counts and queued work) unchanged; undecodable stamps
+/// are dropped and an over-cap map keeps only its newest stamps.
+#[test]
+fn listing_owed_pacing_map_decodes_leniently_and_keeps_the_traversal() {
+    let f = Fixture::new();
+    let mut index = kept_generation(&f, SnapshotSource::ClaudeCode, false);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.pending_candidates.push_back(ScanTraversalPath {
+        scan_root: f.root.clone(),
+        path: f.root.join(format!("{GROWN}.jsonl")),
+        census_member: true,
+        watcher_hint: false,
+    });
+    traversal.counts.unreadable_path_count = 1;
+    let saved = serde_json::to_value(&index).unwrap();
+    let over_cap = (0..MAX_LISTING_OWED_PACES as u64 + 3)
+        .map(|at| (format!("/synthetic/{at:05}.jsonl"), json!(at)))
+        .collect::<serde_json::Map<_, _>>();
+    let newest = (3..MAX_LISTING_OWED_PACES as u64 + 3)
+        .map(|at| (format!("/synthetic/{at:05}.jsonl"), json!(at)))
+        .collect::<serde_json::Map<_, _>>();
+    let cases = [
+        (None, json!({})),
+        (
+            Some(json!({"/synthetic/a.jsonl": 5})),
+            json!({"/synthetic/a.jsonl": 5}),
+        ),
+        (
+            Some(json!({"/synthetic/a.jsonl": "future-shape", "/synthetic/b.jsonl": 7})),
+            json!({"/synthetic/b.jsonl": 7}),
+        ),
+        (Some(json!("future-shape")), json!({})),
+        (Some(Value::Object(over_cap)), Value::Object(newest)),
+    ];
+    let mut baseline = None;
+    for (number, (stored, expected)) in cases.into_iter().enumerate() {
+        let mut old = saved.clone();
+        if let Some(stored) = stored {
+            old["traversal"]["listing_owed_requeued_unix_seconds"] = stored;
+        }
+        let path = f.root.join(format!("paces-{number}.json"));
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).expect("the pacing map never fails the index");
+        let mut traversal = serde_json::to_value(loaded.traversal.as_ref().unwrap()).unwrap();
+        let paces = traversal
+            .as_object_mut()
+            .unwrap()
+            .remove("listing_owed_requeued_unix_seconds")
+            .unwrap_or_else(|| json!({}));
+        assert_eq!(paces, expected, "case {number}");
+        let kept = loaded.traversal.as_ref().unwrap();
+        assert_eq!(kept.counts.unreadable_path_count, 1, "case {number}");
+        assert_eq!(
+            kept.pending_candidates.len(),
+            1,
+            "case {number}: queued work"
+        );
+        let baseline = baseline.get_or_insert_with(|| traversal.clone());
+        assert_eq!(&traversal, baseline, "case {number}: traversal kept");
+    }
+}
+
+/// Starts a due re-listing pass on a kept generation and walks it.
+fn relist(source: SnapshotSource, index: &mut ScanIndex) {
+    let now = OffsetDateTime::now_utc();
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.listing_started_unix_seconds =
+        Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
+    start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
+    advance_bounded_directory_traversal(source, index, 7, None);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+}
+
+/// [money] A known Codex rollout append with no directory move or watcher
+/// hint is queued once by the re-listing pass, Tail-read once, and emits the
+/// same whole money body as a cold Full.
 #[test]
 fn retained_codex_stat_growth_tails_once_with_full_money() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -705,32 +1188,14 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
         .unwrap()
         .moved_directories()
         .is_empty());
-    refresh_retained_codex_roster(
-        SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
-        7,
-        discovery_retention!(index),
-    );
-    let traversal = index.traversal.as_ref().unwrap();
-    assert_eq!(traversal.counts.codex_roster_growth_enqueued, 1);
-    assert_eq!(traversal.pending_candidates.len(), 1);
-    assert!(!traversal.pending_candidates[0].census_member);
-    // A second refresh before selection cannot duplicate queued work.
-    refresh_retained_codex_roster(
-        SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
-        7,
-        discovery_retention!(index),
-    );
-    assert_eq!(
-        index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .counts
-            .codex_roster_growth_enqueued,
-        1
-    );
+    // A second pass before selection cannot duplicate queued work.
+    for _ in 0..2 {
+        relist(SnapshotSource::Codex, &mut index);
+        let traversal = index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.counts.listing_changes_without_hint, 1);
+        assert_eq!(traversal.pending_candidates.len(), 1);
+        assert!(!traversal.pending_candidates[0].census_member);
+    }
     let (caught, scan, reads, _) = f.page(SnapshotSource::Codex, index);
     assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
     assert_eq!(scan.snapshots.len(), 1);
@@ -754,8 +1219,9 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
     assert!(reads.0.lock().unwrap().0.is_empty());
 }
 
-/// [behaviour] Unchanged bytes and inventory-held growth cannot enqueue or
-/// acquire again while their stat/refusal evidence stays unchanged.
+/// [behaviour] The re-listing pass queues and acquires nothing for unchanged
+/// bytes (a ctime-only change included) or for inventory-held growth while
+/// its refusal evidence stays unchanged.
 #[test]
 fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
     for held_growth in [false, true] {
@@ -775,21 +1241,53 @@ fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
                 ..CodexInventoryHold::default()
             });
         } else {
-            f.age(1); // mtime alone cannot grant another acquisition
+            let original = fs::metadata(&f.path).unwrap().permissions();
+            let mut read_only = original.clone();
+            read_only.set_readonly(true);
+            fs::set_permissions(&f.path, read_only).unwrap();
+            fs::set_permissions(&f.path, original).unwrap();
         }
         for _ in 0..2 {
-            refresh_retained_codex_roster(
-                SnapshotSource::Codex,
-                index.traversal.as_mut().unwrap(),
-                7,
-                discovery_retention!(index),
-            );
+            relist(SnapshotSource::Codex, &mut index);
             let traversal = index.traversal.as_ref().unwrap();
             assert!(traversal.pending_candidates.is_empty());
-            assert_eq!(traversal.counts.codex_roster_growth_enqueued, 0);
+            assert_eq!(traversal.counts.listing_changes_without_hint, 0);
         }
         let (_, scan, reads, _) = f.page(SnapshotSource::Codex, index);
         assert!(scan.snapshots.is_empty());
         assert!(reads.0.lock().unwrap().0.is_empty());
+    }
+}
+
+/// [behaviour] A watcher hint for a settled file is dropped unless this
+/// cycle leased one of its snapshots for a reason re-offer; the leased hint
+/// is kept for the ordinary candidate gate.
+#[test]
+fn leased_reoffer_hint_survives_the_settled_hint_filter() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let unchanged = f.root.join(format!("{UNCHANGED}.jsonl"));
+        let hints = [unchanged.clone()];
+        assert!(
+            changed_watcher_hints(&index, &hints).is_empty(),
+            "{source:?}: a settled hint is dropped"
+        );
+        let fingerprint = index.file_snapshot_fingerprints[&local_index_key(&unchanged)]
+            .first()
+            .expect("the read recorded its snapshot")
+            .clone();
+        let leased =
+            index.activate_reason_reoffer_retries(BTreeMap::from([(fingerprint, "body".into())]));
+        assert_eq!(leased, vec![unchanged.clone()], "{source:?}");
+        assert_eq!(
+            changed_watcher_hints(&index, &hints),
+            vec![unchanged],
+            "{source:?}: the leased hint is kept"
+        );
     }
 }

@@ -120,14 +120,20 @@ pub(super) fn stored_digest(key: &RowKey, version: u32, bytes: &[u8]) -> Result<
     Ok(integrity(h))
 }
 pub(super) fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8], cap: u64) -> Result<T> {
-    exact_json(&expand(bytes, cap)?)
+    Ok(exact_json(&expand(bytes, cap)?)?.0)
 }
-pub(super) fn exact_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<T> {
-    let value: T = strict_json(json)?;
+/// `strict_json` plus value equality, sharing one parse of each side. Also
+/// returns the value's compact serialization, which the equality check proved.
+pub(super) fn exact_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<(T, Vec<u8>)> {
+    let mut de = serde_json::Deserializer::from_slice(json);
+    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
+    de.end()?;
     let original: serde_json::Value = serde_json::from_slice(json)?;
-    let restored: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&value)?)?;
+    let canonical = serde_json::to_vec(&value)?;
+    let restored: serde_json::Value = serde_json::from_slice(&canonical)?;
+    key_coverage(&original, &restored, &observed, &mut Vec::new())?;
     ensure!(original == restored, "state_v2_noncanonical_value");
-    Ok(value)
+    Ok((value, canonical))
 }
 /// Existing v1 deserializers include opaque RawValue and flatten boundaries.
 /// Validate the consumed key coverage too, so those boundaries cannot hide an
@@ -306,7 +312,8 @@ mod tests {
             assert!(decode::<serde_json::Value>(raw, 1024).is_err());
         }
     }
-    /// [format] generic guard rejects nested ignored fields and opaque census keys.
+    /// [format] generic and exact guards reject nested ignored fields, opaque
+    /// census keys and noncanonical values.
     #[test]
     fn generic_guard_rejects_nested_ignored_fields_and_opaque_census_keys() {
         #[derive(Serialize, Deserialize)]
@@ -319,6 +326,20 @@ mod tests {
         }
         assert!(strict_json::<Parent>(br#"{"child":{"count":0,"owed":true}}"#).is_err());
         assert!(strict_json::<Parent>(br#"{"child":{"count":0}}"#).is_ok());
+        let error = exact_json::<Parent>(br#"{"child":{"count":0,"owed":true}}"#).err();
+        assert!(error
+            .unwrap()
+            .to_string()
+            .contains("state_v2_ignored_field"));
+        // A consumed field the serializer omits passes the key guard only.
+        #[derive(Serialize, Deserialize)]
+        struct Sparse {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            maybe: Option<u64>,
+        }
+        assert!(strict_json::<Sparse>(br#"{"maybe":null}"#).is_ok());
+        let error = exact_json::<Sparse>(br#"{"maybe":null}"#).err();
+        assert_eq!(error.unwrap().to_string(), "state_v2_noncanonical_value");
         assert!(strict_json::<ScanIndex>(
             br#"{"schema_version":2,"files":{},"claude_request_census":{"~lost":{}}}"#
         )

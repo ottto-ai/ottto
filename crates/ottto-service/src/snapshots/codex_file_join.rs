@@ -1788,7 +1788,6 @@ pub(super) mod tests {
             traces,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
@@ -1796,7 +1795,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: None,
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         for _ in 0..10_000 {
@@ -2047,7 +2045,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         for _ in 0..1000 {
@@ -2417,7 +2414,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         loop {
             match owned.step(None) {
@@ -2596,7 +2592,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         loop {
             match owned.step(None) {
@@ -2629,7 +2624,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let changed = "ffffffff-1111-4111-8111-ffffffffffff";
@@ -2725,7 +2719,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let mut added = false;
@@ -2829,7 +2822,6 @@ pub(super) mod tests {
             false,
             None,
             hints,
-            false,
             false,
         );
         for _ in 0..1000 {
@@ -3116,8 +3108,8 @@ pub(super) mod tests {
         assert!(inventory_hold(&index).is_none());
         fs::remove_dir_all(root).unwrap();
     }
-    /// [money] Protected history survives retirement; quiet retries acquire
-    /// and enqueue nothing, while bounded metadata visits may advance.
+    /// [money] Protected history survives retirement; quiet retries acquire,
+    /// enqueue and count nothing.
     #[test]
     fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         let root = native_join_fixture_root(true);
@@ -3201,7 +3193,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         assert!(
             quiet.codex_join_inventory.is_none(),
@@ -3209,18 +3200,9 @@ pub(super) mod tests {
         );
         let (quiet_index, quiet_result) = scan(&root, after.clone(), 3);
         assert_eq!(quiet_result.scanned_file_count, 0);
-        let mut quiet_counts = quiet_index.traversal.as_ref().unwrap().counts.clone();
-        let mut expected_counts = counts;
-        assert_eq!(quiet_counts.codex_roster_growth_enqueued, 0);
-        assert_eq!(expected_counts.codex_roster_growth_enqueued, 0);
-        // An append need not move the directory witness, so quiet retries
-        // still perform bounded roster visits. Only this work counter varies;
-        // every money, loss, cause and enqueue count remains idempotent.
-        quiet_counts.codex_roster_refresh_visited = 0;
-        expected_counts.codex_roster_refresh_visited = 0;
         assert_eq!(
-            serde_json::to_value(&quiet_counts).unwrap(),
-            serde_json::to_value(&expected_counts).unwrap()
+            serde_json::to_value(&quiet_index.traversal.as_ref().unwrap().counts).unwrap(),
+            serde_json::to_value(&counts).unwrap()
         );
         assert_eq!(
             quiet_index
@@ -3783,7 +3765,6 @@ pub(super) mod tests {
                 None,
                 false,
                 None,
-                false,
             )
             .unwrap();
             assert!(parsed.complete());
@@ -3858,7 +3839,6 @@ pub(super) mod tests {
                 traces: None,
                 ledgers: None,
                 artifacts: false,
-                context_curve: false,
                 index: &previous,
             })
             .unwrap();
@@ -3867,7 +3847,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         let (mut steps, mut yields) = (0, 0);

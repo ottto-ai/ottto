@@ -1055,6 +1055,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: tokens,
@@ -2098,6 +2099,7 @@ mod tests {
         tagged.request_evidence = vec![crate::snapshots::SnapshotRequestEvidence {
             identity_basis: "telemetry".to_string(),
             provider_workspace_hash: Some("organization_hash".to_string()),
+            account_source: None,
         }];
         let mut later = tagged.usage_buckets[0].clone();
         later.bucket_start = "2026-07-19T11:00:00Z".to_string();
@@ -2815,6 +2817,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "gpt-5.6-codex".to_string(),
             input_tokens: 100,
             output_tokens: 20,

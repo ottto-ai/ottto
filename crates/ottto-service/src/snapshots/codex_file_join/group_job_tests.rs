@@ -239,7 +239,6 @@ fn sampled_hinted(
         None,
         hints,
         false,
-        false,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope(scope.into()));
     for _ in 0..100_000 {
@@ -1429,7 +1428,6 @@ fn group_with_legacy_tee_is_byte_charged() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &previous,
         })
         .unwrap();
@@ -1439,7 +1437,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1457,7 +1454,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         false,
         None,
         &[],
-        false,
         false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
@@ -1579,7 +1575,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &previous,
         })
         .unwrap();
@@ -1588,7 +1583,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1611,7 +1605,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         false,
         None,
         &[],
-        false,
         false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
@@ -2169,6 +2162,8 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         counts: crate::snapshots::ScanTraversalCounts::default(),
         residue: crate::snapshots::ScanTraversalResidue::default(),
         context_inputs: None,
+        listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
     }
 }
 
@@ -2728,7 +2723,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             None,
             None,
             false,
-            false,
             codex_counting_version::AckEvidence::None
         )
         .is_err());
@@ -2741,7 +2735,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &metadata,
             None,
             None,
-            false,
             false
         )
         .is_err());
@@ -2760,7 +2753,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &index,
         })
         .unwrap();
@@ -2782,7 +2774,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert_refused(CodexZstCause::GroupReadUnsupported, || {
