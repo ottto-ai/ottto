@@ -6,8 +6,9 @@
 //! refresh token spent, and Claude Code then signs the login out
 //! (anthropics/claude-code#95822).
 //!
-//! The daemon's own short Claude runs (the Verify smoke and an MCP inventory
-//! probe of a server that is Claude Code itself) therefore never start from 15 minutes before the access
+//! The daemon's own short Claude runs (the `-p /context` footprint read, the
+//! Verify smoke, and an MCP inventory probe of a server that is Claude Code
+//! itself) therefore never start from 15 minutes before the access
 //! token's expiry until the background refresher (`claude_refresher`) has
 //! confirmed a new expiry, nor while the token is expired. `claude auth
 //! status` and `claude doctor` are not run at all.
@@ -283,6 +284,21 @@ pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &Claud
     }
 }
 
+/// The `/context` read's pin, unchanged: `CLAUDE_CONFIG_DIR` set to the
+/// login's config dir (unset for the default login) and no
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`; the rest of the environment is kept,
+/// so it runs as that home is configured.
+pub(crate) fn pin_claude_context_login(
+    command: &mut std::process::Command,
+    slot: &ClaudeConfigDirSlot,
+) {
+    match slot.config_dir() {
+        Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),
+        None => command.env_remove("CLAUDE_CONFIG_DIR"),
+    };
+    command.env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+}
+
 /// The directory holding this login's refresh lock (its config dir;
 /// `~/.claude` for the default login).
 pub(crate) fn refresh_lock_dir(slot: &ClaudeConfigDirSlot) -> Option<std::path::PathBuf> {
@@ -338,24 +354,30 @@ pub(crate) fn empty_working_dir() -> std::io::Result<EmptyWorkingDir> {
     Ok(EmptyWorkingDir { path })
 }
 
-/// Ownership for the Unix MCP probes only. Verify retains its existing
+/// Ownership for the Unix MCP/context probes only. Verify retains its existing
 /// stop API above. No response-size policy or process-group kill is introduced.
 #[cfg(unix)]
 pub(crate) mod probe {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
-    static ADMITTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Origin {
+        McpInventory,
+        Context,
+    }
 
-    fn admitted() -> &'static Mutex<BTreeSet<String>> {
-        ADMITTED.get_or_init(|| Mutex::new(BTreeSet::new()))
+    static ADMITTED: OnceLock<Mutex<BTreeMap<String, Origin>>> = OnceLock::new();
+
+    fn admitted() -> &'static Mutex<BTreeMap<String, Origin>> {
+        ADMITTED.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
     pub(crate) fn login_key(slot: &ClaudeConfigDirSlot) -> String {
@@ -411,18 +433,22 @@ pub(crate) mod probe {
     }
 
     impl Reservation {
-        fn start(slot: &ClaudeConfigDirSlot) -> Result<Self, StartError> {
+        fn start(slot: &ClaudeConfigDirSlot, origin: Origin) -> Result<Self, StartError> {
             let key = login_key(slot);
             {
                 let mut active = admitted()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if active.contains(&key)
-                    || active.len() >= crate::mcp_inventory::MCP_HARVEST_MAX_CONCURRENCY
+                let capacity = match origin {
+                    Origin::McpInventory => crate::mcp_inventory::MCP_HARVEST_MAX_CONCURRENCY,
+                    Origin::Context => 1, // Existing serial context capture.
+                };
+                if active.contains_key(&key)
+                    || active.values().filter(|value| **value == origin).count() >= capacity
                 {
                     return Err(StartError::Refused(ClaudeSpawnRefusal::CleanupPending));
                 }
-                active.insert(key.clone());
+                active.insert(key.clone(), origin);
             }
             let permit = Arc::new(Permit(key));
             let (sender, receiver) = mpsc::sync_channel::<Packet>(1);
@@ -587,6 +613,7 @@ pub(crate) mod probe {
         pub(crate) fn spawn(
             mut command: Command,
             login: Option<&ClaudeConfigDirSlot>,
+            origin: Origin,
             deadline: Instant,
         ) -> Result<Self, StartError> {
             check_deadline(deadline)?;
@@ -596,13 +623,22 @@ pub(crate) mod probe {
             }
             let (stdout, output) = parent_pipe(true)?;
             command.stdout(Stdio::from(output)).stderr(Stdio::null());
-            let (stdin, input) = parent_pipe(false)?;
-            command.stdin(Stdio::from(input));
-            let stdin = Some(stdin);
-            let reservation = login.map(Reservation::start).transpose()?;
+            let stdin = if origin == Origin::McpInventory {
+                let (stdin, input) = parent_pipe(false)?;
+                command.stdin(Stdio::from(input));
+                Some(stdin)
+            } else {
+                None
+            };
+            let reservation = login
+                .map(|slot| Reservation::start(slot, origin))
+                .transpose()?;
             if let Some(slot) = login {
                 check_short_claude_run(slot).map_err(StartError::Refused)?;
-                pin_claude_login(&mut command, slot);
+                match origin {
+                    Origin::McpInventory => pin_claude_login(&mut command, slot),
+                    Origin::Context => pin_claude_context_login(&mut command, slot),
+                }
             }
             check_deadline(deadline)?;
             let child = command.spawn()?;
@@ -632,6 +668,23 @@ pub(crate) mod probe {
                 packet.stdin.as_mut().expect("MCP input"),
                 packet.stdout.as_mut().expect("probe output"),
             )
+        }
+
+        pub(crate) fn stdout(&mut self) -> &mut File {
+            self.packet
+                .as_mut()
+                .expect("owned probe")
+                .stdout
+                .as_mut()
+                .expect("probe output")
+        }
+
+        pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            #[cfg(test)]
+            if test_support::take_probe_fault(test_support::ProbeFault::Status) {
+                return Err(io::Error::other("injected status failure"));
+            }
+            self.packet.as_mut().expect("owned probe").child.try_wait()
         }
 
         pub(crate) fn finish(mut self, deadline: Instant) {
@@ -753,7 +806,7 @@ pub(crate) mod probe {
 
     #[cfg(test)]
     pub(crate) fn is_active(slot: &ClaudeConfigDirSlot) -> bool {
-        admitted().lock().unwrap().contains(&login_key(slot))
+        admitted().lock().unwrap().contains_key(&login_key(slot))
     }
 
     #[cfg(test)]
@@ -768,25 +821,29 @@ pub(crate) mod probe {
             for index in 0..crate::mcp_inventory::MCP_HARVEST_MAX_CONCURRENCY {
                 let slot = ClaudeConfigDirSlot::registered(format!("/tmp/ottto-probe-mcp-{index}"))
                     .unwrap();
-                owners.push(Reservation::start(&slot).ok().unwrap());
+                owners.push(
+                    Reservation::start(&slot, Origin::McpInventory)
+                        .ok()
+                        .unwrap(),
+                );
             }
+            let context = ClaudeConfigDirSlot::Default;
+            owners.push(Reservation::start(&context, Origin::Context).ok().unwrap());
             for index in 0..20 {
                 let next =
                     ClaudeConfigDirSlot::registered(format!("/tmp/ottto-probe-next-{index}"))
                         .unwrap();
-                assert!(matches!(
-                    Reservation::start(&next),
-                    Err(StartError::Refused(ClaudeSpawnRefusal::CleanupPending))
-                ));
-                assert_eq!(
-                    active_count(),
-                    crate::mcp_inventory::MCP_HARVEST_MAX_CONCURRENCY
-                );
+                for origin in [Origin::McpInventory, Origin::Context] {
+                    assert!(matches!(
+                        Reservation::start(&next, origin),
+                        Err(StartError::Refused(ClaudeSpawnRefusal::CleanupPending))
+                    ));
+                }
+                assert_eq!(active_count(), 5);
             }
-            let reused = ClaudeConfigDirSlot::registered("/tmp/ottto-probe-mcp-0").unwrap();
             drop(owners); // All unused waiters are joined before slot reuse.
             assert_eq!(active_count(), 0);
-            drop(Reservation::start(&reused).ok().unwrap());
+            drop(Reservation::start(&context, Origin::Context).ok().unwrap());
             assert_eq!(active_count(), 0);
         }
 
@@ -797,9 +854,11 @@ pub(crate) mod probe {
             let composed = ClaudeConfigDirSlot::registered("/tmp/ottto-probe-é").unwrap();
             let decomposed = ClaudeConfigDirSlot::registered("/tmp/ottto-probe-e\u{301}").unwrap();
             assert_ne!(composed.config_dir(), decomposed.config_dir());
-            let owner = Reservation::start(&composed).ok().unwrap();
+            let owner = Reservation::start(&composed, Origin::McpInventory)
+                .ok()
+                .unwrap();
             assert!(matches!(
-                Reservation::start(&decomposed),
+                Reservation::start(&decomposed, Origin::Context),
                 Err(StartError::Refused(ClaudeSpawnRefusal::CleanupPending))
             ));
             assert_eq!(composed.config_dir(), Some("/tmp/ottto-probe-é"));
@@ -841,6 +900,7 @@ pub(crate) mod test_support {
         Prepare,
         Read,
         Write,
+        Status,
         FillStdin,
     }
 
@@ -860,7 +920,12 @@ pub(crate) mod test_support {
         let taken = PROBE_FAULT
             .compare_exchange(fault as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-        if taken && matches!(fault, ProbeFault::Read | ProbeFault::Write) {
+        if taken
+            && matches!(
+                fault,
+                ProbeFault::Read | ProbeFault::Write | ProbeFault::Status
+            )
+        {
             // Inject an error after admission while retaining a synthetic
             // protected credential; no real keychain may resolve the test.
             for policy in PROBE_POLICIES
@@ -1163,6 +1228,12 @@ pub(crate) mod test_support {
             if self.fake.root.join("direct").exists() {
                 self.wait_until(|| !Self::alive(self.pid("direct")));
             }
+        }
+
+        pub(crate) fn command(&self) -> std::process::Command {
+            let mut command = std::process::Command::new(&self.script);
+            command.env_clear();
+            command
         }
     }
 

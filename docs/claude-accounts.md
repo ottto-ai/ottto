@@ -359,11 +359,11 @@ off), Ottto keeps each registered slot and the default login signed in:
   was blanked, it is not refreshed again and asks to sign in again until a new
   credential appears.
 
-The daemon's other short Claude runs (the Verify smoke and the MCP inventory
-probe of a server that is Claude Code itself, such as `claude mcp serve`) do
-not start from 15 minutes before a login's access expiry until
+The daemon's other short Claude runs (the `-p /context` footprint read, the
+Verify smoke, and the MCP inventory probe of a server that is Claude Code
+itself, such as `claude mcp serve`) do not start from 15 minutes before a login's access expiry until
 the refresh has advanced it, nor while it is expired or Claude Code holds its
-refresh lock. A skipped Verify
+refresh lock. A skipped `/context` read retries in 30 minutes; a skipped Verify
 returns a warning asking to open Claude Code once (or wait), then Verify. A
 deferred MCP probe keeps the last uploaded inventory (or, without a fresh one,
 reports that server unreachable). Each of these runs is pinned to the login
@@ -400,7 +400,8 @@ logins with a valid access token.
 Residual risks not removed: a server-side 401 makes Claude Code refresh
 regardless of the local clock; a crash or power loss between the provider
 rotating the token and Claude Code saving it; the customer's own short Claude
-Code commands; and Claude processes started under user MCP servers.
+Code commands; and Claude processes started under user MCP servers or hooks of
+the `/context` read.
 
 ## Tips
 

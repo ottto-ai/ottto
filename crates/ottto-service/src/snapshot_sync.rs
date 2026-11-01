@@ -7117,7 +7117,9 @@ fn prepare_sync_source_inner(
         .with_codex_side_pass(codex_side_pass)
         .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
-    if source == SnapshotSource::Codex {
+    if source == SnapshotSource::ClaudeCode {
+        scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    } else if source == SnapshotSource::Codex {
         scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     if crate::snapshots::claude_native_comparison::enabled() {

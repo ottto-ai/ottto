@@ -36,6 +36,7 @@ mod durable_tail_codec;
 mod durable_tail_store;
 mod external_scheduler_attribution;
 mod hex;
+mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
@@ -251,6 +252,7 @@ impl ControlToken {
 pub struct LocalDaemon {
     session_launch: Arc<Mutex<session_launch::Registry>>,
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
+    footprint_cwds: Arc<context_footprint::CwdProjection>,
     codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
@@ -471,6 +473,7 @@ impl LocalDaemon {
         Self {
             session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
+            footprint_cwds: Arc::default(),
             codex_preludes: Arc::default(),
             codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
                 snapshot_sync::home_dir().ok().as_deref(),

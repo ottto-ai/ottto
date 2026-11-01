@@ -1136,12 +1136,12 @@ fn harvest_stdio_bounded(
     claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
     timeout: Duration,
 ) -> Result<ProbeOutput> {
-    use crate::claude_spawn_gate::probe::{ChildProbe, Reader, StartError, Writer};
+    use crate::claude_spawn_gate::probe::{ChildProbe, Origin, Reader, StartError, Writer};
     let started = Instant::now();
     let deadline = started + timeout.min(HANDSHAKE_TIMEOUT);
     let command = env.command_in(command, args, cwd, config_dir, server_env);
-    let mut child =
-        ChildProbe::spawn(command, claude_login, deadline).map_err(|error| match error {
+    let mut child = ChildProbe::spawn(command, claude_login, Origin::McpInventory, deadline)
+        .map_err(|error| match error {
             StartError::Refused(refusal) => anyhow::Error::new(McpProbeDeferred(refusal)),
             StartError::Io(error) => anyhow!("spawn mcp server failed: {error}"),
         })?;
