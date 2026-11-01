@@ -112,7 +112,16 @@ pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
     let mut db = populate(path, index, BTreeMap::new());
-    import::Mapper.hydrate_context(&mut db).unwrap().0
+    hydrate_resident(&mut db)
+}
+
+/// The production hydrate with cold archives read back resident, for graph
+/// comparisons.
+pub(super) fn hydrate_resident(db: &mut sqlite::Sqlite) -> ScanIndex {
+    let mut index = import::Mapper.hydrate_context(db).unwrap().0;
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    kinds_accounts::materialize(&mut tx, &mut index).unwrap();
+    index
 }
 
 /// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt
