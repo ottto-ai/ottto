@@ -101,7 +101,7 @@ pub(crate) struct Candidate {
     receipt: Receipt,
     /// Retry/ACK mode isolation remains source-wide even when the file's
     /// acquisition receipt uses the unaffected base context. `None` when the
-    /// mode is the receipt's own context (always, switch OFF): no allocation.
+    /// mode is the receipt's own context: no allocation.
     mode_context: Option<String>,
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
@@ -230,28 +230,8 @@ impl ScanIndex {
         context == base || context == local_on || context == wire_on
     }
 
-    /// OFF takes main's receipt path unless ON evidence of this base remains
-    /// (the adopted source context or any file receipt): then it stays current.
-    pub(crate) fn set_copy_prefix_base_upload_context(
-        &mut self,
-        base: Option<String>,
-        enabled: bool,
-    ) {
-        let on_evidence = |base: &String| {
-            let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
-            let wire_on =
-                crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
-            let on = |context: &String| *context == local_on || *context == wire_on;
-            self.upload_context_fingerprint.as_ref().is_some_and(&on)
-                || self
-                    .files
-                    .values()
-                    .filter_map(|entry| entry.upload_context_receipt.as_ref())
-                    // A local empty proof is not ACK evidence.
-                    .filter(|receipt| !receipt.body_witness.is_empty())
-                    .any(|receipt| on(&receipt.context_fingerprint))
-        };
-        self.copy_prefix_base_upload_context = base.filter(|base| enabled || on_evidence(base));
+    pub(crate) fn set_copy_prefix_base_upload_context(&mut self, base: Option<String>) {
+        self.copy_prefix_base_upload_context = base;
     }
 
     /// Only mode debt can share the scoped history-read admission. A genuine

@@ -1,5 +1,6 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
+use super::super::account_pending_retention::Archived;
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::BTreeMap;
@@ -20,6 +21,9 @@ pub(super) struct KindCx {
     /// Per cold family, the last rollover a committed save wrote. A sibling
     /// graph (checkpoint subset, retry working graph) skips what it names.
     pub(super) cold_rolled: BTreeMap<String, u64>,
+    /// Outcomes of the store-only rollovers this save writes. A sibling's
+    /// committed rollovers are skipped, and a failed save's are discarded.
+    pub(super) archived: Archived,
     valid: bool,
 }
 
@@ -183,6 +187,7 @@ pub(super) fn delta(
 ) -> Result<Baseline> {
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
+    cx.archived = Archived::default();
     let result = (|| {
         let mut rows = mapper::Rows {
             tx: Some(tx),
@@ -218,9 +223,7 @@ pub(super) fn save_graph(
         "state_v2_context_invalid"
     );
     let generation = previous.generation;
-    let started = std::time::Instant::now();
-    let before = store.save_row_attempts();
-    let mut span_outcome = "error";
+    let mut span = SaveSpan::begin(store);
     let mut pending = std::mem::take(committed);
     let mut published = false;
     let result = (|| {
@@ -234,11 +237,7 @@ pub(super) fn save_graph(
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;
         let outcome = tx.commit(generation, next.generation);
-        span_outcome = match outcome {
-            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
-            DurableCommitOutcome::NotPublished => "not_published",
-            DurableCommitOutcome::Ambiguous => "ambiguous",
-        };
+        span.outcome(&outcome);
         published = !matches!(outcome, DurableCommitOutcome::NotPublished);
         match outcome {
             DurableCommitOutcome::Committed(generation) => {
@@ -282,7 +281,8 @@ pub(super) fn save_graph(
                     "account_windows_retained",
                     &serde_json::json!({
                         "windows": windows, "max_per_family": max, "families_over_64": count,
-                        "uncollapsed": uncollapsed
+                        "uncollapsed": uncollapsed,
+                        "replaced": pending.archived.replaced, "pushed": pending.archived.pushed
                     }),
                 );
                 Ok(digests)
@@ -306,16 +306,42 @@ pub(super) fn save_graph(
             next.generation = generation;
         }
     }
-    let after = store.save_row_attempts();
-    telemetry::event(
-        "save_span",
-        &serde_json::json!({
-            "duration_ms": started.elapsed().as_millis(), "outcome": span_outcome,
-            "generation": next.generation, "rows_put": after.0.saturating_sub(before.0),
-            "rows_removed": after.1.saturating_sub(before.1)
-        }),
-    );
+    span.emit(store, next.generation);
     result
+}
+/// One `save_span` per write attempt: duration, commit outcome ("error"
+/// before any commit), resulting generation and rows put or removed.
+pub(super) struct SaveSpan {
+    started: std::time::Instant,
+    before: (u64, u64),
+    outcome: &'static str,
+}
+impl SaveSpan {
+    pub(super) fn begin(store: &sqlite::Sqlite) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            before: store.save_row_attempts(),
+            outcome: "error",
+        }
+    }
+    pub(super) fn outcome(&mut self, outcome: &DurableCommitOutcome) {
+        self.outcome = match outcome {
+            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
+            DurableCommitOutcome::NotPublished => "not_published",
+            DurableCommitOutcome::Ambiguous => "ambiguous",
+        };
+    }
+    pub(super) fn emit(self, store: &sqlite::Sqlite, generation: u64) {
+        let after = store.save_row_attempts();
+        telemetry::event(
+            "save_span",
+            &serde_json::json!({
+                "duration_ms": self.started.elapsed().as_millis(), "outcome": self.outcome,
+                "generation": generation, "rows_put": after.0.saturating_sub(self.before.0),
+                "rows_removed": after.1.saturating_sub(self.before.1)
+            }),
+        );
+    }
 }
 
 pub(super) fn private_paths(

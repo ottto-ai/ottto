@@ -1,5 +1,5 @@
 //! Account families share the generic mapper; only window positions need policy.
-use super::super::account_pending_retention::{ArchivedWindows, ColdFold, ColdWindows};
+use super::super::account_pending_retention::{Archived, ArchivedWindows, ColdFold, ColdWindows};
 use super::super::usage_pending::{ColdUsage, UsagePending};
 use super::super::{
     ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow, ClaudeUsageFamilyPending,
@@ -50,8 +50,15 @@ pub(super) fn rows(
         let (kept, tail) = match wanted.map(|p| &p.previous_windows) {
             Some(ArchivedWindows::Cold(cold)) => {
                 let committed = cold.committed(cx.cold_rolled.get(family).copied());
-                let archive =
-                    cold_archive(rows, family, cold, previous, seeded.as_deref(), committed)?;
+                let archive = cold_archive(
+                    rows,
+                    family,
+                    cold,
+                    previous,
+                    seeded.as_deref(),
+                    committed,
+                    &mut cx.archived,
+                )?;
                 if let Some(last) = cold.last_roll() {
                     cx.cold_rolled.insert(family.clone(), last);
                 }
@@ -242,9 +249,10 @@ fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<Us
 }
 /// A cold family's stored archive as (digests of the rows the replay keeps,
 /// replayed tail). Its ids and digests come from the baseline, or from the
-/// hydrate that built it. Only rows the endpoint rule may replace are read:
-/// at most the last two, by key, and only when windows rolled. Anything that
-/// does not match the baseline is Unknown and refuses the save.
+/// hydrate that built it. Only the row the run rule may replace is read: the
+/// last, by key, and only when windows rolled. Anything that does not match
+/// the baseline is Unknown and refuses the save. `outcomes` counts the
+/// replayed rollovers.
 ///
 /// `committed` counts this graph's queued rollovers a sibling's committed
 /// save already wrote (a clone shares them): the stored archive is then that
@@ -256,6 +264,7 @@ fn cold_archive(
     previous: Option<&WindowBaseline>,
     seeded: Option<&[u64]>,
     committed: Option<usize>,
+    outcomes: &mut Archived,
 ) -> Result<(Vec<[u8; 32]>, Vec<ClaudeAccountFamilyPendingWindow>)> {
     let unknown = || {
         telemetry::count("cold_row_unknown", 1);
@@ -287,7 +296,7 @@ fn cold_archive(
     if !cold.rolls_after(skip) {
         return Ok((digests, Vec::new()));
     }
-    let from = archived.len().saturating_sub(2);
+    let from = archived.len().saturating_sub(1);
     let tx = rows.tx.as_deref_mut().ok_or_else(unknown)?;
     let mut tail = Vec::new();
     for (id, digest) in archived[from..].iter().zip(&digests[from..]) {
@@ -304,7 +313,7 @@ fn cold_archive(
         tail.push(window);
     }
     digests.truncate(from);
-    Ok((digests, cold.replay(tail, skip)))
+    Ok((digests, cold.replay(tail, skip, outcomes)))
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,

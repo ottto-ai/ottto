@@ -2067,12 +2067,11 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only, copy-prefix switch on: the row's
+    /// Wire contract 5, bucket rows only: the row's
     /// accepted proof was copy-derived and is tombstoned; a retaining receiver
     /// drops that proof for good. Like
     /// `identity_retained`, only sent when the server advertised option (ii)
-    /// and hashed in the identity leaf. Omitted when false, so switch-off
-    /// bytes are unchanged.
+    /// and hashed in the identity leaf. Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16735,8 +16734,12 @@ struct ClaudeDesktopIdentityEvidence {
 }
 
 // The desktop store holds one ~80KB JSON per session; both caps are far above
-// anything observed and exist only to bound a pathological store.
+// anything observed and exist only to bound a pathological store. Tests use a
+// small page so pagination fixtures need dozens of files, not thousands.
+#[cfg(not(test))]
 const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
+#[cfg(test)]
+const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 32;
 const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
@@ -26931,9 +26934,7 @@ impl OwnedSourceScan {
             claude_retry_queue_due_families(index, collected_at);
         }
         let mut scoped_prefix_paths = Vec::new();
-        if source == SnapshotSource::ClaudeCode
-            && claude_request_money::e2::resumed_prefix_enabled()
-        {
+        if source == SnapshotSource::ClaudeCode {
             claude_copy_prefix_reread::select(
                 index,
                 recovery_priority,
@@ -47996,16 +47997,6 @@ impl ScanIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn claude_retry_admission_for_test(&self) -> Option<(Option<&str>, bool)> {
-        self.claude_stale_family_carry
-            .origin
-            .as_ref()?
-            .admission
-            .as_ref()
-            .map(|state| (state.after_root.as_deref(), state.complete))
-    }
-
-    #[cfg(test)]
     pub(crate) fn initialize_current_claude_contract_for_test(&mut self) {
         assert!(self.files.is_empty() && self.traversal.is_none());
         assert!(self.claude_request_identity_contract.is_none());
@@ -48022,18 +48013,6 @@ impl ScanIndex {
             self.claude_request_identity_contract.as_deref(),
             self.claude_request_identity_contract_changed,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn claude_duplicate_fence_closed_for_test(&self) -> bool {
-        self.claude_duplicate_request_witness_overflowed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scan_traversal_exhausted_for_test(&self) -> bool {
-        self.traversal.as_ref().is_some_and(|traversal| {
-            traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
-        })
     }
 
     #[cfg(test)]
@@ -50120,6 +50099,8 @@ impl ScanIndex {
         }
         self.save_internal(path, read_limit, false, Some(owner))
     }
+    /// Test-only since growth claims commit their rows directly.
+    #[cfg(test)]
     fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
         self.save_internal(path, None, true, None)
     }
@@ -51156,136 +51137,8 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        let empty_advances = self.claude_empty_map_advances(previous);
-        let held_keys = self.locally_held_keys(held);
-        let placeholders =
-            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
-        let mut result = self.clone();
-        result
-            .claude_money_birth_store
-            .preserve_missing_from(&previous.claude_money_birth_store);
-        self.note_claude_history_not_accepted(previous, &held_keys);
-        for key in &held_keys {
-            let reparse = self
-                .files
-                .get(key)
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
-                || self
-                    .file_snapshot_fingerprints
-                    .get(key)
-                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
-                    && !self.claude_account_deferred_holds.contains_key(key);
-            match previous.files.get(key) {
-                Some(committed) => {
-                    let mut committed = committed.clone();
-                    // Account retry preserves its sampled audit obligation;
-                    // authority/family-only holds keep their existing restore
-                    // semantics (E1 #870 owns that separate composition).
-                    if let Some(working) = self.files.get(key).filter(|_| {
-                        self.claude_account_deferred_holds.contains_key(key)
-                            || self
-                                .file_snapshot_fingerprints
-                                .get(key)
-                                .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
-                    }) {
-                        committed.carry_sampled_audit(working);
-                    }
-                    if reparse {
-                        committed.source_file_fingerprint.clear();
-                    } else if let Some(working) = self.files.get(key) {
-                        evidence_owed::carry_debt(&mut committed, working);
-                    }
-                    result.files.insert(key.clone(), committed);
-                }
-                None if placeholders.contains(key) => {
-                    if let Some(entry) = result.files.get_mut(key) {
-                        entry.last_snapshot_fingerprint = None;
-                        entry.last_upload_body_witness = None;
-                    }
-                    result.re_owe_effective_upload_body_witness_revision(key, 0);
-                }
-                None => {
-                    result.files.remove(key);
-                }
-            }
-            if let Some(carried) = previous.accepted_rebuild_incidence.get(key) {
-                result
-                    .accepted_rebuild_incidence
-                    .insert(key.clone(), carried.clone());
-                result.preserve_carried_ack_clock(previous);
-            }
-            match previous.file_snapshot_fingerprints.get(key) {
-                Some(fingerprints) => {
-                    result
-                        .file_snapshot_fingerprints
-                        .insert(key.clone(), fingerprints.clone());
-                }
-                None => {
-                    result.file_snapshot_fingerprints.remove(key);
-                }
-            }
-            if previous.confirmed_empty_files.contains(key) {
-                result.confirmed_empty_files.insert(key.clone());
-            } else {
-                result.confirmed_empty_files.remove(key);
-            }
-            result.revert_codex_blocked_attribution(previous, key);
-            match previous.terminal_jsonl_dispositions.get(key) {
-                Some(disposition) => {
-                    result
-                        .terminal_jsonl_dispositions
-                        .insert(key.clone(), disposition.clone());
-                }
-                None => {
-                    result.terminal_jsonl_dispositions.remove(key);
-                }
-            }
-            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
-                match previous.claude_owned_start_census.get(&member) {
-                    Some(witness) => {
-                        result
-                            .claude_owned_start_census
-                            .insert(member, witness.clone());
-                    }
-                    None => {
-                        result.claude_owned_start_census.remove(&member);
-                    }
-                }
-            }
-        }
-        let mut restored = BTreeSet::new();
-        for key in &held_keys {
-            match result.file_snapshot_fingerprints.get(key) {
-                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
-                None => restored.extend(
-                    result
-                        .files
-                        .get(key)
-                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
-                ),
-            }
-        }
-        for fingerprint in &restored {
-            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
-                result
-                    .snapshot_activity_at
-                    .insert_if_absent(fingerprint.clone(), || activity_at.clone());
-            }
-            if previous
-                .accepted_snapshot_fingerprints
-                .contains(fingerprint)
-            {
-                result
-                    .accepted_snapshot_fingerprints
-                    .insert(fingerprint.clone());
-            }
-        }
-        result.restore_claude_empty_map_advances(empty_advances);
-        let current = result.current_snapshot_fingerprints();
-        result
-            .snapshot_activity_at
-            .retain(|fingerprint, _| current.contains(fingerprint));
-        result
+        self.clone()
+            .into_locally_held_keys_reverted(previous, held, reparse_held)
     }
 
     /// The caller already owns the scanned graph. Restore only held keys in
@@ -52624,10 +52477,9 @@ impl ScanIndex {
         // re-parse, usually the binding read, instead of a Full every pass.
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if claude_request_money::e2::resumed_prefix_enabled()
-            && self
-                .claude_copy_removals
-                .pending(claude_money_birth_store::location_key(&key))
+        if self
+            .claude_copy_removals
+            .pending(claude_money_birth_store::location_key(&key))
         {
             return (
                 CandidateDecision::Parse,
@@ -53042,10 +52894,8 @@ impl ScanIndex {
         );
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
-                if claude_request_money::e2::resumed_prefix_enabled() {
-                    self.claude_copy_removals
-                        .clear_hold(claude_money_birth_store::location_key(&key));
-                }
+                self.claude_copy_removals
+                    .clear_hold(claude_money_birth_store::location_key(&key));
                 self.note_empty_file_upload_context(&key);
                 self.confirmed_empty_files.insert(key);
             }
@@ -54426,8 +54276,6 @@ mod tests {
 
     #[test]
     fn e2_deferred_retry_root_keeps_service_debt_and_committed_fingerprints() {
-        let _resumed_prefix =
-            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
         {
             let root = "11111111-1111-4111-8111-111111111111";
             let project = PathBuf::from("/synthetic/projects/p");
@@ -55857,141 +55705,6 @@ mod tests {
         ));
     }
 
-    fn legacy_shaped_index(mut index: ScanIndex) -> ScanIndex {
-        let mut value = serde_json::to_value(&index).expect("serialize current index");
-        let object = value.as_object_mut().expect("scan index object");
-        object.remove("accepted_snapshot_fingerprints");
-        object.remove("accepted_snapshot_fingerprint_ledger_version");
-        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
-        assert!(index.accepted_snapshot_fingerprints.is_empty());
-        assert!(index.legacy_settlement_ledger_needs_migration());
-        index
-    }
-
-    /// The 0.1.122 ledger records no witness of which migration path wrote it,
-    /// so a machine that sealed its revisions without proof and one that swept
-    /// them are indistinguishable on disk. Every ledger left at the unproven
-    /// version is therefore re-opened exactly once and re-proved.
-    #[test]
-    fn ledger_migrated_without_settlement_proof_reopens_once_then_stays_terminal() {
-        let root = temp_dir("scan-index-unproven-ledger-reopen");
-        let path = root.join("codex-scan-index-v3.json");
-        let sealed = "a".repeat(64);
-        let stranded = "b".repeat(64);
-        let mut index = ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([sealed.clone(), stranded.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([sealed.clone(), stranded.clone()])
-                .into(),
-            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-            ..ScanIndex::default()
-        };
-        index
-            .save(&path)
-            .expect("persist the unproven 0.1.122 ledger");
-
-        let mut reopened = ScanIndex::load(&path).expect("the unproven ledger shape still loads");
-        assert!(
-            reopened.legacy_settlement_ledger_needs_migration(),
-            "an unproven ledger is not treated as migrated"
-        );
-        let (armed, changed) =
-            reopened.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([sealed.clone(), stranded.clone()]),
-            "the whole unproven accepted set is re-offered, not trusted"
-        );
-        assert!(reopened.accepted_snapshot_fingerprints.is_empty());
-
-        // The re-open is idempotent: a second cycle resumes the sweep from the
-        // persisted cursor instead of discarding what the server has since
-        // acknowledged.
-        reopened.save(&path).expect("persist the re-opened ledger");
-        let mut resumed = ScanIndex::load(&path).expect("reload the re-opened ledger");
-        let (again, _) =
-            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(
-            again.is_empty(),
-            "both revisions are already armed, so no page is re-armed"
-        );
-        assert_eq!(
-            resumed.legacy_settlement_reconciliation_pending_fingerprints(),
-            BTreeSet::from([sealed.clone(), stranded.clone()])
-        );
-
-        // The server settles both, which is the only evidence that closes the
-        // migration.
-        resumed.retain_quarantined_fingerprints(&BTreeMap::new());
-        resumed.record_accepted_snapshot_fingerprints(&BTreeSet::from([sealed, stranded]));
-        resumed.finish_legacy_settlement_reconciliation();
-        assert!(!resumed.legacy_settlement_ledger_needs_migration());
-        assert!(resumed
-            .legacy_settlement_reconcile_after_fingerprint
-            .is_none());
-        let (terminal, changed) =
-            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(terminal.is_empty());
-        assert!(!changed, "a settled ledger never re-opens again");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_0_1_121_unfinished_strand_rearms_in_persisted_bounded_pages() {
-        let root = temp_dir("scan-index-rearm-stranded-revision");
-        let path = root.join("codex-scan-index-v3.json");
-        let accepted = "a".repeat(64);
-        let stranded = "b".repeat(64);
-        let mut index = legacy_shaped_index(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), stranded.clone()]),
-            )]),
-            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
-            ..ScanIndex::default()
-        });
-
-        let (first_page, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
-        assert!(changed);
-        assert_eq!(first_page, BTreeSet::from([accepted.clone()]));
-        assert!(
-            index.traversal.is_none(),
-            "the empty traversal is restarted"
-        );
-        let first = index
-            .quarantined_snapshot_fingerprints
-            .get(&accepted)
-            .expect("the first bounded identity is armed");
-        assert_eq!(
-            first.witness.contract,
-            SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION
-        );
-        assert_eq!(first.retry_after_unix_seconds, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint,
-            Some(accepted.clone())
-        );
-        index.save(&path).expect("persist repaired retry state");
-
-        let mut restarted = ScanIndex::load(&path).expect("reload repaired index");
-        let (second_page, changed) =
-            restarted.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
-        assert!(changed);
-        assert_eq!(second_page, BTreeSet::from([stranded.clone()]));
-        assert!(restarted
-            .quarantined_snapshot_fingerprints
-            .contains_key(&stranded));
-        assert_eq!(
-            restarted.legacy_settlement_reconciliation_pending_fingerprints(),
-            BTreeSet::from([accepted, stranded])
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn snapshot_admission_boundaries_match_backend_640_kib() {
         assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
@@ -57060,94 +56773,6 @@ mod tests {
             4,
             "one membership change reparses the new member and every unchanged sibling"
         );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_scan_index_reparses_once_to_establish_semantic_activity_witness() {
-        let root = temp_dir("scan-index-migration");
-        let path = root.join("rollout-019e253c-6666-7000-9000-ffffffffffff.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-ffffffffffff\"}}\n",
-                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let metadata = fs::metadata(&path).expect("metadata");
-        let modified_unix_seconds = metadata
-            .modified()
-            .ok()
-            .and_then(unix_seconds)
-            .expect("mtime seconds");
-        let legacy_metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&root));
-        let legacy_source_file_fingerprint = source_file_fingerprint_with_context(
-            &path,
-            metadata.len(),
-            modified_unix_seconds,
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            &legacy_metadata.legacy_sidecar_fingerprint,
-        );
-        let mut index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&path),
-                ScanIndexEntry {
-                    codex_fragment: None,
-                    size_bytes: metadata.len(),
-                    modified_unix_seconds,
-                    modified_unix_nanos: None,
-                    source_file_fingerprint: legacy_source_file_fingerprint,
-                    last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
-                    scan_identity_version: None,
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
-                    evidence_owed: false,
-                },
-            )]),
-            ..ScanIndex::default()
-        };
-
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan");
-        assert_eq!(scan.scanned_file_count, 1);
-        assert_eq!(scan.snapshots.len(), 1);
-        let migrated = index.files.get(&local_index_key(&path)).expect("entry");
-        assert_eq!(
-            migrated.scan_identity_version.as_deref(),
-            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-        );
-        assert_ne!(
-            migrated.last_snapshot_fingerprint.as_deref(),
-            Some("legacy-snapshot-fingerprint")
-        );
-        assert!(migrated.modified_unix_nanos.is_some());
-        assert!(index
-            .file_snapshot_fingerprints
-            .get(&local_index_key(&path))
-            .expect("exact entity set")
-            .iter()
-            .all(|fingerprint| index.snapshot_activity_at.contains_key(fingerprint)));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -58297,48 +57922,6 @@ mod tests {
         "019fb22b-0000-7000-8000-000000000013",
     ];
 
-    /// One cycle of the source loop in the order `sync_source_snapshots`
-    /// evaluates it: the historical-backfill gate is read from durable
-    /// backfill state before the scan, the legacy settlement sweep is armed
-    /// only while no replay is pending, the scan runs, a complete census marks
-    /// the backfill done for this destination, and the sweep is finished after
-    /// settlement. The server leg is deliberately absent - nothing is ACKed -
-    /// so an armed page stays armed and the accepted set never grows here.
-    fn gated_codex_cycle(
-        index: &mut ScanIndex,
-        roots: &[PathBuf],
-        backfill: &mut crate::backfill::BackfillState,
-        destination: &str,
-        collected_at: &str,
-    ) -> (SourceScanResult, Option<BTreeSet<String>>) {
-        let backfill_pending =
-            crate::backfill::pending_backfill_sources_for_destination(backfill, destination)
-                .contains(&SnapshotSource::Codex);
-        let armed =
-            (!backfill_pending && index.legacy_settlement_ledger_needs_migration()).then(|| {
-                index
-                    .prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50)
-                    .0
-            });
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            roots,
-            index,
-            collected_at,
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan the residue fixture");
-        if backfill_pending && scan.census_complete {
-            crate::backfill::mark_backfill_complete_for_destination(
-                backfill,
-                SnapshotSource::Codex,
-                destination,
-            );
-        }
-        index.finish_legacy_settlement_reconciliation();
-        (scan, armed)
-    }
-
     fn cycle_clock(cycle: u64) -> String {
         format!("2026-09-03T00:{:02}:00Z", 5 * cycle)
     }
@@ -58422,248 +58005,6 @@ mod tests {
         let clean = ScanTraversalCounts::default();
         assert!(!clean.has_errors());
         assert!(clean.settled_residue().is_none());
-    }
-
-    /// The shape found on an upgraded machine: a ledger sealed at the unproven
-    /// version with every current revision recorded as accepted and no cursor,
-    /// behind a Codex census that a single unresolvable archived rollout keeps
-    /// incomplete with nothing pending. The census must complete with the
-    /// residue named, the destination backfill must clear on that census, and
-    /// the next cycle must re-open the ledger exactly once.
-    #[test]
-    fn unproven_ledger_behind_non_progressing_codex_residue_completes_and_reopens_once() {
-        let fixture = CodexResidueFixture::create("codex-residue-unproven-ledger");
-        fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
-        let residue_path =
-            fixture.write_rollout(&fixture.archived, RESIDUE_SESSION, "2026-07-30T11-35-45");
-        for (position, session_id) in HEALTHY_SESSIONS.iter().take(2).enumerate() {
-            fixture.insert_thread(session_id, 40, "user");
-            fixture.write_rollout(
-                &fixture.sessions,
-                session_id,
-                &format!("2026-08-2{position}T09-00-00"),
-            );
-        }
-        let roots = fixture.roots();
-        let destination = "destination-namespace-under-test";
-        let mut index = ScanIndex::default();
-        let mut backfill = crate::backfill::BackfillState::default();
-
-        // Cycle 0 establishes the checkpointed history. Then model the
-        // upgrade: the previous daemon sealed every current revision into a
-        // v1 ledger, and this destination's backfill is pending again.
-        let (seed, _) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(0),
-        );
-        assert_eq!(seed.snapshots.len(), 2, "{seed:#?}");
-        assert_eq!(seed.ownership_incomplete_file_count, 1);
-        assert_eq!(seed.zero_snapshot_usage_evidence_count, 1);
-        assert_eq!(seed.dropped_usage_record_count, 1);
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(RESIDUE_SESSION));
-        let current = index.current_snapshot_fingerprints();
-        assert_eq!(current.len(), 2);
-        index.accepted_snapshot_fingerprints = current.clone().into();
-        index.accepted_snapshot_fingerprint_ledger_version =
-            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION;
-        index.legacy_settlement_reconcile_after_fingerprint = None;
-        let mut backfill = crate::backfill::BackfillState::default();
-        assert!(
-            crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
-                .contains(&SnapshotSource::Codex)
-        );
-
-        // Cycle 1: the gate is still closed when it is read, but the census
-        // completes with the residue named, which clears the backfill.
-        let (first, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(1),
-        );
-        assert!(
-            armed.is_none(),
-            "the gate was closed when this cycle read it"
-        );
-        assert!(first.census_complete, "{first:#?}");
-        assert!(!first.scan_cap_hit);
-        assert_eq!(first.ownership_incomplete_file_count, 1);
-        assert_eq!(first.dropped_usage_record_count, 1);
-        assert!(
-            index.traversal.is_none(),
-            "a complete census drops the traversal"
-        );
-        let witness = index
-            .scan_residue_witness
-            .clone()
-            .expect("a census that completed with residue records it");
-        assert_eq!(witness.ownership_incomplete_file_count, 1);
-        assert_eq!(witness.zero_snapshot_usage_evidence_count, 1);
-        assert_eq!(witness.dropped_usage_record_count, 1);
-        assert_eq!(
-            witness.index_keys,
-            BTreeSet::from([local_index_key(&residue_path)])
-        );
-        assert_eq!(witness.archived_residue_file_count(), 1);
-        assert_eq!(
-            witness.codex_state_only_blocked_session_ids,
-            BTreeSet::from([RESIDUE_SESSION.to_string()])
-        );
-        assert!(
-            !crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
-                .contains(&SnapshotSource::Codex),
-            "a complete census marks the destination backfill done"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-            "the ledger is untouched until the gate opens"
-        );
-
-        // Cycle 2: the gate is open and the unproven ledger re-opens.
-        let (second, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(2),
-        );
-        assert!(second.census_complete);
-        assert_eq!(
-            armed.as_ref(),
-            Some(&current),
-            "every previously sealed revision is re-offered"
-        );
-        assert!(index.accepted_snapshot_fingerprints.is_empty());
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
-            current.iter().next_back()
-        );
-        let persisted = serde_json::to_value(&index).expect("serialize index");
-        assert!(
-            persisted
-                .get("accepted_snapshot_fingerprint_ledger_version")
-                .is_none(),
-            "the re-opened ledger drops its version key"
-        );
-        assert!(persisted
-            .get("legacy_settlement_reconcile_after_fingerprint")
-            .is_some());
-
-        // Cycle 3: nothing is re-opened again; the armed page waits for the
-        // server, which this model never provides.
-        let (third, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(3),
-        );
-        assert!(third.census_complete);
-        assert_eq!(armed, Some(BTreeSet::new()));
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(index.quarantined_snapshot_fingerprints.len(), 2);
-        assert_eq!(
-            index.legacy_settlement_reconciliation_pending_fingerprints(),
-            current
-        );
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(RESIDUE_SESSION));
-        let _ = fs::remove_dir_all(fixture.home);
-    }
-
-    /// The other shape: a pre-ledger index mid-sweep with a persisted cursor,
-    /// frozen behind the same residue. Once the census completes the sweep
-    /// arms its next page; nothing is re-opened and the re-earned acceptances
-    /// are kept.
-    #[test]
-    fn pre_ledger_sweep_behind_non_progressing_codex_residue_resumes() {
-        let fixture = CodexResidueFixture::create("codex-residue-pre-ledger-sweep");
-        fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
-        fixture.write_rollout(
-            &fixture.sessions,
-            ACTIVE_RESIDUE_SESSION,
-            "2026-07-30T11-35-45",
-        );
-        for (position, session_id) in HEALTHY_SESSIONS.iter().enumerate() {
-            fixture.insert_thread(session_id, 40, "user");
-            fixture.write_rollout(
-                &fixture.sessions,
-                session_id,
-                &format!("2026-08-2{position}T09-00-00"),
-            );
-        }
-        let roots = fixture.roots();
-        let destination = "destination-namespace-under-test";
-        let mut index = ScanIndex::default();
-        let mut backfill = crate::backfill::BackfillState::default();
-        let (seed, _) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(0),
-        );
-        assert_eq!(seed.snapshots.len(), 3, "{seed:#?}");
-        let current = index
-            .current_snapshot_fingerprints()
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(current.len(), 3);
-        let settled = current.iter().take(2).cloned().collect::<BTreeSet<_>>();
-        index.accepted_snapshot_fingerprints = settled.clone().into();
-        index.accepted_snapshot_fingerprint_ledger_version = 0;
-        index.legacy_settlement_reconcile_after_fingerprint = Some(current[1].clone());
-        let mut backfill = crate::backfill::BackfillState::default();
-
-        let (first, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(1),
-        );
-        assert!(armed.is_none());
-        assert!(first.census_complete, "{first:#?}");
-        assert_eq!(first.ownership_incomplete_file_count, 1);
-        let witness = index.scan_residue_witness.clone().expect("residue witness");
-        assert_eq!(witness.archived_residue_file_count(), 0);
-        assert_eq!(
-            witness.codex_state_only_blocked_session_ids,
-            BTreeSet::from([ACTIVE_RESIDUE_SESSION.to_string()])
-        );
-
-        let (second, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(2),
-        );
-        assert!(second.census_complete);
-        assert_eq!(
-            armed,
-            Some(BTreeSet::from([current[2].clone()])),
-            "the sweep resumes from its cursor with the one unsettled revision"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprints, settled,
-            "a pre-ledger sweep keeps what the server already acknowledged"
-        );
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
-            Some(&current[2])
-        );
-        let _ = fs::remove_dir_all(fixture.home);
     }
 
     /// Residue is settled only once discovery has finished: a page that still
@@ -59287,197 +58628,6 @@ mod tests {
         .expect("restored root converges through a fresh complete census");
         assert!(restored.census_complete);
         assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[test]
-    fn old_index_without_root_witness_infers_missing_previously_observed_root() {
-        let parent = temp_dir("old-index-missing-root");
-        let root = parent.join("sessions");
-        let index_path = parent.join("scan-index.json");
-        let prior_path = root.join("session.jsonl");
-        let mut old_index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        old_index
-            .save(&index_path)
-            .expect("write pre-witness index");
-        let serialized: Value =
-            serde_json::from_slice(&fs::read(&index_path).expect("read pre-witness index"))
-                .expect("parse pre-witness index");
-        assert!(serialized.get("known_configured_scan_roots").is_none());
-        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness index");
-
-        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
-        let (scan, disappearance_events) = disappearance_diagnostics::observe(|| {
-            scan_source_roots(
-                SnapshotSource::Pi,
-                std::slice::from_ref(&root),
-                &mut upgraded,
-                "2026-07-31T00:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-            )
-            .expect("upgrade inference remains source-local")
-        });
-        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
-        assert_eq!(
-            serde_json::to_vec(&upgraded.files).unwrap(),
-            authoritative_files,
-            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
-        );
-
-        assert!(!scan.census_complete);
-        assert_eq!(scan.disappeared_file_count, 1);
-        assert!(upgraded.files.contains_key(&local_index_key(&prior_path)));
-        assert!(upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&root)));
-        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_vanished_symlink_witness_does_not_promote_optional_roots() {
-        use std::os::unix::fs::symlink;
-
-        let parent = temp_dir("legacy-vanished-symlink-root");
-        let target = parent.join("relocated-sessions");
-        let configured_link = parent.join("configured-sessions");
-        let optional_root = parent.join("optional-sessions");
-        fs::create_dir_all(&target).expect("create prior canonical target");
-        let prior_path = fs::canonicalize(&target)
-            .expect("canonicalize prior target")
-            .join("session.jsonl");
-        fs::remove_dir_all(&target).expect("remove prior canonical target");
-        let index_path = parent.join("scan-index.json");
-        let mut old_index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        let roots = vec![optional_root.clone(), configured_link.clone()];
-        old_index.traversal = Some(terminal_unhealthy_traversal(
-            scan_traversal_context_fingerprint(
-                SnapshotSource::Pi,
-                &roots,
-                &old_index,
-                BACKFILL_WINDOW_DAYS,
-            ),
-        ));
-        old_index
-            .save(&index_path)
-            .expect("write pre-witness symlink index");
-        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness symlink index");
-
-        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
-        let (missing, disappearance_events) = disappearance_diagnostics::observe(|| {
-            scan_source_roots(
-                SnapshotSource::Pi,
-                &roots,
-                &mut upgraded,
-                "2026-07-31T00:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-            )
-            .expect("unresolved legacy symlink remains source-local")
-        });
-        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
-        assert_eq!(
-            serde_json::to_vec(&upgraded.files).unwrap(),
-            authoritative_files,
-            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
-        );
-
-        assert!(!missing.census_complete);
-        assert_eq!(missing.disappeared_file_count, 1);
-        assert_eq!(
-            upgraded.legacy_unresolved_root_file_witnesses,
-            BTreeSet::from([local_index_key(&prior_path)])
-        );
-        assert!(!upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&optional_root)));
-
-        fs::create_dir_all(&target).expect("restore canonical target");
-        symlink(&target, &configured_link).expect("restore configured symlink");
-        let restored = scan_source_roots(
-            SnapshotSource::Pi,
-            &roots,
-            &mut upgraded,
-            "2026-07-31T00:10:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("restored symlink covers its durable legacy witness");
-
-        assert_eq!(
-            restored.disappeared_file_count,
-            0,
-            "legacy_witnesses={} optional_known={} link_known={}",
-            upgraded.legacy_unresolved_root_file_witnesses.len(),
-            upgraded
-                .known_configured_scan_roots
-                .contains(&local_index_key(&optional_root)),
-            upgraded
-                .known_configured_scan_roots
-                .contains(&local_index_key(&configured_link)),
-        );
-        assert!(restored.census_complete, "restored scan: {restored:#?}");
-        assert!(upgraded.files.is_empty());
-        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
-        assert!(upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&configured_link)));
-        assert!(!upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&optional_root)));
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[test]
-    fn legacy_root_context_change_does_not_claim_unrelated_optional_root() {
-        let parent = temp_dir("legacy-root-context-change");
-        let old_root = parent.join("old-sessions");
-        let new_optional_root = parent.join("new-optional-sessions");
-        let prior_path = old_root.join("session.jsonl");
-        let mut index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        let old_roots = vec![old_root];
-        index.traversal = Some(terminal_unhealthy_traversal(
-            scan_traversal_context_fingerprint(
-                SnapshotSource::Pi,
-                &old_roots,
-                &index,
-                BACKFILL_WINDOW_DAYS,
-            ),
-        ));
-
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&new_optional_root),
-            &mut index,
-            "2026-07-31T00:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("changed root context starts a fresh authoritative scope");
-
-        assert!(scan.census_complete);
-        assert_eq!(scan.disappeared_file_count, 0);
-        assert!(index.files.is_empty());
-        assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
-        assert!(!index
-            .known_configured_scan_roots
-            .contains(&local_index_key(&new_optional_root)));
         let _ = fs::remove_dir_all(parent);
     }
 
@@ -79410,100 +78560,6 @@ mod tests {
         index
     }
 
-    /// L-SB upgrade (C-1, SB-T4): an index from before attribution moves its
-    /// whole blocked set to `legacy` once; attribution never releases a
-    /// legacy id, and only an acceptance, a holder-less join release or a
-    /// fresh index does.
-    #[test]
-    fn l_sb_upgrade_moves_the_blocked_set_to_legacy_once_and_attribution_never_releases_it() {
-        let mut index = ScanIndex::default();
-        index
-            .codex_state_only_blocked_session_ids
-            .extend(sb_ids(&["old-x", "old-y", "old-z"]));
-        index.migrate_codex_blocked_attribution();
-        assert!(index.codex_state_only_blocked_attributed);
-        assert_eq!(
-            index.codex_state_only_blocked_legacy,
-            sb_ids(&["old-x", "old-y", "old-z"])
-        );
-        // Idempotent: a later page start adds nothing.
-        sb_disclose(&mut index, "k1", &["new"]);
-        index.migrate_codex_blocked_attribution();
-        assert!(!index.codex_state_only_blocked_legacy.contains("new"));
-        // A key that blocked a legacy id re-parses, shrinks, is deleted (no
-        // retirement): the legacy id stays blocked.
-        sb_disclose(&mut index, "k1", &["old-x"]);
-        sb_disclose(&mut index, "k1", &[]);
-        assert!(sb_blocked(&index, "old-x") && !sb_blocked(&index, "new"));
-        // Released only by an acceptance or a holder-less join release.
-        index.accept_codex_block(["k9".to_owned()], "old-y");
-        assert!(!sb_blocked(&index, "old-y"));
-        index.codex_state_only_blocked_unattributed.remove("old-z");
-        index.codex_state_only_blocked_legacy.remove("old-z");
-        index.release_codex_block("old-z");
-        assert!(!sb_blocked(&index, "old-z"));
-        assert!(sb_blocked(&index, "old-x"));
-        assert_attribution_blocked(&index);
-    }
-
-    /// C-1 downgrade and re-upgrade: the four fields are additive and
-    /// skipped when empty, so an old binary loads the index, drops them on
-    /// its next save and keeps the blocked set. Re-upgrading moves the whole
-    /// set to `legacy` again (one jump), and nothing is released.
-    #[test]
-    fn l_sb_downgrade_and_reupgrade_preserve_every_block() {
-        let fresh = serde_json::to_value(ScanIndex::default()).unwrap();
-        for field in [
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
-        ] {
-            assert!(fresh.get(field).is_none(), "{field} serialized when empty");
-        }
-        let mut index = ScanIndex::default();
-        index
-            .codex_state_only_blocked_session_ids
-            .insert("legacy-id".to_owned());
-        index.migrate_codex_blocked_attribution();
-        sb_disclose(&mut index, "held-key", &["held-id", "shared-id"]);
-        sb_disclose(&mut index, "other-key", &["shared-id"]);
-        index
-            .codex_state_only_blocked_session_ids
-            .insert("queued-owner".to_owned());
-        index
-            .codex_state_only_blocked_unattributed
-            .insert("queued-owner".to_owned());
-        let blocked = index.codex_state_only_blocked_session_ids.clone();
-        // Round trip through this binary keeps everything.
-        let saved = serde_json::to_value(&index).unwrap();
-        let reloaded: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
-        assert_eq!(
-            reloaded.codex_state_only_blocked_by_file,
-            index.codex_state_only_blocked_by_file
-        );
-        assert!(reloaded.codex_state_only_blocked_attributed);
-        // The old binary: unknown fields are ignored and gone on its save.
-        let mut old = saved;
-        for field in [
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
-        ] {
-            assert!(old.as_object_mut().unwrap().remove(field).is_some());
-        }
-        let mut reupgraded: ScanIndex = serde_json::from_value(old).unwrap();
-        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
-        assert!(!reupgraded.codex_state_only_blocked_attributed);
-        reupgraded.migrate_codex_blocked_attribution();
-        assert_eq!(reupgraded.codex_state_only_blocked_legacy, blocked);
-        // Nothing is released by attribution after the jump.
-        sb_disclose(&mut reupgraded, "held-key", &[]);
-        sb_disclose(&mut reupgraded, "other-key", &[]);
-        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
-    }
-
     /// SB-T5b (zero-usage cure), both legs, each with a variant where another
     /// stored key still names the id. (a) A held fork with ambiguous
     /// candidates {X, Y} re-parses complete resolved to X: Y is released and
@@ -83402,223 +82458,6 @@ mod tests {
         assert!(envelope.get("conflict_head_challenge").is_none());
         assert!(envelope.get("rescan_from_revision_hash").is_none());
         assert!(envelope.get("forced_full_rescan").is_none());
-    }
-
-    /// The exact on-disk shape of an index written before the accepted-ledger
-    /// version field existed: the accepted set is present, because
-    /// `record_accepted_snapshot_fingerprints` recorded real entity ACKs, and
-    /// the version field is absent, so serde defaults it to the pre-ledger
-    /// value. Building it through serde rather than by assigning `0` is what
-    /// makes it the shape a real upgrade deserializes.
-    fn pre_ledger_index_with_accepted(mut index: ScanIndex) -> ScanIndex {
-        let mut value = serde_json::to_value(&index).expect("serialize current index");
-        let object = value.as_object_mut().expect("scan index object");
-        object.remove("accepted_snapshot_fingerprint_ledger_version");
-        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION
-        );
-        assert!(!index.accepted_snapshot_fingerprints.is_empty());
-        assert!(index.legacy_settlement_ledger_needs_migration());
-        index
-    }
-
-    /// A pre-ledger accepted set holds real entity ACKs, but the revisions the
-    /// silent retry-loss dropped are gone from the index entirely, so
-    /// `current - accepted` is already empty and the seal branch is reachable
-    /// on the first cycle. Sealing there retires the migration without ever
-    /// arming a page, and arming is the forced re-parse of the owning files
-    /// that recovers those revisions.
-    ///
-    /// This is the exact pre-fix state: version field absent on disk, accepted
-    /// covering every current revision, no sweep cursor, empty pending set.
-    #[test]
-    fn pre_ledger_accepted_set_is_not_sealed_by_finish_without_the_bounded_sweep() {
-        let accepted = "a".repeat(64);
-        let sibling = "b".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), sibling.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted, sibling]).into(),
-            ..ScanIndex::default()
-        });
-        assert!(
-            index
-                .legacy_settlement_reconcile_after_fingerprint
-                .is_none(),
-            "the shape under test has never armed a page"
-        );
-        assert!(
-            index
-                .legacy_settlement_reconciliation_pending_fingerprints()
-                .is_empty(),
-            "the seal branch is reachable only because nothing is pending"
-        );
-
-        index.finish_legacy_settlement_reconciliation();
-
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
-            "an empty pending set over a never-swept pre-ledger accepted set is not settlement \
-             evidence and may not close the migration"
-        );
-        assert!(index.legacy_settlement_ledger_needs_migration());
-    }
-
-    /// The same guard has to hold at the earlier site.
-    /// `prepare_legacy_settlement_reconciliation` runs at the top of every
-    /// ordinary cycle and `finish_legacy_settlement_reconciliation` only at its
-    /// end, so a guard that lives only in `finish_*` delays the unproven seal
-    /// by one cycle instead of preventing it. On the same never-armed
-    /// pre-ledger shape the sweep re-opens the ledger and arms every current
-    /// revision rather than sealing it.
-    #[test]
-    fn pre_ledger_accepted_set_is_reopened_by_prepare_instead_of_sealed() {
-        let accepted = "a".repeat(64);
-        let sibling = "b".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), sibling.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone(), sibling.clone()])
-                .into(),
-            ..ScanIndex::default()
-        });
-        assert!(
-            index
-                .legacy_settlement_reconciliation_pending_fingerprints()
-                .is_empty(),
-            "the seal branch is reachable only because nothing is pending"
-        );
-
-        let (armed, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([accepted.clone(), sibling.clone()]),
-            "the never-swept pre-ledger set is re-offered, not sealed"
-        );
-        assert!(
-            index.accepted_snapshot_fingerprints.is_empty(),
-            "the re-open clears the set so the sweep has something to arm"
-        );
-        assert!(
-            index.legacy_settlement_ledger_needs_migration(),
-            "the ledger stays open until the server settles every revision"
-        );
-        for fingerprint in [&accepted, &sibling] {
-            let record = index
-                .quarantined_snapshot_fingerprints
-                .get(fingerprint)
-                .expect("every current revision is re-armed for the bounded sweep");
-            assert_eq!(
-                record.disposition,
-                SnapshotQuarantineDisposition::RetryPending
-            );
-            assert_eq!(record.retry_after_unix_seconds, 0);
-        }
-        assert!(
-            index.bounded_sweep_had_unsettled_upload,
-            "arming is what forces the re-parse that recovers a dropped revision"
-        );
-        assert_eq!(
-            index.bounded_sweep_unsettled_cause_names(),
-            ["legacy_reconcile"]
-        );
-    }
-
-    /// The re-open is bounded, not a wedge: refusing the unproven seal starts
-    /// the ordinary sweep, and the sweep closes the migration once the server
-    /// has settled every page.
-    #[test]
-    fn reopened_pre_ledger_sweep_terminates_and_seals_after_the_server_settles() {
-        let fingerprints = (0..120)
-            .map(|value| format!("{value:064x}"))
-            .collect::<BTreeSet<_>>();
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "bounded-sweep-session-set.jsonl".to_string(),
-                fingerprints.clone(),
-            )]),
-            accepted_snapshot_fingerprints: fingerprints.clone().into(),
-            ..ScanIndex::default()
-        });
-        assert!(index
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty());
-
-        let mut pages = Vec::new();
-        while index.legacy_settlement_ledger_needs_migration() {
-            let (armed, _) =
-                index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-            if armed.is_empty() {
-                break;
-            }
-            assert!(armed.len() <= 50, "a cycle never arms more than one page");
-            pages.push(armed.len());
-            // The server settles the armed page.
-            index.retain_quarantined_fingerprints(&BTreeMap::new());
-            index.record_accepted_snapshot_fingerprints(&armed);
-            index.finish_legacy_settlement_reconciliation();
-        }
-
-        assert_eq!(pages, vec![50, 50, 20]);
-        assert!(
-            !index.legacy_settlement_ledger_needs_migration(),
-            "the guard refuses one unproven seal; it does not hold the ledger open forever"
-        );
-        assert_eq!(index.accepted_snapshot_fingerprints, fingerprints);
-        let (terminal, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(terminal.is_empty());
-        assert!(!changed, "a settled ledger never re-opens again");
-    }
-
-    /// The sweep cursor is what scopes the pre-ledger leg to never-armed
-    /// ledgers. A ledger already being swept has re-earned acceptances through
-    /// the server, and a second re-open would discard them and restart the
-    /// pass, so the guard must not fire once the cursor is set.
-    #[test]
-    fn pre_ledger_ledger_already_being_swept_is_not_reopened_again() {
-        let proved = "a".repeat(64);
-        let first_pending = "b".repeat(64);
-        let second_pending = "c".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([
-                    proved.clone(),
-                    first_pending.clone(),
-                    second_pending.clone(),
-                ]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([proved.clone()]).into(),
-            legacy_settlement_reconcile_after_fingerprint: Some(proved.clone()),
-            ..ScanIndex::default()
-        });
-        assert!(!index.legacy_settlement_ledger_is_unproven());
-
-        let (armed, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([first_pending, second_pending]),
-            "the sweep resumes over the remaining revisions"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprints,
-            BTreeSet::from([proved]),
-            "an acceptance the sweep already proved is never discarded"
-        );
     }
 
     fn traversal_reset_scope_checkpoint(

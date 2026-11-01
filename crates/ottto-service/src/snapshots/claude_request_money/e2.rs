@@ -48,64 +48,6 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Local release switch: the owner's support-dir marker (a regular file,
-/// never a symlink), using the support-directory sentinel pattern. Absent preserves
-/// released money behavior. Read once per process, so the daemon and the
-/// re-read CLI apply it from their next start. Independent of the server's
-/// wire capability.
-pub(crate) const RESUMED_PREFIX_MARKER: &str = "claude_resumed_prefix_dedupe_enabled";
-pub(crate) fn resumed_prefix_enabled() -> bool {
-    #[cfg(test)]
-    {
-        // A test opts in on its own thread, never reading the host marker.
-        !PRE_CHANGE_BUILDER.with(std::cell::Cell::get)
-            && RESUMED_PREFIX.with(std::cell::Cell::get).unwrap_or(false)
-    }
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| resumed_prefix_enabled_at(&ottto_core::default_support_dir()))
-    }
-}
-pub(crate) fn resumed_prefix_enabled_at(support: &std::path::Path) -> bool {
-    super::super::local_switch::marker_at(support, RESUMED_PREFIX_MARKER)
-}
-#[cfg(test)]
-thread_local! {
-    static RESUMED_PREFIX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static PRE_CHANGE_BUILDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-pub(crate) struct ResumedPrefixForTest(Option<bool>);
-#[cfg(test)]
-impl ResumedPrefixForTest {
-    pub(crate) fn set(on: bool) -> Self {
-        Self(RESUMED_PREFIX.with(|v| v.replace(Some(on))))
-    }
-}
-#[cfg(test)]
-impl Drop for ResumedPrefixForTest {
-    fn drop(&mut self) {
-        RESUMED_PREFIX.with(|v| v.set(self.0));
-    }
-}
-#[cfg(test)]
-pub(crate) fn with_pre_change_builder<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PRE_CHANGE_BUILDER.with(|v| v.set(self.0));
-        }
-    }
-    let _restore = Restore(PRE_CHANGE_BUILDER.with(|v| v.replace(true)));
-    f()
-}
-#[path = "e2_legacy.rs"]
-mod legacy;
-#[cfg(test)]
-#[path = "e2_pre_change_builder.rs"]
-mod pre_change_builder;
-
 /// Owner B (SOURCE Amendment 14): revision 3 keeps a listed family, and
 /// every family while the list pauses adoption, on ordinary (pre-E2)
 /// money. With the gate on, E2 applies to every other family; a family it
@@ -420,7 +362,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     let FileFold {
         entity,
         own_requests: _,
-        resumed_prefix: _,
         copy_unproven_wire: _,
         money_birth: _,
         physical,
@@ -509,6 +450,33 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     store.set_money_rule_version(current);
 }
 
+/// Fixed count-only causes of the existing certificate veto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CertificateFailure {
+    UnplaceableUsage,
+    CopyRestoration,
+    IdlessRestoration,
+    HeldPrefixRemoval,
+    AmbiguousDuplicate,
+    IdentityGrain,
+    IdentityCost,
+    IdentityUsage,
+}
+impl CertificateFailure {
+    fn hold_reason(self) -> &'static str {
+        match self {
+            Self::UnplaceableUsage => "uncertified_by=unplaceable_usage",
+            Self::CopyRestoration => "uncertified_by=copy_restoration",
+            Self::IdlessRestoration => "uncertified_by=idless_restoration",
+            Self::HeldPrefixRemoval => "uncertified_by=held_prefix_removal",
+            Self::AmbiguousDuplicate => "uncertified_by=ambiguous_duplicate",
+            Self::IdentityGrain => "uncertified_by=identity_grain",
+            Self::IdentityCost => "uncertified_by=identity_cost",
+            Self::IdentityUsage => "uncertified_by=identity_usage",
+        }
+    }
+}
+
 /// Pure accumulation consumed by the request-owned literal emitter. No census, claims,
 /// custody, maturity or alternate response classifier participates here.
 #[derive(Debug, Clone)]
@@ -530,6 +498,7 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) resolver_conflicts: u64,
     pub(crate) held: bool,
     pub(crate) certificate_ok: bool,
+    pub(super) certificate_failure: Option<CertificateFailure>,
     /// Local-only uncertainty from every counted path twin.
     pub(crate) clock_incomplete: bool,
     /// Exact telemetry exceeded the identity owner's bounded key pool.
@@ -551,6 +520,7 @@ impl Default for ClaudeEntityBody {
             resolver_conflicts: 0,
             held: false,
             certificate_ok: true,
+            certificate_failure: None,
             clock_incomplete: false,
             identity_over_cap: false,
             live_maps_initialized: false,
@@ -564,6 +534,11 @@ fn mark_copy_key(key: &mut ClaudeLiveKey) {
     key.2.insert(COPY_UNPROVEN_KEY.into(), "true".into());
 }
 impl ClaudeEntityBody {
+    fn fail_certificate(&mut self, reason: CertificateFailure) {
+        self.certificate_ok = false;
+        self.certificate_failure.get_or_insert(reason);
+    }
+
     fn mark_copy_unproven(&mut self) {
         self.grains = std::mem::take(&mut self.grains)
             .into_iter()
@@ -684,6 +659,7 @@ impl ClaudeEntityBody {
             .saturating_add(other.resolver_conflicts);
         self.held |= other.held;
         self.certificate_ok &= other.certificate_ok;
+        self.certificate_failure = self.certificate_failure.or(other.certificate_failure);
         self.clock_incomplete |= other.clock_incomplete;
         self.identity_over_cap |= other.identity_over_cap;
         self.activity_unix = self.activity_unix.max(other.activity_unix);
@@ -762,6 +738,7 @@ macro_rules! entity_heap_method {
                 resolver_conflicts: _,
                 held: _,
                 certificate_ok: _,
+                certificate_failure: _,
                 clock_incomplete: _,
                 identity_over_cap: _,
                 activity_unix: _,
@@ -847,7 +824,6 @@ crate::heap_layout_bound::no_heap!(true; PrefixTally);
 pub(crate) struct FileFold {
     pub(crate) entity: ClaudeEntityBody,
     own_requests: u64,
-    resumed_prefix: bool,
     copy_unproven_wire: bool,
     /// Copy rule with the EFFECTIVE cutoff (inherited across proven moves).
     money_birth: ClaudeFileBirth,
@@ -897,7 +873,7 @@ pub(crate) struct FileFold {
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
 }
-money_heap_fields!(FileFold; inline: [own_requests, resumed_prefix, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1009,11 +985,7 @@ impl FileFold {
             grains,
             absorb,
             held,
-            if resumed_prefix_enabled() {
-                inherited.checked_mul(2)?
-            } else {
-                inherited
-            },
+            inherited.checked_mul(2)?,
             base_selector,
             bucket_fallback,
             fallbacks,
@@ -1101,9 +1073,7 @@ impl FileFold {
         let mut fold = Self {
             entity: Default::default(),
             own_requests: 0,
-            resumed_prefix: resumed_prefix_enabled(),
-            copy_unproven_wire: resumed_prefix_enabled()
-                && context.is_some_and(|c| c.index.copy_unproven_enabled),
+            copy_unproven_wire: context.is_some_and(|c| c.index.copy_unproven_enabled),
             money_birth: money_birth.with_minimum(cutoff),
             physical,
             role,
@@ -1262,7 +1232,8 @@ impl FileFold {
         }
         let Some(placement) = placed.placement.as_ref() else {
             // Native drops it as unplaceable usage; never publish over it.
-            self.entity.certificate_ok = false;
+            self.entity
+                .fail_certificate(CertificateFailure::UnplaceableUsage);
             self.disclose("unplaceable", 1);
             return;
         };
@@ -1285,7 +1256,7 @@ impl FileFold {
         }
         let tokens = ClaudeMoneyTokens::from_usage(usage);
         let requests = usage.request_count;
-        if self.resumed_prefix && copied == Some(false) {
+        if copied == Some(false) {
             self.own_requests += requests;
         }
         if copied == Some(true) {
@@ -1294,13 +1265,9 @@ impl FileFold {
             self.entity.removed_requests += requests;
             if !has_request_id {
                 let marker = self
-                    .resumed_prefix
-                    .then(|| {
-                        self.accounts
-                            .as_deref()
-                            .and_then(|accounts| accounts.copied_marker_position(sequence))
-                    })
-                    .flatten();
+                    .accounts
+                    .as_deref()
+                    .and_then(|accounts| accounts.copied_marker_position(sequence));
                 let into = match marker {
                     Some(position) => self
                         .idless_inherited
@@ -1364,14 +1331,6 @@ impl FileFold {
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
-        #[cfg(test)]
-        if PRE_CHANGE_BUILDER.with(std::cell::Cell::get) {
-            self.decide_native_pre_change(context, markers, fork_parent);
-
-            self.skipped.shrink_to_fit();
-            self.spend(started);
-            return;
-        }
         self.decide_native(context, markers, fork_parent);
         // The fold lives until the page finishes: keep no parse-time slack.
 
@@ -1410,13 +1369,13 @@ impl FileFold {
             // Timestamp skip: id-less copies stay skipped with the rest.
             self.idless_copy = None;
             self.idless_inherited = None;
-            self.keep_copies(true, markers);
+            self.keep_copies(markers);
             return;
         }
         if certified {
             if let Some(witness) = self.original_witness(context) {
                 self.proof = Some(CopyProof::Twin(witness));
-                self.keep_copies(true, markers);
+                self.keep_copies(markers);
                 return;
             }
         }
@@ -1434,11 +1393,7 @@ impl FileFold {
             // Keep marker-dependent grains staged until the page decides
             // individual requests; provisional markers must not become own
             // account evidence before proof removes their copied request.
-            if self.resumed_prefix {
-                self.copy = None;
-            } else {
-                self.keep_copies(false, markers);
-            }
+            self.copy = None;
             return;
         }
         if let Some(mut copy) = self.copy.take() {
@@ -1460,12 +1415,8 @@ impl FileFold {
     }
 
     /// Hold the copies as removed (finally, or until the page checks them).
-    fn keep_copies(
-        &mut self,
-        prefix_excluded: bool,
-        markers: Option<&claude_request_identity::OrgMarkers>,
-    ) {
-        self.finish_identity_start(prefix_excluded, markers);
+    fn keep_copies(&mut self, markers: Option<&claude_request_identity::OrgMarkers>) {
+        self.finish_identity_start(true, markers);
         self.copy = None;
     }
 
@@ -1516,7 +1467,7 @@ impl FileFold {
     /// for its prefix, whatever the writer version. A certified resumed file
     /// keeps its timestamp or twin rule (never two removals of one request).
     fn cross_session_candidate(&self, context: Option<&ReadContext<'_>>, certified: bool) -> bool {
-        (self.first_own.is_none() || (self.resumed_prefix && !certified))
+        (self.first_own.is_none() || !certified)
             && self.physical.is_some()
             && self.location.is_some()
             && context.is_some_and(|context| {
@@ -1588,7 +1539,8 @@ impl FileFold {
             self.entity.removed_requests.checked_sub(requests),
         ) else {
             // Cannot give it back exactly: never publish over it.
-            self.entity.certificate_ok = false;
+            self.entity
+                .fail_certificate(CertificateFailure::CopyRestoration);
             return;
         };
         self.entity.removed = removed;
@@ -1640,12 +1592,12 @@ impl FileFold {
                     None => self.entity.absorb_grains(&idless),
                 }
                 self.copied = self.copied.saturating_sub(responses);
-                if self.resumed_prefix {
-                    self.prefix.unproven_idless += requests;
-                }
+                self.prefix.unproven_idless += requests;
                 self.disclose("copy_idless", responses);
             }
-            _ => self.entity.certificate_ok = false,
+            _ => self
+                .entity
+                .fail_certificate(CertificateFailure::IdlessRestoration),
         }
     }
 
@@ -1932,24 +1884,6 @@ pub(crate) fn decide_page_copies(
     accepted: Option<&AcceptedBuckets>,
 ) -> CopyRemovalUpdates {
     let _spent = PageSpent::start("page.copies");
-    if !resumed_prefix_enabled() {
-        let mut holders = Vec::new();
-        for at in 0..items.len() {
-            let Some(fold) = items[at].claude_money.as_deref_mut() else {
-                continue;
-            };
-            fold.entity.held = false;
-            match fold.proof.clone() {
-                Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
-                Some(CopyProof::Holders(_)) => holders.push(at),
-                None => {}
-            }
-        }
-        if !holders.is_empty() {
-            legacy::decide_holders(items, &holders, index);
-        }
-        return CopyRemovalUpdates::default();
-    }
     let mut holders = Vec::new();
     let mut resolved_holds = Vec::new();
     for at in 0..items.len() {
@@ -2747,7 +2681,8 @@ fn defer_prefix(
             fold.copied = fold.copied.saturating_sub(1);
             fold.prefix.held_requests += o.usage.request_count;
         } else {
-            fold.entity.certificate_ok = false;
+            fold.entity
+                .fail_certificate(CertificateFailure::HeldPrefixRemoval);
         }
     }
     if fold.first_own.is_none() || accepted_prefix {
@@ -2818,7 +2753,8 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     for id in uncovered {
         if fold.is_ambiguous(id) {
             // Two responses claim it: no single grain to give back.
-            fold.entity.certificate_ok = false;
+            fold.entity
+                .fail_certificate(CertificateFailure::AmbiguousDuplicate);
         } else if let Some(occurrence) = claude_usage_occurrences.get(id) {
             fold.restore_one(occurrence);
         }
@@ -2946,7 +2882,7 @@ fn attach_one(
         (lent.key, lent.origin) = (reported.0.clone(), reported.1);
     }
     if let Some(cost) = row.cost_usd_micros {
-        if fold.resumed_prefix && fold.unproven_copy(occurrence) {
+        if fold.unproven_copy(occurrence) {
             fold.prefix.priced_requests += requests;
             fold.prefix.cost_micros = fold.prefix.cost_micros.saturating_add(cost);
         }
@@ -3103,16 +3039,19 @@ pub(crate) fn place_request_identity(
     // take_estimated owns exact token/request removal; reported contributions
     // differ only in the cost and unpriced counters removed alongside them.
     let Some(grain) = fold.entity.grains.get(&slot) else {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityGrain);
         return;
     };
     let Some(left_cost) = grain.cost_micros.checked_sub(cost.unwrap_or(0)) else {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityCost);
         return;
     };
     let unpriced = grain.unpriced;
     if !fold.entity.take_estimated(&slot, &tokens, requests) {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityUsage);
         return;
     }
     if let Some(grain) = fold.entity.grains.get_mut(&slot) {
@@ -3162,40 +3101,36 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
         let membership = timed("attach.membership", || {
             family_membership(&items.borrow(), members)
         });
-        if resumed_prefix_enabled() {
-            for row in report.rows {
-                let Some(cost) = row.cost_usd_micros else {
+        for row in report.rows {
+            let Some(cost) = row.cost_usd_micros else {
+                continue;
+            };
+            if report.duplicate_keys.contains(&row.request_id)
+                || !validate_claude_api_row(row, root)
+            {
+                continue;
+            }
+            for at in matching_members(&membership, &row.request_id) {
+                let mut items = items.borrow_mut();
+                let item = &mut items[at];
+                let Some(occurrence) = item.claude_usage_occurrences.get(&row.request_id) else {
                     continue;
                 };
-                if report.duplicate_keys.contains(&row.request_id)
-                    || !validate_claude_api_row(row, root)
-                {
+                let Some(fold) = item.claude_money.as_deref_mut() else {
                     continue;
-                }
-                for at in matching_members(&membership, &row.request_id) {
-                    let mut items = items.borrow_mut();
-                    let item = &mut items[at];
-                    let Some(occurrence) = item.claude_usage_occurrences.get(&row.request_id)
-                    else {
-                        continue;
-                    };
-                    let Some(fold) = item.claude_money.as_deref_mut() else {
-                        continue;
-                    };
-                    // A partially held prefix has no per-id final removal view.
-                    // Leave its dollars uncovered rather than pricing a hold.
-                    if fold.resumed_prefix
-                        && !fold.entity.held
-                        && fold.prefix.held_requests == 0
-                        && fold.is_skipped(occurrence.sequence)
-                        && !fold.is_ambiguous(&row.request_id)
-                        && !occurrence.usage.is_zero()
-                        && claude_api_matches_transcript_occurrence(row, occurrence)
-                    {
-                        fold.prefix.removed_priced_requests += occurrence.usage.request_count;
-                        fold.prefix.removed_cost_micros =
-                            fold.prefix.removed_cost_micros.saturating_add(cost);
-                    }
+                };
+                // A partially held prefix has no per-id final removal view.
+                // Leave its dollars uncovered rather than pricing a hold.
+                if !fold.entity.held
+                    && fold.prefix.held_requests == 0
+                    && fold.is_skipped(occurrence.sequence)
+                    && !fold.is_ambiguous(&row.request_id)
+                    && !occurrence.usage.is_zero()
+                    && claude_api_matches_transcript_occurrence(row, occurrence)
+                {
+                    fold.prefix.removed_priced_requests += occurrence.usage.request_count;
+                    fold.prefix.removed_cost_micros =
+                        fold.prefix.removed_cost_micros.saturating_add(cost);
                 }
             }
         }
@@ -3760,10 +3695,9 @@ pub(crate) fn finish_page(
             continue;
         };
         let source_session_id: &String = source_session_id;
-        // OFF would restore an uncertified resumed prefix. Count only a
+        // Released money restored an uncertified resumed prefix. Count only a
         // proven removal, never a held/unproven request or certified skip.
-        if fold.resumed_prefix
-            && fold.first_own.is_some()
+        if fold.first_own.is_some()
             && !fold.money_birth.writer_certified(fold.first_own)
             && fold.entity.removed_requests > 0
         {
@@ -3805,18 +3739,16 @@ pub(crate) fn finish_page(
         );
         diag("copy_prefix_hold_expired", fold.prefix.hold_expired);
         session.decided.add(&Counts::prefix(&fold.prefix));
-        if fold.resumed_prefix {
-            session.decided.0[22] += fold.own_requests;
-            diag(
-                "copy_prefix_removed_priced_requests",
-                fold.prefix.removed_priced_requests,
-            );
-            diag(
-                "copy_prefix_removed_cost_micros",
-                fold.prefix.removed_cost_micros,
-            );
-            diag("copy_prefix_own_requests", fold.own_requests);
-        }
+        session.decided.0[22] += fold.own_requests;
+        diag(
+            "copy_prefix_removed_priced_requests",
+            fold.prefix.removed_priced_requests,
+        );
+        diag(
+            "copy_prefix_removed_cost_micros",
+            fold.prefix.removed_cost_micros,
+        );
+        diag("copy_prefix_own_requests", fold.own_requests);
         session.decided.add(&Counts::work([
             0,
             0,
@@ -3926,6 +3858,11 @@ pub(crate) fn finish_page(
                 "emission_rejected"
             };
             *hold_reasons.entry(reason).or_default() += 1;
+            if reason == "uncertified" {
+                if let Some(failure) = entity.certificate_failure {
+                    *hold_reasons.entry(failure.hold_reason()).or_default() += 1;
+                }
+            }
             withheld.insert(item.source_session_id.clone());
         }
         if let Some(accounts) = item
@@ -4004,7 +3941,7 @@ fn record_decided(held: bool, counts: Counts) {
     }
 }
 
-/// Copy-prefix switch on: the identity row of each request a copied marker
+/// The identity row of each request a copied marker
 /// had lent an account to, as `visit_identity_rows` builds rows:
 /// (bucket start, row, lent account).
 pub(crate) fn copied_marker_lent_rows(
