@@ -11,6 +11,17 @@ fn route(mode: Mode, page: &Page) -> RouteResult {
     RouteResult::emitted(mode, SnapshotSource::ClaudeCode, wire, &page.scan.snapshots)
 }
 
+/// Deliver a finished page: its exact ACKs earn per-file upload-context
+/// receipts, as the service records them after settlement.
+fn deliver(page: &mut Page) -> BTreeMap<String, String> {
+    let mut progress = e2_progress();
+    let (status, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let acks = std::mem::take(&mut progress.fresh_context_body_acks);
+    accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
+    acks
+}
+
 /// [money] Copy-prefix dedupe through every acquisition route: a resumed main
 /// file whose uncertified writer copied an earlier session's requests, with
 /// own turns after them. RAM Tail, cold Full and a restored owner remove the
@@ -44,21 +55,38 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         );
         // The page is delivered: its exact ACKs earn per-file upload-context
         // receipts as the service records them, so only the grown copy is
-        // read on the next pages.
-        let mut progress = e2_progress();
-        let (status, _, _) = upload(&first.scan.snapshots, &mut progress, ack);
-        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        accept_upload_context_acks_for_test(
-            &mut first.index,
+        // read on the next pages. The warm page was never delivered, so the
+        // unchanged holder owes its proof here, as a production file without
+        // a receipt does: the page that re-reads it must offer its identical
+        // bodies and earn the receipt, or it is re-read on every page.
+        let acks = deliver(&mut first);
+        if let Some(why) = upload_context_owed_diagnosis_for_test(
+            &first.index,
+            &holder,
             &first.scan.snapshots,
-            &progress.fresh_context_body_acks,
-        );
+            &acks,
+        ) {
+            panic!(
+                "the re-read holder still owes its proof (modes {:?}): {why}",
+                first.modes
+            );
+        }
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, at) in [("d", D.1), ("e", "2026-08-02T07:09:10Z")] {
             append(&path, &line_by(COPY, request, at, 10, RESUME_WRITER));
             input_clock(&path);
+            for (arm, prior) in ["ram", "cold", "disk"].iter().zip(&priors) {
+                // The page activates the same context before it selects.
+                let mut prior = prior.clone();
+                prior.activate_upload_context("e2-synthetic-destination".into());
+                if let Some(why) =
+                    upload_context_owed_diagnosis_for_test(&prior, &holder, &[], &BTreeMap::new())
+                {
+                    panic!("page {request}: the {arm} prior owes the holder again: {why}");
+                }
+            }
             let restart = disk.owner(SnapshotSource::ClaudeCode);
             let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0), (0, 1, 0));
             finish_claude_pages(&c, &mut pages);

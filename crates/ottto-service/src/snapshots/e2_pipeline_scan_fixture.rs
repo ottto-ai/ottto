@@ -272,6 +272,77 @@ pub(crate) fn accept_upload_context_acks_for_test(
     index.stamp_entity_upload_context_acks("e2-fixture-destination", acks, &contexts);
 }
 
+/// Why `path` still owes its upload-context proof after a page whose `items`
+/// were sent and `acks` exact-ACKed (empty when no page was delivered).
+/// `None` when the file is proven. Counts and flags only.
+pub(crate) fn upload_context_owed_diagnosis_for_test(
+    index: &ScanIndex,
+    path: &Path,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) -> Option<String> {
+    let key = local_index_key(path);
+    if !index.file_upload_context_requires_adoption(&key) {
+        return None;
+    }
+    let entry = index.files.get(&key);
+    let source = entry.map_or(String::new(), |entry| entry.source_file_fingerprint.clone());
+    let entities = index
+        .file_snapshot_fingerprints
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    let mine = |item: &&SnapshotItem| entities.contains(&item.snapshot_fingerprint);
+    let receipt = entry.and_then(|entry| entry.upload_context_receipt.as_ref());
+    Some(format!(
+        "entry={} source_empty={} entities={} in_page={} same_source_items={} acked={} \
+         accepted_ledger={} quarantined={} confirmed_empty={} decode_hold={} \
+         account_deferred={} excluded_source={} receipt={} receipt_context_active={} \
+         receipt_source_match={} receipt_body_match={} last_body={} page_candidates={} \
+         active_context={}",
+        entry.is_some(),
+        source.is_empty(),
+        entities.len(),
+        items.iter().filter(mine).count(),
+        items
+            .iter()
+            .filter(|item| item.source_file_fingerprint.as_deref() == Some(source.as_str()))
+            .count(),
+        items
+            .iter()
+            .filter(mine)
+            .filter(|item| {
+                acks.get(&item.snapshot_fingerprint) == Some(&snapshot_upload_body_witness(item))
+            })
+            .count(),
+        entities
+            .iter()
+            .filter(|fp| index.accepted_snapshot_fingerprints.contains(*fp))
+            .count(),
+        entities
+            .iter()
+            .filter(|fp| index.quarantined_snapshot_fingerprints.contains_key(*fp))
+            .count(),
+        index.confirmed_empty_files.contains(&key),
+        index.decode_holds_file(&key),
+        index.claude_account_deferred_holds.contains_key(&key),
+        index
+            .effective_upload_body_witness_revision_excluded_source_files
+            .contains(&source),
+        receipt.is_some(),
+        receipt.is_some_and(|receipt| {
+            index.active_upload_context_fingerprint.as_ref() == Some(&receipt.context_fingerprint)
+        }),
+        receipt.is_some_and(|receipt| receipt.source_witness == source),
+        receipt.zip(entry).is_some_and(|(receipt, entry)| {
+            entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+        }),
+        entry.is_some_and(|entry| entry.last_upload_body_witness.is_some()),
+        index.file_upload_context_ack_candidates(items).len(),
+        index.active_upload_context_fingerprint.is_some(),
+    ))
+}
+
 /// Install the real exclusion input used by ordinary-money fixture families.
 /// An empty slice adopts request-owned money on the next normal source pass.
 pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
