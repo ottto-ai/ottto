@@ -88452,8 +88452,8 @@ const _: () = {
     assert!(size_of::<OwnedJsonlParser>() == 5312);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // The merged candidate, parse-reason and accepted-extent fields make the
-    // active frame 896 bytes; parser/custody boxing is unchanged.
-    assert!(size_of::<OwnedActiveFile>() == 896);
+    // active frame 888 bytes; parser/custody boxing is unchanged.
+    assert!(size_of::<OwnedActiveFile>() == 888);
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
     );
