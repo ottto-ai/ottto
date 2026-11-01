@@ -1304,8 +1304,12 @@ fn prepare_page_cache_for_upload(
     head_cas_required: bool,
     legacy_pending: &BTreeSet<String>,
 ) {
-    let cut_patch =
-        enabled && snapshot.history_segments.is_some() && snapshot.cache_observations.is_some();
+    let cut_patch = enabled
+        && snapshot.history_segments.is_some()
+        && snapshot
+            .cache_observations
+            .as_ref()
+            .is_some_and(|patch| !patch.operations.is_empty());
     prepare_snapshot_cache_for_upload(
         snapshot,
         progress,
@@ -11622,11 +11626,15 @@ where
     if !history_roots.is_empty() {
         let active = pending_by_fingerprint
             .values()
-            .filter_map(|(index, _, _)| literal_family(&items[*index]))
+            .filter_map(|(index, _, _)| history_group(&items[*index]))
+            .map(|(live, _)| live)
             .filter(|root| history_roots.contains(root))
             .collect::<BTreeSet<_>>();
         for (index, item) in items.iter().enumerate() {
-            let Some(root) = literal_family(item).filter(|root| active.contains(root)) else {
+            let Some(root) = history_group(item)
+                .map(|(live, _)| live)
+                .filter(|root| active.contains(root))
+            else {
                 continue;
             };
             let item_fingerprint = fingerprint(item);
@@ -11665,7 +11673,10 @@ where
         let mut parts = Vec::<Vec<usize>>::new();
         let mut by_root = BTreeMap::<&str, usize>::new();
         for &index in indices {
-            match literal_family(&items[index]).filter(|root| history_roots.contains(root)) {
+            match history_group(&items[index])
+                .map(|(live, _)| live)
+                .filter(|root| history_roots.contains(root))
+            {
                 Some(root) => match by_root.get(root) {
                     Some(&part) => parts[part].push(index),
                     None => {
@@ -11711,40 +11722,54 @@ where
             let member = session_id(&items[*index]);
             (!is_segment(&items[*index]), member != Some(root), member)
         });
+        // A cut root's uncut family members are units of their own, after its
+        // group: they may carry a cache patch, which must not share the
+        // group's request.
+        let (members, family): (Vec<_>, Vec<_>) = members
+            .into_iter()
+            .partition(|(index, _, _)| history_group(&items[*index]).is_some());
         // A settled-history group's unACKed members (ACKed, unchanged ones
         // were skipped above) travel in ONE request: the receiver refuses a
         // segment without its live body. Over the receiver's limits nothing
         // of it goes this pass: counted deferred and alarmed, never dropped
         // or stripped, and offered again whole.
-        if history_refused.contains(root)
-            || members
-                .iter()
-                .any(|(index, _, _)| is_segment(&items[*index]))
+        if !members.is_empty()
+            && (history_refused.contains(root)
+                || members
+                    .iter()
+                    .any(|(index, _, _)| is_segment(&items[*index])))
         {
             let bytes = members
                 .iter()
                 .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
             let skipped = if history_refused.contains(root) {
-                crate::snapshots::history_segments::Skipped::PartRefused
+                Some(crate::snapshots::history_segments::Skipped::PartRefused)
             } else if crate::snapshots::history_segments::group_fits(members.len(), bytes) {
+                None
+            } else {
+                Some(crate::snapshots::history_segments::Skipped::GroupOverBatch)
+            };
+            if let Some(skipped) = skipped {
+                // Held on the existing retry backoff: owed, re-read when due.
+                crate::snapshots::history_segments::alarm_scope(poison_scope, skipped);
+                for (index, _, _) in &members {
+                    progress.quarantine_retryable_body(
+                        fingerprint(&items[*index]),
+                        &body_witness(&items[*index]),
+                    );
+                }
+                history_deferred += members.len();
+            } else {
                 order.extend(members);
                 unit_ends.push(order.len());
-                continue;
-            } else {
-                crate::snapshots::history_segments::Skipped::GroupOverBatch
-            };
-            // Held on the existing retry backoff: owed, re-read when due.
-            crate::snapshots::history_segments::alarm_scope(poison_scope, skipped);
-            for (index, _, _) in &members {
-                progress.quarantine_retryable_body(
-                    fingerprint(&items[*index]),
-                    &body_witness(&items[*index]),
-                );
             }
-            history_deferred += members.len();
-            continue;
+        } else {
+            for group in literal_family_groups(members) {
+                order.extend(group);
+                unit_ends.push(order.len());
+            }
         }
-        for group in literal_family_groups(members) {
+        for group in literal_family_groups(family) {
             order.extend(group);
             unit_ends.push(order.len());
         }

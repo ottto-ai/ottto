@@ -504,7 +504,7 @@ fn upload(
         snapshot_upload_body_witness,
         |s| Some(s.source_session_id.as_str()),
         |_| false,
-        crate::snapshots::claude_request_money::request_owned_family_root,
+        crate::snapshots::history_segments::packing_unit,
         crate::snapshots::history_segments::history_group,
         &mut InplaceRetryBudget::default(),
         |batch| {

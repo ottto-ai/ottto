@@ -1472,6 +1472,7 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
     item.cache_observations = pending_head_index_item().1.cache_observations;
     // [money] A headless cut live body sends its usage without its
     // non-empty cache patch, counted once (never silent).
+    assert!(!item.cache_observations.as_ref().unwrap().operations.is_empty());
     let mut cut = item.clone();
     cut.history_segments = Some(crate::snapshots::history_segments::SnapshotHistorySegments {
         through: "2026-08-27T00:00:00Z".into(),

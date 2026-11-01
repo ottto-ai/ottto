@@ -150,8 +150,9 @@ pub(crate) enum Skipped {
     /// sent without it (counted deferred, never resent each pass).
     PartRefused,
     /// A cut live body with no cache head sent its usage without its
-    /// non-empty cache patch; the patch goes again with the session's next
-    /// upload (never recorded as delivered).
+    /// non-empty cache patch (counted once per prepared page); the patch
+    /// goes again with the session's next upload, never recorded as
+    /// delivered.
     CachePatchWithheld,
 }
 
