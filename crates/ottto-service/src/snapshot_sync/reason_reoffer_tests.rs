@@ -534,7 +534,7 @@ fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
     assert!(select(&mut progress, &index, NOW));
     let leased = progress.active_reason_reoffers.clone();
     progress.attempted_reason_reoffers.insert(fp(2));
-    progress.quarantine_retryable_body(&fp(2), &body(2));
+    progress.quarantine_retryable_body(&fp(2), &body(2), quarantine_retry_after(&fp(2)));
     progress.finish_reason_reoffers(&leased, false, SnapshotSource::Codex.api_slug());
     let counts = progress.reason_reoffer_counts;
     assert_eq!(
@@ -607,7 +607,7 @@ fn materialized_cache_probe_matches_only_its_own_refusal_witness() {
 fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     let (mut progress, index) = refused(&[(1, original_pair(0))]);
     assert!(select(&mut progress, &index, NOW));
-    progress.quarantine_retryable_body(&fp(1), &body(1));
+    progress.quarantine_retryable_body(&fp(1), &body(1), quarantine_retry_after(&fp(1)));
     let retry = progress.quarantined_fingerprints[&fp(1)].clone();
     let root = test_dir("reoffer-newer-conflict-retirement");
     let path = root.join("progress.json");
@@ -708,10 +708,14 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
         (6, original_pair(NOW + DAY)),
     ]);
     for value in 1..=4 {
-        progress.quarantine_retryable_body(&fp(value), &body(value));
+        progress.quarantine_retryable_body(
+            &fp(value),
+            &body(value),
+            quarantine_retry_after(&fp(value)),
+        );
     }
     // A conflict on another body of the entity is ordinary new work.
-    progress.quarantine_retryable_body(&fp(5), &body(500));
+    progress.quarantine_retryable_body(&fp(5), &body(500), quarantine_retry_after(&fp(5)));
     progress
         .quarantined_fingerprints
         .get_mut(&fp(5))
@@ -811,7 +815,7 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
 #[test]
 fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts() {
     let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
-    progress.quarantine_retryable_body(&fp(1), &body(1));
+    progress.quarantine_retryable_body(&fp(1), &body(1), quarantine_retry_after(&fp(1)));
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
     index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
