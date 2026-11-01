@@ -1354,10 +1354,13 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let restart = E2ScanFixture::capturing_identity();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
         let cold = E2ScanFixture::capturing_identity();
+        // The restart reads first: the RAM page writes its successor record at
+        // native settlement, which a later restart would reuse as Unchanged.
+        let restarted = c.raw(&restart, prior.clone(), 100, true, &[]);
         let mut pages = [
             c.raw(&retained, prior.clone(), 100, true, &[]),
-            c.raw(&cold, prior.clone(), 100, true, &[]),
-            c.raw(&restart, prior, 100, true, &[]),
+            c.raw(&cold, prior, 100, true, &[]),
+            restarted,
         ];
         assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
         assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
