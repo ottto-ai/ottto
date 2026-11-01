@@ -12676,6 +12676,16 @@ pub(crate) fn erase_disabled_sources(
         let marker = source_marker_path(support_dir, source);
         let erased = erase_source_files(support_dir, source, || {
             cache.durable_forget_source(source);
+            if source == SnapshotSource::Codex {
+                cache.forget_codex_job();
+            }
+            // Reconnect is this source's first bootstrap again: a full replay.
+            update_backfill_state(support_dir, |backfill| {
+                let slug = source.api_slug();
+                backfill.completed_parser_versions.remove(slug);
+                backfill.completed_replay_revisions.remove(slug);
+                backfill.completed_destination_namespaces.remove(slug);
+            })?;
             if state.as_deref() == Some("reconnect") {
                 std::fs::remove_file(&marker)?;
                 sync_progress_parent(&marker)
@@ -12698,10 +12708,17 @@ fn erase_source_files(
     source: SnapshotSource,
     complete: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let others = [
+    let posture = (source == SnapshotSource::ClaudeCode)
+        .then(|| crate::context_posture::cache_path(support_dir));
+    let others: Vec<PathBuf> = [
         crate::active_sessions::active_session_cache_path(support_dir, source),
         detected_uses_cache_path(support_dir, source),
-    ];
+        crate::mcp_inventory::cache_path(support_dir, source),
+    ]
+    .into_iter()
+    .chain(posture)
+    .flat_map(|path| [path.with_extension("json.tmp"), path])
+    .collect();
     let stable = snapshot_index_path(support_dir, source);
     let destinations = support_dir.join("snapshots/destinations");
     // Every parent exists, so an fsync of it fails only on a real I/O error.

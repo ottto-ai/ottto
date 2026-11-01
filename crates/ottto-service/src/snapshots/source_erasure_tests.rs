@@ -69,10 +69,13 @@ impl Fixture {
             self.support
                 .join("detected_uses")
                 .join(format!("{}.json", source.api_slug())),
+            crate::mcp_inventory::cache_path(&self.support, source),
         ] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, CANARY).unwrap();
-            paths.push(path);
+            for path in [path.with_extension("json.tmp"), path] {
+                fs::write(&path, CANARY).unwrap();
+                paths.push(path);
+            }
         }
         paths
     }
@@ -245,11 +248,35 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
     let (first_index, first) = cold_full(ScanIndex::default());
     let path = f.destination.join("claude_code-scan-index-v3.json");
     let live = state_v2::money_test_support::publish(&first_index, &path, &progress_bytes());
+    let posture = crate::context_posture::cache_path(&f.support);
+    fs::create_dir_all(posture.parent().unwrap()).unwrap();
+    fs::write(&posture, CANARY).unwrap();
+    // A finished bootstrap here must not narrow reconnect to the receipt window.
+    let namespace = NAMESPACE.repeat(64);
+    crate::backfill::update_backfill_state(&f.support, |state| {
+        crate::backfill::mark_backfill_complete_for_destination(state, source, &namespace);
+        crate::backfill::mark_backfill_complete_for_destination(
+            state,
+            SnapshotSource::Codex,
+            &namespace,
+        );
+    })
+    .unwrap();
     assert!(state_v2::published(&path).unwrap());
 
     disable_snapshot_source(&f.support, source).unwrap();
     assert_eq!(f.erase(), 0);
     assert!(!path.exists());
+    assert!(!posture.exists());
+    let pending = crate::backfill::pending_backfill_sources_for_destination(
+        &crate::backfill::load_backfill_state(&f.support),
+        &namespace,
+    );
+    assert!(pending.contains(&source), "reconnect owes a full replay");
+    assert!(
+        !pending.contains(&SnapshotSource::Codex),
+        "others untouched"
+    );
     assert!(enabled_snapshot_sources_in(&device(), &f.support)
         .iter()
         .all(|enabled| *enabled != source));
