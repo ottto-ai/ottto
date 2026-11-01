@@ -405,9 +405,15 @@ impl Completion {
             &scan.snapshots,
             &scan.census_window_end,
             |index| {
-                accumulate_claude_usage_family_pending_with_credit(
+                let (families, retained) = claude_page_usage_families(
                     &scan.snapshots,
                     &mut index.claude_usage_family_pending,
+                )
+                .map_err(|_| unknown)?;
+                accumulate_claude_usage_family_pending_with_credit(
+                    &scan.snapshots,
+                    families,
+                    retained,
                     &scan.census_window_end,
                     MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
                     Some(&mut budget),
