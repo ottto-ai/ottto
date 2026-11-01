@@ -1082,11 +1082,18 @@ mod application_cases {
                 .unwrap();
             let fence_bytes = fs::read(&c.path).unwrap();
             current.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
+            telemetry::take_thread_event_for_test("save_ceiling_alarm");
+            telemetry::take_thread_event_for_test("save_ceiling_cause");
             let error =
                 super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
                     .unwrap_err();
             // Value admission is save pressure: the paced named hold, not DbUnavailable.
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
+            assert!(telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some());
+            assert_eq!(
+                telemetry::take_thread_event_for_test("save_ceiling_cause"),
+                Some(serde_json::json!("value_admission"))
+            );
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0

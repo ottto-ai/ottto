@@ -59,6 +59,10 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
             PASS.with(|pass| pass.borrow_mut().active = matches!(value.as_str(), Some("v2")));
         }
     }
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(value) {
+        THREAD_EVENTS.with(|events| events.borrow_mut().insert(name, value));
+    }
     if let Ok(mut stats) = stats().lock() {
         if let Ok(value) = serde_json::to_value(value) {
             stats.latest.insert(name, value);
@@ -70,6 +74,17 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
 #[cfg(test)]
 pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
     stats().lock().ok()?.latest.get(name).cloned()
+}
+#[cfg(test)]
+thread_local! {
+    static THREAD_EVENTS: std::cell::RefCell<BTreeMap<&'static str, serde_json::Value>> =
+        Default::default();
+}
+/// Test evidence only: takes this thread's latest value of an event, so a
+/// concurrent test cannot supply or overwrite it.
+#[cfg(test)]
+pub(super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
+    THREAD_EVENTS.with(|events| events.borrow_mut().remove(name))
 }
 /// Cumulative process-lifetime count, kept in the same inventory as events.
 pub(super) fn count(name: &'static str, n: u64) {
@@ -333,12 +348,15 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
-    let family_requests = index
-        .claude_usage_family_pending
-        .values()
-        .try_fold(0_u64, |sum, p| {
-            sum.checked_add(heap(&p.member_request_id_hashes)?)
-        });
+    // Cold: only this pass's loaded families hold request hashes in RAM.
+    use super::super::usage_pending::UsagePending;
+    let evidence = match &index.claude_usage_family_pending {
+        UsagePending::Resident(families) => families,
+        UsagePending::Cold(cold) => cold.loaded(),
+    };
+    let family_requests = evidence.values().try_fold(0_u64, |sum, p| {
+        sum.checked_add(heap(&p.member_request_id_hashes)?)
+    });
     let usage_pending = heap(&index.claude_usage_family_pending)
         .zip(family_requests)
         .and_then(|(all, requests)| all.checked_sub(requests));

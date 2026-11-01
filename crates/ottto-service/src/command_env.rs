@@ -30,23 +30,18 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
     first_program_in(executable_search_dirs_for_program(program), program)
 }
 
-/// Interactive launches search the inherited daemon PATH before native/npm prefixes and
-/// finally Codex desktop bundles. Claude Desktop's private CLI is excluded.
+/// Interactive launches search in agent status's order: Codex desktop bundles,
+/// then the inherited daemon PATH and native/npm prefixes. Claude Desktop's
+/// private CLI is excluded.
 pub(crate) fn interactive_cli_path(program: &str, home: &Path) -> Option<PathBuf> {
     if program == "claude" {
         return claude_default_login_executable_path(home);
     }
-    let mut dirs = executable_search_dirs_from(
-        env::var_os(COMMAND_SEARCH_PATH_ENV).or_else(|| env::var_os("PATH")),
-        Some(home.as_os_str().to_owned()),
-        true,
-    );
-    if program == "codex" && env::var_os(COMMAND_SEARCH_PATH_ENV).is_none() {
-        dirs.extend(codex_desktop_bundle_dirs(&[
-            PathBuf::from("/Applications"),
-            home.join("Applications"),
-        ]));
-    }
+    let home = Some(home.as_os_str().to_owned());
+    let dirs = match env::var_os(COMMAND_SEARCH_PATH_ENV) {
+        Some(path_var) => executable_search_dirs_from(Some(path_var), home, true),
+        None => executable_search_dirs_for_program_with_home(program, home),
+    };
     dirs.into_iter()
         .map(|dir| dir.join(program))
         .find(|path| is_absolute_executable(path))
