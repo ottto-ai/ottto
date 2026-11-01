@@ -864,6 +864,15 @@ impl Transaction for ReadBack<'_> {
     fn scan_kind(&mut self, _: &RecordKind, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
         Ok(Vec::new())
     }
+    fn scan_record_key(
+        &mut self,
+        _: &RecordKind,
+        _: &[u8],
+        _: Option<u64>,
+        _: usize,
+    ) -> Result<Vec<Header>> {
+        Ok(Vec::new())
+    }
     fn commit(self, _: u64, _: u64) -> DurableCommitOutcome {
         DurableCommitOutcome::NotPublished
     }
