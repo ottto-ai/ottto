@@ -5063,6 +5063,28 @@ fn carry_shared_index(shared: bool) -> ScanIndex {
     index
 }
 
+/// The carry fixture with each `body-…` snapshot fingerprint spelled as a
+/// real one (64 lowercase hex): a store load drops any other accepted
+/// identity, which would leave every family body unaccepted.
+fn carry_hex_bodies(index: &mut ScanIndex) {
+    use sha2::Digest;
+    let hex = |body: &str| format!("{:x}", sha2::Sha256::digest(body.as_bytes()));
+    for (_, entry) in &mut index.files {
+        if let Some(body) = entry.last_snapshot_fingerprint.as_mut() {
+            *body = hex(body);
+        }
+    }
+    for (_, bodies) in &mut index.file_snapshot_fingerprints {
+        *bodies = bodies.iter().map(|body| hex(body)).collect();
+    }
+    let accepted: BTreeSet<String> = index
+        .accepted_snapshot_fingerprints
+        .iter()
+        .map(|body| hex(body))
+        .collect();
+    index.accepted_snapshot_fingerprints = accepted.into();
+}
+
 /// [money] R2, the shared-owner tie-breaks as on main: a request read in two
 /// carried families is owned by the later root in root order, so only that
 /// owner keeps its re-arm; a request read twice inside one family names no
@@ -5097,7 +5119,13 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
         return;
     }
     let dir = crate::test_scratch::canonical_private_dir("stale-carry-cold");
-    let (custody, cold) = v2::ColdSession::publish(&carry_shared_index(true), &dir);
+    let mut fixture = carry_shared_index(true);
+    carry_hex_bodies(&mut fixture);
+    let (custody, cold) = v2::ColdSession::publish(&fixture, &dir);
+    assert_eq!(
+        cold.accepted_snapshot_fingerprints, fixture.accepted_snapshot_fingerprints,
+        "the load keeps every accepted body"
+    );
     assert!(cold
         .claude_usage_family_pending
         .family(CARRY_SHARER)
