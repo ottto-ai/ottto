@@ -78,7 +78,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         scan_roots: vec![PathBuf::from(SCAN_ROOT)],
         pending_directories: VecDeque::new(),
         pending_candidates: VecDeque::new(),
-        observed_index_keys: BTreeSet::new(),
+        observed_index_keys: Default::default(),
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,

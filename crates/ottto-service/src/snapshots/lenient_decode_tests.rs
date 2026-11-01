@@ -3095,7 +3095,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
         .map(|n| format!("{n:064x}"))
         .collect::<BTreeSet<_>>();
     let mut seed = ScanIndex {
-        accepted_snapshot_fingerprints: original.clone(),
+        accepted_snapshot_fingerprints: original.clone().into(),
         ..ScanIndex::default()
     };
     seed.file_snapshot_fingerprints

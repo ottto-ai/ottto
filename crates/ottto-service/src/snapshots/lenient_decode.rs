@@ -1494,9 +1494,10 @@ fn authority_is_unbound(index: &ScanIndex, key: &str) -> bool {
 fn migrate_carried_ack_debt(index: &mut ScanIndex) -> std::result::Result<(), Error> {
     // Migrate the old marker without granting later ACKs blanket retention.
     if index.accepted_incidence_pending_census && index.accepted_rebuild_incidence.is_empty() {
-        index
-            .accepted_rebuild_incidence
-            .insert(String::new(), index.accepted_snapshot_fingerprints.clone());
+        index.accepted_rebuild_incidence.insert(
+            String::new(),
+            (*index.accepted_snapshot_fingerprints).clone(),
+        );
     }
     index.admit_carried_ack_debt()?;
     Ok(())
@@ -2086,7 +2087,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
-                        "files" => index.files = self.records("files", value, true)?,
+                        "files" => {
+                            index.files = self.records::<Shared<_>>("files", value, true)?.into()
+                        }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }
@@ -2167,8 +2170,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 self.records("claude_account_family_pending", value, true)?
                         }
                         "claude_usage_family_witnesses" => {
-                            index.claude_usage_family_witnesses =
-                                self.records("claude_usage_family_witnesses", value, true)?
+                            index.claude_usage_family_witnesses = self
+                                .records::<Shared<_>>("claude_usage_family_witnesses", value, true)?
+                                .into()
                         }
                         "claude_usage_family_pending" => {
                             index.claude_usage_family_pending =
@@ -2350,14 +2354,15 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
                             }
                             index.file_snapshot_fingerprints = if pass == Pass::IdentityCarry {
-                                self.carried_incidence(value)?
+                                self.carried_incidence(value)?.into()
                             } else {
                                 self.typed(value)?
                             }
                         }
                         "snapshot_activity_at" => {
-                            index.snapshot_activity_at =
-                                self.records("snapshot_activity_at", value, false)?
+                            index.snapshot_activity_at = self
+                                .records::<Shared<_>>("snapshot_activity_at", value, false)?
+                                .into()
                         }
                         "accepted_snapshot_fingerprints" => {
                             if pass == Pass::IdentityCarry
@@ -2366,7 +2371,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
                             }
                             index.accepted_snapshot_fingerprints =
-                                self.accepted(value, pass == Pass::IdentityCarry)?
+                                self.accepted(value, pass == Pass::IdentityCarry)?.into()
                         }
                         "accepted_snapshot_fingerprint_ledger_version" => {
                             index.accepted_snapshot_fingerprint_ledger_version =

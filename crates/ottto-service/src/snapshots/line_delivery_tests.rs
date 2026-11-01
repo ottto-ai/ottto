@@ -934,7 +934,7 @@ fn unselected_page(source: &str) -> Value {
 }
 
 /// A file with an accepted sampled generation keeps verification rescue.
-fn rescue(files: &mut BTreeMap<String, ScanIndexEntry>, path: &Path) {
+fn rescue(files: &mut SharedMap<String, ScanIndexEntry>, path: &Path) {
     let mut entry = super::tests::manifest_index_entry(None);
     entry.set_unverified_deadline(0);
     files.insert(local_index_key(path), entry);
@@ -1227,7 +1227,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 census_at,
                 7,
                 crate::snapshots::DiscoveryRetention {
-                    files: &BTreeMap::new(),
+                    files: &SharedMap::default(),
                     account_holds: holds,
                     memo: None,
                     growth: None,

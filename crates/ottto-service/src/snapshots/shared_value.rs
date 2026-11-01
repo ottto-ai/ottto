@@ -5,7 +5,7 @@
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Borrow;
-use std::collections::{btree_map, BTreeMap, BTreeSet};
+use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
 use std::fmt;
 use std::iter::Map;
 use std::mem::{align_of, size_of};
@@ -139,9 +139,16 @@ impl<T: Ord + Clone> Shared<BTreeSet<T>> {
         }
     }
 }
-impl<T: PartialEq> PartialEq<Shared<BTreeSet<T>>> for BTreeSet<T> {
-    fn eq(&self, other: &Shared<BTreeSet<T>>) -> bool {
-        *self == **other
+impl<T: Ord> FromIterator<T> for Shared<BTreeSet<T>> {
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        Self::new(values.into_iter().collect())
+    }
+}
+impl<T: Ord + Clone> IntoIterator for Shared<BTreeSet<T>> {
+    type Item = T;
+    type IntoIter = btree_set::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_inner().into_iter()
     }
 }
 
@@ -149,8 +156,12 @@ type Iter<'a, K, V> =
     Map<btree_map::Iter<'a, K, Shared<V>>, fn((&'a K, &'a Shared<V>)) -> (&'a K, &'a V)>;
 type Range<'a, K, V> =
     Map<btree_map::Range<'a, K, Shared<V>>, fn((&'a K, &'a Shared<V>)) -> (&'a K, &'a V)>;
+type Values<'a, K, V> = Map<btree_map::Values<'a, K, Shared<V>>, fn(&'a Shared<V>) -> &'a V>;
 type IntoIter<K, V> = Map<btree_map::IntoIter<K, Shared<V>>, fn((K, Shared<V>)) -> (K, V)>;
 
+fn unshared_value<V>(value: &Shared<V>) -> &V {
+    value
+}
 fn unshared<'a, K, V>((key, value): (&'a K, &'a Shared<V>)) -> (&'a K, &'a V) {
     (key, &**value)
 }
@@ -168,8 +179,8 @@ impl<K, V> SharedMap<K, V> {
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.0.iter().map(unshared)
     }
-    pub fn values(&self) -> impl DoubleEndedIterator<Item = &V> + ExactSizeIterator + Clone {
-        self.0.values().map(|value| &**value)
+    pub fn values(&self) -> Values<'_, K, V> {
+        self.0.values().map(unshared_value)
     }
     /// The value handles, to move a value to another map without copying it.
     pub fn iter_shared(&self) -> btree_map::Iter<'_, K, Shared<V>> {
@@ -240,10 +251,6 @@ impl<K: Ord + Clone, V: Clone> SharedMap<K, V> {
         }
         self.0.make_mut().remove(key).map(Shared::into_inner)
     }
-    pub fn pop_first(&mut self) -> Option<(K, V)> {
-        let (key, value) = self.0.make_mut().pop_first()?;
-        Some((key, value.into_inner()))
-    }
     pub fn clear(&mut self) {
         if !self.0.is_empty() {
             self.0 = Shared::default();
@@ -269,12 +276,16 @@ impl<K: Ord + Clone, V: Clone> SharedMap<K, V> {
     pub fn entry(&mut self, key: K) -> SharedEntry<'_, K, V> {
         SharedEntry { map: self, key }
     }
-    pub fn into_values(self) -> impl DoubleEndedIterator<Item = V> {
-        self.0.into_inner().into_values().map(Shared::into_inner)
-    }
 }
 #[cfg(test)]
 impl<K: Ord + Clone, V: Clone> SharedMap<K, V> {
+    pub fn into_values(self) -> impl DoubleEndedIterator<Item = V> {
+        self.0.into_inner().into_values().map(Shared::into_inner)
+    }
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        let (key, value) = self.0.make_mut().pop_first()?;
+        Some((key, value.into_inner()))
+    }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.0.make_mut().values_mut().map(Shared::make_mut)
     }
@@ -348,6 +359,11 @@ impl<K: Ord, V> From<BTreeMap<K, V>> for SharedMap<K, V> {
         map.into_iter().collect()
     }
 }
+impl<K: Ord, V, const N: usize> From<[(K, V); N]> for SharedMap<K, V> {
+    fn from(entries: [(K, V); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
 impl<K, V> From<BTreeMap<K, Shared<V>>> for SharedMap<K, V> {
     fn from(map: BTreeMap<K, Shared<V>>) -> Self {
         Self(Shared::new(map))
@@ -385,11 +401,6 @@ impl<K: Eq, V: Eq> Eq for SharedMap<K, V> {}
 impl<K: PartialEq, V: PartialEq> PartialEq<BTreeMap<K, V>> for SharedMap<K, V> {
     fn eq(&self, other: &BTreeMap<K, V>) -> bool {
         self.len() == other.len() && self.iter().eq(other.iter())
-    }
-}
-impl<K: PartialEq, V: PartialEq> PartialEq<SharedMap<K, V>> for BTreeMap<K, V> {
-    fn eq(&self, other: &SharedMap<K, V>) -> bool {
-        other == self
     }
 }
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for SharedMap<K, V> {
