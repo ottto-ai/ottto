@@ -203,6 +203,19 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         assert!(cut
             .iter()
             .all(|segment| segment.history_segment.as_ref().unwrap().of == ROOT));
+        // Locally every segment belongs to its live body's file (no file
+        // on the wire): the file's entity set, which drives census
+        // incidence, retry re-reads and the no-op test, covers the group.
+        let file_set = pages[1]
+            .index
+            .file_snapshot_fingerprints
+            .values()
+            .find(|set| set.contains(&live.snapshot_fingerprint))
+            .expect("the live body's file");
+        assert!(cut
+            .iter()
+            .all(|segment| file_set.contains(&segment.snapshot_fingerprint)));
+        assert!(cut.iter().all(|segment| segment.source_file_fingerprint.is_none()));
         // The OFF whole and the ON pieces carry the same money.
         assert_eq!(off.scan.snapshots.len(), 1);
         assert!(off.scan.snapshots[0].history_segments.is_none());

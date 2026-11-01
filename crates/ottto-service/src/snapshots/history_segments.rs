@@ -145,6 +145,9 @@ pub(crate) enum Skipped {
     /// A group's unACKed members do not fit one request: none is sent this
     /// pass (counted deferred, never dropped or stripped).
     GroupOverBatch,
+    /// A group member's exact bytes are refused for good: the group is not
+    /// sent without it (counted deferred, never resent each pass).
+    PartRefused,
 }
 
 #[derive(Serialize)]
@@ -225,6 +228,44 @@ pub(crate) fn segment_of(id: &str) -> Option<&str> {
             !live.is_empty() && date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
         })
         .map(|(live, _)| live)
+}
+
+/// Each segment's local file, keyed by segment id: its live body's
+/// `source_file_fingerprint`. Segments name no file on the wire; locally
+/// they settle, retry and leave with that file. Empty without segments.
+pub(crate) fn segment_files(items: &[SnapshotItem]) -> BTreeMap<String, String> {
+    if items.iter().all(|item| item.history_segment.is_none()) {
+        return BTreeMap::new();
+    }
+    let lives = items
+        .iter()
+        .filter(|item| item.history_segments.is_some())
+        .filter_map(|item| {
+            Some((
+                item.source_session_id.as_str(),
+                item.source_file_fingerprint.as_deref()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    items
+        .iter()
+        .filter_map(|item| {
+            let file = lives.get(item.history_segment.as_ref()?.of.as_str())?;
+            Some((item.source_session_id.clone(), (*file).to_string()))
+        })
+        .collect()
+}
+
+/// An item's local file: its own, else (a segment) its live body's.
+pub(crate) fn local_file<'a>(
+    item: &'a SnapshotItem,
+    segment_files: &'a BTreeMap<String, String>,
+) -> Option<&'a String> {
+    item.source_file_fingerprint.as_ref().or_else(|| {
+        segment_files
+            .get(&item.source_session_id)
+            .filter(|_| item.history_segment.is_some())
+    })
 }
 
 /// The live session id of a cut session's group: a segment's `of`, or the

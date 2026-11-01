@@ -8361,10 +8361,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
         result.census_complete = false;
         index.mark_bounded_sweep_unsettled();
     }
+    // A settled-history segment belongs to its live body's file: the file's
+    // entity set, no-op test and retry re-read cover its whole group.
+    let segment_files = history_segments::segment_files(&result.snapshots);
     let mut by_source_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut by_source_file_body_witness: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for snapshot in &result.snapshots {
-        if let Some(source_file_fingerprint) = snapshot.source_file_fingerprint.as_ref() {
+        if let Some(source_file_fingerprint) =
+            history_segments::local_file(snapshot, &segment_files)
+        {
             by_source_file
                 .entry(source_file_fingerprint.clone())
                 .or_default()
@@ -8419,7 +8424,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             );
         }
         let quarantine_retry_required = result.snapshots.iter().any(|snapshot| {
-            snapshot.source_file_fingerprint.as_deref()
+            history_segments::local_file(snapshot, &segment_files).map(String::as_str)
                 == Some(pending.source_file_fingerprint.as_str())
                 && index.quarantine_requires_retry_body(
                     &snapshot.snapshot_fingerprint,
@@ -8587,9 +8592,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
     }
     result.snapshots.retain(|snapshot| {
         !carried_noop_entities.contains(&snapshot.snapshot_fingerprint)
-            && snapshot
-                .source_file_fingerprint
-                .as_ref()
+            && history_segments::local_file(snapshot, &segment_files)
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });

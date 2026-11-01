@@ -5518,6 +5518,10 @@ fn apply_cut(
         // The whole body's lent slots, against the rows this entry holds.
         let derived = copy_derived_rows(&original, &piece, own);
         if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+            // A segment with its own entry is flagged from that entry alone.
+            if own.is_some() {
+                piece.copy_invalidated.clear();
+            }
             for (start, rows) in copy_invalidated_rows(segment, &derived, own) {
                 piece
                     .copy_invalidated

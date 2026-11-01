@@ -4490,7 +4490,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
                 [false, true]
             );
-            // Per entity (Lead B C1): the same frozen rows held by a settled-
+            // Per entity: the same frozen rows held by a settled-
             // history segment's own entry. The cut tombstones the lent row
             // in that entry, never the live one, and the segment sends it
             // with today's attribution.

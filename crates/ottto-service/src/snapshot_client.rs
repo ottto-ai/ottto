@@ -786,8 +786,15 @@ pub struct SnapshotEntityRejection {
 }
 
 impl SnapshotEntityRejection {
+    /// A retryable settled-history group refusal: nothing of the group was
+    /// written and the whole group is to be offered again.
+    pub(crate) fn history_segments_hold(&self) -> bool {
+        !self.permanent && self.reason.starts_with("history_segments_")
+    }
+
     /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
-    /// this body for review. Only these reasons may be non-permanent.
+    /// this body for review. Only these reasons, and a settled-history group
+    /// refusal, may be non-permanent.
     pub(crate) fn usage_decrease_hold(&self) -> bool {
         matches!(
             self.safe_reason(),
@@ -964,6 +971,19 @@ impl SnapshotBatchResponse {
     fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
         for rejection in self.rejected_entities.iter().filter(|r| !r.permanent) {
+            if rejection.history_segments_hold() {
+                // Only a member of a cut session's group can be refused for it.
+                if !request.snapshots.iter().any(|item| {
+                    item.source_session_id == rejection.source_session_id
+                        && item.snapshot_fingerprint == rejection.snapshot_fingerprint
+                        && crate::snapshots::history_segments::group_of(item).is_some()
+                }) {
+                    return Err(anyhow!(
+                        "snapshot ACK holds a body outside a settled-history group"
+                    ));
+                }
+                continue;
+            }
             let held_literal = declared
                 && request.snapshots.iter().any(|item| {
                     item.source_session_id == rejection.source_session_id
@@ -1112,7 +1132,10 @@ impl SnapshotBatchResponse {
                 retained_proof_missing: Vec::new(),
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent && !rejection.usage_decrease_hold() {
+            if !rejection.permanent
+                && !rejection.usage_decrease_hold()
+                && !rejection.history_segments_hold()
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(

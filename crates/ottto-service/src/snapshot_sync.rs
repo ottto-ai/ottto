@@ -10384,7 +10384,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // A settled-history window over a size cap once tagged holds its
         // session: delayed, never stripped, and retried like E2's holds.
         let history_held = evidence.history_held.take();
-        if let Some((cache, committed)) = retained {
+        if let Some((cache, committed)) = retained.filter(|_| !history_held.is_empty()) {
             cache.add_held_new_files(committed, index, &scan_result.snapshots, &history_held);
         }
         disposition.hold_request_owned(history_held);
@@ -11054,7 +11054,9 @@ where
                 .as_ref()
                 .map_or(true, |(live, _)| !unsettled_groups.contains(live));
             if settled.contains(item_fingerprint) && !group_settled {
-                // Pending like a conflict: the page is not Completed.
+                // Pending like a conflict, and held on the same backoff: the
+                // page is not Completed and the body stays owed.
+                progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
                 group_blocked += 1;
                 continue;
             }
@@ -11135,7 +11137,7 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if let Some(rejection) = rejected.get(item_fingerprint) {
-                if !rejection.permanent && rejection.reason.starts_with("history_segments_") {
+                if rejection.history_segments_hold() {
                     forget_group(&mut *progress, item);
                 }
                 if rejection.permanent {
@@ -11513,6 +11515,80 @@ where
             }
         }
     }
+    // A settled-history group travels whole: the receiver refuses a segment
+    // without its live body and counts parts it holds plus parts sent. Once
+    // any member is pending, every member without an exact positive ACK
+    // joins it, whatever its own retry clock, and so does the live body even
+    // when ACKed. ACKed unchanged segments stay skipped (the receiver holds
+    // them). A member whose exact bytes are refused for good holds the group.
+    let history_roots = items
+        .iter()
+        .filter(|item| {
+            session_id(item).is_some_and(crate::snapshots::history_segments::is_segment_id)
+        })
+        .filter_map(&literal_family)
+        .collect::<BTreeSet<_>>();
+    let mut history_forced = BTreeSet::new();
+    let mut history_refused = BTreeSet::new();
+    if !history_roots.is_empty() {
+        let active = pending_by_fingerprint
+            .values()
+            .filter_map(|(index, _, _)| literal_family(&items[*index]))
+            .filter(|root| history_roots.contains(root))
+            .collect::<BTreeSet<_>>();
+        for (index, item) in items.iter().enumerate() {
+            let Some(root) = literal_family(item).filter(|root| active.contains(root)) else {
+                continue;
+            };
+            let item_fingerprint = fingerprint(item);
+            let witness = body_witness(item);
+            if pending_by_fingerprint.contains_key(item_fingerprint) {
+                continue;
+            }
+            if progress
+                .permanent_rejections
+                .get(item_fingerprint)
+                .is_some_and(|record| record.body_witness == witness)
+            {
+                history_refused.insert(root);
+                continue;
+            }
+            let acked = progress
+                .accepted_body_witnesses
+                .get(item_fingerprint)
+                .is_some_and(|accepted| *accepted == witness);
+            if acked && session_id(item) != Some(root) {
+                continue;
+            }
+            let body_length = snapshot_packing_json_length(item).map_err(|_| {
+                anyhow::Error::new(SnapshotLocalStateRejected {
+                    operation: "serialize snapshot for batch packing",
+                })
+            })?;
+            history_forced.insert(index);
+            pending_by_fingerprint
+                .insert(item_fingerprint.to_string(), (index, body_length, witness));
+        }
+    }
+    // A request's indivisible parts: a settled-history group is one, every
+    // other body its own. Recovery splits between parts only.
+    let request_parts = |indices: &[usize]| {
+        let mut parts = Vec::<Vec<usize>>::new();
+        let mut by_root = BTreeMap::<&str, usize>::new();
+        for &index in indices {
+            match literal_family(&items[index]).filter(|root| history_roots.contains(root)) {
+                Some(root) => match by_root.get(root) {
+                    Some(&part) => parts[part].push(index),
+                    None => {
+                        by_root.insert(root, parts.len());
+                        parts.push(vec![index]);
+                    }
+                },
+                None => parts.push(vec![index]),
+            }
+        }
+        parts
+    };
     let mut deferred_validation_error = None;
     let mut batches = VecDeque::new();
     // Request-owned literal bodies travel with their Claude family (early-t7
@@ -11555,29 +11631,46 @@ where
         // segment without its live body. Over the receiver's limits nothing
         // of it goes this pass: counted deferred and alarmed, never dropped
         // or stripped, and offered again whole.
-        if members.iter().any(|(index, _, _)| {
-            session_id(&items[*index])
-                .is_some_and(crate::snapshots::history_segments::is_segment_id)
-        }) {
+        if history_refused.contains(root)
+            || members.iter().any(|(index, _, _)| {
+                session_id(&items[*index])
+                    .is_some_and(crate::snapshots::history_segments::is_segment_id)
+            })
+        {
             let bytes = members
                 .iter()
                 .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
-            if crate::snapshots::history_segments::group_fits(members.len(), bytes) {
+            let skipped = if history_refused.contains(root) {
+                crate::snapshots::history_segments::Skipped::PartRefused
+            } else if crate::snapshots::history_segments::group_fits(members.len(), bytes) {
                 order.extend(members);
                 unit_ends.push(order.len());
+                continue;
             } else {
-                crate::snapshots::history_segments::alarm_scope(
-                    poison_scope,
-                    crate::snapshots::history_segments::Skipped::GroupOverBatch,
+                crate::snapshots::history_segments::Skipped::GroupOverBatch
+            };
+            // Held on the existing retry backoff: owed, re-read when due.
+            crate::snapshots::history_segments::alarm_scope(poison_scope, skipped);
+            for (index, _, _) in &members {
+                progress.quarantine_retryable_body(
+                    fingerprint(&items[*index]),
+                    &body_witness(&items[*index]),
                 );
-                history_deferred += members.len();
             }
+            history_deferred += members.len();
             continue;
         }
         for group in literal_family_groups(members) {
             order.extend(group);
             unit_ends.push(order.len());
         }
+    }
+    if history_deferred > 0 {
+        persist(progress).map_err(|_| {
+            anyhow::Error::new(SnapshotLocalStateRejected {
+                operation: "save settled-history group hold",
+            })
+        })?;
     }
     let mut units = Vec::with_capacity(unit_ends.len());
     let mut start = 0;
@@ -11696,12 +11789,15 @@ where
         let indices = indices
             .into_iter()
             .filter(|index| {
-                !progress.contains_body(fingerprint(&items[*index]), &body_witness(&items[*index]))
+                history_forced.contains(index)
+                    || !progress
+                        .contains_body(fingerprint(&items[*index]), &body_witness(&items[*index]))
             })
             .collect::<Vec<_>>();
         if indices.is_empty() {
             continue;
         }
+        let parts = request_parts(&indices);
         if adaptive {
             if adaptive_attempts >= SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT {
                 return Err(deferred_validation_error
@@ -11752,6 +11848,20 @@ where
                     fingerprint(&items[poison_index]),
                     &body_witness(&items[poison_index]),
                 );
+                // The rest of its settled-history group waits with it, held
+                // on the retry backoff: never a segment without its live.
+                let poison_part = parts
+                    .iter()
+                    .find(|part| part.contains(&poison_index))
+                    .filter(|part| part.len() > 1);
+                for index in poison_part.into_iter().flatten() {
+                    if *index != poison_index {
+                        progress.quarantine_retryable_body(
+                            fingerprint(&items[*index]),
+                            &body_witness(&items[*index]),
+                        );
+                    }
+                }
                 if persist(progress).is_err() {
                     *progress = progress_before_quarantine;
                     return Err(anyhow::Error::new(SnapshotLocalStateRejected {
@@ -11762,41 +11872,47 @@ where
                 // save failure must leave both the settlement and the once-set
                 // untouched so a successful retry can report the real loss.
                 record_poison_loss_once(poison_scope, poison_fingerprint);
+                if let Some(part) = poison_part {
+                    history_deferred += part.len() - 1;
+                }
                 let remaining = indices
                     .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, item)| (index != request_index).then_some(item))
+                    .filter(|index| {
+                        *index != poison_index
+                            && !poison_part.is_some_and(|part| part.contains(index))
+                    })
                     .collect::<Vec<_>>();
                 if !remaining.is_empty() {
                     batches.push_front((remaining, false));
                 }
             }
             Err(error)
-                if indices.len() > 1
+                if parts.len() > 1
                     && adaptive_splits < SNAPSHOT_ADAPTIVE_SPLIT_LIMIT
                     && is_item_specific_validation_failure(&error) =>
             {
                 // Legacy 422 is a full-batch/no-write outcome. Retry exact
                 // singletons so one poisoned item cannot strand healthy
-                // siblings and no binary subset is mistaken for an ACK.
+                // siblings and no binary subset is mistaken for an ACK. A
+                // settled-history group is retried whole, as one part.
                 adaptive_splits += 1;
-                for index in indices.into_iter().rev() {
-                    batches.push_front((vec![index], true));
+                for part in parts.into_iter().rev() {
+                    batches.push_front((part, true));
                 }
             }
             Err(error)
-                if indices.len() > 1
+                if parts.len() > 1
                     && adaptive_splits < SNAPSHOT_ADAPTIVE_SPLIT_LIMIT
                     && is_snapshot_batch_deadline_failure(&error) =>
             {
                 adaptive_splits += 1;
-                let midpoint = indices.len() / 2;
-                let right = indices[midpoint..].to_vec();
-                let left = indices[..midpoint].to_vec();
+                let midpoint = parts.len() / 2;
+                let right = parts[midpoint..].concat();
+                let left = parts[..midpoint].concat();
                 batches.push_front((right, true));
                 batches.push_front((left, true));
             }
-            Err(error) if indices.len() > 1 && is_item_specific_validation_failure(&error) => {
+            Err(error) if parts.len() > 1 && is_item_specific_validation_failure(&error) => {
                 // Keep the original typed validation error in the anyhow
                 // chain so the caller still reports backend_validation_error
                 // when the bounded isolation budget is exhausted.

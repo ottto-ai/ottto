@@ -690,15 +690,22 @@ fn history_live_conflict_forgets_its_earlier_segment_acks() {
 }
 
 /// [behaviour][money] A group's unACKed members travel in ONE request, up
-/// to the receiver's limits, against a minimal receiver model that refuses a
-/// segment without its live body. At the limit (99 segments + live) one
-/// request carries all of it and every token settles once. A later pass
-/// sends only what changed (ACKed, unchanged segments are skipped). One over
-/// the limit sends nothing: the pass is Deferred (counted), nothing settles
-/// and every member stays owed for a later pass.
+/// to the receiver's limits, against a minimal receiver model: at most 100
+/// entities, and it REFUSES (retryable, nothing written) a segment without
+/// its live body or a live body whose held plus sent parts miss its `count`.
+/// - At the limit (99 segments + live) one request carries all of it and
+///   every token settles once.
+/// - A later pass sends only changed segments, with their live body even
+///   when that is ACKed and unchanged; ACKed unchanged segments are skipped.
+/// - After a group refusal every member waits on its own retry clock; when
+///   any one comes due the whole unACKed group goes again, never a part.
+/// - A 422 isolates bodies but retries the group as one part.
+/// - One over the limit sends nothing: the pass is Deferred (counted) and
+///   every member is held on the retry backoff, owed for a later pass.
 #[test]
 fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
     let live = "synthetic-long";
+    let other = "synthetic-other";
     let group = |segments: u64| {
         let mut items = (0..segments)
             .map(|n| {
@@ -719,7 +726,13 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
             .map(|item| item["input_tokens"].as_u64().unwrap())
             .sum::<u64>()
     };
-    let upload = |progress: &mut SnapshotUploadProgress, items: &[Value]| {
+    let id = |value: &Value| value["source_session_id"].as_str().unwrap().to_owned();
+    // `stored`: segment ids the receiver holds. `refuse`: refuse the next
+    // group once (e.g. a head conflict).
+    let upload = |progress: &mut SnapshotUploadProgress,
+                  items: &[Value],
+                  stored: &mut BTreeSet<String>,
+                  refuse: &mut bool| {
         let mut requests = Vec::<Vec<Value>>::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_literal_families(
@@ -731,11 +744,38 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
             |value: &Value| value["snapshot_fingerprint"].as_str().unwrap().to_owned(),
             |value: &Value| value["source_session_id"].as_str(),
             |_: &Value| false,
-            |_: &Value| Some(live),
+            |value: &Value| (value["source_session_id"] != other).then_some(live),
             &mut InplaceRetryBudget::default(),
             |batch: Vec<Value>| {
+                requests.push(batch.clone());
+                if batch
+                    .iter()
+                    .any(|value| value["source_session_id"] == other)
+                {
+                    return Err(anyhow::Error::new(crate::snapshot_client::BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0]}]}"#.into()),
+                    }));
+                }
+                assert!(batch.len() <= crate::snapshots::history_segments::GROUP_MAX_ITEMS);
+                let sent = batch
+                    .iter()
+                    .filter(|value| value["history_segment"].is_object())
+                    .map(id)
+                    .collect::<BTreeSet<_>>();
+                let whole = batch
+                    .iter()
+                    .find(|value| value["source_session_id"] == live)
+                    .is_some_and(|value| {
+                        stored.union(&sent).count() as u64
+                            == value["history_segments"]["count"].as_u64().unwrap()
+                    });
+                let refused = std::mem::take(refuse) || !whole;
+                if !refused {
+                    stored.extend(sent);
+                }
                 let entity = |value: &Value| crate::snapshot_client::SnapshotEntityRef {
-                    source_session_id: value["source_session_id"].as_str().unwrap().into(),
+                    source_session_id: id(value),
                     snapshot_fingerprint: value["snapshot_fingerprint"].as_str().unwrap().into(),
                     occurrence_count: 1,
                     body_witness_version: None,
@@ -745,17 +785,16 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
                 };
-                // Minimal receiver: at most 100 entities, and a segment
-                // shares its request with its live body.
-                assert!(batch.len() <= crate::snapshots::history_segments::GROUP_MAX_ITEMS);
-                let has_live = batch.iter().any(|value| value["source_session_id"] == live);
-                assert!(
-                    has_live,
-                    "the receiver refuses a segment without its live body"
-                );
-                requests.push(batch.clone());
+                let rejection = |value: &Value| crate::snapshot_client::SnapshotEntityRejection {
+                    source_session_id: id(value),
+                    snapshot_fingerprint: value["snapshot_fingerprint"].as_str().unwrap().into(),
+                    reason: "history_segments_part_count_mismatch".into(),
+                    detail: "synthetic group refusal".into(),
+                    permanent: false,
+                    occurrence_count: 1,
+                };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
-                    accepted: batch.len() as u64,
+                    accepted: if refused { 0 } else { batch.len() as u64 },
                     sessions_reconciled: 0,
                     session_ids: vec![],
                     disabled: false,
@@ -763,57 +802,140 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
                     entity_ack_contract: Some(
                         crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into(),
                     ),
-                    accepted_entities: batch.iter().map(entity).collect(),
+                    accepted_entities: if refused {
+                        vec![]
+                    } else {
+                        batch.iter().map(entity).collect()
+                    },
                     unchanged_entities: vec![],
-                    rejected_entities: vec![],
+                    rejected_entities: if refused {
+                        batch.iter().map(rejection).collect()
+                    } else {
+                        vec![]
+                    },
                     conflict_entities: vec![],
                 })
             },
             |_| Ok(()),
         );
-        (result.unwrap(), requests)
+        (result, requests)
+    };
+    let segment_only = |request: &Vec<Value>| {
+        request
+            .iter()
+            .any(|value| value["history_segment"].is_object())
+            && !request
+                .iter()
+                .any(|value| value["source_session_id"] == live)
     };
     // At the limit: one request with every member, segments oldest first.
     let fresh = progress;
     let mut items = group(99);
     let mut progress = fresh();
-    let (result, requests) = upload(&mut progress, &items);
-    assert_eq!(result, ResumableUploadResult::Completed);
+    let mut stored = BTreeSet::new();
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].len(), 100);
     assert_eq!(tokens(&requests[0]), tokens(&items));
-    let ids = requests[0]
-        .iter()
-        .map(|value| value["source_session_id"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(ids.last(), Some(&live));
+    let ids = requests[0].iter().map(id).collect::<Vec<_>>();
+    assert_eq!(ids.last().map(String::as_str), Some(live));
     assert!(ids[..99].windows(2).all(|pair| pair[0] < pair[1]));
     for item in &items {
         assert!(progress
             .accepted_fingerprints
             .contains(item["snapshot_fingerprint"].as_str().unwrap()));
     }
-    // Next pass: only the changed members are sized and sent.
+    // Next pass: only changed members are sized and sent.
     items[3]["snapshot_fingerprint"] = json!("a".repeat(64));
     items[99]["snapshot_fingerprint"] = json!("e".repeat(64));
-    let (result, requests) = upload(&mut progress, &items);
-    assert_eq!(result, ResumableUploadResult::Completed);
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0]
-            .iter()
-            .map(|value| value["source_session_id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec![format!("{live}#w20250104").as_str(), live]
+    let pair = vec![format!("{live}#w20250104"), live.to_owned()];
+    assert_eq!(requests[0].iter().map(id).collect::<Vec<_>>(), pair);
+    // A changed segment alone brings its ACKed, unchanged live body.
+    items[3]["snapshot_fingerprint"] = json!("b".repeat(64));
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].iter().map(id).collect::<Vec<_>>(), pair);
+    assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
+
+    // A refused group: every member is held on its own retry clock. When
+    // any one comes due the whole unACKed group goes again in one request.
+    let items = group(3);
+    for due in [3, 0] {
+        let mut progress = fresh();
+        let mut stored = BTreeSet::new();
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut true);
+        assert_eq!(
+            result.unwrap(),
+            ResumableUploadResult::Deferred { count: 4 }
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(progress.quarantined_fingerprints.len(), 4);
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(requests.is_empty(), "nothing is due yet");
+        progress.active_quarantine_retries = BTreeSet::from([items[due]["snapshot_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned()]);
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].len(), 4);
+        assert_eq!(stored.len(), 3);
+        for item in &items {
+            assert!(progress
+                .accepted_fingerprints
+                .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+        }
+    }
+
+    // A 422 on a mixed batch retries the group whole and the other body
+    // alone; no request ever carries a segment without its live body.
+    let mut mixed = group(3);
+    mixed.push(
+        json!({"source_session_id": other, "snapshot_fingerprint": "c".repeat(64),
+        "input_tokens": 1}),
     );
-    // One over the limit: nothing is sent; the pass is Deferred, counted.
+    let mut progress = fresh();
+    let mut stored = BTreeSet::new();
+    let (result, requests) = upload(&mut progress, &mixed, &mut stored, &mut false);
+    assert!(result.is_err(), "the poison body still fails the cycle");
+    assert!(requests.iter().any(|request| {
+        request.len() == 4
+            && !request
+                .iter()
+                .any(|value| value["source_session_id"] == other)
+    }));
+    assert!(requests.iter().any(|request| request.len() == 1));
+    assert!(!requests.iter().any(segment_only));
+    assert_eq!(stored.len(), 3);
+    for item in &mixed[..4] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+    }
+
+    // One over the limit: nothing is sent; Deferred, counted, and held.
     let items = group(100);
     let mut progress = fresh();
-    let (result, requests) = upload(&mut progress, &items);
-    assert_eq!(result, ResumableUploadResult::Deferred { count: 101 });
+    let (result, requests) = upload(&mut progress, &items, &mut BTreeSet::new(), &mut false);
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 101 }
+    );
     assert!(requests.is_empty());
     assert!(progress.accepted_fingerprints.is_empty());
     assert!(progress.accepted_body_witnesses.is_empty());
+    assert_eq!(progress.quarantined_fingerprints.len(), 101);
+    assert!(progress
+        .quarantined_fingerprints
+        .values()
+        .all(|record| { record.disposition == SnapshotQuarantineDisposition::RetryPending }));
 }
 
 /// [format] Segment hints persist in their own sibling field, beside the
