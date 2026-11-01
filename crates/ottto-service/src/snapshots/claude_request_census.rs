@@ -646,6 +646,19 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fp| fp == self.source_file_fingerprint)
     }
 
+    /// Owed-evidence keep (`evidence_owed` ON only): this exact revision was
+    /// parsed in `window` under the current derivation, whatever its shape,
+    /// so a re-read reproduces it. Never proof, coverage or an ACK.
+    pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {
+        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+            && self.window == window
+            && !self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && decode_fingerprint(entry_fingerprint)
+                .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+    }
+
     /// Freshness of a ledger holder: `current_for`, or a loss-free
     /// identity-incomplete record (it has message-only, id-less or displaced
     /// responses) whose message-only ids are known (`message_known`, the
@@ -778,6 +791,12 @@ pub(crate) fn claude_request_hash(request_id: &str) -> u64 {
     let mut prefix = [0_u8; 8];
     prefix.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(prefix)
+}
+
+/// `claude_request_hash` from a pending key (the full SHA-256 hex of the
+/// request id): its first 16 hex digits. None for a malformed key.
+pub(crate) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u64> {
+    u64::from_str_radix(sha256_hex.get(..16)?, 16).ok()
 }
 
 /// `ScanIndex::claude_request_census`: every record by index key, with the
@@ -3090,7 +3109,7 @@ pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFil
             record.birth.is_some_and(|birth| {
                 candidate.physical_identity == Some([birth.device, birth.inode])
             }) && record.modified == Some(entry.modified_unix_seconds)
-                && (entry.source_file_fingerprint.is_empty()
+                && (entry.rearmed()
                     || decode_fingerprint(&entry.source_file_fingerprint)
                         == Some(record.source_file_fingerprint))
         }
@@ -3276,7 +3295,7 @@ fn transcript_retirement_age(
     // Not dirty: the indexed revision is still the one the record (and its
     // mtime) describes.
     let entry = files.get(key).filter(|entry| {
-        decode_fingerprint(&entry.source_file_fingerprint)
+        decode_fingerprint(entry.observed_fingerprint())
             .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
     })?;
     // A record written before `m` (#664) takes the entry's mtime: the equal
@@ -3790,8 +3809,9 @@ impl ClaudeRequestCensusJoin {
         if let Some(record) =
             record.filter(|record| record.shape != ClaudeRequestCensusShape::OverBudget)
         {
-            if decode_fingerprint(&entry.source_file_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
+            if !entry.evidence_owed
+                && decode_fingerprint(&entry.source_file_fingerprint)
+                    .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
             {
                 return ClaudeRequestCensusCoverage::Fingerprint;
             }
@@ -3809,7 +3829,7 @@ impl ClaudeRequestCensusJoin {
             && !index.file_snapshot_fingerprints.contains_key(key)
         {
             ClaudeRequestCensusCoverage::Placeholder
-        } else if entry.source_file_fingerprint.is_empty() {
+        } else if entry.rearmed() {
             ClaudeRequestCensusCoverage::EmptyFingerprint
         } else if record.is_some() {
             ClaudeRequestCensusCoverage::FingerprintMismatch

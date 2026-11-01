@@ -44,6 +44,7 @@ mod kinds_misc;
 mod mapper;
 mod sqlite;
 use kinds::KindCx;
+pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
 /// inline graph. An absent attachment borrows this immutable empty value.
@@ -109,6 +110,14 @@ struct Identity {
     db_id: String,
     binding: super::scan_index_persistence::Binding,
     fence_generation: u64,
+}
+
+/// Sources whose index routes through this store. The set only grows: a
+/// published route's custody wins, and dropping its source here would let v1
+/// load the frozen JSON. Removing a source needs an explicit export back to
+/// v1, never an edit to this set.
+fn v2_on(source: super::scan_index_persistence::Source) -> bool {
+    matches!(source, super::scan_index_persistence::Source::Claude)
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;

@@ -585,13 +585,15 @@ transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 
 For an unknown field or other state-v2 load failure, an unpublished source keeps
 collecting through v1 and reports `import_paused` / `import_paused_alarm`.
-After the durable fence, collection holds with a named state-v2 error and the
-existing local-data repair status and alarm. Keep the database, fence, baseline
+After the durable fence, collection holds. A key, kind, control or version
+written by a newer build holds as "update Ottto" (downgrade); any other failure
+holds with a named state-v2 error and the existing local-data repair status and
+alarm. Keep the database, fence, baseline
 and upload-progress bytes as found. Do not reset, rewrite or delete them to clear
 the hold. Growth-retained files remain discoverable so a compatible build can
 catch up by Tail after the hold clears.
 
-If this hold lasts **24 hours**, escalate to **Ottto state recovery support**
+If a local-data hold lasts **24 hours**, escalate to **Ottto state recovery support**
 with the counts-only diagnostics and named hold reason. Source applications can
 age out their original transcript files while collection is held; an extended
 hold can therefore lose usage. Prioritize a compatible build and preservation

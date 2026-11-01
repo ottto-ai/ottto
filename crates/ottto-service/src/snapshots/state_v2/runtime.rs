@@ -2,7 +2,7 @@
 //! is complete. OFF remains v1 before publication; custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure, Context};
-use import::{ClaudeMapper, Mapper, Pace, Pause};
+use import::{Mapper, Pace, Pause};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,10 +110,13 @@ impl Hold {
             .any(|e| e.to_string() == "state_v2_foreign_binding")
         {
             Self::ForeignBinding
-        } else if error
-            .chain()
-            .any(|e| e.to_string() == "scan_index_representation_refused")
-        {
+        } else if error.chain().any(|e| {
+            // A key this build does not know, inside a known row, was written
+            // by a newer build: hold until upgrade, never as a data fault.
+            let text = e.to_string();
+            text == "scan_index_representation_refused"
+                || text.starts_with("state_v2_ignored_field")
+        }) {
             Self::Future
         } else if error
             .chain()
@@ -250,7 +253,7 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
 
 fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding> {
     super::super::scan_index_integration::scan_index_storage_binding(path)
-        .filter(|b| b.source == super::super::scan_index_persistence::Source::Claude)
+        .filter(|b| v2_on(b.source))
 }
 
 pub(in super::super) struct Session {
@@ -289,16 +292,11 @@ pub(in super::super) fn load_locked(
         return Ok((None, false));
     }
     let switched = enabled(support);
-    let index = load_with_custody(path, switched, &ClaudeMapper, custody)?;
+    let index = load_with_custody(path, switched, custody)?;
     let sample_v1 = switched && index.is_none();
     Ok((index, sample_v1))
 }
-fn load_with_custody<M: Mapper>(
-    path: &Path,
-    switched: bool,
-    mapper: &M,
-    custody: bool,
-) -> Result<Option<ScanIndex>> {
+fn load_with_custody(path: &Path, switched: bool, custody: bool) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
         return Ok(None);
     };
@@ -336,7 +334,7 @@ fn load_with_custody<M: Mapper>(
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
+                        let (mut index, mut cx) = Mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         // Digest the exact persisted image: a save then also
                         // persists whatever normalization changes.
@@ -360,13 +358,13 @@ fn load_with_custody<M: Mapper>(
             let (deadline, work) = purge_policy();
             let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
                 .map_err(Hold::storage)?;
-            db.path_extractor(M::private_paths);
-            db.reference_extractor(M::references);
+            db.path_extractor(Mapper::private_paths);
+            db.reference_extractor(Mapper::references);
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
-            let (mut index, mut cx) = mapper
+            let (mut index, mut cx) = Mapper
                 .hydrate_context(&mut db)
                 .context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
@@ -407,7 +405,7 @@ fn load_with_custody<M: Mapper>(
                 telemetry::event("import_restart_attempt", &1);
             }
             // Inventory precedes v1 recovery/decoding and never creates artifacts.
-            match mapper.inventory_context(path) {
+            match Mapper.inventory_context(path) {
                 Ok(original) => {
                     state.inventory_ready = true;
                     state.original = original;
@@ -469,9 +467,6 @@ fn pause(state: &mut RouteState, class: Pause) {
 /// Import is attempted only on the normalized available graph and only if the
 /// pre-decode inventory acquired a due slot. No writes on any paused path.
 pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> Result<()> {
-    import_with(path, index, &ClaudeMapper)
-}
-fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<()> {
     let Some(binding) = binding(path) else {
         return Ok(());
     };
@@ -504,7 +499,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            let generation = mapper.import_generation(index)?;
+            let generation = Mapper.import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
@@ -517,11 +512,11 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             telemetry::baseline(path);
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
-            db.path_extractor(M::private_paths);
-            db.reference_extractor(M::references);
+            db.path_extractor(Mapper::private_paths);
+            db.reference_extractor(Mapper::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
-            let cx = mapper.import_graph(&mut db, index, state.original.as_ref())?;
+            let cx = Mapper.import_graph(&mut db, index, state.original.as_ref())?;
             original.unchanged()?;
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
@@ -544,12 +539,12 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
         let (deadline, work) = purge_policy();
         let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
             .map_err(Hold::storage)?;
-        db.path_extractor(M::private_paths);
-        db.reference_extractor(M::references);
+        db.path_extractor(Mapper::private_paths);
+        db.reference_extractor(Mapper::references);
         db.audit_headers()?;
         let stamp = db.stamp()?;
         ensure!(
-            stamp.0 == mapper.import_generation(index)?,
+            stamp.0 == Mapper.import_generation(index)?,
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
@@ -630,7 +625,7 @@ fn save_with_custody(
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let (previous, mut cx) = ClaudeMapper.hydrate_context(&mut session.db)?;
+                let (previous, mut cx) = Mapper.hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
                 session.cx = cx;
@@ -649,7 +644,7 @@ fn save_with_custody(
                     path,
                     owner,
                 )?;
-                let digests = ClaudeMapper.save(
+                let digests = Mapper.save(
                     &mut session.db,
                     &identity,
                     previous,

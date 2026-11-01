@@ -418,7 +418,8 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
     const EXTENDED: &str = "synthetic-family2";
     const UNREQUESTED: &str = "synthetic-unrequested";
     const MISSING: &str = "synthetic-missing";
-    let (_scratch, mut db) = Scratch::store();
+    // Published, so a rolled-back damage transaction leaves the store usable.
+    let (_scratch, mut db) = Scratch::live_store();
     let mut index = fixture();
     let family = index.claude_account_family_pending[WITH_WINDOWS].clone();
     assert!(!family.previous_windows.is_empty());
@@ -614,7 +615,7 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
             next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
         }
         // Claim-only skips window retirement, so a clean family stays clean.
-        let saved = import::ClaudeMapper
+        let saved = import::Mapper
             .save(&mut db, &identity, committed, &mut next, &mut cx, true)
             .err()
             .map(|error| error.to_string());
