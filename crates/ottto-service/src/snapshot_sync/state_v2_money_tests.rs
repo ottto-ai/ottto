@@ -583,10 +583,11 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
     });
 }
 
-/// A4: the second account, shared by every cold row. The row's telemetry
-/// (r1 alone when the row has none) answers on account a, and one more
-/// request answers on account b, so the rows compare account placement, not
-/// only totals.
+/// A4: two accounts, shared by every cold row. The row's telemetry (r1 alone
+/// when the row has none) answers on account a, and two more root requests
+/// answer on accounts a and b. Telemetry tags a request only with its trace
+/// ownership row, so each added request carries one; the row's own traces
+/// are kept, so its ownership cases are unchanged.
 #[cfg(unix)]
 fn second_account(c: &Corpus, path: &Path) {
     fn rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
@@ -612,10 +613,13 @@ fn second_account(c: &Corpus, path: &Path) {
         .into_iter()
         .map(|row| tag(row, Some(&"a".repeat(64))))
         .collect();
-    append(path, &line(ROOT, "r-account-b", AT, 40));
-    effort.push(tagged_api("r-account-b", 40, Some(&"b".repeat(64))));
-    let traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
+    let mut traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
         rows(c, "claude-code-trace-ownership");
+    for (request, tokens, account) in [("r-account-a", 40, "a"), ("r-account-b", 50, "b")] {
+        append(path, &line(ROOT, request, AT, tokens));
+        effort.push(tagged_api(request, tokens, Some(&account.repeat(64))));
+        traces.push(trace(request, ""));
+    }
     c.evidence(&effort, &traces);
 }
 
