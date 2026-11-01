@@ -117,8 +117,8 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 /// skeletons precede census-owned request membership; no partial graph escapes.
 /// Test view: cold archives are read back resident, for graph comparisons.
 #[cfg(test)]
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+pub(super) fn hydrate(
+    store: &mut sqlite::Sqlite,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;

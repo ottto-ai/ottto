@@ -36,8 +36,6 @@ impl Scratch {
         ));
         fs::create_dir(&dir).unwrap();
         let mut db = sqlite::Sqlite::create_import(&dir.join("index.v2.sqlite.import")).unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         db.control(
             "identity",
             &Identity {
@@ -54,7 +52,7 @@ impl Scratch {
     fn live_store() -> (Self, sqlite::Sqlite) {
         let (scratch, db) = Self::store();
         db.finish_import().unwrap();
-        let mut db = sqlite::Sqlite::open(
+        let db = sqlite::Sqlite::open(
             &scratch.0.join("index.v2.sqlite.import"),
             &Identity {
                 format: FORMAT,
@@ -64,8 +62,6 @@ impl Scratch {
             },
         )
         .unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         (scratch, db)
     }
 }
@@ -712,8 +708,7 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
             next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
         }
         // Claim-only skips window retirement, so a clean family stays clean.
-        let saved = import::Mapper
-            .save(&mut db, &identity, committed, &mut next, &mut cx, true)
+        let saved = import::save(&mut db, &identity, committed, &mut next, &mut cx, true)
             .err()
             .map(|error| error.to_string());
         let generation = db.read_control::<u64>("generation").unwrap();
