@@ -879,6 +879,13 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
             }
         }
         let cold_baseline = baseline(&cold, &mut cold_cx).unwrap();
+        // Seed mode keeps every stored cold row in the baseline.
+        for (root, window) in &cold_baseline.windows {
+            for id in &window.ids {
+                let key = mapper::key("account_window", root, *id).unwrap();
+                assert!(cold_baseline.rows.contains_key(&key), "{root} {id}");
+            }
+        }
         cold.generation += 1;
         roll(&mut cold, boundary, false);
         let mut tx = cold_db.begin(TxnMode::Write).unwrap();
