@@ -318,7 +318,7 @@ impl Totals {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{
         advance_bounded_directory_traversal, candidate_from_traversal_path,
         ensure_bounded_traversal, local_index_key, open_and_identify_scan_candidate,
@@ -394,7 +394,10 @@ mod tests {
         panic!("synthetic Claude generation failed to retire within its page bound");
     }
 
-    fn finish(mut state: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    /// Raw scan completion, without carry effects or post-policy finalization.
+    pub(in crate::snapshots) fn finish(
+        mut state: OwnedSourceScan,
+    ) -> (ScanIndex, SourceScanResult) {
         for _ in 0..1024 {
             match state.step(None) {
                 OwnedSourceScanStep::Pending(next) => state = next,

@@ -7365,6 +7365,7 @@ fn released(
 /// is retained for that owner while unrelated work completes normally.
 #[test]
 fn plain_codex_residue_keeps_owner_custody_across_reload() {
+    use crate::snapshots::disappearance_diagnostics::tests::finish;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
 
     let fixture = ScanRoot::with_sessions(&[]);
@@ -7391,15 +7392,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
     let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
     let last = fixture.root.join("last-page.jsonl");
     fs::write(&last, b"").unwrap();
-    let finish = |mut scan: OwnedSourceScan| {
-        for _ in 0..1000 {
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
-            };
-        }
-        panic!("residue page did not finish");
-    };
     let new_scan = |index| {
         OwnedSourceScan::new(
             SnapshotSource::Codex,
