@@ -475,7 +475,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             pause(state, Pause::Partial);
             return Ok(());
         }
-        let _gauge = telemetry::Stage::import(path);
+        let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
         let result = (|| -> Result<KindCx> {
             let original = state.original.as_mut().ok_or(Pause::Mismatch)?;
             original.unchanged()?;
