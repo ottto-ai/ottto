@@ -107,6 +107,8 @@ fn apc_terminal_fixture() -> ScanIndex {
             member_occurrences: BTreeMap::new(),
             invalid: false,
             idless_revision: None,
+            identity_contract: None,
+            contract_unproven: false,
         },
     );
     index
