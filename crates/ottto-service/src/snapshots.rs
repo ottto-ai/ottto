@@ -87,6 +87,8 @@ mod contract5_cutover_tests;
 mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
+mod shared_value;
+pub(crate) use shared_value::{Shared, SharedMap};
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
