@@ -29,17 +29,17 @@ pages to EOF; a process restart loses that checkpoint.
 Power, CPU, contention and byte-budget refusal before a Full remain eligible on
 the next pass. A spent Full keeps its saved six-hour retry deadline. An unchanged
 structural cause does not trigger another Full. Parent support and same-session
-union bodies are follow-up work. The archive CPU/work allowance is bounded per
-pass; remaining unconsumed reservations are cancelled. Power is sampled once per
-page. Resource exhaustion can discard a spent RAM checkpoint, leaving its saved
-paced retry. Caps retain owed discovery and disclose refusal.
+union bodies are follow-up work. The archive CPU/work allowance gates admission
+of the next archive; a started Full retains its RAM parser to EOF. Unconsumed
+reservations cancel without a Full penalty. Power is sampled once per page.
+Caps retain owed discovery and disclose refusal.
 
 Exact accepted body witnesses in the current destination settle an archive.
 Settled archive markers keep only object stamp and disposition; acquisition
 headers and body scratch are discarded. Settled files use listing stamps rather
-than repeated opens or one scan step per archive. Scope checks are shared at
-reservation, read and publication boundaries, validating each directory home
-once. Archive work restores the native continuation QoS when it finishes.
+than repeated opens or one scan step per archive. Only immutable inventory coverage
+is shared. Live scope checks run for each archive at admission and publication,
+validating each directory home once within a check. Archive work restores the native continuation QoS when it finishes.
 Archive state uses the existing index save and state-store owners, with no slot added to ordinary file entries.
 
 Release note: context or replay changes retain accepted archive money and mark
@@ -55,3 +55,17 @@ at release cuts is follow-up work.
 Header and Full reservation batches currently require up to two committed index
 saves per pass. Held counts aggregate by cause; generic alarms occur on transitions.
 Malformed archive records become archive debt without ordinary decode holds.
+
+Archive refusals use one transition owner. Quiet outcomes preserve their marker;
+unspent transient or correctness refusals cancel their reservation; spent refusals
+retain the saved retry deadline; structural byte failures and correction debt stay
+quiet on the same stamp. Pending stores its attempt/deadline only in boxed work.
+Known missing archives retire their markers. Unknown collection metadata has one
+named, non-path debt marker; typed records are checked on load.
+
+A started Full retains the native RAM parser across decoded-byte pages and runs
+to EOF. Work/CPU allowances gate the next admission, never discard a started
+parser. Live content, archive and directory witnesses are rechecked for each
+archive at admission and publication; only immutable coverage is memoized.
+One damaged or unknown header defers every archive uniqueness proof. Resource
+receipt refusals can recur at the six-hour pace. Process memory measurement is owed.

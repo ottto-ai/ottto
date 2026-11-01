@@ -466,6 +466,10 @@ pub(super) fn hydrate_txn(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
+    index.archives = std::mem::take(&mut index.archives)
+        .into_iter()
+        .map(|(key, a)| (key, a.checked()))
+        .collect();
     read_holds(index, tx, cx)
 }
 pub(super) fn delta(

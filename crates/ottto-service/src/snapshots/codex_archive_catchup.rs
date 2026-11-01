@@ -8,32 +8,15 @@ pub(super) enum Admission {
     Held,
 }
 impl ScanIndex {
-    pub(super) fn archive_hold(&mut self, path: &Path, cause: CodexZstCause) {
-        if let Some(a) = self.archives.get_mut(&local_index_key(path)) {
-            a.hold(cause);
-        }
-    }
-    pub(super) fn archive_unavailable(&mut self, path: &Path) {
-        let a = self
-            .archives
-            .entry(local_index_key(path))
-            .or_insert_with(|| {
-                let mut a = ArchiveEvidence::unknown();
-                a.disposition = ArchiveDisposition::HeaderValidated;
-                a
-            });
-        if a.work.is_none() {
-            self.archive_pass.deferred += 1;
-            return;
-        }
-        if a.stamp.is_some() || matches!(a.disposition, ArchiveDisposition::HeaderValidated) {
-            a.transient();
-        }
-    }
-    fn archive_fence_hold(&mut self, path: &Path, cause: CodexZstCause) {
-        if let Some(a) = self.archives.get_mut(&local_index_key(path)) {
-            a.cancel_reservation();
-            a.disposition = ArchiveDisposition::Held { cause };
+    pub(super) fn archive_transition(&mut self, path: &Path, change: ArchiveTransition) {
+        let key = local_index_key(path);
+        if matches!(change, ArchiveTransition::Gone) {
+            self.archives.remove(&key);
+        } else if !matches!(change, ArchiveTransition::Quiet) {
+            self.archives
+                .entry(key)
+                .or_insert_with(ArchiveEvidence::unknown)
+                .transition(change);
         }
     }
     pub(super) fn archive_owed_count(&self) -> usize {
@@ -77,7 +60,9 @@ impl ScanIndex {
                 a.disposition,
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
             ) {
-                a.hold(CodexZstCause::CorrectionUnapplied);
+                a.transition(ArchiveTransition::Correctness(
+                    CodexZstCause::CorrectionUnapplied,
+                ));
                 changed += 1;
             }
         }
@@ -89,9 +74,8 @@ impl ScanIndex {
         &self,
         key: &str,
         i: &codex_file_join::HeaderInventory,
-        boundary: usize,
     ) -> Result<(), CodexZstCause> {
-        i.archive_scope(self, boundary)?;
+        i.archive_scope(self)?;
         let h = i
             .archive_headers
             .iter()
@@ -156,11 +140,16 @@ impl ScanIndex {
                 continue;
             }
             if !self.archive_parent_ready(&key, validated) {
-                self.archive_hold(&c.path, CodexZstCause::ParentLedgerUnbound);
+                self.archive_transition(
+                    &c.path,
+                    ArchiveTransition::Correctness(CodexZstCause::ParentLedgerUnbound),
+                );
                 continue;
             }
-            match self.archive_fence(&key, inventory, 0) {
-                Err(cause) => self.archive_fence_hold(&c.path, cause),
+            match self.archive_fence(&key, inventory) {
+                Err(cause) => {
+                    self.archive_transition(&c.path, ArchiveTransition::Correctness(cause))
+                }
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
                     if a.work
@@ -169,8 +158,7 @@ impl ScanIndex {
                     {
                         continue;
                     }
-                    a.reserve();
-                    a.work.as_mut().unwrap().reserved = true;
+                    a.transition(ArchiveTransition::Reserve);
                     self.archive_pass.dirty = true;
                 }
             }
@@ -196,18 +184,24 @@ impl ScanIndex {
         }
         if !budget.archive_ready(&self.archive_pass) {
             // No Full bytes spent: cancel the unconsumed reservation.
-            self.archives.get_mut(&key).unwrap().transient();
+            self.archive_transition(
+                &c.path,
+                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+            );
             return Admission::Held;
         }
         if !self.archive_parent_ready(&key, validated) {
-            self.archive_hold(&c.path, CodexZstCause::ParentLedgerUnbound);
+            self.archive_transition(
+                &c.path,
+                ArchiveTransition::Correctness(CodexZstCause::ParentLedgerUnbound),
+            );
             return Admission::Held;
         }
         if let Err(cause) = inventory
             .ok_or(CodexZstCause::OwnerUnproven)
-            .and_then(|i| self.archive_fence(&key, i, 1))
+            .and_then(|i| self.archive_fence(&key, i))
         {
-            self.archive_fence_hold(&c.path, cause);
+            self.archive_transition(&c.path, ArchiveTransition::Correctness(cause));
             return Admission::Held;
         }
         Admission::Read
@@ -222,9 +216,9 @@ impl ScanIndex {
         let key = local_index_key(path);
         if let Err(cause) = inventory
             .ok_or(CodexZstCause::OwnerUnproven)
-            .and_then(|i| self.archive_fence(&key, i, 2))
+            .and_then(|i| self.archive_fence(&key, i))
         {
-            self.archive_fence_hold(path, cause);
+            self.archive_transition(path, ArchiveTransition::Correctness(cause));
             return false;
         }
         if !self

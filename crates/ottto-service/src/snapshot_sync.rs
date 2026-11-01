@@ -3974,10 +3974,9 @@ impl SyncCounts {
                 .ownership_incomplete_file_count
                 .saturating_add(scan_result.archive_owed_count)
                 as u64,
-            causes: scan_result.causes.summary(
-                scan_result
-                    .ownership_incomplete_file_count
-                    .saturating_add(scan_result.archive_owed_count),
+            causes: scan_result.causes.summary_with_archive(
+                scan_result.ownership_incomplete_file_count,
+                scan_result.archive_owed_count,
             ),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
@@ -12903,27 +12902,106 @@ mod tests {
     }
     pub(crate) fn assert_archive_debt_preserves_replay_progress(
         mut index: ScanIndex,
-        scan: &SourceScanResult,
+        scan: SourceScanResult,
     ) {
         assert!(scan.census_complete);
-        let counts = SyncCounts::from_scan_result(scan, 0, 7);
+        let counts = SyncCounts::from_scan_result(&scan, 0, 7);
         assert!(counts.has_disclosed_loss());
         assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
-        let root = test_dir("archive-backfill-isolation");
-        let destination = "synthetic-destination";
-        let mut backfill = load_backfill_state(&root);
-        if scan.census_complete {
-            mark_backfill_complete_for_destination(
-                &mut backfill,
-                SnapshotSource::Codex,
-                destination,
-            );
-        }
-        let pending = pending_backfill_sources_for_destination(&backfill, destination)
+        let causes = crate::snapshots::ownership_diagnostics::line(counts.causes);
+        assert!(causes.contains("archive_owed"));
+        assert!(!causes.contains("unattributed"));
+        let root = crate::test_scratch::ScratchDir::new("archive-backfill-isolation");
+        let support = root.join("support");
+        let secrets = root.join("secrets");
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _manifests = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let url = snapshot_status_server(captured.clone());
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &url);
+        let client = SnapshotApiClient::new(url);
+        let device = LocalDeviceBinding {
+            device_id: "archive-fixture".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["codex".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .unwrap();
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        let daemon = test_daemon("otm_test");
+        let path = support.join("index.json");
+        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let progress_path = support.join("progress.json");
+        let mut progress = SnapshotUploadProgress::new(
+            destination.clone(),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        );
+        progress.save(&progress_path).unwrap();
+        let status = test_agent_status(SourceKind::Codex);
+        let preparation = SourcePreparation {
+            native_comparison_reservation: None, native_comparison_lease: None,
+            prepared_claude_evidence: None, terminal_native_traversal: None,
+            native_comparison_controller: None, retry_authority: None,
+            source: SnapshotSource::Codex, claude_scan_roots: None,
+            account_witness: daemon.snapshot_scan_account_witness().unwrap(),
+            scan_started_at: scan.census_window_end.clone(),
+            activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,
+                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
+                "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
+            receipt_window_days: 7, context_curve_enabled: true, cache_observations_enabled: false,
+            scan_agent_status_collection: Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() }),
+            attribution_context: None, upload_policy: SnapshotUploadPolicy::default(),
+            upload_destination_namespace: destination.clone(), receipt_client: client.clone(),
+            index_path: path.clone(), upload_progress_path: progress_path.clone(),
+            upload_progress: progress, committed_index: index.clone(),
+            backfill_state: load_backfill_state(&support), backfill_pending: true,
+            replay_generation: "replay".into(), legacy_reconciliation_pending: BTreeSet::new(), active_legacy_reconciliation: BTreeSet::new(), scan: None,
+        };
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        finish_sync_source(
+            preparation,
+            index,
+            scan,
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            &root,
+            &support,
+            &daemon,
+            &mut transport,
+            &mut retry,
+        )
+        .unwrap();
+        let backfill = load_backfill_state(&support);
+        let pending = pending_backfill_sources_for_destination(&backfill, &destination)
             .contains(&SnapshotSource::Codex);
-        assert!(!pending);
+        assert!(
+            !pending,
+            "production finish persisted the completed backfill"
+        );
+        assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_some());
+        index = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["archives"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
         let fp = "a".repeat(64);
-        let mut progress = SnapshotUploadProgress::new("c".repeat(64), test_quarantine_witness());
+        let mut progress =
+            SnapshotUploadProgress::load(&progress_path, &destination, test_quarantine_witness())
+                .unwrap();
         for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
             progress.quarantine([fp.as_str()]);
         }
@@ -12941,7 +13019,19 @@ mod tests {
             None,
         );
         assert!(progress.active_quarantine_retries.contains(&fp));
-        std::fs::remove_dir_all(root).unwrap();
+        let requests = captured.lock().unwrap();
+        let terminal = requests
+            .iter()
+            .map(|r| http_request_json(r))
+            .find(|v| v.get("last_ownership_incomplete_file_count").is_some())
+            .unwrap();
+        assert!(
+            terminal["last_ownership_incomplete_file_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(terminal.get("manifest").is_some());
     }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]

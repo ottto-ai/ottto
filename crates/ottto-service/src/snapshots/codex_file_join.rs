@@ -375,7 +375,7 @@ pub(super) struct HeaderInventory {
     cache_pruned: bool,
     pub(super) archive_complete: bool,
     plain_finished: bool,
-    archive_checks: [std::cell::OnceCell<Option<CodexZstCause>>; 3],
+    archive_coverage: std::cell::OnceCell<bool>,
     pub(super) archive_headers: Vec<HeaderWitness>,
     archive_pending: VecDeque<PathBuf>,
     /// Roster files whose first record was refused, each with the metadata
@@ -423,7 +423,7 @@ impl HeaderInventory {
             cache_pruned: false,
             archive_complete: true,
             plain_finished: false,
-            archive_checks: Default::default(),
+            archive_coverage: Default::default(),
             archive_headers: Vec::new(),
             archive_pending: paths
                 .iter()
@@ -448,31 +448,31 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
-    /// One scope check per reservation/read/publication boundary, shared by
-    /// every archive. Directory homes are validated once within that check.
-    pub(super) fn archive_scope(
-        &self,
-        index: &ScanIndex,
-        boundary: usize,
-    ) -> Result<(), CodexZstCause> {
-        let cause = *self.archive_checks[boundary].get_or_init(|| {
-            if !codex_counting_version::absence_coverage_complete(index, self) {
-                return Some(CodexZstCause::OwnerUnproven);
-            }
-            let valid = self.archive_complete
-                && self.content_unchanged()
-                && self.archives_unchanged()
-                && self
-                    .headers
-                    .iter()
-                    .chain(&self.archive_headers)
-                    .map(|h| &h.home)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .all(|home| self.directories.validate(home).is_ok());
-            (!valid).then_some(CodexZstCause::AdmissionRefused)
-        });
-        cause.map_or(Ok(()), Err)
+    /// Only immutable inventory coverage is shared. Live witnesses are checked
+    /// afresh for each archive's reservation, admission and publication.
+    pub(super) fn archive_scope(&self, index: &ScanIndex) -> Result<(), CodexZstCause> {
+        if !*self
+            .archive_coverage
+            .get_or_init(|| codex_counting_version::absence_coverage_complete(index, self))
+        {
+            return Err(CodexZstCause::OwnerUnproven);
+        }
+        let valid = self.archive_complete
+            && self.content_unchanged()
+            && self.archives_unchanged()
+            && self
+                .headers
+                .iter()
+                .chain(&self.archive_headers)
+                .map(|h| &h.home)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .all(|home| self.directories.validate(home).is_ok());
+        if valid {
+            Ok(())
+        } else {
+            Err(CodexZstCause::AdmissionRefused)
+        }
     }
     pub(super) fn archives_unchanged(&self) -> bool {
         self.archive_headers.iter().all(|h| {
@@ -509,6 +509,19 @@ impl HeaderInventory {
         index.archive_pass.started |= !self.archive_pending.is_empty();
         if !index.archive_pass.headers_prepared {
             index.archive_pass.headers_prepared = true;
+            let gone: Vec<_> = index
+                .archives
+                .keys()
+                .filter(|key| {
+                    Path::new(key).is_absolute()
+                        && fs::symlink_metadata(key)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                })
+                .cloned()
+                .collect();
+            for key in gone {
+                index.archive_transition(Path::new(&key), ArchiveTransition::Gone);
+            }
             // One durable batch for bounded inventory work, independent from Full.
             if index.archive_pass.ready(1) {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
@@ -519,7 +532,8 @@ impl HeaderInventory {
                                 a.disposition,
                                 ArchiveDisposition::HeaderValidated
                                     | ArchiveDisposition::Held {
-                                        cause: CodexZstCause::AdmissionRefused
+                                        cause: CodexZstCause::AdmissionRefused,
+                                        ..
                                     }
                             )
                     }) {
@@ -535,6 +549,13 @@ impl HeaderInventory {
                             {
                                 index.archives.insert(key.clone(), a);
                             }
+                            if index
+                                .archives
+                                .get(&key)
+                                .is_some_and(|a| a.quiet_disposition())
+                            {
+                                continue;
+                            }
                             if let Some(w) =
                                 index.archives.get_mut(&key).and_then(|a| a.work.as_mut())
                             {
@@ -544,8 +565,7 @@ impl HeaderInventory {
                                     w.header_attempts = w.header_attempts.saturating_add(1);
                                     w.header_retry_after =
                                         sampled_scan::now_seconds().saturating_add(21600);
-                                    w.save_pending = true;
-                                    w.reservation_saved = false;
+                                    w.reservation = ArchiveReservation::HeaderSave;
                                     index.archive_pass.dirty = true;
                                 }
                             }
@@ -641,7 +661,19 @@ impl HeaderInventory {
             self.archive_pending.pop_front();
             match result {
                 Ok(Some(h)) => self.archive_headers.push(h),
-                _ => self.archive_complete = false,
+                Err(error) => {
+                    let change = if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        ArchiveTransition::Gone
+                    } else {
+                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                    };
+                    index.archive_transition(&path, change);
+                    self.archive_complete = false;
+                }
+                Ok(None) => self.archive_complete = false,
             }
             if !settled {
                 return false;
@@ -844,7 +876,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, plain_finished, archive_checks, archive_complete, archive_headers, archive_pending, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, plain_finished, archive_coverage, archive_complete, archive_headers, archive_pending, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

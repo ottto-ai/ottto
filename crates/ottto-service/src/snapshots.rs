@@ -218,8 +218,8 @@ use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState}
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
 };
-use codex_compressed_input::ArchiveDisposition;
 use codex_compressed_input::{is_compressed_codex_rollout, refuse_compressed_codex, OpenedInput};
+use codex_compressed_input::{ArchiveDisposition, ArchiveReservation, ArchiveTransition};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
@@ -27420,7 +27420,7 @@ impl OwnedSourceScan {
                     index.archive_pass.headers_prepared = false;
                     for a in index.archives.values_mut() {
                         if let Some(w) = a.work.as_mut() {
-                            w.reserved = false;
+                            w.reservation = ArchiveReservation::None;
                         }
                     }
                 }
@@ -28156,6 +28156,17 @@ impl OwnedSourceScan {
                         !grouped_paths.contains(&local_index_key(&candidate.path))
                     });
                     if !inventory.complete {
+                        identified_candidates.retain(|candidate| {
+                            if codex_archive_path(&candidate.path) {
+                                index.archive_transition(
+                                    &candidate.path,
+                                    ArchiveTransition::Correctness(CodexZstCause::OwnerUnproven),
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        });
                         census.record_unreadable(UnreadableCause::AliasParser, 1);
                         census.ownership_incomplete_file_count += identified_candidates.len();
                         census
@@ -28916,16 +28927,6 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                if active.parser.reader.reader.is_compressed() && !index.archive_pass.ready(1) {
-                    for a in index.archives.values_mut() {
-                        if a.work.as_ref().is_some_and(|w| w.reserved && !w.decoded) {
-                            a.cancel_reservation();
-                        }
-                    }
-                    index.archive_hold(&active.candidate.path, CodexZstCause::AdmissionRefused);
-                    active.parser.reader.reader.close();
-                    pending!();
-                }
                 let before_body_read = active.parser.reader.consumed_bytes();
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active, &roots);
@@ -29174,7 +29175,14 @@ impl OwnedSourceScan {
                             } else {
                                 CodexZstCause::AdmissionRefused
                             };
-                            index.archive_hold(&active.candidate.path, cause);
+                            index.archive_transition(
+                                &active.candidate.path,
+                                if cause == CodexZstCause::DecodeFailed {
+                                    ArchiveTransition::Structural(cause)
+                                } else {
+                                    ArchiveTransition::Transient(cause)
+                                },
+                            );
                             active.parser.reader.reader.close();
                             pending!();
                         }
@@ -29254,6 +29262,14 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(()) => {
+                            if codex_archive_path(&active.candidate.path) {
+                                index.archive_transition(
+                                    &active.candidate.path,
+                                    ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+                                );
+                                active.parser.reader.reader.close();
+                                pending!();
+                            }
                             if source == SnapshotSource::ClaudeCode {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
@@ -29762,7 +29778,10 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(_) if codex_archive_path(&candidate.path) => {
-                            index.archive_hold(&candidate.path, CodexZstCause::OutputHeld);
+                            index.archive_transition(
+                                &candidate.path,
+                                ArchiveTransition::Structural(CodexZstCause::OutputHeld),
+                            );
                             parser.reader.reader.close();
                             pending!();
                         }
@@ -29803,7 +29822,10 @@ impl OwnedSourceScan {
                         > codex_file_join::MAX_RECEIPT_BYTES
                 {
                     if codex_archive_path(&candidate.path) {
-                        index.archive_hold(&candidate.path, CodexZstCause::AdmissionRefused);
+                        index.archive_transition(
+                            &candidate.path,
+                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+                        );
                         parser.reader.reader.close();
                         pending!();
                     }
@@ -30285,9 +30307,9 @@ impl OwnedSourceScan {
                         }
                         pending!();
                     }
-                    Err(_error) => {
+                    Err(error) => {
                         #[cfg(test)]
-                        sampled_scan::test_hooks::record_finish_error(&_error);
+                        sampled_scan::test_hooks::record_finish_error(&error);
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::invalidate_claude_request_census(
                                 index,
@@ -30300,7 +30322,14 @@ impl OwnedSourceScan {
                             } else {
                                 CodexZstCause::AdmissionRefused
                             };
-                            index.archive_hold(&candidate.path, cause);
+                            index.archive_transition(
+                                &candidate.path,
+                                if cause == CodexZstCause::DecodeFailed {
+                                    ArchiveTransition::Structural(cause)
+                                } else {
+                                    ArchiveTransition::Transient(cause)
+                                },
+                            );
                             pending!();
                         }
                         census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
@@ -32673,6 +32702,21 @@ impl OwnedSourceScan {
                     counters.tombstone_hits = counters.tombstone_hits.saturating_add(1);
                 });
             }
+            if codex_archive_path(&candidate.path) {
+                let key = local_index_key(&candidate.path);
+                if index.archives.get(&key).is_some_and(|a| {
+                    a.quiet_disposition()
+                        && !a.ready_full()
+                        && fs::symlink_metadata(&candidate.path)
+                            .and_then(crate::transcript_acquisition::FileStamp::capture)
+                            .is_ok_and(|stamp| {
+                                a.stamp.as_ref().is_some_and(|old| old.same_content(&stamp))
+                            })
+                }) {
+                    index.archive_transition(&candidate.path, ArchiveTransition::Quiet);
+                    pending!();
+                }
+            }
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -32684,6 +32728,13 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(()) => {
+                        if codex_archive_path(&candidate.path) {
+                            index.archive_transition(
+                                &candidate.path,
+                                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+                            );
+                            pending!();
+                        }
                         census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                         pending!();
                     }
@@ -32739,7 +32790,15 @@ impl OwnedSourceScan {
                 )
             else {
                 if archive_candidate {
-                    index.archive_hold(Path::new(&rescue_key), CodexZstCause::AdmissionRefused);
+                    let path = Path::new(&rescue_key);
+                    let change = if fs::symlink_metadata(path)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        ArchiveTransition::Gone
+                    } else {
+                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                    };
+                    index.archive_transition(path, change);
                 }
                 if verification_rescue && !failed_open_retry && !open_parked {
                     sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
@@ -33566,18 +33625,12 @@ impl OwnedSourceScan {
                         );
                     }
                     if codex_archive_path(&candidate.path) {
-                        if error
-                            .downcast_ref::<codex_compressed_input::ArchiveAdmissionYield>()
-                            .is_some()
-                        {
-                            if let Some(a) =
-                                index.archives.get_mut(&local_index_key(&candidate.path))
-                            {
-                                a.cancel_reservation();
-                            }
+                        let change = if codex_compressed_input::structural_read_error(&error) {
+                            ArchiveTransition::Structural(CodexZstCause::DecodeFailed)
                         } else {
-                            index.archive_hold(&candidate.path, CodexZstCause::DecodeFailed);
-                        }
+                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                        };
+                        index.archive_transition(&candidate.path, change);
                         pending!();
                     }
                     census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
@@ -44304,6 +44357,17 @@ fn advance_bounded_directory_traversal_with_budget(
             let path = entry.path();
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
+                Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
+                    index.archive_transition(
+                        &path,
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            ArchiveTransition::Gone
+                        } else {
+                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                        },
+                    );
+                    continue;
+                }
                 Err(_) => {
                     traversal
                         .counts
@@ -44339,8 +44403,15 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
-                Err(_) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    index.archive_unavailable(&path);
+                Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
+                    index.archive_transition(
+                        &path,
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            ArchiveTransition::Gone
+                        } else {
+                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                        },
+                    );
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -44540,8 +44611,15 @@ fn candidate_from_traversal_path_at(
 ) -> Option<CandidateFile> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
-        Err(_) if source == SnapshotSource::Codex && codex_archive_path(&pending.path) => {
-            discovery.index.archive_unavailable(&pending.path);
+        Err(error) if source == SnapshotSource::Codex && codex_archive_path(&pending.path) => {
+            discovery.index.archive_transition(
+                &pending.path,
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ArchiveTransition::Gone
+                } else {
+                    ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+                },
+            );
             return None;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -45362,23 +45440,6 @@ fn open_and_identify_scan_candidate_with_rescue_at(
             .insert(local_index_key(&candidate.path));
         census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
         return None;
-    }
-    if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
-        let key = local_index_key(&candidate.path);
-        if let Some(a) = retention.archives.get(&key) {
-            if fs::symlink_metadata(&candidate.path)
-                .ok()
-                .filter(|m| m.is_file() && !m.file_type().is_symlink())
-                .and_then(|m| crate::transcript_acquisition::FileStamp::capture(m).ok())
-                .is_some_and(|stamp| {
-                    a.stamp.as_ref().is_some_and(|old| old.same_content(&stamp))
-                        && a.quiet_disposition()
-                        && !a.ready_full()
-                })
-            {
-                return None;
-            }
-        }
     }
     let opened = open_candidate_file_stat_retained(
         source,
