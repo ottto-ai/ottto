@@ -200,10 +200,7 @@ impl OriginalProgress {
     pub(super) fn capture(index_path: &Path) -> Result<Self> {
         let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
             .context("state_v2_original_progress_binding")?;
-        require(
-            binding.source == super::super::scan_index_persistence::Source::Claude,
-            "source",
-        )?;
+        require(v2_on(binding.source), "source")?;
         let mut original = Self {
             index_path: index_path.to_owned(),
             namespace: binding.namespace_hash,
@@ -644,10 +641,7 @@ impl ProgressRecovery {
             identity.format == FORMAT && generation >= identity.fence_generation,
             "generation",
         )?;
-        require(
-            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
-            "source",
-        )?;
+        require(v2_on(identity.binding.source), "source")?;
         let recovery = Self {
             scope: Scope {
                 identity,

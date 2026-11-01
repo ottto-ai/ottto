@@ -711,9 +711,7 @@ pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 /// MUST stay in lockstep with the backend pricing catalog's
 /// `context_bucket_threshold_tokens` for the 1M-capable Claude models and the
 /// cost projector's `_derive_context_bucket`, which honors this daemon-supplied
-/// bucket ahead of its own (request_count==1-gated) derivation. See
-/// coding-agents-observability backend/app/services/telemetry_cost_projector.py
-/// and backend/app/domain/pricing/selector_context.py.
+/// bucket ahead of its own (request_count==1-gated) derivation.
 pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 
 /// How a model's price line bills a request over it.
@@ -2053,9 +2051,9 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only, copy-prefix switch on (X-B1, Lead B
-    /// 2026-10-31): the row's accepted proof was copy-derived and is
-    /// tombstoned; a retaining receiver drops that proof for good. Like
+    /// Wire contract 5, bucket rows only, copy-prefix switch on: the row's
+    /// accepted proof was copy-derived and is tombstoned; a retaining receiver
+    /// drops that proof for good. Like
     /// `identity_retained`, only sent when the server advertised option (ii)
     /// and hashed in the identity leaf. Omitted when false, so switch-off
     /// bytes are unchanged.
@@ -2119,7 +2117,7 @@ pub struct SnapshotRequestEvidence {
 /// Missing/null/unknown keeps existing wire bytes for every source.
 pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
 
-/// How a carried account reached a request (SOURCE 2026-10-31, class N).
+/// How a carried account reached a request (counts only).
 /// Shared wire shape for source reducers; unmarked provenance stays absent.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -2391,7 +2389,7 @@ struct ClaudeFullRearmProgress {
     /// skip stays vetoed until one runs or the fence opens.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     first_proof_hold_since_full_rearm: bool,
-    /// Option A (SOURCE 2026-10-27): root digests of the families whose local
+    /// Root digests of the families whose local
     /// holds stamped `CompletedBlockingHolds` in this sweep, at most
     /// `MAX_SCOPED_HELD_FAMILY_ROOTS`. `Some` only while every stamp of the
     /// sweep flag named its held families; read only through
@@ -2399,7 +2397,7 @@ struct ClaudeFullRearmProgress {
     /// loads `None`, which keeps the sweep-wide unchanged-proof veto.
     #[serde(skip_serializing_if = "Option::is_none")]
     held_family_roots: Option<BTreeSet<String>>,
-    /// Lead A ruling (a): the `""` cutover's latch re-arms at one terminal.
+    /// The `""` cutover's latch re-arms at one terminal.
     #[serde(skip_serializing_if = "is_zero_u8")]
     contract_cutover: u8,
 }
@@ -4088,14 +4086,13 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
-    /// #851's Desktop store inventory, decoded and ignored. Nothing reads it and
-    /// no save writes it: like any unknown key it is gone after the next save,
-    /// so a stale digest cannot vouch for a census that never saw its stores.
-    /// Registered so sharded metadata carrying it loads. Appended to preserve
-    /// every older positional index slot.
+    /// Inventory fence for the Desktop pagination cursor, never identity proof.
+    /// The version prefix rejects #851's legacy digest; an absent/mismatched
+    /// fence restarts discovery before any census can certify completeness.
+    /// Reuses the existing appended positional slot.
     #[serde(
         default,
-        skip_serializing,
+        skip_serializing_if = "claude_desktop_store_inventory_is_legacy",
         deserialize_with = "deserialize_lenient_default"
     )]
     claude_desktop_store_inventory: Option<String>,
@@ -4103,7 +4100,7 @@ pub struct ScanIndex {
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
     /// it. Only an empty undamaged store is never written, so an absent field
-    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// is an empty store; damaged metadata stays uncertain until
     /// the current proof decides.
     #[serde(
         default,
@@ -5301,7 +5298,7 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
-    /// SOURCE 2026-10-31 (#944 xPR F5): the copy-derived accepted rows this
+    /// Copy-derived rows (#944): the accepted rows this
     /// pass's bodies treat as never accepted. The sync loop tombstones them
     /// through `AcceptedBuckets` and saves before any upload.
     pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
@@ -5458,7 +5455,7 @@ impl ClaudeUsageAuthorityDisposition {
             .collect()
     }
 
-    /// Option A: every Claude family a held entity of this page could count
+    /// Every Claude family a held entity of this page could count
     /// under, as raw roots: the entity's own root, the path root of each index
     /// key that names its revision, and the root of every authority record
     /// that already binds it as a member. A family named here only keeps its
@@ -7312,7 +7309,7 @@ const CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL: &str = "changed_wi
 // Existing contract field records that E2 already armed paced revision debt
 // during this traversal. It cannot clear the contract latch at its terminal.
 const CLAUDE_E2_IDENTITY_ADOPTION_PENDING: &str = "e2_identity_adoption_pending";
-// Lead A ruling (a) cutover states; spent keeps the cutover's latch inert.
+// Cutover states; spent keeps the cutover's latch inert.
 const CLAUDE_CONTRACT_CUTOVER_OWED: u8 = 1;
 const CLAUDE_CONTRACT_CUTOVER_SPENT: u8 = 2;
 const CLAUDE_CONTRACT_CUTOVER_REAL: u8 = 3;
@@ -10412,7 +10409,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 .claude_full_rearm_progress
                 .first_proof_hold_since_full_rearm;
         let stays_closed = overflowed_before && index.claude_duplicate_request_witness_overflowed;
-        // Lead A ruling (a): the cutover's latch re-arms at one terminal under
+        // The cutover's latch re-arms at one terminal under
         // the recorded contract; its baseline carries over (no full re-arm).
         let cutover = index.claude_full_rearm_progress.contract_cutover;
         let contract = claude_request_identity::cycle_contract(identity.is_some());
@@ -10621,7 +10618,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // and the accepted ledger is current and not being rebuilt. Authority
         // debt alone does not unsettle the sweep; `claude_unchanged_proof_roots`
         // still excludes every quarantined or demoting root.
-        // Option A: when the sweep's only unsettled cause is scoped
+        // When the sweep's only unsettled cause is scoped
         // `CompletedBlockingHolds`, only the held families lose the skip below;
         // they stay held, re-offered and unproven residue. Any other cause, or
         // a stamp that could not name its families, keeps the sweep-wide veto.
@@ -16959,27 +16956,54 @@ impl ClaudeTitleMetadata {
         identity_capture: bool,
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
-        for root in roots {
-            // root is `<home>/.claude/projects`; the desktop store lives under
-            // `<home>/Library/Application Support/Claude/claude-code-sessions`.
-            let Some(home) = root.parent().and_then(Path::parent) else {
-                continue;
-            };
-            store_dirs.insert(
-                home.join("Library")
-                    .join("Application Support")
-                    .join("Claude")
-                    .join("claude-code-sessions"),
+        let mut census = ClaudeDesktopStoreCensus::default();
+        let homes = roots
+            .iter()
+            .filter_map(|root| root.parent().and_then(Path::parent))
+            .collect::<BTreeSet<_>>();
+        for home in homes {
+            let discovery = crate::claude_desktop::discover_support_roots(home);
+            census.profile_read_count += discovery.roots.len();
+            census.profile_discovery_incomplete_count +=
+                usize::from(discovery.capped || discovery.error);
+            store_dirs.extend(
+                discovery
+                    .roots
+                    .into_iter()
+                    .map(|root| root.join("claude-code-sessions")),
             );
         }
-        Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at, identity_capture)
+        Self::load_from_store_dirs_with_census(
+            &store_dirs,
+            index,
+            collected_at,
+            identity_capture,
+            census,
+        )
     }
 
+    #[cfg(test)]
     fn load_from_store_dirs_with_index(
         store_dirs: &BTreeSet<PathBuf>,
         index: &mut ScanIndex,
         collected_at: &str,
         identity_capture: bool,
+    ) -> Self {
+        Self::load_from_store_dirs_with_census(
+            store_dirs,
+            index,
+            collected_at,
+            identity_capture,
+            ClaudeDesktopStoreCensus::default(),
+        )
+    }
+
+    fn load_from_store_dirs_with_census(
+        store_dirs: &BTreeSet<PathBuf>,
+        index: &mut ScanIndex,
+        collected_at: &str,
+        identity_capture: bool,
+        mut census: ClaudeDesktopStoreCensus,
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
         let retry_due = match (
@@ -17003,7 +17027,40 @@ impl ClaudeTitleMetadata {
         } else {
             index.claude_desktop_census_witness = None;
         }
+        // Keep the existing 64-byte inventory decoder boundary. The non-hex
+        // version marker distinguishes this 248-bit cursor fence from #851's
+        // legacy SHA-256 digest. This is never account/identity proof.
+        let mut inventory = claude_request_identity::inventory_digest(store_dirs);
+        inventory.replace_range(..2, "p1");
+        if index.claude_desktop_store_inventory.as_ref() != Some(&inventory) {
+            // A retained completion witness already binds a legacy cursor to
+            // these same stores. Preserve that established healthy refresh.
+            let witnessed_inventory = index.claude_desktop_store_inventory.is_none()
+                && index.claude_desktop_census_witness.is_some();
+            index.claude_desktop_store_inventory = Some(inventory);
+            if !witnessed_inventory {
+                census.inventory_sweep_restart_count += 1;
+                index.claude_desktop_store_cursor = None;
+                index.claude_desktop_store_upper_bound = None;
+                index.claude_desktop_store_sweep_had_errors = false;
+                index.claude_desktop_identity_census_complete = false;
+                index.claude_desktop_lineage_census_complete = false;
+                index.claude_desktop_census_witness = None;
+            }
+        }
+        // A newly discovered profile may hold a conflicting copy. Until the
+        // whole inventory is read, an old census cannot prove uniqueness.
+        if census.has_errors() {
+            index.claude_desktop_identity_census_complete = false;
+            index.claude_desktop_lineage_census_complete = false;
+            index.claude_desktop_census_witness = None;
+        }
         if !retry_due {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_desktop_store_deferred_alarm",
+                "claude_code",
+                &census,
+            );
             return Self::from_durable_index_with_metadata(
                 index,
                 Self {
@@ -17021,7 +17078,6 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_store_upper_bound.clone(),
             MAX_CLAUDE_DESKTOP_SESSION_FILES,
         );
-        let mut census = ClaudeDesktopStoreCensus::default();
         let mut remaining_entries = MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN;
         for (position, dir) in store_dirs.iter().enumerate() {
             collect_claude_desktop_session_files(
@@ -17040,6 +17096,19 @@ impl ClaudeTitleMetadata {
         }
         let (session_files, sweep_complete, next_cursor, next_upper_bound) =
             selection.finish(census.discovered_file_count);
+        // The retained store entries already record which profile sources were
+        // read. Count a profile once when its first valid session is acquired;
+        // later refreshes are not new-source reads. No new persistent registry.
+        let mut new_profiles = store_dirs
+            .iter()
+            .filter(|dir| {
+                !index
+                    .claude_desktop_title_files
+                    .keys()
+                    .any(|path| Path::new(path).starts_with(dir))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut original_identity_changed = false;
         let mut lineage_changed = false;
         for path in &session_files {
@@ -17055,6 +17124,14 @@ impl ClaudeTitleMetadata {
                 original_identity,
             ) {
                 Ok(Some(entry)) => {
+                    if let Some(profile) = new_profiles
+                        .iter()
+                        .find(|dir| path.starts_with(dir))
+                        .cloned()
+                    {
+                        new_profiles.remove(&profile);
+                        census.profile_new_source_read_count += 1;
+                    }
                     let previous = index.claude_desktop_title_files.get(&local_index_key(path));
                     original_identity_changed |= previous.map_or(true, |previous| {
                         previous.cli_session_id != entry.cli_session_id
@@ -17142,6 +17219,15 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_store_retry_not_before_unix_seconds = None;
         }
 
+        crate::local_resource_diagnostics::traversal_point(
+            if metadata.sidecar_census_incomplete {
+                "claude_desktop_store_deferred_alarm"
+            } else {
+                "claude_desktop_store_census"
+            },
+            "claude_code",
+            &census,
+        );
         Self::from_durable_index_with_metadata(index, metadata)
     }
 
@@ -17503,20 +17589,33 @@ fn read_claude_transcript_live_window(
     Ok((metadata, window))
 }
 
-#[derive(Debug, Default)]
+fn claude_desktop_store_inventory_is_legacy(inventory: &Option<String>) -> bool {
+    inventory
+        .as_deref()
+        .map_or(true, |value| value.len() != 64 || !value.starts_with("p1"))
+}
+
+#[derive(Debug, Default, Serialize)]
 struct ClaudeDesktopStoreCensus {
+    profile_read_count: usize,
+    profile_new_source_read_count: usize,
+    store_found_count: usize,
+    inventory_sweep_restart_count: usize,
+    profile_discovery_incomplete_count: usize,
     discovered_file_count: usize,
     unreadable_path_count: usize,
     symlink_rejected_count: usize,
     depth_exceeded_count: usize,
     invalid_file_count: usize,
     entry_budget_exceeded_count: usize,
+    #[serde(skip)]
     observed_paths: BTreeSet<String>,
 }
 
 impl ClaudeDesktopStoreCensus {
     fn has_errors(&self) -> bool {
-        self.unreadable_path_count > 0
+        self.profile_discovery_incomplete_count > 0
+            || self.unreadable_path_count > 0
             || self.symlink_rejected_count > 0
             || self.depth_exceeded_count > 0
             || self.invalid_file_count > 0
@@ -17610,6 +17709,9 @@ fn collect_claude_desktop_session_files(
             return;
         }
     };
+    if depth == 0 {
+        census.store_found_count += 1;
+    }
     for entry in entries {
         if *remaining_entries == 0 {
             census.entry_budget_exceeded_count += 1;
@@ -41111,7 +41213,7 @@ impl CodexTitleMetadata {
         );
     }
 
-    /// E2 B3b (Lead B, 2026-10-31): a failed created-thread census holds only
+    /// A failed created-thread census holds only
     /// rollouts whose proof could depend on a failing home's state database.
     fn created_thread_census_incomplete_for(&self, path: &Path) -> bool {
         !self.created_thread_census_failed_homes.is_empty()
@@ -41916,7 +42018,7 @@ fn record_codex_identity_key(
     key
 }
 
-/// Bounded retries of a transient sidecar open: on Ron's M4 (2026-10-31)
+/// Bounded retries of a transient sidecar open: on a real install (2026-10-31)
 /// `~/.codex/state_5.sqlite` failed SQLITE_CANTOPEN at its first prepare on 11
 /// of 175 Codex pages while Codex itself kept it open. BUSY at the open's
 /// schema probe, which never waits, is retried too: it usually means Codex
@@ -46748,7 +46850,7 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
-                        // Lead B Addendum 4 (option 1): a body whose owner
+                        // A body whose owner
                         // account this scan cleared for a non-discard unhealthy
                         // read uploads Unknown now; the owner is never rewritten.
                         (Some(owner), None)
@@ -47731,7 +47833,7 @@ impl ScanIndex {
             return;
         }
         use claude_request_identity::{COLLECTOR, E2_GROUPING};
-        // Lead A ruling (a): the first cutover from `""` owes one re-arm; once
+        // The first cutover from `""` owes one re-arm; once
         // spent, only a real contract-to-contract change re-arms again.
         let cutover = &mut self.claude_full_rearm_progress.contract_cutover;
         *cutover = match (*cutover, self.claude_request_identity_contract.as_deref()) {
@@ -74454,6 +74556,258 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    /// [money] ALT-only identity and conflicting profile copies preserve every token.
+    #[test]
+    fn claude_desktop_all_profiles_identity_preserves_money_and_refuses_conflicts() {
+        let session = "11111111-2222-3333-4444-555555555555";
+        let account = "123e4567-e89b-12d3-a456-426614174000";
+        let org = "123e4567-e89b-12d3-a456-426614174001";
+        let desktop = json!({"cliSessionId": session, "createdAt": "2026-07-10T10:00:00Z"});
+        let transcript = json!({"timestamp": "2026-07-10T10:01:00Z", "type": "assistant",
+            "sessionId": session, "entrypoint": "claude-desktop", "requestId": "request-1",
+            "message": {"id": "message-1", "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 35, "output_tokens": 8}}});
+        let (home, path, projects) = claude_desktop_fixture(
+            "desktop-all-profiles-money",
+            session,
+            &desktop.to_string(),
+            &format!("{transcript}\n"),
+        );
+        let support = home.join("Library/Application Support");
+        let alt = support.join("Claude-ALT");
+        let bucket = alt.join("claude-code-sessions").join(account).join(org);
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(alt.join("config.json"), "{}").unwrap();
+        fs::rename(
+            support.join("Claude/claude-code-sessions/account-ctx/workspace/local_desktop-1.json"),
+            bucket.join("local_alt.json"),
+        )
+        .unwrap();
+        let untagged = parse_claude_code_jsonl_file_with_title_metadata(
+            &path,
+            "2026-07-10T10:04:00Z",
+            "fp".into(),
+            &ClaudeTitleMetadata::default(),
+            true,
+        )
+        .unwrap()
+        .remove(0);
+        let expected = ottto_core::billing_identity_hash("anthropic", "account", account).unwrap();
+        for conflict in [false, true] {
+            if conflict {
+                let other = support
+                    .join("Claude/claude-code-sessions")
+                    .join("123e4567-e89b-12d3-a456-426614174002")
+                    .join(org);
+                fs::create_dir_all(&other).unwrap();
+                fs::write(other.join("local_conflict.json"), desktop.to_string()).unwrap();
+            }
+            let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects));
+            assert_eq!(
+                metadata
+                    .session_account_evidence(session)
+                    .identity_disposition,
+                Some(if conflict { "conflict" } else { "complete" })
+            );
+            let item = parse_claude_code_jsonl_file_with_title_metadata(
+                &path,
+                "2026-07-10T10:04:00Z",
+                "fp".into(),
+                &metadata,
+                true,
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                (item.input_tokens, item.output_tokens, item.request_count),
+                (35, 8, 1)
+            );
+            assert_eq!(
+                usage_totals_from_item(&item),
+                usage_totals_from_item(&untagged)
+            );
+            assert!(!item.model_usage.is_empty());
+            assert!(item
+                .model_usage
+                .iter()
+                .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+                .all(|row| row.account_identifier_hash.as_deref()
+                    == (!conflict).then_some(expected.as_str())));
+            let mut rows = item.model_usage;
+            for row in &mut rows {
+                row.account_identifier_hash = None;
+            }
+            assert_eq!(
+                serde_json::to_value(rows).unwrap(),
+                serde_json::to_value(&untagged.model_usage).unwrap()
+            );
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// [regress] The session reader skipped configured sibling Desktop profiles.
+    #[test]
+    fn claude_desktop_all_profiles_reuses_discovery_and_defers_incomplete_inventory() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-all-profiles-discovery");
+        let support = home.join("Library/Application Support");
+        let projects = home.join(".claude/projects");
+        for profile in ["Claude", "Claude-ALT", "Claude-B", "Claude-unconfigured"] {
+            let root = support.join(profile);
+            let bucket = root
+                .join("claude-code-sessions")
+                .join("123e4567-e89b-12d3-a456-426614174000")
+                .join("123e4567-e89b-12d3-a456-426614174001");
+            fs::create_dir_all(&bucket).unwrap();
+            if profile != "Claude-unconfigured" {
+                fs::write(root.join("config.json"), "{}").unwrap();
+            }
+            fs::write(
+                bucket.join("local.json"),
+                json!({"cliSessionId": profile}).to_string(),
+            )
+            .unwrap();
+        }
+        let mut index = ScanIndex::default();
+        let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            true,
+        );
+        for root in crate::claude_desktop::discover_support_roots(&home).roots {
+            let session = root.file_name().unwrap().to_str().unwrap();
+            assert_eq!(
+                metadata
+                    .session_account_evidence(session)
+                    .identity_disposition,
+                Some("complete")
+            );
+        }
+        assert!(!metadata
+            .original_identity_evidence
+            .contains_key("Claude-unconfigured"));
+        // Existing byte bounds must defer the census, retain prior evidence and
+        // keep it incomplete during backoff, rather than silently omit a file.
+        let oversized = support.join("Claude-ALT/claude-code-sessions/oversized.json");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES + 1)
+            .unwrap();
+        for at in ["2026-07-10T10:05:00Z", "2026-07-10T10:05:01Z"] {
+            let deferred = ClaudeTitleMetadata::load_from_roots_with_index(
+                std::slice::from_ref(&projects),
+                &mut index,
+                at,
+                true,
+            );
+            assert!(deferred.original_identity_census_incomplete);
+            assert_eq!(
+                deferred
+                    .session_account_evidence("Claude-ALT")
+                    .identity_disposition,
+                Some("missing")
+            );
+            assert!(deferred
+                .original_identity_evidence
+                .contains_key("Claude-ALT"));
+            assert!(index.claude_desktop_census_witness.is_none());
+        }
+    }
+
+    /// [behaviour] A new profile restarts a paged census even before its first witness.
+    #[test]
+    fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-profile-pagination");
+        let support = home.join("Library/Application Support");
+        let projects = home.join(".claude/projects");
+        let org = "123e4567-e89b-12d3-a456-426614174001";
+        let bucket = support
+            .join("Claude/claude-code-sessions")
+            .join("123e4567-e89b-12d3-a456-426614174000")
+            .join(org);
+        fs::create_dir_all(&bucket).unwrap();
+        for n in 0..=MAX_CLAUDE_DESKTOP_SESSION_FILES {
+            fs::write(
+                bucket.join(format!("{n:05}.json")),
+                r#"{"cliSessionId":"shared"}"#,
+            )
+            .unwrap();
+        }
+        let mut index = ScanIndex::default();
+        let first = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            true,
+        );
+        assert!(first.original_identity_census_incomplete);
+        assert!(index.claude_desktop_census_witness.is_none());
+        // Exercise the actual bounded production serializer and decoder.
+        let index_path = home.join("scan-index.json");
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        let complete = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:05:00Z",
+            true,
+        );
+        assert!(!complete.original_identity_census_incomplete);
+        assert_eq!(
+            complete
+                .session_account_evidence("shared")
+                .identity_disposition,
+            Some("complete")
+        );
+        let refresh = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:06:00Z",
+            true,
+        );
+        assert!(refresh.sidecar_census_incomplete);
+        // A missing completion witness must not disable the inventory fence.
+        index.claude_desktop_census_witness = None;
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        let alt = support.join("Claude-ALT");
+        let other = alt
+            .join("claude-code-sessions")
+            .join("123e4567-e89b-12d3-a456-426614174002")
+            .join(org);
+        fs::create_dir_all(&other).unwrap();
+        fs::write(alt.join("config.json"), "{}").unwrap();
+        fs::write(other.join("local.json"), r#"{"cliSessionId":"shared"}"#).unwrap();
+        let deferred = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:06:01Z",
+            true,
+        );
+        assert!(deferred.original_identity_census_incomplete);
+        assert!(index.claude_desktop_census_witness.is_none());
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        for at in ["2026-07-10T10:07:00Z", "2026-07-10T10:09:00Z"] {
+            let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
+                std::slice::from_ref(&projects),
+                &mut index,
+                at,
+                true,
+            );
+            assert_eq!(
+                metadata
+                    .session_account_evidence("shared")
+                    .identity_disposition,
+                Some("conflict")
+            );
+            assert!(metadata.account_identifier_hash("shared").is_none());
+            index.save(&index_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
+        }
+        assert!(index.claude_desktop_identity_census_complete);
+    }
+
     #[test]
     fn late_claude_desktop_account_mapping_escapes_semantic_noop_suppression() {
         let session_id = "33333333-4444-5555-6666-777777777777";
@@ -78053,7 +78407,7 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
+    /// [money] One home's created-thread census
     /// fails. A rollout whose proof comes only from another, healthy home is
     /// not held, nor is its spawned child. A rollout that might depend on two
     /// homes (a copy of its id in the failing home), its spawned descendants, one

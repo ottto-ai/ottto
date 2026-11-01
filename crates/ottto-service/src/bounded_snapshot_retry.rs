@@ -4,7 +4,7 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshot_retry::RetryBudget;
 
-/// Accepted E9-2 requested-layout evidence (Lead A ruling, 2026-10-28):
+/// Requested-layout evidence (2026-10-28):
 /// 4H for outgoing clone, selected checkpoint/restoration, ACK maps and JSON
 /// comparisons; 4 MiB auxiliary decode (8192 nodes, capped 128 KiB input);
 /// 4 MiB encoded index/request/response copies, gzip and ACK response growth;

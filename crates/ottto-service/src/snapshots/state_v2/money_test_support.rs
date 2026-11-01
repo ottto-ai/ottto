@@ -5,11 +5,23 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(super) fn binding() -> super::super::scan_index_persistence::Binding {
+use super::super::scan_index_persistence::Source;
+
+pub(super) fn binding(source: Source) -> super::super::scan_index_persistence::Binding {
     super::super::scan_index_persistence::Binding {
-        source: super::super::scan_index_persistence::Source::Claude,
+        source,
         namespace_hash: "a".repeat(64),
     }
+}
+
+/// Synthetic v1 file name that `scan_index_storage_binding` binds to `source`.
+pub(super) fn synthetic_file(source: Source, suffix: &str) -> String {
+    let slug = match source {
+        Source::Claude => "claude_code",
+        Source::Codex => "codex",
+        Source::Pi => "pi",
+    };
+    format!("{slug}-synthetic-scan-index{suffix}")
 }
 
 pub(super) fn populate(
@@ -18,18 +30,18 @@ pub(super) fn populate(
     presence: BTreeMap<String, bool>,
 ) -> sqlite::Sqlite {
     let mut db = sqlite::Sqlite::create_import(path).unwrap();
-    db.path_extractor(import::ClaudeMapper::private_paths);
-    db.reference_extractor(import::ClaudeMapper::references);
+    db.path_extractor(import::Mapper::private_paths);
+    db.reference_extractor(import::Mapper::references);
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-money-custody".into(),
-        binding: binding(),
+        binding: binding(Source::Claude),
         fence_generation: index.generation,
     };
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();
-    cx.binding = Some(binding());
+    cx.binding = Some(binding(Source::Claude));
     cx.presence = presence;
     let mut tx = db.begin(TxnMode::Write).unwrap();
     kinds::populate(index, &mut tx, &mut cx).unwrap();
@@ -41,8 +53,8 @@ pub(super) fn populate(
     // tests must operate on a completed import reopened in live WAL mode.
     db.finish_import().unwrap();
     let mut db = sqlite::Sqlite::open(path, &identity).unwrap();
-    db.path_extractor(import::ClaudeMapper::private_paths);
-    db.reference_extractor(import::ClaudeMapper::references);
+    db.path_extractor(import::Mapper::private_paths);
+    db.reference_extractor(import::Mapper::references);
     db
 }
 
@@ -75,12 +87,12 @@ pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
         BTreeMap::new(),
     );
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (previous, mut cx) = kinds::hydrate(&mut db, binding()).unwrap();
+    let (previous, mut cx) = kinds::hydrate(&mut db, binding(Source::Claude)).unwrap();
     let mut digests = kinds::baseline(&previous, &mut cx).unwrap();
     for page in pages {
         let mut expected = page.clone();
         digests = kinds::save_graph(&mut db, &identity, digests, &mut expected, &mut cx).unwrap();
-        let restored = kinds::hydrate(&mut db, binding()).unwrap().0;
+        let restored = kinds::hydrate(&mut db, binding(Source::Claude)).unwrap().0;
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
             serde_json::to_vec(&expected).unwrap()
@@ -100,10 +112,8 @@ pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
     let mut db = populate(path, index, BTreeMap::new());
-    import::ClaudeMapper.hydrate_context(&mut db).unwrap().0
+    import::Mapper.hydrate_context(&mut db).unwrap().0
 }
-
-use import::Mapper;
 
 /// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt
 /// file, with definite metadata (shared by the format and inventory tests).
@@ -120,8 +130,8 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         fence_generation: index.generation + 1,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
-    db.path_extractor(import::ClaudeMapper::private_paths);
-    db.reference_extractor(import::ClaudeMapper::references);
+    db.path_extractor(import::Mapper::private_paths);
+    db.reference_extractor(import::Mapper::references);
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();

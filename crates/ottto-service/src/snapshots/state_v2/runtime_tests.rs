@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped ClaudeMapper writes,
+//! F5–F7 route fixtures over native stores: the shipped Mapper writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
@@ -12,8 +12,8 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     states().lock().unwrap().remove(path);
 }
 
-fn load_with<M: Mapper>(path: &Path, importable: bool, mapper: &M) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, importable, mapper, published(path)?)
+fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+    load_with_custody(path, importable, published(path)?)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -170,7 +170,7 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
 fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     let before = fs::read(&f.path).unwrap();
     // An ordinary v1 owner must not prevent uninstall from reaching its
     // established cleanup, and an absent checkpoint lock must stay absent.
@@ -187,9 +187,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     assert_eq!(fs::read(&f.path).unwrap(), before);
     let live = Fixture::new();
     live.published();
-    let index = load_with(&live.path, false, &ClaudeMapper)
-        .unwrap()
-        .unwrap();
+    let index = load_with(&live.path, false).unwrap().unwrap();
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
@@ -216,7 +214,7 @@ fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
         let db = fence::sibling(&f.path, ".v2.sqlite");
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            load_with(&f.path, false, &ClaudeMapper)
+            load_with(&f.path, false)
                 .unwrap_err()
                 .downcast_ref::<Hold>(),
             Some(&Hold::FenceLost)
@@ -261,7 +259,7 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
                 .unwrap();
             assert_eq!(pair.0, f.identity());
             assert!(pair.1.exists());
-            assert!(load_with(&f.path, false, &ClaudeMapper).unwrap().is_some());
+            assert!(load_with(&f.path, false).unwrap().is_some());
             assert!(guard_containment_locked(&f.path).is_err());
         }
     }
@@ -272,7 +270,7 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
 fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());
     assert_eq!(index.generation, G + 1);
     // A fresh route must decode the missing semantic rows, never treat them as empty.
@@ -313,7 +311,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     f.published();
     // Published custody before this process's first load: v1 JSON is stale.
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Import));
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     let file = serde_json::from_value(serde_json::json!({
         "size_bytes": 4, "modified_unix_seconds": 1,
         "source_file_fingerprint": "a".repeat(64),
@@ -341,7 +339,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let held = live();
     assert!(!held.complete);
     assert_eq!(held.incomplete_reason, Some(IncompleteReason::Hold));
-    let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut retry = load_with(&f.path, false).unwrap().unwrap();
     assert!(!retry.files.contains_key("uncommitted"));
     save_with(&f.path, &mut retry).unwrap();
     let committed = live();
@@ -413,7 +411,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         assert!(!fence::sibling(&f.path, suffix).exists());
     }
     assert!(save_with(&f.path, &mut stale).is_err());
-    assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
+    assert!(load_with(&f.path, false).is_err());
 }
 /// [format] publication pending pause does not touch v1.
 #[test]
@@ -423,9 +421,9 @@ fn publication_pending_pause_does_not_touch_v1() {
     raw["future_money"] = serde_json::json!({"owed": 1});
     let bytes = serde_json::to_vec(&raw).unwrap();
     fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
+    after_v1_locked(&f.path, &mut index).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
@@ -473,7 +471,7 @@ fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
     ] {
         let f = Fixture::new();
         fs::write(&f.path, &bytes).unwrap();
-        assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
+        assert!(load_with(&f.path, false).is_err());
         assert!(guard_containment_locked(&f.path).is_err());
         assert_eq!(fs::read(&f.path).unwrap(), bytes);
     }
@@ -485,7 +483,7 @@ fn generation_and_capability_are_checked_before_external_effects() {
     for future_writer in [false, true] {
         let f = Fixture::new();
         f.published();
-        let index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let index = load_with(&f.path, false).unwrap().unwrap();
         let check = crate::snapshots::state_v2_side_effect_guard(&f.path, &index);
         check().unwrap();
         {
@@ -513,14 +511,13 @@ fn generation_and_capability_are_checked_before_external_effects() {
 fn another_graph_save_cannot_advance_a_stale_external_guard() {
     let f = Fixture::new();
     f.published();
-    let (mut first, load_events) = crate::local_resource_diagnostics::capture(|| {
-        load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap()
-    });
+    let (mut first, load_events) =
+        crate::local_resource_diagnostics::capture(|| load_with(&f.path, false).unwrap().unwrap());
     let load = &load_events.last().unwrap()["counts"]["latest"]["load_span"];
     assert!(load["duration_ms"].is_u64());
     assert_eq!(load["generation"], G);
     assert_eq!(load.as_object().unwrap().len(), 2);
-    let second = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let second = load_with(&f.path, false).unwrap().unwrap();
     let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
     stale().unwrap();
     let (saved, save_events) =
@@ -546,7 +543,7 @@ fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_h
         let f = Fixture::new();
         f.published();
         if reused {
-            load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+            load_with(&f.path, false).unwrap().unwrap();
         }
         let recovery =
             super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None)
@@ -561,10 +558,10 @@ fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_h
         // Holds the same owner lock as the production load entry point; replay
         // must not recursively acquire it through the external side-effect guard.
         let _lock = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        assert!(load_with(&f.path, false, &ClaudeMapper).unwrap().is_some());
+        assert!(load_with(&f.path, false).unwrap().is_some());
         assert_eq!(fs::read(&progress).unwrap(), next);
         fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
-        assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
+        assert!(load_with(&f.path, false).is_err());
         assert_eq!(fs::read(&progress).unwrap(), next);
         assert!(guard_containment_locked(&f.path).is_err());
     }
@@ -575,7 +572,7 @@ fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_h
 fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     index.upload_context_fingerprint = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
     index.file_upload_context_enabled = true;
@@ -621,7 +618,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         Some("active-synthetic-policy")
     );
     assert!(index.file_upload_context_enabled && index.v2().persistence_v2.is_some());
-    let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let current = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
         current.upload_context_fingerprint,
         index.upload_context_fingerprint
@@ -636,9 +633,9 @@ fn newly_adopted_import_can_save_without_an_intervening_load() {
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
     // Use the real inventory/import/publication path so import seals the
     // external progress receipt through the production mapper.
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
+    after_v1_locked(&f.path, &mut index).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
     assert_eq!(index.generation, 1);
@@ -658,9 +655,9 @@ fn import_without_original_inventory_refuses_publication() {
     let f = Fixture::new();
     let bytes = b"synthetic-v1-authority";
     fs::write(&f.path, bytes).unwrap();
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
+    after_v1_locked(&f.path, &mut index).unwrap();
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
@@ -1154,7 +1151,7 @@ mod hydrate_parity {
 fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
     with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     let error = save_with(&f.path, &mut index).unwrap_err();
@@ -1166,7 +1163,7 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
         index.generation
     )
     .is_err());
-    let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut retry = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(retry.generation, G);
     // Reopen cannot clear a failed-save upload fence.
     assert!(guard_external(
@@ -1199,12 +1196,12 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
 fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
     with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let current = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(current.generation, G);
     assert_eq!(collection_page_limit(&current, 1), 1);
     // This is the production external boundary used before uploads and ACKs.
@@ -1224,11 +1221,11 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
 fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     fill_session(&mut index);
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveFull));
-    let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut retry = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(retry.generation, G);
     let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &retry);
     assert_eq!(
@@ -1267,7 +1264,7 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
 fn store_reload_demand_outside_a_save_reopens_on_next_load() {
     let f = Fixture::new();
     f.published();
-    let index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| {
         db.control("erasure_pending", &G).unwrap();
         db.control("erasure_since", &0_u64).unwrap();
@@ -1275,7 +1272,7 @@ fn store_reload_demand_outside_a_save_reopens_on_next_load() {
         assert!(db.maintenance(true).is_err());
         assert!(db.reload_required());
     });
-    let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let reloaded = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(reloaded.generation, G);
     with_session_db(&reloaded, |db| {
         assert!(!db.reload_required());
@@ -1288,7 +1285,7 @@ fn store_reload_demand_outside_a_save_reopens_on_next_load() {
 fn unpublished_import_does_not_reorder_v1_progress_admission() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     assert!(states().lock().unwrap().contains_key(&f.path));
     assert!(!published(&f.path).unwrap());
     f.published();
@@ -1308,7 +1305,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
     raw["future_money"] = serde_json::json!({"owed": 19});
     fs::write(&f.path, serde_json::to_vec(&raw).unwrap()).unwrap();
-    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true).unwrap().is_none());
     let legacy = ScanIndex::load(&f.path).unwrap();
     assert!(legacy.persistence_available());
     assert!(legacy.v2().persistence_v2.is_none());
@@ -1392,7 +1389,11 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let before_fence = fs::read(&f.path).unwrap();
     // A held load returns no graph to collection, so it cannot authorize a Full
     // or a transcript re-read. A compatible build must recover these same bytes.
-    assert!(ScanIndex::load(&f.path).is_err());
+    let error = ScanIndex::load(&f.path).unwrap_err();
+    // A newer build's key holds as "update", not as local damage.
+    assert!(crate::snapshots::scan_index_health::is_version_refusal(
+        &error
+    ));
     assert_eq!(fs::read(&db_path).unwrap(), before_db);
     assert_eq!(fs::read(&f.path).unwrap(), before_fence);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
