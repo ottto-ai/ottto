@@ -7591,6 +7591,9 @@ pub struct ClaudeDuplicateCensusCounts {
     pub census_invalid: bool,
     pub invalid_current_window_family_count: usize,
     pub pending_occurrence_count: usize,
+    /// Retained occurrences reached 90% of the pending-occurrence cap.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pending_occurrence_cap_alarm: bool,
     pub page_invalidated_identity_count: usize,
     pub page_invalidated_occurrence_mismatch_count: usize,
     pub page_invalidated_cap_count: usize,
@@ -9267,7 +9270,8 @@ pub(crate) fn record_claude_native_observations(
                 &scan.census_window_end,
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             )
-        }),
+        })
+        .unwrap_or_default(),
         census_window_end: scan.census_window_end.clone(),
         index_generation: index.generation,
     }
@@ -11006,33 +11010,43 @@ fn claude_stale_pending_keeps_census_invalid(
 
 fn accumulate_claude_usage_family_pending_with_limit(
     snapshots: &[SnapshotItem],
-    pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    pending: &mut UsagePending,
     census_window_end: &str,
     max_occurrences: usize,
-) -> ClaudeDuplicateCensusCounts {
-    accumulate_claude_usage_family_pending_with_credit(
+) -> Result<ClaudeDuplicateCensusCounts, usage_pending::Unknown> {
+    let (pending_by_root, retained) = claude_page_usage_families(snapshots, pending)?;
+    Ok(accumulate_claude_usage_family_pending_with_credit(
         snapshots,
         pending_by_root,
+        retained,
         census_window_end,
         max_occurrences,
         None,
     )
-    .expect("ordinary observation accumulation has no optional credit")
+    .expect("ordinary observation accumulation has no optional credit"))
+}
+
+/// The families a page accumulates into, with the occurrences every family
+/// retains (the cap's running total). Cold: the page's families must be
+/// loaded; new ones join the loaded set.
+fn claude_page_usage_families<'a>(
+    snapshots: &[SnapshotItem],
+    pending: &'a mut UsagePending,
+) -> Result<(&'a mut BTreeMap<String, ClaudeUsageFamilyPending>, usize), usage_pending::Unknown> {
+    let retained = pending.total_occurrences();
+    let families = pending.page_mut(snapshots.iter().map(claude_snapshot_family_root_ref))?;
+    Ok((families, retained))
 }
 
 fn accumulate_claude_usage_family_pending_with_credit(
     snapshots: &[SnapshotItem],
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    mut retained_occurrence_count: usize,
     census_window_end: &str,
     max_occurrences: usize,
     mut credit: Option<&mut claude_native_comparison::NativeBodyBudget<'_>>,
 ) -> Result<ClaudeDuplicateCensusCounts, crate::source_rotation::LocalRefusal> {
     let mut counts = ClaudeDuplicateCensusCounts::default();
-    let mut retained_occurrence_count = pending_by_root
-        .values()
-        .flat_map(|pending| pending.member_occurrences.values())
-        .map(BTreeMap::len)
-        .fold(0_usize, usize::saturating_add);
     for item in snapshots {
         let construction = match credit.as_deref_mut() {
             Some(credit) => {
@@ -11173,6 +11187,8 @@ fn accumulate_claude_usage_family_pending_with_credit(
         }
     }
     counts.pending_occurrence_count = retained_occurrence_count;
+    counts.pending_occurrence_cap_alarm =
+        retained_occurrence_count.saturating_mul(10) >= max_occurrences.saturating_mul(9);
     Ok(counts)
 }
 
@@ -85590,7 +85606,7 @@ mod census_unreadable_tests {
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
-crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, pending_occurrence_cap_alarm, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
