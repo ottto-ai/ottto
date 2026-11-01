@@ -139,6 +139,8 @@ macro_rules! scan_index_fields {
             claude_history_emission => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
+            copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
+            copy_prefix_recovery_scope => Misc (runtime none) [] side,
         }
     };
     (@apply [each $m:ident] $($f:ident => $g:ident $store:tt [$($kind:literal => $introduced:literal),*] $heap:ident,)*) => {
@@ -167,7 +169,7 @@ pub(super) enum Group {
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 2;
+pub(super) const LAYOUT: u32 = 3;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
@@ -239,3 +241,7 @@ mod tests {
         assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
     }
 }
+
+#[cfg(test)]
+#[path = "proof_recovery_tests.rs"]
+mod proof_recovery_tests;

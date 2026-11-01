@@ -181,11 +181,15 @@ local request envelope. Estimate creates no support directory and changes no
 state or upload.
 
 After the change is installed, an authorized operator may replace `--estimate`
-with `--apply`. Apply publishes one private create-new request under
+with `--apply`. Each use of `--apply` or `--apply --replace` on the operator's
+machine requires its owner's explicit go in the executor's session. Apply
+publishes one private request with a fresh nonce under
 `snapshots/claude-copy-prefix-reread.json`; it does not restart the service,
-read transcript bodies or upload. Existing intent is never overwritten. Only
-the ordinary daemon processes it under its sync lock. No helper or
-implementing agent runs apply or starts this re-read.
+read transcript bodies or upload. Existing intent wins unless `--replace`
+is supplied together with `--apply`: the tool writes and syncs a temporary
+file, then atomically renames it over the existing request and syncs its parent.
+Readers see a whole old or new request. Only the ordinary daemon processes it
+under its sync lock. Implementation and review never execute this operation.
 
 The daemon rechecks the same closure and validates every member remains indexed, lies inside the
 configured Claude roots and has the same size, creation time and modification
@@ -193,10 +197,26 @@ time. Any mismatch refuses the whole request, with a counts-only refusal.
 It uses `re_owe_effective_upload_body_witness_revision(key, 2)` to lower only
 those files, without clearing a fingerprint, census record, ACK or global
 replay generation. A local bit in the existing per-file money-mark byte
-records that this one-shot request already re-owed the file; ordinary money
-restamps preserve it. Completed revision-3 entries are never re-owed again by
-that request, across restart. Removing an indexed file clears its marks as
-before. An index rebuild is not authorized by this tool.
+records that this request already re-owed the file; ordinary money restamps
+preserve it. After all validation, a new nonce clears that bit only for the
+published closure, then re-owes through the same revision API. The destination's
+last accepted nonce and the marks/debt are saved in the same index publication.
+The same nonce never re-arms a completed member, including after restart or
+replacement with identical request bytes. Legacy requests without a nonce keep
+their one-shot behavior and grant no proof-recovery authority. Removing an
+indexed file clears its marks as before. An index rebuild is not authorized
+by this tool.
+
+On each preparation, runtime proof-recovery scope contains only members of the
+currently published intent whose nonce matches the accepted nonce and that
+still owe revision debt. The scope is never persisted; later pages, held retries
+and restarts reconstruct it. Missing or refused requests clear it. Publish the
+complete birth-ordered proof cohort explicitly, including earlier holders:
+retired census metadata cannot discover omitted cross-session origins. The
+census integration uses this scope for complete, loss-free reads of retired
+holders, preserving existing caps and overlap custody. A non-Full revival stays
+unverified and retains its Full-audit duty. Unavailable proof leaves copied
+usage counted.
 
 Files are offered in `(min(stored effective birth, physical birth), path)`
 order, earlier first, ahead of ordinary census/audits within the same selection

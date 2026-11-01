@@ -21,6 +21,8 @@ struct Member {
 struct Request {
     members: Vec<Member>,
     window_days: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
 }
 
 /// Counts/durations only; never expose local scope identities.
@@ -79,7 +81,7 @@ fn member(path: &Path) -> Result<Member> {
         modified: stat.modified()?.duration_since(UNIX_EPOCH)?.as_nanos(),
     })
 }
-fn plan(mut members: Vec<Member>, window_days: u64) -> Result<Request> {
+fn plan(mut members: Vec<Member>, window_days: u64, nonce: Option<String>) -> Result<Request> {
     ensure!(
         window_days <= BACKFILL_WINDOW_DAYS,
         "window exceeds existing policy"
@@ -104,6 +106,7 @@ fn plan(mut members: Vec<Member>, window_days: u64) -> Result<Request> {
     Ok(Request {
         members,
         window_days,
+        nonce,
     })
 }
 fn in_window(member: &Member, now: u64, days: u64) -> bool {
@@ -243,6 +246,7 @@ fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<Pat
         plan(
             closed.iter().map(|p| member(p)).collect::<Result<_>>()?,
             listed.window_days,
+            listed.nonce.clone(),
         )?,
         added_by_twins,
     ))
@@ -256,8 +260,10 @@ pub fn run(
     support: &Path,
     index_path: &Path,
     apply: bool,
+    replace: bool,
     window_days: u64,
 ) -> Result<Estimate> {
+    ensure!(!replace || apply, "replace requires apply");
     let paths: Vec<PathBuf> = bounded_json(scope)?;
     ensure!(
         !paths.is_empty() && paths.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
@@ -272,6 +278,7 @@ pub fn run(
     let listed = plan(
         paths.iter().map(|p| member(p)).collect::<Result<_>>()?,
         window_days,
+        None,
     )?;
     // Unlike ScanIndex::load this reader takes no checkpoint lock, repairs
     // nothing and creates no state. Invalid/incomplete state fails closed.
@@ -291,7 +298,7 @@ pub fn run(
             .all(|m| index.files.contains_key(&local_index_key(&m.path))),
         "scope is not indexed"
     );
-    let (request, added_by_twins) = closure(&index, &listed)?;
+    let (mut request, added_by_twins) = closure(&index, &listed)?;
     let counts = estimate(
         &request,
         &listed,
@@ -303,6 +310,9 @@ pub fn run(
             counts.blocked_files == 0,
             "scope outside existing window or page budget"
         );
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| anyhow::anyhow!("request nonce unavailable"))?;
+        request.nonce = Some(format!("{:x}", Sha256::digest(nonce)));
         let encoded = serde_json::to_vec(&request)?;
         ensure!(
             encoded.len() as u64 <= MAX_REQUEST_BYTES,
@@ -319,8 +329,8 @@ pub fn run(
         for path in created.into_iter().rev() {
             sync_checkpoint_parent(path)?;
         }
-        // A create-new private file is published by atomic hard link; daemon
-        // readers never see a partially written request. Existing intent wins.
+        // Publish the complete private file atomically. Existing intent wins
+        // unless the operator explicitly requested replacement.
         let temp = dir.join(format!(".copy-prefix-request-{}", std::process::id()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -335,7 +345,11 @@ pub fn run(
             file.write_all(&encoded)?;
             file.sync_all()?;
             let published = dir.join(REQUEST);
-            fs::hard_link(&temp, &published)?;
+            if replace {
+                fs::rename(&temp, &published)?;
+            } else {
+                fs::hard_link(&temp, &published)?;
+            }
             sync_checkpoint_parent(&published)?;
             Ok(())
         })();
@@ -355,12 +369,13 @@ pub(crate) fn prepare(
     collected_at: &str,
     window_days: u64,
 ) -> Result<Vec<PathBuf>> {
+    index.copy_prefix_recovery_scope.clear();
     let path = support.join("snapshots").join(REQUEST);
     if !path.try_exists()? {
         return Ok(Vec::new());
     }
     let request: Request = bounded_json(&path)?;
-    let mut request = plan(request.members, request.window_days)?;
+    let mut request = plan(request.members, request.window_days, request.nonce)?;
     let (closed, _) = closure(index, &request)?;
     ensure!(
         closed
@@ -430,6 +445,22 @@ pub(crate) fn prepare(
     request
         .members
         .sort_by(|a, b| (a.birth, &a.path).cmp(&(b.birth, &b.path)));
+    // All validation precedes nonce acceptance and debt mutation. Both are
+    // saved in the same index publication before the partial-commit baseline.
+    if request.nonce.is_some() && request.nonce != index.copy_prefix_last_accepted_nonce {
+        for m in &request.members {
+            let key = local_index_key(&m.path);
+            let marks = index
+                .claude_money_birth_store
+                .money_marks(claude_money_birth_store::location_key(&key));
+            index
+                .claude_money_birth_store
+                .set_money_marks(&key, marks & !REOWED);
+        }
+        index.copy_prefix_last_accepted_nonce = request.nonce.clone();
+    }
+    let accepted =
+        request.nonce.is_some() && request.nonce == index.copy_prefix_last_accepted_nonce;
     let mut pending = Vec::new();
     for m in request.members {
         let key = local_index_key(&m.path);
@@ -444,6 +475,9 @@ pub(crate) fn prepare(
                 .set_money_marks(&key, marks | REOWED);
         }
         if index.effective_upload_body_witness_revision_requires_adoption(&key) {
+            if accepted {
+                index.copy_prefix_recovery_scope.insert(m.path.clone());
+            }
             pending.push(m.path);
         }
     }

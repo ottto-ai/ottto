@@ -4113,6 +4113,12 @@ pub struct ScanIndex {
     /// source-wide, while reacquisition is restricted to requested files.
     #[serde(skip)]
     pub(crate) copy_prefix_base_upload_context: Option<String>,
+    /// Local destination-scoped publication authority, saved with re-owed marks.
+    #[serde(default)]
+    pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
+    /// Accepted intent members still owing revision debt; rebuilt each prepare.
+    #[serde(skip)]
+    pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4325,6 +4331,8 @@ impl Default for ScanIndex {
             upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
+            copy_prefix_last_accepted_nonce: None,
+            copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -51714,6 +51722,8 @@ impl ScanIndex {
             upload_context_proof: self.upload_context_proof.clone(),
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
+            copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
+            copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,

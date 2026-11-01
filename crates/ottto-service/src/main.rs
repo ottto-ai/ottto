@@ -61,9 +61,12 @@ enum Command {
             required_unless_present = "apply"
         )]
         estimate: bool,
-        /// Publish local intent for the ordinary daemon; operator authorization required.
+        /// Publish local intent. Each use requires the machine owner's explicit go in the executor's session.
         #[arg(long)]
         apply: bool,
+        /// Atomically replace an existing intent; the same explicit go is required for each use.
+        #[arg(long, requires = "apply")]
+        replace: bool,
     },
     Status {
         #[arg(long)]
@@ -210,6 +213,7 @@ fn main() -> Result<()> {
         ref index,
         ref support_dir,
         apply,
+        replace,
         window_days,
         ..
     }) = cli.command
@@ -219,6 +223,7 @@ fn main() -> Result<()> {
             support_dir,
             index,
             apply,
+            replace,
             window_days,
         ) {
             Ok(counts) => println!("{}", serde_json::to_string(&counts)?),
