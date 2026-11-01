@@ -365,3 +365,76 @@ fn replay_overlap_at_capacity_keeps_complete_known_metadata_coverage() {
     assert_eq!(row.freshness.skipped_untracked_entries, 0);
     assert_eq!(row.freshness.changed_since_scan_complete_count, Some(0));
 }
+
+fn alarm_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    rows.iter()
+        .filter(|row| row["stage"] == "freshness_alarm")
+        .map(|row| &row["counts"])
+        .collect()
+}
+
+/// [regress] The old gauge restarted with the process: the first walk of a new process
+/// reads the true age from the stored stamp and live mtime, across pages that reload the index.
+#[test]
+fn first_walk_after_restart_reports_the_durable_age_across_pages() {
+    for source in [
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Pi,
+    ] {
+        let scratch = crate::test_scratch::ScratchDir::new("freshness-alarm-walk");
+        let root = scratch.join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let grown = root.join("a/grown.jsonl");
+        std::fs::write(&grown, b"{}\n{}\n").unwrap();
+        std::fs::write(root.join("b/settled.jsonl"), b"{}\n").unwrap();
+        std::fs::write(root.join("b/unindexed.jsonl"), b"{}\n").unwrap();
+        let week_old = SystemTime::now() - std::time::Duration::from_secs(7 * DAY);
+        for path in [&grown, &root.join("b/unindexed.jsonl")] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(week_old)
+                .unwrap();
+        }
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            source,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-30T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let stored = crate::snapshots::tests::manifest_index_entry(None);
+        index.files.insert(local_index_key(&grown), stored);
+        let settled = root.join("b/settled.jsonl");
+        let live = std::fs::metadata(&settled).unwrap();
+        let mut stored = crate::snapshots::tests::manifest_index_entry(None);
+        stored.size_bytes = live.len();
+        stored.modified_unix_nanos = live.modified().ok().and_then(unix_nanos);
+        index.files.insert(local_index_key(&settled), stored);
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            // Budget 2: the root, directory a, then directory b, each pass reloading the index.
+            for _ in 0..3 {
+                advance_bounded_directory_traversal_with_budget(
+                    source,
+                    &mut index,
+                    BACKFILL_WINDOW_DAYS,
+                    2,
+                    None,
+                );
+                index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            }
+        });
+        let rows = alarm_rows(&rows);
+        assert_eq!(rows.len(), 1, "one row per walk");
+        assert!(rows[0]["age_s"].as_u64().unwrap() > 6 * DAY);
+        assert_eq!(rows[0]["changed_files"], 1);
+        assert_eq!(rows[0]["over_6h_files"], 1);
+        assert_eq!(rows[0]["unindexed_over_6h"], 1);
+        assert_eq!(rows[0]["basis"], "walk");
+        assert_eq!(rows[0]["alarm"], true);
+    }
+}

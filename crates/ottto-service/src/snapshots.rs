@@ -44333,6 +44333,13 @@ fn advance_bounded_directory_traversal_with_budget(
         },
     );
     let mut remaining = max_entries;
+    // Marked directories are Codex days that appeared after a walk, not a walk.
+    let root_walk = traversal
+        .pending_directories
+        .iter()
+        .any(|directory| !directory.watcher_hint);
+    let mut freshness = money_freshness::WalkFold::resume(source);
+    let listed_at = sampled_scan::now_seconds();
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -44519,6 +44526,13 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
+            freshness.file(
+                index
+                    .files
+                    .get(&local_index_key(&path))
+                    .map(|entry| entry.same_listing_stamp_as(&metadata)),
+                listed_at.saturating_sub(modified_unix_seconds),
+            );
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             }) && !retention.owes_stamped(
@@ -44624,6 +44638,9 @@ fn advance_bounded_directory_traversal_with_budget(
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
         }
+    }
+    if root_walk {
+        freshness.page_end(source, traversal.pending_directories.is_empty());
     }
     index.traversal = Some(traversal);
 }
