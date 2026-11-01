@@ -6,7 +6,7 @@ A shed snapshot upload no longer produces an identical re-upload every five
 minutes forever. The daemon now recognises 429/503, honours `Retry-After` with
 jitter, commits the progress it actually made, and defers that source until the
 backoff expires. Cycle phase is spread deterministically across the fleet, and
-batch bodies can be gzip-encoded once the backend route decompresses them.
+eligible batch bodies are gzip-encoded by default.
 
 ## What was wrong
 
@@ -84,20 +84,17 @@ stable across restarts — a random offset would re-scatter on every launch, whi
 is worse for the freshness promise than being predictable. A machine that has not
 been claimed yet has no stable id and simply starts on time.
 
-## gzip — shipped, default off, and why
+## gzip — enabled by default
 
 Bodies repeat identical selector maps per hour bucket, so deflate has a lot to
 work with; the encoder measurably shrinks a representative body by more than 4×.
 
-It is **off by default** because nothing decompresses a *request* body unless a
-route opts in, and the batch route does not yet — the OTLP route is the only one
-in the estate with a request-decompression path. Shipping this enabled would 4xx
-every upload from an upgraded daemon against today's server.
+The backend now decompresses snapshot requests. Gzip starts enabled for each
+process; the environment opt-in has been removed. The existing transport
+fallbacks remain:
 
-So the encoder ships now, behind `OTTTO_SNAPSHOT_UPLOAD_GZIP=1`, and the default
-flips in the release **after** the batch route decompresses. Two safeguards make
-a premature flip harmless:
-
+* Bodies over the 1 MiB decoded or 2 MiB compressed budgets use identity encoding.
+  Encoding failures also send the original JSON with identity encoding.
 * On a 400 or 415 the client disables gzip for the process and immediately retries
   the same batch with identity encoding.
 * 422 is deliberately **not** a fallback trigger: a 422 means the server parsed
@@ -113,6 +110,5 @@ time.
 
 ## Follow-ups
 
-* Flip the gzip default once the batch route decompresses request bodies.
 * The receipt has no "deferred" collector state; `server_error` is the closest
   fit. A `deferred` outcome belongs with the per-entity ACK vocabulary.

@@ -4320,6 +4320,8 @@ const SPAWN_PARENT: &str = "01a0c0de-5e24-7f10-8a93-a0c1968d8a3a";
 /// thread (Σ last = 200 input over 3 requests); `fork` adds a
 /// `forked_from_id` (copied-history evidence that keeps it held).
 struct CreatedThreadHome {
+    // These lineage controls count Legacy: their owning header predates this epoch.
+    _cutover: codex_counting_version::TestCutover,
     fixture: ScanRoot,
     path: PathBuf,
     body: Vec<Vec<u8>>,
@@ -4398,6 +4400,7 @@ impl CreatedThreadHome {
         let path = fixture.root.join(format!("rollout-{CREATED}.jsonl"));
         fs::write(&path, body[..written].concat()).unwrap();
         let home = Self {
+            _cutover: codex_counting_version::TestCutover::set(base_ms + 1),
             fixture,
             path,
             body,
@@ -8137,6 +8140,10 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
         let (next, scan) = home.generation(index, &cache, n);
         assert!(session_usage(&scan, CHILD).is_empty());
         assert!(!next.codex_parent_ownership_refs.contains(PARENT));
+        // [behaviour] A refused global parent-ref request is locally visible.
+        if n == 0 {
+            assert!(scan.cap_counts.parent_ref_refusals > 0);
+        }
         assert_eq!(restarts_in_scope(&scan), Some(0), "generation {n}");
         assert_eq!(
             parent_causes(&scan),
@@ -12624,6 +12631,10 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
                 break;
             }
             if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
+                // Retain the real Legacy ACK before the entry leaves the index.
+                assert!(codex_counting_version::tombstone_before_retire(
+                    &mut index, &key
+                ));
                 // The per-pass index loads without the parked file's entry.
                 index.files.remove(&key);
                 cleared = true;

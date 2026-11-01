@@ -40,10 +40,24 @@ fn proven_families(name: &str, count: usize) -> Families {
             })
             .collect::<String>();
         fs::write(&path, lines).expect("write family fixture");
-        let item =
-            parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", format!("source-{family}"))
-                .expect("parse family fixture")
-                .remove(0);
+        // Real paused-adoption input: the family keeps ordinary money, so the
+        // reported-usage proof and rebuild below run on its body.
+        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-02T07:01:00Z",
+            format!("source-{family}"),
+        )
+        .expect("parse family fixture")
+        .remove(0);
+        assert!(item.claude_money.is_none(), "ordinary money");
+        if family == 0 {
+            // Positive control: without the paused input, E2 owns the money.
+            let request_owned =
+                parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "control".into())
+                    .expect("parse family fixture")
+                    .remove(0);
+            assert!(request_owned.claude_money.is_some(), "E2 money");
+        }
         index_file(
             &mut index,
             &local_index_key(&path),
@@ -124,8 +138,8 @@ fn rebuild_first_family(families: &Families) -> SnapshotItem {
 
 #[test]
 fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Ordinary-money families (paused input) keep the reported-body proof.
+
     let alone = proven_families("witness-scope-alone", 1);
     let crowded = proven_families("witness-scope-crowded", 9);
     let expected = rebuild_first_family(&alone);

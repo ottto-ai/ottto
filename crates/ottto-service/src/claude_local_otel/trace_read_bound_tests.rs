@@ -133,8 +133,9 @@ fn strict_trace_read_discards_rows_when_a_real_writer_appends_past_opened_length
     assert!(settled.rows_discarded.is_empty());
 }
 
+/// [regress] Capture past the warning cannot extend an already-opened read.
 #[test]
-fn strict_trace_read_stops_at_opened_length_when_a_real_writer_crosses_the_capture_cap() {
+fn strict_trace_read_stops_at_opened_length_when_a_real_writer_crosses_the_warning() {
     let scratch = crate::test_scratch::ScratchDir::new("trace-bound-capture-cap");
     let row = trace_row("capped", "owned-X");
     append_trace_ownership_evidence(&scratch, &row).unwrap();
@@ -145,7 +146,7 @@ fn strict_trace_read_stops_at_opened_length_when_a_real_writer_crosses_the_captu
     encoded.push(b'\n');
     before_next_trace_read_for_test(move |path| {
         // Valid re-exported rows in small chunks; the final real capture call
-        // crosses the on-disk cap and refuses proof.
+        // crosses the warning while the opened reader still refuses growth.
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         let mut left = (MAX_EVIDENCE_FILE_BYTES - 1 - opened_len) / (encoded.len() as u64);
         while left > 0 {
@@ -154,7 +155,7 @@ fn strict_trace_read_stops_at_opened_length_when_a_real_writer_crosses_the_captu
             left -= count;
         }
         drop(file);
-        assert!(append_trace_ownership_evidence(&support, &row).is_err());
+        append_trace_ownership_evidence(&support, &row).unwrap();
         assert!(fs::metadata(path).unwrap().len() >= MAX_EVIDENCE_FILE_BYTES);
     });
     let (report, bytes) =
