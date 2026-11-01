@@ -3840,6 +3840,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
         item.request_evidence.push(SnapshotRequestEvidence {
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
+            account_source: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
@@ -4177,7 +4178,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// Retired evidence cannot reset live census, move slots or select another read.
+/// [format] Retired evidence cannot reset live census, move slots or select
+/// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     let seed = every_persisted_field_fixture();
@@ -4212,6 +4214,10 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         "terminal_zero_snapshot_usage_evidence_count",
         "unchanged_reread_admitted",
         "reread_budget_refused",
+        "causes",
+        "caps",
+        "codex_roster_refresh_visited",
+        "codex_roster_growth_enqueued",
     ];
     let mut old = serde_json::to_value(&seed).unwrap();
     old["reread_guard"] = serde_json::json!({
@@ -4221,12 +4227,19 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     });
     old["traversal"]["counts"]["unchanged_reread_admitted"] = serde_json::json!(41);
     old["traversal"]["counts"]["reread_budget_refused"] = serde_json::json!(43);
+    old["traversal"]["counts"]["codex_roster_refresh_visited"] = serde_json::json!(45);
+    old["traversal"]["counts"]["codex_roster_growth_enqueued"] = serde_json::json!(47);
     let mut forms = vec![serde_json::to_string(&old).unwrap()];
-    // Full nested counter sequence, including nonzero retired slots 20/21.
+    // Full nested counter sequence, including nonzero retired slots 20/21
+    // and 24/25 (the seed's causes and caps are empty).
     old["traversal"]["counts"] = Value::Array(
         count_fields
             .iter()
-            .map(|name| old["traversal"]["counts"][*name].clone())
+            .map(|name| match *name {
+                "causes" => serde_json::to_value(ownership::Counts::default()).unwrap(),
+                "caps" => serde_json::to_value(CapCounts::default()).unwrap(),
+                _ => old["traversal"]["counts"][*name].clone(),
+            })
             .collect(),
     );
     forms.push(
@@ -4324,6 +4337,8 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                 "reread_guard",
                 "unchanged_reread_admitted",
                 "reread_budget_refused",
+                "codex_roster_refresh_visited",
+                "codex_roster_growth_enqueued",
             ] {
                 assert!(!saved.contains(&format!("\"{retired}\":")));
             }

@@ -36,7 +36,8 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// Third field: epoch changed this pass; fourth: per-cycle retained capability.
+/// Third field: epoch changed this pass; fourth: per-cycle retained capability;
+/// fifth: receiver item cap; sixth: per-cycle account-source capability.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
@@ -44,6 +45,7 @@ pub(crate) struct AcceptedBuckets(
     bool,
     bool,
     usize,
+    bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -337,12 +339,17 @@ fn row_proof(key: &FingerprintKey, row: &Value, evidence: &Value) -> Option<[u8;
             None => None,
             Some(reference) => {
                 let entry = evidence.get(usize::try_from(reference.as_u64()?).ok()?)?;
+                // A row holding a carried share is never proof.
+                if entry.get("account_source").is_some() {
+                    return None;
+                }
                 Some(authority_hash(
                     key,
                     &AuthorityKey {
                         login: part["account_identifier_hash"].as_str().map(str::to_owned),
                         org: entry["provider_workspace_hash"].as_str().map(str::to_owned),
                         basis: entry["identity_basis"].as_str().and_then(basis_token)?,
+                        account_source: None,
                     },
                 ))
             }
@@ -411,18 +418,22 @@ impl AcceptedSession {
                             else {
                                 continue;
                             };
-                            Some(authority_hash(
-                                fingerprint_key,
-                                &AuthorityKey {
-                                    login: part["account_identifier_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    org: evidence["provider_workspace_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    basis,
-                                },
-                            ))
+                            // A carried share is placement, never a proven authority.
+                            evidence.get("account_source").is_none().then(|| {
+                                authority_hash(
+                                    fingerprint_key,
+                                    &AuthorityKey {
+                                        login: part["account_identifier_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        org: evidence["provider_workspace_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        basis,
+                                        account_source: None,
+                                    },
+                                )
+                            })
                         }
                     };
                     row_shares.insert(AcceptedShare {
@@ -612,7 +623,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     state.missing = state.missing.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None, false, false, 0))
+                Ok(AcceptedBuckets(states, None, false, false, 0, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -643,7 +654,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0)
+        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -691,6 +702,7 @@ impl AcceptedBuckets {
             false,
             false,
             0,
+            false,
         )
     }
     #[cfg(test)]
@@ -730,6 +742,7 @@ impl AcceptedBuckets {
         self.2 = live.2;
         self.3 = live.3;
         self.4 = live.4;
+        self.5 = live.5;
     }
     /// Runtime-only receiver cap; never serialized as accepted proof.
     pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
@@ -753,6 +766,14 @@ impl AcceptedBuckets {
     }
     pub(crate) fn retained_enabled(&self) -> bool {
         self.3
+    }
+    /// Account carry marking for this cycle: only the server's exact
+    /// capability token emits `account_source`; absent keeps main's bytes.
+    pub(crate) fn set_account_source_enabled(&mut self, enabled: bool) {
+        self.5 = enabled;
+    }
+    pub(crate) fn account_source_enabled(&self) -> bool {
+        self.5
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -1222,6 +1243,7 @@ mod heap_tests {
             false,
             false,
             0,
+            false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
@@ -1337,6 +1359,7 @@ mod keyed_tests {
             login: Some("low-entropy-login".into()),
             org: Some("low-entropy-org".into()),
             basis: TELEMETRY_LOGIN,
+            account_source: None,
         };
         let material = json!([
             "claude_accepted_authority:v2",
@@ -1708,6 +1731,7 @@ mod retained_heap_tests {
             false,
             false,
             0,
+            false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();

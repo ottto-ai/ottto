@@ -3609,10 +3609,9 @@ fn clear_source_manifests_for_test() {
 /// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
 ///
 /// The cost tiers are allowed to stretch a quiet source out to here and no
-/// further, and the 6-hour full sweep is unconditional on top of it: neither the
-/// filesystem watcher nor a server directive can suppress a sweep, because a
-/// watcher that silently stops delivering events would otherwise stop collection
-/// with every health signal green.
+/// further: neither the filesystem watcher nor a server directive can suppress
+/// a scan, because a watcher that silently stops delivering events would
+/// otherwise stop collection with every health signal green.
 const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How long the loop is willing to sit inside one wait before re-deciding.
@@ -3649,7 +3648,6 @@ fn record_finished_snapshot_cadence(
         cadence.record_scan_failure(now);
     } else {
         cadence.record_scan_success(now, accepted);
-        cadence.record_full_sweep(now);
     }
 }
 
@@ -7566,6 +7564,14 @@ fn finish_sync_source(
                     .as_deref()
                     == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
         );
+    upload_progress
+        .accepted_identity_buckets
+        .set_account_source_enabled(
+            activity_hint
+                .session_request_account_source_contract
+                .as_deref()
+                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
+        );
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10263,8 +10269,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
     let mut identity_custody = (wire_budget.max_item_bytes
-        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES)
-        .then(|| withheld.clone());
+        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES
+        || accepted_identity_buckets.is_some_and(
+            crate::snapshots::claude_request_identity::AcceptedBuckets::account_source_enabled,
+        ))
+    .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {
         for item in &mut scan_result.snapshots {
