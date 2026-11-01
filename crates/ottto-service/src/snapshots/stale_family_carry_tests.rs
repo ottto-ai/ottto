@@ -86,17 +86,13 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         let hash = format!("{root}-{sequence}").replace('-', "0");
         let hashes = BTreeSet::from([hash.clone()]);
         let occurrences = BTreeMap::from([(hash, carry_occurrence(sequence as u64, 10))]);
-        witness
-            .member_request_id_fingerprints
-            .insert(member.clone(), claude_request_id_set_fingerprint(&hashes));
-        witness.member_occurrence_fingerprints.insert(
-            member.clone(),
-            claude_occurrence_map_fingerprint(&occurrences),
-        );
         pending
             .member_request_id_hashes
             .insert(member.clone(), hashes);
-        pending.member_occurrences.insert(member, occurrences);
+        pending
+            .member_occurrences
+            .insert(member.clone(), occurrences);
+        carry_witness_member(&mut witness, &member, &pending);
     }
     index
         .claude_usage_family_pending
@@ -5025,20 +5021,28 @@ fn carry_add_request(index: &mut ScanIndex, root: &str, member: &str, hash: &str
     let pending = index.claude_usage_family_pending.get_mut(root).unwrap();
     let hashes = pending.member_request_id_hashes.get_mut(member).unwrap();
     hashes.insert(hash.to_string());
-    let hashes = hashes.clone();
     let occurrences = pending.member_occurrences.get_mut(member).unwrap();
     occurrences.insert(hash.to_string(), carry_occurrence(9, 10));
-    let occurrences = occurrences.clone();
     if let Some(witness) = index.claude_usage_family_witnesses.get_mut(root) {
-        witness.member_request_id_fingerprints.insert(
-            member.to_string(),
-            claude_request_id_set_fingerprint(&hashes),
-        );
-        witness.member_occurrence_fingerprints.insert(
-            member.to_string(),
-            claude_occurrence_map_fingerprint(&occurrences),
-        );
+        carry_witness_member(witness, member, pending);
     }
+}
+
+/// A witness member's fingerprints over that member's pending.
+fn carry_witness_member(
+    witness: &mut ClaudeUsageFamilyWitness,
+    member: &str,
+    pending: &ClaudeUsageFamilyPending,
+) {
+    let hashes = &pending.member_request_id_hashes[member];
+    let occurrences = &pending.member_occurrences[member];
+    witness
+        .member_request_id_fingerprints
+        .insert(member.into(), claude_request_id_set_fingerprint(hashes));
+    witness.member_occurrence_fingerprints.insert(
+        member.into(),
+        claude_occurrence_map_fingerprint(occurrences),
+    );
 }
 
 /// The failed window plus a second witnessed family, rooted after the first

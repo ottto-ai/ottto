@@ -6444,7 +6444,7 @@ fn claude_fence_closed_retry_carry_observed(
             request_owners.extend(pending.member_request_id_hashes.values().flatten().map(
                 |request_hash| {
                     (
-                        usage_pending::request_key(request_hash),
+                        lenient_decode::repair_key(request_hash),
                         root_session_id.as_str(),
                     )
                 },
@@ -6460,7 +6460,6 @@ fn claude_fence_closed_retry_carry_observed(
     // in two carried roots is owned by the later root in root order.
     request_owners.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)));
     request_owners.dedup_by_key(|(key, _)| *key);
-    state_v2::usage_join_keys(request_owners.len());
     // Pass 2: every family's requests against those owners.
     let mut shared_owners = BTreeSet::new();
     if !request_owners.is_empty() {
@@ -6471,7 +6470,7 @@ fn claude_fence_closed_retry_carry_observed(
                 .flatten()
                 .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
             {
-                let key = usage_pending::request_key(request_hash);
+                let key = lenient_decode::repair_key(request_hash);
                 if let Ok(at) = request_owners.binary_search_by(|(owned, _)| owned.cmp(&key)) {
                     let owner = request_owners[at].1;
                     if owner != root_session_id {
@@ -43136,9 +43135,8 @@ fn ensure_bounded_traversal(
         // witnessed, accepted families and compacts their pending to member
         // keys: it credits no evidence, keeps that census invalid so the fence
         // stays closed, and the next complete census retires it.
-        // Cold usage pending: the carry streams the families it joins and
-        // the carried ones are read compacted. Unknown defers this retry,
-        // counted.
+        // Cold usage pending: the carry streams the families it joins.
+        // Unknown defers this retry, counted.
         let stale_pending_roots = index
             .claude_usage_family_pending
             .views()
@@ -43370,16 +43368,9 @@ fn ensure_bounded_traversal(
             capped_roots.retain(|root| retained_roots.contains(root));
             replay
         };
-        let mut compact = |pending: &mut ClaudeUsageFamilyPending| {
-            pending.member_occurrences.clear();
-            pending
-                .member_request_id_hashes
-                .values_mut()
-                .for_each(BTreeSet::clear);
-        };
-        // Cold: each carried or capped family is compacted as it is read.
+        // Cold: the carried and capped families load before they compact.
         let compacted = carried_roots.union(&capped_roots).cloned().collect();
-        if state_v2::load_usage_shaped(index, Some(&compacted), &mut compact).is_err() {
+        if state_v2::load_usage(index, Some(&compacted)).is_err() {
             return claude_stale_retry_usage_unknown(
                 index,
                 prior_unsettled_upload,
@@ -43388,11 +43379,16 @@ fn ensure_bounded_traversal(
             );
         }
         for root_session_id in &compacted {
-            if let Ok(Some(pending)) = index
+            if let Some(pending) = index
                 .claude_usage_family_pending
                 .family_mut(root_session_id)
+                .expect("usage_pending_loaded_before_join")
             {
-                compact(pending);
+                pending.member_occurrences.clear();
+                pending
+                    .member_request_id_hashes
+                    .values_mut()
+                    .for_each(BTreeSet::clear);
             }
         }
         drop(compacted);
