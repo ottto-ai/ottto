@@ -76,7 +76,7 @@ impl ColdStore {
         let bytes = serde_json::to_vec(index).unwrap();
         let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let mut db = populate(path, &expected, BTreeMap::new());
-        let cold = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+        let cold = import::Mapper.hydrate_context(&mut db).unwrap().0;
         let restored = hydrate_resident(&mut db);
         expected.generation += 1;
         assert_eq!(
@@ -104,11 +104,11 @@ impl ColdStore {
             .read_control::<Identity>("identity")
             .unwrap()
             .unwrap();
-        let (stored, mut cx) = import::ClaudeMapper.hydrate_context(&mut self.db).unwrap();
+        let (stored, mut cx) = import::Mapper.hydrate_context(&mut self.db).unwrap();
         let baseline = kinds::baseline(&stored, &mut cx).unwrap();
         roll_account_families(page, end);
         kinds::save_graph(&mut self.db, &identity, baseline, page, &mut cx).unwrap();
-        let cold = import::ClaudeMapper
+        let cold = import::Mapper
             .hydrate_context(&mut self.db)
             .unwrap()
             .0;

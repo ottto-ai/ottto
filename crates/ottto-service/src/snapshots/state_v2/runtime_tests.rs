@@ -320,10 +320,10 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
             ArchivedWindows::Cold(_)
         )
     };
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert!(cold(&index));
     assert!(save_with(&f.path, &mut index).unwrap());
-    let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let reloaded = load_with(&f.path, false).unwrap().unwrap();
     assert!(cold(&reloaded));
     assert_eq!(
         materialized(&reloaded).claude_account_family_pending,
@@ -414,7 +414,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
         );
         f.import_graph(Some(&pre));
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-        let loaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let loaded = load_with(&f.path, false).unwrap().unwrap();
         let mut working = if cold { loaded } else { materialized(&loaded) };
         let committed = working.clone();
         // This page changed both members; A is accepted, B's upload is held.
@@ -454,7 +454,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
                 oldest = Some(mapper::key("account_window", "family", ids[0]).unwrap());
             });
             DELETE_DURING_HYDRATE.with(|delete| delete.set(oldest));
-            let _ = load_with(&f.path, false, &ClaudeMapper);
+            let _ = load_with(&f.path, false);
             let (before, after) = RACED_STAMPS.with(std::cell::Cell::take).unwrap();
             assert_eq!(before.0, after.0, "the generation is unchanged");
             assert_ne!(before.1, after.1, "the full stamp moved");
@@ -472,7 +472,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             assert!(save_with(&f.path, &mut checkpoint).is_err());
             return None;
         }
-        let mut claim = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let mut claim = load_with(&f.path, false).unwrap().unwrap();
         assert_eq!(
             claim.files[A].last_snapshot_fingerprint,
             Some(fingerprint('3'))
@@ -497,7 +497,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             &BTreeSet::new(),
         );
         assert!(save_with(&f.path, &mut checkpoint).unwrap());
-        let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
         assert_eq!(
             reloaded.files[B].last_snapshot_fingerprint,
             Some(fingerprint('4'))
