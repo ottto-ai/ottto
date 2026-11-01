@@ -2714,8 +2714,10 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
         .unwrap();
         (item, money, result)
     };
-    let per_hour = identity::item_bytes(&apply_long(200).0) / 200;
-    let (long, long_money, result) = apply_long((3_145_728 + 64 * 1024) / per_hour + 1);
+    // Size from the marginal bytes per hour, so fixed overhead never undershoots.
+    let base = identity::item_bytes(&apply_long(200).0);
+    let per_hour = (identity::item_bytes(&apply_long(400).0) - base) / 200;
+    let (long, long_money, result) = apply_long(200 + (3_145_728 + 128 * 1024 - base) / per_hour);
     assert_eq!(result, Tagged::Sent { refusals: 0 });
     assert_eq!(sticky_money(&long), long_money);
     assert!(long
