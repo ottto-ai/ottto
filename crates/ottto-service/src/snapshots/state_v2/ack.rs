@@ -34,8 +34,8 @@ fn require(ok: bool, reason: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Runtime-only. Clones retain the authenticated source scope, not environment
-/// switch state. A companion from another DB or a newer recovery set holds.
+/// Runtime-only. Clones retain the authenticated source scope. A companion from
+/// another DB or a newer recovery set holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgressRecovery {
     scope: Scope,
@@ -200,10 +200,7 @@ impl OriginalProgress {
     pub(super) fn capture(index_path: &Path) -> Result<Self> {
         let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
             .context("state_v2_original_progress_binding")?;
-        require(
-            binding.source == super::super::scan_index_persistence::Source::Claude,
-            "source",
-        )?;
+        require(v2_on(binding.source), "source")?;
         let mut original = Self {
             index_path: index_path.to_owned(),
             namespace: binding.namespace_hash,
@@ -380,7 +377,7 @@ impl ProgressRecovery {
     }
 
     /// Caller holds the source owner; called before progress decoding/containment.
-    /// OFF/v1 and Codex/Pi perform no extra reads, writes or normalization.
+    /// v1 and Codex/Pi perform no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {
         if !state_v2_growth_retention_active(index) {
             return Ok(None);
@@ -644,10 +641,7 @@ impl ProgressRecovery {
             identity.format == FORMAT && generation >= identity.fence_generation,
             "generation",
         )?;
-        require(
-            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
-            "source",
-        )?;
+        require(v2_on(identity.binding.source), "source")?;
         let recovery = Self {
             scope: Scope {
                 identity,

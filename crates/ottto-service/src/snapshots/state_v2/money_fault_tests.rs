@@ -1,6 +1,6 @@
 //! Cross-kind custody faults use the composed mapper, never a partial graph.
+use super::super::scan_index_persistence::Source;
 use super::*;
-use import::Mapper;
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -109,7 +109,8 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
             &index,
             presence.clone(),
         );
-        let (restored, cx) = kinds::hydrate(&mut db, money_test_support::binding()).unwrap();
+        let (restored, cx) =
+            kinds::hydrate(&mut db, money_test_support::binding(Source::Claude)).unwrap();
         let mut expected = index;
         expected.generation = 1;
         assert_eq!(
@@ -142,7 +143,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
             &fixture(),
             BTreeMap::new(),
         );
-        assert!(import::ClaudeMapper.hydrate_context(&mut db).is_ok());
+        assert!(import::Mapper.hydrate_context(&mut db).is_ok());
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let mut rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 64)
@@ -154,7 +155,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         assert!(tx.delete(&h.key).unwrap());
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         assert!(
-            import::ClaudeMapper.hydrate_context(&mut db).is_err(),
+            import::Mapper.hydrate_context(&mut db).is_err(),
             "missing {kind} must not look like empty custody"
         );
     }
@@ -174,7 +175,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
         before.values().any(|refs| *refs >= 2),
         "real deduplicated evidence"
     );
-    let (prev, _) = kinds::hydrate(&mut db, money_test_support::binding()).unwrap();
+    let (prev, _) = kinds::hydrate(&mut db, money_test_support::binding(Source::Claude)).unwrap();
     let mut raw = serde_json::to_value(&prev).unwrap();
     raw["claude_request_census"]
         .as_object_mut()
@@ -188,7 +189,8 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
     let mut next: ScanIndex = serde_json::from_value(raw).unwrap();
     next.generation = 2;
     for commit in [false, true] {
-        let (_, mut cx) = kinds::hydrate(&mut db, money_test_support::binding()).unwrap();
+        let (_, mut cx) =
+            kinds::hydrate(&mut db, money_test_support::binding(Source::Claude)).unwrap();
         let baseline = kinds::baseline(&prev, &mut cx).unwrap();
         let mut tx = db.begin(TxnMode::Write).unwrap();
         kinds::delta(baseline, &next, &mut tx, &mut cx).unwrap();
@@ -199,7 +201,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
             drop(tx);
         }
         let counts = assert_refs(&mut db);
-        let restored = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+        let restored = import::Mapper.hydrate_context(&mut db).unwrap().0;
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
             serde_json::to_vec(if commit { &next } else { &prev }).unwrap()
@@ -230,7 +232,7 @@ fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         assert!(tx.delete(key).unwrap());
         assert!(
-            kinds::hydrate_txn(&mut tx, money_test_support::binding()).is_err(),
+            kinds::hydrate_txn(&mut tx, money_test_support::binding(Source::Claude)).is_err(),
             "{key:?}"
         );
         drop(tx); // Preserve evidence for the next domain's fault.
@@ -245,7 +247,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
     let path = scratch.join("claude_code-scan-index.json");
     std::fs::write(&path, br#"{"schema_version":2,"files":{}}"#).unwrap();
     assert!(
-        import::ClaudeMapper.inventory_context(&path).is_ok(),
+        import::Mapper.inventory_context(&path).is_ok(),
         "valid original must reach inventory"
     );
     // #915 has no mapper on this main: every prospective representation is
@@ -288,7 +290,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         let bytes = serde_json::to_vec(&raw).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(
-            import::ClaudeMapper.inventory_context(&path).map(|_| ()),
+            import::Mapper.inventory_context(&path).map(|_| ()),
             expected,
             "{case} {field}"
         );
@@ -317,7 +319,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    assert!(import::ClaudeMapper.hydrate_context(&mut db).is_err());
+    assert!(import::Mapper.hydrate_context(&mut db).is_err());
 }
 
 /// [money] money large memberships segment and preserve exact shared domains.
@@ -345,7 +347,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         &index,
         BTreeMap::new(),
     );
-    let restored = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+    let restored = import::Mapper.hydrate_context(&mut db).unwrap().0;
     let mut expected = index;
     expected.generation = 1;
     assert_eq!(
@@ -370,13 +372,13 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
             .unwrap_or_else(|| panic!("{kind} fixture must span physical chunks"));
         sqlite::remove_value_chunk(&tx, row);
         assert!(
-            kinds::hydrate_txn(&mut tx, money_test_support::binding()).is_err(),
+            kinds::hydrate_txn(&mut tx, money_test_support::binding(Source::Claude)).is_err(),
             "missing {kind} segment"
         );
         drop(tx);
     }
     assert_eq!(
-        serde_json::to_vec(&import::ClaudeMapper.hydrate_context(&mut db).unwrap().0).unwrap(),
+        serde_json::to_vec(&import::Mapper.hydrate_context(&mut db).unwrap().0).unwrap(),
         serde_json::to_vec(&expected).unwrap()
     );
 }

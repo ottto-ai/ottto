@@ -205,8 +205,7 @@ pub(super) struct Skipped<'a> {
 /// The per-pass skipped set as a queue+replay view: census members still
 /// queued at page end plus stale-carry replay (including work replayed
 /// again after a refusal), exactly what `skipped_file_count_due_to_limit`
-/// counts. Cap refusals are not in it, and it is not `scan_cap_hit` (which
-/// #899 also raises for withheld terminal effects). No stat or read.
+/// counts. Cap refusals are not in it, and it is not `scan_cap_hit`. No stat or read.
 pub(super) fn skipped_view(index: &ScanIndex) -> impl Iterator<Item = Skipped<'_>> + '_ {
     index
         .traversal
