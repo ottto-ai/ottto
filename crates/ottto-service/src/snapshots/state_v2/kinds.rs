@@ -18,7 +18,8 @@ pub(super) struct KindCx {
     /// Per cold family, the last rollover a committed save wrote. A sibling
     /// graph (checkpoint subset, retry working graph) skips what it names.
     pub(super) cold_rolled: BTreeMap<String, u64>,
-    /// Outcomes of the cold rollovers this save replayed.
+    /// Outcomes of the store-only rollovers this save writes. A sibling's
+    /// committed rollovers are skipped, and a failed save's are discarded.
     pub(super) archived: Archived,
     valid: bool,
 }
@@ -243,16 +244,12 @@ pub(super) fn save_graph(
                 if count != 0 {
                     telemetry::event("account_windows_alarm", &count);
                 }
-                // Archived windows by outcome: this save's cold replays and
-                // resident rollovers since the last committed save.
-                let resident = Archived::take_resident();
                 telemetry::event(
                     "account_windows_retained",
                     &serde_json::json!({
                         "windows": windows, "max_per_family": max, "families_over_64": count,
                         "uncollapsed": uncollapsed,
-                        "replaced": pending.archived.replaced.saturating_add(resident.replaced),
-                        "pushed": pending.archived.pushed.saturating_add(resident.pushed)
+                        "replaced": pending.archived.replaced, "pushed": pending.archived.pushed
                     }),
                 );
                 Ok(digests)

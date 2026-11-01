@@ -962,6 +962,9 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         roll(&mut graph, &at(5));
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(previous, &graph, &mut tx, &mut cx).unwrap();
+        // The save counts the store-only rollovers it replays: both replace.
+        let replayed = if cold { (2, 0) } else { (0, 0) };
+        assert_eq!((cx.archived.replaced, cx.archived.pushed), replayed);
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         let restored = hydrate(db, Scratch::binding()).unwrap().0;
         let archive = restored.claude_account_family_pending[FAMILY]

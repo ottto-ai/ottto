@@ -293,19 +293,14 @@ impl ClaudeAccountFamilyPending {
     /// Archive the replaced current window. Strict archives keep only the
     /// newest window of an equal run; opaque evidence is funded by the whole
     /// encoded index, so it keeps every window until the hold resolves. A
-    /// cold archive folds the window now and queues it for the next save,
-    /// whose replay counts its outcome.
+    /// cold archive folds the window now and queues it for the next save.
     pub(super) fn archive(&mut self, old: ClaudeAccountFamilyPendingWindow, strict: bool) {
         let current_end = &self.current.census_window_end;
         match &mut self.previous_windows {
             ArchivedWindows::Resident(windows) if strict => {
-                let replaced = retain_run_endpoint(windows, old, current_end);
-                Archived::note_resident(replaced);
+                retain_run_endpoint(windows, old, current_end);
             }
-            ArchivedWindows::Resident(windows) => {
-                windows.push(old);
-                Archived::note_resident(false);
-            }
+            ArchivedWindows::Resident(windows) => windows.push(old),
             ArchivedWindows::Cold(cold) => {
                 debug_assert!(strict, "cold archives exist only without raw holds");
                 cold.summary.fold(&old);
@@ -397,38 +392,18 @@ fn retain_run_endpoint(
     false
 }
 
-/// Archived windows per outcome: replaced a run's newest window, or appended.
+/// Replayed rollovers per outcome: replaced a run's newest window, or appended.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Archived {
     pub(super) replaced: u64,
     pub(super) pushed: u64,
 }
-// Resident archives decide at rollover; the next committed v2 save drains them.
-static RESIDENT_REPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RESIDENT_PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 impl Archived {
     fn note(&mut self, replaced: bool) {
         if replaced {
             self.replaced += 1;
         } else {
             self.pushed += 1;
-        }
-    }
-
-    fn note_resident(replaced: bool) {
-        let counter = if replaced {
-            &RESIDENT_REPLACED
-        } else {
-            &RESIDENT_PUSHED
-        };
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Resident outcomes since the last call.
-    pub(super) fn take_resident() -> Self {
-        Self {
-            replaced: RESIDENT_REPLACED.swap(0, std::sync::atomic::Ordering::Relaxed),
-            pushed: RESIDENT_PUSHED.swap(0, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
