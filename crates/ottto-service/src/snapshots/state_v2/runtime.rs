@@ -509,6 +509,8 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
         })();
+        // One gauge per import attempt, including one refused for an over-cap row.
+        telemetry::row_cap_save();
         let mut cx = match result {
             Ok(cx) => {
                 telemetry::event("import_done", &1);

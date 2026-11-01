@@ -465,6 +465,38 @@ pub(super) fn save_work(rows: u64, bytes: u64) {
         stats.save_dirty_bytes.observe(bytes);
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
+    row_cap_save();
+}
+
+thread_local! {
+    static ROW_CAP: std::cell::RefCell<Option<(u64, String)>> = const { std::cell::RefCell::new(None) };
+}
+/// Logical row bytes as a percent of the row's admission cap. Only written
+/// rows are seen: digest-unchanged rows skip the write and the cap check.
+pub(super) fn row_cap(kind: &str, bytes: u64, cap: u64) {
+    let percent = bytes.saturating_mul(100) / cap.max(1);
+    ROW_CAP.with(|max| {
+        let mut max = max.borrow_mut();
+        if !matches!(&*max, Some((p, _)) if *p >= percent) {
+            *max = Some((percent, kind.to_owned()));
+        }
+    });
+}
+pub(super) fn row_cap_reset() {
+    ROW_CAP.with(|max| max.borrow_mut().take());
+}
+/// One gauge per save or import that wrote rows: the largest percent and its
+/// catalogue kind name. The alarm warns at 75% of the cap; it never refuses.
+pub(super) fn row_cap_save() {
+    if let Some((percent, kind)) = ROW_CAP.with(|max| max.borrow_mut().take()) {
+        event(
+            "row_cap_max",
+            &serde_json::json!({ "percent": percent, "kind": kind }),
+        );
+        if percent >= 75 {
+            event("row_cap_alarm", &percent);
+        }
+    }
 }
 
 #[cfg(test)]

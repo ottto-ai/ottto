@@ -1889,6 +1889,9 @@ values, chunks, metadata, tombstones, reference updates and restart staging.
 whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
 `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`row_cap_max` reports the largest written row as a percent of its cap, with its
+kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
+refuse every save of that source.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history.
 These events contain no keys, paths, restart names, reference tuples or digests.

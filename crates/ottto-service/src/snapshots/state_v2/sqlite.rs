@@ -855,6 +855,7 @@ impl Store for Sqlite {
     type Txn<'a> = Txn<'a>;
     fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
+            telemetry::row_cap_reset();
             self.save_failure = None;
             self.mark_dirty()?;
             self.stats.erasure_pending_marks = 0;

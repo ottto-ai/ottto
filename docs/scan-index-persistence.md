@@ -584,6 +584,9 @@ committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect.
+Each save or import that writes rows reports `row_cap_max`, the largest written
+row's logical bytes as a percent of its cap with its kind name, and
+`row_cap_alarm` at 75% or more; digest-unchanged rows are not rewritten or seen.
 
 For an unknown field or other state-v2 load failure, an unpublished source keeps
 collecting through v1 and reports `import_paused` / `import_paused_alarm`.
