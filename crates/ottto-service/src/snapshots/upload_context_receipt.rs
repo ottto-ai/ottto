@@ -611,7 +611,11 @@ impl ScanIndex {
             let Some(entry) = self.files.get_mut(&candidate.key) else {
                 continue;
             };
-            if entry.source_file_fingerprint != candidate.receipt.source_witness
+            // A revision cleared for a forced reparse keeps the receipt of the
+            // revision the page parsed; a file now at another revision earns
+            // none.
+            if (!entry.source_file_fingerprint.is_empty()
+                && entry.source_file_fingerprint != candidate.receipt.source_witness)
                 || entry.last_upload_body_witness.as_ref() != Some(&candidate.receipt.body_witness)
                 || entry.upload_context_receipt.as_ref() == Some(&candidate.receipt)
             {
