@@ -22,9 +22,14 @@ pub(crate) const CONTRACT: &str = "session_history_segments:v1";
 /// Full bodies at or under this size are never cut.
 pub(crate) const TRIGGER_BYTES: usize = 512 * 1024;
 
+/// The receiver's per-request entity limit: a group's unACKed members
+/// travel in one request, so at most this many.
+pub(crate) const GROUP_MAX_ITEMS: usize = 100;
+
 #[cfg(test)]
 thread_local! {
     static TRIGGER_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static HOLD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// `TRIGGER_BYTES`; a test may lower it for its own thread.
@@ -50,6 +55,38 @@ pub(crate) fn with_trigger_for_test<T>(bytes: usize, f: impl FnOnce() -> T) -> T
     }
     let _restore = Restore(TRIGGER_FOR_TEST.replace(Some(bytes)));
     f()
+}
+
+/// Run `f` with every settled window over a size cap once tagged, so a
+/// pipeline test reaches the size hold without a window that large.
+#[cfg(test)]
+pub(crate) fn with_held_windows_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOLD_FOR_TEST.set(self.0);
+        }
+    }
+    let _restore = Restore(HOLD_FOR_TEST.replace(true));
+    f()
+}
+
+#[cfg(test)]
+pub(crate) fn held_windows_for_test() -> bool {
+    HOLD_FOR_TEST.get()
+}
+
+/// Whether one request carrying a group's unACKed members, `bytes` their
+/// packed bodies, fits the receiver: at most `GROUP_MAX_ITEMS` entities and
+/// the wire cap with each member's semantic envelope at its maximum.
+pub(crate) fn group_fits(members: usize, bytes: usize) -> bool {
+    const REQUEST_RESERVE: usize = 64 * 1024;
+    let envelopes = members.saturating_mul(super::MAX_SEMANTIC_ENVELOPE_BYTES + 64);
+    members <= GROUP_MAX_ITEMS
+        && bytes
+            .saturating_add(envelopes)
+            .saturating_add(REQUEST_RESERVE)
+            <= super::MAX_SNAPSHOT_BATCH_WIRE_BYTES
 }
 const DAY_SECONDS: i64 = 86_400;
 const WINDOW_SECONDS: i64 = 7 * DAY_SECONDS;
@@ -102,6 +139,12 @@ pub(crate) enum Skipped {
     /// sizes): the receiver takes whole 7-day windows only, so the body stays
     /// whole on today's path.
     WindowOverLimit,
+    /// A piece failed for a cause the cut cannot fix (not a size cap): the
+    /// whole body stays on today's path.
+    PieceFailed,
+    /// A group's unACKed members do not fit one request: none is sent this
+    /// pass (counted deferred, never dropped or stripped).
+    GroupOverBatch,
 }
 
 #[derive(Serialize)]
@@ -111,9 +154,30 @@ struct Alarm {
 
 /// Local alarm only (counts, no id): never expected at today's sizes.
 pub(crate) fn alarm(source: SnapshotSource, skipped: Skipped) {
+    alarm_scope(source.api_slug(), skipped);
+}
+
+/// Counted: a group refused under its `through` (the receiver lost a part,
+/// e.g. a whole or lower body retired it) forgot `segments` local ACKs, so
+/// the next pass sends them again. A bounded resend (the refused live body
+/// waits out its retry backoff), never a loop.
+pub(crate) fn reoffered(scope: &str, segments: usize) {
+    #[derive(Serialize)]
+    struct Reoffered {
+        segments: usize,
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "history_segments_reoffered",
+        scope,
+        &Reoffered { segments },
+    );
+}
+
+/// `alarm` for an upload scope (the source's API slug).
+pub(crate) fn alarm_scope(scope: &str, skipped: Skipped) {
     crate::local_resource_diagnostics::traversal_point(
         "history_segments_skipped",
-        source.api_slug(),
+        scope,
         &Alarm { skipped },
     );
 }
@@ -143,8 +207,8 @@ pub(crate) fn segment_id(live: &str, start: i64) -> Option<String> {
 }
 
 /// Upload packing unit: a cut session's group, else its request-owned
-/// family. A group larger than one batch is packed oldest segment first and
-/// its live body last, so each batch advances the stored history.
+/// family. A group's unACKed members travel in one request, segments oldest
+/// first and the live body last (`group_fits`).
 pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
     group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
 }

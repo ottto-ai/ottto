@@ -337,10 +337,31 @@ impl SharedCache {
         items: &[SnapshotItem],
         withheld: &BTreeSet<String>,
     ) {
+        self.update_held_new_files(committed, scanned, items, withheld, true);
+    }
+    /// A hold decided later in the same pass (the settled-history size hold)
+    /// takes the same paced retry: it only adds held keys, never clears one.
+    pub(crate) fn add_held_new_files(
+        &self,
+        committed: &ScanIndex,
+        scanned: &ScanIndex,
+        items: &[SnapshotItem],
+        held: &BTreeSet<String>,
+    ) {
+        self.update_held_new_files(committed, scanned, items, held, false);
+    }
+    fn update_held_new_files(
+        &self,
+        committed: &ScanIndex,
+        scanned: &ScanIndex,
+        items: &[SnapshotItem],
+        withheld: &BTreeSet<String>,
+        clear: bool,
+    ) {
         if let Ok(mut cache) = self.retained() {
             cache.update_e2_held(|key| {
                 if committed.files.contains_key(key) {
-                    return Some(false);
+                    return clear.then_some(false);
                 }
                 let entry = scanned.files.get(key)?;
                 let mut visited = false;
@@ -353,7 +374,7 @@ impl SharedCache {
                         held |= withheld.contains(&item.source_session_id);
                     }
                 }
-                visited.then_some(held)
+                visited.then_some(held).filter(|held| clear || *held)
             });
         }
     }

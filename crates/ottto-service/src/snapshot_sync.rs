@@ -7743,9 +7743,15 @@ fn finish_sync_source(
         // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
-        if upload_progress
+        // Per entity: a settled-history segment's rows name its own entry.
+        let copy_invalidated = std::mem::take(&mut disposition.copy_invalidated);
+        let live_changed = upload_progress
             .accepted_identity_buckets
-            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
+            .invalidate_copy_derived(&copy_invalidated);
+        if upload_progress
+            .accepted_identity_segments
+            .invalidate_copy_derived(&copy_invalidated)
+            || live_changed
         {
             upload_progress.save(&upload_progress_path)?;
         }
@@ -10376,8 +10382,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         );
         disposition.copy_invalidated = request_identity.copy_invalidated;
         // A settled-history window over a size cap once tagged holds its
-        // session: delayed, never stripped.
-        disposition.hold_request_owned(evidence.history_held.take());
+        // session: delayed, never stripped, and retried like E2's holds.
+        let history_held = evidence.history_held.take();
+        if let Some((cache, committed)) = retained {
+            cache.add_held_new_files(committed, index, &scan_result.snapshots, &history_held);
+        }
+        disposition.hold_request_owned(history_held);
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,
@@ -11008,6 +11018,7 @@ where
         // Settled-history groups settle whole: a member stays
         // unsettled, and is offered again with its group, unless every
         // member on this page settled. Segments record before their live body.
+        let mut group_blocked = 0usize;
         let mut unsettled_groups = groups
             .iter()
             .filter(|(index, _)| !settled.contains(fingerprint(&items[*index])))
@@ -11043,6 +11054,8 @@ where
                 .as_ref()
                 .map_or(true, |(live, _)| !unsettled_groups.contains(live));
             if settled.contains(item_fingerprint) && !group_settled {
+                // Pending like a conflict: the page is not Completed.
+                group_blocked += 1;
                 continue;
             }
             if settled.contains(item_fingerprint) {
@@ -11115,9 +11128,7 @@ where
                 }
             }
             if forgot > 0 {
-                eprintln!(
-                    "local snapshot history group offered again for {poison_scope}: segments={forgot}"
-                );
+                crate::snapshots::history_segments::reoffered(poison_scope, forgot);
             }
         };
         for index in indices {
@@ -11158,13 +11169,17 @@ where
         // happen. One conflicting entity deadlocked its whole
         // source permanently, across restarts.
         // A held body is pending the same way.
-        conflicted_entities = response.conflict_entities.len().saturating_add(
-            response
-                .rejected_entities
-                .iter()
-                .filter(|entity| !entity.permanent)
-                .count(),
-        );
+        conflicted_entities = response
+            .conflict_entities
+            .len()
+            .saturating_add(
+                response
+                    .rejected_entities
+                    .iter()
+                    .filter(|entity| !entity.permanent)
+                    .count(),
+            )
+            .saturating_add(group_blocked);
     } else {
         for index in indices {
             let item = &items[*index];
@@ -11523,6 +11538,8 @@ where
             }
         }
     }
+    // Members of a settled-history group over one request, not sent.
+    let mut history_deferred = 0usize;
     for (root, mut members) in literal_families {
         // Settled-history segments lead their live body, then root first.
         members.sort_by_key(|(index, _, _)| {
@@ -11533,6 +11550,30 @@ where
                 member,
             )
         });
+        // A settled-history group's unACKed members (ACKed, unchanged ones
+        // were skipped above) travel in ONE request: the receiver refuses a
+        // segment without its live body. Over the receiver's limits nothing
+        // of it goes this pass: counted deferred and alarmed, never dropped
+        // or stripped, and offered again whole.
+        if members.iter().any(|(index, _, _)| {
+            session_id(&items[*index])
+                .is_some_and(crate::snapshots::history_segments::is_segment_id)
+        }) {
+            let bytes = members
+                .iter()
+                .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
+            if crate::snapshots::history_segments::group_fits(members.len(), bytes) {
+                order.extend(members);
+                unit_ends.push(order.len());
+            } else {
+                crate::snapshots::history_segments::alarm_scope(
+                    poison_scope,
+                    crate::snapshots::history_segments::Skipped::GroupOverBatch,
+                );
+                history_deferred += members.len();
+            }
+            continue;
+        }
         for group in literal_family_groups(members) {
             order.extend(group);
             unit_ends.push(order.len());
@@ -11853,9 +11894,11 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
-    } else if conflicted_entities > 0 || context_budget_deferred > 0 {
+    } else if conflicted_entities > 0 || context_budget_deferred > 0 || history_deferred > 0 {
         Ok(ResumableUploadResult::Deferred {
-            count: conflicted_entities.saturating_add(context_budget_deferred),
+            count: conflicted_entities
+                .saturating_add(context_budget_deferred)
+                .saturating_add(history_deferred),
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {

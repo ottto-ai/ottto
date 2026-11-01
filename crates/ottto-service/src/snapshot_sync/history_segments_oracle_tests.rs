@@ -5,7 +5,8 @@ use super::money_equivalence_tests::{claude_pages, compare_claude_uploads, corpu
 use super::state_v2_money_tests::tagged_api;
 use super::*;
 use crate::snapshots::claude_request_identity::AcceptedBuckets;
-use crate::snapshots::history_segments::with_trigger_for_test;
+use crate::snapshots::e2_pipeline_scan_fixture::explicitly_held;
+use crate::snapshots::history_segments::{group_of, with_held_windows_for_test, with_trigger_for_test};
 
 const WEEK: i64 = 7 * 86_400;
 /// Four windows (three settled) keep the transcript inside one retained
@@ -130,7 +131,9 @@ fn totals(items: &[SnapshotItem]) -> [u64; 5] {
 /// placement), the pieces conserve the OFF whole's totals, every bucket row
 /// keeps the account the scan placed (window boundaries carried by the
 /// scan's own reconcile, never injected), and a crash before the group's ACK
-/// resends the same group after restart.
+/// resends the same group after restart. A size hold is paced like E2's
+/// holds: the held session sends nothing, and a quiet next pass re-reads
+/// nothing.
 #[test]
 fn segmented_session_cold_full_ram_and_restored_tail_agree() {
     let name = "segmented_session_oracle";
@@ -150,12 +153,12 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         telemetry(&c, &requests);
         let grown_at = requests.last().unwrap().1 + 3_600;
         let now = grown_at + 3_600;
-        let segments = AcceptedBuckets::segments_for_test();
+        let mut segments = AcceptedBuckets::segments_for_test();
         let disk = Disk::new(&c);
         let scanner = E2ScanFixture::default();
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
         let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
-        warm.enrich_with_segments(&c, None, Some((&segments, now)));
+        warm.enrich_with_segments(&c, None, Some((&mut segments, now)));
         warm.finish();
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
         assert!(disk.records() > 0, "the warm owner persists its records");
@@ -172,12 +175,12 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
             &c,
             &scanner,
             &restart,
-            [prior.clone(), prior.clone(), prior],
+            [prior.clone(), prior.clone(), prior.clone()],
             (0, 1, 0),
             (0, 1, 0),
         );
         for page in &mut pages {
-            page.enrich_with_segments(&c, None, Some((&segments, now)));
+            page.enrich_with_segments(&c, None, Some((&mut segments, now)));
             page.finish();
         }
         compare_claude_uploads(&pages);
@@ -238,5 +241,23 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         let (resumed, wire, _) = upload(full, &mut progress, ack);
         assert_eq!(resumed.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(wire, cold_wire);
+
+        // A settled window over a size cap holds the session. The held pass
+        // reuses the retained read (no transcript bytes), sends nothing of
+        // the group and stays owed; the quiet pass after it does the same.
+        for _ in 0..2 {
+            let mut held = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            with_held_windows_for_test(|| {
+                held.enrich_with_segments(&c, None, Some((&mut segments, now)))
+            });
+            assert_eq!(held.modes, (0, 0, 1), "an unchanged retained acquisition");
+            assert!(explicitly_held(&held.disposition, ROOT));
+            held.finish();
+            assert!(held
+                .scan
+                .snapshots
+                .iter()
+                .all(|item| item.source_session_id != ROOT && group_of(item) != Some(ROOT)));
+        }
     }));
 }

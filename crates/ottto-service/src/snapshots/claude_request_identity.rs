@@ -939,6 +939,7 @@ pub(crate) fn apply_cut_held_for_test(
         &evidence,
         accepted.get(&item.source_session_id),
         accepted.retained_enabled(),
+        &mut Vec::new(),
     );
     (tagged, evidence.history_held.take())
 }
@@ -5464,13 +5465,16 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
 /// entry's; retained proof is its own entry's only. A window over a size cap
 /// once tagged holds the session (delayed, never stripped; the receiver takes
 /// whole windows only). Any other failed piece keeps the whole body on
-/// today's path. Segments wait on the live body.
+/// today's path. Segments wait on the live body. Copy-prefix invalidation
+/// acts per entity: a segment's own entry tombstones the lent rows it holds
+/// (`invalidated_rows` names the segment), the live entry the rest.
 fn apply_cut(
     item: &mut SnapshotItem,
     grouping: Grouping,
     evidence: &ScanEvidence<'_>,
     accepted: Option<&accepted::AcceptedSession>,
     retained: bool,
+    invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Result<Tagged, Ineligible> {
     let Some(now) = evidence.history_segments_now else {
         return apply_grouped_with_accepted(item, grouping, accepted, retained);
@@ -5490,6 +5494,7 @@ fn apply_cut(
     if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::trigger_bytes()) {
         return tagged;
     }
+    let mut segment_rows = Vec::new();
     let Some((mut segments, mut live)) = history_segments::plan(
         SnapshotSource::ClaudeCode,
         &original,
@@ -5509,16 +5514,47 @@ fn apply_cut(
         let own = evidence
             .accepted_segments
             .and_then(|ledger| ledger.get(&segment.source_session_id));
-        let view = accepted::segment_view(own, accepted, &keys);
-        let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
+        let mut piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
+        // The whole body's lent slots, against the rows this entry holds.
+        let derived = copy_derived_rows(&original, &piece, own);
+        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+            for (start, rows) in copy_invalidated_rows(segment, &derived, own) {
+                piece
+                    .copy_invalidated
+                    .entry(start)
+                    .or_default()
+                    .extend(rows);
+            }
+        }
+        let own_invalidated = own
+            .filter(|_| !derived.is_empty())
+            .map(|own| own.invalidated(&derived));
+        let view = accepted::segment_view(own_invalidated.as_ref().or(own), accepted, &keys);
         let mut trimmed = BTreeSet::new();
         let caps =
             match apply_grouped_trimmed(segment, piece, view.as_ref(), retained, &mut trimmed) {
                 Ok(Tagged::Sent { .. }) => trimmed.into_iter().collect(),
                 Ok(Tagged::Fallback { over_cap, .. }) if !over_cap.is_empty() => over_cap,
                 // Any other cause is the whole session's too: today's path.
-                _ => return tagged,
+                _ => {
+                    history_segments::alarm(
+                        SnapshotSource::ClaudeCode,
+                        history_segments::Skipped::PieceFailed,
+                    );
+                    return tagged;
+                }
             };
+        #[cfg(test)]
+        let caps = if history_segments::held_windows_for_test() {
+            vec![OverCap::Bytes]
+        } else {
+            caps
+        };
+        segment_rows.extend(derived.into_iter().map(|(bucket, row)| CopyInvalidation {
+            session: segment.source_session_id.clone(),
+            bucket,
+            row,
+        }));
         match caps.as_slice() {
             [] => {}
             // A window over a size cap stays over it: hold, never strip
@@ -5538,7 +5574,13 @@ fn apply_cut(
                 return tagged;
             }
             // Any other cause is the whole session's too: today's path.
-            _ => return tagged,
+            _ => {
+                history_segments::alarm(
+                    SnapshotSource::ClaudeCode,
+                    history_segments::Skipped::PieceFailed,
+                );
+                return tagged;
+            }
         }
     }
     let owned = starts(&live);
@@ -5547,6 +5589,7 @@ fn apply_cut(
         Ok(result) => {
             live.history_cut = segments;
             *item = live;
+            invalidated_rows.extend(segment_rows);
             Ok(result)
         }
         Err(_) => tagged,
@@ -5615,6 +5658,7 @@ fn tag_item(
             evidence,
             invalidated.as_ref().or(accepted),
             retained,
+            invalidated_rows,
         );
         if tagged.is_err() {
             (
@@ -5689,7 +5733,14 @@ fn tag_item(
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     grouping.accepted_miss = miss;
-    let tagged = apply_cut(item, grouping, evidence, accepted, retained);
+    let tagged = apply_cut(
+        item,
+        grouping,
+        evidence,
+        accepted,
+        retained,
+        invalidated_rows,
+    );
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);
     }

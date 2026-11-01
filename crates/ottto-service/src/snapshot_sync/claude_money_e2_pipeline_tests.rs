@@ -254,8 +254,8 @@ impl Page {
         &mut self,
         corpus: &Corpus,
         accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
-        segments: Option<(
-            &crate::snapshots::claude_request_identity::AcceptedBuckets,
+        mut segments: Option<(
+            &mut crate::snapshots::claude_request_identity::AcceptedBuckets,
             i64,
         )>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -270,13 +270,17 @@ impl Page {
                     None,
                     Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
-                    segments,
+                    segments.as_ref().map(|(ledger, now)| (&**ledger, *now)),
                     None,
                 )
                 .unwrap()
             });
+        let copy_invalidated = std::mem::take(&mut disposition.copy_invalidated);
         if let Some(accepted) = accepted {
-            accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
+            accepted.invalidate_copy_derived(&copy_invalidated);
+        }
+        if let Some((ledger, _)) = segments.as_mut() {
+            ledger.invalidate_copy_derived(&copy_invalidated);
         }
         self.released = released;
         self.unhealthy = stats.unhealthy_root_no_fallback_requests;
@@ -4486,6 +4490,43 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
                 [false, true]
             );
+            // Per entity (Lead B C1): the same frozen rows held by a settled-
+            // history segment's own entry. The cut tombstones the lent row
+            // in that entry, never the live one, and the segment sends it
+            // with today's attribution.
+            {
+                use crate::snapshots::history_segments::{segment_id, with_trigger_for_test};
+                let window = 1_785_369_600; // 2026-07-30, an aligned window start
+                let id = segment_id(COPY, window).unwrap();
+                let mut segments = AcceptedBuckets::segments_for_test();
+                segments.set_retained_enabled(retained);
+                let mut value = serde_json::to_value(stored).unwrap();
+                value["source_session_id"] = json!(id);
+                value["history_segment"] = json!({"of": COPY,
+                    "window_start": "2026-07-30T00:00:00Z", "window_end": "2026-08-06T00:00:00Z"});
+                segments.record(&value);
+                if retained {
+                    segments.record_proved(&value, true, &[]);
+                }
+                let mut live = AcceptedBuckets::for_test();
+                live.set_retained_enabled(retained);
+                let untouched = serde_json::to_vec(&live).unwrap();
+                let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+                take_identity_counts();
+                with_trigger_for_test(1, || {
+                    page.enrich_with_segments(
+                        &c,
+                        Some(&mut live),
+                        Some((&mut segments, window + 21 * 86_400)),
+                    )
+                });
+                let counts = serde_json::to_value(take_identity_counts()).unwrap();
+                assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 1);
+                assert_eq!(serde_json::to_vec(&live).unwrap(), untouched);
+                let segment = body(&page, &id).expect("the settled window is its own entity");
+                assert_eq!(rows(segment)[0], today[0], "the X row moves to today's attribution");
+                assert_eq!(org_shares(segment).get(&x), None);
+            }
             // X-B1 (Lead B 2026-10-31): `copy_invalidated` per bucket row.
             let flags = |item: &SnapshotItem| {
                 item.usage_buckets
