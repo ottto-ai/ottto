@@ -947,7 +947,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         .collect();
     p.current.census_window_end = at(3);
     let (_resident_scratch, mut resident_db) = Scratch::store();
-    let (_cold_scratch, mut cold_db) = Scratch::store();
+    let (_cold_scratch, mut cold_db) = Scratch::live_store();
     commit_populate(&mut resident_db, &index);
     commit_populate(&mut cold_db, &index);
     let mut saved = Vec::new();

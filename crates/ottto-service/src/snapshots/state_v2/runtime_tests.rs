@@ -1324,14 +1324,23 @@ mod hydrate_parity {
 
         let mut index = seed();
         // A complete hydrate with raw holds keeps account archives resident.
+        // Decode marks a window without member requests invalid, so give each
+        // window one member request set.
+        let window = |day: u32| {
+            let mut window = account_window(day);
+            let hash = format!("{:064x}", u64::from(day));
+            let requests =
+                s::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
+            window.members.insert("member".into(), 1);
+            window.member_requests.insert("member".into(), requests);
+            window.evidence_request_count = 1;
+            window
+        };
         index.claude_account_family_pending.insert(
             "account-family".into(),
             s::ClaudeAccountFamilyPending {
-                current: account_window(30),
-                previous_windows: ArchivedWindows::Resident(vec![
-                    account_window(25),
-                    account_window(27),
-                ]),
+                current: window(30),
+                previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
