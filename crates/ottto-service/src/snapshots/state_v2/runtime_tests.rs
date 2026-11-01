@@ -440,6 +440,10 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
                 .unwrap()
                 .last_snapshot_fingerprint = Some(fingerprint(c));
         }
+        // A's upload was acknowledged, as the ack path records it.
+        working
+            .accepted_snapshot_fingerprints
+            .insert(fingerprint('3'));
         roll(&mut working, 28);
         assert_eq!(
             matches!(
