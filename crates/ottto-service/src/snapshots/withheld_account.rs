@@ -306,7 +306,7 @@ impl ScanIndex {
         let parsed = self
             .files
             .get(key)
-            .filter(|entry| entry.source_file_fingerprint == fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == fingerprint)
             .map(|entry| self.withheld_seen(PARSED, entry.size_bytes, fingerprint));
         let key = memo_key(key);
         let trigger = self
