@@ -1899,6 +1899,18 @@ erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
+`store_growth` samples the SQLite store once per idle daily reference-maintenance
+pass, after reference verification (an hourly retry of a failed pass samples again).
+It reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
+(`rows`), `key_bytes` and `value_bytes` for each present catalogue kind, plus
+`shared_value_bytes` and `chunk_bytes`. Value bytes use the store's logical
+length metadata; chunk bytes sum stored chunk lengths and overlap the logical
+record/shared values, so do not add them together. These are payload lengths,
+not per-table allocated space. Sampling uses what remains of the existing
+reference-check VM budget. `partial: true` means
+sampling was interrupted, failed or ran out of budget; completed counts remain,
+unavailable scalar counts are null and missing kinds are unknown, not zero.
+Only registered kind labels and counts are emitted, never keys or values.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`
 also reports `uncollapsed`, the windows older than their equal-evidence run's
