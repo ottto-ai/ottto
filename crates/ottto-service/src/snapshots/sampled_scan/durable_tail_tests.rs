@@ -5831,11 +5831,13 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
         if arm == "capacity" {
             let mut stores = owner.cache.durable().unwrap();
+            let spent_at = std::time::Instant::now();
             for n in 0..2 * store::MAX_RECORDS {
-                assert!(stores.fund_key(store::key_digest(
-                    DurableSource::ClaudeCode,
-                    &format!("other-{n}")
-                )));
+                let digest = store::key_digest(DurableSource::ClaudeCode, &format!("other-{n}"));
+                assert!(stores.fund_key(digest));
+                // A real spent-read high water retains authority across begin_pass;
+                // empty reservations are correctly reclaimed before growth.
+                stores.retail_spent.get_mut(&digest).unwrap().spent = Some((1, spent_at));
             }
             assert_eq!(stores.retail_spent.len(), 2 * store::MAX_RECORDS);
         }
@@ -6007,7 +6009,8 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             if arm == "capacity" {
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent.len(),
-                    2 * store::MAX_RECORDS
+                    2 * store::MAX_RECORDS,
+                    "native_restore capacity_spent_authority {context:?}"
                 );
             }
         }
@@ -7234,6 +7237,26 @@ fn b4_structural_transition(near_cap: bool) {
     assert_native_write_before_save(&cache, lock, source, &index, &key);
     cache.retained().unwrap().clear();
     let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    // Typed restore and retained admission need more credit than the native
+    // stream writer. A structural Full may therefore receipt a successor even
+    // though it cannot retain or restore the graph. No quarantine is allowed.
+    let assert_successor = |cache: &SharedCache, end: u64, written: u64| {
+        let disk = store_snapshot(&store::store_dir_for_index(&index_path));
+        assert!(
+            disk.keys().eq(original_disk.keys()),
+            "native_restore structural_no_quarantine entries={}",
+            disk.len()
+        );
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+        assert_eq!(slot.store.counters().records_written, written);
+        let record = store::tests::found(
+            slot.store
+                .read(&store::key_digest(DurableSource::ClaudeCode, &key)),
+        );
+        assert_eq!(record.format, store::FORMAT_V3);
+        assert_eq!(record.record.certificate.length, end);
+    };
     let sealed_birth = std::fs::metadata(&path).unwrap().created().unwrap();
     let append =
         |id: &str| {
@@ -7298,12 +7321,9 @@ fn b4_structural_transition(near_cap: bool) {
     );
     assert!(
         cache.retained().unwrap().peek(&key).is_none(),
-        "native_restore structural_no_record {context:?}"
+        "native_restore structural_no_retained_copy {context:?}"
     );
-    assert_eq!(
-        store_snapshot(&store::store_dir_for_index(&index_path)),
-        original_disk
-    );
+    assert_successor(&cache, end, 2);
     let actual = a0h_batch(&root, &mut next, &mut caught);
     let (mut oracle_index, mut oracle, oracle_modes) = run(
         Arc::new(SharedCache::default()),
@@ -7390,6 +7410,7 @@ fn b4_structural_transition(near_cap: bool) {
         assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
         assert_eq!(caught.snapshots[0].input_tokens, 175);
         assert_eq!(caught_index.files[&key].size_bytes, high);
+        assert_successor(&cache, high, 3);
         assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
             && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
         append("growth-4");
@@ -7412,6 +7433,7 @@ fn b4_structural_transition(near_cap: bool) {
     assert_eq!(modes, (1, 0, final_end));
     assert_eq!(caught.snapshots[0].input_tokens, 150);
     assert_eq!(index.files[&key].size_bytes, final_end);
+    assert_successor(&cache, final_end, 3);
     assert_eq!(cache.durable().unwrap().counters.active_bound[0], [2, 2]);
     index.save(&index_path).unwrap();
     drop(cache);
