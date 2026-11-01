@@ -292,16 +292,7 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
     // [money] Archived account windows stay row-only through the latched OFF
     // load and save, and read back with the pre-switch placement.
     let f = Fixture::new();
-    let window = |day: u32| crate::snapshots::ClaudeAccountFamilyPendingWindow {
-        version: crate::snapshots::CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
-        census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
-        account_identifier_hash: "d".repeat(64),
-        evidence_request_count: 0,
-        census_complete: false,
-        members: BTreeMap::new(),
-        member_requests: BTreeMap::new(),
-        invalid: false,
-    };
+    let window = account_window;
     let mut pre = ScanIndex::default();
     pre.claude_account_family_pending.insert(
         "family".into(),
@@ -333,6 +324,84 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
+}
+/// A synthetic account window ending on October `day`.
+fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    crate::snapshots::ClaudeAccountFamilyPendingWindow {
+        version: crate::snapshots::CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
+        census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
+        account_identifier_hash: "d".repeat(64),
+        evidence_request_count: 0,
+        census_complete: false,
+        members: BTreeMap::new(),
+        member_requests: BTreeMap::new(),
+        invalid: false,
+    }
+}
+/// [money] A held page's subset save commits the working graph's queued cold
+/// rollovers. The retry's working graph adopts that generation, rolls on and
+/// saves without an Unknown refusal; the store reads back exactly as the
+/// resident path leaves it, placement included.
+#[test]
+fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
+    fn family(index: &mut ScanIndex) -> &mut crate::snapshots::ClaudeAccountFamilyPending {
+        index
+            .claude_account_family_pending
+            .get_mut("family")
+            .unwrap()
+    }
+    // Equal evidence at later boundaries: strict rollovers replace the
+    // archive's last endpoint across the subset/working boundary.
+    fn roll(index: &mut ScanIndex, day: u32) {
+        let family = family(index);
+        let old = std::mem::replace(&mut family.current, account_window(day));
+        family.archive(old, true);
+    }
+    let run = |cold: bool| {
+        let f = Fixture::new();
+        let mut pre = ScanIndex::default();
+        pre.claude_account_family_pending.insert(
+            "family".into(),
+            crate::snapshots::ClaudeAccountFamilyPending {
+                current: account_window(27),
+                previous_windows: ArchivedWindows::Resident(vec![
+                    account_window(25),
+                    account_window(26),
+                ]),
+                confirmed_absent_members: BTreeSet::new(),
+            },
+        );
+        f.import_graph(Some(&pre));
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        let loaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let mut working = if cold { loaded } else { materialized(&loaded) };
+        let committed = working.clone();
+        roll(&mut working, 28);
+        assert_eq!(
+            matches!(
+                family(&mut working).previous_windows,
+                ArchivedWindows::Cold(_)
+            ),
+            cold
+        );
+        let mut subset = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held".to_string()]),
+        );
+        assert!(save_with(&f.path, &mut subset).unwrap());
+        working.generation = subset.generation;
+        roll(&mut working, 29);
+        assert!(save_with(&f.path, &mut working).unwrap());
+        let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let mut view = materialized(&reloaded);
+        family(&mut view).clone()
+    };
+    let cold = run(true);
+    assert_eq!(cold, run(false));
+    assert_eq!(cold.current, account_window(29));
+    assert!(!cold.previous_windows.resident().is_empty());
 }
 /// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
 /// and exposes only committed file membership to the restart-record sweep.

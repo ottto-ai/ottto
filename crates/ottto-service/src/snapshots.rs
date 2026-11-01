@@ -84945,6 +84945,11 @@ mod state_v2_maintenance_lock_tests {
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
+#[cfg(test)]
+pub(crate) use state_v2::money_test_support::{
+    has_cold_archive as state_v2_has_cold_archive,
+    roll_account_families as state_v2_roll_account_families, ColdStore as StateV2ColdStore,
+};
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;
