@@ -494,6 +494,7 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
     };
     let [unchanged, sibling, refused, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
     let mut committed: ScanIndex = serde_json::from_value(json!({
+        "files": {},
         "upload_context_fingerprint": "prior-context"
     }))
     .unwrap();
