@@ -1216,7 +1216,7 @@ impl FileFold {
     /// A response of the copied prefix (before the resume boundary, by the
     /// clock `observe` read) that still counts after the page's decision:
     /// its copy proof failed. Exactly the flagged range; own turns never.
-    fn unproven_copy(&self, occurrence: &ClaudeTranscriptUsageOccurrence) -> bool {
+    pub(crate) fn unproven_copy(&self, occurrence: &ClaudeTranscriptUsageOccurrence) -> bool {
         let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
         !occurrence.usage.is_zero()
             && self.money_birth.copied_with_slack(at, SLACK) == Some(true)

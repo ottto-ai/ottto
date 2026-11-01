@@ -1211,12 +1211,33 @@ mod durable_restart {
     /// reconciliation and finish before we serialize the upload request.
     /// A nonempty E2 literal and reported price prevent vacuous equality of
     /// held pages or pre-finalization accumulators.
-    fn enriched_e2(f: &Fixture, mut run: Run) -> Run {
-        crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-            &f.support,
-            &mut run.result,
-            &mut run.index,
-        );
+    fn enriched_e2(f: &Fixture, run: Run) -> Run {
+        enriched_e2_with(f, run, None)
+    }
+
+    /// `enriched_e2` under this cycle's accepted-identity state (its capabilities).
+    fn enriched_e2_with(
+        f: &Fixture,
+        mut run: Run,
+        accepted: Option<&claude_request_identity::AcceptedBuckets>,
+    ) -> Run {
+        match accepted {
+            None => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                    &f.support,
+                    &mut run.result,
+                    &mut run.index,
+                );
+            }
+            Some(accepted) => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                    &f.support,
+                    &mut run.result,
+                    &mut run.index,
+                    Some(accepted),
+                );
+            }
+        }
         apply_upload_policy(
             SOURCE,
             &mut run.result.snapshots,
@@ -1328,6 +1349,85 @@ mod durable_restart {
                     }
                 }
             }
+        });
+    }
+
+    /// [behaviour] SOURCE Q2: after a restart that restores and tails, the
+    /// carry seeds from the restored requests, reading no earlier bytes, and
+    /// equals a cold full read.
+    #[test]
+    fn carry_after_restart_tail_matches_cold_full() {
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let mut accepted = claude_request_identity::AcceptedBuckets::default();
+            accepted.set_account_source_enabled(true);
+            // A leading native gap, then own A. After restart append a
+            // trailing gap: the two native gaps share a row but have
+            // backward/forward provenance, so multipart assertions are real.
+            let f = Fixture::new(2);
+            f.write_rows(false, &f.api[1..2]);
+            f.write_rows(true, &f.trace[1..2]);
+            let state = State::new(&f);
+            let first = Arc::new(SharedCache::default());
+            state.begin(&first);
+            let seed = enriched_e2_with(
+                &f,
+                raw_scan(&f, ScanIndex::default(), Some(first.clone()), |_| {}),
+                Some(&accepted),
+            );
+            let mut prior = settle(seed);
+            prior.save(&state.index_path).unwrap();
+            first.durable_write_after_save(state.lock, SOURCE, &prior);
+            drop(first);
+            // No telemetry row for req_3: a gap after req_2's own A.
+            let prefix_bytes = fs::metadata(&f.path).unwrap().len();
+            f.append_transcript(2);
+            let tail_bytes = fs::metadata(&f.path).unwrap().len() - prefix_bytes;
+            let prior = ScanIndex::load(&state.index_path).unwrap();
+            let restarted = Arc::new(SharedCache::default());
+            state.begin(&restarted);
+            let warm = enriched_e2_with(
+                &f,
+                raw_scan(&f, prior.clone(), Some(restarted.clone()), |_| {}),
+                Some(&accepted),
+            );
+            let cold = enriched_e2_with(&f, raw_scan(&f, prior, None, |_| {}), Some(&accepted));
+            assert_layout_mode(warm.modes, (0, 1, 0));
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(
+                    warm.native_bytes, tail_bytes,
+                    "zero extra native bytes for the seed"
+                );
+            }
+            assert_eq!(
+                restored(&restarted),
+                u64::from(crate::heap_layout_bound::layout_supported())
+            );
+            assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+            let item = &warm.result.snapshots[0];
+            assert!(item
+                .model_usage
+                .iter()
+                .any(|row| row.identity_parts.is_some()));
+            assert_eq!(
+                uniform_session_account_hash(item),
+                f.api[0].account_identifier_hash
+            );
+            assert_eq!(
+                exact_session_account_hash(item),
+                None,
+                "placement is never login proof"
+            );
+            assert_eq!(
+                warm.result.snapshots[0]
+                    .request_evidence
+                    .iter()
+                    .filter_map(|entry| entry.account_source)
+                    .collect::<Vec<_>>(),
+                [
+                    AccountSource::CarriedForward,
+                    AccountSource::CarriedBackward
+                ]
+            );
         });
     }
 

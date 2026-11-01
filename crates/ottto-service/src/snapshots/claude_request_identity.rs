@@ -18,7 +18,7 @@ use super::claude_request_accounts::{local_subscription, normalize_activity};
 use super::{
     activity_bucket_from_timestamp, build_row_identity, claude_snapshot_request_id_hashes,
     codex_identity_is_uuid_shaped, rfc3339_unix_seconds, row_key_from_model_usage,
-    snapshot_fingerprint, usd_picos_string, RowKey, ScanIndex, SelectorCapture,
+    snapshot_fingerprint, usd_picos_string, AccountSource, RowKey, ScanIndex, SelectorCapture,
     SnapshotIdentityPart, SnapshotItem, SnapshotModelUsage, SnapshotRequestEvidence,
     SnapshotSource, UsageTotals, USD_PICO_SCALE,
 };
@@ -199,12 +199,14 @@ pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
-/// present for login and org, then the basis token bytewise.
+/// present for login and org, then the basis token bytewise. A carried key
+/// (`account_source`) sorts after its own-evidence twin and is never proof.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AuthorityKey {
     pub(crate) login: Option<String>,
     pub(crate) org: Option<String>,
     pub(crate) basis: &'static str,
+    pub(crate) account_source: Option<AccountSource>,
 }
 
 impl AuthorityKey {
@@ -212,15 +214,28 @@ impl AuthorityKey {
         EvidenceKey {
             org: self.org.clone(),
             basis: self.basis,
+            account_source: self.account_source,
         }
     }
 }
 
-/// `request_evidence` total order: org absent first, org hash, then basis.
+/// `request_evidence` total order: org absent first, org hash, then basis
+/// (then an absent `account_source` first, so unmarked orders are unchanged).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct EvidenceKey {
     org: Option<String>,
     basis: &'static str,
+    account_source: Option<AccountSource>,
+}
+
+impl EvidenceKey {
+    fn wire(&self) -> SnapshotRequestEvidence {
+        SnapshotRequestEvidence {
+            identity_basis: self.basis.to_string(),
+            provider_workspace_hash: self.org.clone(),
+            account_source: self.account_source,
+        }
+    }
 }
 
 /// Why a request's usage is left untagged. Only refused-versus-missing reaches
@@ -483,6 +498,8 @@ pub(crate) struct Grouping {
     max_groups: usize,
     keys: BTreeSet<AuthorityKey>,
     keys_over_cap: bool,
+    /// This provenance contract keeps over-cap identity owed, never stripped.
+    hold_over_cap: bool,
     upstream_proof_lost: bool,
     /// Additional cache-reconciliation wire bytes, projected once before tags.
     extra_wire_bytes: usize,
@@ -618,6 +635,7 @@ impl Grouping {
             max_groups,
             keys: BTreeSet::new(),
             keys_over_cap: false,
+            hold_over_cap: false,
             upstream_proof_lost: false,
             extra_wire_bytes: 0,
             accepted_share_changed: BTreeSet::new(),
@@ -1221,7 +1239,7 @@ fn apply_grouped_with_accepted(
     }
     // All cap reasons share one exit after display shedding: bytes, authority
     // keys, parts, rows and evidence entries preserve the same owed custody.
-    if max_item_bytes > MAX_ITEM_BYTES && !over_cap.is_empty() {
+    if (max_item_bytes > MAX_ITEM_BYTES || grouping.hold_over_cap) && !over_cap.is_empty() {
         over_cap.insert(OverCap::IdentityHeld);
         crate::local_resource_diagnostics::claude_identity_over_cap(
             &over_cap,
@@ -1576,13 +1594,7 @@ fn fresh_row_value(
     let identity = row_identity(row, by_key, &index).ok()?;
     let mut fresh = row.clone();
     set_row(&mut fresh, identity, &index);
-    let evidence = evidence
-        .into_iter()
-        .map(|entry| SnapshotRequestEvidence {
-            identity_basis: entry.basis.to_string(),
-            provider_workspace_hash: entry.org,
-        })
-        .collect::<Vec<_>>();
+    let evidence = evidence.iter().map(EvidenceKey::wire).collect::<Vec<_>>();
     Some((
         serde_json::to_value(fresh).ok()?,
         serde_json::to_value(evidence).ok()?,
@@ -1622,6 +1634,16 @@ fn defer_retained_rows(
             else {
                 continue;
             };
+            // A carried share never invokes option (ii), even when the
+            // row has prior proof or also contains observed shares.
+            if group
+                .by_key
+                .keys()
+                .flatten()
+                .any(|key| key.account_source.is_some())
+            {
+                continue;
+            }
             let proves = !group.refused
                 && !group.truncated
                 && group
@@ -1672,6 +1694,22 @@ fn defer_retained_rows(
     deferred
 }
 
+/// Marking a previously accepted carry preserves its placement. A carried
+/// slot ACKed without proof remains None; a legacy proved slot compares the
+/// unmarked pair. The shared comparison also governs copy invalidation.
+fn share_placement(
+    accepted: &accepted::AcceptedSession,
+    prior: &BTreeSet<Option<[u8; 32]>>,
+    key: &AuthorityKey,
+) -> Option<[u8; 32]> {
+    let hash = accepted.authority_hash(key);
+    if key.account_source.is_some() && prior.contains(&None) && !prior.contains(&Some(hash)) {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
 /// The frozen share set of a row whose current tagged shares differ from it.
 fn changed_shares(
     accepted: &accepted::AcceptedSession,
@@ -1689,7 +1727,10 @@ fn changed_shares(
         .by_key
         .iter()
         .filter(|(_, amount)| amount.counts != [0; 8])
-        .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
+        .map(|(key, _)| {
+            key.as_ref()
+                .and_then(|key| share_placement(accepted, &prior, key))
+        })
         .collect::<BTreeSet<_>>();
     // Resolving an untagged share to the same surviving tagged set is
     // new proof, not a retag. Missing prior tagged keys still count changed.
@@ -1791,7 +1832,7 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
-                let key = key.filter(|key| prior.contains(&Some(accepted.authority_hash(key))));
+                let key = key.filter(|key| prior.contains(&share_placement(accepted, &prior, key)));
                 // Never reconstruct missing proof from the ledger.
                 kept.entry(key)
                     .or_default()
@@ -1971,6 +2012,7 @@ fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
                                 login,
                                 org: evidence.provider_workspace_hash.as_deref(),
                                 basis,
+                                account_source: evidence.account_source,
                             })
                         }
                     };
@@ -2238,13 +2280,7 @@ fn install(
         .enumerate()
         .map(|(position, entry)| (entry.clone(), position as u16))
         .collect::<BTreeMap<_, _>>();
-    item.request_evidence = evidence
-        .iter()
-        .map(|entry| SnapshotRequestEvidence {
-            identity_basis: entry.basis.to_string(),
-            provider_workspace_hash: entry.org.clone(),
-        })
-        .collect();
+    item.request_evidence = evidence.iter().map(EvidenceKey::wire).collect();
     item.request_identity_refusals = refusals;
     for (row, identity) in item.model_usage.iter_mut().zip(top) {
         set_row(row, identity, &index);
@@ -2701,7 +2737,7 @@ pub(crate) fn semantic_leaf(item: &SnapshotItem) -> Value {
 }
 
 /// Authority-key order of a dereferenced leaf identity (untagged sorts first).
-type LeafOrder = (u8, u8, String, u8, String, String);
+type LeafOrder = (u8, u8, String, u8, String, String, Option<AccountSource>);
 
 fn deref(
     login: Option<&String>,
@@ -2710,8 +2746,13 @@ fn deref(
 ) -> Option<(Value, LeafOrder)> {
     let entry = evidence.get(usize::from(evidence_ref?))?;
     let org = entry.provider_workspace_hash.as_ref();
+    let mut identity = json!({"basis": entry.identity_basis, "login": login, "org": org});
+    // Only a carried share names its source; unmarked leaves keep their bytes.
+    if let Some(source) = entry.account_source {
+        identity["source"] = json!(source);
+    }
     Some((
-        json!({"basis": entry.identity_basis, "login": login, "org": org}),
+        identity,
         (
             1,
             u8::from(login.is_some()),
@@ -2719,6 +2760,7 @@ fn deref(
             u8::from(org.is_some()),
             org.cloned().unwrap_or_default(),
             entry.identity_basis.clone(),
+            entry.account_source,
         ),
     ))
 }
@@ -2754,7 +2796,7 @@ fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence])
                     evidence,
                 );
                 let sort = identity.as_ref().map_or(
-                    (0, 0, String::new(), 0, String::new(), String::new()),
+                    (0, 0, String::new(), 0, String::new(), String::new(), None),
                     |(_, sort)| sort.clone(),
                 );
                 let mut leaf = json!({
@@ -3011,9 +3053,209 @@ pub(crate) struct RequestAccounts {
     /// its grain slot, kept current through telemetry placement, and that
     /// account (see `copy_derived_rows`).
     pub(crate) copied_marker_lent: BTreeMap<u64, LentSlot>,
+    /// This transcript's carried-account placement counts (requests).
+    carried: CarryCounts,
 }
-crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent);
+crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis, account_source);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
+
+/// Requests placed by Ron's carry rule (class N, local counts line).
+#[derive(Clone, Copy, Debug, Default)]
+struct CarryCounts {
+    forward: u64,
+    backward: u64,
+    /// Carried forward from one account to a gap a different account closed.
+    ambiguous_gap: u64,
+    /// A gap no own account could reach: no seed, an incomplete transcript,
+    /// a seed over the key cap, or a run a no-account row ended.
+    no_seed: u64,
+    /// Own telemetry that names no valid account (API key, cloud, placeholder).
+    blocked_no_account: u64,
+    /// Runtime-only resource verdict, propagated into the existing item HOLD.
+    keys_over_cap: bool,
+}
+crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, keys_over_cap);
+
+/// Ron's rule under `session_request_account_source:v1`, within one
+/// transcript in native order (SOURCE 2026-10-31): a gap (a request with no
+/// telemetry row) takes the account the latest earlier request's own
+/// telemetry named, marked `carried_forward`; gaps before the first such
+/// request take it, marked `carried_backward`. Only own telemetry seeds, never
+/// a fill (marker, start, bound, retained, root) or a copied request. A row
+/// naming no valid account blocks the carry on both sides.
+struct Carry<'o> {
+    on: bool,
+    /// The normal read holds every request of this transcript.
+    complete: bool,
+    /// An own (non-copy) request was seen: later gaps carry or stay Unknown.
+    seen_own: bool,
+    /// Invalid telemetry prevents old markers/start/bindings from crossing it.
+    blocked: bool,
+    /// The latest own telemetry account, never a fill-derived key.
+    seed: Option<(u64, Arc<AuthorityKey>)>,
+    first: Option<Arc<AuthorityKey>>,
+    run: u64,
+    /// Gaps before the first seed; the first `closed` were cut off by a block.
+    /// 8 bytes per request, at most 512 KiB (native 65,536 cap), capability on.
+    pending: Vec<&'o mut super::ClaudeTranscriptUsageOccurrence>,
+    closed: usize,
+    counts: CarryCounts,
+}
+
+impl Carry<'_> {
+    fn new(on: bool, complete: bool) -> Self {
+        Self {
+            on,
+            complete,
+            seen_own: false,
+            blocked: false,
+            seed: None,
+            first: None,
+            run: 0,
+            pending: Vec::new(),
+            closed: 0,
+            counts: CarryCounts::default(),
+        }
+    }
+
+    /// The marked twin of an own key, sharing the item's key cap.
+    fn marked(
+        keys: &mut Vec<Arc<AuthorityKey>>,
+        own: &AuthorityKey,
+        source: AccountSource,
+        over_cap: &mut bool,
+    ) -> AccountPartition {
+        let key = AuthorityKey {
+            account_source: Some(source),
+            ..own.clone()
+        };
+        if let Some(known) = keys.iter().find(|known| ***known == key) {
+            return Some(Arc::clone(known));
+        }
+        if keys.len() >= MAX_AUTHORITY_KEYS {
+            *over_cap = true;
+            return None;
+        }
+        let key = Arc::new(key);
+        keys.push(Arc::clone(&key));
+        Some(key)
+    }
+
+    /// A request whose own telemetry named `own`. Only a whole observed pair
+    /// (telemetry org, or a login with no org at all) seeds.
+    fn own(&mut self, sequence: u64, own: &Arc<AuthorityKey>, copy: bool) {
+        if !self.on || copy {
+            return;
+        }
+        // Backward fill reaches only the first own request's account.
+        let first = !self.seen_own;
+        self.seen_own = true;
+        let whole = own.basis == TELEMETRY || (own.basis == TELEMETRY_LOGIN && own.org.is_none());
+        let next = (self.complete && whole).then(|| Arc::clone(own));
+        if next.is_some() {
+            self.blocked = false;
+        }
+        if let (Some((_, previous)), Some(next)) = (&self.seed, &next) {
+            if (&previous.login, &previous.org) != (&next.login, &next.org) {
+                self.counts.ambiguous_gap += self.run;
+            }
+        }
+        self.run = 0;
+        self.seed = next.map(|next| {
+            if first {
+                self.first = Some(Arc::clone(&next));
+            }
+            (sequence, next)
+        });
+    }
+
+    /// Own telemetry naming no valid account: no carry across it.
+    fn block(&mut self, requests: u64) {
+        self.counts.blocked_no_account += requests;
+        self.blocked = true;
+        self.seed = None;
+        self.run = 0;
+        if !self.seen_own {
+            self.closed = self.pending.len();
+        }
+    }
+
+    /// The forward carry for a gap, or main's `earlier` with the switch off.
+    fn forward(
+        &mut self,
+        earlier: &Option<(u64, AccountPartition)>,
+        gap: bool,
+        keys: &mut Vec<Arc<AuthorityKey>>,
+    ) -> Option<(u64, AccountPartition)> {
+        if !self.on {
+            return earlier.clone();
+        }
+        let (position, own) = self.seed.as_ref().filter(|_| gap)?;
+        // Only keys actually used by gaps consume the shared authority cap.
+        Self::marked(
+            keys,
+            own,
+            AccountSource::CarriedForward,
+            &mut self.counts.keys_over_cap,
+        )
+        .map(|key| (*position, Some(key)))
+    }
+
+    /// Counts a request placed without own evidence; returns whether it
+    /// waits for backward fill (a gap before any own request, still Unknown).
+    fn placed(&mut self, gap: bool, account: &AccountPartition, requests: u64) -> bool {
+        if !self.on {
+            return false;
+        }
+        match account {
+            Some(key) if key.account_source == Some(AccountSource::CarriedForward) => {
+                self.counts.forward += requests;
+                self.run += requests;
+                false
+            }
+            // Before own evidence a non-gap keeps main's (absent) fill.
+            Some(_) => false,
+            None if !self.seen_own && !gap => false,
+            None if !self.seen_own && self.complete => true,
+            None => {
+                self.counts.no_seed += requests;
+                false
+            }
+        }
+    }
+
+    /// Backward fill once the walk is done: the first seed's marked twin, or
+    /// Unknown (counted) when there is none or a block cut the gap off.
+    fn finish(
+        mut self,
+        keys: &mut Vec<Arc<AuthorityKey>>,
+        mut place: impl FnMut(&mut super::ClaudeTranscriptUsageOccurrence, AccountPartition),
+    ) -> CarryCounts {
+        let backward = self
+            .first
+            .take()
+            .filter(|_| self.pending.len() > self.closed)
+            .and_then(|first| {
+                Self::marked(
+                    keys,
+                    &first,
+                    AccountSource::CarriedBackward,
+                    &mut self.counts.keys_over_cap,
+                )
+            });
+        for (index, occurrence) in self.pending.into_iter().enumerate() {
+            let requests = occurrence.usage.request_count;
+            match backward.clone().filter(|_| index >= self.closed) {
+                Some(account) => {
+                    self.counts.backward += requests;
+                    place(occurrence, Some(account));
+                }
+                None => self.counts.no_seed += requests,
+            }
+        }
+        self.counts
+    }
+}
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -3030,6 +3272,7 @@ pub(crate) fn request_accounts(
             login: Some(login.to_owned()),
             org: None,
             basis: TELEMETRY_LOGIN,
+            account_source: None,
         })
     });
     let mut accounts = RequestAccounts {
@@ -3063,6 +3306,7 @@ pub(crate) fn request_accounts(
                     login: None,
                     org: Some(org.to_owned()),
                     basis: TRANSCRIPT_ORG,
+                    account_source: None,
                 }));
                 accounts.runs.push(AccountRun {
                     position: marker.position,
@@ -3127,6 +3371,7 @@ pub(crate) fn request_accounts(
                     login: None,
                     org: Some(org.to_owned()),
                     basis: TRANSCRIPT_ORG,
+                    account_source: None,
                 })
             });
         accounts.runs.push(AccountRun {
@@ -3445,6 +3690,7 @@ pub(crate) fn reconcile_request_accounts(
                     login: Some(login),
                     org: None,
                     basis: TELEMETRY_LOGIN,
+                    account_source: None,
                 }));
                 accounts.starting = key.clone();
                 accounts.fallback = key.clone();
@@ -3455,6 +3701,12 @@ pub(crate) fn reconcile_request_accounts(
         }
         // Existing occurrence storage owns these requests. The temporary sort
         // is 16 bytes per resolved request, at most 1 MiB (native 65,536 cap).
+        // Check while the item's request map is still present; draining it
+        // first would make every nonempty transcript look incomplete.
+        let mut carry = Carry::new(
+            evidence.carries_accounts(),
+            !evidence.carries_accounts() || !super::claude_member_invalidity_is_structural(item),
+        );
         let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
         let mut requests = occurrences.iter_mut().collect::<Vec<_>>();
         requests.sort_unstable_by_key(|(_, occurrence)| occurrence.sequence);
@@ -3494,6 +3746,17 @@ pub(crate) fn reconcile_request_accounts(
                 .and_then(|row| *row);
             let identity = request_occurrence_facts(item, request, occurrence, false)
                 .map(|facts| classify_ref(evidence, &facts));
+            let copy = carry.on && fold.unproven_copy(occurrence);
+            // A gap has no telemetry row and no other stream's owner.
+            let gap = carry.on
+                && !copy
+                && !evidence.requests.contains_key(&(root, request.as_str()))
+                && !matches!(
+                    identity,
+                    Some(IdentityRef::Refused(
+                        Refusal::ForeignOwner | Refusal::ConflictingDuplicate
+                    ))
+                );
             let read = matches!(
                 identity,
                 Some(IdentityRef::Tagged(_) | IdentityRef::Missing)
@@ -3557,9 +3820,22 @@ pub(crate) fn reconcile_request_accounts(
             let preserve_org = contradicted && own_marker.is_some();
             let refused = contradicted && own.is_none() && own_marker.is_none();
             let before = accounts.inherited;
-            let account = if preserve_org {
+            let mut backward = false;
+            // Present but invalid/no-account telemetry blocks both directions,
+            // including the contradictory/refused arm. Reuse valid_login's
+            // normalized verdict, never guess from a marker or binding.
+            let blocked = carry.on
+                && (evidence.invalid_logins.contains(&(root, request.as_str()))
+                    || matches!(evidence.requests.get(&(root, request.as_str())), Some(None)));
+            if blocked {
+                carry.block(occurrence.usage.request_count);
+            }
+            let account = if blocked {
+                None
+            } else if preserve_org {
                 own_marker.and_then(|run| run.account.clone())
             } else if let Some(own) = own {
+                carry.own(sequence, &own, copy);
                 let account = Some(own);
                 // The first retained request establishes the actual start;
                 // a durable binding only fills a request with no own evidence.
@@ -3576,12 +3852,16 @@ pub(crate) fn reconcile_request_accounts(
                     .saturating_add(occurrence.usage.request_count);
                 accounts.fallback.clone().or_else(|| accounts.bound.clone())
             } else {
-                let account = match (marker, earlier.as_ref()) {
+                let carried = carry.forward(&earlier, gap, &mut keys);
+                let account = match (marker, carried.as_ref()) {
+                    _ if carry.blocked => None,
                     (Some(marker), Some((position, account))) if marker.position < *position => {
                         account.clone()
                     }
                     (Some(marker), _) => marker.account.clone(),
                     (_, Some((_, account))) => account.clone(),
+                    // After own evidence only a carry or marker places a gap.
+                    _ if carry.on && carry.seen_own => None,
                     _ => accounts
                         .starting
                         .clone()
@@ -3593,6 +3873,7 @@ pub(crate) fn reconcile_request_accounts(
                         .inherited
                         .saturating_add(occurrence.usage.request_count);
                 }
+                backward = !blocked && carry.placed(gap, &account, occurrence.usage.request_count);
                 account
             };
             occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
@@ -3613,7 +3894,17 @@ pub(crate) fn reconcile_request_accounts(
                 native.account(sequence),
                 account,
             );
+            if backward {
+                carry.pending.push(occurrence);
+            }
         }
+        accounts.carried = carry.finish(&mut keys, |occurrence, account| {
+            accounts.inherited = accounts
+                .inherited
+                .saturating_add(occurrence.usage.request_count);
+            occurrence.e2_inherited = Some(true);
+            place_request_identity(&mut fold, occurrence, None, None, account);
+        });
         item.claude_usage_occurrences = occurrences;
         accounts.reconciled = true;
         fold.accounts = Some(accounts);
@@ -3657,6 +3948,7 @@ pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex
                     login: Some(binding.account_identifier_hash.clone()),
                     org: None,
                     basis: TELEMETRY_LOGIN,
+                    account_source: None,
                 })
             });
         let fold = item.claude_money.as_deref_mut().expect("checked fold");
@@ -3777,7 +4069,13 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
-        if accounts.unhealthy_no_fallback {
+        // Reconciliation's new Unknown decisions are final for this file.
+        // A blanket root/start fill must not restore an invalid account or
+        // turn an explicitly seedless gap into unmarked per-request proof.
+        if accounts.unhealthy_no_fallback
+            || (accounts.reconciled
+                && (accounts.carried.blocked_no_account > 0 || accounts.carried.no_seed > 0))
+        {
             continue;
         }
         if accounts.subagent {
@@ -3925,6 +4223,24 @@ pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
         counts.claude_mixed_login_sessions += u64::from(mixed || partitions.len() > 1);
         counts.claude_inherited_org_requests += inherited_requests(&members);
         counts.claude_identity_conflict_fallbacks += u64::from(conflict);
+        // Path twins hold the same transcript: count it once.
+        let carried = members
+            .iter()
+            .filter_map(|item| item.claude_money.as_deref()?.accounts.as_deref())
+            .map(|accounts| accounts.carried)
+            .fold(CarryCounts::default(), |most, next| CarryCounts {
+                forward: most.forward.max(next.forward),
+                backward: most.backward.max(next.backward),
+                ambiguous_gap: most.ambiguous_gap.max(next.ambiguous_gap),
+                no_seed: most.no_seed.max(next.no_seed),
+                blocked_no_account: most.blocked_no_account.max(next.blocked_no_account),
+                keys_over_cap: most.keys_over_cap || next.keys_over_cap,
+            });
+        counts.claude_carried_forward_requests += carried.forward;
+        counts.claude_carried_backward_requests += carried.backward;
+        counts.claude_carry_ambiguous_gap_requests += carried.ambiguous_gap;
+        counts.claude_carry_no_seed_requests += carried.no_seed;
+        counts.claude_carry_blocked_no_account_requests += carried.blocked_no_account;
     }
     counts
 }
@@ -3940,10 +4256,21 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
             counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    for (counter, value) in IDENTITY_COUNTS[5..].iter().zip([
+        counts.claude_carried_forward_requests,
+        counts.claude_carried_backward_requests,
+        counts.claude_carry_ambiguous_gap_requests,
+        counts.claude_carry_no_seed_requests,
+        counts.claude_carry_blocked_no_account_requests,
+    ]) {
+        if value != 0 {
+            counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
-static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     // Current loaded-list inventory, not process-total sums across cycles.
@@ -3964,14 +4291,25 @@ pub(crate) struct IdentityCounts {
     claude_listed_legacy_families: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_listed_legacy_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carried_forward_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carried_backward_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carry_ambiguous_gap_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carry_no_seed_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carry_blocked_no_account_requests: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 pub(crate) fn take_identity_counts() -> IdentityCounts {
-    let [mixed, inherited, conflicts, families, files] = IDENTITY_COUNTS
-        .each_ref()
-        .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [mixed, inherited, conflicts, families, files, forward, backward, ambiguous, no_seed, blocked] =
+        IDENTITY_COUNTS
+            .each_ref()
+            .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
     IdentityCounts {
         identity_cap: budget::take_counts(),
         claude_mixed_login_sessions: mixed,
@@ -3979,6 +4317,11 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_identity_conflict_fallbacks: conflicts,
         claude_listed_legacy_families: families,
         claude_listed_legacy_files: files,
+        claude_carried_forward_requests: forward,
+        claude_carried_backward_requests: backward,
+        claude_carry_ambiguous_gap_requests: ambiguous,
+        claude_carry_no_seed_requests: no_seed,
+        claude_carry_blocked_no_account_requests: blocked,
     }
 }
 
@@ -4000,6 +4343,7 @@ fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
                     login: key.login.as_deref(),
                     org: key.org.as_deref(),
                     basis: key.basis,
+                    account_source: key.account_source,
                 }),
                 None => IdentityRef::Missing,
             };
@@ -4015,10 +4359,16 @@ fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
             );
         },
     )?;
+    let carry_keys_over_cap = item
+        .claude_money
+        .as_deref()
+        .and_then(|fold| fold.accounts.as_deref())
+        .is_some_and(|accounts| accounts.carried.keys_over_cap);
     grouping.upstream_proof_lost = item
         .claude_money
         .as_deref()
         .is_some_and(|fold| fold.entity.identity_over_cap);
+    grouping.upstream_proof_lost |= carry_keys_over_cap;
     grouping.keys_over_cap |= grouping.upstream_proof_lost;
     grouping.latest.unordered |= item
         .claude_money
@@ -4169,6 +4519,12 @@ impl<'a> ScanEvidence<'a> {
         self
     }
 
+    /// This cycle's `session_request_account_source:v1` capability.
+    fn carries_accounts(&self) -> bool {
+        self.accepted_buckets
+            .is_some_and(AcceptedBuckets::account_source_enabled)
+    }
+
     pub(crate) fn with_wire_budget(mut self, budget: WireBudget<'a>) -> Self {
         self.wire_budget = budget;
         self
@@ -4296,6 +4652,7 @@ pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> Ac
         login: Some(login.to_owned()),
         org: Some(org.to_owned()),
         basis: TELEMETRY,
+        account_source: None,
     }))
 }
 
@@ -4392,6 +4749,7 @@ pub(crate) struct KeyRef<'k> {
     login: Option<&'k str>,
     org: Option<&'k str>,
     basis: &'static str,
+    account_source: Option<AccountSource>,
 }
 
 impl KeyRef<'_> {
@@ -4399,6 +4757,7 @@ impl KeyRef<'_> {
         self.basis == key.basis
             && self.login == key.login.as_deref()
             && self.org == key.org.as_deref()
+            && self.account_source == key.account_source
     }
 
     fn to_key(self) -> AuthorityKey {
@@ -4406,6 +4765,7 @@ impl KeyRef<'_> {
             login: self.login.map(str::to_string),
             org: self.org.map(str::to_string),
             basis: self.basis,
+            account_source: self.account_source,
         }
     }
 }
@@ -4417,6 +4777,7 @@ impl AuthorityKey {
             login: self.login.as_deref(),
             org: self.org.as_deref(),
             basis: self.basis,
+            account_source: self.account_source,
         }
     }
 }
@@ -4535,6 +4896,7 @@ pub(crate) fn classify_ref<'k>(
             login: Some(login),
             org: Some(org),
             basis: TELEMETRY,
+            account_source: None,
         });
     }
     // Login-only telemetry: a trusted marker org joins only when it is an
@@ -4554,6 +4916,7 @@ pub(crate) fn classify_ref<'k>(
         login: Some(login),
         org,
         basis: TELEMETRY_LOGIN,
+        account_source: None,
     })
 }
 
@@ -4598,11 +4961,13 @@ fn transcript_identity<'k>(
             login: Some(login),
             org: Some(org),
             basis: TRANSCRIPT_SOLE_LOGIN,
+            account_source: None,
         },
         None => KeyRef {
             login: None,
             org: Some(org),
             basis: TRANSCRIPT_ORG,
+            account_source: None,
         },
     }))
 }
@@ -5443,6 +5808,7 @@ fn tag_item(
             return None;
         }
         let mut grouping = request_owned_grouping(item)?;
+        grouping.hold_over_cap = evidence.carries_accounts();
         let lifecycle = (
             item.source_started_at.clone(),
             item.source_ended_at.clone(),

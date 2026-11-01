@@ -3840,6 +3840,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
         item.request_evidence.push(SnapshotRequestEvidence {
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
+            account_source: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
