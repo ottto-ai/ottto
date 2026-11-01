@@ -1228,6 +1228,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 7,
                 crate::snapshots::DiscoveryRetention {
                     files: &SharedMap::default(),
+                    oversized: None,
                     account_holds: holds,
                     memo: None,
                     growth: None,
@@ -1260,6 +1261,99 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
         gates(&big, &BTreeMap::new()),
         (None, true, false, Value::Null)
     );
+}
+
+/// [regress] An initial size refusal remains owed after save/reload and a
+/// recovery re-walk beyond the discovery window, without an indexed entry.
+#[test]
+fn never_indexed_oversized_debt_survives_the_age_window() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let root = Root::new("ld-oversized-aged");
+        let path = root.projects().join("rollout-oversized.jsonl");
+        let bytes = max_jsonl_file_bytes(source) + 1;
+        File::create(&path).unwrap().set_len(bytes).unwrap();
+        let mut index = ScanIndex::default();
+        let roots = [root.projects()];
+        let walk = |index: &mut ScanIndex, at: &str| {
+            ensure_bounded_traversal(source, &roots, index, at, 7);
+            while !index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_directories
+                .is_empty()
+            {
+                advance_bounded_directory_traversal(source, index, 7, None);
+            }
+        };
+        walk(&mut index, NOW);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().oversized_discovery.len(),
+            1
+        );
+        assert!(index.files.is_empty());
+        let mut saved = serde_json::to_value(&index).unwrap();
+        let first_seen = sampled_scan::now_seconds().saturating_sub(7200);
+        saved["traversal"]["oversized_discovery"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()["first_seen_unix_seconds"] = first_seen.into();
+        let mut index: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
+        set_old(&path);
+        walk(&mut index, "2026-10-15T12:00:00Z");
+        let traversal = index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.counts.oversized_file_count, 1);
+        assert!(traversal
+            .observed_index_keys
+            .contains(&local_index_key(&path)));
+        assert!(discovery_retention!(index).owes(&path));
+        assert!(candidates(&index).is_empty(), "Full remains size bounded");
+        assert!(index.files.is_empty());
+        let (_, rows) = capture(|| oversized_discovery::alarm(source, traversal));
+        let counts = &rows[0]["counts"];
+        assert_eq!(counts["outstanding_file_count"], 1);
+        assert_eq!(counts["outstanding_bytes"], bytes);
+        assert!(counts["first_seen_oversized_age_seconds"].as_u64().unwrap() >= 7200);
+        let before = serde_json::to_value(traversal).unwrap();
+        assert_eq!(
+            before["oversized_discovery"],
+            saved["traversal"]["oversized_discovery"]
+        );
+
+        // Once it fits, the same debt rescues both candidate and open age
+        // gates, so recovery can use the ordinary reader.
+        fs::write(&path, b"{}\n").unwrap();
+        set_old(&path);
+        let candidate = candidate_from_traversal_path(
+            source,
+            ScanTraversalPath {
+                scan_root: root.projects(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut ScanCensus::default(),
+            rfc3339_unix_seconds("2026-10-15T12:00:00Z"),
+            7,
+            &mut CandidateDiscovery::new(&mut index, None),
+        )
+        .expect("small owed file remains a candidate");
+        assert!(open_and_identify_scan_candidate(
+            source,
+            candidate,
+            &mut ScanCensus::default(),
+            rfc3339_unix_seconds("2026-10-15T12:00:00Z"),
+            7,
+            discovery_retention!(index)
+        )
+        .is_some());
+    }
 }
 
 /// [behaviour] Sleep/restart retention is source-neutral: only real positive growth
@@ -3872,6 +3966,7 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
         BACKFILL_WINDOW_DAYS,
         DiscoveryRetention {
             files: &index.files,
+            oversized: None,
             account_holds: &index.claude_account_deferred_holds,
             memo: Some(&index.withheld_memo),
             growth: None,

@@ -1,4 +1,4 @@
-//! Oversized Claude files are honest sweep-wide loss, with content-driven,
+//! Oversized files are honest sweep-wide loss. Claude has content-driven,
 //! cadence-bounded discovery retries and a six-hour recovery re-walk. This
 //! state never enters an upload body.
 use super::*;
@@ -8,6 +8,11 @@ pub(super) struct Debt {
     content_hash: String,
     /// The public loss counter counts sightings, including duplicate hints.
     observations: usize,
+    #[serde(default)]
+    size_bytes: u64,
+    /// Local scheduling clock; never uploaded. Older records start at the next sighting.
+    #[serde(default)]
+    first_seen_unix_seconds: u64,
 }
 
 pub(super) fn path_hash(path: &Path) -> String {
@@ -59,6 +64,9 @@ pub(super) fn merge(target: &mut BTreeMap<String, Debt>, incoming: BTreeMap<Stri
     for (key, mut debt) in incoming {
         if let Some(old) = target.get(&key) {
             debt.observations = debt.observations.saturating_add(old.observations);
+            if old.first_seen_unix_seconds > 0 {
+                debt.first_seen_unix_seconds = old.first_seen_unix_seconds;
+            }
         }
         target.insert(key, debt);
     }
@@ -68,32 +76,69 @@ pub(super) fn record(
     source: SnapshotSource,
     scan_root: &Path,
     path: &Path,
+    size_bytes: u64,
     debts: &mut BTreeMap<String, Debt>,
 ) {
-    if source != SnapshotSource::ClaudeCode {
+    // Only Claude's existing recovery needs content samples. Other sources
+    // retain metadata-only debt and keep their ordinary clock retry cadence.
+    let (size_bytes, content_hash) = if source == SnapshotSource::ClaudeCode {
+        content_witness(scan_root, path).unwrap_or((size_bytes, String::new()))
+    } else {
+        (size_bytes, String::new())
+    };
+    if size_bytes <= max_jsonl_file_bytes(source) {
         return;
     }
-    // A failed witness stays untracked retryable loss; never suppress its
-    // existing clock recovery without the content evidence needed to wake it.
-    if let Ok((size, content_hash)) = content_witness(scan_root, path) {
-        // It may have shrunk between discovery's stat and this no-follow
-        // sample. Leave that sighting on ordinary recovery, so a small-file
-        // marker cannot suppress the parse that is now possible.
-        if size <= MAX_CLAUDE_JSONL_FILE_BYTES {
-            return;
-        }
-        let key = path_hash(path);
-        let observations = debts
-            .get(&key)
-            .map_or(1, |old| old.observations.saturating_add(1));
-        debts.insert(
-            key,
-            Debt {
-                content_hash,
-                observations,
-            },
-        );
+    let debt = debts.entry(path_hash(path)).or_insert_with(|| Debt {
+        content_hash: String::new(),
+        observations: 0,
+        size_bytes,
+        first_seen_unix_seconds: sampled_scan::now_seconds(),
+    });
+    debt.content_hash = content_hash;
+    debt.size_bytes = size_bytes;
+    debt.observations = debt.observations.saturating_add(1);
+    if debt.first_seen_unix_seconds == 0 {
+        debt.first_seen_unix_seconds = sampled_scan::now_seconds();
     }
+}
+
+/// Re-walks reset sighting counters, but never reset an outstanding alarm's age.
+pub(super) fn restart(traversal: Option<&mut ScanTraversalCheckpoint>) -> BTreeMap<String, Debt> {
+    let mut debts = traversal
+        .map(|walk| std::mem::take(&mut walk.oversized_discovery))
+        .unwrap_or_default();
+    for debt in debts.values_mut() {
+        debt.observations = 0;
+    }
+    debts
+}
+
+pub(super) fn alarm(source: SnapshotSource, traversal: &ScanTraversalCheckpoint) {
+    let now = sampled_scan::now_seconds();
+    let mut bytes = 0_u64;
+    let mut age = 0_u64;
+    for debt in traversal.oversized_discovery.values() {
+        bytes = bytes.saturating_add(debt.size_bytes);
+        if debt.first_seen_unix_seconds > 0 {
+            age = age.max(now.saturating_sub(debt.first_seen_unix_seconds));
+        }
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "oversized_discovery_alarm",
+        source.api_slug(),
+        &serde_json::json!({
+            "outstanding_file_count": traversal.oversized_discovery.len(),
+            "outstanding_bytes": bytes,
+            "first_seen_oversized_age_seconds": age,
+        }),
+    );
+}
+
+pub(super) fn release(counts: &mut ScanTraversalCounts, debt: Debt) {
+    counts.oversized_file_count = counts
+        .oversized_file_count
+        .saturating_sub(debt.observations);
 }
 
 pub(super) fn clock_retry_required(
@@ -104,7 +149,11 @@ pub(super) fn clock_retry_required(
         return traversal.counts.has_errors();
     }
     let mut counts = traversal.counts.clone();
-    for debt in traversal.oversized_discovery.values() {
+    for debt in traversal
+        .oversized_discovery
+        .values()
+        .filter(|debt| !debt.content_hash.is_empty())
+    {
         counts.oversized_file_count = counts
             .oversized_file_count
             .saturating_sub(debt.observations);
@@ -167,11 +216,9 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
         changed = true;
         if size > MAX_CLAUDE_JSONL_FILE_BYTES {
             // Retried this file's discovery cap, with the new content witness.
-            traversal
-                .oversized_discovery
-                .get_mut(&hash)
-                .unwrap()
-                .content_hash = content_hash;
+            let debt = traversal.oversized_discovery.get_mut(&hash).unwrap();
+            debt.content_hash = content_hash;
+            debt.size_bytes = size;
         } else {
             let scan_root = scan_root.clone();
             let debt = traversal.oversized_discovery.remove(&hash).unwrap();
@@ -200,4 +247,4 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
     }
 }
 
-crate::heap_layout_bound::fields!(Debt; content_hash, observations);
+crate::heap_layout_bound::fields!(Debt; content_hash, observations, size_bytes, first_seen_unix_seconds);

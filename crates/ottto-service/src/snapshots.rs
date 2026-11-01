@@ -41,6 +41,13 @@ macro_rules! discovery_retention {
     };
     ($index:expr) => {
         $crate::snapshots::DiscoveryRetention {
+            oversized: $index.traversal.as_ref().map(|walk| &walk.oversized_discovery),
+            ..discovery_retention!(@entries $index)
+        }
+    };
+    (@entries $index:expr) => {
+        $crate::snapshots::DiscoveryRetention {
+            oversized: None,
             files: &$index.files,
             account_holds: &$index.claude_account_deferred_holds,
             memo: Some(&$index.withheld_memo),
@@ -26824,7 +26831,10 @@ impl OwnedSourceScan {
                 source,
                 traversal,
                 backfill_window_days,
-                discovery_retention!(index, &resource_probe.discovery_growth),
+                DiscoveryRetention {
+                    growth: Some(&resource_probe.discovery_growth),
+                    ..discovery_retention!(@entries index)
+                },
             );
             start_due_listing_pass(traversal, collected_at);
             next_generation_hints =
@@ -31856,6 +31866,9 @@ impl OwnedSourceScan {
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
                 }
+                if let Some(traversal) = index.traversal.as_ref() {
+                    oversized_discovery::alarm(source, traversal);
+                }
                 let traversal_snapshot = index
                     .traversal
                     .as_ref()
@@ -32600,6 +32613,14 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
+            if let Some(traversal) = index.traversal.as_mut() {
+                if let Some(debt) = traversal
+                    .oversized_discovery
+                    .remove(&oversized_discovery::path_hash(&candidate.path))
+                {
+                    oversized_discovery::release(&mut traversal.counts, debt);
+                }
+            }
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
@@ -43500,6 +43521,12 @@ fn ensure_bounded_traversal(
     if let Some(parts) = context_observation {
         claude_contract::started_context(&context_fingerprint, parts, roots);
     }
+    let oversized_debt = oversized_discovery::restart(
+        index
+            .traversal
+            .as_mut()
+            .filter(|_| prior_traversal_context_matches),
+    );
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -43507,7 +43534,7 @@ fn ensure_bounded_traversal(
         pending_directories,
         pending_candidates: VecDeque::new(),
         observed_index_keys: Default::default(),
-        oversized_discovery: BTreeMap::new(),
+        oversized_discovery: oversized_debt,
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
             .then(codex_file_join::DirectoryCensus::new),
@@ -43885,6 +43912,10 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
+            let retention = DiscoveryRetention {
+                oversized: Some(&traversal.oversized_discovery),
+                ..retention
+            };
             retention.observe_stamped_growth(
                 &path,
                 metadata.len(),
@@ -43910,6 +43941,7 @@ fn refresh_retained_codex_roster(
                     source,
                     &scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -44401,7 +44433,8 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             let retention = DiscoveryRetention {
                 growth,
-                ..discovery_retention!(index)
+                oversized: Some(&traversal.oversized_discovery),
+                ..discovery_retention!(@entries index)
             };
             let modified_unix_seconds = metadata
                 .modified()
@@ -44479,14 +44512,15 @@ fn advance_bounded_directory_traversal_with_budget(
             traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
+                retention.note_withheld_oversized(source, &path);
                 oversized_discovery::record(
                     source,
                     &directory.scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
-                retention.note_withheld_oversized(source, &path);
                 continue;
             }
             if let Some(&position) = pending.get(&path) {
@@ -44515,6 +44549,20 @@ fn advance_bounded_directory_traversal_with_budget(
         }
     }
     restore(&mut traversal.counts, relisted_counts);
+    if !traversal.oversized_discovery.is_empty()
+        && traversal.pending_directories.is_empty()
+        && walk_issues(&traversal.counts) == (0, 0, 0, 0)
+    {
+        let present = traversal
+            .observed_index_keys
+            .iter()
+            .map(|key| oversized_discovery::path_hash(Path::new(key)))
+            .filter(|key| traversal.oversized_discovery.contains_key(key))
+            .collect::<BTreeSet<_>>();
+        traversal
+            .oversized_discovery
+            .retain(|key, _| present.contains(key));
+    }
     if walk_issues(&traversal.counts) != issues_before {
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
@@ -44711,6 +44759,7 @@ fn candidate_from_traversal_path_at(
                 source,
                 &pending.scan_root,
                 &pending.path,
+                metadata.len(),
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &pending.path);
@@ -45047,7 +45096,13 @@ fn collect_recent_jsonl_files(
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
             census.oversized_file_count += 1;
-            oversized_discovery::record(source, scan_root, &path, &mut census.oversized_discovery);
+            oversized_discovery::record(
+                source,
+                scan_root,
+                &path,
+                metadata.len(),
+                &mut census.oversized_discovery,
+            );
             continue;
         }
         selection.insert(CandidateFile {
@@ -45106,6 +45161,8 @@ struct AccountMoveObservations {
 struct DiscoveryRetention<'a> {
     /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
     files: &'a SharedMap<String, ScanIndexEntry>,
+    /// Initial size refusals are owed even with no indexed size witness.
+    oversized: Option<&'a BTreeMap<String, oversized_discovery::Debt>>,
     /// Correctness hold: unresolved ownership debt stays discoverable, including growth.
     /// Only the approved interim withheld_reparse{start,evidence,growth} exception may Full.
     /// At the hold cap no new exemption is invented; unknown identity cannot memo-Skip.
@@ -45151,6 +45208,9 @@ impl<'a> DiscoveryRetention<'a> {
     fn owes(&self, path: &Path) -> bool {
         sampled_audit::path_requires_verification(self.files, path)
             || self.account_holds.contains_key(&local_index_key(path))
+            || self
+                .oversized
+                .is_some_and(|debts| debts.contains_key(&oversized_discovery::path_hash(path)))
     }
 
     fn owes_stamped(
@@ -45201,6 +45261,7 @@ mod discovery_support {
             static NONE: BTreeMap<String, String> = BTreeMap::new();
             Self {
                 files,
+                oversized: None,
                 account_holds: &NONE,
                 memo: None,
                 growth: None,
@@ -45470,6 +45531,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                 source,
                 &candidate.scan_root,
                 &candidate.path,
+                candidate.size_bytes,
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &candidate.path);
