@@ -440,13 +440,6 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
 }
-/// One failed parking decision; no logging, resource probes or scan ownership.
-pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
-    source_count(source, 16 + usize::from(layout_supported), |slot| {
-        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-            .unwrap_or_else(|n| n)
-    });
-}
 
 /// A vanished file's index entry was retired while its parsed body was not
 /// ACKed; nothing holds or resends that body. `usage` is the resident
@@ -862,8 +855,6 @@ impl Probe {
             #[serde(flatten)]
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
@@ -898,10 +889,6 @@ impl Probe {
                         .and_then(|memo| memo.held_gauge())
                 })
                 .flatten(),
-            source_rotation_serial_fallback: drain(
-                source,
-                &[("unsupported_layout", 16), ("bound_refused", 17)],
-            ),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()

@@ -51161,7 +51161,7 @@ impl ScanIndex {
     }
 
     /// The caller already owns the scanned graph. Restore only held keys in
-    /// that allocation; the unchanged borrowed implementation remains a test-only oracle.
+    /// that allocation.
     pub(crate) fn into_locally_held_keys_reverted(
         mut self,
         previous: &ScanIndex,

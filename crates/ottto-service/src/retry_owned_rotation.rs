@@ -22,13 +22,10 @@ struct OwnedRotationProof {
     retries: Vec<(usize, u64)>,
     controls: BTreeMap<&'static str, (String, serde_json::Value)>,
     cancel: Option<&'static str>,
-    force_refusal: bool,
-    budget: usize,
-    max_parked_bound: usize,
     max_shared_bound_and_send: usize,
 }
 impl OwnedRotationProof {
-    fn new(hours: usize, cancel: Option<&'static str>, force_refusal: bool, budget: usize) -> Self {
+    fn new(hours: usize, cancel: Option<&'static str>) -> Self {
         let a = SameSourceAckFixture::new();
         let b = integrated_claude(hours);
         let pi = RotationRoot(test_dir("owned-rotation-pi"));
@@ -82,9 +79,6 @@ impl OwnedRotationProof {
             retries: vec![],
             controls,
             cancel,
-            force_refusal,
-            budget,
-            max_parked_bound: 0,
             max_shared_bound_and_send: 0,
         }
     }
@@ -126,8 +120,7 @@ impl OwnedRotationProof {
             );
             self.now += 4_000;
             let slots_bound = self.slots.iter().flatten().map(|s| s.bound).sum::<usize>();
-            let combined =
-                self.max_parked_bound + slots_bound + *self.trace.send_peaks.last().unwrap();
+            let combined = slots_bound + *self.trace.send_peaks.last().unwrap();
             assert!(combined <= crate::source_rotation::OVERLAP_BUDGET);
             self.max_shared_bound_and_send = self.max_shared_bound_and_send.max(combined);
             if let Err(error) = result {
@@ -178,12 +171,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                 "backfill_window_days":30,"recommended_scan_after":"2026-10-05T00:05:00Z"
             }))
             .unwrap();
-        let mut progress = test_upload_progress();
-        if self.force_refusal {
-            progress
-                .accepted_cache_states
-                .insert("opaque".into(), serde_json::json!({"opaque":true}));
-        }
         Ok(Some(SourcePreparation {
             native_comparison_reservation: None,
             native_comparison_lease: None,
@@ -210,7 +197,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             receipt_client: SnapshotApiClient::new("http://offline.invalid"),
             index_path: root.join("owned-index.json"),
             upload_progress_path: root.join("owned-progress.json"),
-            upload_progress: progress,
+            upload_progress: test_upload_progress(),
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
@@ -269,13 +256,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             } => crate::source_rotation::Step::Complete((preparation, index, scan)),
         }
     }
-    fn bound(&self, frame: &SourcePreparation, limit: usize) -> Option<usize> {
-        let bound = crate::heap_layout_bound::bound(frame, limit);
-        if self.force_refusal {
-            assert!(bound.is_none());
-        }
-        bound
-    }
     fn finish(&mut self, completed: Self::Completed, _remaining: Option<usize>) -> Result<()> {
         let (preparation, index, scan) = completed;
         let expected = &self.controls[preparation.source.api_slug()];
@@ -302,10 +282,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
     }
     fn monotonic(&self) -> Duration {
         Duration::from_millis(self.now)
-    }
-    fn parked(&mut self, bytes: usize) {
-        assert!(bytes <= self.budget);
-        self.max_parked_bound = self.max_parked_bound.max(bytes);
     }
 }
 
