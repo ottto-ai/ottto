@@ -30097,13 +30097,12 @@ impl OwnedSourceScan {
                     std::mem::take(&mut group.recovered)
                 });
                 let mut parser = parser;
-                if parser.accumulator.source == SnapshotSource::Pi {
-                    // RAM-only membership of the fork's parent; counts only.
-                    parser
-                        .accumulator
-                        .seen_pi_usage_keys
-                        .finish_fork_read(|parent| index.files.contains_key(parent));
-                }
+                // RAM-only membership of a fork's parent; counts only. A
+                // file whose header names no parent has no fork state.
+                parser
+                    .accumulator
+                    .seen_pi_usage_keys
+                    .finish_fork_read(|parent| index.files.contains_key(parent));
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
@@ -37012,8 +37011,7 @@ impl OwnedJsonlParser {
         // A fully read Pi fork whose positive usage was all copied must
         // publish zero too: an earlier accepted revision can be inflated.
         let (has_parent, header_nanos) = accumulator.seen_pi_usage_keys.fork_parts();
-        let emit_empty_pi_fork = source == SnapshotSource::Pi
-            && has_parent
+        let emit_empty_pi_fork = has_parent
             && header_nanos.is_some()
             && report.complete()
             && recognized_usage_drop_count == 0
