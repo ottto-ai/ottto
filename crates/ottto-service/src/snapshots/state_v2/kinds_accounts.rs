@@ -300,7 +300,7 @@ pub(super) fn hydrate_filtered(
     let cold = roots.is_none() && index.decode_holds.is_empty();
     macro_rules! load {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, roots, seed.as_deref_mut())?;
+            index.$f = mapper::read_field_map(tx, $kind, roots, seed.as_deref_mut())?;
         };
         ($($t:tt)*) => {};
     }

@@ -327,7 +327,6 @@ mod tests {
     };
     use super::*;
     use std::{
-        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
     };
@@ -591,7 +590,9 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                    crate::snapshots::DiscoveryRetention::unverified(
+                        &crate::snapshots::SharedMap::default(),
+                    ),
                 )
             });
             assert!(opened.is_none());
@@ -1491,7 +1492,9 @@ mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
         });
         assert!(opened.is_none());
@@ -1579,7 +1582,9 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                    crate::snapshots::DiscoveryRetention::unverified(
+                        &crate::snapshots::SharedMap::default()
+                    ),
                 )
                 .is_none());
             }
@@ -1834,7 +1839,9 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
         });
         assert_eq!(events[1][Site::Open.index()], [1, 0]);

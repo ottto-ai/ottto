@@ -88,6 +88,10 @@ mod contract5_cutover_tests;
 mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
+mod shared_value;
+#[cfg(test)]
+mod shared_value_tests;
+pub(crate) use shared_value::{Shared, SharedMap};
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
@@ -2719,7 +2723,7 @@ struct ScanTraversalCheckpoint {
     scan_roots: Vec<PathBuf>,
     pending_directories: VecDeque<ScanTraversalPath>,
     pending_candidates: VecDeque<ScanTraversalPath>,
-    observed_index_keys: BTreeSet<String>,
+    observed_index_keys: Shared<BTreeSet<String>>,
     /// Complete current Codex rollout population, including files outside the
     /// usage lookback. Parent-prefix uniqueness cannot ignore an older
     /// duplicate source-session id merely because it is not a usage candidate.
@@ -3570,7 +3574,7 @@ pub struct ScanIndex {
     /// pass before this witness advances.
     #[serde(default)]
     upload_context_fingerprint: Option<String>,
-    pub files: BTreeMap<String, ScanIndexEntry>,
+    pub files: SharedMap<String, ScanIndexEntry>,
     /// Hash-only owner proof keyed by machine and session in this source index.
     /// A later current login can never replace it.
     #[serde(default)]
@@ -3690,7 +3694,7 @@ pub struct ScanIndex {
     /// store without retaining these safe extracted fields would make titles
     /// disappear whenever their file was outside the current bounded page.
     #[serde(default)]
-    claude_desktop_title_files: BTreeMap<String, ClaudeDesktopTitleIndexEntry>,
+    claude_desktop_title_files: SharedMap<String, ClaudeDesktopTitleIndexEntry>,
     /// Proven root/child account families survive incremental child-only
     /// reparses. The witness is local-only, carries no raw account identifier,
     /// and is created only from a complete filesystem census plus exact request
@@ -3703,7 +3707,7 @@ pub struct ScanIndex {
     /// persist only content-free request-set fingerprints; raw provider request
     /// ids remain in the transcript/API sidecars that produced them.
     #[serde(default)]
-    claude_usage_family_witnesses: BTreeMap<String, ClaudeUsageFamilyWitness>,
+    claude_usage_family_witnesses: SharedMap<String, ClaudeUsageFamilyWitness>,
     #[serde(default)]
     claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
     /// Slice D1: one request-census record per Claude transcript index key,
@@ -3908,17 +3912,17 @@ pub struct ScanIndex {
     /// Most files contain one session; the set preserves exact entity grain
     /// for split/provider files instead of hiding all but an arbitrary last.
     #[serde(default)]
-    pub file_snapshot_fingerprints: BTreeMap<String, BTreeSet<String>>,
+    pub file_snapshot_fingerprints: SharedMap<String, BTreeSet<String>>,
     /// Server-reconstructible semantic activity clock for each final entity.
     /// This mirrors the accepted-log `occurred_at` rule and never uses local
     /// file mtime or the collector observation clock.
     #[serde(default)]
-    pub snapshot_activity_at: BTreeMap<String, Option<String>>,
+    pub snapshot_activity_at: SharedMap<String, Option<String>>,
     /// Exact entity ACK identities known durable at the backend. Older indexes
     /// deserialize this empty. The separate version bit distinguishes that
     /// legacy absence from a current, authoritatively empty ledger.
     #[serde(default)]
-    accepted_snapshot_fingerprints: BTreeSet<String>,
+    accepted_snapshot_fingerprints: Shared<BTreeSet<String>>,
     #[serde(default)]
     accepted_snapshot_fingerprint_ledger_version: u8,
     /// Restart-stable lexicographic cursor for bounded re-entry of ambiguous
@@ -4257,7 +4261,7 @@ impl Default for ScanIndex {
             generation: 0,
             upload_ack_retirement_handoff: None,
             upload_context_fingerprint: None,
-            files: BTreeMap::new(),
+            files: SharedMap::default(),
             retired_reread_guard: serde::de::IgnoredAny,
             session_account_bindings: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
@@ -4282,10 +4286,10 @@ impl Default for ScanIndex {
             codex_proof_index_incarnation: String::new(),
             codex_proof_index_minted: String::new(),
             codex_parent_proof_parents_live: BTreeMap::new(),
-            claude_desktop_title_files: BTreeMap::new(),
+            claude_desktop_title_files: SharedMap::default(),
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
-            claude_usage_family_witnesses: BTreeMap::new(),
+            claude_usage_family_witnesses: SharedMap::default(),
             claude_usage_family_pending: BTreeMap::new(),
             claude_request_census: ClaudeRequestCensus::default(),
             claude_request_census_shadow: ClaudeRequestCensusShadowState::default(),
@@ -4332,9 +4336,9 @@ impl Default for ScanIndex {
             codex_counting_tombstones: BTreeMap::new(),
             codex_counting_evicted_legacy: Default::default(),
             codex_counting_evictions: [0; 3],
-            file_snapshot_fingerprints: BTreeMap::new(),
-            snapshot_activity_at: BTreeMap::new(),
-            accepted_snapshot_fingerprints: BTreeSet::new(),
+            file_snapshot_fingerprints: SharedMap::default(),
+            snapshot_activity_at: SharedMap::default(),
+            accepted_snapshot_fingerprints: Default::default(),
             accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
             legacy_settlement_reconcile_after_fingerprint: None,
             quarantined_snapshot_fingerprints: BTreeMap::new(),
@@ -6784,11 +6788,12 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
     let roots_count = carry.roots.union(&carry.capped_roots).count();
     let carry = &mut index.claude_stale_family_carry;
     let mut rearmed = 0_usize;
-    for (index_key, entry) in &mut index.files {
+    for (index_key, entry) in index.files.slots_mut() {
         if claude_index_path_member_ref(Path::new(index_key))
             .is_some_and(|member| carry.contains(member.root))
             && !entry.rearmed()
         {
+            let entry = entry.make_mut();
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
@@ -7079,12 +7084,13 @@ fn replay_and_rearm_claude_family(
         }
     }
     let mut rearmed = 0_usize;
-    for (index_key, entry) in &mut index.files {
+    for (index_key, entry) in index.files.slots_mut() {
         if (rearm_parsed || index_key.as_str() != parsed_key)
             && in_family(index_key)
             && !entry.rearmed()
         {
             // Defensive reset of the parsed member remains explicit read debt.
+            let entry = entry.make_mut();
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
@@ -8854,7 +8860,7 @@ pub fn apply_claude_effort_evidence_with_index(
         .map(|(root, _)| root.clone())
         .collect::<BTreeSet<_>>();
     if !reprove_roots.is_empty() {
-        for (key, entry) in &mut index.files {
+        for (key, entry) in index.files.slots_mut() {
             if claude_index_path_family_member(Path::new(key))
                 .is_some_and(|(root, _)| reprove_roots.contains(&root))
             {
@@ -8862,7 +8868,9 @@ pub fn apply_claude_effort_evidence_with_index(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::AccountReproof,
                     !entry.source_file_fingerprint.is_empty(),
                 );
-                entry.source_file_fingerprint.clear();
+                if !entry.source_file_fingerprint.is_empty() {
+                    entry.make_mut().source_file_fingerprint.clear();
+                }
             }
         }
         index
@@ -8901,7 +8909,7 @@ pub fn apply_claude_effort_evidence_with_index(
                 .then_some(root_session_id.clone())
             })
             .collect::<BTreeSet<_>>();
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
             else {
@@ -8911,8 +8919,9 @@ pub fn apply_claude_effort_evidence_with_index(
                 && complete_family_members
                     .get(&root_session_id)
                     .is_some_and(|members| members.contains(&source_session_id))
+                && !entry.source_file_fingerprint.is_empty()
             {
-                entry.source_file_fingerprint.clear();
+                entry.make_mut().source_file_fingerprint.clear();
             }
         }
         index
@@ -9021,7 +9030,7 @@ pub fn apply_claude_effort_evidence_with_index(
                         .contains_key(*root_session_id)
             })
             .collect::<BTreeSet<_>>();
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
             else {
@@ -9029,11 +9038,12 @@ pub fn apply_claude_effort_evidence_with_index(
             };
             if newly_proven_roots.contains(&root_session_id)
                 && !current_source_session_ids.contains(source_session_id.as_str())
+                && !entry.source_file_fingerprint.is_empty()
             {
                 // Earlier pages uploaded an honest NULL before the terminal
                 // census could prove the family. Reparse them once so the new
                 // durable witness emits the correction on the next pass.
-                entry.source_file_fingerprint.clear();
+                entry.make_mut().source_file_fingerprint.clear();
             }
         }
     }
@@ -10014,7 +10024,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         })
         .collect::<BTreeSet<_>>();
     if !owned_start_reparse_ids.is_empty() {
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             if claude_index_path_family_member(Path::new(index_key)).is_some_and(
                 |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
             ) {
@@ -10022,7 +10032,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
                     !entry.source_file_fingerprint.is_empty(),
                 );
-                entry.source_file_fingerprint.clear();
+                if !entry.source_file_fingerprint.is_empty() {
+                    entry.make_mut().source_file_fingerprint.clear();
+                }
             }
         }
     }
@@ -10578,7 +10590,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let guard = evidence_owed::enabled();
         let census_window = rfc3339_unix_seconds(census_window_end);
         let contract_window = index.claude_full_rearm_progress.identity_contract_window;
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
             else {
@@ -10679,7 +10691,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     || changed_duplicate_owner
                     || current_member_owns_changed_request
                 {
-                    entry.source_file_fingerprint.clear();
+                    if !entry.source_file_fingerprint.is_empty() {
+                        entry.make_mut().source_file_fingerprint.clear();
+                    }
                 } else {
                     if identity_contract_rearm && !entry.rearmed() {
                         let reowed =
@@ -10690,7 +10704,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                             owed.reowed_after_current_contract_read += u64::from(reowed);
                         });
                     }
-                    evidence_owed::clear(entry);
+                    evidence_owed::clear(entry.make_mut());
                 }
                 rearmed_bytes = rearmed_bytes.saturating_add(entry.size_bytes);
             } else if proof_candidate && negative {
@@ -12241,9 +12255,9 @@ fn claude_tombstone_repair_scratch_admitted(
 /// the normal reserve-before-retire covers only RetryPending records, so its
 /// later disappearance would prune the witness.
 fn claude_fence_present_roots<'k>(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     confirmed_empty_files: &BTreeSet<String>,
-    witnesses: &BTreeMap<String, ClaudeUsageFamilyWitness>,
+    witnesses: &SharedMap<String, ClaudeUsageFamilyWitness>,
     observed_index_keys: &'k BTreeSet<String>,
     residue_index_keys: &'k BTreeSet<String>,
 ) -> BTreeMap<&'k str, bool> {
@@ -12273,7 +12287,7 @@ fn claude_fence_present_roots<'k>(
 /// witness is either tombstoned or found, so the count visits at most
 /// `tombstones.len() + limit` witnesses.
 fn count_untombstoned_claude_witnessed_roots(
-    witnesses: &BTreeMap<String, ClaudeUsageFamilyWitness>,
+    witnesses: &SharedMap<String, ClaudeUsageFamilyWitness>,
     tombstones: &BTreeMap<String, u64>,
     present: &BTreeMap<&str, bool>,
     limit: usize,
@@ -27362,7 +27376,7 @@ impl OwnedSourceScan {
                 index
                     .traversal
                     .as_ref()
-                    .map(|traversal| traversal.observed_index_keys.clone())
+                    .map(|traversal| (*traversal.observed_index_keys).clone())
                     .unwrap_or_default()
             } else {
                 index.files.keys().cloned().collect()
@@ -42867,12 +42881,16 @@ fn ensure_bounded_traversal(
         // A completed checkpoint already takes the ordinary fresh-start
         // stale-pending re-arm below; only an active walk needs rewinding.
         if !recompute_terminal_carry && !retained.is_empty() && index.traversal.is_some() {
-            for (key, entry) in &mut index.files {
+            for (key, entry) in index.files.slots_mut() {
                 if claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     retained.roots.contains(member.root)
                         || retained.capped_roots.contains(member.root)
                 }) {
-                    rearm_cause::clear(key, entry, rearm_cause::Cause::CarryInvalidation);
+                    rearm_cause::clear(
+                        key,
+                        entry.make_mut(),
+                        rearm_cause::Cause::CarryInvalidation,
+                    );
                 }
             }
             for candidate in &retained.replay {
@@ -43297,7 +43315,7 @@ fn ensure_bounded_traversal(
         let mut carried_file_count = 0_usize;
         let mut capped_file_count = 0_usize;
         let mut window_rearmed_file_count = 0_usize;
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some((root, _)) = claude_index_path_family_member(Path::new(index_key))
                 .filter(|(root, _)| stale_pending_roots.contains(root))
             else {
@@ -43317,7 +43335,7 @@ fn ensure_bounded_traversal(
             } else {
                 rearm_cause::clear_owed(
                     index_key,
-                    entry,
+                    entry.make_mut(),
                     transition.rearm_cause(),
                     transition.owes(),
                 );
@@ -43541,7 +43559,7 @@ fn ensure_bounded_traversal(
         scan_roots,
         pending_directories,
         pending_candidates: VecDeque::new(),
-        observed_index_keys: BTreeSet::new(),
+        observed_index_keys: Default::default(),
         oversized_discovery: BTreeMap::new(),
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
@@ -43586,7 +43604,7 @@ fn ensure_bounded_traversal(
 fn codex_selection_may_exhaust_page(
     traversal: &ScanTraversalCheckpoint,
     file_limit: usize,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
 ) -> bool {
     if traversal.pending_candidates.len() > file_limit {
         return true;
@@ -43620,7 +43638,7 @@ fn codex_selection_may_exhaust_page(
 /// New paths need a watcher/roster hint so a cold history walk stays FIFO.
 fn codex_fresh_data_pending(
     candidate: &ScanTraversalPath,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
 ) -> bool {
     let entry = files.get(&local_index_key(&candidate.path));
     if entry.is_none() && !candidate.watcher_hint {
@@ -45140,7 +45158,7 @@ struct AccountMoveObservations {
 #[derive(Clone, Copy)]
 struct DiscoveryRetention<'a> {
     /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
-    files: &'a BTreeMap<String, ScanIndexEntry>,
+    files: &'a SharedMap<String, ScanIndexEntry>,
     /// Correctness hold: unresolved ownership debt stays discoverable, including growth.
     /// Only the approved interim withheld_reparse{start,evidence,growth} exception may Full.
     /// At the hold cap no new exemption is invented; unknown identity cannot memo-Skip.
@@ -45231,7 +45249,7 @@ mod discovery_support {
         }
         /// Entries only: no other owed source (tests and index-free callers).
         pub(in crate::snapshots) fn unverified(
-            files: &'a BTreeMap<String, ScanIndexEntry>,
+            files: &'a SharedMap<String, ScanIndexEntry>,
         ) -> Self {
             static NONE: BTreeMap<String, String> = BTreeMap::new();
             Self {
@@ -45811,7 +45829,7 @@ fn opened_object_identity_and_stat_retained(
 fn adopt_stored_changed_time(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     live: Option<OpenedObjectStat>,
     file: &mut File,
 ) -> std::io::Result<Option<String>> {
@@ -48846,8 +48864,10 @@ impl ScanIndex {
             return false;
         }
         self.historical_replay_generation = Some(generation);
-        for entry in self.files.values_mut() {
-            entry.upload_context_receipt = None;
+        for (_, entry) in self.files.slots_mut() {
+            if entry.upload_context_receipt.is_some() {
+                entry.make_mut().upload_context_receipt = None;
+            }
         }
         self.upload_context_fingerprint = None;
         // Replay resets delivery authority, not file-owned recovery evidence.
@@ -48859,7 +48879,8 @@ impl ScanIndex {
         self.codex_counting_tombstones.clear();
         self.codex_counting_evicted_legacy = Default::default();
         let active = self.active_effective_upload_body_witness_revision;
-        for entry in self.files.values_mut() {
+        for (_, entry) in self.files.slots_mut() {
+            let entry = entry.make_mut();
             if entry.has_unverified_source() {
                 let due = entry.unverified_deadline().unwrap_or(0);
                 entry.set_unverified_deadline(due);
@@ -49132,7 +49153,7 @@ impl ScanIndex {
             scan_roots: Vec::new(),
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             oversized_discovery: BTreeMap::new(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -50245,8 +50266,7 @@ impl ScanIndex {
         for fingerprint in fingerprints {
             index
                 .snapshot_activity_at
-                .entry(fingerprint)
-                .or_insert_with(|| Some("2050-01-01T00:00:00Z".to_string()));
+                .insert_if_absent(fingerprint, || Some("2050-01-01T00:00:00Z".to_string()));
         }
         index
             .manifest_for_window(source, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
@@ -50512,7 +50532,7 @@ impl ScanIndex {
                 .or_default()
                 .push((key.clone(), capture));
         }
-        let bytes = |files: &BTreeMap<String, ScanIndexEntry>| {
+        let bytes = |files: &SharedMap<String, ScanIndexEntry>| {
             files
                 .values()
                 .flat_map(|entry| {
@@ -50593,7 +50613,8 @@ impl ScanIndex {
         previous: &ScanIndex,
         accepted: &BTreeSet<String>,
     ) {
-        for (key, entry) in &mut self.files {
+        for (key, slot) in self.files.slots_mut() {
+            let entry = &**slot;
             let settled = self
                 .file_snapshot_fingerprints
                 .get(key)
@@ -50631,15 +50652,22 @@ impl ScanIndex {
                         })
                 });
             if settled && capture_covered {
-                entry.codex_captured_joined_member_set = None;
-                entry.codex_captured_tier_receipt = None;
-                entry.codex_captured_tier_receipt_required = false;
-                entry.codex_captured_uncommitted = false;
+                if entry.codex_captured_joined_member_set.is_some()
+                    || entry.codex_captured_tier_receipt.is_some()
+                    || entry.codex_captured_tier_receipt_required
+                    || entry.codex_captured_uncommitted
+                {
+                    let entry = slot.make_mut();
+                    entry.codex_captured_joined_member_set = None;
+                    entry.codex_captured_tier_receipt = None;
+                    entry.codex_captured_tier_receipt_required = false;
+                    entry.codex_captured_uncommitted = false;
+                }
             } else if pending_capture {
                 // Acceptance of an older body cannot settle newly captured facts.
                 // A rollback/quarantine must never replace them with an older,
                 // smaller applied receipt, or repair missing facts by guessing.
-                entry.codex_captured_tier_receipt = old
+                let captured_receipt = old
                     .and_then(|old| old.codex_captured_tier_receipt.as_ref())
                     .map(|captured| {
                         entry
@@ -50649,6 +50677,8 @@ impl ScanIndex {
                             .unwrap_or(captured)
                             .clone()
                     });
+                let entry = slot.make_mut();
+                entry.codex_captured_tier_receipt = captured_receipt;
                 entry.codex_captured_joined_member_set = pending_join.cloned();
                 entry.codex_captured_tier_receipt_required = pending_tiers;
                 entry.codex_captured_uncommitted =
@@ -50847,7 +50877,7 @@ impl ScanIndex {
             if let Some(current) = self.files.get_mut(to) {
                 current.carry_sampled_audit(&entry);
             } else {
-                self.files.insert(to.to_owned(), entry);
+                self.files.insert_shared(to.to_owned(), entry);
             }
         }
         if let Some(incidence) = self.file_snapshot_fingerprints.remove(from) {
@@ -50861,7 +50891,7 @@ impl ScanIndex {
                 self.accepted_incidence_pending_census = true;
             } else {
                 self.file_snapshot_fingerprints
-                    .insert(to.to_owned(), incidence);
+                    .insert_shared(to.to_owned(), incidence);
             }
         }
         if let Some(incidence) = self.accepted_rebuild_incidence.remove(from) {
@@ -51202,8 +51232,7 @@ impl ScanIndex {
             if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
                 result
                     .snapshot_activity_at
-                    .entry(fingerprint.clone())
-                    .or_insert_with(|| activity_at.clone());
+                    .insert_if_absent(fingerprint.clone(), || activity_at.clone());
             }
             if previous
                 .accepted_snapshot_fingerprints
@@ -51335,8 +51364,7 @@ impl ScanIndex {
         for fingerprint in &restored {
             if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
                 self.snapshot_activity_at
-                    .entry(fingerprint.clone())
-                    .or_insert_with(|| activity_at.clone());
+                    .insert_if_absent(fingerprint.clone(), || activity_at.clone());
             }
             if previous
                 .accepted_snapshot_fingerprints
@@ -51456,7 +51484,7 @@ impl ScanIndex {
                 }
             }
         };
-        let mut files = BTreeMap::new();
+        let mut files = BTreeMap::<String, Shared<ScanIndexEntry>>::new();
         let mut safe_keys = BTreeSet::new();
         // SOURCE Round 15: a fence this page's terminal drained exempted
         // present roots by their working entries. If this subset drops one
@@ -51465,11 +51493,11 @@ impl ScanIndex {
         let fence_drained_here = previous.claude_retired_family_tombstones_uncertain
             && !self.claude_retired_family_tombstones_uncertain;
         let mut drops_exempted_member = false;
-        for (key, entry) in &self.files {
+        for (key, entry) in self.files.iter_shared() {
             if safe(key, entry.last_snapshot_fingerprint.as_deref()) {
                 files.insert(key.clone(), entry.clone());
                 safe_keys.insert(key.clone());
-            } else if let Some(committed) = previous.files.get(key) {
+            } else if let Some(committed) = previous.files.get_shared(key) {
                 if !entry.source_file_fingerprint.is_empty()
                     && crate::local_resource_diagnostics::claude_reread::active()
                 {
@@ -51518,7 +51546,7 @@ impl ScanIndex {
         // A complete census may prune vanished/aged paths from `self`, but a
         // partial upload must never make that deletion durable. Only the final
         // all-accepted save may publish pruning.
-        for (key, entry) in &previous.files {
+        for (key, entry) in previous.files.iter_shared() {
             files.entry(key.clone()).or_insert_with(|| entry.clone());
         }
         let mut codex_state_only_snapshot_fingerprints = BTreeMap::new();
@@ -51551,9 +51579,11 @@ impl ScanIndex {
             } else {
                 confirmed_empty_files.remove(key);
             }
-            match self.file_snapshot_fingerprints.get(key) {
+            match self.file_snapshot_fingerprints.get_shared(key) {
                 Some(fingerprints) => {
-                    file_snapshot_fingerprints.insert(key.clone(), fingerprints.clone());
+                    if file_snapshot_fingerprints.get_shared(key) != Some(fingerprints) {
+                        file_snapshot_fingerprints.insert_shared(key.clone(), fingerprints.clone());
+                    }
                 }
                 None => {
                     file_snapshot_fingerprints.remove(key);
@@ -51608,14 +51638,12 @@ impl ScanIndex {
                 || committable_fingerprints.contains(fingerprint))
                 && !retained_quarantine.contains_key(fingerprint)
         });
-        let mut snapshot_activity_at = BTreeMap::new();
+        let mut snapshot_activity_at = self.snapshot_activity_at.clone();
+        snapshot_activity_at
+            .retain(|fingerprint, _| committable_fingerprints.contains(fingerprint));
         for fingerprint in committable_fingerprints {
-            if let Some(activity_at) = self
-                .snapshot_activity_at
-                .get(fingerprint)
-                .or_else(|| previous.snapshot_activity_at.get(fingerprint))
-            {
-                snapshot_activity_at.insert(fingerprint.clone(), activity_at.clone());
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                snapshot_activity_at.insert_if_absent(fingerprint.clone(), || activity_at.clone());
             }
         }
         let mut claude_owned_start_census = previous.claude_owned_start_census.clone();
@@ -51678,7 +51706,7 @@ impl ScanIndex {
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             retired_reread_guard: serde::de::IgnoredAny,
-            files,
+            files: files.into(),
             session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
@@ -54272,7 +54300,7 @@ mod tests {
             scan_roots: Vec::new(),
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             oversized_discovery: BTreeMap::new(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -55593,7 +55621,7 @@ mod tests {
         assert!(recovered.files.is_empty());
 
         let mut replacement = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 "content-free-key".to_string(),
                 ScanIndexEntry {
                     codex_fragment: None,
@@ -55695,15 +55723,15 @@ mod tests {
         let path = root.join("codex-scan-index-v2.json");
         let fingerprint = "a".repeat(64);
         let mut corrupt = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 "content-free-key".to_string(),
                 manifest_index_entry(Some(&fingerprint)),
             )]),
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "content-free-key".to_string(),
                 BTreeSet::from([fingerprint.clone()]),
             )]),
-            snapshot_activity_at: BTreeMap::from([(
+            snapshot_activity_at: SharedMap::from([(
                 fingerprint,
                 Some("syntactically-json-but-not-rfc3339".to_string()),
             )]),
@@ -55784,11 +55812,12 @@ mod tests {
         let sealed = "a".repeat(64);
         let stranded = "b".repeat(64);
         let mut index = ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([sealed.clone(), stranded.clone()]),
             )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([sealed.clone(), stranded.clone()]),
+            accepted_snapshot_fingerprints: BTreeSet::from([sealed.clone(), stranded.clone()])
+                .into(),
             accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
             ..ScanIndex::default()
         };
@@ -55850,7 +55879,7 @@ mod tests {
         let accepted = "a".repeat(64);
         let stranded = "b".repeat(64);
         let mut index = legacy_shaped_index(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([accepted.clone(), stranded.clone()]),
             )]),
@@ -56308,7 +56337,7 @@ mod tests {
     #[test]
     fn historical_replay_generation_clears_once_then_resumes_its_frozen_cursor() {
         let mut index = ScanIndex {
-            files: BTreeMap::from([("old.jsonl".to_string(), manifest_index_entry(Some("old")))]),
+            files: SharedMap::from([("old.jsonl".to_string(), manifest_index_entry(Some("old")))]),
             resume_after_path: Some("page-one.jsonl".to_string()),
             resume_upper_bound_path: Some("page-three.jsonl".to_string()),
             ..ScanIndex::default()
@@ -56495,11 +56524,11 @@ mod tests {
         let keep = "a".repeat(64);
         let quarantine = "b".repeat(64);
         let mut index = ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "opaque-file".to_string(),
                 BTreeSet::from([keep.clone(), quarantine.clone()]),
             )]),
-            snapshot_activity_at: BTreeMap::from([(
+            snapshot_activity_at: SharedMap::from([(
                 keep.clone(),
                 Some("2050-01-01T00:00:00Z".to_string()),
             )]),
@@ -56542,7 +56571,7 @@ mod tests {
         let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
         stale_witness.collector_version.push_str("-old");
         let mut index = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
                     codex_fragment: None,
@@ -56570,11 +56599,11 @@ mod tests {
                     evidence_owed: false,
                 },
             )]),
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 local_index_key(&path),
                 BTreeSet::from([fingerprint.clone()]),
             )]),
-            snapshot_activity_at: BTreeMap::from([(
+            snapshot_activity_at: SharedMap::from([(
                 fingerprint.clone(),
                 Some("2050-01-01T00:00:00Z".to_string()),
             )]),
@@ -57011,7 +57040,7 @@ mod tests {
             &legacy_metadata.legacy_sidecar_fingerprint,
         );
         let mut index = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
                     codex_fragment: None,
@@ -57239,7 +57268,7 @@ mod tests {
             scan_roots: roots.clone(),
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             oversized_discovery: BTreeMap::new(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -57923,7 +57952,8 @@ mod tests {
         let traversal = index.traversal.as_mut().expect("traversal");
         traversal.pending_directories.clear();
         traversal.pending_candidates.clear();
-        traversal.observed_index_keys = BTreeSet::from([removed_key.clone(), retained_key.clone()]);
+        traversal.observed_index_keys =
+            BTreeSet::from([removed_key.clone(), retained_key.clone()]).into();
         traversal.reconciliation_upper_bound = Some(retained_key.clone());
         traversal.reconciliation_after = Some(removed_key.clone());
         traversal.reconciliation_started = true;
@@ -58387,7 +58417,7 @@ mod tests {
             .contains(RESIDUE_SESSION));
         let current = index.current_snapshot_fingerprints();
         assert_eq!(current.len(), 2);
-        index.accepted_snapshot_fingerprints = current.clone();
+        index.accepted_snapshot_fingerprints = current.clone().into();
         index.accepted_snapshot_fingerprint_ledger_version =
             SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION;
         index.legacy_settlement_reconcile_after_fingerprint = None;
@@ -58538,7 +58568,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(current.len(), 3);
         let settled = current.iter().take(2).cloned().collect::<BTreeSet<_>>();
-        index.accepted_snapshot_fingerprints = settled.clone();
+        index.accepted_snapshot_fingerprints = settled.clone().into();
         index.accepted_snapshot_fingerprint_ledger_version = 0;
         index.legacy_settlement_reconcile_after_fingerprint = Some(current[1].clone());
         let mut backfill = crate::backfill::BackfillState::default();
@@ -58849,7 +58879,7 @@ mod tests {
                 scan_roots: Vec::new(),
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
-                observed_index_keys: BTreeSet::new(),
+                observed_index_keys: Default::default(),
                 oversized_discovery: BTreeMap::new(),
                 codex_rollout_paths: BTreeSet::new(),
                 codex_join_directory_census: None,
@@ -59216,7 +59246,7 @@ mod tests {
         let index_path = parent.join("scan-index.json");
         let prior_path = root.join("session.jsonl");
         let mut old_index = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 local_index_key(&prior_path),
                 manifest_index_entry(Some("prior-entity")),
             )]),
@@ -59275,7 +59305,7 @@ mod tests {
         fs::remove_dir_all(&target).expect("remove prior canonical target");
         let index_path = parent.join("scan-index.json");
         let mut old_index = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 local_index_key(&prior_path),
                 manifest_index_entry(Some("prior-entity")),
             )]),
@@ -59365,7 +59395,7 @@ mod tests {
         let new_optional_root = parent.join("new-optional-sessions");
         let prior_path = old_root.join("session.jsonl");
         let mut index = ScanIndex {
-            files: BTreeMap::from([(
+            files: SharedMap::from([(
                 local_index_key(&prior_path),
                 manifest_index_entry(Some("prior-entity")),
             )]),
@@ -60902,7 +60932,7 @@ mod tests {
                 session_id.to_string(),
                 fingerprint.clone(),
             )]),
-            snapshot_activity_at: BTreeMap::from([(fingerprint.clone(), activity.clone())]),
+            snapshot_activity_at: SharedMap::from([(fingerprint.clone(), activity.clone())]),
             ..ScanIndex::default()
         };
         index.activate_upload_context("next-context".to_string());
@@ -61878,10 +61908,7 @@ mod tests {
         };
 
         let mut index = ScanIndex {
-            files: std::collections::BTreeMap::from([(
-                path.to_string_lossy().to_string(),
-                legacy_entry,
-            )]),
+            files: SharedMap::from([(path.to_string_lossy().to_string(), legacy_entry)]),
             ..ScanIndex::default()
         };
 
@@ -83094,7 +83121,7 @@ mod tests {
         index
             .codex_state_only_snapshot_fingerprints
             .insert("state-only".to_string(), "aa".to_string());
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = SharedMap::from([
             ("aa".to_string(), Some("2026-01-01T00:00:00Z".to_string())),
             ("bb".to_string(), Some("2026-06-30T23:59:59Z".to_string())),
         ]);
@@ -83115,7 +83142,7 @@ mod tests {
         let excluded_end = "c".repeat(64);
         let excluded_old_modified_now = "d".repeat(64);
         let mut index = ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([
+            file_snapshot_fingerprints: SharedMap::from([
                 (
                     "old-file-modified-now.jsonl".to_string(),
                     BTreeSet::from([excluded_old_modified_now.clone()]),
@@ -83130,7 +83157,7 @@ mod tests {
         index
             .codex_state_only_snapshot_fingerprints
             .insert("state-only".to_string(), inside_start.clone());
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = SharedMap::from([
             (inside_start, Some("2026-01-01T00:00:00Z".to_string())),
             (
                 inside_late_sidecar,
@@ -83288,11 +83315,11 @@ mod tests {
         let accepted = "a".repeat(64);
         let sibling = "b".repeat(64);
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([accepted.clone(), sibling.clone()]),
             )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted, sibling]),
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted, sibling]).into(),
             ..ScanIndex::default()
         });
         assert!(
@@ -83331,11 +83358,12 @@ mod tests {
         let accepted = "a".repeat(64);
         let sibling = "b".repeat(64);
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([accepted.clone(), sibling.clone()]),
             )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone(), sibling.clone()]),
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone(), sibling.clone()])
+                .into(),
             ..ScanIndex::default()
         });
         assert!(
@@ -83392,11 +83420,11 @@ mod tests {
             .map(|value| format!("{value:064x}"))
             .collect::<BTreeSet<_>>();
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "bounded-sweep-session-set.jsonl".to_string(),
                 fingerprints.clone(),
             )]),
-            accepted_snapshot_fingerprints: fingerprints.clone(),
+            accepted_snapshot_fingerprints: fingerprints.clone().into(),
             ..ScanIndex::default()
         });
         assert!(index
@@ -83440,7 +83468,7 @@ mod tests {
         let first_pending = "b".repeat(64);
         let second_pending = "c".repeat(64);
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([
                     proved.clone(),
@@ -83448,7 +83476,7 @@ mod tests {
                     second_pending.clone(),
                 ]),
             )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([proved.clone()]),
+            accepted_snapshot_fingerprints: BTreeSet::from([proved.clone()]).into(),
             legacy_settlement_reconcile_after_fingerprint: Some(proved.clone()),
             ..ScanIndex::default()
         });
@@ -83480,7 +83508,7 @@ mod tests {
             scan_roots: Vec::new(),
             pending_directories,
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             oversized_discovery: BTreeMap::new(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -83512,7 +83540,7 @@ mod tests {
     fn traversal_reset_scope_index(traversal: ScanTraversalCheckpoint) -> ScanIndex {
         ScanIndex {
             traversal: Some(traversal),
-            file_snapshot_fingerprints: BTreeMap::from([(
+            file_snapshot_fingerprints: SharedMap::from([(
                 "test.jsonl".to_string(),
                 BTreeSet::from(["a".repeat(64), "b".repeat(64)]),
             )]),
@@ -84646,7 +84674,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            DiscoveryRetention::unverified(&BTreeMap::new())
+            DiscoveryRetention::unverified(&SharedMap::default())
         )
         .is_none());
         assert_eq!(

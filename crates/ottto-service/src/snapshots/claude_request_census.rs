@@ -19,7 +19,7 @@
 
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref, rfc3339_unix_seconds,
-    ClaudeRequestCensusShadowCounts, ScanIndex, ScanIndexEntry, SnapshotItem,
+    ClaudeRequestCensusShadowCounts, ScanIndex, ScanIndexEntry, SharedMap, SnapshotItem,
     MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
 };
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -820,7 +820,7 @@ pub(super) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u
 /// hash total kept in step so the budget check never walks the map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeRequestCensus {
-    records: BTreeMap<String, ClaudeRequestCensusRecord>,
+    records: SharedMap<String, ClaudeRequestCensusRecord>,
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
@@ -965,7 +965,7 @@ fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
 
 impl ClaudeRequestCensus {
     /// Storage sees invalidation stubs too; ordinary readers deliberately do not.
-    pub(crate) fn storage_records(&self) -> &BTreeMap<String, ClaudeRequestCensusRecord> {
+    pub(crate) fn storage_records(&self) -> &SharedMap<String, ClaudeRequestCensusRecord> {
         &self.records
     }
 
@@ -1331,7 +1331,7 @@ impl ClaudeRequestCensus {
     /// (#915's lost marks must keep this when they merge).
     fn release_aged(
         &mut self,
-        files: &BTreeMap<String, ScanIndexEntry>,
+        files: &SharedMap<String, ScanIndexEntry>,
         cutoff: u64,
         fits: &dyn Fn(usize, usize) -> bool,
         all_or_none: bool,
@@ -1419,12 +1419,12 @@ impl ClaudeRequestCensus {
         aged.sort_unstable_by_key(|&(_, position, _, _)| position);
         let mut retire = aged.iter().map(|&(_, position, _, _)| position).peekable();
         let mut freed = (0_usize, 0_usize);
-        for (position, (key, record)) in self.records.iter_mut().enumerate() {
+        for (position, (key, record)) in self.records.slots_mut().enumerate() {
             if retire.next_if_eq(&position).is_none() {
                 continue;
             }
             let before = (record.hash_count(), entry_serialized_bytes(key, record));
-            record.retire();
+            record.make_mut().retire();
             let after = entry_serialized_bytes(key, record);
             freed.0 += before.0;
             freed.1 += before.1.saturating_sub(after);
@@ -1468,7 +1468,7 @@ impl ClaudeRequestCensus {
     pub(crate) fn take(&mut self, key: &str) -> Option<ClaudeRequestCensusRecord> {
         let old = self.records.remove(key)?;
         self.charge(key, &old, false);
-        Some(old)
+        Some(old.into_inner())
     }
 
     /// Invalidate `key`'s record but keep its first-seen birth in place, so a
@@ -3301,7 +3301,7 @@ struct TranscriptRetirement {
 /// at `cutoff`, if it does: an unretired record holding hashes whose indexed
 /// revision is still the one it describes, last modified before the cutoff.
 fn transcript_retirement_age(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     cutoff: u64,
     key: &str,
     record: &ClaudeRequestCensusRecord,
@@ -3441,16 +3441,18 @@ fn retire_claude_transcript_records_excluding(
     }
     let mut retire = aged.iter().map(|&(_, position, _)| position).peekable();
     let mut freed = (0_usize, 0_usize);
-    for (position, (key, record)) in census.records.iter_mut().enumerate() {
-        if retire.next_if_eq(&position).is_none() {
-            continue;
+    if retire.peek().is_some() {
+        for (position, (key, record)) in census.records.slots_mut().enumerate() {
+            if retire.next_if_eq(&position).is_none() {
+                continue;
+            }
+            let before = (record.hash_count(), entry_serialized_bytes(key, record));
+            record.make_mut().retire();
+            let after = entry_serialized_bytes(key, record);
+            freed.0 += before.0;
+            freed.1 += before.1.saturating_sub(after);
+            retirement.aged += 1;
         }
-        let before = (record.hash_count(), entry_serialized_bytes(key, record));
-        record.retire();
-        let after = entry_serialized_bytes(key, record);
-        freed.0 += before.0;
-        freed.1 += before.1.saturating_sub(after);
-        retirement.aged += 1;
     }
     census.hash_total -= freed.0;
     census.serialized_total = census.serialized_total.saturating_sub(freed.1);

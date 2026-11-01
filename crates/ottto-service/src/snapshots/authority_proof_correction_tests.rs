@@ -1961,7 +1961,7 @@ mod previous_release_0_1_173 {
     /// type exactly as the base `ScanIndex` field decodes it.
     pub(super) fn loader_accepts_authority_records(
         records: &Value,
-        witnesses: &BTreeMap<String, ClaudeUsageFamilyWitness>,
+        witnesses: &SharedMap<String, ClaudeUsageFamilyWitness>,
     ) -> serde_json::Result<bool> {
         let records: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord> =
             serde_json::from_value(records.clone())?;

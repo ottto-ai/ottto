@@ -1,5 +1,6 @@
 //! Shared typed-record mapping. Only semantic window and evidence hooks differ.
 use super::*;
+use crate::snapshots::{Shared, SharedMap};
 use anyhow::{ensure, Context};
 use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
@@ -405,6 +406,31 @@ impl Rows<'_> {
         }
         Ok(self.next)
     }
+}
+/// A `ScanIndex` map field, hydrated from its rows under its own value type.
+pub(super) trait FieldMap {
+    type Value: DeserializeOwned + Serialize;
+    fn from_rows(rows: BTreeMap<String, Self::Value>) -> Self;
+}
+impl<T: DeserializeOwned + Serialize> FieldMap for BTreeMap<String, T> {
+    type Value = T;
+    fn from_rows(rows: Self) -> Self {
+        rows
+    }
+}
+impl<T: DeserializeOwned + Serialize> FieldMap for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn from_rows(rows: BTreeMap<String, Shared<T>>) -> Self {
+        rows.into()
+    }
+}
+pub(super) fn read_field_map<M: FieldMap>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: Option<&BTreeSet<String>>,
+    seed: Option<&mut Digests>,
+) -> Result<M> {
+    read_map(tx, kind, roots, seed).map(M::from_rows)
 }
 pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,

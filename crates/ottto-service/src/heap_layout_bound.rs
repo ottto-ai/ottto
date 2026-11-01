@@ -27,6 +27,11 @@ impl Counter {
         if self.visits > 4096 {
             return None;
         }
+        self.charge(bytes)
+    }
+    /// Charge a fixed header that rides on the next visit of its own value,
+    /// so wrapping a value adds bytes but no traversal work.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Option<()> {
         self.bytes = self.bytes.checked_add(bytes)?;
         (self.bytes <= self.limit).then_some(())
     }

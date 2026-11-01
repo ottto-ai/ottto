@@ -2984,7 +2984,7 @@ impl SnapshotUploadProgress {
                 .retain(|session, _| self.accepted_cache_heads.contains_key(session));
         }
         let mut selected = 0;
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some(pending) = self
                 .pending_cache_heads
                 .get(&cache_head_index_key(index_key))
@@ -3002,6 +3002,7 @@ impl SnapshotUploadProgress {
             {
                 // Existing candidate_decision treats a nonempty file without a
                 // final group as Parse. Entity membership/ACK state stays intact.
+                let entry = entry.make_mut();
                 entry.last_snapshot_fingerprint = None;
                 entry.last_upload_body_witness = None;
                 selected += 1;
@@ -8627,7 +8628,7 @@ fn finish_sync_source(
                         source.api_slug(),
                         safe_error(&error)
                     );
-                    committed_index.clone()
+                    committed_index
                 }
             };
             if retry.enabled()
@@ -22110,7 +22111,7 @@ mod tests {
             "replay-only.jsonl".to_string(),
             BTreeSet::from([replay_only.clone()]),
         );
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = crate::snapshots::SharedMap::from([
             (inside, Some("2026-08-29T00:00:00Z".to_string())),
             (replay_only, Some("2026-04-01T00:00:00Z".to_string())),
         ]);
@@ -22242,7 +22243,7 @@ mod tests {
             "replay-only.jsonl".to_string(),
             BTreeSet::from([replay_only.clone()]),
         );
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = crate::snapshots::SharedMap::from([
             (inside, Some("2026-08-29T00:00:00Z".to_string())),
             (replay_only, Some("2025-08-29T00:00:00Z".to_string())),
         ]);
