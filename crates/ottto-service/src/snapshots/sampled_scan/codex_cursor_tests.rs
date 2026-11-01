@@ -3302,7 +3302,7 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
 /// post-policy upload set within two ordinary pages.
 /// [regress] (c) a due quarantine retry of an unchanged, already read file is
 /// neither fresh nor a census member. It rides the next selecting page beside
-/// that work, keeps its flags, and is not read again on the page after.
+/// that work, keeps its flags, and with no new hint is not queued again.
 #[test]
 fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3377,12 +3377,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
             &[fixture.file(SESSION)],
         );
         index = next;
-        let published = fresh
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(published, BTreeSet::from([NEW, SESSION]));
+        assert_eq!(published_ids(&fresh), BTreeSet::from([NEW, SESSION]));
         assert_eq!(fresh.census_window_end, window);
         assert!(!fresh.census_complete);
         assert!(index.traversal.as_ref().unwrap().codex_freshness_yield);
@@ -3416,12 +3411,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
         let (next, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
         index = next;
-        let published = fresh
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
+        assert_eq!(published_ids(&fresh), BTreeSet::from([NEXT, SESSION]));
 
         // Pay the owed ordinary turn so arm (b) starts, like a cold backlog,
         // with no freshness yield pending.
@@ -3446,11 +3436,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
             index = next;
             assert_eq!(scan.census_window_end, window, "same open generation");
             assert!(!scan.census_complete);
-            published.extend(
-                scan.snapshots
-                    .iter()
-                    .map(|item| item.source_session_id.clone()),
-            );
+            published.extend(published_ids(&scan).into_iter().map(String::from));
             if published.contains(NEW_DAY) {
                 break;
             }
@@ -3477,17 +3463,11 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         let queued = index.traversal.as_ref().unwrap().pending_candidates.len();
         cache.clear();
-        let published_ids = |scan: &SourceScanResult| {
-            scan.snapshots
-                .iter()
-                .map(|item| item.source_session_id.clone())
-                .collect::<BTreeSet<_>>()
-        };
         let selected = selected_page(&fixture, &cache, index, &collected_at(7), &hints);
         assert_eq!(selected.codex_selected_flags[&key], (false, true));
         let (next, ridden) = finish_published(selected);
         index = next;
-        assert_eq!(published_ids(&ridden), BTreeSet::from([NEW.to_string()]));
+        assert_eq!(published_ids(&ridden), BTreeSet::from([NEW]));
         assert_eq!(ridden.census_window_end, window);
         assert_eq!(pending_flags(&index, &leased), None);
         assert_eq!(
@@ -3497,10 +3477,19 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         // SESSION joined the queue; the census turn still read its members.
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() <= queued);
 
-        // The lease is still held, yet only a new hint could queue the file.
+        // No new hint here: the file stays out of the queue. The sync loop
+        // re-hints a lease left unsettled, which this fixture does not cover.
         let (_, after) = published_scan(&fixture, &cache, index, &collected_at(8), &[]);
-        assert_eq!(published_ids(&after), BTreeSet::from([SESSION.to_string()]));
+        assert_eq!(published_ids(&after), BTreeSet::from([SESSION]));
     });
+}
+
+/// The session ids `scan` published.
+fn published_ids(scan: &SourceScanResult) -> BTreeSet<&str> {
+    scan.snapshots
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect()
 }
 
 /// One Codex page selected at `collected_at`, not yet stepped.
