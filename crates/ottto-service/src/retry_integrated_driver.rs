@@ -322,6 +322,8 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         &mut scan.snapshots,
         &working,
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
     );
     assert!(withheld.is_empty(), "{withheld:?}");
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut working);
