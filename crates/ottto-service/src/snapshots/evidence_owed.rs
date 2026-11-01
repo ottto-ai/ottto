@@ -406,6 +406,21 @@ pub(super) fn resolve(
     reason: &mut Option<CandidateParseReason>,
 ) {
     let key = local_index_key(&candidate.path);
+    let family = claude_index_path_family_member(&candidate.path);
+    // Cold usage pending: an owed member's family is read and re-stamped
+    // below, so it is loaded first. Unknown (counted) leaves the member owed.
+    if let Some((root, _)) = family.as_ref().filter(|_| {
+        enabled()
+            && index
+                .files
+                .get(&key)
+                .is_some_and(|entry| entry.evidence_owed)
+    }) {
+        let roots = BTreeSet::from([root.clone()]);
+        if super::state_v2::load_usage(index, Some(&roots)).is_err() {
+            return;
+        }
+    }
     // An owed entry main's clear later emptied is main's debt, read as main.
     let Some(entry) = index
         .files
@@ -738,7 +753,7 @@ pub(super) fn latch_clearable(
         return None;
     }
     let mut exempt = BTreeSet::new();
-    for (root, pending) in &index.claude_usage_family_pending {
+    for (root, pending) in index.claude_usage_family_pending.loaded_all() {
         if pending.invalid || evidence_free(pending) {
             continue;
         }
@@ -766,7 +781,11 @@ pub(super) fn mark_unproven_at_latch_clear(index: &mut ScanIndex, census_window_
         return;
     }
     let current = EvidenceContract::current(index);
-    for pending in index.claude_usage_family_pending.values_mut() {
+    for pending in index
+        .claude_usage_family_pending
+        .loaded_all_mut()
+        .values_mut()
+    {
         if pending.census_window_end != census_window_end || pending.identity_contract != current {
             pending.contract_unproven = true;
         }

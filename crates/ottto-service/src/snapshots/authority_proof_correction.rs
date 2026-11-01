@@ -988,6 +988,19 @@ impl ScanIndex {
             for item in group.iter().filter(|item| rejected(item)) {
                 eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
             }
+            // Cold: the drained family's pending is the preimage a revert
+            // restores, so it is loaded first. Unknown leaves this drain owed
+            // (counted); nothing of it is applied.
+            let roots = BTreeSet::from([candidate.root.clone()]);
+            if !drains.families.contains_key(&candidate.root)
+                && state_v2::load_usage(self, Some(&roots)).is_err()
+            {
+                continue;
+            }
+            let Ok(pending) = self.claude_usage_family_pending.family(&candidate.root) else {
+                continue;
+            };
+            let pending = pending.cloned();
             drains
                 .families
                 .entry(candidate.root.clone())
