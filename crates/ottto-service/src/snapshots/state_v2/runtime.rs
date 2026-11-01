@@ -110,10 +110,13 @@ impl Hold {
             .any(|e| e.to_string() == "state_v2_foreign_binding")
         {
             Self::ForeignBinding
-        } else if error
-            .chain()
-            .any(|e| e.to_string() == "scan_index_representation_refused")
-        {
+        } else if error.chain().any(|e| {
+            // A key this build does not know, inside a known row, was written
+            // by a newer build: hold until upgrade, never as a data fault.
+            let text = e.to_string();
+            text == "scan_index_representation_refused"
+                || text.starts_with("state_v2_ignored_field")
+        }) {
             Self::Future
         } else if error
             .chain()

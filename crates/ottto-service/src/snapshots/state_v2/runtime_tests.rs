@@ -1289,6 +1289,17 @@ fn unpublished_import_does_not_reorder_v1_progress_admission() {
     assert!(published(&f.path).unwrap());
 }
 
+/// [behaviour] a newer key inside a known row holds as Future (update), not a data fault.
+#[test]
+fn newer_row_key_holds_as_future_not_db_unavailable() {
+    for text in [
+        "state_v2_ignored_field",
+        "state_v2_ignored_field at line 1 column 9",
+    ] {
+        let error = Hold::storage(anyhow::anyhow!(text).context("state_v2_open_hydrate"));
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+    }
+}
 /// [money] Unknown state preserves v1 before publication, holds afterward, and rollback keeps the last good graph.
 #[test]
 fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_custody() {
