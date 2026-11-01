@@ -1289,17 +1289,6 @@ fn unpublished_import_does_not_reorder_v1_progress_admission() {
     assert!(published(&f.path).unwrap());
 }
 
-/// [behaviour] a newer key inside a known row holds as Future (update), not a data fault.
-#[test]
-fn newer_row_key_holds_as_future_not_db_unavailable() {
-    for text in [
-        "state_v2_ignored_field",
-        "state_v2_ignored_field at line 1 column 9",
-    ] {
-        let error = Hold::storage(anyhow::anyhow!(text).context("state_v2_open_hydrate"));
-        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
-    }
-}
 /// [money] Unknown state preserves v1 before publication, holds afterward, and rollback keeps the last good graph.
 #[test]
 fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_custody() {
@@ -1397,7 +1386,11 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let before_fence = fs::read(&f.path).unwrap();
     // A held load returns no graph to collection, so it cannot authorize a Full
     // or a transcript re-read. A compatible build must recover these same bytes.
-    assert!(ScanIndex::load(&f.path).is_err());
+    let error = ScanIndex::load(&f.path).unwrap_err();
+    // A newer build's key holds as "update", not as local damage.
+    assert!(crate::snapshots::scan_index_health::is_version_refusal(
+        &error
+    ));
     assert_eq!(fs::read(&db_path).unwrap(), before_db);
     assert_eq!(fs::read(&f.path).unwrap(), before_fence);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
