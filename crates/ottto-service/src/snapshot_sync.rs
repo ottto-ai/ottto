@@ -5380,6 +5380,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     source.api_slug(),
                     safe_error(&error)
                 );
+                crate::snapshots::money_freshness::report_failed_pass(source, self.support_dir);
                 self.failed_sources.push(source.api_slug());
             }
         }

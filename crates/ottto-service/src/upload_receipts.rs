@@ -856,6 +856,18 @@ pub fn read(
     })
 }
 
+/// When `source` last had anything accepted, from the bounded ring.
+pub(crate) fn newest_accepted_unix_seconds(state_dir: &Path, source: SourceKind) -> Option<u64> {
+    let capacity = UPLOAD_RECEIPT_RING_CAPACITY as u16;
+    read(state_dir, capacity, None, Some(source))
+        .ok()?
+        .receipts
+        .iter()
+        .find(|receipt| receipt.accepted_count > 0)
+        .and_then(|receipt| OffsetDateTime::parse(&receipt.uploaded_at, &Rfc3339).ok())
+        .and_then(|uploaded_at| u64::try_from(uploaded_at.unix_timestamp()).ok())
+}
+
 fn empty_receipt(
     source: SourceKind,
     batch_item_count: usize,

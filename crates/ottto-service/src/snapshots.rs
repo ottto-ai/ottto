@@ -86,7 +86,7 @@ mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
 mod contract5_cutover_tests;
-mod money_freshness;
+pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 mod shared_value;
@@ -32694,9 +32694,6 @@ impl OwnedSourceScan {
             };
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
-            }
-            if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
-                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
             }
             if preflight_source_file_fingerprint
                 .as_ref()

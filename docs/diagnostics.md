@@ -1963,6 +1963,24 @@ Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
 and kept today's untagged/refused rule). `accepted_share_changed` also counts
 proved rows sent with different proof.
 
+### Freshness alarm (all sources)
+
+Each source emits one `local_resources` `freshness_alarm` point when a root walk
+ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
+`now - live mtime` over indexed files whose live listing stamp differs from the
+stored settled stamp, `changed_files` and `over_6h_files` count them, and
+`unindexed_over_6h` counts files with no index entry older than six hours (no
+alarm bit). A failed pass may never reach the walk, so with `basis: "last_ack"`
+`age_s` is the time since the source's newest accepted upload receipt, the file
+counts are 0, and no receipt in the bounded ring gives `age_s: null`. `alarm` is
+true when `age_s` is null or above 21,600 seconds. Both inputs are durable and
+nothing new is stored, so the first complete walk after a restart reports the
+true age; only the in-progress fold is process-local, so a restart mid-walk
+under-reports for one walk and a retried page can count a file twice. A file
+appended to continuously reads as fresh until it pauses. Refused or quarantined
+files settle without acceptance and stay with the terminal counters. The row
+carries counts only, and the `money_freshness_disabled` marker does not affect it.
+
 ### Money freshness (Claude queue and replay)
 
 The default-ON Claude shadow and freshness gauges share one
@@ -1977,11 +1995,10 @@ All ages are process-local LOWER BOUNDS, never inputs to decisions.
 A regular file `money_freshness_disabled` in the normal support directory turns
 BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
 them ON. Policy is read once per process; restart after adding/removing the
-marker. OFF skips Touched allocation, equality attestation, page observation and
-metadata observation before any tracker mutex, clone or candidate decision. It
-emits neither shadow nor freshness data. The ordinary scan and skipped-file audit
-count continue unchanged. Fixtures use thread-local guards and never consult the
-host marker.
+marker. OFF skips Touched allocation, equality attestation and page observation
+before any tracker mutex, clone or candidate decision. It emits neither shadow
+nor freshness gauge data. The ordinary scan and skipped-file audit count continue
+unchanged. Fixtures use thread-local guards and never consult the host marker.
 
 `discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
 `discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
@@ -1992,35 +2009,9 @@ retained stamps. `skipped_untracked_entries` and
 16,384-stamp bound; they are occurrences, not invented distinct-file counts.
 Directories not yet enumerated and files outside the skipped view are uncovered.
 
-`changed_since_scan_files` and `unchanged_since_scan_files` compare metadata
-already observed on the opened candidate with indexed size and second/nanosecond
-mtime. No transcript read or extra candidate stat is added. Missing or stale
-samples and files without an indexed scan count as
-`changed_since_scan_unknown_files`; `changed_since_scan_complete_count` is null
-when coverage is incomplete. The first page may have only unknown coverage.
-These counters are folded into the existing FirstPending traversal and bounded
-stamp work, with no third queue pass or second map.
-
-`changed_over_6h_alarm` is true after observed changed positives on consecutive
-passes span **more than 21,600 seconds**; the same row includes unread count and
-age. There is no second alarm emission. Zero/unknown-only observations, scope
-reset, restart or clock rollback break the episode. Inter-pass continuity is a
-sampled condition, not proof of continuous filesystem state.
-
-The restart proxy is DERIVED server/log-side from this same emission:
-`tracker_initialized && changed_since_scan_files > 0`, correlated with its
-`process_id` and source. `tracker_initialized` is claimed by an independent
-process-wide atomic at completed emission, so it is true AT MOST ONCE per process.
-Tracker resets, index reloads, scope/path changes and kill-switch toggles never
-re-arm it. No per-scope ledger, restart_* payload field or persisted evidence is
-needed. This counts starts with an observed positive condition; it does not prove
-a prior episode. A positive condition cleared before the first completed pass,
-or hidden by unknown initial metadata, is not counted. A disabled process emits
-nothing and does not claim a first observation.
-
-Memory remains bounded by the existing 16,384 stamps (48 bytes each, +512 KiB
-versus the original shadow), accounted by runtime_heap_bytes and its retained
-bound. Classification is transient in the existing bounded heap/vector; there
-is no separate gauge dedup allocation or scope ledger. Enlarged stamp transients
-are conservatively bounded by an additional 4 MiB. No child-finalize eligibility
-measurement, dormant family-consumer API or money/read/census decision is added.
+Memory remains bounded by the existing 16,384 stamps (16 bytes each), accounted
+by runtime_heap_bytes and its retained bound. Classification is transient in the
+existing bounded heap/vector; there is no separate gauge dedup allocation or
+scope ledger. Enlarged stamp transients are conservatively bounded by an
+additional 4 MiB. No child-finalize eligibility measurement, dormant
+family-consumer API or money/read/census decision is added.

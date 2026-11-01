@@ -60,41 +60,23 @@ fn queue(index: &mut ScanIndex, n: usize, indexed: bool) {
 fn hash(n: usize) -> u64 {
     shadow::hash64(path(n).path.as_os_str().as_encoded_bytes())
 }
-fn observed(stamps: &mut shadow::FirstPending, n: usize, size: u64, nanos: u64, epoch: u64) {
-    stamps.observe_metadata(
-        hash(n),
-        Metadata {
-            epoch,
-            size,
-            seconds: 10,
-            nanos,
-        },
-    );
-}
 fn stamp(stamps: &mut shadow::FirstPending, index: &ScanIndex, now: u64) {
-    stamps.observe(shadow::skipped_view(index), |_| false, now, Some(index), 1);
+    stamps.observe(shadow::skipped_view(index), |_| false, now, Some(index));
 }
 
 fn measure(
     index: &ScanIndex,
     stamps: &mut shadow::FirstPending,
-    epoch: u64,
     now: u64,
 ) -> shadow::PendingCensusMembers {
     stamps
-        .observe(
-            shadow::skipped_view(index),
-            |_| false,
-            now,
-            Some(index),
-            epoch,
-        )
+        .observe(shadow::skipped_view(index), |_| false, now, Some(index))
         .0
 }
 
-/// [behaviour] Pending ages and current metadata coverage are aggregate-only lower bounds.
+/// [behaviour] Pending ages are aggregate-only lower bounds.
 #[test]
-fn each_gauge_and_metadata_coverage_are_distinct_and_read_free() {
+fn each_gauge_is_distinct_and_read_free() {
     let mut index = fixture();
     queue(&mut index, 0, false);
     for n in 1..=4 {
@@ -102,14 +84,10 @@ fn each_gauge_and_metadata_coverage_are_distinct_and_read_free() {
     }
     let mut stamps = shadow::FirstPending::default();
     stamp(&mut stamps, &index, NOW);
-    observed(&mut stamps, 1, 101, 10_000_000_000, 1); // size changed
-    observed(&mut stamps, 2, 100, 10_000_000_001, 1); // nanos-only change
-    observed(&mut stamps, 3, 100, 10_000_000_000, 1); // unchanged
-    observed(&mut stamps, 4, 101, 10_000_000_000, 0); // prior page is unknown
-                                                      // Duplicate queue+replay occurrence must not double-count a tracked file.
+    // Duplicate queue+replay occurrence must not double-count a tracked file.
     index.claude_stale_family_carry.replay.push(path(1));
     let before = serde_json::to_vec(&index).unwrap();
-    let row = with_transcript_io_denied(|| measure(&index, &mut stamps, 1, NOW + DAY + 1));
+    let row = with_transcript_io_denied(|| measure(&index, &mut stamps, NOW + DAY + 1));
     assert_eq!(serde_json::to_vec(&index).unwrap(), before);
     assert_eq!(row.tracked, 5);
     assert_eq!(row.oldest_age_s, DAY + 1);
@@ -118,28 +96,20 @@ fn each_gauge_and_metadata_coverage_are_distinct_and_read_free() {
     assert_eq!(row.freshness.discovered_unread_over_24h_tracked_files, 1);
     assert_eq!(row.freshness.oldest_discovered_unread_age_seconds, DAY + 1);
     assert_eq!(row.freshness.indexed_or_replay_tracked_files, 4);
-    assert_eq!(row.freshness.changed_since_scan_files, 2);
-    assert_eq!(row.freshness.unchanged_since_scan_files, 1);
-    assert_eq!(row.freshness.changed_since_scan_unknown_files, 2);
-    assert_eq!(row.freshness.metadata_observed_files, 3);
-    assert_eq!(row.freshness.changed_since_scan_complete_count, None);
     assert!(row.freshness.ages_are_process_local_lower_bounds);
-    assert_eq!(measure(&index, &mut stamps, 1, NOW + DAY).over_24h, 0);
+    assert_eq!(measure(&index, &mut stamps, NOW + DAY).over_24h, 0);
 }
 
-/// [behaviour] Replay is distinct from unread work and missing change evidence stays unknown.
+/// [behaviour] Replay is distinct from unread work.
 #[test]
-fn replay_without_index_is_not_never_read_and_unknown_is_not_zero() {
+fn replay_without_index_is_not_never_read() {
     let mut index = fixture();
     index.claude_stale_family_carry.replay.push(path(1));
     let mut stamps = shadow::FirstPending::default();
     stamp(&mut stamps, &index, NOW);
-    let row = measure(&index, &mut stamps, 1, NOW + DAY + 1);
+    let row = measure(&index, &mut stamps, NOW + DAY + 1);
     assert_eq!(row.freshness.discovered_unread_tracked_files, 0);
     assert_eq!(row.freshness.indexed_or_replay_tracked_files, 1);
-    assert_eq!(row.freshness.changed_since_scan_complete_count, None);
-    let empty = measure(&fixture(), &mut stamps, 1, NOW);
-    assert_eq!(empty.freshness.changed_since_scan_complete_count, Some(0));
 }
 
 /// [behaviour] Bounded coverage loss is explicit and restart ages are lower bounds.
@@ -151,13 +121,13 @@ fn eviction_is_reported_as_missing_coverage_and_restart_ages_reset() {
     }
     let mut stamps = shadow::FirstPending::default();
     stamp(&mut stamps, &index, NOW);
-    let row = measure(&index, &mut stamps, 1, NOW + DAY + 1);
+    let row = measure(&index, &mut stamps, NOW + DAY + 1);
     assert_eq!(row.tracked, shadow::MAX_FIRST_PENDING as u64);
     assert_eq!(row.freshness.skipped_untracked_entries, 1);
     assert_eq!(row.freshness.discovered_unread_untracked_entries, 1);
     let mut restarted = shadow::FirstPending::default();
     stamp(&mut restarted, &index, NOW + DAY + 1);
-    let restarted = measure(&index, &mut restarted, 1, NOW + DAY + 1);
+    let restarted = measure(&index, &mut restarted, NOW + DAY + 1);
     assert_eq!(restarted.oldest_age_s, 0);
     assert_eq!(
         restarted.freshness.discovered_unread_over_24h_tracked_files,
@@ -166,70 +136,9 @@ fn eviction_is_reported_as_missing_coverage_and_restart_ages_reset() {
     assert!(restarted.freshness.ages_are_process_local_lower_bounds);
 }
 
-fn positive() -> Counts {
-    Counts {
-        changed_since_scan_files: 1,
-        ..Counts::default()
-    }
-}
-
-/// [behaviour] Alarm continuity requires observed positives strictly beyond six hours.
+/// [behaviour] A scope change or reload restarts the process-local stamp clock.
 #[test]
-fn alarm_strict_edge_zero_unknown_restart_clock_and_scope_isolation() {
-    let mut a = Episode::new();
-    let mut b = Episode::new();
-    a.update(&mut positive(), NOW);
-    b.update(&mut Counts::default(), NOW + ALARM_AFTER);
-    let mut edge = positive();
-    a.update(&mut edge, NOW + ALARM_AFTER);
-    assert!(!edge.changed_over_6h_alarm);
-    a.update(&mut edge, NOW + ALARM_AFTER + 1);
-    assert!(edge.changed_over_6h_alarm);
-    a.update(&mut Counts::default(), NOW + ALARM_AFTER + 2);
-    let mut row = positive();
-    a.update(&mut row, NOW + ALARM_AFTER + 3);
-    assert_eq!(row.changed_episode_age_seconds, 0);
-    a.update(
-        &mut Counts {
-            changed_since_scan_unknown_files: 1,
-            ..Counts::default()
-        },
-        NOW + 2 * ALARM_AFTER,
-    );
-    let mut restarted = Episode::new();
-    let mut restart_row = positive();
-    restarted.update(&mut restart_row, NOW + 2 * ALARM_AFTER + 1);
-    assert!(!restart_row.tracker_initialized);
-    assert!(!restart_row.changed_over_6h_alarm);
-    let mut rollback = positive();
-    a.update(&mut rollback, NOW - 1);
-    assert_eq!(rollback.changed_episode_age_seconds, 0);
-}
-
-/// [money] Lead B restart proxy allows exactly one atomic first observation across threads and resets.
-#[test]
-fn first_observation_is_process_wide_and_never_rearmed() {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let observed = AtomicBool::new(false);
-    let start = std::sync::Barrier::new(8);
-    let firsts = std::thread::scope(|threads| {
-        let callers = (0..8)
-            .map(|_| {
-                threads.spawn(|| {
-                    start.wait();
-                    claim_first_observation(&observed)
-                })
-            })
-            .collect::<Vec<_>>();
-        callers
-            .into_iter()
-            .map(|caller| usize::from(caller.join().unwrap()))
-            .sum::<usize>()
-    });
-    assert_eq!(
-        firsts, 1,
-        "the same production atomic claim elects exactly one caller"
-    );
+fn stamp_clock_restarts_with_scope_and_reload() {
     let mut runtime = shadow::Runtime::default();
     let mut index = fixture();
     let touched = shadow::Touched::default();
@@ -254,27 +163,7 @@ fn first_observation_is_process_wide_and_never_rearmed() {
         )
         .unwrap();
         assert_eq!(row.pending_census_members.stamped_for_s, age);
-        assert!(!claim_first_observation(&observed));
     }
-    {
-        let _disabled = DisabledForTest::new();
-        assert!(!enabled());
-        shadow::observe_page(&index, &None, &[], &ScanCensus::default(), &None, NOW + 4);
-        assert!(!claim_first_observation(&observed));
-    }
-    assert!(enabled());
-    shadow::evaluate_page(
-        &mut runtime,
-        &index,
-        &touched,
-        std::iter::empty(),
-        false,
-        "restored",
-        NOW + 5,
-    )
-    .unwrap();
-    assert!(!claim_first_observation(&observed));
-    assert!(observed.load(Relaxed));
 }
 
 /// [off=main] Disabling the shadow adds no tracker state, allocation or diagnostic emission.
@@ -299,7 +188,6 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
     };
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         shadow::attest_equality_skip(&index, &candidate, &None, NOW);
-        shadow::observe_freshness_metadata(&candidate, &None);
         shadow::observe_page(&index, &None, &[], &ScanCensus::default(), &None, NOW);
     });
     assert!(records.is_empty());
@@ -344,26 +232,22 @@ fn kill_switch_defaults_on_and_requires_a_regular_file() {
     }
 }
 
-/// [regress] Duplicate heap-eviction coverage bug: retained queue/replay keys keep complete metadata coverage.
+/// [regress] Duplicate heap-eviction coverage bug: retained queue/replay keys keep complete coverage.
 #[test]
-fn replay_overlap_at_capacity_keeps_complete_known_metadata_coverage() {
+fn replay_overlap_at_capacity_keeps_complete_coverage() {
     let mut index = fixture();
     let mut stamps = shadow::FirstPending::default();
     for n in 0..shadow::MAX_FIRST_PENDING {
         queue(&mut index, n, true);
     }
     stamp(&mut stamps, &index, NOW);
-    for n in 0..shadow::MAX_FIRST_PENDING {
-        observed(&mut stamps, n, 100, 10_000_000_000, 1);
-    }
     let duplicate = (0..shadow::MAX_FIRST_PENDING)
         .min_by_key(|n| hash(*n))
         .unwrap();
     index.claude_stale_family_carry.replay.push(path(duplicate));
-    let row = measure(&index, &mut stamps, 1, NOW + 1);
+    let row = measure(&index, &mut stamps, NOW + 1);
     assert_eq!(row.tracked, shadow::MAX_FIRST_PENDING as u64);
     assert_eq!(row.freshness.skipped_untracked_entries, 0);
-    assert_eq!(row.freshness.changed_since_scan_complete_count, Some(0));
 }
 
 fn alarm_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
@@ -437,4 +321,43 @@ fn first_walk_after_restart_reports_the_durable_age_across_pages() {
         assert_eq!(rows[0]["basis"], "walk");
         assert_eq!(rows[0]["alarm"], true);
     }
+}
+
+/// [behaviour] A failed pass ages from the newest acceptance for its source; none is unknown.
+#[test]
+fn failed_pass_reports_the_last_ack_and_unknown_alarms() {
+    use ottto_protocol::SourceKind;
+    let scratch = crate::test_scratch::ScratchDir::new("freshness-alarm-failed-pass");
+    let report = || {
+        crate::local_resource_diagnostics::capture(|| {
+            report_failed_pass(SnapshotSource::Pi, &scratch)
+        })
+        .1
+    };
+    let ack = |source, accepted: u64| {
+        let response = serde_json::from_value(serde_json::json!({
+            "accepted": accepted,
+            "sessions_reconciled": 0,
+            "session_ids": [],
+            "disabled": false,
+        }))
+        .unwrap();
+        crate::upload_receipts::append_success(&scratch, source, 1, 200, None, &response).unwrap();
+    };
+    let assert_unknown = |rows: Vec<serde_json::Value>| {
+        let row = alarm_rows(&rows)[0];
+        assert!(row["age_s"].is_null());
+        assert_eq!(row["basis"], "last_ack");
+        assert_eq!(row["alarm"], true);
+    };
+    assert_unknown(report());
+    ack(SourceKind::Codex, 1);
+    ack(SourceKind::Pi, 0);
+    assert_unknown(report());
+    ack(SourceKind::Pi, 1);
+    let rows = report();
+    let row = alarm_rows(&rows)[0];
+    assert!(row["age_s"].as_u64().unwrap() < ALARM_AFTER);
+    assert_eq!(row["basis"], "last_ack");
+    assert_eq!(row["alarm"], false);
 }

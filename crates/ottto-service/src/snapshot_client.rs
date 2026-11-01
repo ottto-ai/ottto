@@ -3280,7 +3280,7 @@ impl SnapshotApiClient {
     }
 }
 
-fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
+pub(crate) fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
     match source {
         "claude_code" => ottto_protocol::SourceKind::ClaudeCode,
         "pi" => ottto_protocol::SourceKind::Pi,
