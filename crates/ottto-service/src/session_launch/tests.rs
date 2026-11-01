@@ -758,9 +758,23 @@ fn codex_launch_uses_the_bundled_cli_before_a_stale_path_install() {
         .unwrap();
     assert_eq!(result.outcome, Some(Outcome::Ready));
     assert_eq!(result.cli_version.as_deref(), Some("0.170.0"));
+    let secret = fs::read_to_string(result.launcher_path.unwrap())
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    let consumed = registry.consume(&result.launch_id.unwrap(), &secret);
     assert_eq!(
-        registry.entries[&result.launch_id.unwrap()].program,
-        bundle.join("codex").canonicalize().unwrap()
+        consumed.plan.unwrap().program,
+        Some(
+            bundle
+                .join("codex")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        )
     );
     std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
 }
