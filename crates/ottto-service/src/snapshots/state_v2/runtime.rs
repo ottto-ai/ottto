@@ -1259,6 +1259,26 @@ pub(in super::super) fn load_usage(
     if result.is_err() {
         telemetry::count("usage_pending_unknown", 1);
     }
+    // CI diagnostic: which guard refused a cold page's load.
+    #[cfg(test)]
+    if let Err(error) = &result {
+        eprintln!(
+            "STATE_V2_USAGE_UNKNOWN wanted={wanted:?} generation={} session={:?} error={error:#}",
+            index.generation,
+            index.v2().persistence_v2.as_ref().map(|runtime| {
+                runtime.session.lock().ok().and_then(|guard| {
+                    guard.as_ref().map(|s| {
+                        (
+                            s.stamp,
+                            s.reload,
+                            s.db.reload_required(),
+                            s.db.stamp().map_err(|e| format!("{e:#}")),
+                        )
+                    })
+                })
+            }),
+        );
+    }
     result
 }
 
