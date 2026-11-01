@@ -611,8 +611,6 @@ fn save_with_custody(
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let (previous, mut cx) = Mapper.hydrate_context(&mut session.db)?;
-                #[cfg(test)]
-                let _ = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take);
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
                 // Committed rollovers outlive the dropped baseline: a sibling

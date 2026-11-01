@@ -34,8 +34,7 @@ const G: u64 = 1;
 type RacedStamps = Option<((u64, u64), (u64, u64))>;
 thread_local! {
     /// Delete this row from another connection right after the next
-    /// reused-session hydrate, before its stamp is re-read. Save fallback
-    /// hydration consumes it without deleting a row.
+    /// reused-session hydrate, before its stamp is re-read.
     pub(super) static DELETE_DURING_HYDRATE: std::cell::Cell<Option<RowKey>> =
         const { std::cell::Cell::new(None) };
     /// That session connection's stamps around the delete.

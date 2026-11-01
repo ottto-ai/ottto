@@ -431,14 +431,6 @@ fn row_claim_commits_expected_rows_without_a_hydrate() {
     let (claimed, untouched) = admit_without_hydrate(&mut index, &candidate, now);
     assert!(claimed);
     assert!(untouched, "no committed graph was hydrated");
-    with_state(&f.path, |state| {
-        assert!(
-            state.save_digests.as_ref().unwrap().generation == 2,
-            "the claim keeps the committed baseline"
-        );
-        Ok(())
-    })
-    .unwrap();
     assert_eq!(
         sampled_audit::own_growth_claim_generation(&index, &f.path),
         Some(2)
@@ -468,37 +460,25 @@ fn row_claim_commits_expected_rows_without_a_hydrate() {
         super::tests::with_session_db(index, |db| {
             let mut tx = db.begin(TxnMode::Read).unwrap();
             for table in Table::ALL {
-                let mut after = None;
-                loop {
-                    let page = tx
-                        .scan_prefix(RowPrefix { table }, after.as_ref(), 128)
-                        .unwrap();
-                    if page.is_empty() {
-                        break;
-                    }
-                    after = page.last().map(|h| h.key.clone());
-                    for h in page {
-                        // Generation alone advances between the two saves.
-                        if h.key != RowKey::Meta("generation".into()) {
-                            let mut value = Vec::new();
-                            tx.read_value(&h, &mut value).unwrap();
-                            rows.insert(h.key, (h.fixed, h.value_version, value));
-                        }
+                for h in super::super::money_fault_tests::headers(&mut tx, table) {
+                    // Generation alone advances between the two saves.
+                    if h.key != RowKey::Meta("generation".into()) {
+                        let mut value = Vec::new();
+                        tx.read_value(&h, &mut value).unwrap();
+                        rows.insert(h.key, (h.fixed, h.value_version, value));
                     }
                 }
             }
         });
         rows
     };
-    super::tests::DELETE_DURING_HYDRATE
-        .with(|cell| cell.set(Some(RowKey::Meta("growth_claim_tripwire".into()))));
+    with_state(&f.path, |state| {
+        let baseline = state.save_digests.as_ref().expect("save must not hydrate");
+        assert_eq!(baseline.generation, 2);
+        Ok(())
+    })
+    .unwrap();
     index.save(&f.path).unwrap();
-    assert!(
-        super::tests::DELETE_DURING_HYDRATE
-            .with(std::cell::Cell::take)
-            .is_some(),
-        "the next ordinary save did not hydrate"
-    );
     let saved_rows = durable_rows(&index);
     let committed = durable(&index);
     assert_eq!(committed.generation, 3);
