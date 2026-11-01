@@ -4088,15 +4088,27 @@ impl ClaudeDefaultHomeOwner {
     }
 }
 
-/// Prove the default home's token owner. The owner is the cached account:
-/// nothing changes. The owner is another known account (a registered slot
-/// with the same hashes): `stable` takes that account's own `.claude.json`,
-/// so labels and plan facts come only from an account Ottto knows. Anything
-/// else stays unproven and the caller fails closed.
+/// Prove the default home's token owner, only where the local files disagree:
+/// a locally valid token whose plan contradicts `.claude.json`. Elsewhere
+/// (`None`) the default home keeps its usual path. The owner is the cached
+/// account: the credential's plan is stale and is dropped. The owner is
+/// another known account (a registered slot with the same hashes): `stable`
+/// takes that account's own `.claude.json`, so labels and plan facts come
+/// only from an account Ottto knows. Anything else stays unproven and the
+/// caller fails closed.
 fn resolve_claude_default_home_owner(
+    login_state: &ClaudeLocalLoginState,
     stable: &mut StableClaudeSlotCredential,
     known_identities: &[ClaudeCliOauthAccount],
-) -> ClaudeDefaultHomeOwner {
+) -> Option<ClaudeDefaultHomeOwner> {
+    if *login_state != ClaudeLocalLoginState::AccessValid
+        || !claude_local_plan_facts_contradict(
+            stable.credential.subscription_type.as_deref(),
+            stable.oauth_account.organization_type.as_deref(),
+        )
+    {
+        return None;
+    }
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
     // The same gates as a background usage read, "Background limit refresh"
     // included: no call means unproven.
@@ -4121,8 +4133,10 @@ fn resolve_claude_default_home_owner(
             Some(known) => stable.oauth_account = known.clone(),
             None => resolved.proven = None,
         }
+    } else if resolved.proven.is_some() {
+        stable.credential.subscription_type = None;
     }
-    resolved
+    Some(resolved)
 }
 
 /// The owner check's hashes on the default slot's local status, and the adopt
@@ -4154,6 +4168,7 @@ fn collect_claude_status(
     captured_at: String,
     expires_at: String,
     slot_owned_bindings: &BTreeSet<ClaudeStrongBinding>,
+    keep_signed_in: bool,
     known_identities: &[ClaudeCliOauthAccount],
 ) -> (
     AgentStatusSnapshot,
@@ -4186,11 +4201,28 @@ fn collect_claude_status(
     // the stored credential, `.claude.json` (after). `claude auth status`
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
-    // The default home is never refreshed in the background: Ottto starts no
-    // Claude run there, so other writers' logins stay theirs.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
-    let login_state = local.state;
+    let mut login_state = local.state;
     let default_live = local.live_login();
+    // "Keep my Claude accounts signed in": the default login gets the same
+    // single waiting background refresh as registered slots.
+    let refresh = if claude_oauth_usage_network_disabled() {
+        crate::claude_refresher::RefreshDecision::NotNeeded
+    } else {
+        crate::claude_refresher::maybe_refresh(
+            "default",
+            &ClaudeConfigDirSlot::Default,
+            &default_live,
+            keep_signed_in,
+        )
+    };
+    if login_state == ClaudeLocalLoginState::RefreshPending
+        && refresh == crate::claude_refresher::RefreshDecision::FailedWaitingForSignIn
+    {
+        // The background refresh could not advance this credential: ask for
+        // sign-in (the app's "Sign in again" gate), no retry until it changes.
+        login_state = ClaudeLocalLoginState::NeedsLogin;
+    }
     if let Some(warning) = claude_relogin_warning(
         default_live
             .metadata
@@ -4215,14 +4247,10 @@ fn collect_claude_status(
     );
     // `.claude.json` is only a display cache here: another writer (a Claude
     // Desktop session) may have written it for a different account than the
-    // stored token's. The token's proven owner decides, from now on.
-    let default_owner = match (&login_state, stable_default_credential.as_mut()) {
-        (
-            ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending,
-            Ok(stable),
-        ) => Some(resolve_claude_default_home_owner(stable, known_identities)),
-        _ => None,
-    };
+    // stored token's. Where the two disagree, the token's proven owner decides.
+    let default_owner = stable_default_credential.as_mut().ok().and_then(|stable| {
+        resolve_claude_default_home_owner(&login_state, stable, known_identities)
+    });
     if let Some(owner) = &default_owner {
         if owner.split_login() {
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
@@ -4788,6 +4816,7 @@ fn collect_claude_status_snapshots(
         captured_at.clone(),
         expires_at.clone(),
         &slot_owned_bindings,
+        upkeep_consent,
         &known_identities,
     );
     let mut candidates = Vec::new();
@@ -19392,13 +19421,11 @@ fn resolved_codex_home_command(
 
 /// Resolve Claude once and apply the single shared sanitized exact-slot
 /// environment used by the browser sign-in and the background refresher. No
-/// provider or token-shaped ambient variables survive `env_clear`. Only a
-/// registered slot: the default home is refused (`None`).
+/// provider or token-shaped ambient variables survive `env_clear`.
 pub(crate) fn resolved_claude_slot_command(
     slot: &ClaudeConfigDirSlot,
     args: &[&str],
 ) -> Option<Command> {
-    crate::claude_spawn_gate::require_explicit_claude_home(slot).ok()?;
     let identity = effective_user_identity()?;
     let program_path = crate::command_env::claude_executable_path(&identity.home_dir)?;
     let mut command = Command::new(program_path);
@@ -19415,7 +19442,14 @@ pub(crate) fn resolved_claude_slot_command(
     if let Some(path_env) = crate::command_env::claude_path_env(&identity.home_dir) {
         command.env("PATH", path_env);
     }
-    crate::claude_spawn_gate::pin_claude_login(&mut command, slot);
+    match slot.config_dir() {
+        Some(config_dir) => {
+            command.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        None => {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+    }
     Some(command)
 }
 
@@ -27330,11 +27364,15 @@ for line in sys.stdin:
         }
     }
 
-    /// [behaviour] The default home's token owner decides its identity, from
-    /// the proof on: proven and known → that account's identity, the split
-    /// code's adopt action and hashes; proven but unknown, or a failed check
-    /// → unproven (the caller fails closed); a failure is not retried inside
-    /// its back-off, and a proven token is not asked again.
+    /// [regress] The observed split (`.claude.json` names a Team account, the
+    /// token's owner is a known Max slot) resolves to that owner with the
+    /// split code. [behaviour] Only a valid token whose plan contradicts
+    /// `.claude.json` is checked: proven and known → that account's identity,
+    /// adopt action and hashes; proven as the cached account → its identity,
+    /// the stale plan dropped; proven but unknown, or a failed check →
+    /// unproven (the caller fails closed); a failure is not retried inside its
+    /// back-off, and a proven token is not asked again. An expired token or
+    /// consistent files keep the usual path, consent on or off.
     #[test]
     #[serial_test::serial]
     fn default_home_identity_follows_the_proven_token_owner() {
@@ -27346,6 +27384,13 @@ for line in sys.stdin:
             Ok(serde_json::json!({
                 "account": {"uuid": "terminal-account", "email": "terminal@example.invalid"},
                 "organization": {"uuid": "terminal-org", "organization_type": "claude_max"}
+            }))
+        }
+        fn desktop_profile() -> Result<Value, u16> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({
+                "account": {"uuid": "desktop-account"},
+                "organization": {"uuid": "desktop-org"}
             }))
         }
         fn unavailable() -> Result<Value, u16> {
@@ -27370,11 +27415,15 @@ for line in sys.stdin:
         };
         let known = std::slice::from_ref(&terminal);
         let calls = || CALLS.load(Ordering::SeqCst);
+        let valid = ClaudeLocalLoginState::AccessValid;
+        let resolve = |stable: &mut StableClaudeSlotCredential, known: &[ClaudeCliOauthAccount]| {
+            resolve_claude_default_home_owner(&valid, stable, known).expect("checked")
+        };
 
         // (a) Proven and known: the home is that account, from now on.
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(terminal_profile)));
         let mut proven = stable("owner-check-token-a");
-        let owner = resolve_claude_default_home_owner(&mut proven, known);
+        let owner = resolve(&mut proven, known);
         assert!(owner.split_login());
         assert_eq!(proven.oauth_account, terminal);
         claude_account_from_local_metadata(&proven.oauth_account, &proven.credential)
@@ -27406,13 +27455,13 @@ for line in sys.stdin:
             )
         );
         assert!(status.owner_proven_at.is_some());
-        let again = resolve_claude_default_home_owner(&mut stable("owner-check-token-a"), known);
+        let again = resolve(&mut stable("owner-check-token-a"), known);
         assert!(again.split_login());
         assert_eq!(calls(), 1, "one call per token");
 
         // (b) Proven but unknown: unproven, `.claude.json` is not used.
         let mut unknown = stable("owner-check-token-b");
-        let owner = resolve_claude_default_home_owner(&mut unknown, &[]);
+        let owner = resolve(&mut unknown, &[]);
         assert!(owner.proven.is_none());
         assert_eq!(owner.binding_override(), Some(None));
         assert_eq!(unknown.oauth_account, desktop);
@@ -27425,11 +27474,30 @@ for line in sys.stdin:
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(unavailable)));
         let before = calls();
         for _ in 0..2 {
-            let owner =
-                resolve_claude_default_home_owner(&mut stable("owner-check-token-c"), known);
+            let owner = resolve(&mut stable("owner-check-token-c"), known);
             assert!(owner.proven.is_none());
         }
         assert_eq!(calls() - before, 1);
+
+        // (e) Proven as the cached account: its identity, the stale plan dropped.
+        PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(desktop_profile)));
+        let mut same = stable("owner-check-token-e");
+        let owner = resolve(&mut same, known);
+        assert!(owner.proven.is_some() && !owner.split_login());
+        assert_eq!(owner.binding_override(), None);
+        assert_eq!(same.oauth_account, desktop);
+        claude_account_from_local_metadata(&same.oauth_account, &same.credential)
+            .expect("a proven owner outranks the stale plan");
+
+        // (f) An expired token is never sent: no call, the usual path.
+        let before = calls();
+        assert!(resolve_claude_default_home_owner(
+            &ClaudeLocalLoginState::RefreshPending,
+            &mut stable("owner-check-token-f"),
+            known,
+        )
+        .is_none());
+        assert_eq!(calls(), before);
 
         // (d) "Background limit refresh" off: no call inside a pass, unproven.
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(terminal_profile)));
@@ -27449,10 +27517,18 @@ for line in sys.stdin:
             )
             .expect("consent off");
         let before = calls();
-        let owner = with_claude_pass(false, current_unix_seconds(), || {
-            resolve_claude_default_home_owner(&mut stable("owner-check-token-d"), known)
+        let (owner, consistent) = with_claude_pass(false, current_unix_seconds(), || {
+            let mut consistent = StableClaudeSlotCredential {
+                oauth_account: terminal.clone(),
+                credential: max_login_credential("owner-check-token-g"),
+            };
+            (
+                resolve(&mut stable("owner-check-token-d"), known),
+                resolve_claude_default_home_owner(&valid, &mut consistent, known),
+            )
         });
         assert!(owner.proven.is_none());
+        assert!(consistent.is_none(), "consistent files keep the usual path");
         assert_eq!(calls(), before, "no profile call with consent off");
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(None));
         let _ = fs::remove_dir_all(&support);

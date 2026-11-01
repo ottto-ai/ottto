@@ -545,7 +545,7 @@ fn run_claude_context(
     crate::claude_spawn_gate::check_short_claude_run(&login)
         .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
     let mut command = env.claude_command()?;
-    crate::claude_spawn_gate::pin_claude_context_login(&mut command, &login);
+    crate::claude_spawn_gate::pin_claude_login(&mut command, &login);
     command
         .current_dir(workspace)
         .stdout(Stdio::piped())

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub(crate) const CLAUDE_UNSET: &[&str] = &[
+pub(super) const CLAUDE_UNSET: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "ANTHROPIC_API_KEY",
@@ -38,13 +38,6 @@ pub(crate) const CLAUDE_UNSET: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
     "CLAUDE_CODE_OAUTH_TOKEN_FD",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    // Claude Desktop's host-owned login and account for its child sessions.
-    "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
-    "CLAUDE_CODE_ACCOUNT_UUID",
-    "CLAUDE_CODE_ORGANIZATION_UUID",
-    "CLAUDE_CODE_USER_EMAIL",
-    "CLAUDE_CODE_SUBSCRIPTION_TYPE",
-    "CLAUDE_CODE_RATE_LIMIT_TIER",
     "OTTTO_CONTROL_TOKEN",
 ];
 pub(super) const CODEX_UNSET: &[&str] = &[

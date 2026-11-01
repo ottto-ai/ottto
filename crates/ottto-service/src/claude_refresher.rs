@@ -191,8 +191,7 @@ pub(crate) fn judge_refresh(
 }
 
 /// Decide for one login and, when due, start its refresher. `slot_id` is the
-/// daemon's opaque slot id. Callers pass registered slots only, and the
-/// command refuses the default home.
+/// daemon's opaque slot id (`default` for the default login).
 pub(crate) fn maybe_refresh(
     slot_id: &str,
     slot: &ClaudeConfigDirSlot,
@@ -280,6 +279,7 @@ impl RefreshLauncher for ProductionLauncher {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "Claude Code CLI not found")
             })?;
+        crate::claude_spawn_gate::pin_claude_login(&mut command, slot);
         command
             .current_dir(cwd)
             .stdin(Stdio::null())

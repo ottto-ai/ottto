@@ -3,7 +3,6 @@
 //! never runs doctor/auth/login as part of a launch.
 mod binding;
 mod preflight;
-pub(crate) use preflight::CLAUDE_UNSET;
 mod recent;
 #[cfg(test)]
 mod tests;
