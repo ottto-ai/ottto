@@ -1288,7 +1288,7 @@ mod tests {
 import os
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 mode = os.environ["FAKE_CODEX_MODE"]
 log = open(os.environ["FAKE_CODEX_LOG"], "a")

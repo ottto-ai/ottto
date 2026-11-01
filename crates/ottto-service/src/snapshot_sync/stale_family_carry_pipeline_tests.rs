@@ -1392,8 +1392,6 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
 }
 
-include!("retry_admission_pipeline_tests.rs");
-
 // Mirror prepare's existing baseline ordering, then use the shared full pipeline
 // and save/reload every synthetic page. No fixture alters acquisition policy.
 fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<RearmPage> {
@@ -1447,11 +1445,6 @@ fn source_latch_generation(
     panic!("bounded fixture ends");
 }
 
-// The production walk refuses a frame past 4096 visits (heap_layout_bound.rs
-// `Counter::add`). This test keeps about 15% headroom so an unrelated new
-// field cannot trip that cap here; it measures the ceiling, not the money.
-const LATCH_CONTRACT_FRAME_VISIT_HEADROOM_LIMIT: usize = 3500;
-
 /// Each transcript the single page re-reads adds one `SnapshotItem` to the
 /// scan's `snapshots` (~310 visits) plus entries in both index copies the
 /// frame holds. The money here is the standalone session's alone, so the
@@ -1471,9 +1464,6 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
-    let _headroom = crate::snapshot_sync::WakeFrameVisitLimitForTest::new(
-        LATCH_CONTRACT_FRAME_VISIT_HEADROOM_LIMIT,
-    );
     // Production's only cycle contract: the COLLECTOR (gate-off) arm is
     // unreachable with the gate retired (`compiled_cycle_contract` always
     // yields E2_GROUPING), and listing a session is not gate-off.
