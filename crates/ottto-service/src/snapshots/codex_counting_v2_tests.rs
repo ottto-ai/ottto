@@ -428,6 +428,250 @@ fn codex_v2_native_price_bucket_requires_own_time_and_preserves_explicit_line_bu
     }
 }
 
+fn thread_settings(timestamp: Option<&str>, tier: Option<Value>) -> Value {
+    let mut settings = json!({"model": MODEL});
+    if let Some(tier) = tier {
+        settings["service_tier"] = tier;
+    }
+    let mut line = json!({"timestamp": timestamp, "type": "event_msg",
+        "payload": {"type": "thread_settings_applied", "thread_settings": settings}});
+    if timestamp.is_none() {
+        line.as_object_mut().unwrap().remove("timestamp");
+    }
+    line
+}
+
+/// One whole turn with one response of `input` tokens, on both usage streams.
+fn tier_turn(
+    values: &mut Vec<Value>,
+    total: &mut T6,
+    turn: &str,
+    at: &str,
+    own_time: bool,
+    input: u64,
+) {
+    let usage = [input, 0, 0, 10, 1, input + 10];
+    *total = sum(*total, usage);
+    let mut native = native(at, turn, turn, usage, *total);
+    let mut ui = ui(at, usage, *total);
+    if !own_time {
+        native.as_object_mut().unwrap().remove("timestamp");
+        ui.as_object_mut().unwrap().remove("timestamp");
+    }
+    values.extend([
+        started(at, turn),
+        context(at, turn),
+        native,
+        ui,
+        completed(at, turn),
+    ]);
+}
+
+/// Input tokens by emitted `service_tier` with its one source, on the aggregate
+/// and the hourly rows, which must agree. The reducer's key never reaches a row.
+fn input_by_tier(item: &SnapshotItem) -> BTreeMap<Option<String>, (u64, Option<String>)> {
+    assert!(!serde_json::to_string(item)
+        .unwrap()
+        .contains(CODEX_THREAD_TIER));
+    let collect = |rows: Vec<&SnapshotModelUsage>| {
+        let mut tiers = BTreeMap::<Option<String>, (u64, Option<String>)>::new();
+        for row in rows {
+            let entry = tiers
+                .entry(row.selector_context.get("service_tier").cloned())
+                .or_default();
+            entry.0 += row.input_tokens;
+            entry.1 = row.selector_sources.get("service_tier").cloned();
+        }
+        tiers
+    };
+    let tiers = collect(item.model_usage.iter().collect());
+    assert_eq!(
+        tiers,
+        collect(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage)
+                .collect()
+        )
+    );
+    tiers
+}
+
+const THREAD_TIER_SOURCE: &str = "derived_from_thread_settings";
+const AT_EPOCH: &str = "2026-11-09T00:00:00Z";
+
+/// [money] Requested tier for both counting versions: an in-epoch snapshot
+/// replaces the running tier, anything but an explicit `fast`, `priority` or
+/// `flex` clears it and adds no `service_tier`, and pre-epoch or undated
+/// evidence and requests keep exactly today's untiered row.
+#[test]
+fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
+    let in_epoch = |minute: u64| format!("2026-11-09T00:{minute:02}:00Z");
+    let priority = || Some(json!("priority"));
+    let mut values = vec![header("2026-08-31T23:00:00Z")];
+    let mut total = [0; 6];
+    // A pre-epoch snapshot seeds nothing, before or at the boundary.
+    values.push(thread_settings(Some("2026-11-08T23:00:00Z"), priority()));
+    tier_turn(
+        &mut values,
+        &mut total,
+        "t1",
+        "2026-11-08T23:59:59Z",
+        true,
+        1,
+    );
+    tier_turn(&mut values, &mut total, "t2", AT_EPOCH, true, 2);
+    for (index, (tier, input)) in [("fast", 8), ("priority", 16), ("flex", 32)]
+        .into_iter()
+        .enumerate()
+    {
+        let at = in_epoch(1 + index as u64);
+        values.push(thread_settings(Some(&at), Some(json!(tier))));
+        tier_turn(&mut values, &mut total, tier, &at, true, input);
+    }
+    // Default, omitted, null and unrecognized each clear an earlier Fast.
+    for (index, (tier, input)) in [
+        (Some(json!("default")), 4),
+        (None, 64),
+        (Some(Value::Null), 128),
+        (Some(json!("auto")), 256),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = in_epoch(10 + index as u64);
+        values.push(thread_settings(Some(&at), priority()));
+        values.push(thread_settings(Some(&at), tier));
+        tier_turn(
+            &mut values,
+            &mut total,
+            &format!("clear-{index}"),
+            &at,
+            true,
+            input,
+        );
+    }
+    // An undated snapshot changes nothing; an undated request is never stamped.
+    let at = in_epoch(20);
+    values.push(thread_settings(Some(&at), priority()));
+    values.push(thread_settings(None, None));
+    tier_turn(&mut values, &mut total, "kept", &at, true, 512);
+    tier_turn(&mut values, &mut total, "undated", &at, false, 1024);
+    let source = Some(THREAD_TIER_SOURCE.to_string());
+    let expected = BTreeMap::from([
+        (None, (1 + 2 + 4 + 64 + 128 + 256 + 1024, None)),
+        (Some("priority".to_string()), (8 + 16 + 512, source.clone())),
+        (Some("flex".to_string()), (32, source)),
+    ]);
+    for active in [false, true] {
+        let run = run_price_source(&values, active);
+        assert_eq!(
+            input_by_tier(run.item.as_ref().unwrap()),
+            expected,
+            "{active}"
+        );
+    }
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        for value in &values {
+            apply_codex_line(value, &mut accumulator);
+        }
+    });
+    assert_eq!(counts.codex_non_default_thread_tier, 9);
+}
+
+/// [money] `logs_2` and the protected replay win over the running thread tier,
+/// which files no receipt of its own. A receipt filed from state without the
+/// reducer's key, as a record saved before the release holds, still replays.
+#[test]
+fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
+    use super::codex_file_join::{AppliedTierReceipt, TierReplay};
+    let pass = |values: &[Value],
+                v2: bool,
+                traces: Option<CodexTurnTraceMap>,
+                receipt: Option<AppliedTierReceipt>,
+                keyless: bool| {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        if v2 {
+            codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+        }
+        accumulator.codex_turn_traces = traces.map(Arc::new);
+        let required = receipt.is_some();
+        accumulator.codex_tier_replay = Some(TierReplay::new(receipt, required, "scope".into()));
+        for value in values {
+            accumulator
+                .codex_tier_replay
+                .as_mut()
+                .unwrap()
+                .observe(value);
+            apply_codex_line(value, &mut accumulator);
+            if keyless {
+                accumulator
+                    .current_selector
+                    .context
+                    .remove(CODEX_THREAD_TIER);
+            }
+        }
+        assert_eq!(accumulator.codex_counting_v2(), v2);
+        let filed = accumulator
+            .codex_tier_replay
+            .take()
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut items = accumulator.into_items(
+            Path::new("/synthetic/sessions/rollout.jsonl"),
+            "2026-11-10T00:00:00Z",
+            "fp".into(),
+            None,
+        );
+        (items.pop().expect("snapshot"), filed)
+    };
+    let mut values = vec![
+        header(POST),
+        thread_settings(Some(AT_EPOCH), Some(json!("flex"))),
+    ];
+    let mut total = [0; 6];
+    tier_turn(
+        &mut values,
+        &mut total,
+        "fast-turn",
+        "2026-11-09T00:01:00Z",
+        true,
+        100,
+    );
+    tier_turn(
+        &mut values,
+        &mut total,
+        "next-turn",
+        "2026-11-09T00:02:00Z",
+        true,
+        200,
+    );
+    let mut traces = CodexTurnTraceMap::default();
+    traces.priority_turns.insert("fast-turn".into());
+    let logs_2 = Some("derived_from_logs_2".to_string());
+    let expected = BTreeMap::from([
+        (Some("priority".to_string()), (100, logs_2)),
+        (
+            Some("flex".to_string()),
+            (200, Some(THREAD_TIER_SOURCE.to_string())),
+        ),
+    ]);
+    for v2 in [false, true] {
+        let (item, receipt) = pass(values.as_slice(), v2, Some(traces.clone()), None, false);
+        assert_eq!(input_by_tier(&item), expected, "logs_2 {v2}");
+        let (item, replayed) = pass(values.as_slice(), v2, None, receipt.clone(), false);
+        assert_eq!(input_by_tier(&item), expected, "replay {v2}");
+        assert_eq!(replayed, receipt, "the thread tier files no receipt {v2}");
+        let (_, old_receipt) = pass(values.as_slice(), v2, Some(traces.clone()), None, true);
+        assert_eq!(
+            old_receipt, receipt,
+            "the key is outside the replay key {v2}"
+        );
+    }
+}
+
 #[test]
 fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
     let first = [200_000, 100_000, 1_000, 20, 4, 200_020];
