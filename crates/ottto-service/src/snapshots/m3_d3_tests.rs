@@ -318,6 +318,15 @@ impl Rig {
 fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-due-lossy-shrink");
     rig.create(SESSION_A, 2);
+    // Establish the old birth before sealing: APFS clamps birth when mtime
+    // moves before creation. Later aging must preserve this same object.
+    let file = File::options()
+        .write(true)
+        .open(rig.path(SESSION_A))
+        .unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(100))
+        .unwrap();
+    file.set_modified(SystemTime::now()).unwrap();
     assert_eq!(rig.pass().published(SESSION_A), 1);
     rig.assert_native_record(SESSION_A);
     let record = fs::read(rig.record(SESSION_A)).unwrap();
@@ -493,12 +502,23 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             // the transcript stops growing and leaves the discovery window.
             rig.append(SESSION_A, 1);
             assert_eq!(rig.pass().published(SESSION_A), 0);
+            let birth = fs::metadata(rig.path(SESSION_A))
+                .unwrap()
+                .created()
+                .unwrap();
             File::options()
                 .write(true)
                 .open(rig.path(SESSION_A))
                 .unwrap()
                 .set_modified(SystemTime::now() - Duration::from_secs(400 * 86_400))
                 .unwrap();
+            assert_eq!(
+                fs::metadata(rig.path(SESSION_A))
+                    .unwrap()
+                    .created()
+                    .unwrap(),
+                birth
+            );
             let aged = rig.pass();
             assert_eq!(aged.full(), 0);
             assert_eq!(aged.published(SESSION_A), 0);
