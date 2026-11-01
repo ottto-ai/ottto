@@ -1236,13 +1236,16 @@ mod application_cases {
         assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
     }
 
-    /// [format] desktop inventory conversion keeps original presence without digest custody.
+    /// [format] desktop inventory conversion keeps original presence; only a
+    /// versioned cursor fence keeps custody, like the v1 serializer.
     #[test]
-    fn desktop_inventory_conversion_keeps_original_presence_without_digest_custody() {
+    fn desktop_inventory_conversion_keeps_presence_and_only_versioned_fence() {
+        let fence = format!("p1{}", "b".repeat(62));
         for inventory in [
             None,
             Some(serde_json::Value::Null),
             Some(serde_json::json!("a".repeat(64))),
+            Some(serde_json::json!(fence)),
         ] {
             let c = Corpus::new();
             let mut value = serde_json::json!({"schema_version":2,"generation":0,"files":{}});
@@ -1279,7 +1282,13 @@ mod application_cases {
                 loaded.presence.get("claude_desktop_store_inventory"),
                 original.presence.get("claude_desktop_store_inventory")
             );
-            assert_eq!(restored.claude_desktop_store_inventory, None);
+            assert_eq!(
+                restored.claude_desktop_store_inventory.as_deref(),
+                inventory
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .filter(|v| *v == fence)
+            );
             assert_eq!(
                 serde_json::to_vec(&restored).unwrap(),
                 serde_json::to_vec(&index).unwrap()
