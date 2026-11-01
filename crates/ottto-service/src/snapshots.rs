@@ -2084,6 +2084,14 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
+    /// Wire contract 5, bucket rows only, copy-prefix switch on (X-B1, Lead B
+    /// 2026-10-31): the row's accepted proof was copy-derived and is
+    /// tombstoned; a retaining receiver drops that proof for good. Like
+    /// `identity_retained`, only sent when the server advertised option (ii)
+    /// and hashed in the identity leaf. Omitted when false, so switch-off
+    /// bytes are unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4060,10 +4068,12 @@ pub struct ScanIndex {
     /// E2 stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
-    /// it; absent/damaged metadata stays uncertain until the current proof decides.
+    /// it. Only an empty undamaged store is never written, so an absent field
+    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// the current proof decides.
     #[serde(
-        default = "claude_request_money::copy_removals::CopyRemovals::missing",
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_empty",
+        default,
+        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
@@ -5143,6 +5153,10 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// SOURCE 2026-10-31 (#944 xPR F5): the copy-derived accepted rows this
+    /// pass's bodies treat as never accepted. The sync loop tombstones them
+    /// through `AcceptedBuckets` and saves before any upload.
+    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
     /// Contract-5 only: this terminal census compared every indexed Claude
     /// family member's current requests. Unlike fence coverage, a bound
     /// authority quarantine excuses nothing. Taken before the census prunes
@@ -16023,11 +16037,7 @@ impl SelectorHashes {
 // a native selector hash ("base" or hexadecimal).
 const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
 fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
-    let selector_hash = if row.copy_unproven {
-        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
-    } else {
-        selector_hash
-    };
+    let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
     RowKey {
         model: row.model.clone(),
         selector_hash,
@@ -16038,6 +16048,18 @@ fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -
         gateway_provider: row.gateway_provider.clone(),
         model_provider: row.model_provider.clone(),
         subscription_product: row.subscription_product.clone(),
+    }
+}
+
+/// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
+/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
+/// #944 proved rows), must partition through here so a marked row and an
+/// unmarked twin never share a key.
+pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
+    if copy_unproven {
+        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
+    } else {
+        selector_hash
     }
 }
 
@@ -21553,6 +21575,7 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
         evidence_ref: None,
         identity_parts: None,
         identity_retained: false,
+        copy_invalidated: false,
         model: row_key.model.clone(),
         input_tokens: row.usage.input_tokens,
         output_tokens: row.usage.output_tokens,
@@ -34423,6 +34446,7 @@ fn codex_state_only_snapshot(
         identity_parts: None,
         copy_unproven: false,
         identity_retained: false,
+        copy_invalidated: false,
         model,
         input_tokens: 0,
         output_tokens: 0,
@@ -80405,6 +80429,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "claude-opus-4-7".to_string(),
             input_tokens: 100,
             output_tokens: 40,
@@ -82160,6 +82185,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "claude-opus-4-7".to_string(),
             input_tokens: 100,
             output_tokens: 40,
@@ -84547,7 +84573,7 @@ crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capabi
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
 crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
-crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
+crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
