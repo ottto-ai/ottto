@@ -1383,7 +1383,11 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let before_fence = fs::read(&f.path).unwrap();
     // A held load returns no graph to collection, so it cannot authorize a Full
     // or a transcript re-read. A compatible build must recover these same bytes.
-    assert!(ScanIndex::load(&f.path).is_err());
+    let error = ScanIndex::load(&f.path).unwrap_err();
+    // A newer build's key holds as "update", not as local damage.
+    assert!(crate::snapshots::scan_index_health::is_version_refusal(
+        &error
+    ));
     assert_eq!(fs::read(&db_path).unwrap(), before_db);
     assert_eq!(fs::read(&f.path).unwrap(), before_fence);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
