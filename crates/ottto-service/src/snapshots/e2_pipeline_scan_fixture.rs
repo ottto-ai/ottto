@@ -249,8 +249,10 @@ pub(crate) fn exact_acks_for_test(items: &[SnapshotItem]) -> BTreeMap<String, St
 /// The production finish of per-file upload-context proof for one page:
 /// the page's final `items` become receipt candidates under the index's
 /// active context, and only exact `acks` earn receipts (`snapshot_sync`
-/// finish and partial checkpoint run the same two calls). Call it after the
-/// page's settlement, where the service does.
+/// finish and partial checkpoint run the same calls), and the exact ACKs
+/// stamp their entities' durable context proof under the active context in
+/// one fixture destination. Call it after the page's settlement, where the
+/// service does.
 pub(crate) fn accept_upload_context_acks_for_test(
     index: &mut ScanIndex,
     items: &[SnapshotItem],
@@ -258,6 +260,16 @@ pub(crate) fn accept_upload_context_acks_for_test(
 ) {
     let candidates = index.file_upload_context_ack_candidates(items);
     index.accept_file_upload_context_acks(&candidates, acks);
+    let contexts = index
+        .active_upload_context_fingerprint
+        .as_ref()
+        .map(|context| {
+            acks.keys()
+                .map(|entity| (entity.clone(), context.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    index.stamp_entity_upload_context_acks("e2-fixture-destination", acks, &contexts);
 }
 
 /// Install the real exclusion input used by ordinary-money fixture families.

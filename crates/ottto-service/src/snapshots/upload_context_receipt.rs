@@ -332,6 +332,57 @@ impl ScanIndex {
         !self.receipt_matches(key, entry)
     }
 
+    /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries
+    /// THIS file's receipt to the new revision instead of re-sending the same
+    /// accepted bodies. The caller found a complete parse of the new revision
+    /// with the identical entity and body sets, and excludes quarantined, held
+    /// and correction-owed files. The old receipt must prove those bodies
+    /// under the file's context and replay epoch, and every entity must still
+    /// have its durable exact-ACK stamp of that body under that context.
+    /// Anything else is sent; the read itself always happens.
+    pub(super) fn carry_upload_context_receipt(
+        &mut self,
+        key: &str,
+        source_witness: &str,
+        entity_bodies: &BTreeMap<String, String>,
+    ) -> bool {
+        let proof = &self.upload_context_proof;
+        let carried = self.file_upload_context_enabled()
+            && !entity_bodies.is_empty()
+            && proof.destination_namespace_hash.is_some()
+            && proof.replay_generation == self.historical_replay_generation
+            && self.files.get(key).is_some_and(|entry| {
+                entry.source_file_fingerprint == source_witness
+                    && entry
+                        .upload_context_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            receipt.source_witness != source_witness
+                                && self.file_expected_context(key)
+                                    == Some(&receipt.context_fingerprint)
+                                && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
+                                && entry.last_upload_body_witness.as_ref()
+                                    == Some(&receipt.body_witness)
+                                && entity_bodies.iter().all(|(entity, body)| {
+                                    proof.entity_stamps.get(entity).is_some_and(|stamp| {
+                                        stamp.context_fingerprint == receipt.context_fingerprint
+                                            && stamp.body_witness == *body
+                                    })
+                                })
+                        })
+            });
+        if carried {
+            if let Some(receipt) = self
+                .files
+                .get_mut(key)
+                .and_then(|entry| entry.upload_context_receipt.as_mut())
+            {
+                receipt.source_witness = source_witness.to_string();
+            }
+        }
+        carried
+    }
+
     /// An entity's durable stamp proves exactly this body under this context,
     /// in this destination and replay generation.
     pub(crate) fn entity_upload_context_proven(

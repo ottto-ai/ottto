@@ -8537,8 +8537,46 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // again when a history hold is released, even without an old body tuple.
         // Legacy/unknown incidence stays funded and protects only its original
         // ACKs even when no file association can be recovered.
+        // A semantic no-op at a moved revision carries its receipt (A1-A4):
+        // complete parse, identical entity and body sets, no quarantine retry,
+        // no hold. A correction-owed member is not carried: its own no-op rule
+        // drains it, so its unchanged bodies are not re-sent either, and a
+        // later read carries or sends once the correction settled.
+        let semantic_noop = final_group_fingerprint.is_some()
+            && final_group_fingerprint == pending.previous_snapshot_fingerprint
+            && final_upload_body_witness == pending.previous_upload_body_witness
+            && !pending.codex_pending_recovery
+            && !quarantine_retry_required;
+        let correction_owed = semantic_noop
+            && source == SnapshotSource::ClaudeCode
+            && index.claude_authority_correction_owed(&pending.index_key);
+        if semantic_noop
+            && !correction_owed
+            && !index.decode_holds_file(&pending.index_key)
+            && !index
+                .claude_account_deferred_holds
+                .contains_key(&pending.index_key)
+            && !final_fingerprints
+                .iter()
+                .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp))
+        {
+            let entity_bodies = result
+                .snapshots
+                .iter()
+                .filter(|item| {
+                    item.source_file_fingerprint.as_deref()
+                        == Some(pending.source_file_fingerprint.as_str())
+                })
+                .map(|item| (item.snapshot_fingerprint.clone(), body_witness(item)))
+                .collect::<BTreeMap<_, _>>();
+            index.carry_upload_context_receipt(
+                &pending.index_key,
+                &pending.source_file_fingerprint,
+                &entity_bodies,
+            );
+        }
         let context_rearm_required =
-            index.file_upload_context_requires_adoption(&pending.index_key);
+            !correction_owed && index.file_upload_context_requires_adoption(&pending.index_key);
         if let Some(unknown) = index.accepted_rebuild_incidence.get("") {
             carried_noop_entities.extend(
                 unknown
@@ -8574,15 +8612,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .insert(pending.index_key.clone(), final_fingerprints);
             index.confirmed_empty_files.remove(&pending.index_key);
         }
-        if final_group_fingerprint.is_some()
-            && final_group_fingerprint == pending.previous_snapshot_fingerprint
-            && final_upload_body_witness == pending.previous_upload_body_witness
-            // An unresolved POST may have replaced that older accepted body.
-            // Use the pre-replay fact: record() writes provisional new entries.
-            && !pending.codex_pending_recovery
-            && !quarantine_retry_required
-            && !context_rearm_required
-        {
+        // An unresolved POST may have replaced that older accepted body.
+        // Use the pre-replay fact: record() writes provisional new entries.
+        if semantic_noop && !context_rearm_required {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result
                 .semantic_noop_count
@@ -52511,6 +52543,16 @@ impl ScanIndex {
 
     /// StateMissing M2: this member is selected only because its family owes
     /// a proof correction (no witness change and no due retry).
+    /// This indexed file is a family member an owed proof correction names.
+    fn claude_authority_correction_owed(&self, key: &str) -> bool {
+        claude_index_path_family_member(Path::new(key)).is_some_and(|(root, member)| {
+            self.claude_usage_authority_quarantine
+                .get(&root)
+                .and_then(|record| record.proof_correction.as_ref())
+                .is_some_and(|correction| correction.owed_member_ids.contains(&member))
+        })
+    }
+
     fn claude_authority_correction_only(&self, candidate: &CandidateFile) -> bool {
         claude_index_path_family_member(&candidate.path).is_some_and(|(root, member)| {
             self.claude_usage_authority_quarantine

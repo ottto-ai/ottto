@@ -768,6 +768,71 @@ fn context_change_is_owed_once_then_stamped_and_equals_a_full() {
     f.assert_quiet();
 }
 
+/// [regress] [money] An mtime-only rewrite moves the revision with the same
+/// bodies: the file is read again, its complete parse finds the identical
+/// entity and body sets, and the receipt carries to the new revision with no
+/// re-send (before: every accepted body went on the wire again). The carried
+/// bodies are the exact-ACKed ones, which equal a cold Full.
+#[test]
+fn mtime_only_rewrite_carries_the_receipt_without_a_resend() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (sent, _) = f.walk(true);
+    assert!(!sent.snapshots.is_empty());
+    let context = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, context, &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &sent.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "receipted");
+    let mut cold = Fixture::new(f.source);
+    let (cold_scan, _) = cold.walk(true);
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+        &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &sent),
+    );
+    let before = f.entry().clone();
+    let modified = fs::metadata(&f.path).unwrap().modified().unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(60)))
+        .unwrap();
+    let sent_items = f.uploader.counts().0;
+    let previous = f.index.clone();
+    let (moved, _) = f.walk(true);
+    assert_eq!(moved.scanned_file_count, 1, "the read still happens");
+    assert!(
+        moved.snapshots.is_empty(),
+        "no re-send: {:?}",
+        moved.snapshots
+    );
+    assert!(moved.semantic_noop_count > 0);
+    let entry = f.entry().clone();
+    assert_ne!(
+        entry.source_file_fingerprint,
+        before.source_file_fingerprint
+    );
+    assert_eq!(
+        entry.last_upload_body_witness,
+        before.last_upload_body_witness
+    );
+    let receipt = entry.upload_context_receipt.as_ref().expect("carried");
+    assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+    assert_eq!(
+        receipt.body_witness,
+        before.upload_context_receipt.as_ref().unwrap().body_witness
+    );
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &moved.snapshots)
+        .unwrap();
+    assert_eq!(f.uploader.counts().0, sent_items, "0 resends");
+    f.assert_quiet();
+}
+
 /// [regress] A refused sibling leaves a proven file quiet: no re-read, no
 /// re-send. Before, Pi's source-wide gate kept every file owed while any
 /// sibling stayed unsettled.
