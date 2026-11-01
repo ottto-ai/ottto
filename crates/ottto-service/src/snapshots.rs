@@ -3491,6 +3491,8 @@ pub(crate) struct UploadAckRetirementHandoff {
     pub pending_bodies: BTreeMap<String, String>,
 }
 
+/// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
+/// each new field's save rule there (serde `skip_serializing*` keys here are inert).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
     /// V2-only custody and growth debt; absent on ordinary v1 paths.
