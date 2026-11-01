@@ -116,9 +116,15 @@ pub(super) fn restart(traversal: Option<&mut ScanTraversalCheckpoint>) -> BTreeM
 
 pub(super) fn alarm(source: SnapshotSource, traversal: &ScanTraversalCheckpoint) {
     let now = sampled_scan::now_seconds();
+    let mut files = 0_u64;
     let mut bytes = 0_u64;
     let mut age = 0_u64;
-    for debt in traversal.oversized_discovery.values() {
+    for debt in traversal
+        .oversized_discovery
+        .values()
+        .filter(|debt| debt.size_bytes > max_jsonl_file_bytes(source))
+    {
+        files += 1;
         bytes = bytes.saturating_add(debt.size_bytes);
         if debt.first_seen_unix_seconds > 0 {
             age = age.max(now.saturating_sub(debt.first_seen_unix_seconds));
@@ -128,7 +134,7 @@ pub(super) fn alarm(source: SnapshotSource, traversal: &ScanTraversalCheckpoint)
         "oversized_discovery_alarm",
         source.api_slug(),
         &serde_json::json!({
-            "outstanding_file_count": traversal.oversized_discovery.len(),
+            "outstanding_file_count": files,
             "outstanding_bytes": bytes,
             "first_seen_oversized_age_seconds": age,
         }),
@@ -221,11 +227,11 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
             debt.size_bytes = size;
         } else {
             let scan_root = scan_root.clone();
-            let debt = traversal.oversized_discovery.remove(&hash).unwrap();
-            traversal.counts.oversized_file_count = traversal
-                .counts
-                .oversized_file_count
-                .saturating_sub(debt.observations);
+            // Keep the age rescue until the ordinary open succeeds. A shrink
+            // after the discovery window is still owed, not proof of a read.
+            let debt = traversal.oversized_discovery.get_mut(&hash).unwrap();
+            debt.content_hash = content_hash;
+            debt.size_bytes = size;
             traversal.pending_candidates.push_back(ScanTraversalPath {
                 scan_root,
                 path: path.to_path_buf(),

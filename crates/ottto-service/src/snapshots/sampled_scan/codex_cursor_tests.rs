@@ -3575,7 +3575,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        discovery_retention!(@entries index),
     );
     assert!(!index
         .traversal

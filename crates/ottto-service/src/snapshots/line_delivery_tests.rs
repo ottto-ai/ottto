@@ -1053,7 +1053,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            discovery_retention!(index),
+            discovery_retention!(@entries index),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1306,6 +1306,9 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
             .unwrap()["first_seen_unix_seconds"] = first_seen.into();
         let mut index: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
         set_old(&path);
+        index.reset_traversal();
+        let mut index: ScanIndex =
+            serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
         walk(&mut index, "2026-10-15T12:00:00Z");
         let traversal = index.traversal.as_ref().unwrap();
         assert_eq!(traversal.counts.oversized_file_count, 1);
@@ -1330,6 +1333,12 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
         // gates, so recovery can use the ordinary reader.
         fs::write(&path, b"{}\n").unwrap();
         set_old(&path);
+        if source == SnapshotSource::ClaudeCode {
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.unhealthy_retry_not_before_unix_seconds = Some(0);
+            oversized_discovery::retry_changed(traversal, "2026-10-15T12:00:00Z");
+            assert_eq!(traversal.pending_candidates.len(), 1);
+        }
         let candidate = candidate_from_traversal_path(
             source,
             ScanTraversalPath {
@@ -1567,7 +1576,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         7,
-        discovery_retention!(index),
+        discovery_retention!(@entries index),
     );
     assert!(candidates(&index).contains(&path));
     assert!(index

@@ -8001,7 +8001,7 @@ impl SourceScanResult {
                         .is_some_and(|entry| entry.codex_applied_tier_receipt.is_some())
                 })
             {
-                index.traversal = None;
+                index.reset_traversal();
                 index.resume_after_path = None;
                 index.resume_upper_bound_path = None;
                 index.resume_census_window_end = None;
@@ -8118,7 +8118,7 @@ impl SourceScanResult {
     }
     pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
         if self.census_complete {
-            index.traversal = None;
+            index.reset_traversal();
             index.resume_after_path = None;
             index.resume_upper_bound_path = None;
             index.resume_census_window_end = None;
@@ -26799,7 +26799,7 @@ impl OwnedSourceScan {
             // now so sidecar additions/removals are folded into each affected
             // file fingerprint before a terminal manifest can publish. Actual identity
             // census loss also revisits consumed pages once to retract completeness.
-            index.traversal = None;
+            index.reset_traversal();
         }
         // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
         // it read-only across every session file via Arc.
@@ -32190,7 +32190,7 @@ impl OwnedSourceScan {
                                 .map(|candidate| candidate.path.clone())
                                 .collect::<Vec<_>>()
                         });
-                    index.traversal = None;
+                    index.reset_traversal();
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
                     index.resume_census_window_end = None;
@@ -32613,14 +32613,6 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
-            if let Some(traversal) = index.traversal.as_mut() {
-                if let Some(debt) = traversal
-                    .oversized_discovery
-                    .remove(&oversized_discovery::path_hash(&candidate.path))
-                {
-                    oversized_discovery::release(&mut traversal.counts, debt);
-                }
-            }
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
@@ -42870,7 +42862,7 @@ fn ensure_bounded_traversal(
                     );
                 }
             }
-            index.traversal = None;
+            index.reset_traversal();
         }
     }
     let prior_traversal_context_matches = index
@@ -42968,7 +42960,7 @@ fn ensure_bounded_traversal(
         // uncarried, and if the walk already passed one of its members the
         // traversal starts again so the uncarry precedes every pass.
         if !refund_claude_stale_family_carry(index) {
-            index.traversal = None;
+            index.reset_traversal();
             return ensure_bounded_traversal(
                 source,
                 roots,
@@ -43521,12 +43513,7 @@ fn ensure_bounded_traversal(
     if let Some(parts) = context_observation {
         claude_contract::started_context(&context_fingerprint, parts, roots);
     }
-    let oversized_debt = oversized_discovery::restart(
-        index
-            .traversal
-            .as_mut()
-            .filter(|_| prior_traversal_context_matches),
-    );
+    let oversized_debt = oversized_discovery::restart(index.traversal.as_mut());
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -44512,7 +44499,7 @@ fn advance_bounded_directory_traversal_with_budget(
             traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
-                retention.note_withheld_oversized(source, &path);
+                discovery_retention!(@entries index).note_withheld_oversized(source, &path);
                 oversized_discovery::record(
                     source,
                     &directory.scan_root,
@@ -46426,6 +46413,19 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
+    /// Rebuild discovery while retaining outstanding size debt in its existing
+    /// checkpoint. An invalidated context starts a fresh walk on the next page.
+    fn reset_traversal(&mut self) {
+        match self
+            .traversal
+            .as_mut()
+            .filter(|walk| !walk.oversized_discovery.is_empty())
+        {
+            Some(walk) => walk.context_fingerprint.clear(),
+            None => self.traversal = None,
+        }
+    }
+
     pub(crate) fn local_codex_census_aggregates(
         &self,
     ) -> codex_scan_diagnostics::CensusIndexAggregates {
@@ -48908,7 +48908,7 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload = false;
         self.bounded_sweep_unsettled_causes = 0;
         self.claude_full_rearm_progress.held_family_roots = None;
-        self.traversal = None;
+        self.reset_traversal();
         self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints.clear();
@@ -49049,7 +49049,7 @@ impl ScanIndex {
                         && t.counts.has_errors()
                 }) && self.claude_stale_family_carry.replay.is_empty();
             if traversal_is_terminal_unhealthy {
-                self.traversal = None;
+                self.reset_traversal();
             }
             self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::LegacyReconcile);
         }
@@ -49213,7 +49213,7 @@ impl ScanIndex {
                     && t.counts.has_errors()
             }) && self.claude_stale_family_carry.replay.is_empty()
             {
-                self.traversal = None;
+                self.reset_traversal();
             }
             self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AdmissionReoffer);
         }
@@ -52816,6 +52816,14 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        if let Some(traversal) = self.traversal.as_mut() {
+            if let Some(debt) = traversal
+                .oversized_discovery
+                .remove(&oversized_discovery::path_hash(&candidate.path))
+            {
+                oversized_discovery::release(&mut traversal.counts, debt);
+            }
+        }
         rearm_cause::reproven(&key);
         let last_upload_body_witness = self
             .files
