@@ -1901,7 +1901,11 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         entry.set_unverified_deadline(due);
         crowded.files.insert(pending_key.clone(), entry);
     }
+    // One pinned real second for both pages: the crowded page's progress
+    // slot owes `now + INTERVAL`, and restoration keeps that earlier due.
     sampled_scan::set_test_now(None);
+    let now = sampled_scan::now_seconds();
+    sampled_scan::set_test_now(Some(now));
     let (crowded, _, seen) = plain(&hold.fixture, CLAUDE, crowded, &hold.cache);
     assert_eq!(seen.modes, (0, 0, 0));
     assert_eq!(restored(), restored_before, "no free slot to restore into");
@@ -1918,13 +1922,13 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     // A freed slot: the next scan restores it, reading nothing.
     let mut freed = crowded;
     freed.files.remove(&pending[0]);
-    let start = sampled_scan::now_seconds();
     let (freed, _, seen) = plain(&hold.fixture, CLAUDE, freed, &hold.cache);
-    let end = sampled_scan::now_seconds();
     assert_eq!(seen.modes, (0, 0, 0), "restoration is no read");
     assert_eq!(restored(), restored_before + 1);
-    let deadline = freed.files[&key].unverified_deadline().unwrap();
-    assert!((start + INTERVAL..=end + INTERVAL).contains(&deadline));
+    assert_eq!(
+        freed.files[&key].unverified_deadline(),
+        Some(now + INTERVAL)
+    );
     assert!(sampled_audit::path_requires_verification(
         &freed.files,
         &hold.fixture.file.0
