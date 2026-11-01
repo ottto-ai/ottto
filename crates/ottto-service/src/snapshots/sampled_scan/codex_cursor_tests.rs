@@ -4328,6 +4328,18 @@ impl CreatedThreadHome {
         state_source: &str,
         spawn_parent: Option<&str>,
     ) -> Self {
+        Self::with_lineage_aged(written, fork, state_source, spawn_parent, 0)
+    }
+
+    /// `with_lineage` whose content and state row are `age_ms` older than the
+    /// rollout file's birth: a copied or recreated rollout.
+    fn with_lineage_aged(
+        written: usize,
+        fork: bool,
+        state_source: &str,
+        spawn_parent: Option<&str>,
+        age_ms: i64,
+    ) -> Self {
         let fixture = ScanRoot::with_sessions(&[]);
         let now = i64::try_from(
             SystemTime::now()
@@ -4336,7 +4348,7 @@ impl CreatedThreadHome {
                 .as_millis(),
         )
         .unwrap();
-        let base_ms = now - now % 1_000;
+        let base_ms = now - now % 1_000 - age_ms;
         let at = |offset: i64| bounded_rfc3339_millis(base_ms + offset).unwrap();
         let second = |offset: i64| u64::try_from(base_ms / 1_000 + offset).unwrap();
         let turn = |n: u64| format!("{}-5000-7000-8000-{n:012}", &CREATED[..8]);
@@ -4888,6 +4900,57 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     );
     assert_oracle(&home, &cache, &index, &cured, 3, true, &[]);
     assert_admitted_once(&home, &cache, index, &cured, 4);
+}
+
+/// [regress] A copied created thread: its header matches the state row's
+/// creation time, but the rollout file was born days later. A state-declared
+/// created thread proves its creation from that header, not from file birth,
+/// so the curing append binds it and credits its usage once, equal in totals
+/// and placement to a cold Full. A thread the state row does not classify as
+/// created (rollout-declared, spawn parent) keeps the file-birth check and
+/// stays held, as on main.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
+fn copied_created_thread_binds_from_its_header_not_file_birth() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    const COPIED_DAYS_LATER_MS: i64 = 5 * 86_400_000;
+    for (state_source, spawn_parent, admitted) in [
+        ("agent_created_thread", None, true),
+        ("user", Some(SPAWN_PARENT), false),
+    ] {
+        let home = CreatedThreadHome::with_lineage_aged(
+            3,
+            false,
+            state_source,
+            spawn_parent,
+            COPIED_DAYS_LATER_MS,
+        );
+        let cache = Arc::new(SharedCache::default());
+        let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+        assert!(created_usage(&held).is_empty(), "{state_source}");
+        home.flush_from(3);
+        let (index, cured) = home.generation(index, &cache, 1);
+        if !admitted {
+            assert!(created_usage(&cured).is_empty(), "{state_source}");
+            assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+            continue;
+        }
+        assert_eq!(
+            created_usage(&cured),
+            vec![(200, 3)],
+            "{state_source}: {}",
+            counters(&cache)
+        );
+        let (cold_index, cold) = home.oracle(1);
+        money_oracle::assert_equivalent(
+            &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+            &scan_money(SnapshotSource::Codex, &index, &cured),
+        );
+        assert_admitted_once(&home, &cache, index, &cured, 2);
+    }
 }
 
 /// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by

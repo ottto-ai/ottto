@@ -18590,6 +18590,7 @@ impl SnapshotAccumulator {
                         file_metadata,
                         thread,
                         rollout_extent,
+                        created_thread,
                     ),
                     child_created_at_nanos: (parent.is_some() || parentless_creation_bound)
                         .then_some(thread)
@@ -37265,6 +37266,7 @@ fn codex_sidecar_rollout_file_matches(
     file_metadata: &fs::Metadata,
     thread: Option<&CodexStateThread>,
     rollout_extent: Option<CodexRolloutExtent>,
+    created_thread: bool,
 ) -> bool {
     if rollout_extent.is_some_and(|extent| extent.next_byte_offset != file_metadata.len()) {
         return false;
@@ -37285,8 +37287,15 @@ fn codex_sidecar_rollout_file_matches(
         return false;
     }
 
+    // A state-declared created thread proves its creation time from its own
+    // header (`codex_native_created_thread_header`). File birth names only this
+    // object generation, which recreating or copying the rollout resets.
     if let (Some(sidecar_created), Ok(file_created)) = (
-        thread.created_at.as_deref().and_then(rfc3339_unix_nanos),
+        thread
+            .created_at
+            .as_deref()
+            .filter(|_| !created_thread)
+            .and_then(rfc3339_unix_nanos),
         file_metadata.created(),
     ) {
         let Some(file_created) = system_time_unix_nanos_i128(file_created) else {
