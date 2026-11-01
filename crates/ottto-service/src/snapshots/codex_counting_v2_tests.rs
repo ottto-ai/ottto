@@ -498,7 +498,7 @@ fn input_by_tier(item: &SnapshotItem) -> BTreeMap<Option<String>, (u64, Option<S
 }
 
 const THREAD_TIER_SOURCE: &str = "derived_from_thread_settings";
-const AT_EPOCH: &str = "2026-11-04T00:00:00Z";
+const AT_EPOCH: &str = "2026-11-06T00:00:00Z";
 
 /// [money] Requested tier for both counting versions: an in-epoch snapshot
 /// replaces the running tier, anything but an explicit `fast`, `priority` or
@@ -506,17 +506,17 @@ const AT_EPOCH: &str = "2026-11-04T00:00:00Z";
 /// evidence and requests keep exactly today's untiered row.
 #[test]
 fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
-    let in_epoch = |minute: u64| format!("2026-11-04T00:{minute:02}:00Z");
+    let in_epoch = |minute: u64| format!("2026-11-06T00:{minute:02}:00Z");
     let priority = || Some(json!("priority"));
     let mut values = vec![header("2026-08-31T23:00:00Z")];
     let mut total = [0; 6];
     // A pre-epoch snapshot seeds nothing, before or at the boundary.
-    values.push(thread_settings(Some("2026-11-03T23:00:00Z"), priority()));
+    values.push(thread_settings(Some("2026-11-05T23:00:00Z"), priority()));
     tier_turn(
         &mut values,
         &mut total,
         "t1",
-        "2026-11-03T23:59:59Z",
+        "2026-11-05T23:59:59Z",
         true,
         1,
     );
@@ -621,7 +621,7 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
             .unwrap();
         let mut items = accumulator.into_items(
             Path::new("/synthetic/sessions/rollout.jsonl"),
-            "2026-11-05T00:00:00Z",
+            "2026-11-07T00:00:00Z",
             "fp".into(),
             None,
         );
@@ -636,7 +636,7 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
         &mut values,
         &mut total,
         "fast-turn",
-        "2026-11-04T00:01:00Z",
+        "2026-11-06T00:01:00Z",
         true,
         100,
     );
@@ -644,7 +644,7 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
         &mut values,
         &mut total,
         "next-turn",
-        "2026-11-04T00:02:00Z",
+        "2026-11-06T00:02:00Z",
         true,
         200,
     );

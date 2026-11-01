@@ -901,12 +901,12 @@ fn provider_price_line(model: &str) -> Option<(u64, ProviderPriceLineKind)> {
 /// restating the price split never touches older history.
 const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
 
-/// 2026-11-04T00:00:00Z, provisional: set at the release cut to the 00:00Z
-/// on/after install on every machine. Codex thread-settings tiers and
+/// 2026-11-06T00:00:00Z, a 00:00Z expected on/after install on every machine.
+/// Codex thread-settings tiers and
 /// `TieredForward` lines count only evidence and usage dated from here, so a
 /// request's row is a function of its file's bytes on every read route and
 /// usage accepted before the release keeps exactly the row it had.
-const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_793_923_200;
 
 fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
     timestamp
@@ -75522,14 +75522,14 @@ mod tests {
         assert_eq!(provider_context_bucket("gpt-6.1-sol", 0, now), None);
         // Forward lines stamp nothing before their own later date, so a re-read
         // never restates usage accepted without a bucket.
-        let forward = Some("2026-11-04T00:00:00Z");
+        let forward = Some("2026-11-06T00:00:00Z");
         assert_eq!(
             forward.and_then(rfc3339_unix_seconds),
             Some(CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
         );
         for model in ["gpt-6.1-terra", "gpt-6-rosalind"] {
             for (prompt, observed_at, bucket) in [
-                (400_000, Some("2026-11-03T23:59:59Z"), None),
+                (400_000, Some("2026-11-05T23:59:59Z"), None),
                 (400_000, None, None),
                 (0, forward, None),
                 (272_000, forward, Some("short")),

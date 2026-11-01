@@ -1244,10 +1244,10 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             .into_iter()
             .enumerate()
         {
-            let at = "2026-11-04T07:00:00Z";
+            let at = "2026-11-06T07:00:00Z";
             let snapshot = tier.map_or(String::new(), |tier| settings(at, tier));
             let rows = codex_rows(&format!("tier-{step}"), 30 + step as u64)
-                .replace("2026-10-27", "2026-11-04");
+                .replace("2026-10-27", "2026-11-06");
             grow(&(snapshot + &rows));
             let (cold_index, cold_scan, cold_modes) =
                 other_page(&c, &E2ScanFixture::default(), source, prior.clone());
