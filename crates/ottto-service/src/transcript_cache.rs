@@ -396,17 +396,17 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .get(key)
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
-    /// A retained entry without taking it (M1 durable write after an index
-    /// save encodes it in place under the retained lock).
-    #[cfg_attr(not(unix), allow(dead_code))]
     /// The same resident's acquisition provenance, borrowed under this cache guard.
     pub(crate) fn custody(&self, key: &str) -> Option<&crate::snapshots::DurableCustody> {
         self.custody.as_ref()?.get(key).map(Box::as_ref)
     }
     /// Borrow resident keys under the existing retained lock (at most CACHE_ENTRIES).
+    #[cfg(unix)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.entries.keys()
     }
+    /// A retained entry without taking it (M1 durable write after an index
+    /// save encodes it in place under the retained lock; deletion diagnostics).
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
     }

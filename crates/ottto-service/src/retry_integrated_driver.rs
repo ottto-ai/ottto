@@ -117,8 +117,22 @@ fn integrated_ack(
         .iter()
         .map(|item| {
             let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
-            // As the backend's entity ACK does, the digest travels only with
-            // a witness version.
+            if version.is_none() {
+                // Ordinary fixtures have no witness domain, as on the backend.
+                let retained_version = crate::snapshots::snapshot_upload_body_witness_version(item);
+                assert!(
+                    matches!(
+                        retained_version,
+                        None | Some(
+                            crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
+                                | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
+                        )
+                    ),
+                    "unexpected retained ordinary fixture witness: {retained_version:?}"
+                );
+            }
+            // Additive evidence uses the production public ACK version; the
+            // digest travels only with that version.
             Ok(serde_json::json!({
                 "source_session_id":item.source_session_id,
                 "snapshot_fingerprint":item.snapshot_fingerprint,
