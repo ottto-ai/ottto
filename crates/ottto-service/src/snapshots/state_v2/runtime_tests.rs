@@ -602,7 +602,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         }
         f.import_graph(Some(&pre));
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-        let loaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let loaded = load_with(&f.path, false).unwrap().unwrap();
         let stored = materialized(&loaded).claude_usage_family_pending.clone();
         assert_eq!(*stored, *pre.claude_usage_family_pending);
         let mut working = if cold { loaded } else { materialized(&loaded) };
@@ -670,7 +670,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
 
         // Restart: production reloads this hold-free store cold in both runs.
         // A1: running total == sum of heads == fold of the stored rows.
-        let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
         let usage = &reloaded.claude_usage_family_pending;
         assert!(usage.cold().is_some());
         let families = materialized(&reloaded)
@@ -703,7 +703,7 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
     }
     f.import_graph(Some(&pre));
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    let mut working = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let mut working = load_with(&f.path, false).unwrap().unwrap();
     assert!(working.claude_usage_family_pending.cold().is_some());
     with_session_db(&working, |db| {
         let key = mapper::key("usage.pending", "r2", 1).unwrap();
@@ -1176,8 +1176,14 @@ mod hydrate_parity {
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
+        // A loaded graph's cold usage map does not serialize: compare the
+        // families it stores.
+        let view = match actual.claude_usage_family_pending.cold() {
+            Some(_) => materialized(actual),
+            None => actual.clone(),
+        };
         assert_eq!(
-            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&view).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         assert!(actual.decode_holds.same_as(&expected.decode_holds));
