@@ -44811,7 +44811,7 @@ fn candidate_from_traversal_path(
 }
 
 /// Open-admission inputs: census clock, backfill window, main's owed-key
-/// retention and v2 growth debt (None when OFF).
+/// retention and v2 growth debt (None for a v1 graph).
 #[derive(Clone, Copy)]
 struct CandidateWindow<'a> {
     census_unix_seconds: Option<u64>,
