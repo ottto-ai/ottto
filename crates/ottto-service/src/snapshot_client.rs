@@ -166,15 +166,21 @@ fn gzip(body: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-/// Keep encoded requests inside the backend's independent gzip budgets.
-/// Identity requests retain the existing exact 4 MiB preflight and packing.
-fn gzip_snapshot_batch(body: &[u8], enabled: bool) -> Option<Vec<u8>> {
-    const MAX_DECODED_BYTES: usize = 1024 * 1024;
-    const MAX_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
-    if !enabled || body.len() > MAX_DECODED_BYTES {
+/// Keep encoded requests inside the backend's independent gzip budgets. A
+/// receiver advertising items over 2 MiB decodes a whole request; an older one
+/// decodes 1 MiB, so larger bodies keep identity encoding and the exact preflight.
+fn gzip_snapshot_batch(body: &[u8], enabled: bool, item_cap: usize) -> Option<Vec<u8>> {
+    const OLDER_RECEIVER_ITEM_BYTES: usize = 2 * 1024 * 1024;
+    const OLDER_RECEIVER_DECODED_BYTES: usize = 1024 * 1024;
+    let max_decoded = if item_cap > OLDER_RECEIVER_ITEM_BYTES {
+        crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES
+    } else {
+        OLDER_RECEIVER_DECODED_BYTES
+    };
+    if !enabled || body.len() > max_decoded {
         return None;
     }
-    gzip(body).filter(|encoded| encoded.len() <= MAX_COMPRESSED_BYTES)
+    gzip(body).filter(|encoded| encoded.len() <= 2 * max_decoded)
 }
 
 /// A rejection that means "I could not read your encoding", as opposed to "your
@@ -2153,13 +2159,30 @@ impl SnapshotApiClient {
             .and_then(decode_activity_hint)
     }
 
+    #[cfg(test)]
     pub fn upload_batch(
         &self,
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, None)
+        self.upload_batch_with_item_cap(
+            relay_token,
+            request,
+            enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+        )
+    }
+
+    /// `item_cap` is this pass's receiver limit; it selects the gzip budget.
+    pub(crate) fn upload_batch_with_item_cap(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+        item_cap: usize,
+    ) -> Result<SnapshotBatchResponse> {
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, item_cap, None)
     }
 
     /// Optional retry transport: fresh authority at every physical POST, one
@@ -2179,6 +2202,7 @@ impl SnapshotApiClient {
             relay_token,
             request,
             enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
             Some((budget, validate)),
         )
     }
@@ -2188,6 +2212,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
+        item_cap: usize,
         mut retry: Option<(
             &mut crate::snapshot_retry::RetryBudget,
             &mut dyn FnMut() -> Result<()>,
@@ -2218,7 +2243,7 @@ impl SnapshotApiClient {
             .as_ref()
             .map(|(budget, _)| budget.gzip_enabled(default_gzip))
             .unwrap_or(default_gzip);
-        let compressed = gzip_snapshot_batch(&body, gzip_enabled);
+        let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
                 validate()?;
@@ -4038,21 +4063,27 @@ mod tests {
                     state as u8
                 })
                 .collect::<Vec<_>>();
-            let encoded = gzip_snapshot_batch(&body, true).expect("within budgets");
+            let encoded = gzip_snapshot_batch(&body, true, 655_360).expect("within budgets");
             assert!(encoded.len() <= 2 * 1024 * 1024);
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(encoded.as_slice())
                 .read_to_end(&mut decoded)
                 .unwrap();
             assert_eq!(decoded, body);
-            assert!(gzip_snapshot_batch(&body, false).is_none());
+            assert!(gzip_snapshot_batch(&body, false, 655_360).is_none());
         }
         for size in [1024 * 1024 + 1, 2 * 640 * 1024, 2 * 1024 * 1024] {
             assert!(
-                gzip_snapshot_batch(&vec![b'x'; size], true).is_none(),
+                gzip_snapshot_batch(&vec![b'x'; size], true, 2 * 1024 * 1024).is_none(),
                 "identity fallback preserves large packed requests without a gzip 413"
             );
         }
+        // Only a receiver advertising over 2 MiB gets a large encoded request.
+        let max = crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES;
+        let item_cap = 8 * 1024 * 1024;
+        assert!(gzip_snapshot_batch(&vec![b'x'; 1024 * 1024 + 1], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max + 1], true, item_cap).is_none());
     }
 
     #[test]
@@ -5213,6 +5244,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 }
 
 #[cfg(test)]
-pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
-    gzip_snapshot_batch(body, true)
+pub(crate) fn retention_gzip_probe(body: &[u8], item_cap: usize) -> Option<Vec<u8>> {
+    gzip_snapshot_batch(body, true, item_cap)
 }

@@ -6279,6 +6279,27 @@ fn collect_unparkable_preparation_with_rotation(
         .expect("ordinary serial owned source completion")
 }
 #[cfg(test)]
+thread_local! {
+    static WAKE_FRAME_VISIT_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+/// A test's own visit ceiling, below the walk's 4096 cap, checked on every
+/// measured wake frame while the guard lives.
+#[cfg(test)]
+pub(crate) struct WakeFrameVisitLimitForTest(Option<usize>);
+#[cfg(test)]
+impl WakeFrameVisitLimitForTest {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self(WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.replace(Some(limit))))
+    }
+}
+#[cfg(test)]
+impl Drop for WakeFrameVisitLimitForTest {
+    fn drop(&mut self) {
+        WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+#[cfg(test)]
 fn try_collect_native_preparation_with_rotation_observed(
     frame: SourcePreparation,
     require_frame_bound: bool,
@@ -6345,6 +6366,14 @@ fn try_collect_native_preparation_with_rotation_observed(
                     receipt.visits_for_test(),
                     measured.is_some()
                 );
+                if let Some(limit) = WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+                    assert!(
+                        receipt.visits_for_test() <= limit,
+                        "codex_wake_frame step {} used {} visits; this test keeps them at or under {limit}",
+                        self.steps,
+                        receipt.visits_for_test()
+                    );
+                }
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
                     "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {
@@ -8356,7 +8385,12 @@ fn finish_sync_source(
                 let token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let response = client.upload_batch(&token, &request, enforce_head_cas)?;
+                let response = client.upload_batch_with_item_cap(
+                    &token,
+                    &request,
+                    enforce_head_cas,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
                 Ok(response)
             },
@@ -8481,8 +8515,12 @@ fn finish_sync_source(
                 let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let mut response =
-                    client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+                let mut response = client.upload_batch_with_item_cap(
+                    &upload_relay_token,
+                    &request,
+                    reconcile_class,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
                 response.bind_conflict_rescans(&request);
                 let request_fingerprints = request
@@ -9250,7 +9288,10 @@ fn finish_sync_source(
             scan_result.codex_counting_v2.as_deref(),
         );
         if !resolved_permanent_rejections {
-            return Err(snapshot_entity_deferred(count));
+            return Err(snapshot_entity_deferred(
+                count,
+                upload_progress.context_resend.deferred.len(),
+            ));
         }
         // Permanent refusals still finish transport successfully and remain
         // disclosed as errors. Only an otherwise earned, clean selected save
@@ -10610,6 +10651,8 @@ fn require_normal_write_ack_for_legacy_reconciliation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityDeferred {
     count: usize,
+    conflicted: usize,
+    context_budget: usize,
 }
 
 impl std::fmt::Display for SnapshotEntityDeferred {
@@ -10624,8 +10667,12 @@ impl std::fmt::Display for SnapshotEntityDeferred {
 
 impl std::error::Error for SnapshotEntityDeferred {}
 
-fn snapshot_entity_deferred(count: usize) -> anyhow::Error {
-    anyhow::Error::new(SnapshotEntityDeferred { count })
+fn snapshot_entity_deferred(count: usize, context_budget: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityDeferred {
+        count,
+        conflicted: count.saturating_sub(context_budget),
+        context_budget,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13056,8 +13103,8 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if error.downcast_ref::<BatchRejected>().is_some() {
         return "local snapshot payload validation failed".to_string();
     }
-    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
-        return "local snapshot upload deferred by unsettled entities".to_string();
+    if let Some(deferred) = error.downcast_ref::<SnapshotEntityDeferred>() {
+        return format!("local snapshot upload deferred by unsettled entities: count={} conflicted={} context_budget={}", deferred.count, deferred.conflicted, deferred.context_budget);
     }
     if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
         return "local health upload held after setup-run refresh failed".to_string();
@@ -16458,7 +16505,7 @@ mod tests {
             .accepted_fingerprints
             .contains(&items[SNAPSHOT_BATCH_LIMIT]));
 
-        let deferred = snapshot_entity_deferred(1);
+        let deferred = snapshot_entity_deferred(1, 0);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
@@ -16467,7 +16514,7 @@ mod tests {
         );
         assert_eq!(
             safe_error(&deferred),
-            "local snapshot upload deferred by unsettled entities"
+            "local snapshot upload deferred by unsettled entities: count=1 conflicted=1 context_budget=0"
         );
 
         // Model the next authoritative scan replacing the oversized canonical
@@ -16548,12 +16595,12 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_deferred(3);
+        let deferred = snapshot_entity_deferred(3, 2);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
-                .map(|error| error.count),
-            Some(3)
+                .map(|error| (error.count, error.conflicted, error.context_budget)),
+            Some((3, 1, 2))
         );
     }
 
