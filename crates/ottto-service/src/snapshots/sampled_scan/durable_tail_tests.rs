@@ -1763,6 +1763,28 @@ pub(super) fn native_record_of(
     fixture::finish_record(&mut parser, scope, 1_800_000_000)
 }
 
+/// The Codex record as the production singleton read builds it: the active
+/// counting view is configured before the read (as the scan's group job does).
+pub(super) fn counted_codex_record_of(
+    path: &Path,
+    scope: &Scope,
+) -> (CachedJsonlReduction, Checkpoint) {
+    let mut parser = fixture::parser(
+        SnapshotSource::Codex,
+        path,
+        File::open(path).unwrap(),
+        apply_codex_line,
+    );
+    codex_counting_version::configure_group_once(
+        &mut parser.accumulator,
+        codex_counting_version::AckEvidence::None,
+    );
+    parser
+        .prepare_acquisition(None, scope, None, 1_800_000_000)
+        .unwrap();
+    fixture::finish_record(&mut parser, scope, 1_800_000_000)
+}
+
 pub(super) fn native_fixture(path: &Path) {
     std::fs::write(
         path,
@@ -4226,10 +4248,19 @@ fn other_source_restore_after_return_release(
     index.save(&index_path).unwrap();
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let interp = Interpretation::of(source, &key, &index, false, &namespace);
-    let binding = expected(ds, source, &key, &scope, &index, &interp, None)
+    let (reduction, _) = counted_codex_record_of(&path, &scope);
+    let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
         .unwrap()
         .binding;
-    let (reduction, _) = native_record_of(&path, &scope, source);
+    // Format-3 scope binds the body's immutable (configured) counting.
+    binding.scope = v3_replay_scope(
+        source,
+        &scope,
+        &index,
+        &interp,
+        effective_revision(source),
+        &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
+    );
     let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
     let mut disk = fixture::store(&index_path, ds);
     assert_eq!(
@@ -4250,6 +4281,15 @@ fn other_source_restore_after_return_release(
         1
     );
     move || {
+        // Scoped restore requires real growth; a quiet file is a zero-input hold.
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
         let interp = Interpretation::of(source, &key, &index, false, &namespace);
         let restored = cache
             .durable_restore(
@@ -4750,6 +4790,9 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     .any(|event| event["counts"]["active_current_bytes"] == 0));
                 sampled_jsonl::preparation_tests::set(None);
             }
+            // Request the fresh metadata census this quiet >=W step models; a
+            // refused census otherwise resumes its traversal and its 2026 clock.
+            index.traversal = None;
             // A quiet period longer than W cannot hide unread suffix: growth
             // was already fully counted and committed before entering quiet.
             let (next, quiet, metrics) = run(
@@ -5145,7 +5188,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         disk.restart();
         assert!(disk.cache.retained_checkpoint(&key).is_none());
         assert!(disk.index.claude_usage_family_pending.is_empty());
-        let prior = disk.index.clone();
+        let mut prior = disk.index.clone();
+        // Runtime-only (serde skip): the sync caller re-activates the current
+        // row after every load, exactly as the seed did above.
+        prior.activate_effective_upload_body_witness_revision(
+            effective_revision(source) - u64::from(change == ContractChange::BodyWitness),
+        );
         disk.cache
             .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
         let (cold_index, cold, cold_modes) = read(
@@ -5183,8 +5231,13 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         let counts = disk.cache.durable_counters(source).unwrap().0;
         match change {
             ContractChange::Unchanged => {
-                assert_eq!(counts.restored, 1);
-                assert_eq!(modes, (0, 0, 1));
+                // A quiet restore reads zero bytes; the owed selection takes
+                // its ordinary paced Full, money-equal to the cold Full.
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("old_binding_no_match"), None);
+                assert_eq!(counts.ineligible.get("rederive_quiet"), Some(&1));
+                assert_eq!(counts.resource_full.get("rederive_quiet"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
                 assert!(current.is_some());
                 assert_eq!(current, stamped);
             }
@@ -5555,12 +5608,9 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                         .as_mut()
                         .unwrap()
                         .acquired_revision = revision;
-                    prior
-                        .files
-                        .get_mut(&key)
-                        .unwrap()
-                        .effective_upload_body_witness_revision = revision;
-                    prior.active_effective_upload_body_witness_revision = revision;
+                    // a0h_scan activates the current revision: keep the index
+                    // current (no history debt); only the record's acquisition
+                    // and its scope are behind.
                     assert!(!prior.effective_upload_body_witness_revision_requires_adoption(&key));
                     let i = Interpretation::of(source, &key, &prior, false, &slot.namespace);
                     record.record.binding.scope = expected(
@@ -5660,8 +5710,33 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
-        assert_eq!(modes, (1, 0, 0), "{reason}: real native Full");
-        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
+        // Class d: the metadata step's byte-zero Full replaced the undecodable
+        // same-context current-revision predecessor with a valid successor.
+        // Only records this namespace cannot prove (context, revision) survive.
+        let replaced = reason == "restore_semantics";
+        let len = || std::fs::metadata(&path).unwrap().len();
+        let survivor_or_successor = || {
+            if replaced {
+                let successor = store::tests::found(
+                    fixture::store(&index_path, ds).read(&store::key_digest(ds, &key)),
+                );
+                assert!(codec::decode(&successor.record.body, source).is_ok());
+                assert_eq!(successor.record.certificate.sealed_offset, len());
+            } else {
+                assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+            }
+        };
+        let context = |stage: &str, modes: (usize, usize, usize), scan: &SourceScanResult| {
+            native_restore_context(stage.into(), modes, scan, &owner.cache, None)
+        };
+        let c = context("stale/growth", modes, &scan);
+        if replaced {
+            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
+            assert_eq!(modes.1, 1, "{reason}: successor Tail {c:?}");
+        } else {
+            assert_eq!(modes, (1, 0, 0), "{reason}: real native Full {c:?}");
+            assert_eq!(io.1, len());
+        }
         let body = a0h_wire(&root, &mut index, &mut scan);
         assert_eq!(
             (
@@ -5675,13 +5750,20 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            1
+            u64::from(!replaced)
         );
         let ((), alarm) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
-        assert_eq!(alarm.len(), 1);
-        assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
-        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        // durable_alarm emits the store snapshot and a separate cause delta.
+        let alarm = alarm
+            .into_iter()
+            .filter(|alarm| alarm["counts"][reason].is_array())
+            .collect::<Vec<_>>();
+        assert_eq!(alarm.len(), usize::from(!replaced));
+        if !replaced {
+            assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
+        }
+        survivor_or_successor();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -5694,9 +5776,25 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             owner.begin_durable(source, &root, &index_path);
             owner.cache.durable().unwrap().retail_full_now =
                 Some(pace_time(now + std::time::Duration::from_secs(seconds)));
-            let ((held, scan, modes), io) =
+            let ((mut held, mut scan, modes), io) =
                 a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
             assert_eq!(modes.0, 0);
+            if replaced {
+                // The successor is restored; no ACK, so the unaccepted growth is
+                // read by Tail once and every publication is the exact cold body.
+                let c = context("stale/reselect", modes, &scan);
+                assert!(modes.1 == 0 || !scan.snapshots.is_empty(), "{c:?}");
+                if !scan.snapshots.is_empty() {
+                    let body = a0h_wire(&root, &mut held, &mut scan);
+                    let s = &scan.snapshots[0];
+                    assert_eq!((s.input_tokens, s.request_count), (700, 3), "{c:?}");
+                    let (mut ci, mut cs, _) =
+                        a0h_scan(&E2ScanFixture::default(), &roots, &root, prior.clone());
+                    assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+                }
+                survivor_or_successor();
+                continue;
+            }
             assert_eq!(io, (0, 0));
             assert!(scan.snapshots.is_empty());
             assert_eq!(held.files[&key].size_bytes, accepted);
@@ -5729,22 +5827,29 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             Some(pace_time(now + std::time::Duration::from_secs(21600)));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
-        let body = a0h_wire(&root, &mut index, &mut scan);
-        assert_eq!(
-            (
-                scan.snapshots[0].input_tokens,
-                scan.snapshots[0].request_count
-            ),
-            (700, 3)
-        );
-        let cold = E2ScanFixture::default();
-        let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
-        assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        let c = context("stale/release", modes, &scan);
+        if replaced {
+            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
+        } else {
+            assert_eq!(modes, (1, 0, 0), "{c:?}");
+            assert_eq!(io.1, len());
+        }
+        if !replaced || !scan.snapshots.is_empty() {
+            let body = a0h_wire(&root, &mut index, &mut scan);
+            assert_eq!(
+                (
+                    scan.snapshots[0].input_tokens,
+                    scan.snapshots[0].request_count
+                ),
+                (700, 3)
+            );
+            let cold = E2ScanFixture::default();
+            let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+            assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        }
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            2
+            if replaced { 0 } else { 2 }
         );
         assert!(index.files.contains_key(&key));
         assert_eq!(
@@ -5756,13 +5861,28 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             0
         );
         owner.cache.durable_gc(lock, source, &prior).unwrap();
-        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        survivor_or_successor();
         let restarted = E2ScanFixture::default();
         restarted.begin_durable(source, &root, &index_path);
-        let ((_, _, modes), io) =
+        let ((mut ri, mut rs, modes), io) =
             a0h_observe(|| a0h_scan(&restarted, &roots, &root, prior.clone()));
-        assert_eq!(modes.0, 1);
-        assert!(io.1 > 0);
+        if replaced {
+            // Restart restores the valid successor; the unaccepted growth is
+            // published again with the exact cold body (no ACK was recorded).
+            let c =
+                native_restore_context("stale/restart".into(), modes, &rs, &restarted.cache, None);
+            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
+            assert!(!rs.snapshots.is_empty(), "{c:?}");
+            let body = a0h_wire(&root, &mut ri, &mut rs);
+            let s = &rs.snapshots[0];
+            assert_eq!((s.input_tokens, s.request_count), (700, 3));
+            let (mut ci, mut cs, _) =
+                a0h_scan(&E2ScanFixture::default(), &roots, &root, prior.clone());
+            assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        } else {
+            assert_eq!(modes.0, 1);
+            assert!(io.1 > 0);
+        }
         assert_eq!(
             restarted
                 .cache
@@ -5770,7 +5890,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 .unwrap()
                 .0
                 .stale_full[cause],
-            1
+            u64::from(!replaced)
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6808,7 +6928,8 @@ impl O3Fixture {
         owner
             .cache
             .durable_write_after_save(
-                test_locks::hold(&self.root),
+                // The fixture already holds this scratch state dir's lock.
+                crate::locked_state_dir::held_for(&self.root).unwrap(),
                 SnapshotSource::ClaudeCode,
                 index,
             )
@@ -7652,7 +7773,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let index_path = root.join("index.json");
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let admit = |fingerprint: &str| {
-        let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+        let (reduction, checkpoint) = counted_codex_record_of(&path, &scope);
         let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
         assert!(cache.insert_admitted(
             key.clone(),
@@ -7796,6 +7917,10 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
     lease.release();
     let mut parser = owned_parser(source, &path, file);
+    codex_counting_version::configure_group_once(
+        &mut parser.accumulator,
+        codex_counting_version::AckEvidence::None,
+    );
     assert_eq!(
         parser
             .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
@@ -9148,7 +9273,8 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     owner
         .cache
         .durable_write_after_save(
-            test_locks::hold(&f.root),
+            // The fixture already holds this scratch state dir's lock.
+            crate::locked_state_dir::held_for(&f.root).unwrap(),
             SnapshotSource::ClaudeCode,
             &index,
         )
@@ -10778,14 +10904,61 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 .unwrap();
             let owner = f.owner();
             let mut prior = ScanIndex::load(&f.index_path).unwrap();
+            // The active revision is runtime-only; sync activates it after every
+            // load (as a1a_scan_at does). Revision 0 denies every request-owned item.
+            prior.activate_effective_upload_body_witness_revision(effective_revision(
+                SnapshotSource::ClaudeCode,
+            ));
             let accepted_witness = prior.files[&f.key].last_upload_body_witness.clone();
             let before = prior.clone();
+            // The same synthetic pre-August birth as the seed and the cold oracle.
+            let scan_at = |owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+                           prior: &mut ScanIndex| {
+                claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                    f.scan_at(owner, prior, "2026-08-02T08:00:00Z", 1)
+                })
+            };
+            let mut expected_tokens = 900;
+            if edit == "shorter_object" {
+                // S2: an unproved new object below the accepted end holds at the
+                // accepted floor; no shorter body is published. Growth catches up.
+                let entry = serde_json::to_value(&prior.files[&f.key]).unwrap();
+                let held_owner = f.owner();
+                let ((held, body, modes), rows) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        scan_at(&held_owner, &mut prior.clone())
+                    });
+                assert_eq!(modes, (0, 0, 0), "{binding}: floor holds, no Full/Tail");
+                assert!(body.snapshots.is_empty());
+                assert_eq!(body.unreadable_path_count, 0);
+                assert_eq!(serde_json::to_value(&held.files[&f.key]).unwrap(), entry);
+                assert_eq!(std::fs::read(&f.record_path).unwrap(), survivor);
+                assert_eq!(
+                    rows.iter()
+                        .filter_map(|r| r["counts"]["restored_behind_accepted"]["held"].as_u64())
+                        .sum::<u64>(),
+                    1,
+                    "{binding}: actual floor diagnostic"
+                );
+                drop(held_owner);
+                f.append("short-growth", 100);
+                File::options()
+                    .write(true)
+                    .open(&f.path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_657_600),
+                    )
+                    .unwrap();
+                assert!(std::fs::metadata(&f.path).unwrap().len() >= old_length);
+                expected_tokens = 1000;
+            }
             let ((mut index, mut scan, mode), bytes) =
-                observe_consumed(|| f.scan_at(&owner, &mut prior, "2026-08-02T08:00:00Z", 1));
+                observe_consumed(|| scan_at(&owner, &mut prior));
             assert_eq!(mode.0, 1, "{binding}/{edit}: independent A2 Full");
             assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
             assert!(!scan.snapshots.is_empty());
-            assert_eq!(scan.snapshots[0].input_tokens, 900);
+            assert_eq!(scan.snapshots[0].input_tokens, expected_tokens);
             assert_eq!(
                 index.files[&f.key].last_upload_body_witness, accepted_witness,
                 "no manufactured ACK"
@@ -10804,7 +10977,7 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 owner
                     .cache
                     .durable_write_after_save(
-                        test_locks::hold(&f.root),
+                        crate::locked_state_dir::held_for(&f.root).unwrap(),
                         SnapshotSource::ClaudeCode,
                         &index
                     )
@@ -10816,6 +10989,9 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
             drop(owner);
             let restarted = f.owner();
             let mut loaded = ScanIndex::load(&f.index_path).unwrap();
+            loaded.activate_effective_upload_body_witness_revision(effective_revision(
+                SnapshotSource::ClaudeCode,
+            ));
             let ((held, later, modes), bytes) = observe_consumed(|| {
                 f.scan_at(&restarted, &mut loaded, "2026-08-04T08:00:00Z", 183)
             });

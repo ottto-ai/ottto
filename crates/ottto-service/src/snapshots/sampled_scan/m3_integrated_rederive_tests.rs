@@ -72,7 +72,7 @@ impl ColdReplay {
         std::fs::write(&path, text).unwrap();
         let scope = Scope("integrated-file".into());
         let namespace = Scope("integrated-store".into());
-        let (reduction, checkpoint) = native_record_of(&path, &scope, SnapshotSource::Codex);
+        let (reduction, checkpoint) = counted_codex_record_of(&path, &scope);
         let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
         assert_eq!(
             codec::decode(&body, SnapshotSource::Codex)
@@ -424,6 +424,11 @@ fn restored_chain_append_during_identity_samples_keeps_tail_and_exact_cold_body(
         &rig.path,
         File::open(&rig.path).unwrap(),
     );
+    // The production read configures the same counting view as the record.
+    codex_counting_version::configure_group_once(
+        &mut parser.accumulator,
+        codex_counting_version::AckEvidence::None,
+    );
     assert_eq!(
         parser
             .prepare_acquisition_owned(Some(taken), &rig.scope, None, now_seconds())
@@ -437,6 +442,10 @@ fn restored_chain_append_during_identity_samples_keeps_tail_and_exact_cold_body(
         SnapshotSource::Codex,
         &rig.path,
         File::open(&rig.path).unwrap(),
+    );
+    codex_counting_version::configure_group_once(
+        &mut cold.accumulator,
+        codex_counting_version::AckEvidence::None,
     );
     cold.prepare_acquisition(None, &rig.scope, None, now_seconds())
         .unwrap();
@@ -492,8 +501,26 @@ fn claude_both_restore_floor_edges_hold_then_catch_up_without_moving_accepted_fa
         let owner = rig.owner();
         let before = serde_json::to_value(&rig.prior.files[&rig.key]).unwrap();
         let record = std::fs::read(&rig.record_path).unwrap();
+        let mut floor_prior = rig.prior.clone();
+        if !late {
+            // A source-verified census proves an in-place shrink and reads the
+            // shorter body. The floor edge is the unproved shrink: withdraw only
+            // the census's independent proof (as warm_shortened_old_file_*).
+            let census = floor_prior
+                .claude_request_census
+                .get(&rig.key)
+                .expect("real census record premise")
+                .clone();
+            assert!(
+                !census.unverified_for_test(),
+                "real source-verified census premise"
+            );
+            floor_prior
+                .claude_request_census
+                .insert_for_test(&rig.key, census.with_unverified_for_test(true));
+        }
         let ((held, body, modes), rows) =
-            crate::local_resource_diagnostics::capture(|| rig.scan(&owner, &mut rig.prior.clone()));
+            crate::local_resource_diagnostics::capture(|| rig.scan(&owner, &mut floor_prior));
         assert!(body.snapshots.is_empty(), "floor edge late={late}");
         assert_eq!(modes, (0, 0, 0));
         assert_eq!(body.unreadable_path_count, 0);
