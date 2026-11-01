@@ -13117,6 +13117,7 @@ mod tests {
     pub(crate) fn assert_archive_debt_preserves_replay_progress(
         mut index: ScanIndex,
         scan: SourceScanResult,
+        expected_markers: usize,
     ) {
         assert!(scan.census_complete);
         let counts = SyncCounts::from_scan_result(&scan, 0, 7);
@@ -13210,7 +13211,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            2
+            expected_markers
         );
         let fp = "a".repeat(64);
         let mut progress =

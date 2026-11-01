@@ -35,7 +35,7 @@ reservations cancel without a Full penalty. Power is sampled once per page.
 Caps retain owed discovery and disclose refusal.
 
 Exact accepted body witnesses in the current destination settle an archive.
-Settled archive markers keep only object stamp and disposition; acquisition
+Settled archive markers keep object stamp, validated owner and acquisition context; acquisition
 headers and body scratch are discarded. Settled files use listing stamps rather
 than repeated opens or one scan step per archive. Only immutable inventory coverage
 is shared. Live scope checks run for each archive at admission and publication,
@@ -48,7 +48,7 @@ generic correction/evidence debt remains a named follow-up.
 
 Other follow-ups are same-session union bodies, retained resend, durable
 continuation if measurement justifies it, archive parents, shared listing/owed
-resolution, placement-comparator convergence and resource measurements. The
+resolution, end-to-end placement route and tagged positive-control coverage and resource measurements. The
 historical-writer compatibility probe currently runs in Linux CI; running it only
 at release cuts is follow-up work.
 
@@ -71,9 +71,19 @@ One damaged or unknown header defers every archive uniqueness proof. Resource
 receipt refusals can recur at the six-hour pace. Process memory measurement is owed.
 
 Transitions guard settled, correction, decoded structural and receipt-waiting
-states. Correction retains the ordinary file owner without creating header-less
+states. Correction retains the marker owner without creating header-less
 work. Receipt-waiting Pending is quiet only with its exact file incidence and
 before the saved deadline; an unaccepted expired body takes a paced native retry.
-Partial checkpoints retain the previous marker outside accepted safe keys, and
+Partial checkpoints retain the previous witness-bearing marker outside accepted safe keys, and
 reservation saves copy only their own new reservations. Header-less Reserve and
 marker creation by correctness/structural refusal are refused by the owner.
+
+Per-marker acquisition context drives correction even before source context promotion.
+A newly acquired archive under the active context is not correction debt. Physically
+oversized archives remain archive-only AdmissionRefused debt; large-archive
+acquisition is follow-up work, without changing ordinary plain limits. Known
+unopened header permissions cancel their saved deadline; restored crash permission
+stays paced. Latched structural headers are never refreshed on an unchanged stamp.
+Bounded reconciliation owns marker deletion. A persisted deferred-population alarm
+count suppresses repeated alarms after reload; its additive positional slot follows
+archives and leaves historical slots unchanged. This count grants no read or ACK.

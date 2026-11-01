@@ -507,6 +507,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
     "claude_copy_removals",
     "archives",
+    "archive_deferred_alarm_count",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2104,6 +2105,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
                         "files" => index.files = self.records("files", value, true)?,
+                        "archive_deferred_alarm_count" => {
+                            index.archive_deferred_alarm_count =
+                                self.diagnostic_timestamp(value)?.unwrap_or(0)
+                        }
                         "archives" => {
                             index.archives = self
                                 .records_checked(

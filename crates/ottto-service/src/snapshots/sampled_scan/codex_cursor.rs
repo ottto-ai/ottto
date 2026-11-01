@@ -284,9 +284,8 @@ pub(crate) struct ArchivePass {
     pub(crate) prepared: bool,
     pub(crate) headers_prepared: bool,
     pub(crate) deferred: std::collections::BTreeSet<String>,
-    pub(crate) last_deferred: usize,
 }
-crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, dirty, prepared, headers_prepared, deferred, last_deferred; shared gates);
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, dirty, prepared, headers_prepared, deferred; shared gates);
 
 impl ArchivePass {
     /// A new ordinary pass: fresh counters and the prepare-time power gate;

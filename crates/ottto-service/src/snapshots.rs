@@ -4087,6 +4087,8 @@ pub struct ScanIndex {
     // Append persisted fields so every older positional slot stays stable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) archives: BTreeMap<String, codex_compressed_input::ArchiveEvidence>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) archive_deferred_alarm_count: u64,
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,
@@ -4253,6 +4255,7 @@ impl Default for ScanIndex {
             claude_account_window_retention: Default::default(),
             archive_pass: Default::default(),
             archives: BTreeMap::new(),
+            archive_deferred_alarm_count: 0,
             withheld_memo: Default::default(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
@@ -27472,6 +27475,7 @@ impl OwnedSourceScan {
                     index.archive_pass.headers_prepared = false;
                     for a in index.archives.values_mut() {
                         if let Some(w) = a.work.as_mut() {
+                            w.cancel_unopened_header();
                             w.reservation = ArchiveReservation::None;
                         }
                     }
@@ -44736,6 +44740,9 @@ fn advance_bounded_directory_traversal_with_budget(
                     &metadata,
                 );
             }
+            if codex_archive_path(&path) && index.archive_size_refused(&path, metadata.len()) {
+                continue;
+            }
             let retention = DiscoveryRetention {
                 growth,
                 ..discovery_retention!(index)
@@ -45694,8 +45701,13 @@ fn open_candidate_file_stat_retained(
     let retained = cache
         .filter(|_| source == SnapshotSource::Codex)
         .map(|cache| (cache, candidate.path.as_path()));
-    let (identity, stat, content) =
-        opened_object_identity_and_stat_retained(source, &mut file, retained, held)?;
+    let (identity, stat, content) = opened_object_identity_and_stat_retained(
+        source,
+        &mut file,
+        retained,
+        held,
+        codex_archive_path(&candidate.path),
+    )?;
     candidate.opened_object_identity = identity;
     candidate.withheld_content_stamp = content;
     let tracked =
@@ -46051,7 +46063,7 @@ fn opened_object_identity_and_stat(
     source: SnapshotSource,
     file: &mut File,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
-    opened_object_identity_and_stat_retained(source, file, None, false)
+    opened_object_identity_and_stat_retained(source, file, None, false, false)
         .map(|(identity, stat, _)| (identity, stat))
 }
 
@@ -46062,6 +46074,7 @@ fn opened_object_identity_and_stat_retained(
     file: &mut File,
     retained: Option<(&sampled_scan::SharedCache, &Path)>,
     content_only: bool,
+    archive: bool,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>, Option<String>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
@@ -46072,6 +46085,11 @@ fn opened_object_identity_and_stat_retained(
         ));
     }
     if metadata.len() > max_jsonl_file_bytes(source) {
+        if archive {
+            return Err(std::io::Error::other(
+                codex_compressed_input::ArchiveAdmissionYield,
+            ));
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "snapshot candidate exceeds source file cap",
@@ -46973,13 +46991,7 @@ impl ScanIndex {
     }
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
-        if self
-            .upload_context_fingerprint
-            .as_ref()
-            .is_some_and(|old| old != &fingerprint)
-        {
-            self.hold_archive_corrections();
-        }
+        self.hold_archive_corrections(Some(&fingerprint));
         self.active_upload_context_fingerprint = Some(fingerprint);
     }
 
@@ -49193,7 +49205,7 @@ impl ScanIndex {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return false;
         }
-        self.hold_archive_corrections();
+        self.hold_archive_corrections(None);
         self.historical_replay_generation = Some(generation);
         for entry in self.files.values_mut() {
             entry.upload_context_receipt = None;
@@ -52157,6 +52169,7 @@ impl ScanIndex {
             claude_account_window_retention: self.claude_account_window_retention,
             archive_pass: self.archive_pass.clone(),
             archives: self.archives.clone(),
+            archive_deferred_alarm_count: self.archive_deferred_alarm_count,
             withheld_memo: self.withheld_memo.clone(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
@@ -52346,7 +52359,6 @@ impl ScanIndex {
         result.retain_quarantined_fingerprints(&retained_quarantine);
         result.reconcile_codex_recovery_settlement(previous, accepted);
         self.retain_terminal_off_page_retries(previous, &safe_keys, &mut result);
-        result.archives.clone_from(&self.archives);
         for key in self.archives.keys().filter(|key| !safe_keys.contains(*key)) {
             result.revert_archive_witness(key, previous);
         }

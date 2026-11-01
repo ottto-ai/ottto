@@ -8,6 +8,25 @@ pub(super) enum Admission {
     Held,
 }
 impl ScanIndex {
+    pub(super) fn archive_size_refused(&mut self, path: &Path, bytes: u64) -> bool {
+        if bytes <= max_jsonl_file_bytes(SnapshotSource::Codex) {
+            return false;
+        }
+        let key = local_index_key(path);
+        if self
+            .archives
+            .get(&key)
+            .is_some_and(|a| a.owed_cause().is_none())
+        {
+            self.archive_pass.deferred.insert(key);
+        } else {
+            self.archive_transition(
+                path,
+                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+            );
+        }
+        true
+    }
     pub(super) fn archive_transition(&mut self, path: &Path, change: ArchiveTransition) {
         let key = local_index_key(path);
         if matches!(change, ArchiveTransition::Gone) {
@@ -81,6 +100,9 @@ impl ScanIndex {
         let mut counts = BTreeMap::<CodexZstCause, usize>::new();
         let mut alarm = 0;
         for a in self.archives.values_mut() {
+            if let Some(w) = a.work.as_mut() {
+                w.cancel_unopened_header();
+            }
             if let Some(cause) = a.owed_cause() {
                 *counts.entry(cause).or_default() += 1;
                 if let Some(w) = a.work.as_mut() {
@@ -95,22 +117,23 @@ impl ScanIndex {
             *counts.entry(CodexZstCause::AdmissionRefused).or_default() +=
                 self.archive_pass.deferred.len();
         }
-        if self.archive_pass.deferred.len() != self.archive_pass.last_deferred {
+        if self.archive_pass.deferred.len() as u64 != self.archive_deferred_alarm_count {
             alarm += self.archive_pass.deferred.len();
         }
-        self.archive_pass.last_deferred = self.archive_pass.deferred.len();
+        self.archive_deferred_alarm_count = self.archive_pass.deferred.len() as u64;
         for (cause, count) in counts {
             crate::local_resource_diagnostics::codex_zst_held(cause, count);
         }
         archive_alarm(alarm);
     }
-    pub(super) fn hold_archive_corrections(&mut self) {
+    pub(super) fn hold_archive_corrections(&mut self, context: Option<&str>) {
         let mut count = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
-            ) {
+            ) && context.map_or(true, |context| a.context.as_deref() != Some(context))
+            {
                 a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 ));
@@ -210,6 +233,7 @@ impl ScanIndex {
                         continue;
                     }
                     a.transition(ArchiveTransition::Reserve);
+                    a.context = self.active_upload_context_fingerprint.clone();
                     self.archive_pass.dirty = true;
                 }
             }
