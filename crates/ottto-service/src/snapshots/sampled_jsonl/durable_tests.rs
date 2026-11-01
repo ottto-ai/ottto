@@ -1964,7 +1964,8 @@ fn structurally_decodes(body: &[u8]) -> bool {
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
-    let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| verify(body));
+    let (result, stats) =
+        crate::retry_allocation_probe::measure_caller_thread(|| verify_body(&mut Dec::new(body)));
     assert_eq!(stats.allocations, 0, "{stats:?}");
     result
 }
@@ -2006,8 +2007,9 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
                 "{name} prefix {end}"
             );
         }
-        let (mut visits, present_options) =
-            crate::durable_tail_codec::trace_verify(|| assert_eq!(verify(&body), Ok(())));
+        let (mut visits, present_options) = crate::durable_tail_codec::trace_verify(|| {
+            assert_eq!(verify_body(&mut Dec::new(&body)), Ok(()))
+        });
         assert!(
             present_options >= min_present_options,
             "{name}: walked {present_options} populated optional sections, expected >= {min_present_options}"
@@ -2145,7 +2147,8 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
         encode(reduction, expected.len() - 1, line_cap()),
         Err(Refuse::TooLarge)
     );
-    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    let (_, options) =
+        crate::durable_tail_codec::trace_verify(|| verify_body(&mut Dec::new(&actual)).unwrap());
     assert!(options >= 5, "fixture must populate nested optional state");
     take_l_spans();
 }

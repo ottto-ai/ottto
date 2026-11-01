@@ -318,10 +318,6 @@ pub(in crate::snapshots) fn body_has_skill_labels(
 /// Structural body verification only: no reduction, re-derivation or live
 /// inputs. The caller separately checks source/binding and envelope integrity.
 /// Precondition: check size, mode and the envelope trailer before this walk.
-pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
-    verify_body(&mut Dec::new(body))
-}
-
 pub(in crate::snapshots) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     CachedJsonlReduction::verify(d)?;
     Rederive::verify(d)?;
