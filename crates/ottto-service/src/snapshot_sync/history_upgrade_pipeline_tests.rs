@@ -638,14 +638,12 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
             "held history is not read"
         );
         assert!(changed.uploaded.is_empty(), "{:?}", changed.uploaded);
-        assert_eq!(
-            changed.index.upload_context_owed_file_count(),
-            HISTORY_SESSIONS.len(),
-            "deferred, never credited"
-        );
         for (key, entry) in &changed.index.files {
             let before = &baseline.files[key];
             assert_eq!(entry.effective_upload_body_witness_revision, 1);
+            // Deferred, never credited: the held file keeps its old receipt,
+            // which does not prove it under the new context.
+            assert_eq!(entry.upload_context_receipt, before.upload_context_receipt);
             assert_eq!(
                 entry.last_snapshot_fingerprint,
                 before.last_snapshot_fingerprint

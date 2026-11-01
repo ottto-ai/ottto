@@ -2645,17 +2645,20 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
             ordinary_group.iter().map(|path| f.index.file_upload_context_requires_adoption(&local_index_key(path))).collect::<Vec<_>>()
         );
         assert!(!group_posted || group_admitted, "unadmitted B cannot POST");
+        // d's rewrite keeps its bytes: only the revision moves. After setup
+        // ACK retirement the durable entity stamps still prove B's exact
+        // bodies, so admission carries B's receipts with no POST (A1-A4).
         assert!(
-            !group_admitted || group_posted,
-            "B admission must POST and receive a fresh ACK after setup ACK retirement"
+            !group_posted,
+            "an mtime-only revision move re-sends nothing after ACK retirement"
         );
-        if group_posted {
+        if group_admitted {
             for path in &ordinary_group {
                 let entry = &f.index.files[&local_index_key(path)];
                 let receipt = entry
                     .upload_context_receipt
                     .as_ref()
-                    .expect("normal accepted B response earns its receipt");
+                    .expect("admitted B keeps or carries its receipt");
                 assert_eq!(receipt.context_fingerprint, "d".repeat(64));
                 assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
                 assert_eq!(

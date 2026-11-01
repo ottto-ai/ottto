@@ -1,6 +1,7 @@
 //! Fold-level regressions for the Claude history-upgrade gate: every file is
-//! selected for a reason other than the revision (a changed upload context),
-//! so only the reason-independent gate can hold it. Fixtures are synthetic.
+//! selected for a reason other than the revision (a changed upload context,
+//! and where a held file must still parse, a missing activity clock), so only
+//! the reason-independent gate can hold it. Fixtures are synthetic.
 
 use super::claude_history_upgrade::{
     local_count, with_max_gated_claude_revision, LocalCount, REQUEST_OWNED_USAGE_CONTRACT,
@@ -66,6 +67,13 @@ pub(super) fn families(name: &str, roots: usize) -> (PathBuf, PathBuf, ScanIndex
     (home, root, index)
 }
 
+/// Select every file for a local reason that still parses a held file: a
+/// missing activity clock. Upload-context debt alone no longer does: the gate
+/// vetoes every held body, so that read could never earn a receipt.
+fn forget_activity(index: &mut ScanIndex) {
+    index.snapshot_activity_at.clear();
+}
+
 fn scan(root: &Path, index: &mut ScanIndex, context: &str, revision: u64) -> SourceScanResult {
     index.activate_upload_context(context.into());
     index.activate_effective_upload_body_witness_revision(revision);
@@ -128,7 +136,7 @@ fn revisions(index: &ScanIndex) -> Vec<u64> {
 }
 
 /// Group 2: a member-only line closes over its root; the listed family's
-/// root and sibling are selected by the changed upload context, still parse
+/// root and sibling are selected by a missing activity clock, still parse
 /// (their census records refresh), emit nothing, keep revision 1 and spend
 /// no budget, while the unlisted family upgrades.
 #[test]
@@ -148,6 +156,7 @@ fn listed_family_selected_for_another_reason_emits_nothing() {
     )
     .unwrap();
     index.load_claude_reemission_exclusions(&support);
+    forget_activity(&mut index);
     let previous = index.clone();
     let mut result =
         with_body_witness_adoption_page_budget(2, || scan(&root, &mut index, "ctx-2", 2));
@@ -188,6 +197,7 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
         let mut index = index.clone();
         index.claude_no_list_policy = policy;
         index.load_claude_reemission_exclusions(support);
+        forget_activity(&mut index);
         let state = index.claude_reemission_exclusions.state();
         let mut result = with_no_list_cutoff(cutoff, || scan(&root, &mut index, "ctx-2", 2));
         assert_eq!(result.scanned_file_count, 4);
@@ -550,6 +560,7 @@ fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
         .get_mut(&key)
         .unwrap()
         .effective_upload_body_witness_revision = 1;
+    forget_activity(&mut index);
     let _held = with_no_list_cutoff(u64::MAX, || scan(&root, &mut index, "ctx-3", 2));
     let held = index
         .files

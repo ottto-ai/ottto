@@ -553,8 +553,13 @@ const C1B_RECORDED_REQUEST: &str = "req_agent_a_2";
 /// The C1a fixture whose paired API and trace sidecars also record
 /// `C1B_RECORDED_REQUEST` for the first subagent. Its transcript is a
 /// nonempty subset of its assigned requests, so the family still proves.
+/// The C1a request-id-less transcript is unrelated here and goes: its item
+/// and index entries (both copies) sat this walk-ending page's real frame at
+/// the production 4096-visit cap (4063 visits before per-file receipts and
+/// stamps, 4097 after).
 fn c1b_recorded_request_fixture(case: &'static str, page_files: usize) -> RearmFixture {
     let mut fixture = c1a_fixture(case);
+    std::fs::remove_file(c1a_invalid_path(&fixture)).unwrap();
     fixture.native_file_limit = page_files;
     let (api, trace) = rearm_evidence_lines(Some(REARM_AGENTS[0]), C1B_RECORDED_REQUEST, 5);
     RearmFixture::append(&fixture.sidecar_path("claude-code-effort"), &api);
