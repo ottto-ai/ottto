@@ -27,16 +27,22 @@ fn bounded_native_device() -> LocalDeviceBinding {
     }
 }
 fn bounded_native_ack(item: &SnapshotItem) -> String {
-    let version = match crate::snapshots::snapshot_upload_body_witness_version(item) {
-        Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION) => Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-        Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION) => Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION),
-        None | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION) | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION) => None,
-        other => panic!("unexpected fixture witness: {other:?}"),
-    };
+    // Ordinary fixtures have no witness domain: no version, no digest.
+    let version = crate::snapshots::snapshot_upload_body_witness_version(item);
+    assert!(
+        matches!(
+            version,
+            None | Some(
+                crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
+                    | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
+            )
+        ),
+        "unexpected fixture witness: {version:?}"
+    );
     serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],"disabled":false,
         "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
         "accepted_entities":[{"source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
-        "occurrence_count":1,"body_witness_version":version,"body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))}]}).to_string()
+        "occurrence_count":1,"body_witness_version":null,"body_witness_digest":null}]}).to_string()
 }
 fn bounded_native_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
     use std::io::Write;

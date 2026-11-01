@@ -43,7 +43,6 @@ pub(super) struct ClaudeResponseBook {
 }
 
 impl ClaudeResponseBook {
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.responses.is_empty()
     }

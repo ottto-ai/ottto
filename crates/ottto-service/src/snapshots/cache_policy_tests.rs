@@ -1503,7 +1503,9 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
 /// refused and the next page is Full again. Small residents keep `|P*|` above
 /// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
 /// Full has no X_out (ruling 5), so nothing proves its output fits and it
-/// evicts nothing, whatever the residents' rank.
+/// evicts nothing, even beside strictly older residents. Its equal and newer
+/// rows are dropped: strictly-older ranking already keeps those residents for
+/// every source, and the Claude rows pin that.
 #[test]
 fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     if unexecuted("full_singleton_release") {
@@ -1512,30 +1514,62 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
+    let ranks = [
+        (now - OLD_SECONDS, true),
+        (file_modified, false),
+        (newer_modified, false),
+    ];
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for (idle_modified, older) in [
-            (now - OLD_SECONDS, true),
-            (file_modified, false),
-            (newer_modified, false),
-        ] {
+        // Codex: the strictly-older row alone, the only rank a release reaches.
+        let rows = if source == SnapshotSource::Codex {
+            &ranks[..1]
+        } else {
+            &ranks[..]
+        };
+        for &(idle_modified, older) in rows {
             let releases = older && source == SnapshotSource::ClaudeCode;
             let label = format!("{source:?} idle_modified={idle_modified}");
             let cache = Arc::new(sampled_scan::SharedCache::default());
             let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
             idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
             idle.set_modified(idle_modified);
+            // The fill stops at the first resident that brings the cache to
+            // 9/10 of the state budget, the count a walk after every insert
+            // finds. The residents are identical, so all but the last few go
+            // in as one batch sized from the first one's measured charge and
+            // checked by one walk; the last few are walked one by one.
+            let target = POLICY_STATE_BYTES / 10 * 9;
             let mut residents_inserted = 0;
             observe(|| {
-                while optional_resident(&cache) < POLICY_STATE_BYTES / 10 * 9 {
-                    let retained = retained_reduction(&idle);
+                let mut insert_idle = |count: usize| {
+                    for _ in 0..count {
+                        let retained = retained_reduction(&idle);
+                        assert!(
+                            cache.retained().expect("retained cache lock").insert(
+                                format!("cache-policy-idle-{residents_inserted}"),
+                                retained
+                            ),
+                            "precondition: {label} idle resident is admitted"
+                        );
+                        residents_inserted += 1;
+                    }
+                };
+                let empty = optional_resident(&cache);
+                insert_idle(1);
+                let mut resident = optional_resident(&cache);
+                let charge = (resident - empty).max(1);
+                let batch = (target.saturating_sub(resident) / charge).saturating_sub(2);
+                if batch > 0 {
+                    insert_idle(batch);
+                    resident = optional_resident(&cache);
                     assert!(
-                        cache
-                            .retained()
-                            .expect("retained cache lock")
-                            .insert(format!("cache-policy-idle-{residents_inserted}"), retained),
-                        "precondition: {label} idle resident is admitted"
+                        resident < target,
+                        "precondition: {label} the batched fill stays below 9/10"
                     );
-                    residents_inserted += 1;
+                }
+                while resident < target {
+                    insert_idle(1);
+                    resident = optional_resident(&cache);
                 }
             });
             for (key, modified) in [

@@ -85,11 +85,14 @@ pr_json() {
 }
 
 # check_runs <file> [<id>|<name>|<status>|<conclusion>|<suite>]...
+# Always starts with green Linux tests checks in suite 510 (linux-tests.yml);
+# a later spec with a higher id replaces one (the newest run counts).
 check_runs() {
   local file="$1" spec id name status conclusion suite
   shift
   printf '[]' > "$case_dir/$file.tmp"
-  for spec in "$@"; do
+  for spec in "1|Rust tests (Linux)|completed|success|510" \
+      "2|Rust format (Linux)|completed|success|510" "$@"; do
     IFS='|' read -r id name status conclusion suite <<EOF_SPEC
 $spec
 EOF_SPEC
@@ -194,7 +197,7 @@ queue_json() {
 green_case() {
   new_case "$1"
   pr_json pr OPEN false "$SHA" MERGEABLE
-  workflow_runs "500|pull_request"
+  workflow_runs "500|pull_request" "510|pull_request|7|main||.github/workflows/linux-tests.yml"
   pr_checks checks 500 "10|Rust contracts|completed|skipped|500"
 }
 
@@ -244,6 +247,19 @@ check_runs checks "10|Rust contracts|completed|skipped|500" \
   "13|Dependency review|completed|success|700"
 run_guard 6 --timeout 0 7
 expect_output '"Public surface checks" missing'
+expect_no_log 'gh enqueue'
+
+# The Linux tests gate the enqueue, and only from a linux-tests.yml run.
+green_case linux-red-refused
+pr_checks checks 500 "10|Rust contracts|completed|skipped|500" "97|Rust tests (Linux)|completed|failure|510"
+run_guard 4 7
+expect_output '"Rust tests (Linux)" concluded failure'
+expect_no_log 'gh enqueue'
+
+green_case linux-run-required
+workflow_runs "500|pull_request"
+run_guard 6 --timeout 0 7
+expect_output '"Rust tests (Linux)" missing'
 expect_no_log 'gh enqueue'
 
 green_case more-than-one-page-is-not-judged

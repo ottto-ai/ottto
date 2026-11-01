@@ -1490,6 +1490,153 @@ fn real_scan_reads_forty_small_context_files_in_one_page() {
     assert_eq!(receipted(&f.index, &"e".repeat(64)), 40);
 }
 
+/// [regress] cursor resume zeroes context-read room (census drain,
+/// 2026-11-01: 63 of 95 pages resumed a cursor job, at least 48 of them a
+/// context-only one; ~4.6k context-only members drained at ~3.5/h). A
+/// resumed cursor job, new or context-only, is bounded by its own
+/// allowance; the same page still reads context-only members, and each
+/// earns its receipt and leaves the queue.
+#[test]
+fn cursor_resume_leaves_context_read_room_for_census_members() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let limit = 4096;
+    for large_context_only in [false, true] {
+        sampled_scan::codex_cursor::with_test_limits(limit, limit, 64, || {
+            let mut f = Fixture::new(source);
+            let template = fs::read_to_string(&f.path).unwrap();
+            let mut members = vec![f.path.clone()];
+            for n in 1..4 {
+                let session = format!("019fa111-2222-7333-8444-{n:012}");
+                let path = f
+                    .root
+                    .join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+                fs::write(&path, template.replace(SESSION, &session)).unwrap();
+                members.push(path);
+            }
+            // A file larger than both allowances: new, or already read and
+            // receipted under "d" (context-only after the switch to "e").
+            let large_session = "019fa111-2222-7333-8444-999999999999";
+            let large = f
+                .root
+                .join(format!("rollout-2026-10-29T10-00-00-{large_session}.jsonl"));
+            let mut body = format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":large_session}})
+            );
+            for n in 1..=160u64 {
+                body.push_str(&format!(
+                    "{}\n",
+                    json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12 * n,"output_tokens":4 * n}}}})
+                ));
+            }
+            if large_context_only {
+                fs::write(&large, &body).unwrap();
+            }
+            let receipted = |index: &ScanIndex, paths: &[PathBuf], context: &str| {
+                paths
+                    .iter()
+                    .filter(|path| {
+                        index
+                            .files
+                            .get(&local_index_key(path))
+                            .and_then(|entry| entry.upload_context_receipt.as_ref())
+                            .is_some_and(|receipt| receipt.context_fingerprint == context)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let mut first = members.clone();
+            if large_context_only {
+                first.push(large.clone());
+            }
+            for _ in 0..32 {
+                let previous = f.index.clone();
+                let (scan, _) = f.walk_with_file_limit(true, 64, false);
+                f.uploader.activate(source, "d".repeat(64), &mut f.index);
+                f.uploader
+                    .send(source, &mut f.index, &previous, &scan.snapshots)
+                    .unwrap();
+                if receipted(&f.index, &first, &"d".repeat(64)).len() == first.len() {
+                    break;
+                }
+            }
+            assert_eq!(receipted(&f.index, &first, &"d".repeat(64)), first);
+            assert_eq!(f.cache.cursor_job_key(), None);
+            if !large_context_only {
+                fs::write(&large, &body).unwrap();
+            }
+            assert!(fs::metadata(&large).unwrap().len() > 3 * limit);
+            // Under "e" the members (and a receipted large file) are
+            // unchanged context-only reads; none keeps a retained copy.
+            f.index.activate_file_upload_context(source, "e".repeat(64));
+            for path in members.iter().chain([&large]) {
+                let _ = f.cache.take(&local_index_key(path));
+            }
+            ensure_bounded_traversal(
+                source,
+                std::slice::from_ref(&f.root),
+                &mut f.index,
+                "2026-10-29T12:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+            );
+            advance_bounded_directory_traversal(source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
+            f.index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .make_contiguous()
+                .sort_by_key(|pending| pending.path != large);
+            // A one-file page starts the large file's cursor job; it pauses.
+            f.walk_with_file_limit(true, 1, false);
+            assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+            // One ordinary page resumes it.
+            let previous = f.index.clone();
+            crate::snapshots::begin_continuation_read_ranges_for_test();
+            let ((scan, _), per_file) = terminal_contract_retry::source_acquisitions(|| {
+                f.walk_with_file_limit(true, 64, false)
+            });
+            let ranges = crate::snapshots::take_continuation_read_ranges_for_test();
+            let member_max = members
+                .iter()
+                .map(|path| fs::metadata(path).unwrap().len())
+                .max()
+                .unwrap();
+            assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+            assert!(
+                ranges.iter().any(|range| range.start > member_max),
+                "the paused job advanced past its first chunk"
+            );
+            let read = members
+                .iter()
+                .filter(|path| per_file.contains_key(*path))
+                .count();
+            assert!(
+                read >= 1,
+                "the resume page reads context-only members (large_context_only={large_context_only})"
+            );
+            assert_eq!(
+                f.index.context_read_counts.files,
+                (read + usize::from(large_context_only)) as u64,
+                "admitted context-only reads: the members, and a context-only job"
+            );
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            let earned = receipted(&f.index, &members, &"e".repeat(64));
+            assert_eq!(earned.len(), read, "each read earns its receipt");
+            let pending = &f.index.traversal.as_ref().unwrap().pending_candidates;
+            assert!(earned
+                .iter()
+                .all(|path| pending.iter().all(|queued| queued.path != *path)));
+        });
+    }
+}
+
 /// Cold acquisition on every page makes repeated Full reads observable. Each
 /// file must get its real ACK/receipt in the same page as its sole body parse.
 #[test]
@@ -2386,628 +2533,4 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         );
     }
     f.assert_quiet();
-}
-
-// A retained post-policy group can contain multiple entities even when the
-// current parser emits one session. Model that existing index shape through
-// the real finalizer (as the source-matched mixed control does), settle only
-// the accepted sibling through validated transport, and retain refusal debt.
-// This is a selection/transport fixture, not a monetary equivalence oracle.
-fn c1_retained_mixed_file() -> (Fixture, SnapshotItem) {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let mut row: Value = serde_json::from_str(fs::read_to_string(&f.path).unwrap().trim()).unwrap();
-    row["customTitle"] = json!("Synthetic private title");
-    fs::write(&f.path, format!("{row}\n")).unwrap();
-    let (mut scan, _) = f.walk(false);
-    assert_eq!(scan.snapshots.len(), 1);
-    assert!(scan.snapshots[0].session_display_name.is_some());
-    let mut sibling = scan.snapshots[0].clone();
-    sibling.source_session_id = "019fa111-2222-7333-8444-666666666666".into();
-    scan.snapshots.push(sibling);
-    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
-    let refused = scan.snapshots[1].clone();
-    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-    f.uploader.hold_body(&mut f.index, &refused, false);
-    let previous = f.index.clone();
-    f.uploader
-        .send(f.source, &mut f.index, &previous, &scan.snapshots[..1])
-        .unwrap();
-    assert_eq!(f.uploader.fresh_count(), 1, "one actual exact ACK");
-    assert!(
-        f.entry().upload_context_receipt.is_none(),
-        "no partial file receipt"
-    );
-    assert_ne!(
-        f.index.upload_context_fingerprint,
-        f.index.active_upload_context_fingerprint
-    );
-    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
-    (f, refused)
-}
-
-/// [behaviour] Containment contract: c1 mixed current context holds three relists with zero body reads.
-#[test]
-fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let (mut f, refused) = c1_retained_mixed_file();
-    let persisted = serde_json::to_value(&f.index).unwrap();
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    assert_eq!(
-        serde_json::to_value(&f.index).unwrap(),
-        persisted,
-        "view never persists"
-    );
-    f.assert_quiet(); // Three walks assert actual parses AND native/group bytes.
-    assert!(f.index.mixed_context_view.held_files > 0);
-    assert!(f.entry().upload_context_receipt.is_none());
-    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
-    assert!(!claude_terminal_authority(
-        &f.index,
-        true,
-        "2026-10-29T12:00:00Z"
-    ));
-}
-
-/// [behaviour] Containment contract: c1 privacy reduction never holds old context siblings.
-#[test]
-fn c1_privacy_reduction_never_holds_old_context_siblings() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let (mut f, refused) = c1_retained_mixed_file();
-    f.uploader.policy = SnapshotUploadPolicy {
-        session_titles_enabled: false,
-        ..SnapshotUploadPolicy::default()
-    };
-    f.uploader
-        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
-    let previous = f.index.clone();
-    let (mut scan, _) = f.walk(false);
-    assert_eq!(scan.scanned_file_count, 1, "D gets its own projection");
-    assert!(scan
-        .snapshots
-        .iter()
-        .any(|item| item.session_display_name.is_some()));
-    apply_upload_policy(f.source, &mut scan.snapshots, f.uploader.policy);
-    assert!(scan
-        .snapshots
-        .iter()
-        .all(|item| item.session_display_name.is_none()));
-    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    f.uploader
-        .send(f.source, &mut f.index, &previous, &scan.snapshots)
-        .unwrap();
-    assert!(f
-        .uploader
-        .posts
-        .last()
-        .unwrap()
-        .iter()
-        .all(|item| item.get("session_display_name").is_none_or(Value::is_null)));
-    assert_eq!(f.index.mixed_context_view.held_files, 0);
-    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
-    f.assert_quiet();
-}
-
-/// [behaviour] Containment contract: c1 terminal ends hold and destination siblings rearm once then quiet.
-#[test]
-fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let (mut f, refused) = c1_retained_mixed_file();
-    f.uploader.hold_body(&mut f.index, &refused, true);
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    assert!(
-        !f.index.file_upload_context_waits_for_retry(&f.key()),
-        "terminal ends hold"
-    );
-    f.assert_quiet(); // A sibling already ACKed under this context is not re-sent.
-    assert_eq!(f.index.mixed_context_view.held_files, 0);
-    // Move C→D after the terminal transition: D cannot use C's sibling ACK.
-    f.uploader
-        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-    let previous = f.index.clone();
-    let (scan, _) = f.walk(true);
-    assert_eq!(scan.scanned_file_count, 1);
-    let before = f.uploader.posts.len();
-    let (rearmed, _) = f
-        .uploader
-        .send(f.source, &mut f.index, &previous, &scan.snapshots)
-        .unwrap();
-    assert_eq!(rearmed, 1, "one counted D re-arm");
-    assert_eq!(f.uploader.posts.len(), before + 1);
-    f.assert_quiet();
-    assert_eq!(f.uploader.posts.len(), before + 1, "no repeat D POST");
-    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
-    assert_ne!(
-        f.index.upload_context_fingerprint,
-        f.index.active_upload_context_fingerprint
-    );
-}
-
-/// [behaviour] Containment contract: c1 missing current stamp or cleared source never holds a context move.
-#[test]
-fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let (mut f, _) = c1_retained_mixed_file();
-    f.uploader.forget_stamps();
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    assert!(!f.index.file_upload_context_waits_for_retry(&f.key()));
-    let key = f.key();
-    f.index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    assert!(!f.index.file_upload_context_waits_for_retry(&key));
-    assert!(
-        f.entry().source_file_fingerprint.is_empty(),
-        "no overwritten clear debt"
-    );
-}
-
-/// [behaviour] Containment contract: c1 hold count uses prepared cooldown and lease views.
-#[test]
-fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let (mut f, refused) = c1_retained_mixed_file();
-    let entity = refused.snapshot_fingerprint.clone();
-    let record = f
-        .index
-        .quarantined_snapshot_fingerprints
-        .get_mut(&entity)
-        .unwrap();
-    record.retry_after_unix_seconds = 0;
-    let body = record.upload_body_witness.clone().unwrap();
-    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-    assert_eq!(
-        f.index.mixed_context_view.held_files, 0,
-        "not counted at early activation"
-    );
-    f.index.activate_reason_reoffer_retries(BTreeMap::new());
-    f.index.activate_reason_reoffer_cooldowns(BTreeMap::new());
-    assert!(
-        !f.index.file_upload_context_waits_for_retry(&f.key()),
-        "ordinary timer due"
-    );
-    let exact = BTreeMap::from([(entity, body)]);
-    f.index.activate_reason_reoffer_cooldowns(exact.clone());
-    f.index.count_mixed_file_context_holds();
-    assert_eq!(
-        f.index.mixed_context_view.held_files, 1,
-        "prepared cooldown parks the exact body"
-    );
-    f.index.activate_reason_reoffer_retries(exact);
-    f.index.count_mixed_file_context_holds();
-    assert_eq!(
-        f.index.mixed_context_view.held_files, 0,
-        "prepared lease makes it runnable"
-    );
-    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
-    assert!(
-        f.entry().upload_context_receipt.is_none(),
-        "no credit from a gauge"
-    );
-}
-
-/// [behaviour] Containment contract: receipt context move uses paced catchup then three quiet walks.
-#[test]
-fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let original = fs::read_to_string(&f.path).unwrap();
-    for session in [
-        "019fa111-2222-7333-8444-666666666666",
-        "019fa111-2222-7333-8444-777777777777",
-    ] {
-        fs::write(
-            f.root.join(format!("{session}.jsonl")),
-            original.replace(SESSION, session),
-        )
-        .unwrap();
-    }
-    let previous = f.index.clone();
-    let (scan, _) = f.walk(true);
-    assert_eq!(scan.scanned_file_count, 3);
-    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        3
-    );
-    f.assert_quiet();
-    let limit = fs::metadata(&f.path).unwrap().len();
-    let mut posted = 0;
-    for _ in 0..3 {
-        f.uploader
-            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-        let previous = f.index.clone();
-        let ((scan, bytes), reads) = upload_context_read::with_read_limit(limit, || f.walk(true));
-        assert_eq!(
-            scan.scanned_file_count, 1,
-            "one file fits the catch-up native allowance"
-        );
-        assert_eq!(reads.len(), 1);
-        assert!(
-            bytes <= limit,
-            "context catch-up never bypasses the reader allowance"
-        );
-        let (files, _) = f
-            .uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap();
-        assert_eq!(files, 1, "one newly ACKed file per pass");
-        posted += files;
-        assert!(!scan.census_complete);
-    }
-    assert_eq!(posted, 3);
-    assert!(f.index.files.values().all(|entry| entry
-        .upload_context_receipt
-        .as_ref()
-        .is_some_and(|r| r.context_fingerprint == "e".repeat(64))));
-    let posts = f.uploader.posts.len();
-    f.assert_quiet();
-    assert_eq!(f.uploader.posts.len(), posts);
-    assert_eq!(
-        f.index.upload_context_fingerprint.as_deref(),
-        Some("c".repeat(64).as_str())
-    );
-}
-
-/// [behaviour] Containment contract: context mismatch cannot wake parked key until stat change.
-#[test]
-fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    sampled_audit::reset_open_backoff_for_test();
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    assert_eq!(f.adopt().files, 1);
-    f.assert_quiet();
-    let key = f.key();
-    let now = sampled_scan::now_seconds();
-    let due = now - 1;
-    f.index
-        .claude_request_census_mut_for_test()
-        .insert_for_test(
-            &key,
-            claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
-                &"ab".repeat(32),
-                0,
-                claude_request_census::ClaudeRequestCensusShape::IdentityIncomplete,
-                vec![1],
-            )
-            .with_unverified_for_test(true),
-        );
-    f.index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
-        key: key.clone(),
-        due,
-        attempted: false,
-    });
-    for _ in 0..8 {
-        sampled_audit::progress_open_failed(&mut f.index, &key, now);
-    }
-    assert!(sampled_audit::candidate_open_blocked(&key, now));
-    let failed = sampled_audit::held_audit_open_failed(now);
-    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-    for _ in 0..3 {
-        f.uploader
-            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-        let (scan, bytes) = sampled_scan::with_test_now(now, || f.walk(true));
-        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
-        assert_eq!(
-            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
-            samples
-        );
-        assert_eq!(sampled_audit::held_audit_open_failed(now), failed);
-        assert_eq!(sampled_audit::failed_open_debt(&key, now), Some(due));
-        assert_eq!(
-            f.entry()
-                .upload_context_receipt
-                .as_ref()
-                .unwrap()
-                .context_fingerprint,
-            "d".repeat(64)
-        );
-        assert!(!scan.census_complete);
-    }
-    let mut file = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
-    use std::io::Write;
-    file.write_all(b"{\"type\":\"user\",\"message\":{\"content\":\"stat wake\"}}\n")
-        .unwrap();
-    drop(file);
-    f.uploader
-        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-    let previous = f.index.clone();
-    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
-    assert_eq!(
-        scan.scanned_file_count, 1,
-        "only stat change clears the blocked open"
-    );
-    f.uploader
-        .send(f.source, &mut f.index, &previous, &scan.snapshots)
-        .unwrap();
-    assert_eq!(
-        f.entry()
-            .upload_context_receipt
-            .as_ref()
-            .unwrap()
-            .context_fingerprint,
-        "e".repeat(64)
-    );
-    sampled_audit::reset_open_backoff_for_test();
-}
-
-fn b1_quiet_preparations(f: &mut Fixture, now: u64) {
-    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-    let body = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
-    let reparses = TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get);
-    for offset in 1..=3 {
-        f.uploader.prepare_for_scan(
-            f.source,
-            f.index.active_upload_context_fingerprint.clone().unwrap(),
-            &mut f.index,
-        );
-        let previous = f.index.clone();
-        let ((scan, bytes), reads) = terminal_contract_retry::source_acquisitions(|| {
-            sampled_scan::with_test_now(now + offset, || f.walk(true))
-        });
-        assert_eq!(
-            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
-            samples,
-            "no walk samples"
-        );
-        assert_eq!(
-            TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
-            body,
-            "no Full/body bytes"
-        );
-        assert_eq!(
-            TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get),
-            reparses,
-            "no confirmed_empty_reparse"
-        );
-        assert_eq!(bytes, 0);
-        assert!(reads.is_empty(), "no transcript parser stepped");
-        assert_eq!(scan.scanned_file_count, 0);
-        assert!(!scan.census_complete);
-        let posts = f.uploader.posts.len();
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap();
-        assert_eq!(f.uploader.posts.len(), posts, "no POST without new bodies");
-    }
-}
-
-/// [behaviour] Containment contract: empty and three normal files stay quiet then context rereads empty once.
-#[test]
-fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_empty_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    f.index.upload_context_fingerprint = None; // Actual fresh source-wide context.
-    let empty = f.root.join("019fa111-2222-7333-8444-888888888888.jsonl");
-    fs::write(
-        &empty,
-        "{\"type\":\"user\",\"message\":{\"content\":\"no usage\"}}\n",
-    )
-    .unwrap();
-    let key = local_index_key(&empty);
-    let original = fs::read_to_string(&f.path).unwrap();
-    for session in [
-        "019fa111-2222-7333-8444-666666666666",
-        "019fa111-2222-7333-8444-777777777777",
-    ] {
-        fs::write(
-            f.root.join(format!("{session}.jsonl")),
-            original.replace(SESSION, session),
-        )
-        .unwrap();
-    }
-    let now = sampled_scan::now_seconds();
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    let previous = f.index.clone();
-    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
-    assert_eq!(
-        scan.scanned_file_count, 4,
-        "1 nonzero-byte empty + N=3 ordinary files"
-    );
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        3
-    );
-    assert!(f.index.confirmed_empty_files.contains(&key));
-    assert!(f.index.files[&key].last_upload_body_witness.is_none());
-    assert!(
-        f.index.files[&key].upload_context_receipt.is_none(),
-        "no fake empty receipt"
-    );
-    assert!(terminal_off_empty_context_seen(&f.index, &key));
-    assert!(!f.index.file_upload_context_requires_adoption(&key));
-    b1_quiet_preparations(&mut f, now);
-    // Even an independent forced metadata walk/cadence cannot reparse it for context.
-    expire_terminal_off_discovery_for_test(&f.index);
-    let (_, _, saved_evictions) = with_terminal_off_empty_contexts(|memo| {
-        (memo.keys.len(), memo.order.len(), memo.evictions)
-    });
-    let reparses = TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get);
-    let (same, _) = sampled_scan::with_test_now(now + 5, || f.walk(true));
-    assert_eq!(same.scanned_file_count, 0);
-    assert_eq!(
-        TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get),
-        reparses
-    );
-    let original_bodies = scan
-        .snapshots
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.clone(),
-                snapshot_upload_body_witness(item),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    f.uploader
-        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-    assert!(!terminal_off_empty_context_seen(&f.index, &key));
-    let mut accepted = 0;
-    let mut inputs = 0;
-    let mut outputs = 0;
-    let mut seen = BTreeSet::new();
-    let mut empty_reads = 0;
-    // #901's existing context-read/wire allowance services one ordinary
-    // catch-up file per page here. Drain real pages; do not widen the budget.
-    for pass in 0..3 {
-        f.uploader
-            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
-        let previous = f.index.clone();
-        let ((changed, _), reads) = terminal_contract_retry::source_acquisitions(|| {
-            sampled_scan::with_test_now(now + 6 + pass, || f.walk(true))
-        });
-        empty_reads += reads
-            .iter()
-            .filter(|(path, _)| *path == &empty)
-            .map(|(_, n)| n)
-            .sum::<usize>();
-        for item in &changed.snapshots {
-            assert!(
-                seen.insert(item.source_session_id.clone()),
-                "each ordinary body once under E"
-            );
-            assert_eq!(
-                snapshot_upload_body_witness(item),
-                original_bodies[&item.source_session_id],
-                "context pacing never changes the body"
-            );
-            inputs += item.input_tokens;
-            outputs += item.output_tokens;
-        }
-        accepted += f
-            .uploader
-            .send(f.source, &mut f.index, &previous, &changed.snapshots)
-            .unwrap()
-            .0;
-        assert!(!changed.census_complete);
-    }
-    assert_eq!(accepted, 3, "all three real exact ACKs, across paced pages");
-    assert_eq!(seen.len(), 3);
-    assert_eq!((inputs, outputs), (36, 12));
-    assert_eq!(empty_reads, 1, "one empty read under E across the drain");
-    assert_eq!(
-        TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get) - reparses,
-        1
-    );
-    b1_quiet_preparations(&mut f, now + 8);
-    assert!(
-        f.index.upload_context_fingerprint.is_none(),
-        "source context still unadopted"
-    );
-    assert!(f.index.files[&key].upload_context_receipt.is_none());
-    assert_eq!(
-        with_terminal_off_empty_contexts(|memo| memo.evictions),
-        saved_evictions
-    );
-}
-
-/// [behaviour] Containment contract: held history without body witness does not force rediscovery.
-#[test]
-fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    f.index.upload_context_fingerprint = None;
-    f.index.activate_effective_upload_body_witness_revision(2);
-    f.index
-        .adopt_effective_upload_body_witness_revision_monotonically();
-    f.index.claude_no_list_policy = claude_history_upgrade::NoListPolicy::HoldUnverified;
-    f.index.claude_history_cutoff_unix_seconds = Some(u64::MAX);
-    let now = sampled_scan::now_seconds();
-    f.uploader
-        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
-    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
-    assert_eq!(scan.scanned_file_count, 1);
-    assert!(
-        scan.snapshots.is_empty(),
-        "ordinary history privacy gate still withholds bodies"
-    );
-    assert!(f.entry().last_upload_body_witness.is_none());
-    assert!(
-        !f.index.confirmed_empty_files.contains(&f.key()),
-        "held local bodies are not proven empty"
-    );
-    assert!(
-        f.index
-            .effective_upload_body_witness_revision_requires_adoption(&f.key()),
-        "witness debt is retained"
-    );
-    assert!(
-        f.index.file_upload_context_requires_adoption(&f.key()),
-        "no fake receipt/empty memo"
-    );
-    assert!(!terminal_off_empty_context_seen(&f.index, &f.key()));
-    b1_quiet_preparations(&mut f, now);
-    assert!(f.entry().upload_context_receipt.is_none());
-    assert_eq!(
-        f.entry().effective_upload_body_witness_revision,
-        0,
-        "hold never stamped"
-    );
-}
-
-/// [behaviour] Containment contract: empty memo requires finalization and cannot mask cleared debt.
-#[test]
-fn terminal_off_empty_memo_requires_finalization_and_cannot_mask_cleared_debt() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    fs::write(
-        &f.path,
-        "{\"type\":\"user\",\"message\":{\"content\":\"no usage\"}}\n",
-    )
-    .unwrap();
-    let (mut scan, _) = f.walk(false);
-    assert_eq!(scan.scanned_file_count, 1);
-    assert!(
-        !terminal_off_empty_context_seen(&f.index, &f.key()),
-        "parse alone did not finalize policy"
-    );
-    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    assert!(terminal_off_empty_context_seen(&f.index, &f.key()));
-    assert!(f.entry().upload_context_receipt.is_none());
-    let persisted = serde_json::to_value(&f.index).unwrap();
-    let loaded: ScanIndex = serde_json::from_value(persisted.clone()).unwrap();
-    assert_eq!(
-        serde_json::to_value(&loaded).unwrap(),
-        persisted,
-        "no memo field in persisted state"
-    );
-    let key = f.key();
-    f.index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    assert!(!terminal_off_empty_context_seen(&f.index, &key));
-    assert!(
-        f.index.file_upload_context_requires_adoption(&key),
-        "genuine cleared debt is unchanged"
-    );
-    assert!(f.entry().source_file_fingerprint.is_empty());
 }

@@ -12,8 +12,8 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     states().lock().unwrap().remove(path);
 }
 
-fn load_with(path: &Path, switched: bool) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, switched, published(path)?)
+fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+    load_with_custody(path, importable, published(path)?)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -140,7 +140,7 @@ impl Drop for Fixture {
     }
 }
 
-/// [off=main] Unbound v1 loads ignore growth fields for every source and never
+/// [behaviour] Unbound v1 loads ignore growth fields for every source and never
 /// consult the v2 registry, even when another route owns it.
 #[test]
 fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
@@ -290,10 +290,10 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
         }
     }
 }
-/// [format] f7 off after publication saves through the one semantic save and
-/// published custody without semantic rows holds.
+/// [format] f7 a load with no support dir saves a published route through the
+/// one semantic save and published custody without semantic rows holds.
 #[test]
-fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
+fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
@@ -676,9 +676,9 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     assert!(save_with(&f.path, &mut stale).is_err());
     assert!(load_with(&f.path, false).is_err());
 }
-/// [format] publication pending pause does not touch v1 and off cancels inventory slot.
+/// [format] publication pending pause does not touch v1.
 #[test]
-fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
+fn publication_pending_pause_does_not_touch_v1() {
     let f = Fixture::new();
     let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
     raw["future_money"] = serde_json::json!({"owed": 1});
@@ -689,15 +689,21 @@ fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() 
     after_v1_locked(&f.path, &mut index).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
-    // An OFF load cancels a valid unpublished inventory slot.
-    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+}
+
+/// [behaviour] a load naming its support dir imports v1 and publishes custody.
+#[test]
+fn support_dir_load_imports_and_publishes() {
     let f = Fixture::new();
-    fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true).unwrap().is_none());
-    assert!(load_with(&f.path, false).unwrap().is_none());
-    after_v1_locked(&f.path, &mut index).unwrap();
-    assert!(index.v2().persistence_v2.is_none());
-    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    let index = ScanIndex::load_for_snapshot_source(
+        &f.path,
+        crate::snapshots::SnapshotSource::ClaudeCode,
+        &f.support,
+    )
+    .unwrap();
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
 }
 
 /// [format] absent parent containment guard never promotes a database.
@@ -1747,7 +1753,7 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
     );
 }
 
-/// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.
+/// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
 #[test]
 fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
     let f = Fixture::new();
