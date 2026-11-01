@@ -1335,23 +1335,33 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             );
             prior = disk.commit(&scanner.cache, source, &mut ram_index);
         }
-        // Nothing changed: a restarted process reads no transcript bytes.
+        // Nothing changed: a restarted process starts a first walk, which opens
+        // each file once for its identity samples and parses no byte of it.
         let opens = crate::snapshots::all_transcript_opens_for_test();
         let owner = disk.owner(source);
         let ((_, quiet_scan, modes), consumed) =
             fixture::observe_consumed(|| other_page(&c, &owner, source, prior.clone()));
         assert!(quiet_scan.snapshots.is_empty());
-        let measured = (crate::snapshots::all_transcript_opens_for_test() == opens).then_some(0);
+        let identity_opens = crate::snapshots::all_transcript_opens_for_test() - opens;
+        assert_eq!(identity_opens, files.len());
+        const IDENTITY_SAMPLE_BYTES: u64 = 4096;
+        let anchor_window = files
+            .iter()
+            .map(|(path, _)| match std::fs::metadata(path).unwrap().len() {
+                len if len > IDENTITY_SAMPLE_BYTES => 2 * IDENTITY_SAMPLE_BYTES,
+                len => len,
+            })
+            .sum::<u64>();
         let mut quiet = RouteResult::emitted(Mode::Restart, source, Vec::new(), &[]);
         quiet.modes = modes;
         quiet.io = IoBytes {
             consumed,
-            cheap_checks: measured,
-            anchor_reads: measured,
-            other_reads: measured,
+            cheap_checks: Some(0),
+            anchor_reads: Some(anchor_window),
+            other_reads: Some(0),
             ..Default::default()
         };
-        money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        money_oracle::assert_quiet_restart_with_anchor_window(&quiet, anchor_window);
     }
 }
 
