@@ -32,6 +32,41 @@ pub(super) fn rows(
     }
     Ok(())
 }
+// A key has few rows of a kind, usually one.
+const KEY_PAGE: usize = 8;
+/// The whole kind, or only the requested keys' rows: each key from position
+/// 0, in key order. No other key's header is read.
+pub(super) fn visit(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: Option<&BTreeSet<String>>,
+    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
+) -> Result<()> {
+    let Some(roots) = roots else {
+        return rows(tx, kind, f);
+    };
+    let kind = RecordKind::parse(kind)?;
+    for root in roots {
+        let mut after = None;
+        loop {
+            let page = tx.scan_record_key(&kind, root.as_bytes(), after, KEY_PAGE)?;
+            let more = page.len() == KEY_PAGE;
+            if let Some(h) = page.last() {
+                let RowKey::Record { position, .. } = &h.key else {
+                    anyhow::bail!("state_v2_record_key")
+                };
+                after = Some(*position);
+            }
+            for h in page {
+                f(tx, h)?;
+            }
+            if !more {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
 pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<Vec<u8>> {
     ensure!(
         h.value_version == 1 && h.len <= value_cap(&h.key),
@@ -201,11 +236,16 @@ pub(super) fn put<T: Serialize + ?Sized>(
     key: &RowKey,
     value: &T,
 ) -> Result<Header> {
-    let mut json = codec::json(value, input_cap(key))?;
     let kind = match key {
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",
     };
+    let mut json = codec::json(value, input_cap(key)).inspect_err(|e| {
+        // Refused while encoding, before its size is known: report it as over.
+        if e.to_string().contains("state_v2_value_admission") {
+            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_cap(key));
+        }
+    })?;
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {
@@ -233,10 +273,9 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
-    ensure!(
-        json.len() as u64 <= value_cap(key),
-        "state_v2_value_admission"
-    );
+    let cap = value_cap(key);
+    telemetry::row_cap(kind, json.len() as u64, cap);
+    ensure!(json.len() as u64 <= cap, "state_v2_value_admission");
     let encoded = codec::encode(&json)?;
     tx.put(RowInput {
         key,
@@ -360,8 +399,7 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
         .context("state_v2_missing_manifest")?;
     let expected = read::<usize>(tx, &manifest, seed.as_deref_mut())?;
     let mut result = BTreeMap::new();
-    let mut count = 0;
-    rows(tx, kind, |tx, h| {
+    visit(tx, kind, roots, |tx, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -375,14 +413,14 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
             return Ok(());
         }
         ensure!(*position == 1, "state_v2_member_position");
-        count += 1;
-        let name = family(key_bytes)?;
-        if roots.map_or(true, |roots| roots.contains(&name)) {
-            result.insert(name, read(tx, &h, seed.as_deref_mut())?);
-        }
+        result.insert(family(key_bytes)?, read(tx, &h, seed.as_deref_mut())?);
         Ok(())
     })?;
-    ensure!(count == expected, "state_v2_missing_member");
+    // The manifest counts every member, so only a whole-kind read can compare it.
+    ensure!(
+        roots.is_some() || result.len() == expected,
+        "state_v2_missing_member"
+    );
     Ok(result)
 }
 pub(super) fn private_paths(

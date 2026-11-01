@@ -30,9 +30,6 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
-pub(crate) mod strict_budget;
-#[cfg(test)]
-mod strict_budget_tests;
 #[cfg(test)]
 mod trace_read_bound_tests;
 
@@ -1150,26 +1147,21 @@ fn decode_api_sidecar(
     }
     health.oversized_files = u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
     let before_opened = api_file_generation(&opened);
-    let allowance = strict_budget::allowance(
+    let allowance = protected_allowance(
+        MAX_EVIDENCE_FILE_BYTES,
         strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1)),
     );
     if opened.len() >= allowance {
         health.unreadable_lines += 1;
         return Ok(empty(health));
     }
-    // Preserve ordinary API read-through on concurrent appends. Only an
-    // explicit pass budget bounds the read at opened length plus a sentinel.
-    let limit = if strict_budget::active() {
-        allowance.min(opened.len().saturating_add(1))
-    } else {
-        allowance
-    };
-    let mut reader = BufReader::new((&file).take(limit));
+    // Preserve ordinary API read-through on concurrent appends within the
+    // protected per-pair allowance.
+    let mut reader = BufReader::new((&file).take(allowance));
     let rows = decode_api_rows(&mut reader, session_id, &mut health);
-    let bytes = limit - reader.get_ref().limit();
+    let bytes = allowance - reader.get_ref().limit();
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
-    strict_budget::consumed(bytes);
-    if bytes >= limit {
+    if bytes >= allowance {
         health.unreadable_lines += 1;
         return Ok(empty(health));
     }
@@ -1255,6 +1247,20 @@ impl ApiSidecarDecoder<'_> {
     }
 }
 
+fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
+    if pair_bytes > quantum {
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_sidecar_read",
+            "claude_code",
+            &std::collections::BTreeMap::from([
+                ("oversized_root_alone", 1),
+                ("allowance_bytes", pair_bytes),
+            ]),
+        );
+    }
+    quantum.max(pair_bytes)
+}
+
 /// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
 pub(crate) fn strict_cohort_bytes(support_dir: &Path, root: &str) -> u64 {
     [
@@ -1310,7 +1316,8 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         report.oversized_files += u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
-        let allowance = strict_budget::allowance(
+        let allowance = protected_allowance(
+            MAX_EVIDENCE_FILE_BYTES,
             strict_cohort_bytes(support_dir, &session_id).max(opened.len().saturating_add(1)),
         );
         if opened.len() >= allowance {
@@ -1340,7 +1347,6 @@ pub fn load_claude_trace_ownership_evidence(
             decoder.push_line(line.as_bytes());
         }
         let bytes = limit - reader.get_ref().limit();
-        strict_budget::consumed(bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
         let unchanged = generation_unchanged(&file, &path, api_file_generation(&opened).as_ref());
@@ -2177,11 +2183,6 @@ mod tests {
                 // Re-export is still deduplicated by the SAME decoder.
                 assert_eq!(capture("request-2").unwrap(), 1);
                 assert!(fs::metadata(&path).unwrap().len() > quantum);
-                let allowance = strict_budget::protected_allowance(
-                    quantum,
-                    strict_cohort_bytes(&scratch, session),
-                );
-                let _budget = strict_budget::StrictReadBudget::new(allowance);
                 let (requests, oversized) = if trace {
                     assert!(
                         !claude_trace_ownership_sidecar_fingerprint(&scratch, session).is_empty()

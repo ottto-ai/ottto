@@ -405,12 +405,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
 /// One accounts-only view, as CAS custody loads it (`Some`) or a full load does.
 fn accounts_view(tx: &mut dyn Transaction, roots: Option<&BTreeSet<String>>) -> Result<ScanIndex> {
     let mut view = ScanIndex::default();
-    kinds_accounts::hydrate_filtered(
-        tx,
-        &mut view,
-        &mut KindCx::default(),
-        roots.map(|roots| (roots, false)),
-    )?;
+    kinds_accounts::hydrate_filtered(tx, &mut view, &mut KindCx::default(), roots)?;
     Ok(view)
 }
 /// [money] filtered hydrate equals those families of a full hydrate and refuses the same damage.

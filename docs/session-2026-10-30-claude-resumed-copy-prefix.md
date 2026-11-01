@@ -90,8 +90,8 @@ review before release.
 
 The complete resumed-prefix behavior above ships OFF. The one local setting is
 the owner's support-dir marker `claude_resumed_prefix_dedupe_enabled` (a
-regular file, never a symlink or directory), checked like
-`claude_terminal_off_enabled`. Absent keeps released behavior. (It replaced the
+regular file, never a symlink or directory), using the support-directory
+sentinel pattern. Absent keeps released behavior. (It replaced the
 original `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE` environment key, which the
 Companion-owned LaunchAgent could never carry.)
 This controls resumed dedupe, saved-removal use/writes, prefix retry selection

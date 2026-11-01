@@ -49,7 +49,7 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 /// Local release switch: the owner's support-dir marker (a regular file,
-/// never a symlink), as `claude_terminal_off_enabled`. Absent preserves
+/// never a symlink), using the support-directory sentinel pattern. Absent preserves
 /// released money behavior. Read once per process, so the daemon and the
 /// re-read CLI apply it from their next start. Independent of the server's
 /// wire capability.
@@ -68,7 +68,7 @@ pub(crate) fn resumed_prefix_enabled() -> bool {
     }
 }
 pub(crate) fn resumed_prefix_enabled_at(support: &std::path::Path) -> bool {
-    super::super::terminal_off_policy::marker_at(support, RESUMED_PREFIX_MARKER)
+    super::super::local_switch::marker_at(support, RESUMED_PREFIX_MARKER)
 }
 #[cfg(test)]
 thread_local! {
