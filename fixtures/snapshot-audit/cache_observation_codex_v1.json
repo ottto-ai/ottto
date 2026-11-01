@@ -1,6 +1,6 @@
 {
-  "body_witness_digest": "8e5f2ffcdce04a1ce5bd5c0faa83dd0845ee13507ad325993be7a62a06ea60c6",
-  "body_witness_version": 20,
+  "body_witness_digest": "5e11f7452f676acfd64afbd47ac1f0cdb66b9f8e01cf069a2eacd5a0044c6ccd",
+  "body_witness_version": 16,
   "cache_observations_state": {
     "coverage": "complete",
     "observations": [

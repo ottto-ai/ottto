@@ -32,12 +32,8 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
     let version = crate::snapshots::snapshot_upload_body_witness_version(item).map(|v| match v {
         9 => 3,
         10 => 4,
-        11 => 5,
-        12 => 6,
         15 => 13,
         16 => 14,
-        19 => 17,
-        20 => 18,
         21 | 23 => {
             if item.cache_observations.is_some() {
                 13

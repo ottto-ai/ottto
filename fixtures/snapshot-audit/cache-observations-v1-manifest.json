@@ -22,12 +22,12 @@
       "scan_identity_revision": "claude_code_jsonl:v30"
     },
     "codex": {
-      "body_witness_digest": "8e5f2ffcdce04a1ce5bd5c0faa83dd0845ee13507ad325993be7a62a06ea60c6",
-      "body_witness_version": 20,
-      "fixture_canonical_sha256": "551d92d9d10df4b56ea3da07341cf9c103851db964df917da25c677a7a1d0cf5",
+      "body_witness_digest": "5e11f7452f676acfd64afbd47ac1f0cdb66b9f8e01cf069a2eacd5a0044c6ccd",
+      "body_witness_version": 16,
+      "fixture_canonical_sha256": "68dfcae4c51b3516c567cdb34245e6cd1d572953f0eba353519c91e32b72ecd2",
       "fixture_file": "cache_observation_codex_v1.json",
       "fixture_wire_bytes": 7757,
-      "normalized_public_body_witness_version": 18,
+      "normalized_public_body_witness_version": 14,
       "parser_revision": "codex_jsonl:v40",
       "scan_identity_revision": "codex_jsonl:v34"
     }
@@ -36,9 +36,7 @@
   "manifest_version": "local_cache_observations_wire_manifest:v1",
   "normalized_public_body_witness_map": {
     "15": 13,
-    "16": 14,
-    "19": 17,
-    "20": 18
+    "16": 14
   },
   "schema_version": 1
 }
