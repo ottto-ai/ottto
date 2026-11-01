@@ -4077,6 +4077,15 @@ impl ClaudeDefaultHomeOwner {
         self.proven.is_some() && self.proven_binding() != self.cached
     }
 
+    /// Information only: the default home counts as the token owner's account.
+    fn split_login_diagnostic(&self) -> Option<AgentStatusDiagnostic> {
+        self.split_login().then(|| AgentStatusDiagnostic::source(
+            CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE,
+            AgentDiagnosticSeverity::Warning,
+            "Claude Desktop and the terminal use different accounts in the default Claude folder; it counts as the terminal login's account.",
+        ))
+    }
+
     /// The binding the default slot is verified against when it is not the
     /// one `.claude.json` names: none while unproven, the owner's on a split.
     fn binding_override(&self) -> Option<Option<(String, String)>> {
@@ -4089,30 +4098,34 @@ impl ClaudeDefaultHomeOwner {
 }
 
 /// Prove the default home's token owner, only where the local files disagree:
-/// a locally valid token whose plan contradicts `.claude.json`. Elsewhere
-/// (`None`) the default home keeps its usual path. The owner is the cached
-/// account: the credential's plan is stale and is dropped. The owner is
-/// another known account (a registered slot with the same hashes): `stable`
-/// takes that account's own `.claude.json`, so labels and plan facts come
-/// only from an account Ottto knows. Anything else stays unproven and the
-/// caller fails closed.
+/// a locally valid token whose plan contradicts `.claude.json`. A lapsed token
+/// waiting for Claude Code's refresh is never sent; it keeps the verdict
+/// remembered for that same token. Elsewhere (`None`) the default home keeps
+/// its usual path. The owner is the cached account: the credential's plan is
+/// stale and is dropped. The owner is another known account (a registered
+/// slot with the same hashes): `stable` takes that account's own
+/// `.claude.json`, so labels and plan facts come only from an account Ottto
+/// knows. Anything else stays unproven and the caller fails closed.
 fn resolve_claude_default_home_owner(
     login_state: &ClaudeLocalLoginState,
     stable: &mut StableClaudeSlotCredential,
     known_identities: &[ClaudeCliOauthAccount],
 ) -> Option<ClaudeDefaultHomeOwner> {
-    if *login_state != ClaudeLocalLoginState::AccessValid
-        || !claude_local_plan_facts_contradict(
-            stable.credential.subscription_type.as_deref(),
-            stable.oauth_account.organization_type.as_deref(),
-        )
-    {
+    let refresh_pending = *login_state == ClaudeLocalLoginState::RefreshPending;
+    if !matches!(
+        login_state,
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
+    ) || !claude_local_plan_facts_contradict(
+        stable.credential.subscription_type.as_deref(),
+        stable.oauth_account.organization_type.as_deref(),
+    ) {
         return None;
     }
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
     // The same gates as a background usage read, "Background limit refresh"
-    // included: no call means unproven.
-    let may_call = !claude_oauth_usage_network_disabled()
+    // included, and never for a lapsed token: no call means unproven.
+    let may_call = !refresh_pending
+        && !claude_oauth_usage_network_disabled()
         && !claude_pass_saved_only()
         && !claude_background_read_withheld();
     let owner = stable
@@ -4120,6 +4133,9 @@ fn resolve_claude_default_home_owner(
         .access_token
         .as_deref()
         .and_then(|token| claude_token_owner::proven_owner(token, may_call));
+    if refresh_pending && owner.is_none() {
+        return None;
+    }
     let mut resolved = ClaudeDefaultHomeOwner {
         cached,
         proven: owner,
@@ -4139,8 +4155,7 @@ fn resolve_claude_default_home_owner(
     Some(resolved)
 }
 
-/// The owner check's hashes on the default slot's local status, and the adopt
-/// action on a split login.
+/// The owner check's hashes on the default slot's local status.
 fn apply_claude_default_home_owner(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     owner: Option<&ClaudeDefaultHomeOwner>,
@@ -4154,11 +4169,6 @@ fn apply_claude_default_home_owner(
         status.token_owner_organization_hash,
     ) = owner.proven_binding().unzip();
     status.owner_proven_at = owner.proven.as_ref().map(|owner| owner.proven_at.clone());
-    if owner.split_login() {
-        status.recommended_action =
-            Some(ottto_protocol::ClaudeConfigSlotRecommendedActionV1::ClaudeAdoptDefaultLogin);
-        status.adopt_target_account_hash = status.token_owner_account_hash.clone();
-    }
 }
 
 /// Also returns this pass's exact Claude Desktop folder pairs, read in the same
@@ -4252,13 +4262,7 @@ fn collect_claude_status(
         resolve_claude_default_home_owner(&login_state, stable, known_identities)
     });
     if let Some(owner) = &default_owner {
-        if owner.split_login() {
-            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE,
-                AgentDiagnosticSeverity::Warning,
-                "Claude Desktop and the terminal use different accounts in the default Claude folder; it counts as the terminal login's account.",
-            ));
-        }
+        snapshot.diagnostics.extend(owner.split_login_diagnostic());
         if owner.proven.is_none() {
             stable_default_credential = Err(ClaudeSlotProbeFailure::OwnerUnproven);
         }
@@ -27366,9 +27370,10 @@ for line in sys.stdin:
 
     /// [regress] The observed split (`.claude.json` names a Team account, the
     /// token's owner is a known Max slot) resolves to that owner with the
-    /// split code. [behaviour] Only a valid token whose plan contradicts
+    /// split code, and keeps it while that token waits for its refresh.
+    /// [behaviour] Only a valid token whose plan contradicts
     /// `.claude.json` is checked: proven and known → that account's identity,
-    /// adopt action and hashes; proven as the cached account → its identity,
+    /// split code and hashes; proven as the cached account → its identity,
     /// the stale plan dropped; proven but unknown, or a failed check →
     /// unproven (the caller fails closed); a failure is not retried inside its
     /// back-off, and a proven token is not asked again. An expired token or
@@ -27440,23 +27445,31 @@ for line in sys.stdin:
                 status.token_owner_organization_hash.as_deref(),
                 status.cached_account_hash.as_deref(),
                 status.cached_organization_hash.as_deref(),
-                status
-                    .recommended_action
-                    .map(|action| serde_json::to_value(action).expect("action")),
-                status.adopt_target_account_hash.as_deref(),
             ),
             (
                 Some(terminal_account.as_str()),
                 Some(terminal_org.as_str()),
                 Some(desktop_account.as_str()),
                 Some(desktop_org.as_str()),
-                Some(serde_json::json!("claude_adopt_default_login")),
-                Some(terminal_account.as_str()),
             )
+        );
+        assert_eq!(
+            owner
+                .split_login_diagnostic()
+                .map(|diagnostic| diagnostic.code),
+            Some("claude_default_home_split_login".to_string())
         );
         assert!(status.owner_proven_at.is_some());
         let again = resolve(&mut stable("owner-check-token-a"), known);
         assert!(again.split_login());
+        // [regress] The same token, lapsed and waiting for Claude Code's
+        // refresh, keeps that owner without a call.
+        let pending = resolve_claude_default_home_owner(
+            &ClaudeLocalLoginState::RefreshPending,
+            &mut stable("owner-check-token-a"),
+            known,
+        );
+        assert!(pending.is_some_and(|owner| owner.split_login()));
         assert_eq!(calls(), 1, "one call per token");
 
         // (b) Proven but unknown: unproven, `.claude.json` is not used.
@@ -27489,7 +27502,8 @@ for line in sys.stdin:
         claude_account_from_local_metadata(&same.oauth_account, &same.credential)
             .expect("a proven owner outranks the stale plan");
 
-        // (f) An expired token is never sent: no call, the usual path.
+        // (f) An expired token with no verdict of its own (another lineage) is
+        // never sent: no call, the usual path (owner unproven).
         let before = calls();
         assert!(resolve_claude_default_home_owner(
             &ClaudeLocalLoginState::RefreshPending,
@@ -27498,6 +27512,11 @@ for line in sys.stdin:
         )
         .is_none());
         assert_eq!(calls(), before);
+        let lapsed = stable("owner-check-token-f");
+        assert_eq!(
+            claude_account_from_local_metadata(&lapsed.oauth_account, &lapsed.credential).err(),
+            Some(ClaudeSlotProbeFailure::OwnerUnproven)
+        );
 
         // (d) "Background limit refresh" off: no call inside a pass, unproven.
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(terminal_profile)));
