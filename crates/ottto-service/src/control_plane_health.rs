@@ -15,8 +15,13 @@
 //! so `true` is a marker of a latent descriptor-lifetime bug, not an outage.
 //! The point of reporting it is to learn how often the drain happens, and what
 //! it correlates with, now that the daemon no longer fails because of it.
+//!
+//! `describe_descriptor` and `descriptor_census` write the descriptor state
+//! into the log line of a listener that failed.
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use time::format_description::well_known::Rfc3339;
@@ -259,9 +264,97 @@ fn socket_listener_draining(_fd: i32, _family: ListenerFamily) -> Option<bool> {
     None
 }
 
+/// What `fd` names right now, for the log line written when a listener
+/// fails: closed, still the listener (and whether it is draining), or reused
+/// by some other kind of file.
+#[cfg(unix)]
+pub(crate) fn describe_descriptor(fd: RawFd) -> String {
+    // SAFETY: F_GETFD only reads the descriptor table.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return format!("fd {fd} is closed ({})", std::io::Error::last_os_error());
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes one stat into the live buffer.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return format!(
+            "fd {fd} is open but fstat failed ({})",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: fstat succeeded, so the buffer is initialized.
+    let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if mode != libc::S_IFSOCK {
+        return format!("fd {fd} now names a {}", descriptor_kind(mode));
+    }
+    if !cfg!(target_os = "macos") {
+        return format!("fd {fd} is a socket");
+    }
+    if let Some(draining) = tcp_listener_draining(fd) {
+        return format!("fd {fd} is a TCP listener (draining: {draining})");
+    }
+    if let Some(draining) = listener_draining(fd) {
+        return format!("fd {fd} is a unix listener (draining: {draining})");
+    }
+    format!("fd {fd} is a socket that is not listening")
+}
+
+/// Process soft descriptor limit; failure supplies no admission authority.
+#[cfg(unix)]
+pub(crate) fn descriptor_limit() -> Option<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into the live struct.
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0)
+        .then(|| usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
+}
+
+/// A one-line count of this process's open descriptors by kind.
+#[cfg(unix)]
+pub(crate) fn descriptor_census() -> String {
+    let scan_to = descriptor_limit().unwrap_or(4_096).min(65_536) as RawFd;
+    let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
+    let mut total = 0_usize;
+    for fd in 0..scan_to {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes one stat into the live buffer; a closed
+        // descriptor just fails.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            continue;
+        }
+        // SAFETY: fstat succeeded, so the buffer is initialized.
+        let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+        *counts.entry(descriptor_kind(mode)).or_default() += 1;
+        total += 1;
+    }
+    let kinds = counts
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{total} open descriptors ({kinds})")
+}
+
+#[cfg(unix)]
+fn descriptor_kind(mode: libc::mode_t) -> &'static str {
+    match mode {
+        libc::S_IFSOCK => "socket",
+        libc::S_IFREG => "file",
+        libc::S_IFIFO => "pipe",
+        libc::S_IFDIR => "directory",
+        libc::S_IFCHR => "character device",
+        _ => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::net::{Ipv4Addr, TcpListener};
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn counters_only_move_forward_and_stamp_the_last_served_time() {
@@ -354,5 +447,34 @@ mod tests {
         let file = std::fs::File::open("/dev/null").expect("open /dev/null");
         assert_eq!(listener_draining(file.as_raw_fd()), None);
         assert_eq!(listener_draining(-1), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn describe_descriptor_tells_a_live_listener_from_a_closed_number() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let fd = listener.as_raw_fd();
+        let live = describe_descriptor(fd);
+        if cfg!(target_os = "macos") {
+            assert_eq!(live, format!("fd {fd} is a TCP listener (draining: false)"));
+        } else {
+            assert!(live.starts_with(&format!("fd {fd} is a socket")), "{live}");
+        }
+        // Far above any descriptor a test process opens.
+        let unused = 65_000;
+        assert!(
+            describe_descriptor(unused).starts_with(&format!("fd {unused} is closed")),
+            "{}",
+            describe_descriptor(unused)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_census_counts_open_sockets() {
+        let _listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let census = descriptor_census();
+        assert!(census.contains(" socket"), "{census}");
+        assert!(census.ends_with(')'), "{census}");
     }
 }

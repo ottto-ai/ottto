@@ -174,7 +174,6 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             None,
             &[],
             false,
-            false,
         );
         if cached {
             owned =

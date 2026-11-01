@@ -112,7 +112,6 @@ fn page(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope(NAMESPACE.into()));
     let mut seen = Seen::default();

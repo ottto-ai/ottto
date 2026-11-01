@@ -90,6 +90,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
                     retained_proof_missing: Vec::new(),
                 };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: u64::from(stored),
                     sessions_reconciled: 0,
                     session_ids: vec![],
@@ -176,6 +177,8 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     );
 }
 
+/// [regress] a maximum valid identity ledger stays bounded and admits a small
+/// v2 upload; unchanged retained sessions must not be charged twice.
 #[test]
 fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     let mut progress = progress();
@@ -208,6 +211,29 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     eprintln!("E2_ACCEPTED_PROGRESS_JSON_BYTES={json_bytes} E2_ACCEPTED_PROGRESS_LOAD_PEAK_BYTES={load_peak}");
     assert!(json_bytes <= 7_900_000, "json={json_bytes}");
     assert!(load_peak <= 13_500_000, "peak={load_peak}");
+    let recovery = crate::snapshots::ProgressRecovery::synthetic(
+        &root.join("index.json"),
+        &progress.destination_namespace_hash,
+        0,
+    );
+    recovery
+        .admit_progress_bytes(serde_json::to_vec_pretty(&progress).unwrap().len() as u64)
+        .unwrap();
+    progress.ack_recovery = Some(Box::new(recovery));
+    let before = progress.clone();
+    let item = body();
+    assert!(!progress
+        .admit_ack_custody(
+            std::slice::from_ref(&item),
+            std::iter::empty(),
+            &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            &|_| "d".repeat(64),
+        )
+        .unwrap());
+    assert_eq!(
+        progress, before,
+        "admission neither evicts accepted shares nor mutates custody"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 // Option (ii): only a stored-body entity ACK whose versioned body witness equals
@@ -254,6 +280,7 @@ fn retained_ack(
                 retained_proof_missing: missing.clone(),
             };
             Ok(crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
                 accepted: 1,
                 sessions_reconciled: 0,
                 session_ids: vec![],

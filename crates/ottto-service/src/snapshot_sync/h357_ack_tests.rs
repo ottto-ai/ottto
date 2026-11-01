@@ -87,6 +87,7 @@ fn response_with_reason(
         vec![refs.remove(0)]
     };
     SnapshotBatchResponse {
+        conflict_rescans: Default::default(),
         accepted: (items.len() - rejected) as u64,
         sessions_reconciled: 0,
         session_ids: Vec::new(),
@@ -336,6 +337,7 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: deferred_entity_state(false),
         },
         false,
+        false,
     )
     .unwrap();
     assert_eq!(partial.last_uploaded_count, 43);
@@ -355,12 +357,15 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: CollectorState::Success,
         },
         false,
+        false,
     )
     .unwrap();
     assert!(clean.last_error_code.is_none());
     assert_eq!(clean.last_success_at, clean.last_scan_finished_at);
 }
 
+/// [regress] H359 server-permanent exact bodies cannot resend after restart,
+/// even when version-only witness normalization needs a diagnostic save.
 #[test]
 #[serial_test::serial(client_report)]
 fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_timer() {
@@ -397,7 +402,19 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     let mut stale = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
     stale.upload_body_witness = Some(body.clone());
     stale.retry_after_unix_seconds = 0; // Earlier deadline cannot revoke server permanence.
-    assert!(!restarted.prepare_quarantine_retries(&BTreeMap::from([(fp.clone(), stale)])));
+    let stale_index = BTreeMap::from([(fp.clone(), stale)]);
+    assert!(restarted.prepare_quarantine_retries(&stale_index));
+    assert!(restarted.active_quarantine_retries.is_empty());
+    assert_eq!(restarted.quarantined_fingerprints[&fp].witness, witness);
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].failed_reconstruction_count,
+        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+    );
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].retry_after_unix_seconds,
+        0
+    );
+    assert!(!restarted.prepare_quarantine_retries(&stale_index));
     // A replay can also have no surviving index quarantine to normalize.
     restarted.quarantined_fingerprints.clear();
     let mut accepted = 0;
@@ -508,6 +525,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
+        false,
     )
     .unwrap();
     assert_eq!(status.last_uploaded_count, 0);
@@ -795,6 +813,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
+        evidence_owed: false,
     }
 }
 
@@ -1357,6 +1376,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
                     code: None,
                 })),
                 _ => Ok(SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 0,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),

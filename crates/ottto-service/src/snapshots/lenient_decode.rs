@@ -80,6 +80,85 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    // S1 MISC: exact immutable custody access, without serializing HeldRaw.
+    pub(super) fn v2_provenance(&self) -> (u128, u64) {
+        (self.1.sum, self.1.count)
+    }
+    pub(super) fn v2_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &[u8], Option<std::ops::Range<usize>>, u64)> {
+        self.0.iter().flat_map(|(field, slots)| {
+            slots.iter().map(move |(key, raw)| {
+                (
+                    *field,
+                    key.as_str(),
+                    raw.get().as_bytes(),
+                    raw.1.clone(),
+                    raw.2,
+                )
+            })
+        })
+    }
+    pub(super) fn v2_insert(
+        &mut self,
+        field: &str,
+        key: String,
+        bytes: Vec<u8>,
+        owner: Option<std::ops::Range<usize>>,
+        charge: u64,
+    ) -> anyhow::Result<()> {
+        let field = FIELDS
+            .iter()
+            .copied()
+            .find(|f| *f == field)
+            .or_else(|| (field == "growth_retention").then_some("growth_retention"))
+            .ok_or_else(|| anyhow::anyhow!("state_v2_unknown_hold"))?;
+        anyhow::ensure!(
+            matches!(
+                field,
+                "files"
+                    | "growth_retention"
+                    | "claude_account_family_witnesses"
+                    | "claude_account_family_pending"
+                    | "claude_usage_family_witnesses"
+                    | "claude_usage_family_pending"
+                    | "claude_usage_authority_quarantine"
+                    | "quarantined_snapshot_fingerprints"
+            ),
+            "state_v2_unknown_hold"
+        );
+        anyhow::ensure!(
+            !key.is_empty() && bytes.len() as u64 <= HOLD_BYTES_MAX && charge >= bytes.len() as u64,
+            "state_v2_hold_admission"
+        );
+        anyhow::ensure!(
+            self.held_bytes()
+                .checked_add(charge)
+                .is_some_and(|n| n <= HOLD_BYTES_MAX)
+                && self.0.values().map(BTreeMap::len).sum::<usize>() < HOLD_COUNT_MAX,
+            "state_v2_hold_admission"
+        );
+        let text = String::from_utf8(bytes)?;
+        let len = text.len();
+        let raw = RawValue::from_string(text)?;
+        anyhow::ensure!(raw.get().len() == len, "state_v2_hold_lexeme_changed");
+        let expected_owner = (field == "files").then(|| held_file_owner(&raw)).flatten();
+        anyhow::ensure!(owner == expected_owner, "state_v2_hold_owner_changed");
+        let previous = self
+            .0
+            .entry(field)
+            .or_default()
+            .insert(key, Arc::new(HeldRaw(raw, owner, charge)));
+        anyhow::ensure!(previous.is_none(), "state_v2_duplicate_hold");
+        Ok(())
+    }
+    pub(super) fn v2_finish(&mut self, provenance: (u128, u64)) {
+        self.1 = RepairProvenance {
+            sum: provenance.0,
+            count: provenance.1,
+        };
+        self.rebuild_scopes();
+    }
     pub(super) fn contains_field(&self, field: &str) -> bool {
         self.0.get(field).is_some_and(|slots| !slots.is_empty())
     }
@@ -297,9 +376,6 @@ impl Serialize for ScanIndex {
         field!(claude_stale_family_carry, ClaudeStaleFamilyCarry::is_empty);
         field!(scan_residue_witness, Option::is_none);
         field!(historical_replay_generation, Option::is_none);
-        field!(context_curve_capability_enabled, is_false);
-        field!(context_curve_replay_epoch, is_zero_u64);
-        field!(completed_context_curve_replay_generation, Option::is_none);
         field!(confirmed_empty_files, BTreeSet::is_empty);
         field!(file_snapshot_fingerprints, BTreeMap::is_empty);
         field!(snapshot_activity_at, BTreeMap::is_empty);
@@ -330,8 +406,12 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(
+            claude_desktop_store_inventory,
+            claude_desktop_store_inventory_is_legacy
+        );
+        field!(
             claude_copy_removals,
-            claude_request_money::copy_removals::CopyRemovals::is_empty
+            claude_request_money::copy_removals::CopyRemovals::is_unwritten
         );
         map.end()
     }
@@ -400,9 +480,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_stale_family_carry",
     "scan_residue_witness",
     "historical_replay_generation",
-    "context_curve_capability_enabled",
-    "context_curve_replay_epoch",
-    "completed_context_curve_replay_generation",
+    "context_curve_capability_enabled", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "context_curve_replay_epoch", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "completed_context_curve_replay_generation", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "confirmed_empty_files",
     "file_snapshot_fingerprints",
     "snapshot_activity_at",
@@ -424,7 +504,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
-    "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+    "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
 ];
 
@@ -504,9 +584,6 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
-    "context_curve_capability_enabled",
-    "context_curve_replay_epoch",
-    "completed_context_curve_replay_generation",
 ];
 #[derive(Default)]
 struct Counts {
@@ -528,6 +605,8 @@ struct Decoder<R> {
     family_spans: BTreeMap<&'static str, Span>,
     census_resources: [bool; 2],
     persistence_map: bool,
+    // Hydrate keeps immutable raw evidence alive until freeze/drop analysis.
+    original_holds: Option<Holds>,
 }
 #[derive(Clone, Copy)]
 struct Span {
@@ -952,6 +1031,7 @@ fn read_persistence_mode<R: BufRead + Seek>(
         family_spans: BTreeMap::new(),
         census_resources,
         persistence_map: map_only,
+        original_holds: None,
     };
     // Controls are checked before any record can exhaust hold admission.
     // Otherwise a future ledger placed after damaged records could be renamed
@@ -986,49 +1066,301 @@ fn read_persistence_mode<R: BufRead + Seek>(
     if partial.is_some() {
         index.schema_version = SCAN_INDEX_SCHEMA_VERSION;
     }
-    controls(&index, source)?;
+    finish_decode(
+        &mut index,
+        decoder.holds,
+        decoder.counts,
+        stage,
+        source,
+        map_only,
+    )?;
+    Ok(index)
+}
+
+// The common tail of full, bounded CAS, partial and v2 reads. The raw-dependent
+// repair/freeze pass must finish before these semantic drops and scope rebuilds.
+fn finish_decode(
+    index: &mut ScanIndex,
+    holds: Holds,
+    mut counts: Counts,
+    stage: &str,
+    source: &'static str,
+    map_only: bool,
+) -> std::result::Result<(), Error> {
+    controls(index, source)?;
     // Normalize on every successful read, including both CAS readers. A bad
     // cutoff clears the loaded marker so prior-history signals re-derive it.
     index.drop_malformed_claude_history_cutoff();
-    index.decode_holds = decoder.holds;
+    index.decode_holds = holds;
     index.decode_holds.rebuild_scopes();
     let semantic = if !map_only && index.persistence_available() {
         index.drop_invalid_index_records()
     } else {
         ScanIndexLoadDrops::default()
     };
-    decoder.counts.drops.activity += semantic.activity;
-    decoder.counts.drops.accepted += semantic.accepted;
-    decoder.counts.drops.cursor += semantic.cursor;
-    decoder.counts.drops.quarantine += semantic.quarantine;
+    counts.drops.activity += semantic.activity;
+    counts.drops.accepted += semantic.accepted;
+    counts.drops.cursor += semantic.cursor;
+    counts.drops.quarantine += semantic.quarantine;
     note_scan_index_record_drops_and_decode(
         stage,
         source,
-        decoder.counts.drops,
+        counts.drops,
         [
-            decoder.counts.held,
-            decoder.counts.files,
-            decoder.counts.families,
-            decoder.counts.authority_repairs,
+            counts.held,
+            counts.files,
+            counts.families,
+            counts.authority_repairs,
         ],
     );
     if !map_only && index.persistence_available() {
         index.retain_decodable_codex_parent_state();
         index.drop_unbound_claude_authority_records(stage);
-        settle_retired_family_decode(&mut index);
+        settle_retired_family_decode(index);
     }
     if map_only
         && (!index.decode_holds.is_empty()
             || index.decode_holds.1.count != 0
-            || decoder.counts.drops.activity
-                + decoder.counts.drops.accepted
-                + decoder.counts.drops.cursor
-                + decoder.counts.drops.quarantine
+            || counts.drops.activity
+                + counts.drops.accepted
+                + counts.drops.cursor
+                + counts.drops.quarantine
                 != 0)
     {
         return Err(Error::Refused("incomplete persistence map"));
     }
-    Ok(index)
+    Ok(())
+}
+
+// Only raw custody and siblings that will be frozen are materialized here.
+// This is a bounded raw-field reader, never an encoded ScanIndex or CAS graph.
+struct HydrateInput(Vec<u8>);
+impl std::io::Write for HydrateInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > HOLD_BYTES_MAX.saturating_sub(self.0.len() as u64) {
+            return Err(std::io::Error::other("hydrate hold admission"));
+        }
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            let capacity = needed.next_power_of_two().min(HOLD_BYTES_MAX as usize);
+            self.0.reserve_exact(capacity - self.0.len());
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct RawSlots<'a>(&'a HeldSlots);
+impl Serialize for RawSlots<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, raw) in self.0 {
+            map.serialize_entry(key, raw.0.as_ref())?;
+        }
+        map.end()
+    }
+}
+struct FamilyView<'a, T> {
+    typed: &'a BTreeMap<String, T>,
+    raw: Option<&'a HeldSlots>,
+    roots: &'a BTreeSet<&'a str>,
+}
+impl<T: Serialize> Serialize for FamilyView<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in self.typed {
+            if self.roots.contains(key.as_str())
+                && !self.raw.is_some_and(|slots| slots.contains_key(key))
+            {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if let Some(slots) = self.raw {
+            for (key, raw) in slots {
+                if self.roots.contains(key.as_str()) {
+                    map.serialize_entry(key, raw.0.as_ref())?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+impl Decoder<std::io::Cursor<Vec<u8>>> {
+    fn raw_hydrate_input(
+        &mut self,
+        field: &'static str,
+    ) -> std::result::Result<Option<Span>, Error> {
+        let Some(slots) = self.original_holds.as_ref().and_then(|h| h.0.get(field)) else {
+            return Ok(None);
+        };
+        let mut input = HydrateInput(Vec::new());
+        serde_json::to_writer(&mut input, &RawSlots(slots)).map_err(|_| Error::HoldBudget)?;
+        let span = Span {
+            start: 0,
+            len: input.0.len() as u64,
+            resource: false,
+        };
+        self.reader = std::io::Cursor::new(input.0);
+        Ok(Some(span))
+    }
+    fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
+        let roots = family_hold_roots(&self.holds.0);
+        let mut input = HydrateInput(Vec::new());
+        self.family_spans.clear();
+        macro_rules! field {
+            ($field:ident) => {{
+                let name = stringify!($field);
+                let start = input.0.len() as u64;
+                let view = FamilyView {
+                    typed: &index.$field,
+                    raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
+                    roots: &roots,
+                };
+                serde_json::to_writer(&mut input, &view).map_err(|_| Error::HoldBudget)?;
+                self.family_spans.insert(
+                    name,
+                    Span {
+                        start,
+                        len: input.0.len() as u64 - start,
+                        resource: false,
+                    },
+                );
+            }};
+        }
+        field!(claude_account_family_witnesses);
+        field!(claude_account_family_pending);
+        field!(claude_usage_family_witnesses);
+        field!(claude_usage_family_pending);
+        field!(claude_usage_authority_quarantine);
+        self.reader = std::io::Cursor::new(input.0);
+        Ok(())
+    }
+}
+
+// Hash a typed v2 row view without buffering its potentially large members.
+// Raw slots use their immutable original bytes instead, through the Decoder.
+fn typed_record_hash(value: &impl Serialize) -> std::result::Result<[u8; 32], Error> {
+    super::serialized_json_digest(value, &[])
+        .map(|digest| digest.finalize().into())
+        .ok_or(Error::Refused("typed row view"))
+}
+
+/// Normalize an unpublished mapped graph with the v1 record codecs and the
+/// same repair/freeze/drop tail as ordinary and claim-only v1 CAS rereads.
+/// The caller must supply the current storage snapshot, never a mutated working
+/// graph. Original custody stays immutable until raw-dependent decisions end.
+pub(super) fn post_decode_hydrated(
+    index: &mut ScanIndex,
+    stage: &str,
+    source: &'static str,
+) -> std::result::Result<(), Error> {
+    controls(index, source)?;
+    let original = std::mem::take(&mut index.decode_holds);
+    let mut decoder = Decoder {
+        reader: std::io::Cursor::new(Vec::new()),
+        input_len: u64::MAX,
+        held_bytes: 0,
+        held_count: 0,
+        holds: Holds {
+            1: original.1,
+            ..Holds::default()
+        },
+        counts: Counts::default(),
+        family_spans: BTreeMap::new(),
+        census_resources: [false; 2],
+        persistence_map: false,
+        original_holds: Some(original),
+    };
+    // Typed row views are already decoded. Re-run the exact record codecs for
+    // every original raw slot, including valid siblings frozen by an old read.
+    macro_rules! raw_map {
+        ($field:ident, $method:ident) => {
+            if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
+                    index.$field.remove(key);
+                }
+                index.$field.extend(decoder.$method(span)?);
+            }
+        };
+    }
+    // records takes the field before the span and the debt flag after it.
+    macro_rules! records {
+        ($field:ident) => {
+            if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
+                    index.$field.remove(key);
+                }
+                index
+                    .$field
+                    .extend(decoder.records(stringify!($field), span, true)?);
+            }
+        };
+    }
+    records!(files);
+    // This debt exists only in authenticated v2 rows, never in the v1 codec.
+    if let Some(span) = decoder.raw_hydrate_input("growth_retention")? {
+        for key in decoder.original_holds.as_ref().unwrap().0["growth_retention"].keys() {
+            index.v2_mut().growth_retention.remove(key);
+        }
+        index
+            .v2_mut()
+            .growth_retention
+            .extend(decoder.records("growth_retention", span, true)?);
+    }
+    records!(claude_account_family_witnesses);
+    records!(claude_account_family_pending);
+    records!(claude_usage_family_witnesses);
+    records!(claude_usage_family_pending);
+    for (key, record) in &index.quarantined_snapshot_fingerprints {
+        if !decoder
+            .original_holds
+            .as_ref()
+            .unwrap()
+            .contains("quarantined_snapshot_fingerprints", key)
+            && !snapshot_quarantine_deadline_is_bounded(record)
+        {
+            decoder.holds.1.add(
+                "quarantined_snapshot_fingerprints",
+                key,
+                typed_record_hash(record)?,
+            );
+        }
+    }
+    raw_map!(quarantined_snapshot_fingerprints, quarantines);
+    raw_map!(claude_usage_authority_quarantine, authorities);
+    migrate_carried_ack_debt(index)?;
+    // The authority reader still contains ORIGINAL raw slots. Resolve unbound
+    // repairs before selecting sibling views; no canonical repaired record can
+    // replace the evidence tested by freeze_unbound_authority_repairs.
+    decoder.family_spans.clear();
+    if let Some(span) = decoder.raw_hydrate_input("claude_usage_authority_quarantine")? {
+        decoder
+            .family_spans
+            .insert("claude_usage_authority_quarantine", span);
+        decoder.freeze_unbound_authority_repairs(index)?;
+    }
+    decoder.hydrate_family_input(index)?;
+    decoder.freeze_held_families(index)?;
+    for (key, record) in &index.claude_usage_authority_quarantine {
+        if authority_is_unbound(index, key) {
+            decoder.holds.1.add(
+                "claude_usage_authority_quarantine",
+                key,
+                match decoder.original_holds.as_ref().and_then(|holds| {
+                    holds
+                        .0
+                        .get("claude_usage_authority_quarantine")
+                        .and_then(|slots| slots.get(key))
+                }) {
+                    Some(raw) => repair_key(raw.get()),
+                    None => typed_record_hash(record)?,
+                },
+            );
+        }
+    }
+    finish_decode(index, decoder.holds, decoder.counts, stage, source, false)
 }
 
 pub(super) fn read_file(
@@ -1072,6 +1404,7 @@ pub(super) fn read_identity_carry(
         family_spans: BTreeMap::new(),
         census_resources,
         persistence_map: false,
+        original_holds: None,
     };
     let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
@@ -1111,6 +1444,68 @@ pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::
     }
     Ok(())
 }
+fn family_hold_roots<'a>(holds: &'a BTreeMap<&'static str, HeldSlots>) -> BTreeSet<&'a str> {
+    holds
+        .iter()
+        .filter(|(field, _)| field.starts_with("claude_"))
+        .flat_map(|(_, slots)| slots.keys().map(String::as_str))
+        .chain(
+            holds
+                .get("files")
+                .into_iter()
+                .flat_map(|slots| slots.keys())
+                .filter_map(|key| {
+                    claude_index_path_member_ref(Path::new(key)).map(|member| member.root)
+                }),
+        )
+        .collect()
+}
+
+// CAS materializes only roots that can acquire raw sibling custody. Other
+// authorities/quarantines are normalized one record/family at a time.
+pub(super) fn cas_hold_roots(index: &ScanIndex) -> BTreeSet<String> {
+    family_hold_roots(&index.decode_holds.0)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+pub(super) fn add_cas_provenance(target: &mut ScanIndex, normalized: &ScanIndex) {
+    target.decode_holds.1.sum = target
+        .decode_holds
+        .1
+        .sum
+        .wrapping_add(normalized.decode_holds.1.sum);
+    target.decode_holds.1.count = target
+        .decode_holds
+        .1
+        .count
+        .checked_add(normalized.decode_holds.1.count)
+        .expect("record admission");
+}
+
+fn authority_is_unbound(index: &ScanIndex, key: &str) -> bool {
+    index
+        .claude_usage_authority_quarantine
+        .get(key)
+        .is_some_and(|record| {
+            !index
+                .claude_usage_family_witnesses
+                .get(key)
+                .is_some_and(|witness| claude_usage_authority_preserves_pending(record, witness))
+        })
+}
+
+fn migrate_carried_ack_debt(index: &mut ScanIndex) -> std::result::Result<(), Error> {
+    // Migrate the old marker without granting later ACKs blanket retention.
+    if index.accepted_incidence_pending_census && index.accepted_rebuild_incidence.is_empty() {
+        index
+            .accepted_rebuild_incidence
+            .insert(String::new(), index.accepted_snapshot_fingerprints.clone());
+    }
+    index.admit_carried_ack_debt()?;
+    Ok(())
+}
+
 fn settle_retired_family_decode(index: &mut ScanIndex) {
     let initialized = index.claude_retired_family_tombstones_initialized;
     if index.claude_retired_family_tombstones_initialized
@@ -1307,6 +1702,23 @@ impl<R: BufRead + Seek> Decoder<R> {
         // Retain the lexical key charge, including escapes, so canonical output
         // can never require a larger restart admission. An intact file owner
         // is an inline range into the raw slot, never a second payload copy.
+        if let Some(raw) = self
+            .original_holds
+            .as_ref()
+            .and_then(|holds| holds.0.get(field))
+            .and_then(|slots| slots.get(&key))
+            .cloned()
+        {
+            self.check_hold_bytes(raw.2)?;
+            if self.held_count >= HOLD_COUNT_MAX {
+                return Err(Error::HoldBudget);
+            }
+            self.held_bytes += raw.2;
+            self.held_count += 1;
+            self.holds.0.entry(field).or_default().insert(key, raw);
+            self.note_hold(field);
+            return Ok(());
+        }
         let charge = Self::hold_charge(key_span, span)?;
         let raw = self.raw(span, charge)?;
         self.held_bytes += charge;
@@ -1317,13 +1729,16 @@ impl<R: BufRead + Seek> Decoder<R> {
             .entry(field)
             .or_default()
             .insert(key, Arc::new(HeldRaw(raw, owner, charge)));
+        self.note_hold(field);
+        Ok(())
+    }
+    fn note_hold(&mut self, field: &str) {
         self.counts.held += 1;
         if field == "files" {
             self.counts.files += 1;
         } else if field != "quarantined_snapshot_fingerprints" {
             self.counts.families += 1;
         }
-        Ok(())
     }
     // The revision marker has a fixed 32-byte payload. Inspect its lexical
     // span before Serde sees it: from_reader buffers malformed strings and map
@@ -1428,7 +1843,11 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = if field == "claude_usage_family_pending" {
+            let decoded = if field == "growth_retention" && value.len > 4096 {
+                // Four numeric fields: bound malformed strings before Serde
+                // scratch allocation. Preserve opaque pacing debt as a hold.
+                Err(Error::Refused("growth retention record size"))
+            } else if field == "claude_usage_family_pending" {
                 self.pending_typed(value)
             } else {
                 self.typed(value)
@@ -1911,15 +2330,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "historical_replay_generation" => {
                             index.historical_replay_generation = self.typed(value)?
                         }
-                        "context_curve_capability_enabled" => {
-                            index.context_curve_capability_enabled = self.typed(value)?
-                        }
-                        "context_curve_replay_epoch" => {
-                            index.context_curve_replay_epoch = self.typed(value)?
-                        }
-                        "completed_context_curve_replay_generation" => {
-                            index.completed_context_curve_replay_generation = self.typed(value)?
-                        }
+                        // TOMBSTONE: decode-and-drop (retired context-curve replay).
+                        "context_curve_capability_enabled"
+                        | "context_curve_replay_epoch"
+                        | "completed_context_curve_replay_generation" => {}
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
                         }
@@ -2065,19 +2479,12 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            // An empty undamaged store is never written: absence is an empty
+            // store, not lost metadata (Lead B F4). Damage is `missing`.
             if !seen.contains("claude_copy_removals") {
-                index.claude_copy_removals =
-                    claude_request_money::copy_removals::CopyRemovals::missing();
+                index.claude_copy_removals = Default::default();
             }
-            // Migrate the old marker without granting later ACKs blanket retention.
-            if index.accepted_incidence_pending_census
-                && index.accepted_rebuild_incidence.is_empty()
-            {
-                index
-                    .accepted_rebuild_incidence
-                    .insert(String::new(), index.accepted_snapshot_fingerprints.clone());
-            }
-            index.admit_carried_ack_debt()?;
+            migrate_carried_ack_debt(&mut index)?;
             let authority_span = self
                 .family_spans
                 .get("claude_usage_authority_quarantine")
@@ -2105,17 +2512,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             let key = self.record_key(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
-            let unbound = index
-                .claude_usage_authority_quarantine
-                .get(&key)
-                .is_some_and(|record| {
-                    !index
-                        .claude_usage_family_witnesses
-                        .get(&key)
-                        .is_some_and(|witness| {
-                            claude_usage_authority_preserves_pending(record, witness)
-                        })
-                });
+            let unbound = authority_is_unbound(index, &key);
             if unbound
                 && self
                     .typed::<ClaudeUsageAuthorityQuarantineRecord>(value)
@@ -2145,20 +2542,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         // share their root fence without a corpus-sized temporary key set.
         self.freeze_unbound_authority_repairs(index)?;
         let original = std::mem::take(&mut self.holds.0);
-        let roots = original
-            .iter()
-            .filter(|(field, _)| field.starts_with("claude_"))
-            .flat_map(|(_, slots)| slots.keys().map(String::as_str))
-            .chain(
-                original
-                    .get("files")
-                    .into_iter()
-                    .flat_map(|slots| slots.keys())
-                    .filter_map(|key| {
-                        claude_index_path_member_ref(Path::new(key)).map(|member| member.root)
-                    }),
-            )
-            .collect::<BTreeSet<_>>();
+        let roots = family_hold_roots(&original);
         let fields = std::mem::take(&mut self.family_spans);
         for (field, span) in fields {
             self.reader.seek(SeekFrom::Start(span.start))?;
@@ -2239,18 +2623,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             let key = self.record_key(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
-            if index
-                .claude_usage_authority_quarantine
-                .get(&key)
-                .is_some_and(|record| {
-                    !index
-                        .claude_usage_family_witnesses
-                        .get(&key)
-                        .is_some_and(|witness| {
-                            claude_usage_authority_preserves_pending(record, witness)
-                        })
-                })
-            {
+            if authority_is_unbound(index, &key) {
                 let hash = self.hash_span(value)?;
                 self.holds
                     .1

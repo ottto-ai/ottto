@@ -6,8 +6,10 @@ signals: flexible `credits` and a recurring workspace `individualLimit`.
 window was exhausted appeared to have no remaining capacity even when the
 workspace monthly pool was active.
 
-The app-server and legacy `wham/usage` parsers now normalize
-`individualLimit`/`individual_limit` into one display-safe credit balance:
+The app-server parser now normalizes `individualLimit`/`individual_limit` into
+one display-safe credit balance (the legacy `wham/usage` parser that also did
+this was retired on 2026-10-31 with the `OTTTO_CODEX_LEGACY_OAUTH_USAGE`
+fallback):
 
 - name: `workspace_monthly_credits`
 - unit: `credits`
@@ -28,5 +30,5 @@ its separate explicit, versioned provider-daily-reference consent and grant
 flow. Keeping it there preserves the stricter account exclusion, bounded-day,
 normalization, and upload policy instead of broadening routine quota status.
 
-Focused Rust tests cover app-server parsing, snake-case legacy parsing, and a
-monthly-only app-server snapshot.
+Focused Rust tests cover app-server parsing and a monthly-only app-server
+snapshot.

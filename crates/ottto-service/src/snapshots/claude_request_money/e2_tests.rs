@@ -74,7 +74,7 @@ fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -
     let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
     // The page's copy decision, as the scan runs it; `publish` decides again
     // over the whole page, where a parsed witness proves its own requests.
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     items.remove(0)
 }
 /// Parse, then record the read like the scan does (birth + indexed path).
@@ -145,14 +145,14 @@ fn api_report(read: &ClaudeApiEvidenceRead) -> ClaudeLocalOtelLoadReport {
         health: Default::default(),
     }
 }
-/// The page path with the gate on: attach, side calls, finish.
+/// The always-on page path: attach, side calls, finish.
 fn publish(
     mut items: Vec<SnapshotItem>,
     read: Option<&ClaudeApiEvidenceRead>,
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     if let Some(read) = read {
         attach_page(&mut items, read);
         side_calls_page(
@@ -163,10 +163,15 @@ fn publish(
         );
     }
     {
-        let _resumed_prefix =
-            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
-        finish_page(&mut items, index, telemetry);
-    }
+        let _resumed_prefix = ResumedPrefixForTest::set(true);
+        finish_page(
+            &mut items,
+            index,
+            telemetry,
+            &mut Default::default(),
+            &Default::default(),
+        )
+    };
     items
 }
 fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {
@@ -180,6 +185,31 @@ fn cleanup(paths: &[&Path]) {
     for path in paths {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
+}
+
+/// [behaviour] DS1: the copy-prefix switch is the owner's support-dir marker,
+/// not process environment. Present (a regular file) is ON; absent, a
+/// directory or the old environment key is OFF; tests never read the host.
+#[test]
+fn copy_prefix_switch_is_the_support_marker_and_defaults_off() {
+    let scratch = crate::test_scratch::ScratchDir::new("e2-copy-prefix-marker");
+    assert!(!resumed_prefix_enabled_at(&scratch), "absent marker is OFF");
+    fs::write(scratch.join(RESUMED_PREFIX_MARKER), b"").unwrap();
+    assert!(resumed_prefix_enabled_at(&scratch), "marker present is ON");
+    fs::remove_file(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    fs::create_dir(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    assert!(
+        !resumed_prefix_enabled_at(&scratch),
+        "a directory is not the marker"
+    );
+    assert!(
+        !resumed_prefix_enabled(),
+        "fixtures never consult the host marker"
+    );
+    let on = ResumedPrefixForTest::set(true);
+    assert!(resumed_prefix_enabled());
+    drop(on);
+    assert!(!resumed_prefix_enabled());
 }
 
 #[test]
@@ -851,7 +881,11 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
         .into_iter()
         .map(|path| serde_json::from_value(json!({"scan_root": "/", "path": path})).unwrap())
         .collect::<Vec<ScanTraversalPath>>();
-    defer_roots_of_queued_families(&mut selected, &mut traversal);
+    let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+    assert_eq!(
+        deferred,
+        BTreeSet::from([location_key(&local_index_key(&waiting))])
+    );
     fn paths<'a>(candidates: impl IntoIterator<Item = &'a ScanTraversalPath>) -> Vec<PathBuf> {
         candidates
             .into_iter()
@@ -868,7 +902,7 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     // Once the walk lists the directory nothing is deferred.
     traversal.pending_directories.clear();
     let mut again = vec![traversal.pending_candidates.pop_front().unwrap()];
-    defer_roots_of_queued_families(&mut again, &mut traversal);
+    assert!(defer_roots_of_queued_families(&mut again, &mut traversal).is_empty());
     assert_eq!(paths(&again), vec![waiting]);
 }
 
@@ -927,20 +961,45 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     };
     // Held (absent twin, uncertified, ...): both paths stay, untouched, and
     // the session is returned so the caller holds it (owed, not settled).
-    // Gate on publishes, so it parses gate on too: dark keeps no grains.
     let mut items = page();
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
-    let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
+    let mut reasons = BTreeMap::new();
+    let withheld = finish_page(
+        &mut items,
+        &index,
+        TelemetryRead::Loaded,
+        &mut reasons,
+        &Default::default(),
+    );
+    assert_eq!(reasons, BTreeMap::from([("request_owned_held", 1)]));
     assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
     assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
     assert_eq!(canonical(&items), before);
     assert!(items
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
+    // Repeated always-on preparation still holds the exact same bytes.
+    assert_eq!(
+        finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut Default::default(),
+            &Default::default(),
+        ),
+        BTreeSet::from([ROOT.to_owned()])
+    );
+    assert_eq!(canonical(&items), before);
     // Not held: one summed body, nothing withheld.
     let mut items = page();
-    let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
+    let withheld = finish_page(
+        &mut items,
+        &index,
+        TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
@@ -1373,7 +1432,13 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         // always has. Gate on adds the identity owner's root-account
         // inheritance and account-keyed grains: reported by F3_PERF below.
         let finish_start = Instant::now();
-        let withheld = finish_page(&mut page, &index, TelemetryRead::Loaded);
+        let withheld = finish_page(
+            &mut page,
+            &index,
+            TelemetryRead::Loaded,
+            &mut Default::default(),
+            &Default::default(),
+        );
         assert!(withheld.is_empty());
         let pipeline_time = enrichment_time + finish_start.elapsed();
         assert!(
@@ -1770,7 +1835,7 @@ fn tag_owned_with_fallbacks(
     index: &ScanIndex,
     expected_fallbacks: usize,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
@@ -1794,7 +1859,13 @@ fn tag_owned_with_fallbacks(
         &ownership,
         &per_file_originals,
     );
-    let withheld = finish_page(&mut items, index, TelemetryRead::Loaded);
+    let withheld = finish_page(
+        &mut items,
+        index,
+        TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
     assert!(
         withheld.is_empty(),
         "identity doubt must never withhold money"
@@ -2306,6 +2377,75 @@ fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
     };
 }
 
+/// One ORG_A request plus one telemetry-only side call; returns the item and
+/// the (org, basis) of the side call's row.
+fn side_call_page(side: ClaudeLocalOtelEvidence) -> (SnapshotItem, Option<(String, String)>) {
+    let path = root_file("identity-side-own");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &path,
+        Some(t0()),
+        &index,
+        &[org_marker(ORG_A), line("a", &at(1), 10)],
+    )];
+    let read = sidecar(&[identity_api_row("a", 1, 10, ORG_A), side]);
+    attach_page(&mut items, &read);
+    side_calls_page(
+        &mut items,
+        &api_report(&read),
+        &ClaudeTraceOwnershipLoadReport::default(),
+        &index,
+    );
+    let item = tag_owned(items, &index).remove(0);
+    let side = item
+        .model_usage
+        .iter()
+        .find(|row| {
+            row.selector_context
+                .get("request_usage_origin")
+                .map(String::as_str)
+                == Some("telemetry_reported")
+        })
+        .unwrap()
+        .evidence_ref
+        .map(|at| &item.request_evidence[usize::from(at)])
+        .map(|evidence| {
+            (
+                evidence.provider_workspace_hash.clone().unwrap_or_default(),
+                evidence.identity_basis.clone(),
+            )
+        });
+    assert_evidence_referenced(&item);
+    cleanup(&[&path]);
+    (item, side)
+}
+
+/// [money] [regress] MA1 B3: a telemetry-only side call (Desktop
+/// `prompt_suggestion`/`compact`) with its own complete account was added
+/// under the session fallback instead (2,817 requests per cycle uploaded
+/// account-less). It now carries its own account; totals are unchanged.
+#[test]
+fn e2_side_call_with_own_complete_account_keeps_it_and_money() {
+    let (own, side) = side_call_page(identity_api_row("side", 2, 40, ORG_B));
+    assert_eq!(side, Some((org_hash(ORG_B), "telemetry".to_owned())));
+    let (login_only, _) = side_call_page(row("side", 2, 40));
+    for item in [&own, &login_only] {
+        assert_eq!((item.request_count, item.input_tokens), (2, 50));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0002")
+        );
+    }
+}
+
+/// [behaviour] A side call whose own account is incomplete (login, no org)
+/// keeps the session fallback: the target's starting account.
+#[test]
+fn e2_side_call_with_incomplete_account_falls_back_to_the_session() {
+    let (_, side) = side_call_page(row("side", 2, 40));
+    assert_eq!(side.map(|(org, _)| org), Some(org_hash(ORG_A)));
+}
+
 #[test]
 fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
     let _resumed_prefix =
@@ -2779,7 +2919,14 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
             }));
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
-            assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+            assert!(finish_page(
+                &mut items,
+                &index,
+                TelemetryRead::Loaded,
+                &mut Default::default(),
+                &Default::default(),
+            )
+            .is_empty());
             assert!(rows_of(&items[0])
                 .any(|row| !crate::snapshots::claude_request_accounts::local_subscription(row)));
             let api = ClaudeLocalOtelLoadReport::default();
@@ -3200,7 +3347,14 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
         let activity = claude_request_identity::stage_request_owned_activity(
             &items, &evidence, &ownership, &originals,
         );
-        assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+        assert!(finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut Default::default(),
+            &Default::default(),
+        )
+        .is_empty());
         let before = serde_json::to_vec(&items).unwrap();
         let outcome = claude_request_identity::apply_scan_with_ownership(
             &mut items,
@@ -3232,7 +3386,14 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
             &index,
             &[org_marker(ORG_A), line("one", &at(1), 10)],
         )];
-        assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+        assert!(finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut Default::default(),
+            &Default::default(),
+        )
+        .is_empty());
         items[0].source_started_at = Some("2026-08-02T10:00:00+03:00".into());
         items[0].source_last_activity_at = Some("2026-08-02T10:00:01+03:00".into());
         items[0].source_ended_at = Some("2026-08-02T10:00:01+03:00".into());
@@ -4083,6 +4244,8 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
     }
 }
 
+/// [behaviour] Absent twins disclose page coverage and exact selection deferrals;
+/// complete twins retain their existing positive-body release.
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
     let _resumed_prefix =
@@ -4109,14 +4272,98 @@ fn e2_absent_subagent_twin_holds_its_session() {
         assert_eq!(session, format!("{ROOT}_agent-abc"));
         // The earlier path is indexed and on disk but not on this page.
         let mut items = vec![page(&index)];
-        let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
+        let mut reasons = BTreeMap::new();
+        let withheld = finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &Default::default(),
+        );
         assert_eq!(withheld, BTreeSet::from([session]));
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                ("absent_twin", 1),
+                ("known_twin_paths", 2),
+                ("staged_twin_paths", 1),
+                ("queued_family_deferred_families", 0),
+            ])
+        );
+        reasons.clear();
         // Both paths on the page: one body, nothing withheld.
         let mut items = vec![first, page(&index)];
-        let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
+        let withheld = finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &Default::default(),
+        );
         assert!(withheld.is_empty());
+        assert!(reasons.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].request_count, 2);
+
+        // Two deferred root twins and two held members of ONE family:
+        // count the family once and count all four known native paths.
+        let root_early = root_file("absent-root-early");
+        let root_later = root_file("absent-root-later");
+        let root_first =
+            parse_and_remember(&root_early, t0(), &mut index, &[line("root-a", &at(1), 30)]);
+        let root_second =
+            parse_and_remember(&root_later, t0(), &mut index, &[line("root-b", &at(2), 40)]);
+        let mut traversal = queued_traversal(
+            &[root_early.parent().unwrap().join(ROOT).join("subagents")],
+            &[],
+        )
+        .traversal
+        .unwrap();
+        let mut selected = [&root_early, &root_later]
+            .into_iter()
+            .map(|path| serde_json::from_value(json!({"scan_root":"/", "path":path})).unwrap())
+            .collect();
+        let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+        assert_eq!(deferred.len(), 2);
+        assert!(selected.is_empty());
+        reasons.clear();
+        let mut items = vec![root_second.clone(), page(&index)];
+        let withheld = finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &deferred,
+        );
+        assert_eq!(withheld.len(), 2);
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                ("absent_twin", 2),
+                ("known_twin_paths", 4),
+                ("staged_twin_paths", 2),
+                ("queued_family_deferred_families", 1),
+            ])
+        );
+        assert_eq!(items.iter().map(|i| i.request_count).sum::<u64>(), 2);
+        reasons.clear();
+        let mut items = vec![
+            root_first,
+            root_second,
+            parse(&early, Some(t0()), &index, &[sub_line("a", 1, 10)]),
+            page(&index),
+        ];
+        assert!(finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &Default::default()
+        )
+        .is_empty());
+        assert!(reasons.is_empty());
+        assert_eq!(items.iter().map(|i| i.request_count).sum::<u64>(), 4);
+        cleanup(&[&root_early, &root_later]);
         remove_agent_scratch(&[&early, &later]);
     }
 }
@@ -4338,4 +4585,160 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
             cleanup(&[&path_a, &path_b]);
         }
     };
+}
+
+/// [regress] retained growth identity failure cannot suppress another sessions request.
+#[test]
+fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
+    use crate::snapshots::claude_request_census::{
+        invalidate_claude_request_census, retain_held, ClaudeRequestBirth,
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use std::os::unix::fs::MetadataExt;
+    {
+        for held in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::canonical("growth-identity-copy");
+            let root = scratch.join("sources");
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join(format!("{ROOT}.jsonl"));
+            fs::write(&path, b"{\"requestId\":\"old\"}\n").unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            let modified = crate::snapshots::unix_seconds(metadata.modified().unwrap()).unwrap();
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            let fingerprint = "a".repeat(64);
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(json!({
+                    "size_bytes":metadata.len(), "modified_unix_seconds":modified,
+                    "source_file_fingerprint":fingerprint,
+                    "scan_identity_version":crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+                }))
+                .unwrap(),
+            );
+            index.claude_request_census.insert_for_test(
+                &key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    modified,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![claude_request_hash("old")],
+                )
+                .with_modified_for_test(Some(modified))
+                .with_birth_for_test(Some(ClaudeRequestBirth {
+                    unix_seconds: modified,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                })),
+            );
+            index
+                .claude_money_birth_store
+                .record_observation(ROOT, &key, t0());
+            index.v2_mut().growth_retention.insert(
+                key.clone(),
+                serde_json::from_value(json!({
+                    "predecessor_size":1,
+                }))
+                .unwrap(),
+            );
+            let parent = scratch.join("snapshots/destinations").join("a".repeat(64));
+            fs::create_dir_all(&parent).unwrap();
+            let index_path = parent.join("claude_code-identity-scan-index.json");
+            let progress = br#"{"generation":0}"#;
+            crate::snapshot_sync::with_state_v2_progress_lock(&index_path, |p| {
+                ottto_core::write_owner_only_file_atomic(p, progress).map_err(Into::into)
+            })
+            .unwrap();
+            let mut index =
+                crate::snapshots::publish_state_v2_for_test(&index, &index_path, progress);
+            assert!(crate::snapshots::sampled_audit::growth_retirement_excluded(
+                &index, &key
+            ));
+            let debt = index.v2().growth_retention.clone();
+            let replacement = root.join("replacement");
+            fs::write(&replacement, b"{\"requestId\":\"new\"}\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                .unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            let replaced = fs::metadata(&path).unwrap();
+            assert_eq!(replaced.len(), metadata.len());
+            assert_eq!(
+                crate::snapshots::unix_seconds(replaced.modified().unwrap()),
+                Some(modified)
+            );
+            assert_ne!(replaced.ino(), metadata.ino());
+            let stale = index.claude_request_census.get(&key).unwrap();
+            assert_eq!(
+                scan_evidence(&index, &key, stale),
+                Evidence::Current,
+                "same-length/same-second replacement reproduces the false proof premise"
+            );
+            assert!(stale.clone().with_unverified_for_test(true).proves_scan());
+            let other = "b0000000-0000-4000-8000-00000000000b";
+            let copy_path = root.join(format!("{other}.jsonl"));
+            fs::write(&copy_path, b"synthetic copy\n").unwrap();
+            let mut response = line("old", &at(1), 10);
+            response["sessionId"] = json!(other);
+            let parse_copy = |index: &ScanIndex| {
+                parse(
+                    &copy_path,
+                    Some(t0() + 60_000_000_000),
+                    index,
+                    std::slice::from_ref(&response),
+                )
+            };
+            assert_eq!(
+                fold(&parse_copy(&index)).entity.removed_requests,
+                1,
+                "stale census would suppress this other session"
+            );
+            if held {
+                let candidate = crate::snapshots::CandidateFile {
+                    physical_identity: Some([replaced.dev(), replaced.ino()]),
+                    scan_root: root.clone(),
+                    path: path.clone(),
+                    size_bytes: replaced.len(),
+                    modified_unix_seconds: modified,
+                    modified_unix_nanos: 0,
+                    source_file_fingerprint: fingerprint.clone(),
+                    legacy_source_file_fingerprint: String::new(),
+                    legacy_config_reconciliation_required: false,
+                    opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
+                    withheld_content_stamp: None,
+                };
+                assert!(!retain_held(&mut index, &candidate));
+            } else {
+                // Same invalidation used by the native reader on failed
+                // scope/object revalidation; the old file entry stays put.
+                invalidate_claude_request_census(&mut index, &path);
+            }
+            assert_eq!(
+                index.v2().growth_retention,
+                debt,
+                "scheduling obligation survives"
+            );
+            assert!(index.claude_request_census.get(&key).is_none());
+            let stub = index
+                .claude_request_census
+                .storage_records()
+                .get(&key)
+                .unwrap();
+            assert!(!stub.proves_scan());
+            assert_eq!(scan_evidence(&index, &key, stub), Evidence::None);
+            let copy = parse_copy(&index);
+            assert!(!fold(&copy).entity.held);
+            assert_eq!(
+                fold(&copy).entity.removed_requests,
+                0,
+                "decide_holders cannot use stale ids"
+            );
+            assert_eq!(fold(&copy).entity.totals().1, 1);
+        }
+    }
 }

@@ -11,7 +11,7 @@ fn supported(name: &str) -> bool {
     true
 }
 
-fn corpus(name: &str) -> Corpus {
+pub(super) fn corpus(name: &str) -> Corpus {
     // A shared absolute root gives base and candidate identical input paths.
     // No PID, wall clock or random IDs; raw within-build bodies stay exact.
     let base = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
@@ -39,7 +39,7 @@ fn corpus(name: &str) -> Corpus {
 }
 
 // Pin physical input clocks rather than deleting volatile fields from uploads.
-fn input_clock(path: &Path) {
+pub(super) fn input_clock(path: &Path) {
     std::fs::File::options()
         .write(true)
         .open(path)
@@ -86,7 +86,7 @@ fn save_inputs(c: &Corpus) {
 
 // Retain the actual emitted items: SnapshotItem intentionally has no wire
 // deserializer, and production hashes must be recomputed from production types.
-struct ReceiptBody {
+pub(super) struct ReceiptBody {
     raw: Vec<u8>,
     source: SnapshotSource,
     items: Vec<SnapshotItem>,
@@ -167,6 +167,20 @@ fn assert_cross_build_scope(raw: &Value, cross: &Value) {
 }
 
 fn receipt(name: &str, bodies: &[ReceiptBody]) {
+    receipt_with_output(
+        name,
+        bodies,
+        "OTTTO_MONEY_EQUIVALENCE_OUTPUT",
+        "MONEY_EQUIVALENCE",
+    );
+}
+
+pub(super) fn receipt_with_output(
+    name: &str,
+    bodies: &[ReceiptBody],
+    output_env: &str,
+    marker: &str,
+) {
     assert!(!bodies.is_empty(), "zero emitted bodies is no proof");
     let bytes = serde_json::to_vec(&bodies.iter().map(|b| &b.raw).collect::<Vec<_>>()).unwrap();
     let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -178,7 +192,7 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
     )
     .unwrap();
     let cross_digest = format!("{:x}", Sha256::digest(&cross));
-    if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
+    if let Some(out) = std::env::var_os(output_env) {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join(format!("{name}.json")), &bytes).unwrap();
@@ -191,7 +205,7 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
         .unwrap();
     }
     println!(
-        "MONEY_EQUIVALENCE {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={cross_digest}",
+        "{marker} {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={cross_digest}",
         bytes.len()
     );
 }
@@ -346,7 +360,7 @@ fn claude_pages(
     [tail, full, disk]
 }
 
-fn finish_claude_pages(c: &Corpus, pages: &mut [Page; 3]) {
+pub(super) fn finish_claude_pages(c: &Corpus, pages: &mut [Page; 3]) {
     for page in pages {
         page.enrich(c); // attach, side calls, identity reconcile and emission
         page.finish(); // policy/body witnesses/holds, as in the real pipeline
@@ -358,7 +372,7 @@ fn compare_claude_pages(c: &Corpus, mut pages: [Page; 3]) -> ReceiptBody {
     compare_claude_uploads(&pages)
 }
 
-fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
+pub(super) fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
     let [tail, full, disk] = pages;
     let (a, wire_a, _) = upload(&tail.scan.snapshots, &mut e2_progress(), ack);
     let (b, wire_b, _) = upload(&full.scan.snapshots, &mut e2_progress(), ack);
@@ -832,7 +846,7 @@ fn disk_corpus(name: &str) -> (Corpus, Disk, PathBuf, E2ScanFixture, ScanIndex) 
     (c, disk, path, scanner, prior)
 }
 
-fn grow(path: &Path, request: &str, tokens: u64) {
+pub(super) fn grow(path: &Path, request: &str, tokens: u64) {
     append(path, &line(ROOT, request, AT, tokens));
     input_clock(path);
 }
@@ -1016,3 +1030,68 @@ pending!(
     pi,
     "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
 );
+
+/// Invoked by the existing challenge fixture: exercise the same emitted-body
+/// oracle with real account evidence, without adding a second test/receipt name.
+pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
+    assert!(crate::heap_layout_bound::layout_supported(), "placement oracle must execute");
+    with_e2(|| {
+        let mut c = corpus("head-conflict-account-placement");
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":org}}).to_string()+"\n";
+        let path = c.root(ROOT, &(marker(org_a) + &line(ROOT, "r1", AT, 10)));
+        input_clock(&path);
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let disk = Disk::new(&c);
+        let retained = E2ScanFixture::capturing_identity();
+        disk.begin(&retained, SnapshotSource::ClaudeCode);
+        let mut warm = c.raw(&retained, ScanIndex::default(), 100, true, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+        assert!(disk.records() > 0);
+        let switch = json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"session_context","context":{}}}).to_string()+"\n";
+        append(&path, &(switch + &marker(org_b) + &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)));
+        c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
+        input_clock(&path);
+        let restart = E2ScanFixture::capturing_identity();
+        disk.begin(&restart, SnapshotSource::ClaudeCode);
+        let cold = E2ScanFixture::capturing_identity();
+        let mut pages = [
+            c.raw(&retained, prior.clone(), 100, true, &[]),
+            c.raw(&cold, prior.clone(), 100, true, &[]),
+            c.raw(&restart, prior, 100, true, &[]),
+        ];
+        assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
+        assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
+        assert_eq!(pages[2].modes, (0, 1, 0), "restored Tail");
+        assert_eq!(durable_restores(&restart.cache, SnapshotSource::ClaudeCode).1, 1);
+        finish_claude_pages(&c, &mut pages);
+        let receipt = compare_claude_uploads(&pages);
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let item = receipt.items.iter().find(|item| item.source_session_id == ROOT).unwrap();
+        assert_eq!((item.request_count, item.input_tokens), (2, 30));
+        assert_eq!(item.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.0003"));
+        let mut placement = Vec::new();
+        for row in &item.model_usage {
+            let row = serde_json::to_value(row).unwrap();
+            let parts = row.get("identity_parts").and_then(Value::as_array);
+            let parts = parts.map_or(std::slice::from_ref(&row), Vec::as_slice);
+            for part in parts {
+                let evidence = &item.request_evidence[part["evidence_ref"].as_u64().unwrap() as usize];
+                placement.push((evidence.provider_workspace_hash.clone().unwrap(),
+                    part["request_count"].as_u64().unwrap(), part["input_tokens"].as_u64().unwrap(),
+                    part["cost_usd"].as_str().unwrap().to_string()));
+            }
+        }
+        placement.sort();
+        let mut expected = vec![(a, 1, 10, "0.0001".to_string()), (b, 1, 20, "0.0002".to_string())];
+        expected.sort();
+        assert_eq!(placement, expected, "non-vacuous totals AND account placement across all three arms");
+        println!("HEAD_CONFLICT_MONEY_ORACLE VERIFIED arms=cold_full,ram_tail,restored_tail accounts=2 requests=2 input_tokens=30 cost_usd=0.0003");
+    });
+}

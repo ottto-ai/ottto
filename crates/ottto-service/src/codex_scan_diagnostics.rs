@@ -671,6 +671,7 @@ pub(crate) enum LoaderReason {
     SqliteOpenOrQuery,
     SqliteRowDecode,
     IncompleteShape,
+    LinkedDatabase,
     OtherFailure,
 }
 
@@ -709,23 +710,32 @@ pub(crate) struct LoaderEvidence {
     /// the roots that completed only after one.
     pub transient_retries: u32,
     pub completed_after_retry: u32,
+    /// Opens of an idle database (no `-wal` or `-journal`) read as a snapshot of
+    /// its main file.
+    pub snapshot_fallbacks: u32,
+}
+/// One root's database open counts before its census result.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SidecarOpenCounts {
+    pub retries: u32,
+    pub snapshots: u32,
 }
 impl LoaderEvidence {
-    /// `retries`: the root's transient open retries before `result`.
     pub fn observe_root(
         &mut self,
         result: &Result<()>,
-        retries: u32,
+        open: SidecarOpenCounts,
         conflict: bool,
         root_key: &str,
     ) {
         if self.failed_roots == 0 && result.is_err() {
             self.first_failure_root_digest = Some(digest(root_key));
         }
-        self.transient_retries = self.transient_retries.saturating_add(retries);
-        if retries > 0 && result.is_ok() {
+        self.transient_retries = self.transient_retries.saturating_add(open.retries);
+        if open.retries > 0 && result.is_ok() {
             self.completed_after_retry = self.completed_after_retry.saturating_add(1);
         }
+        self.snapshot_fallbacks = self.snapshot_fallbacks.saturating_add(open.snapshots);
         self.observe(result, conflict);
     }
 
@@ -754,6 +764,8 @@ impl LoaderEvidence {
             }
         } else if error.downcast_ref::<IncompleteShape>().is_some() {
             LoaderReason::IncompleteShape
+        } else if error.downcast_ref::<LinkedDatabase>().is_some() {
+            LoaderReason::LinkedDatabase
         } else {
             LoaderReason::OtherFailure
         };
@@ -844,6 +856,16 @@ impl std::fmt::Display for IncompleteShape {
 }
 impl std::error::Error for IncompleteShape {}
 
+/// A Codex database with another hard link: refused, not retried.
+#[derive(Debug)]
+pub(crate) struct LinkedDatabase;
+impl std::fmt::Display for LinkedDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Codex database has another hard link")
+    }
+}
+impl std::error::Error for LinkedDatabase {}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CensusGates {
     pub discovery_done: bool,
@@ -922,6 +944,10 @@ impl RecoveryLineage {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CodexScanDiagnostics {
+    /// Current indexed files with known activity entirely before the trace window
+    /// and no applied-tier receipt. Exposure only, never a mispricing count.
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    pub price_tier_old_files_without_receipt: u64,
     pub version: u8,
     pub generation: u64,
     pub state_titles: LoaderEvidence,
@@ -1014,16 +1040,16 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
-crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry);
+crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
 crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
 crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::unit_enum!(false;
     LoaderReason: Complete | Io | SqliteBusy | SqliteOpenOrQuery | SqliteRowDecode
-        | IncompleteShape | OtherFailure;
+        | IncompleteShape | LinkedDatabase | OtherFailure;
     LoaderStage: Open | Prepare | Query | Row;
     FileReason: NotParsedThisCycle | Complete | ParentPending | OwnershipIncomplete
         | RecognizedUsageDropped | ReadOrLineLoss;
@@ -1043,14 +1069,24 @@ mod tests {
             .context("private provider path"))
         };
         let mut evidence = LoaderEvidence::default();
-        evidence.observe_root(&Ok(()), 0, false, "successful root");
+        evidence.observe_root(
+            &Ok(()),
+            SidecarOpenCounts::default(),
+            false,
+            "successful root",
+        );
         evidence.observe_root(
             &fault(26, LoaderStage::Prepare),
-            0,
+            SidecarOpenCounts::default(),
             false,
             "failed root one",
         );
-        evidence.observe_root(&fault(10, LoaderStage::Row), 0, false, "failed root two");
+        evidence.observe_root(
+            &fault(10, LoaderStage::Row),
+            SidecarOpenCounts::default(),
+            false,
+            "failed root two",
+        );
         assert_eq!(evidence.completed_roots, 1);
         assert_eq!(evidence.failed_roots, 2);
         assert_eq!(
@@ -1212,9 +1248,11 @@ mod tests {
             sqlite_extended_code: Some(i32::MAX),
             transient_retries: u32::MAX,
             completed_after_retry: u32::MAX,
+            snapshot_fallbacks: u32::MAX,
             ..Default::default()
         };
         // PR-P: the two parent fields at their maxima.
+        diagnostics.price_tier_old_files_without_receipt = u64::MAX;
         diagnostics.parent_unresolvable = ParentUnresolvableCauses::saturated();
         diagnostics.parent_restarts_in_scope = Some(u64::MAX);
         diagnostics.state_titles = evidence;

@@ -618,6 +618,7 @@ fn quarantine_invalid_scan_index(
     // Only the source-aware daemon load (which names its support directory)
     // can spend an armed user Repair; the unattributed load (audit, retry
     // driver) always refuses.
+    state_v2::guard_containment_locked(path)?;
     let recent = scan_index_rebuilt_recently(path, now)?;
     let armed = source
         .zip(support_dir)
@@ -903,10 +904,6 @@ impl ScanIndex {
             "local snapshot scan index load: scan_index_rebuild_carried_ack_debt_entries={entries} scan_index_rebuild_carried_ack_debt_bytes={bytes}"
         ));
         self.historical_replay_generation = carry.historical_replay_generation;
-        self.context_curve_capability_enabled = carry.context_curve_capability_enabled;
-        self.context_curve_replay_epoch = carry.context_curve_replay_epoch;
-        self.completed_context_curve_replay_generation =
-            carry.completed_context_curve_replay_generation;
         Ok(())
     }
 

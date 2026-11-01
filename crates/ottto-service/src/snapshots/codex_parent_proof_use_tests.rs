@@ -220,7 +220,6 @@ fn parse_forged(
         None,
         Some(Arc::new(Mutex::new(ledgers))),
         true,
-        true,
     )
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
@@ -484,6 +483,9 @@ impl Scene {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
+                context_inputs: None,
+                listing_started_unix_seconds: None,
+                listing_owed_requeued_unix_seconds: Default::default(),
             }),
             ..ScanIndex::default()
         };
@@ -553,7 +555,6 @@ impl Scene {
             None,
             None,
             None,
-            true,
             true,
         )
         .unwrap();
@@ -1065,6 +1066,7 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
         assert_eq!(used.codex_parent_proof_refusal, None);
     }
     // Undecided under the ledger too: main holds these children.
+    CapCounts::default().drain("codex");
     for path in [&parent_exhausted.0, &child_exhausted.0, &overflow.0] {
         assert!(
             !parse(path, complete_ledger(), None).complete(),
@@ -1072,6 +1074,10 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
             path.display()
         );
     }
+    // [behaviour] The ordinary overflow is visible through the shared source carrier.
+    let mut caps = CapCounts::default();
+    caps.drain("codex");
+    assert_eq!(caps.boundary_overflow_events, 1);
     let _ = fs::remove_dir_all(root);
 }
 

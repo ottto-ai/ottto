@@ -1112,9 +1112,9 @@ pub(crate) mod test_support {
                     "while IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> {}\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) {initialize_pause} /bin/cat {} ;;\n*'\"method\":\"tools/list\"'*) /bin/cat {}; exit {exit} ;;\nesac\ndone\n",
                     quote(&root.join("requests")), quote(&root.join("initialize")), quote(&root.join("output")),
                 ),
-                // Async commands otherwise get /dev/null as stdin: if the shell
-                // exits before initialize is written, MCP sees a broken pipe.
-                // Save stdin before launching so the descendant holds both pipes.
+                // POSIX gives an async list /dev/null as stdin before explicit
+                // redirections, so `<&0` alone still reads /dev/null under dash.
+                // Save the probe's stdin on fd 3 first so the descendant holds both pipes.
                 "hold-exit" => format!("exec 3<&0\n/bin/sleep 4 <&3 3<&- &\necho $! > {}\nexit 0\n", quote(&root.join("descendant"))),
                 "protected" => format!(": > {}\nexec /bin/sleep 4\n", quote(&root.join(super::REFRESH_LOCK_FILE))),
                 "escaped" => format!(

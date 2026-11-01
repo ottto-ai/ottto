@@ -522,7 +522,7 @@ fn recovery_emission_boundaries(
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
-    e2::decide_page_copies(&mut items, index);
+    e2::decide_page_copies(&mut items, index, None);
     e2::attach_page(&mut items, evidence);
     let unresolved = e2::side_calls_page(
         &mut items,
@@ -533,7 +533,13 @@ fn recovery_emission_boundaries(
         &Default::default(),
         index,
     );
-    let held = e2::finish_page(&mut items, index, e2::TelemetryRead::Loaded);
+    let held = e2::finish_page(
+        &mut items,
+        index,
+        e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
     if index.persistence_available() {
         assert_eq!(items.len(), 1, "positive E2 body before finalization");
         assert!(matches!(
@@ -769,6 +775,42 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert!(reads.is_empty());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
+}
+
+/// [off=main] off large v1 manifest load cas and containment match compact v1.
+#[test]
+fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
+    let compact = Fixture::new();
+    let large = Fixture::new();
+    assert_eq!(large.manifest["storage_format"], json!(1));
+    let mut bytes = fs::read(&large.root).unwrap();
+    bytes.extend_from_slice(&vec![b' '; 8192]);
+    assert!(bytes.len() > 4096);
+    assert!(bytes.len() < scan_index_persistence::MAX_ROOT_BYTES);
+    fs::write(&large.root, &bytes).unwrap();
+    // No sentinel or environment opt-in: exercise the real source-aware OFF
+    // route, v1 CAS writer, and the shared containment admission guard.
+    let mut expected = compact.load();
+    let mut actual = large.load();
+    assert!(actual.v2().persistence_v2.is_none());
+    assert!(actual.persistence_available());
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(fs::read(&large.root).unwrap(), bytes);
+    {
+        let _lock = CheckpointLock::acquire(&large.root).unwrap();
+        state_v2::guard_containment_locked(&large.root).unwrap();
+    }
+    expected.save(&compact.root).unwrap();
+    actual.save(&large.root).unwrap();
+    assert_eq!(
+        fs::read(&large.root).unwrap(),
+        fs::read(&compact.root).unwrap()
+    );
+    assert!(large.load().persistence_available());
+    assert!(!large.root.with_extension("json.v2.sqlite").exists());
 }
 
 // Snapshot every file in this bounded synthetic index, including storage

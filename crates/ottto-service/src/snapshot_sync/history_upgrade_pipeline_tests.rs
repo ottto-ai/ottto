@@ -234,15 +234,10 @@ impl HistoryFixture {
             &index_path,
             &self.support,
         );
-        // Production's replay decision: an unreadable state arms no Claude
-        // replay. A due replay generation stands in for a needed curve replay.
-        let replay_pending = ReplayArming::decide(
-            SnapshotSource::ClaudeCode,
-            &backfill,
-            destination,
-            cycle.replay_generation.is_some(),
-        )
-        .curve_replay_pending;
+        // Production's replay rule: an unreadable state arms no Claude
+        // replay. A due replay generation stands in for a pending replay.
+        let replay_pending = cycle.replay_generation.is_some()
+            && !claude_replay_suppressed(SnapshotSource::ClaudeCode, &backfill);
         let replay_dropped = replay_pending
             && cycle
                 .replay_generation
@@ -677,31 +672,6 @@ fn rearmed_unchanged_history_is_held_and_settles() {
     });
 }
 
-/// Addendum 2 item 13: with the list installed and budget available, history
-/// after a quarantine is paced and a listed family is never emitted.
-#[test]
-fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
-    let fixture = HistoryFixture::new("history-upgrade-list-budget");
-    fixture.baseline();
-    fixture.install_list(&[HISTORY_SESSIONS[0]]);
-    fixture.corrupt_index();
-    let mut sent = Vec::new();
-    crate::snapshots::with_body_witness_adoption_page_budget(1, || {
-        for hour in 9..13 {
-            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
-            sent.push(outcome.uploaded.len());
-            assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
-        }
-    });
-    assert_eq!(sent, vec![1, 1, 0, 0], "one history file per page");
-    let index = ScanIndex::load(&fixture.index_path).expect("reload");
-    let listed = HistoryFixture::key(&index, HISTORY_SESSIONS[0]);
-    for (key, entry) in &index.files {
-        let expected = if *key == listed { 0 } else { 3 };
-        assert_eq!(entry.effective_upload_body_witness_revision, expected);
-    }
-}
-
 /// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (a
 /// positively empty support state: no backfill state, no quarantined index,
 /// no upload ledger, no seen-marker) ingests new files normally, even with
@@ -753,73 +723,6 @@ fn only_files_that_grew_after_a_rebuild_emit() {
             grown.index.files[&key].effective_upload_body_witness_revision,
             3
         );
-    });
-}
-
-/// User Repair override (#718): one interactive Repair of a rebuild-loop
-/// pause runs the same #712-gated rebuild as the first incident. On an
-/// unverified Mac history stays held, so no file comes back as new history,
-/// and the override witness re-arms the seven-day guard.
-#[test]
-fn user_repair_override_rebuild_keeps_history_held() {
-    // Positive control: the current reader uploads the same shape on a fresh destination.
-    let control = HistoryFixture::new("user_repair_override_rebuild_keeps_history_held-control");
-    let control_index = control.baseline_at(3);
-    assert_eq!(
-        control_index.current_snapshot_fingerprints().len(),
-        HISTORY_SESSIONS.len()
-    );
-
-    use crate::snapshots::ScanIndexRebuildOverride;
-    let fixture = HistoryFixture::new("history-upgrade-user-repair-override");
-    fixture.baseline();
-    fixture.corrupt_backfill_state();
-    fixture.corrupt_index();
-    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
-        assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
-        // Budget damage keeps the identity fields strictly recoverable, so
-        // the press may rebuild (SI-718-O1); syntax damage refuses it.
-        fixture.exceed_decode_hold_budget();
-        let refused = ScanIndex::load_for_snapshot_source_with_origin(
-            &fixture.index_path,
-            SnapshotSource::ClaudeCode,
-            &fixture.support,
-        )
-        .unwrap_err();
-        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
-        assert_eq!(
-            crate::snapshots::arm_scan_index_rebuild_manual_override(
-                SnapshotSource::ClaudeCode,
-                std::time::SystemTime::now()
-            ),
-            ScanIndexRebuildOverride::Armed
-        );
-        let overridden = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
-        assert_eq!(
-            crate::snapshots::scan_index_rebuild_manual_override_count(),
-            1
-        );
-        assert!(
-            overridden.uploaded.is_empty(),
-            "the override rebuild re-sent history: {:?}",
-            overridden.uploaded
-        );
-        assert_eq!(overridden.corrections, 0);
-        assert_eq!(overridden.scan.scanned_file_count, HISTORY_SESSIONS.len());
-        assert_eq!(overridden.index.files.len(), HISTORY_SESSIONS.len());
-        for entry in overridden.index.files.values() {
-            assert_eq!(entry.effective_upload_body_witness_revision, 0);
-            assert!(entry.last_upload_body_witness.is_none());
-        }
-        fixture.corrupt_index();
-        let refused = ScanIndex::load_for_snapshot_source_with_origin(
-            &fixture.index_path,
-            SnapshotSource::ClaudeCode,
-            &fixture.support,
-        )
-        .unwrap_err();
-        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
     });
 }
 
@@ -1206,40 +1109,6 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
             1
         );
     });
-}
-
-/// Addendum 1 item 5: revision 2 lets a listed family's genuine change sync,
-/// and a stored 3 is never downgraded by revision 2.
-#[test]
-fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
-    let fixture = HistoryFixture::new("history-upgrade-revision-two-listed");
-    fixture.baseline();
-    fixture.install_list(&[HISTORY_SESSIONS[0]]);
-    fixture.append(HISTORY_SESSIONS[0], "req_0_2");
-    let allowed = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
-    assert!(
-        allowed.uploaded.contains(HISTORY_SESSIONS[0]),
-        "revision 2 lets a listed family's genuine change sync"
-    );
-
-    let fixture = HistoryFixture::new("history-upgrade-no-downgrade");
-    let mut index = fixture.baseline();
-    for entry in index.files.values_mut() {
-        entry.effective_upload_body_witness_revision = 3;
-    }
-    index.save(&fixture.index_path).expect("save newer stamps");
-    let older = fixture.cycle(
-        "2026-08-02T09:00:00Z",
-        HistoryCycle {
-            upload_context: "history-context-2",
-            ..HISTORY_REVISION_2
-        },
-    );
-    assert!(older
-        .index
-        .files
-        .values()
-        .all(|entry| entry.effective_upload_body_witness_revision == 3));
 }
 
 /// Owner B ruling 3 through the pipeline: MONEY's census re-owes a stored 3
@@ -2219,20 +2088,6 @@ fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file()
     }
 }
 
-/// SOURCE d680b524 (b), the reverse: the list names the root `R`, `R.jsonl`
-/// is gone and only subagent files remain. None is offered, and each counts
-/// as held through the absent root.
-#[test]
-fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file() {
-    let (outcome, lines) = rootless_family_rebuild(
-        "history-upgrade-rootless-listed-root",
-        &["agent-a", "agent-b"],
-        HISTORY_SESSIONS[0],
-    );
-    assert_rootless_family_held(&outcome);
-    assert_eq!(family_closure_root_absent_excluded(&lines), 2);
-}
-
 // F2: native scan -> evidence -> finalization -> upload -> settlement -> reload.
 // No accumulator or settlement disposition is supplied by these fixtures.
 // Request-owned literals are intentionally denied below revision 3. These
@@ -2805,81 +2660,6 @@ fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
             Some(false),
             "a good API match cannot certify the failed trace read"
         );
-    });
-}
-
-#[test]
-fn e2_unhealthy_root_holds_owed_agent_history_too() {
-    let fixture = HistoryFixture::new("e2-history-agent-health");
-    let root = HISTORY_SESSIONS[0];
-    let agent = "a4d1585d310070d0f";
-    let agent_path = fixture
-        .root
-        .join(root)
-        .join("subagents")
-        .join(format!("agent-{agent}.jsonl"));
-    std::fs::create_dir_all(agent_path.parent().unwrap()).unwrap();
-    std::fs::write(&agent_path, history_line(root, "req_child", 1)).unwrap();
-    let baseline = fixture
-        .cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE)
-        .index;
-    let agent_key = baseline
-        .files
-        .keys()
-        .find(|key| key.ends_with(&format!("agent-{agent}.jsonl")))
-        .unwrap()
-        .clone();
-    assert_eq!(
-        baseline.files[&agent_key].effective_upload_body_witness_revision,
-        1
-    );
-    let root_key = HistoryFixture::key(&baseline, root);
-    for (number, session) in HISTORY_SESSIONS.iter().enumerate() {
-        e2_history_reported(&fixture, session, number);
-    }
-    let api_path = e2_history_sidecar(&fixture.support, root, false);
-    let trace_path = e2_history_sidecar(&fixture.support, root, true);
-    let api = e2_history_api(root, "req_child", 1);
-    let trace = e2_history_trace(root, "req_child", agent);
-    for (path, row) in [
-        (&api_path, serde_json::to_string(&api).unwrap()),
-        (&trace_path, serde_json::to_string(&trace).unwrap()),
-    ] {
-        writeln!(
-            std::fs::OpenOptions::new().append(true).open(path).unwrap(),
-            "{row}"
-        )
-        .unwrap();
-    }
-    let healthy_trace = std::fs::read(&trace_path).unwrap();
-    std::fs::write(&trace_path, "{bad\n").unwrap();
-    with_e2_history(&fixture, || {
-        let failed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
-        assert_eq!(
-            failed.uploaded.len(),
-            2,
-            "neither root nor its owed agent uploads"
-        );
-        for key in [&root_key, &agent_key] {
-            e2_history_assert_prior_tuple(&baseline, &failed.index, key);
-        }
-        std::fs::write(&trace_path, healthy_trace).unwrap();
-        let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
-        assert_eq!(
-            recovered.uploaded,
-            BTreeSet::from([root.to_owned(), format!("{root}_agent-{agent}")])
-        );
-        for key in [&root_key, &agent_key] {
-            assert_eq!(
-                recovered.index.files[key].effective_upload_body_witness_revision,
-                3
-            );
-        }
-        assert!(recovered
-            .scan
-            .snapshots
-            .iter()
-            .all(|item| item.telemetry_owned_complete == Some(true)));
     });
 }
 

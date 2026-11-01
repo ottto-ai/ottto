@@ -1,7 +1,8 @@
-//! Pure, deterministic construction and validation for serialized context curves.
+//! Wire shape, validation and budget pruning for serialized context curves.
 //!
-//! Provider parsing, ownership decisions, checkpoints, and upload eligibility
-//! remain in the parent snapshot collector.
+//! The daemon no longer builds full uploaded curves (retired with the
+//! `session_context_curve:v1` negotiation). Retained bodies may still carry
+//! one, so the wire structs, validation and pruning stay.
 
 use super::timestamp_is_after;
 use serde::Serialize;
@@ -21,6 +22,9 @@ pub(super) const CONTEXT_CURVE_RETENTION_PEAK: u16 = 0x08;
 pub(super) const CONTEXT_CURVE_RETENTION_TAIL: u16 = 0x10;
 pub(super) const CONTEXT_CURVE_RETENTION_FILL: u16 = 0x20;
 
+// Retired: the two candidate types below are kept only as always-empty
+// durable-tail accumulator slots, so the pinned allowlist digest and the
+// records already on disk stay readable without a Full re-read.
 #[derive(Debug, Clone)]
 pub(super) struct ContextCurveCandidatePoint {
     pub(super) observed_at: Option<String>,
@@ -36,6 +40,7 @@ pub(super) struct ContextCurveCandidateBoundary {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurvePoint {
     pub owned_request_ordinal: u64,
     pub observed_at: String,
@@ -48,6 +53,7 @@ pub struct SnapshotContextCurvePoint {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurveBoundary {
     pub boundary_index: u64,
     pub observed_at: String,
@@ -58,6 +64,7 @@ pub struct SnapshotContextCurveBoundary {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurveModelWindow {
     pub model_window_index: u16,
     pub model: String,
@@ -67,6 +74,7 @@ pub struct SnapshotContextCurveModelWindow {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurve {
     pub contract_version: String,
     pub parser_revision: String,
@@ -125,300 +133,6 @@ fn context_curve_revision_is_safe(value: &str) -> bool {
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-._:".contains(character))
-}
-
-fn canonical_context_curve_timestamp(value: &str) -> Option<String> {
-    OffsetDateTime::parse(value, &Rfc3339)
-        .ok()?
-        .format(&Rfc3339)
-        .ok()
-}
-
-fn mark_context_curve_retention(
-    retention_flags: &mut BTreeMap<u64, u16>,
-    total_points: u64,
-    ordinal: u64,
-    flag: u16,
-) {
-    if ordinal > 0 && ordinal <= total_points {
-        *retention_flags.entry(ordinal).or_default() |= flag;
-    }
-}
-
-pub(super) fn build_context_curve(
-    parser_revision: &str,
-    ownership_revision: &str,
-    model_evidence_revision: &str,
-    candidates: &[ContextCurveCandidatePoint],
-    boundary_candidates: &[ContextCurveCandidateBoundary],
-    unavailable_coverage: &str,
-) -> SnapshotContextCurve {
-    let total_points = candidates.len() as u64;
-    let total_boundaries = boundary_candidates.len() as u64;
-    let unavailable = || {
-        unavailable_context_curve(
-            parser_revision,
-            ownership_revision,
-            unavailable_coverage,
-            total_points,
-            total_boundaries,
-        )
-    };
-    if candidates.is_empty()
-        || candidates.iter().any(|point| {
-            point.effective_input_tokens == 0
-                || point.observed_at.as_deref().map_or(true, |timestamp| {
-                    OffsetDateTime::parse(timestamp, &Rfc3339).is_err()
-                })
-        })
-        || boundary_candidates.iter().any(|boundary| {
-            boundary.point_count_before == 0
-                || boundary.point_count_before >= total_points
-                || boundary.observed_at.as_deref().map_or(true, |timestamp| {
-                    OffsetDateTime::parse(timestamp, &Rfc3339).is_err()
-                })
-                || boundary.observed_at.as_deref().is_some_and(|timestamp| {
-                    let before = candidates[boundary.point_count_before as usize - 1]
-                        .observed_at
-                        .as_deref()
-                        .expect("candidate timestamps validated together");
-                    let after = candidates[boundary.point_count_before as usize]
-                        .observed_at
-                        .as_deref()
-                        .expect("candidate timestamps validated together");
-                    timestamp_is_after(before, timestamp) || timestamp_is_after(timestamp, after)
-                })
-        })
-        || boundary_candidates.windows(2).any(|pair| {
-            pair[0].point_count_before >= pair[1].point_count_before
-                || pair[0]
-                    .observed_at
-                    .as_deref()
-                    .zip(pair[1].observed_at.as_deref())
-                    .is_some_and(|(left, right)| timestamp_is_after(left, right))
-        })
-        || candidates.windows(2).any(|pair| {
-            pair[0]
-                .observed_at
-                .as_deref()
-                .zip(pair[1].observed_at.as_deref())
-                .is_some_and(|(left, right)| timestamp_is_after(left, right))
-        })
-    {
-        return unavailable();
-    }
-
-    let retained_boundary_candidates = if boundary_candidates.len() > MAX_CONTEXT_CURVE_BOUNDARIES {
-        let edge_count = MAX_CONTEXT_CURVE_BOUNDARIES / 2;
-        boundary_candidates
-            .iter()
-            .enumerate()
-            .take(edge_count)
-            .chain(
-                boundary_candidates
-                    .iter()
-                    .enumerate()
-                    .skip(boundary_candidates.len() - edge_count),
-            )
-            .collect::<Vec<_>>()
-    } else {
-        boundary_candidates.iter().enumerate().collect::<Vec<_>>()
-    };
-
-    let mut retention_flags = BTreeMap::<u64, u16>::new();
-    for ordinal in [1_u64, 2, 5, 10, 20] {
-        mark_context_curve_retention(
-            &mut retention_flags,
-            total_points,
-            ordinal,
-            CONTEXT_CURVE_RETENTION_ANCHOR,
-        );
-    }
-    for (_, boundary) in &retained_boundary_candidates {
-        mark_context_curve_retention(
-            &mut retention_flags,
-            total_points,
-            boundary.point_count_before,
-            CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE,
-        );
-        mark_context_curve_retention(
-            &mut retention_flags,
-            total_points,
-            boundary.point_count_before + 1,
-            CONTEXT_CURVE_RETENTION_COMPACTION_AFTER,
-        );
-    }
-    let peak_ordinal = candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, point)| point.effective_input_tokens)
-        .map(|(index, _)| index as u64 + 1)
-        .unwrap_or(1);
-    mark_context_curve_retention(
-        &mut retention_flags,
-        total_points,
-        peak_ordinal,
-        CONTEXT_CURVE_RETENTION_PEAK,
-    );
-    for ordinal in total_points.saturating_sub(9)..=total_points {
-        mark_context_curve_retention(
-            &mut retention_flags,
-            total_points,
-            ordinal.max(1),
-            CONTEXT_CURVE_RETENTION_TAIL,
-        );
-    }
-
-    if retention_flags.len() > MAX_CONTEXT_CURVE_POINTS {
-        return unavailable();
-    }
-    let target = candidates.len().min(MAX_CONTEXT_CURVE_POINTS);
-    while retention_flags.len() < target {
-        let selected = retention_flags.keys().copied().collect::<Vec<_>>();
-        let mut best: Option<(u64, u64)> = None;
-        let mut left = 0_u64;
-        for right in selected
-            .iter()
-            .copied()
-            .chain(std::iter::once(total_points + 1))
-        {
-            if right > left + 1 {
-                let gap = right - left - 1;
-                let midpoint = left + (right - left) / 2;
-                match best {
-                    Some((best_gap, best_midpoint))
-                        if gap < best_gap || (gap == best_gap && midpoint >= best_midpoint) => {}
-                    _ => best = Some((gap, midpoint)),
-                }
-            }
-            left = right;
-        }
-        let Some((_, ordinal)) = best else { break };
-        mark_context_curve_retention(
-            &mut retention_flags,
-            total_points,
-            ordinal,
-            CONTEXT_CURVE_RETENTION_FILL,
-        );
-    }
-
-    let mut before_boundary_by_request = BTreeMap::new();
-    let mut after_boundary_by_request = BTreeMap::new();
-    let boundaries = retained_boundary_candidates
-        .iter()
-        .map(|(original_index, boundary)| {
-            let boundary_index = *original_index as u64 + 1;
-            before_boundary_by_request.insert(boundary.point_count_before + 1, boundary_index);
-            after_boundary_by_request.insert(boundary.point_count_before, boundary_index);
-            SnapshotContextCurveBoundary {
-                boundary_index,
-                observed_at: boundary
-                    .observed_at
-                    .as_deref()
-                    .and_then(canonical_context_curve_timestamp)
-                    .expect("validated boundary timestamp canonicalizes"),
-                before_owned_request_ordinal: boundary.point_count_before,
-                after_owned_request_ordinal: boundary.point_count_before + 1,
-                segment_before_ordinal: *original_index as u64,
-                segment_after_ordinal: *original_index as u64 + 1,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let mut model_window_indexes = BTreeMap::new();
-    let mut model_windows = Vec::new();
-    let mut model_window_overflow = false;
-    let mut points = Vec::with_capacity(retention_flags.len());
-    for (ordinal, flags) in retention_flags {
-        let candidate = &candidates[ordinal as usize - 1];
-        let model = safe_context_curve_model(candidate.model.as_deref());
-        let evidence_kind = if candidate.context_window_tokens.is_some() {
-            "provider_reported_window"
-        } else if model != "unknown" {
-            "provider_reported_model"
-        } else {
-            "unavailable"
-        };
-        let model_key = (
-            model.clone(),
-            candidate.context_window_tokens,
-            evidence_kind.to_string(),
-        );
-        let model_window_index = if let Some(index) = model_window_indexes.get(&model_key) {
-            *index
-        } else if model_windows.len() < MAX_CONTEXT_CURVE_MODEL_WINDOWS {
-            let index = model_windows.len() as u16;
-            model_window_indexes.insert(model_key, index);
-            model_windows.push(SnapshotContextCurveModelWindow {
-                model_window_index: index,
-                model,
-                context_window_tokens: candidate.context_window_tokens,
-                evidence_kind: evidence_kind.to_string(),
-                evidence_revision: model_evidence_revision.to_string(),
-            });
-            index
-        } else {
-            model_window_overflow = true;
-            0
-        };
-        let segment_ordinal = boundary_candidates
-            .iter()
-            .take_while(|boundary| boundary.point_count_before < ordinal)
-            .count() as u64;
-        points.push(SnapshotContextCurvePoint {
-            owned_request_ordinal: ordinal,
-            observed_at: candidate
-                .observed_at
-                .as_deref()
-                .and_then(canonical_context_curve_timestamp)
-                .expect("validated point timestamp canonicalizes"),
-            effective_input_tokens: candidate.effective_input_tokens,
-            model_window_index,
-            segment_ordinal,
-            retention_flags: flags,
-            compaction_before_request_boundary_index: before_boundary_by_request
-                .get(&ordinal)
-                .copied(),
-            compaction_after_request_boundary_index: after_boundary_by_request
-                .get(&ordinal)
-                .copied(),
-        });
-    }
-
-    if model_window_overflow {
-        return unavailable();
-    }
-    let mut curve = SnapshotContextCurve {
-        contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
-        parser_revision: parser_revision.to_string(),
-        ownership_revision: ownership_revision.to_string(),
-        sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
-        coverage: if candidates.len() > MAX_CONTEXT_CURVE_POINTS
-            || boundary_candidates.len() > MAX_CONTEXT_CURVE_BOUNDARIES
-        {
-            "sampled".to_string()
-        } else {
-            "complete".to_string()
-        },
-        total_owned_request_count: total_points,
-        retained_point_count: points.len() as u64,
-        total_compaction_boundary_count: total_boundaries,
-        retained_boundary_count: boundaries.len() as u64,
-        points,
-        boundaries,
-        model_windows,
-    };
-    loop {
-        let encoded_size = serde_json::to_vec(&curve)
-            .map(|encoded| encoded.len())
-            .unwrap_or(usize::MAX);
-        if encoded_size <= MAX_CONTEXT_CURVE_WIRE_BYTES {
-            return curve;
-        }
-        if !prune_one_context_curve_fill_point(&mut curve) {
-            return unavailable();
-        }
-    }
 }
 
 fn compact_context_curve_model_windows(curve: &mut SnapshotContextCurve) {
