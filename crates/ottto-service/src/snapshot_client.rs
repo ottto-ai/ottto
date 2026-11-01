@@ -667,11 +667,6 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
-    /// Durable accepted-log capability for content-free request-index curves.
-    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
-    /// emits curves that the server cannot durably acknowledge.
-    #[serde(default)]
-    pub session_context_curve_contract: Option<String>,
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
@@ -5074,7 +5069,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

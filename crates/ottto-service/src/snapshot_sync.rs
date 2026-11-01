@@ -26,13 +26,12 @@ use crate::snapshot_client::{
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
 use crate::snapshots::{
-    apply_upload_policy, collector_version, context_curve_derivation_revision,
-    finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
-    snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness,
-    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
-    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
-    SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult,
-    UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
+    apply_upload_policy, collector_version, finalize_scan_after_policy_with_body_witness,
+    prepare_codex_recovery_diagnostics, snapshot_quarantine_deadline_is_bounded,
+    snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
+    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
+    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
+    SourceScanResult, UnsettledUploadCause, MAX_BACKFILL_FILES_PER_SOURCE,
     MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
     SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
@@ -603,20 +602,17 @@ fn note_claude_history_cutoff_for_cycle(
 struct ReplayArming {
     /// The source's bootstrap for this destination is pending.
     backfill_pending: bool,
-    /// The index needs the current context-curve replay.
-    curve_replay_pending: bool,
 }
 
 impl ReplayArming {
     /// One decision for production and the history pipeline tests. An
-    /// unreadable backfill state arms no Claude replay of either kind (its
-    /// history is unknown, and a replay would drop the index's entries);
-    /// Codex and Pi replays are not affected.
+    /// unreadable backfill state arms no Claude replay (its history is
+    /// unknown, and a replay would drop the index's entries); Codex and Pi
+    /// replays are not affected.
     fn decide(
         source: SnapshotSource,
         backfill_state: &crate::backfill::BackfillState,
         destination_namespace: &str,
-        curve_replay_needed: bool,
     ) -> Self {
         Self {
             backfill_pending: pending_backfill_sources_for_destination(
@@ -624,8 +620,6 @@ impl ReplayArming {
                 destination_namespace,
             )
             .contains(&source),
-            curve_replay_pending: curve_replay_needed
-                && !claude_replay_suppressed(source, backfill_state),
         }
     }
 }
@@ -4146,12 +4140,8 @@ fn validated_receipt_window_days(negotiated_window_days: u64) -> Result<u64> {
     Ok(negotiated_window_days)
 }
 
-fn scan_request_window_days(
-    receipt_window_days: u64,
-    backfill_pending: bool,
-    curve_replay_pending: bool,
-) -> u64 {
-    if backfill_pending || curve_replay_pending {
+fn scan_request_window_days(receipt_window_days: u64, backfill_pending: bool) -> u64 {
+    if backfill_pending {
         // The scanner applies its own local safety ceiling. `u64::MAX` means
         // "walk the complete replay range", not "claim this width upstream".
         u64::MAX
@@ -5780,7 +5770,6 @@ struct SourcePreparation {
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
-    context_curve_enabled: bool,
     cache_observations_enabled: bool,
     scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
     attribution_context: Option<SessionAttributionContext>,
@@ -6314,34 +6303,15 @@ pub(crate) fn copy_unproven_upload_context(context: String, enabled: bool) -> St
     }
 }
 
-/// The replay generation of a cycle over `index` (pure; shared as above).
-fn cycle_replay_generation(
-    source: SnapshotSource,
-    context_curve_enabled: bool,
-    index: &ScanIndex,
-    upload_destination_namespace: &str,
-) -> String {
+/// The replay generation of a cycle (pure; shared as above).
+fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace: &str) -> String {
     let replay = current_historical_replay(source);
-    if context_curve_enabled {
-        let curve_derivation_revision = context_curve_derivation_revision(source)
-            .expect("curve capability is supported only for local Codex and Claude sources");
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            CONTEXT_CURVE_CONTRACT_VERSION,
-            curve_derivation_revision,
-            index.context_curve_replay_epoch(),
-            upload_destination_namespace
-        )
-    } else {
-        format!(
-            "{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            upload_destination_namespace
-        )
-    }
+    format!(
+        "{}:{}:{}",
+        source.api_slug(),
+        replay.revision,
+        upload_destination_namespace
+    )
 }
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
@@ -6350,13 +6320,13 @@ fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,
-    context_curve_enabled: bool,
     request_identity_capture: bool,
 ) -> crate::transcript_acquisition::Scope {
+    // The trailing `false` is the retired context-curve flag; the scope bytes
+    // are unchanged.
     let mut sampled_scope = format!(
-        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:false",
         index_path.display(),
-        context_curve_enabled
     );
     if request_identity_capture {
         // A retained parser never crosses capture modes; the dark scope bytes
@@ -6525,9 +6495,6 @@ fn prepare_sync_source_inner(
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
     let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
-    let context_curve_enabled = source != SnapshotSource::Pi
-        && activity_hint.session_context_curve_contract.as_deref()
-            == Some(CONTEXT_CURVE_CONTRACT_VERSION);
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
@@ -6785,13 +6752,6 @@ fn prepare_sync_source_inner(
         (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
         resumed_prefix_enabled,
     );
-    if !context_curve_enabled {
-        // Stamp the off transition before taking the partial-commit baseline.
-        // If an ordinary no-curve upload is partially accepted and then shed,
-        // `committable_subset` must persist the new epoch so an immediate
-        // re-enable replays every file changed during that off cycle.
-        index.mark_context_curve_capability_disabled();
-    }
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.
@@ -6809,24 +6769,12 @@ fn prepare_sync_source_inner(
             prior == crate::snapshots::PriorHistory::Unverified,
         );
     }
-    let replay_generation = cycle_replay_generation(
-        source,
-        context_curve_enabled,
-        &index,
-        &upload_destination_namespace,
-    );
-    // An unreadable backfill state arms no Claude replay of either kind, and
-    // no replay-wide scan window (StateMissing H1, N2).
-    let ReplayArming {
-        backfill_pending,
-        curve_replay_pending,
-    } = ReplayArming::decide(
-        source,
-        &backfill_state,
-        &upload_destination_namespace,
-        context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
-    );
-    let historical_replay_pending = backfill_pending || curve_replay_pending;
+    let replay_generation = cycle_replay_generation(source, &upload_destination_namespace);
+    // An unreadable backfill state arms no Claude replay and no replay-wide
+    // scan window (StateMissing H1, N2).
+    let ReplayArming { backfill_pending } =
+        ReplayArming::decide(source, &backfill_state, &upload_destination_namespace);
+    let historical_replay_pending = backfill_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
@@ -6926,7 +6874,6 @@ fn prepare_sync_source_inner(
     let scan_window_days = scan_request_window_days(
         receipt_window_days,
         backfill_pending || admission_reoffer_pending,
-        curve_replay_pending,
     );
     let copy_prefix_scope = if source == SnapshotSource::ClaudeCode {
         match crate::snapshots::claude_copy_prefix_reread::prepare(
@@ -6989,7 +6936,6 @@ fn prepare_sync_source_inner(
         &account_witness,
         &upload_destination_namespace,
         &index_path,
-        context_curve_enabled,
         request_identity_capture,
     );
     #[cfg(unix)]
@@ -7014,7 +6960,6 @@ fn prepare_sync_source_inner(
             (source == SnapshotSource::ClaudeCode).then_some(support_dir),
             &watcher_hints.paths,
             watcher_hints.overflowed,
-            context_curve_enabled,
             request_identity_capture,
             &copy_prefix_scope,
         )
@@ -7032,7 +6977,7 @@ fn prepare_sync_source_inner(
     }
     if let Some(lease) = native_comparison_lease.as_mut() {
         if let Some(native_context) = scan.native_comparison_context() {
-            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}"));
+            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:false"));
             lease.bind_scope(scope);
         } else {
             lease.revoke();
@@ -7051,7 +6996,6 @@ fn prepare_sync_source_inner(
         scan_started_at,
         activity_hint,
         receipt_window_days,
-        context_curve_enabled,
         cache_observations_enabled,
         scan_agent_status_collection,
         attribution_context,
@@ -7085,7 +7029,6 @@ struct ContinuationInputs {
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
-    context_curve_enabled: bool,
     cache_observations_enabled: bool,
     scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
     attribution_context: Option<SessionAttributionContext>,
@@ -7099,7 +7042,7 @@ struct ContinuationInputs {
 }
 
 crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
-    receipt_window_days, context_curve_enabled, cache_observations_enabled,
+    receipt_window_days, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
 
@@ -7154,7 +7097,6 @@ fn take_continuation_inputs(
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
-        context_curve_enabled: preparation.context_curve_enabled,
         cache_observations_enabled: preparation.cache_observations_enabled,
         scan_agent_status_collection: std::sync::Arc::clone(
             &preparation.scan_agent_status_collection,
@@ -7338,19 +7280,13 @@ fn prepare_continuation_source(
     index.require_persistence_available()?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
-    let replay_generation = cycle_replay_generation(
-        source,
-        inputs.context_curve_enabled,
-        &index,
-        &inputs.upload_destination_namespace,
-    );
+    let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
     let arming = ReplayArming::decide(
         source,
         &backfill_state,
         &inputs.upload_destination_namespace,
-        inputs.context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
     );
-    if arming.backfill_pending || arming.curve_replay_pending {
+    if arming.backfill_pending {
         return Ok(Err(ContinuationRefusal::HistoricalReplay));
     }
     if index.snapshot_admission_reoffer_pending() {
@@ -7424,10 +7360,9 @@ fn prepare_continuation_source(
         &roots,
         index,
         &scan_started_at,
-        scan_request_window_days(inputs.receipt_window_days, false, false),
+        scan_request_window_days(inputs.receipt_window_days, false),
         MAX_BACKFILL_FILES_PER_SOURCE,
         inputs.upload_policy.session_artifacts_enabled,
-        inputs.context_curve_enabled,
         ordinary_equivalent,
         inputs.evidence.take(),
     )
@@ -7439,7 +7374,6 @@ fn prepare_continuation_source(
             &inputs.account_witness,
             &inputs.upload_destination_namespace,
             &inputs.index_path,
-            inputs.context_curve_enabled,
             false,
         ),
     )
@@ -7459,7 +7393,6 @@ fn prepare_continuation_source(
         scan_started_at,
         activity_hint: inputs.activity_hint.clone(),
         receipt_window_days: inputs.receipt_window_days,
-        context_curve_enabled: inputs.context_curve_enabled,
         cache_observations_enabled: inputs.cache_observations_enabled,
         scan_agent_status_collection: std::sync::Arc::clone(&inputs.scan_agent_status_collection),
         attribution_context: inputs.attribution_context.take(),
@@ -7594,7 +7527,6 @@ fn finish_sync_source(
         scan_started_at,
         activity_hint,
         receipt_window_days,
-        context_curve_enabled,
         cache_observations_enabled,
         scan_agent_status_collection,
         attribution_context,
@@ -7607,7 +7539,7 @@ fn finish_sync_source(
         mut committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation,
+        replay_generation: _,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: _,
@@ -8892,19 +8824,6 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    // A Claude curve replay an unreadable backfill state suppressed stays
-    // pending (StateMissing H1), so it runs once the marker clears.
-    let curve_replay_suppressed = context_curve_enabled
-        && claude_replay_suppressed(source, &backfill_state)
-        && index.context_curve_replay_needed(&replay_generation);
-    if !curve_replay_suppressed {
-        settle_context_curve_replay_state(
-            &mut index,
-            context_curve_enabled,
-            scan_result.census_complete && upload_fully_settled,
-            &replay_generation,
-        );
-    }
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -9287,26 +9206,6 @@ fn prepare_upload_progress_for_cycle_with_reoffer(
             upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     }
     progress_changed
-}
-
-fn settle_context_curve_replay_state(
-    index: &mut ScanIndex,
-    context_curve_enabled: bool,
-    census_complete: bool,
-    replay_generation: &str,
-) {
-    if context_curve_enabled && census_complete {
-        // This point is reached only after every curve-bearing entity received
-        // an exact durable v5/v6 proof and the bounded traversal reached the
-        // end of its frozen census. Partial pages retain the replay epoch so a
-        // later cycle keeps the full historical window and traversal cursor.
-        index.mark_context_curve_replay_complete(replay_generation.to_string());
-    } else if !context_curve_enabled {
-        // Mark the off epoch only after the ordinary no-curve cycle succeeds.
-        // A later re-enable uses the incremented epoch to force exactly one
-        // fresh historical replay, including files changed while off.
-        index.mark_context_curve_capability_disabled();
-    }
 }
 
 fn reconciliation_agent_status(collection: &AgentStatusCollection) -> &AgentStatusSnapshot {
@@ -13974,7 +13873,7 @@ mod tests {
     fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         let root = cache_effective_wire_fixture_root();
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -13983,7 +13882,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
             let request = SnapshotBatchRequest {
@@ -14255,7 +14157,7 @@ mod tests {
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -14264,7 +14166,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let mut off = scan(&mut index);
         assert_eq!(off.snapshots.len(), 1);
@@ -15487,7 +15392,7 @@ mod tests {
         assert_eq!(scan.snapshots.len(), 1);
         let item = &mut scan.snapshots[0];
         item.context_curve = Some(crate::snapshots::SnapshotContextCurve {
-            contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+            contract_version: crate::snapshots::CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
             parser_revision: "claude_code_jsonl:v28".to_string(),
             ownership_revision: "claude_owned_request_start_proof:v1".to_string(),
             sampling_revision: "context_curve_sampling:v1".to_string(),
@@ -21747,23 +21652,18 @@ mod tests {
     }
 
     #[test]
-    fn backfill_and_curve_replay_keep_report_width_at_current_hint() {
+    fn backfill_replay_keeps_report_width_at_current_hint() {
         let receipt_window_days = validated_receipt_window_days(183).expect("valid hint");
         assert_eq!(
-            scan_request_window_days(receipt_window_days, false, false),
+            scan_request_window_days(receipt_window_days, false),
             receipt_window_days,
             "after replay the scan returns to the current policy width"
         );
 
-        for (replay_name, backfill_pending, curve_replay_pending) in
-            [("backfill", true, false), ("curve", false, true)]
         {
+            let (replay_name, backfill_pending) = ("backfill", true);
             assert_eq!(
-                scan_request_window_days(
-                    receipt_window_days,
-                    backfill_pending,
-                    curve_replay_pending,
-                ),
+                scan_request_window_days(receipt_window_days, backfill_pending),
                 u64::MAX,
                 "{replay_name} replay requests the scanner's broad local range"
             );
@@ -21784,11 +21684,7 @@ mod tests {
                     std::slice::from_ref(&root),
                     &mut index,
                     "2026-08-30T12:00:00Z",
-                    scan_request_window_days(
-                        receipt_window_days,
-                        backfill_pending,
-                        curve_replay_pending,
-                    ),
+                    scan_request_window_days(receipt_window_days, backfill_pending),
                 )
                 .expect("broad replay scan");
                 assert_eq!(
@@ -21851,7 +21747,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut policy_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, false, false),
+            scan_request_window_days(183, false),
         )
         .expect("policy-width scan");
         assert_eq!(policy_scan.discovered_file_count, 0);
@@ -21863,7 +21759,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut replay_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, true, false),
+            scan_request_window_days(183, true),
         )
         .expect("wide replay scan");
         assert_eq!(replay_scan.backfill_window_days, 730);
@@ -21944,7 +21840,6 @@ mod tests {
         assert_eq!(status["manifest"]["window_start"], manifest.window_start);
         assert_eq!(status["manifest"]["window_end"], manifest.window_end);
         assert_eq!(status["manifest"]["rolling_hash"], manifest.rolling_hash);
-        assert_eq!(scan_request_window_days(183, false, true), u64::MAX);
     }
 
     #[test]
@@ -23072,13 +22967,15 @@ mod tests {
             .snapshots
             .iter()
             .map(|item| {
+                let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
+                // As the backend's entity ACK does, the digest travels only with
+                // a witness version.
                 Ok(serde_json::json!({
                     "source_session_id": item.source_session_id,
                     "snapshot_fingerprint": item.snapshot_fingerprint,
                     "occurrence_count": 1,
-                    "body_witness_version":
-                        crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
-                    "body_witness_digest": snapshot_upload_body_witness(item),
+                    "body_witness_version": version,
+                    "body_witness_digest": version.map(|_| snapshot_upload_body_witness(item)),
                     "head_etag": headed.then_some(head),
                 }))
             })
@@ -24379,7 +24276,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 

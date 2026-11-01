@@ -313,7 +313,6 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         &[],
         false,
         false,
-        false,
         &[],
     );
     assert!(scan.claude_family_shadow.is_none());

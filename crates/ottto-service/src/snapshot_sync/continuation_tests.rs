@@ -1164,7 +1164,6 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
             None,
             &[],
             false,
-            false,
         )
         .with_sampled_acquisition(
             Arc::clone(&cache),

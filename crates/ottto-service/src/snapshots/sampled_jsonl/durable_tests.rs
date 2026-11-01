@@ -239,7 +239,6 @@ fn parser(path: &Path, source: SnapshotSource) -> OwnedJsonlParser {
         None,
         None,
         false,
-        true,
     )
     .unwrap()
 }
