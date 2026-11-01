@@ -493,7 +493,6 @@ fn control_name(name: &str) -> bool {
             | "erasure_purged_epoch"
             | "reference_check_success"
             | "reference_check_attempt"
-            | "growth_gauge_attempt"
             | "reference_drift"
             | "minimum_writer_capability"
             | "erasure_pending"

@@ -997,7 +997,7 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
 
-/// [behaviour] idle maintenance emits counts once per persisted daily window.
+/// [behaviour] idle maintenance emits counts once per daily reference-maintenance pass.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {
     fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
@@ -1061,27 +1061,11 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(gauge["chunk_bytes"], 1300);
     assert_eq!(gauge["partial"], false);
     assert!(!gauge.to_string().contains("synthetic-private"));
+    // No second sample until the next daily maintenance pass runs.
     assert!(sample(&mut db).is_empty());
-    drop(db);
-    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
-    db.reference_extractor(refs);
-    // An hourly retry may run, but cannot emit another daily sample after restart.
     db.control("reference_check_success", &0_u64).unwrap();
     db.control("reference_check_attempt", &0_u64).unwrap();
-    assert!(sample(&mut db).is_empty());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    for name in [
-        "reference_check_success",
-        "reference_check_attempt",
-        "growth_gauge_attempt",
-    ] {
-        db.control(name, &(now - 86401)).unwrap();
-    }
     assert_eq!(sample(&mut db).len(), 1);
-    assert!(sample(&mut db).is_empty());
 }
 
 /// [format] one save commits all dirty rows above soft targets.

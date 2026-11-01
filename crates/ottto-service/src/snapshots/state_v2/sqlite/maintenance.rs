@@ -630,38 +630,24 @@ impl Sqlite {
                 && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
             {
                 self.control("reference_check_attempt", &now)?;
-                let gauge_due = self
-                    .read_control::<u64>("growth_gauge_attempt")?
-                    .map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
-                let mut growth = if gauge_due {
-                    // Persist admission before sampling, including partial or failed work.
-                    self.control("growth_gauge_attempt", &now)?;
-                    Some(StoreGrowth {
-                        partial: true,
-                        ..Default::default()
-                    })
-                } else {
-                    None
+                // Stays partial unless the closure completes the sample.
+                let mut growth = StoreGrowth {
+                    partial: true,
+                    ..Default::default()
                 };
                 self.conn()?.execute_batch("BEGIN")?;
                 let budget = size_budget(self.logical_bytes()?, 10);
                 let started = Instant::now();
                 let result = limited(self.conn()?, budget, || {
-                    if let Some(growth) = &mut growth {
-                        let _ = growth.pages(self.conn()?);
-                    }
-                    // Reference verification retains priority; sampling shares its VM budget.
+                    // Reference verification runs first; the sample shares its VM budget.
                     let result = references::verify_counts(self.conn()?, extract);
-                    if let Some(growth) = &mut growth {
-                        let complete = growth.rows(self.conn()?, started, budget).is_ok();
-                        growth.partial = !complete || growth.page_size.is_none();
-                    }
+                    let complete = growth.pages(self.conn()?).is_ok()
+                        && growth.rows(self.conn()?, started, budget).is_ok();
+                    growth.partial = !complete;
                     result
                 });
                 self.conn()?.execute_batch("ROLLBACK")?;
-                if let Some(growth) = growth {
-                    super::super::telemetry::event("store_growth", &growth);
-                }
+                super::super::telemetry::event("store_growth", &growth);
                 match result {
                     Ok(()) => self.control("reference_check_success", &now)?,
                     Err(error)
