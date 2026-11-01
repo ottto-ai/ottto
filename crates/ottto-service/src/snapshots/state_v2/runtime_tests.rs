@@ -1283,8 +1283,8 @@ mod hydrate_parity {
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
-        // The shared load tail never walks a cold archive: the window a v1
-        // load collapses stays in the store, counted as uncollapsed. Publish
+        // The shared load tail never walks a cold archive: the windows a v1
+        // load collapses stay in the store, counted as uncollapsed. Publish
         // the decoded graph, as typed_case does: decode marks these
         // member-less windows invalid, and rows hold only canonical values.
         let index: ScanIndex =
@@ -1300,7 +1300,7 @@ mod hydrate_parity {
         .unwrap();
         let family = &actual.claude_account_family_pending["other-family"];
         assert!(matches!(family.previous_windows, ArchivedWindows::Cold(_)));
-        assert_eq!(family.previous_windows.uncollapsed(), 1);
+        assert_eq!(family.previous_windows.uncollapsed(), 2);
         assert_eq!(actual.claude_account_window_retention.roots_refused, 0);
         assert_eq!(actual.claude_account_window_retention.windows_collapsed, 0);
         assert_eq!(
