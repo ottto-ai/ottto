@@ -739,6 +739,75 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
     };
 }
 
+/// [money] An API row whose request an off-page transcript of the family
+/// already counts (census holder, no trace owner) is not re-added to the
+/// root as a side-call fallback, and finish keeps the same request total.
+/// Without the holder the same row falls back to the root.
+#[test]
+fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_root() {
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    for holder in [false, true] {
+        let p = root_file("side-off-page-holder");
+        let off_page = p
+            .parent()
+            .unwrap()
+            .join(ROOT)
+            .join("subagents/agent-off-page.jsonl");
+        fs::create_dir_all(off_page.parent().unwrap()).unwrap();
+        let mut index = ScanIndex::default();
+        if holder {
+            let held = parse(&off_page, Some(t0()), &index, &[line("held", &at(2), 20)]);
+            record_claude_request_census(
+                &mut index,
+                ClaudeRequestCensusParse {
+                    path: &off_page,
+                    index_key: &local_index_key(&off_page),
+                    source_file_fingerprint: &"a".repeat(64),
+                    census_window_end: "2026-08-02T09:00:00Z",
+                    complete: true,
+                    lossy: false,
+                    source_verified: true,
+                    unchanged_source: false,
+                    itemless_request_hashes: Vec::new(),
+                    opened_birth: None,
+                    modified_unix_seconds: 1,
+                },
+                &[held],
+            );
+        }
+        let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+        let read = sidecar(&[row("r", 1, 10), row("held", 2, 20), row("orphan", 5, 50)]);
+        attach_page(&mut items, &read);
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &index,
+        );
+        // Without the holder the held row is an untraced root fallback too.
+        let side = if holder { 1 } else { 2 };
+        let root = fold(&items[0]);
+        assert_eq!(
+            (root.side_requests, root.root_fallbacks),
+            (side, side),
+            "holder={holder}"
+        );
+        assert_eq!(requests(&items[0], REPORTED), side, "holder={holder}");
+        let total = root.entity.totals().1;
+        assert_eq!(total, 1 + side, "holder={holder}");
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].request_count, got[0].input_tokens),
+            (total, if holder { 60 } else { 80 }),
+            "holder={holder}"
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+}
+
 #[test]
 fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory() {
     // A trace-named member the walk has not discovered may still have a
