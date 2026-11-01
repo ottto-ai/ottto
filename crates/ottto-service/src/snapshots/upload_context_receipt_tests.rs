@@ -1557,9 +1557,11 @@ fn cursor_resume_leaves_context_read_room_for_census_members() {
         }
         assert_eq!(receipted(&f.index, &"d".repeat(64)).len(), members.len());
         assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
-        // Unchanged census members with no receipt are pending context-only
-        // reads; the context (part of the job's scope) is unchanged.
+        // Unchanged census members with no receipt and no retained copy are
+        // pending context-only reads; the context (part of the job's scope)
+        // is unchanged.
         for path in &members {
+            let _ = f.cache.take(&local_index_key(path));
             f.index
                 .files
                 .get_mut(&local_index_key(path))
