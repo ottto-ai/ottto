@@ -53,6 +53,21 @@ pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
     view
 }
 
+/// Delete one stored usage-pending row on the session's own connection,
+/// outside a transaction: neither the generation nor the data version moves,
+/// so the session's stamp still matches the graph.
+pub(in crate::snapshots) fn delete_usage_row_in_session(index: &ScanIndex, root: &str) {
+    let key = mapper::key("usage.pending", root, 1).unwrap();
+    with_session_db(index, |db| sqlite::delete_row_for_test(db, &key));
+}
+
+/// Process-lifetime count of refused cold usage-pending loads.
+pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
+    telemetry::latest_for_test("usage_pending_unknown")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
 pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
@@ -536,17 +551,31 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
                 .all(|r| r.identity_revision.is_some())));
 }
 /// [money] Cold usage pending stores what the resident graph stores: a page
-/// loads only its own families, a sibling subset saves one of them, the
-/// working graph loads another, changes it, removes a third and saves with no
-/// Unknown refusal; the reload equals the resident run. The running total is
-/// the fold of the rows after hydrate and after restart. A whole-kind load
-/// joins every family, and settling returns the unchanged one to its head.
+/// loads only its own families, a sibling subset saves one of them, and the
+/// working graph then loads another, changes its occurrence count, removes a
+/// third and saves itself with no Unknown refusal. Its heads are refreshed by
+/// that save; a whole-kind join and a restart see the explicit rows, and the
+/// running total equals the sum of heads and the fold of the rows (A1).
 #[test]
 fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
     use crate::snapshots::usage_pending::{tests::family, Families, UsagePending};
     let total = |families: &Families| UsagePending::from(families.clone()).total_occurrences();
     let roots =
         |names: &[&str]| -> BTreeSet<String> { names.iter().map(|r| (*r).into()).collect() };
+    // r1 as the sibling saved it, r2 with one member's occurrences dropped
+    // by the working graph, r3 removed and r4 untouched.
+    let mut expected = Families::from([
+        ("r1".to_owned(), family("w1", 2, false)),
+        ("r2".to_owned(), family("w1", 3, false)),
+        ("r4".to_owned(), family("w1", 2, false)),
+    ]);
+    expected.get_mut("r1").unwrap().invalid = true;
+    expected
+        .get_mut("r2")
+        .unwrap()
+        .member_occurrences
+        .pop_first()
+        .unwrap();
     let run = |cold: bool| {
         let f = Fixture::new();
         let mut pre = ScanIndex::default();
@@ -585,52 +614,61 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         );
         assert!(save_with(&f.path, &mut subset).unwrap());
 
-        // The working graph loads r2 after the sibling's save, changes it
-        // and removes r3; r1 is still its loaded value and r4 a head.
+        // The working graph loads r2 after the sibling's save, drops one
+        // member's occurrences from it, removes r3 and saves itself: r1 is
+        // rewritten as the sibling saved it and r4 is kept by its head.
         working.generation = subset.generation;
         load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
         let usage = &mut working.claude_usage_family_pending;
-        usage.family_mut("r2").unwrap().unwrap().census_window_end = "w2".into();
+        let r2 = usage.family_mut("r2").unwrap().unwrap();
+        r2.member_occurrences.pop_first().unwrap();
         usage.discard("r3");
-        let mut checkpoint = working.committable_subset_with_local_holds(
-            &subset,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
+        assert!(save_with(&f.path, &mut working).unwrap());
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
         );
-        assert!(save_with(&f.path, &mut checkpoint).unwrap());
-
-        // A join loads every family; settling keeps only the changed ones.
-        working.generation = checkpoint.generation;
-        load_usage(&mut working, None).unwrap();
-        let joined = working.claude_usage_family_pending.all().unwrap().clone();
+        // The save refreshed the loaded heads: settling returns every loaded
+        // family to its head, and the running total is unchanged.
         settle_usage(&mut working, &BTreeSet::new());
         if let Some(cold) = working.claude_usage_family_pending.cold() {
-            assert_eq!(cold.loaded().keys().collect::<Vec<_>>(), ["r1", "r2"]);
+            assert!(cold.loaded().is_empty());
         }
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
+        );
+
+        // A join loads every family and sees exactly the saved rows.
+        load_usage(&mut working, None).unwrap();
+        assert_eq!(
+            *working.claude_usage_family_pending.all().unwrap(),
+            expected
+        );
+        settle_usage(&mut working, &BTreeSet::new());
         assert_eq!(
             working.claude_usage_family_pending.family("r4").is_err(),
             cold
         );
 
+        // Restart: production reloads this hold-free store cold in both runs.
+        // A1: running total == sum of heads == fold of the stored rows.
         let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
-        let families = materialized(&reloaded).claude_usage_family_pending.clone();
-        assert_eq!(*families, joined);
-        assert_eq!(
-            reloaded.claude_usage_family_pending.total_occurrences(),
-            total(&families)
-        );
-        assert_eq!(reloaded.claude_usage_family_pending.cold().is_some(), cold);
-        families.resident().unwrap().clone()
+        let usage = &reloaded.claude_usage_family_pending;
+        assert!(usage.cold().is_some());
+        let families = materialized(&reloaded)
+            .claude_usage_family_pending
+            .resident()
+            .unwrap()
+            .clone();
+        let heads: usize = usage.views().map(|(_, view)| view.occurrences()).sum();
+        assert_eq!(usage.total_occurrences(), heads);
+        assert_eq!(heads, total(&families));
+        assert_eq!(families, expected);
+        families
     };
     let cold = run(true);
     assert_eq!(cold, run(false));
-    let mut expected = Families::from([
-        ("r1".to_owned(), family("w1", 2, false)),
-        ("r2".to_owned(), family("w2", 3, false)),
-        ("r4".to_owned(), family("w1", 2, false)),
-    ]);
-    expected.get_mut("r1").unwrap().invalid = true;
     assert_eq!(cold, expected);
 }
 

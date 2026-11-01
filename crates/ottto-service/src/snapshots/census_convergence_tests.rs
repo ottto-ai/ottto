@@ -648,6 +648,82 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
     let _ = fs::remove_dir_all(dir);
 }
 
+// [money] A2 at a matching stamp: a stored usage row missing from the
+// session's own store (generation and data version unchanged) refuses the
+// whole page that names its family, counted. Nothing of the page is
+// installed, not even its readable family, and the missing family stays
+// discoverable. A healthy page through the same entry point loads both.
+#[test]
+fn cold_usage_row_missing_at_a_matching_stamp_refuses_the_whole_page() {
+    use state_v2::money_test_support as v2;
+    let (root, parent, items) = claude_account_family_fixture(false);
+    let mut other = items[0].clone();
+    other.source_session_id = "other-root".into();
+    other
+        .attribution_facts
+        .retain(|fact| fact.field != "root_session_ref");
+    assert_eq!(claude_snapshot_family_root(&other), "other-root");
+    assert_eq!(claude_snapshot_family_root(&items[0]), parent);
+    let pending = |member: &str| ClaudeUsageFamilyPending {
+        census_window_end: WINDOW.to_string(),
+        member_request_id_hashes: BTreeMap::from([(
+            member.to_string(),
+            BTreeSet::from([hex64('c')]),
+        )]),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+        idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
+    };
+    let mut index = ScanIndex::default();
+    for family in [parent.as_str(), "other-root"] {
+        index
+            .claude_usage_family_pending
+            .insert(family.to_string(), pending(family));
+    }
+    let scratch = crate::test_scratch::canonical_private_dir("usage-row-missing");
+    let (custody, cold) = v2::ColdSession::publish(&index, &scratch);
+    let page = |index: &mut ScanIndex| {
+        let mut snapshots = vec![items[0].clone(), other.clone()];
+        apply_claude_reported_usage_with_identity(
+            &mut snapshots,
+            &Default::default(),
+            &Default::default(),
+            index,
+            false,
+            WINDOW,
+            None,
+        )
+    };
+
+    // Positive control: the same entry point loads the page's families.
+    let mut healthy = cold.clone();
+    page(&mut healthy);
+    assert!(v2::usage_loaded(&healthy, &parent));
+    assert!(v2::usage_loaded(&healthy, "other-root"));
+
+    v2::delete_usage_row_in_session(&cold, &parent);
+    let mut refused = cold.clone();
+    let before = v2::usage_unknown_count();
+    let disposition = page(&mut refused);
+    assert!(v2::usage_unknown_count() > before, "counted");
+    for session in [items[0].source_session_id.as_str(), "other-root"] {
+        assert!(disposition.quarantined_source_session_ids.contains(session));
+    }
+    assert!(!v2::usage_loaded(&refused, &parent));
+    assert!(
+        !v2::usage_loaded(&refused, "other-root"),
+        "nothing installed"
+    );
+    let usage = &refused.claude_usage_family_pending;
+    assert!(usage.contains_key(&parent));
+    assert!(usage.family(&parent).is_err(), "Unknown, not absent");
+    drop(custody);
+    let _ = fs::remove_dir_all(scratch);
+    let _ = fs::remove_dir_all(root);
+}
+
 // A held key keeps its committed revision, its activity and accepted
 // ledger, and reparse debt; every other key commits as scanned. A held key
 // with no committed revision in a family with retained authority evidence is
