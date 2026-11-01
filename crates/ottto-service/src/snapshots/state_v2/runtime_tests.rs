@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped Mapper writes,
+//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
 }
 
 fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, importable, published(path)?)
+    Ok(load_locked(path, importable, published(path)?)?.0)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -104,8 +104,6 @@ impl Fixture {
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
                 .unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         let mut generation = 0;
@@ -333,7 +331,7 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
+    assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
 }
 /// A synthetic account window ending on October `day`.
 fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
@@ -1130,7 +1128,7 @@ mod hydrate_parity {
             let f = Fixture::new();
             publish(&f, &index);
             let before = fs::read(&f.path).unwrap();
-            let error = load_locked(&f.path, None, published(&f.path).unwrap()).unwrap_err();
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }

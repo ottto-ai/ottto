@@ -31,8 +31,6 @@ pub(super) fn populate(
     presence: BTreeMap<String, bool>,
 ) -> sqlite::Sqlite {
     let mut db = sqlite::Sqlite::create_import(path).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-money-custody".into(),
@@ -53,10 +51,7 @@ pub(super) fn populate(
     // Journal OFF deliberately invalidates aborted imports. Fault/rollback
     // tests must operate on a completed import reopened in live WAL mode.
     db.finish_import().unwrap();
-    let mut db = sqlite::Sqlite::open(path, &identity).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
-    db
+    sqlite::Sqlite::open(path, &identity).unwrap()
 }
 
 pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
@@ -76,7 +71,7 @@ impl ColdStore {
         let bytes = serde_json::to_vec(index).unwrap();
         let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let mut db = populate(path, &expected, BTreeMap::new());
-        let cold = import::Mapper.hydrate_context(&mut db).unwrap().0;
+        let cold = import::hydrate_context(&mut db).unwrap().0;
         let restored = hydrate_resident(&mut db);
         expected.generation += 1;
         assert_eq!(
@@ -104,11 +99,11 @@ impl ColdStore {
             .read_control::<Identity>("identity")
             .unwrap()
             .unwrap();
-        let (stored, mut cx) = import::Mapper.hydrate_context(&mut self.db).unwrap();
+        let (stored, mut cx) = import::hydrate_context(&mut self.db).unwrap();
         let baseline = kinds::baseline(&stored, &mut cx).unwrap();
         roll_account_families(page, end);
         kinds::save_graph(&mut self.db, &identity, baseline, page, &mut cx).unwrap();
-        let cold = import::Mapper.hydrate_context(&mut self.db).unwrap().0;
+        let cold = import::hydrate_context(&mut self.db).unwrap().0;
         (cold, hydrate_resident(&mut self.db))
     }
 }
@@ -174,7 +169,7 @@ pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIn
 /// The production hydrate with cold archives read back resident, for graph
 /// comparisons.
 pub(super) fn hydrate_resident(db: &mut sqlite::Sqlite) -> ScanIndex {
-    let mut index = import::Mapper.hydrate_context(db).unwrap().0;
+    let mut index = import::hydrate_context(db).unwrap().0;
     let mut tx = db.begin(TxnMode::Read).unwrap();
     kinds_accounts::materialize(&mut tx, &mut index).unwrap();
     index
@@ -195,8 +190,6 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         fence_generation: index.generation + 1,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();

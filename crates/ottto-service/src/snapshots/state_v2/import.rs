@@ -39,113 +39,85 @@ impl Pace {
     }
 }
 
-/// Raw inventory and parity proof precede publication. The four semantic
-/// adapters share a transaction and context in `kinds`; this boundary owns
-/// their integration with runtime CAS.
-pub(super) struct Mapper;
-impl Mapper {
-    /// Enumerate the complete reference list packed in this row, including
-    /// repeated edges. Shared values must not reference other shared values.
-    pub(super) fn references(
-        header: &Header,
-        value: &dyn Value,
-        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
-    ) -> Result<()> {
-        kinds::references(header, value, refs)
+/// Raw inventory and parity proof precede publication.
+pub(super) fn inventory_context(path: &Path) -> std::result::Result<Option<Original>, Pause> {
+    Original::read(path).map(Some)
+}
+pub(super) fn import_generation(index: &ScanIndex) -> Result<u64> {
+    index
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| Pause::Oversize.into())
+}
+pub(super) fn import_graph(
+    store: &mut sqlite::Sqlite,
+    index: &ScanIndex,
+    original: Option<&Original>,
+) -> Result<KindCx> {
+    let original = original.ok_or(Pause::Mismatch)?;
+    original.unchanged()?;
+    let mut tx = store.begin(TxnMode::Write)?;
+    let identity = identity(&mut tx)?;
+    let generation = import_generation(index)?;
+    anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
+    let mut cx = KindCx::default();
+    cx.binding = Some(identity.binding.clone());
+    cx.presence = original.presence.clone();
+    kinds::populate(index, &mut tx, &mut cx)?;
+    anyhow::ensure!(
+        tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
+        Pause::Mismatch
+    );
+    // A COMMIT advanced control.generation; the proof must compare the
+    // normalized G graph against that one deliberate G+1 control change.
+    let mut tx = store.begin(TxnMode::Read)?;
+    verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+}
+/// Read every semantic row through Transaction::read_value, verifying
+/// value digests while decoding. Never return
+/// a partially hydrated graph or normalize unknown raw holds away.
+pub(super) fn hydrate_context(store: &mut sqlite::Sqlite) -> Result<(ScanIndex, KindCx)> {
+    let mut tx = store.begin(TxnMode::Read)?;
+    let header = tx
+        .get(&RowKey::Meta("identity".into()))?
+        .ok_or(Hold::ForeignBinding)?;
+    anyhow::ensure!(header.len <= CONTROL_BYTES, Hold::DbUnavailable);
+    let mut bytes = Vec::new();
+    tx.read_value(&header, &mut bytes)?;
+    let identity: Identity = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(v2_on(identity.binding.source), Hold::ForeignBinding);
+    kinds::hydrate_txn(&mut tx, identity.binding)
+}
+/// The one production save: merge current CAS custody, then run the
+/// semantic delta under the resident committed context. Emit the complete
+/// dirty delta with per-key SQLite header reads. Saves above 5k rows /
+/// 32 MiB reduce the next collection page; the whole save rolls back at its
+/// hard ceiling. More than 64 account windows is an alarm, never permission
+/// to drop unsettled custody. KEEP persisted shared refs: decode only each
+/// changed row's old refs, diff against new refs, adjust/reclaim in this
+/// transaction. Never perform whole-history GC during a save.
+pub(super) fn save(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    previous: kinds::Baseline,
+    next: &mut ScanIndex,
+    cx: &mut KindCx,
+    claim_only: bool,
+) -> Result<kinds::Baseline> {
+    {
+        let mut tx = db.begin(TxnMode::Read)?;
+        kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
+        kinds_files::merge_growth_cas(&mut tx, next)?;
     }
-    /// Emit ALL private text from key, fixed/header, labels/aliases and raw
-    /// holds, as well as packed values. Replacements must retain none silently.
-    pub(super) fn private_paths(
-        header: &Header,
-        value: &dyn Value,
-        paths: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
-        kinds::private_paths(header, value, paths)
+    super::super::sampled_audit::prune_growth_retention(
+        next,
+        super::super::sampled_scan::now_seconds(),
+    );
+    if !claim_only {
+        next.retire_committed_claude_account_pending_windows();
     }
-    pub(super) fn inventory_context(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<Option<Original>, Pause> {
-        Original::read(path).map(Some)
-    }
-    pub(super) fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
-        index
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| Pause::Oversize.into())
-    }
-    pub(super) fn import_graph<S: Store>(
-        &self,
-        store: &mut S,
-        index: &ScanIndex,
-        original: Option<&Original>,
-    ) -> Result<KindCx> {
-        let original = original.ok_or(Pause::Mismatch)?;
-        original.unchanged()?;
-        let mut tx = store.begin(TxnMode::Write)?;
-        let identity = identity(&mut tx)?;
-        let generation = self.import_generation(index)?;
-        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
-        let mut cx = KindCx::default();
-        cx.binding = Some(identity.binding.clone());
-        cx.presence = original.presence.clone();
-        kinds::populate(index, &mut tx, &mut cx)?;
-        anyhow::ensure!(
-            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
-            Pause::Mismatch
-        );
-        // A COMMIT advanced control.generation; the proof must compare the
-        // normalized G graph against that one deliberate G+1 control change.
-        let mut tx = store.begin(TxnMode::Read)?;
-        verify_normalized_at(&mut tx, index, original, identity.binding, generation)
-    }
-    /// Read every semantic row through Transaction::read_value, verifying
-    /// value digests while decoding. Never return
-    /// a partially hydrated graph or normalize unknown raw holds away.
-    pub(super) fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
-        let mut tx = store.begin(TxnMode::Read)?;
-        let header = tx
-            .get(&RowKey::Meta("identity".into()))?
-            .ok_or(Hold::ForeignBinding)?;
-        anyhow::ensure!(header.len <= CONTROL_BYTES, Hold::DbUnavailable);
-        let mut bytes = Vec::new();
-        tx.read_value(&header, &mut bytes)?;
-        let identity: Identity = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(v2_on(identity.binding.source), Hold::ForeignBinding);
-        kinds::hydrate_txn(&mut tx, identity.binding)
-    }
-    /// The one production save: merge current CAS custody, then run the
-    /// semantic delta under the resident committed context. Emit the complete
-    /// dirty delta with per-key SQLite header reads. Saves above 5k rows /
-    /// 32 MiB reduce the next collection page; the whole save rolls back at its
-    /// hard ceiling. More than 64 account windows is an alarm, never permission
-    /// to drop unsettled custody. KEEP persisted shared refs: decode only each
-    /// changed row's old refs, diff against new refs, adjust/reclaim in this
-    /// transaction. Never perform whole-history GC during a save.
-    pub(super) fn save(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        previous: kinds::Baseline,
-        next: &mut ScanIndex,
-        cx: &mut KindCx,
-        claim_only: bool,
-    ) -> Result<kinds::Baseline> {
-        {
-            let mut tx = db.begin(TxnMode::Read)?;
-            kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
-            kinds_files::merge_growth_cas(&mut tx, next)?;
-        }
-        super::super::sampled_audit::prune_growth_retention(
-            next,
-            super::super::sampled_scan::now_seconds(),
-        );
-        if !claim_only {
-            next.retire_committed_claude_account_pending_windows();
-        }
-        super::super::lenient_decode::check_held_output(next)?;
-        kinds::save_graph(db, identity, previous, next, cx)
-    }
+    super::super::lenient_decode::check_held_output(next)?;
+    kinds::save_graph(db, identity, previous, next, cx)
 }
 
 fn identity(tx: &mut dyn Transaction) -> Result<Identity> {
@@ -634,11 +606,11 @@ impl Original {
             .retry_identity(proposed)
     }
     #[cfg(test)]
-    pub(super) fn seal_progress<S: Store>(
+    pub(super) fn seal_progress(
         &self,
         path: &Path,
         identity: &Identity,
-        store: &mut S,
+        store: &mut sqlite::Sqlite,
     ) -> Result<()> {
         self.verify_baseline(path)?;
         self.progress
@@ -935,8 +907,6 @@ mod application_cases {
         fn store(&self) -> sqlite::Sqlite {
             let mut db =
                 sqlite::Sqlite::create_import(&self.dir.join("proof.v2.sqlite.import")).unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control(
                 "identity",
                 &Identity {
@@ -980,13 +950,9 @@ mod application_cases {
             let mut db =
                 sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
                     .unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &generation).unwrap();
-            let verified = Mapper
-                .import_graph(&mut db, &index, Some(&original))
-                .unwrap();
+            let verified = import_graph(&mut db, &index, Some(&original)).unwrap();
             assert_eq!(
                 index.generation, generation,
                 "unpublished input is unchanged"
@@ -1091,11 +1057,9 @@ mod application_cases {
             let mut db =
                 sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
                     .unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &0_u64).unwrap();
-            let result = Mapper.import_graph(&mut db, &index, Some(&original));
+            let result = import_graph(&mut db, &index, Some(&original));
             let key = mapper::key("scan_state.traversal", "", 0).unwrap();
             result.unwrap();
             let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1104,7 +1068,7 @@ mod application_cases {
             let stored = mapper::bytes(&mut tx, &header).unwrap();
             assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), expected);
             drop(tx);
-            let restored = Mapper.hydrate_context(&mut db).unwrap().0;
+            let restored = hydrate_context(&mut db).unwrap().0;
             assert_eq!(serde_json::to_vec(&restored.traversal).unwrap(), expected);
             original.capture_progress(&c.path).unwrap();
             original.preserve(&c.path).unwrap();
@@ -1112,7 +1076,7 @@ mod application_cases {
                 .publish_import(&c.path, &identity, db, &mut false)
                 .unwrap();
             let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
-            let mut current = super::super::runtime::load_locked(&c.path, None, true)
+            let mut current = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
                 .unwrap();
@@ -1123,7 +1087,7 @@ mod application_cases {
                     .unwrap_err();
             // Value admission is save pressure: the paced named hold, not DbUnavailable.
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-            let reloaded = super::super::runtime::load_locked(&c.path, None, true)
+            let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
                 .unwrap();
@@ -1155,13 +1119,9 @@ mod application_cases {
         };
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &identity).unwrap();
         db.control("generation", &9_u64).unwrap();
-        Mapper
-            .import_graph(&mut db, &index, Some(&original))
-            .unwrap();
+        import_graph(&mut db, &index, Some(&original)).unwrap();
         original
             .progress
             .as_ref()
@@ -1179,7 +1139,7 @@ mod application_cases {
         let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
         let loaded = super::super::runtime::load_locked(
             &c.path,
-            None,
+            false,
             super::super::runtime::published(&c.path).unwrap(),
         )
         .unwrap()

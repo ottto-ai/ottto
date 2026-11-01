@@ -3,6 +3,9 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+const ERASURE_DEADLINE: Duration = Duration::from_secs(86400);
+const ERASURE_WORK_BUDGET: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy)]
 pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
@@ -14,8 +17,8 @@ pub(in super::super) struct PurgePolicy {
 impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_secs(24 * 60 * 60),
-            work: Duration::from_secs(2),
+            deadline: ERASURE_DEADLINE,
+            work: ERASURE_WORK_BUDGET,
             space: free_space,
             save_ceiling: SAVE_CEILING_BYTES,
         }
@@ -243,6 +246,7 @@ fn free_space(path: &Path) -> Option<u64> {
 }
 
 impl Sqlite {
+    #[cfg(test)]
     pub(in super::super) fn set_purge_policy(
         &mut self,
         deadline: Duration,
@@ -619,61 +623,59 @@ impl Sqlite {
         }
 
         if window == Some(true) {
-            if let Some(extract) = self.references {
-                let last = self.read_control::<u64>("reference_check_success")?;
-                let attempt = self.read_control::<u64>("reference_check_attempt")?;
-                if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
-                    && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
-                {
-                    self.control("reference_check_attempt", &now)?;
-                    let gauge_due = self
-                        .read_control::<u64>("growth_gauge_attempt")?
-                        .map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
-                    let mut growth = if gauge_due {
-                        // Persist admission before sampling, including partial or failed work.
-                        self.control("growth_gauge_attempt", &now)?;
-                        Some(StoreGrowth {
-                            partial: true,
-                            ..Default::default()
-                        })
-                    } else {
-                        None
-                    };
-                    self.conn()?.execute_batch("BEGIN")?;
-                    let budget = size_budget(self.logical_bytes()?, 10);
-                    let started = Instant::now();
-                    let result = limited(self.conn()?, budget, || {
-                        if let Some(growth) = &mut growth {
-                            let _ = growth.pages(self.conn()?);
-                        }
-                        // Reference verification retains priority; sampling shares its VM budget.
-                        let result = references::verify_counts(self.conn()?, extract);
-                        if let Some(growth) = &mut growth {
-                            let complete = growth.rows(self.conn()?, started, budget).is_ok();
-                            growth.partial = !complete || growth.page_size.is_none();
-                        }
-                        result
-                    });
-                    self.conn()?.execute_batch("ROLLBACK")?;
-                    if let Some(growth) = growth {
-                        super::super::telemetry::event("store_growth", &growth);
+            let extract = self.references;
+            let last = self.read_control::<u64>("reference_check_success")?;
+            let attempt = self.read_control::<u64>("reference_check_attempt")?;
+            if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
+                && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
+            {
+                self.control("reference_check_attempt", &now)?;
+                let gauge_due = self
+                    .read_control::<u64>("growth_gauge_attempt")?
+                    .map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
+                let mut growth = if gauge_due {
+                    // Persist admission before sampling, including partial or failed work.
+                    self.control("growth_gauge_attempt", &now)?;
+                    Some(StoreGrowth {
+                        partial: true,
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
+                self.conn()?.execute_batch("BEGIN")?;
+                let budget = size_budget(self.logical_bytes()?, 10);
+                let started = Instant::now();
+                let result = limited(self.conn()?, budget, || {
+                    if let Some(growth) = &mut growth {
+                        let _ = growth.pages(self.conn()?);
                     }
-                    match result {
-                        Ok(()) => self.control("reference_check_success", &now)?,
-                        Err(error)
-                            if error.downcast_ref::<super::super::Hold>()
-                                == Some(&super::super::Hold::ReferenceDrift) =>
-                        {
-                            self.stats.reference_drift =
-                                self.stats.reference_drift.saturating_add(1);
-                            super::super::telemetry::event("reference_drift", &1);
-                            self.control("reference_drift", &1_u64)?;
-                            return Err(error);
-                        }
-                        Err(_) => {
-                            self.stats.reference_check_failed =
-                                self.stats.reference_check_failed.saturating_add(1);
-                        }
+                    // Reference verification retains priority; sampling shares its VM budget.
+                    let result = references::verify_counts(self.conn()?, extract);
+                    if let Some(growth) = &mut growth {
+                        let complete = growth.rows(self.conn()?, started, budget).is_ok();
+                        growth.partial = !complete || growth.page_size.is_none();
+                    }
+                    result
+                });
+                self.conn()?.execute_batch("ROLLBACK")?;
+                if let Some(growth) = growth {
+                    super::super::telemetry::event("store_growth", &growth);
+                }
+                match result {
+                    Ok(()) => self.control("reference_check_success", &now)?,
+                    Err(error)
+                        if error.downcast_ref::<super::super::Hold>()
+                            == Some(&super::super::Hold::ReferenceDrift) =>
+                    {
+                        self.stats.reference_drift = self.stats.reference_drift.saturating_add(1);
+                        super::super::telemetry::event("reference_drift", &1);
+                        self.control("reference_drift", &1_u64)?;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        self.stats.reference_check_failed =
+                            self.stats.reference_check_failed.saturating_add(1);
                     }
                 }
             }

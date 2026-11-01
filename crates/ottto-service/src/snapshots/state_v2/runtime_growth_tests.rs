@@ -57,8 +57,6 @@ impl Fixture {
         };
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&path, ".v2.sqlite.import")).unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &identity).unwrap();
         db.control("generation", &0_u64).unwrap();
         let mut cx = KindCx::default();
