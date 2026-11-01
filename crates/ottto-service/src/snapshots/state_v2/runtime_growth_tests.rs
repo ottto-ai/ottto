@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshots::{
     candidate_from_traversal_path, local_index_key, open_and_identify_scan_candidate_at,
-    sampled_audit, sampled_scan, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
+    sampled_audit, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
     LOCAL_SCAN_INDEX_IDENTITY_VERSION,
 };
 use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -107,7 +107,6 @@ impl Fixture {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0

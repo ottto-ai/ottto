@@ -2726,6 +2726,29 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         }
         let ds = durable_source(source).unwrap();
         let digest = store::key_digest(ds, &key);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
+        // Capture requires an eligible predecessor before the later storage fault.
+        let binding = {
+            let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source)
+            else {
+                panic!("native fixture binding lease")
+            };
+            let counting = acquired::ImmutableCounting::from_reduction(&reduction).unwrap();
+            let binding = cache
+                .live_binding(
+                    ds,
+                    source,
+                    &key,
+                    checkpoint.scope(),
+                    &ScanIndex::default(),
+                    effective_revision(source),
+                    &counting,
+                    &mut lease,
+                )
+                .expect("native fixture binding");
+            lease.release();
+            binding
+        };
         let mut disk = fixture::store(&index_path, ds);
         disk.write_after_save(
             lock,
@@ -2733,13 +2756,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             0,
             vec![PendingRecord {
                 acquisition: fixture_acquisition(source),
-                binding: Binding {
-                    source: ds,
-                    key: digest,
-                    context: [0; 32],
-                    scope: [0; 32],
-                    entry: [0; 32],
-                },
+                binding,
                 certificate: certificate(&path, &namespace),
                 body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
                 allowlist: codec::allowlist_digest(source),
@@ -2755,7 +2772,6 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         ));
         // Acquire genuine native custody while the predecessor is still valid.
         // The following corruption is a later storage fault, not capture authority.
-        let cache = fixture::cache(source, &index_path, &namespace, false);
         let completed = if arm == "codec" {
             native_v3_completion(&cache, &path, source, reduction, checkpoint)
         } else {
@@ -5622,20 +5638,26 @@ fn b1g_owned(
     root: &Path,
     committed: &ScanIndex,
 ) -> OwnedSourceScan {
-    OwnedSourceScan::new_with_identity_capture(
+    let mut index = committed.clone();
+    index.activate_effective_upload_body_witness_revision(effective_revision(
         SnapshotSource::ClaudeCode,
-        roots,
-        committed.clone(),
-        "2026-08-02T08:00:00Z",
-        183,
-        100,
-        false,
-        Some(root),
-        &[],
-        false,
-        false,
-    )
-    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()))
+    ));
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            roots,
+            index,
+            "2026-08-02T08:00:00Z",
+            183,
+            100,
+            false,
+            Some(root),
+            &[],
+            false,
+            false,
+        )
+        .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()))
+    })
 }
 
 fn b1g_scan(
@@ -5645,8 +5667,10 @@ fn b1g_scan(
     _index_path: &Path,
     committed: &mut ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let owned = b1g_owned(owner, roots, root, committed);
-    fixture::scan_modes(owned, 100_000)
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let owned = b1g_owned(owner, roots, root, committed);
+        fixture::scan_modes(owned, 100_000)
+    })
 }
 
 /// [money] b1g absent growth twice overflow cancel restart exact body and idle.
@@ -5853,18 +5877,20 @@ fn b1g_before_read(
     root: &Path,
     committed: &ScanIndex,
 ) -> OwnedSourceScan {
-    let mut owned = b1g_owned(owner, roots, root, committed);
-    for _ in 0..100_000 {
-        let OwnedSourceScanStep::Pending(next) = owned.step(None) else {
-            panic!("native input was never attached");
-        };
-        if let Some(active) = next.active_file.as_ref() {
-            assert_eq!(active.parser.reader.consumed_bytes(), 0);
-            return next;
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let mut owned = b1g_owned(owner, roots, root, committed);
+        for _ in 0..100_000 {
+            let OwnedSourceScanStep::Pending(next) = owned.step(None) else {
+                panic!("native input was never attached");
+            };
+            if let Some(active) = next.active_file.as_ref() {
+                assert_eq!(active.parser.reader.consumed_bytes(), 0);
+                return next;
+            }
+            owned = next;
         }
-        owned = next;
-    }
-    panic!("native input was never reached");
+        panic!("native input was never reached");
+    })
 }
 
 /// [money] b1 future accepted floor blocks fresh cancelled and restarted inputs before read.
@@ -7015,7 +7041,7 @@ fn b4_structural_transition(near_cap: bool) {
     );
     assert!(
         index
-            .accepted_rebuild_incidence
+            .file_snapshot_fingerprints
             .get(&key)
             .is_some_and(|set| !set.is_empty()),
         "real accepted incidence before holding growth"
@@ -7091,7 +7117,12 @@ fn b4_structural_transition(near_cap: bool) {
     next.save(&index_path).unwrap();
     index = next;
     append("growth-2");
-    let old_incidence = index.accepted_rebuild_incidence.clone();
+    let old_incidence = index.file_snapshot_fingerprints.clone();
+    let old_carried = index.accepted_rebuild_incidence.clone();
+    let old_accepted = index.accepted_snapshot_fingerprints.clone();
+    assert!(old_incidence[&key]
+        .iter()
+        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
     assert!(
         old_incidence.get(&key).is_some_and(|set| !set.is_empty()),
         "nonempty prune premise"
@@ -7108,9 +7139,11 @@ fn b4_structural_transition(near_cap: bool) {
             "old size retained for Parse"
         );
         assert_eq!(
-            held.accepted_rebuild_incidence, old_incidence,
+            held.file_snapshot_fingerprints, old_incidence,
             "no incidence prune"
         );
+        assert_eq!(held.accepted_rebuild_incidence, old_carried);
+        assert_eq!(held.accepted_snapshot_fingerprints, old_accepted);
         assert_eq!(
             serde_json::to_value(&held.claude_request_census).unwrap(),
             old_census,
@@ -7249,8 +7282,13 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
             .is_empty(),
         "real nonempty census evidence"
     );
-    let incidence = index.accepted_rebuild_incidence.clone();
+    let incidence = index.file_snapshot_fingerprints.clone();
+    let carried = index.accepted_rebuild_incidence.clone();
+    let accepted = index.accepted_snapshot_fingerprints.clone();
     assert!(incidence.get(&key).is_some_and(|s| !s.is_empty()));
+    assert!(incidence[&key]
+        .iter()
+        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
     use std::io::Write;
     let row = a0h_row("warm-growth", 25).replace(
         "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
@@ -7302,7 +7340,9 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
         census,
         "no census prune at terminal"
     );
-    assert_eq!(held.accepted_rebuild_incidence, incidence);
+    assert_eq!(held.file_snapshot_fingerprints, incidence);
+    assert_eq!(held.accepted_rebuild_incidence, carried);
+    assert_eq!(held.accepted_snapshot_fingerprints, accepted);
     blocked
         .lock()
         .unwrap()
@@ -9398,6 +9438,9 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                         "actual carry clear: {arm}"
                     );
                 }
+                // Request a fresh metadata census at each restart; a retained
+                // traversal otherwise keeps the previous window's clock.
+                prior.traversal = None;
                 let owner = E2ScanFixture::default();
                 owner.begin_durable(source, &root, &index_path);
                 let ((page, consumed), samples) =
@@ -9688,6 +9731,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             );
             let ((), alarms) =
                 crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+            let alarms = alarms
+                .into_iter()
+                .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+                .collect::<Vec<_>>();
             assert_eq!(alarms.len(), 1);
             assert_eq!(
                 alarms[0]["counts"]["old_binding_no_match"],
@@ -9754,6 +9801,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         };
         let ((), alarms) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+        let alarms = alarms
+            .into_iter()
+            .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+            .collect::<Vec<_>>();
         assert_eq!(
             alarms
                 .first()
@@ -9858,6 +9909,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
         let ((), alarms) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+        let alarms = alarms
+            .into_iter()
+            .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+            .collect::<Vec<_>>();
         assert_eq!(alarms.len(), 1);
         assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
         assert_eq!(alarms[0]["source"], "claude_code");
@@ -9868,6 +9923,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         assert_eq!(alarms[0]["counts"]["held_keys"], serde_json::json!([0, 0]));
         let ((), alarms) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+        let alarms = alarms
+            .into_iter()
+            .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+            .collect::<Vec<_>>();
         assert!(alarms.is_empty(), "no duplicate alarm delta");
         let emitted = a1a_wire(&root, &mut index, &mut scan);
         assert_eq!(scan.snapshots.len(), 1);
@@ -10076,6 +10135,10 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     assert_eq!(first_body, a1a_wire(&root, &mut ci, &mut cs));
     let ((), alarms) =
         crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    let alarms = alarms
+        .into_iter()
+        .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+        .collect::<Vec<_>>();
     assert_eq!(alarms.len(), 1);
     assert_eq!(
         alarms[0]["counts"]["old_binding_no_match"],
@@ -10252,6 +10315,10 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     assert_eq!(released_body, a1a_wire(&root, &mut ci, &mut cs));
     let ((), alarms) =
         crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    let alarms = alarms
+        .into_iter()
+        .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+        .collect::<Vec<_>>();
     assert_eq!(alarms.len(), 1);
     assert_eq!(
         alarms[0]["counts"]["old_binding_no_match"],
@@ -10300,6 +10367,10 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     assert_eq!(restarted_body, a1a_wire(&root, &mut ci, &mut cs));
     let ((), alarms) =
         crate::local_resource_diagnostics::capture(|| restarted.cache.durable_alarm(source));
+    let alarms = alarms
+        .into_iter()
+        .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
+        .collect::<Vec<_>>();
     assert_eq!(alarms.len(), 1);
     assert_eq!(
         alarms[0]["counts"]["old_binding_no_match"],
@@ -10471,6 +10542,14 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             .unwrap()
             .write_all(suffix.as_bytes())
             .unwrap();
+        // Freeze creation before the certificate. A later fixed-time mtime
+        // edit must not also change creation time on APFS.
+        let file = File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_200))
+            .unwrap();
+        let birth = file.metadata().unwrap().created().unwrap();
         let index_path = root.join("index.json");
         let key = local_index_key(&path);
         let namespace = Scope("p3-a2-resource".into());
@@ -10552,6 +10631,7 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
             ))
             .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().created().unwrap(), birth);
         // Preserve the real census: removing it forces an authority-family
         // replay and bypasses optional restore even for the equal-size row.
         let ((mut changed, body, modes), events) =

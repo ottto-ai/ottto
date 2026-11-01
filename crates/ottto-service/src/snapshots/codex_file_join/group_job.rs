@@ -419,7 +419,6 @@ impl GroupBoot {
                 growth: None,
             },
             false,
-            sampled_scan::now_seconds(),
             cache,
         ) else {
             return Boot::Strict;

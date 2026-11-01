@@ -71,6 +71,14 @@ fn failure(reason: Reason, layer: Layer) -> Block {
 
 /// No special files, redirects, unbounded reads or parse-error-as-empty layers.
 pub(super) fn read_layer(path: &Path, layer: Layer) -> Result<Option<String>, Block> {
+    read_layer_bytes(path, layer)?
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|_| failure(Reason::SettingsUnreadable, layer))
+        })
+        .transpose()
+}
+
+fn read_layer_bytes(path: &Path, layer: Layer) -> Result<Option<Vec<u8>>, Block> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
@@ -88,14 +96,34 @@ pub(super) fn read_layer(path: &Path, layer: Layer) -> Result<Option<String>, Bl
     if !metadata.is_file() || metadata.len() > 1024 * 1024 {
         return Err(failure(Reason::SettingsUnreadable, layer));
     }
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     file.take(1024 * 1024 + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|_| failure(Reason::SettingsUnreadable, layer))?;
-    if text.len() > 1024 * 1024 {
+    if bytes.len() > 1024 * 1024 {
         return Err(failure(Reason::SettingsUnreadable, layer));
     }
-    Ok(Some(text))
+    Ok(Some(bytes))
+}
+
+/// The Codex desktop app keeps ordinary preferences in the user's
+/// com.openai.codex domain; Codex reads managed config only from these keys.
+fn refuse_codex_managed_keys(path: &Path) -> Result<(), Block> {
+    let Some(bytes) = read_layer_bytes(path, Layer::Managed)? else {
+        return Ok(());
+    };
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|_| failure(Reason::SettingsMalformed, Layer::Managed))?;
+    let preferences = value
+        .as_dictionary()
+        .ok_or_else(|| failure(Reason::SettingsMalformed, Layer::Managed))?;
+    if ["config_toml_base64", "requirements_toml_base64"]
+        .iter()
+        .any(|key| preferences.contains_key(key))
+    {
+        return Err(failure(Reason::ConfigUnsupported, Layer::Managed));
+    }
+    Ok(())
 }
 
 fn ancestors(cwd: &Path) -> impl Iterator<Item = &Path> {
@@ -313,17 +341,18 @@ pub(super) fn codex(binding: &Binding, cwd: &Path, system_dir: &Path) -> Result<
         Layer::Managed,
     )?;
     refuse_present(&binding.root.join("managed_config.toml"), Layer::Managed)?;
-    for path in [
-        binding
+    refuse_present(
+        &PathBuf::from("/Library/Managed Preferences")
+            .join(&binding.user.name)
+            .join("com.openai.codex.plist"),
+        Layer::Managed,
+    )?;
+    refuse_codex_managed_keys(
+        &binding
             .user
             .home
             .join("Library/Preferences/com.openai.codex.plist"),
-        PathBuf::from("/Library/Managed Preferences")
-            .join(&binding.user.name)
-            .join("com.openai.codex.plist"),
-    ] {
-        refuse_present(&path, Layer::Managed)?;
-    }
+    )?;
     if let Some(raw) = read_layer(&binding.root.join("config.toml"), Layer::User)? {
         let doc = raw
             .parse::<toml_edit::DocumentMut>()

@@ -60,11 +60,9 @@ appear in this section. Approved upload uses the existing disclosure and consent
 
 ## Local Resource Measurements
 
-The default-OFF state-v2 backend uses stage `claude_state_v2` in this same
-local sink. Conversion remains paused while publication integration is incomplete;
-these measurements alone do not establish conversion or rollout acceptance.
-Only opted-in or already active Claude custody enables the resource probes;
-Codex and Pi keep their existing measurements.
+The state-v2 store, Claude's scan-index store, uses stage `claude_state_v2` in
+this same local sink. Only Claude's daemon loads and already active Claude custody
+enable the resource probes; Codex and Pi keep their existing measurements.
 
 | Field | Measurement |
 | --- | --- |
@@ -2113,7 +2111,7 @@ Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
 
-The default-OFF Claude state-v2 route reports current bounded states through the
+The Claude state-v2 route reports current bounded states through the
 existing local resource diagnostics sink, including `growth_claim_refused` labels.
 It keeps CPU/RSS, WAL, import peak versus the same-process v1 load, erasure inventory
 and baseline-age/escalation gauges. It does not maintain a second cumulative event
@@ -2127,6 +2125,9 @@ values, chunks, metadata, tombstones, reference updates and restart staging.
 whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
 `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`row_cap_max` reports the largest written row as a percent of its cap, with its
+kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
+refuse every save of that source.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history.
 These events contain no keys, paths, restart names, reference tuples or digests.

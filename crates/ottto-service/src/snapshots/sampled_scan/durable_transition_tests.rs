@@ -1469,10 +1469,9 @@ fn codex_24b_old_writer_row() {
         assert_eq!(tail.modes, (0, 1, 0));
         assert_eq!(tail.restored, 1);
         assert_eq!(tail.io.rederive_named, 0);
-        assert_eq!(
-            tail.io.consumed,
-            suffix.len() as u64 + tail.io.rederive_head
-        );
+        // Stream consumption excludes the separately counted bounded header replay.
+        assert_eq!(tail.io.consumed, suffix.len() as u64);
+        assert!(tail.io.rederive_head > 0);
         assert!(tail.io.rederive_head <= old_size);
         money_oracle::assert_equivalent(&cold, &tail);
         driver.save_gc(Mode::DiskRestore);

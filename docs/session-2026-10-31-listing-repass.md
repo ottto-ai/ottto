@@ -31,11 +31,6 @@ oversized file found by a re-pass records no debt and stays unobserved: debt
 and loss count are recorded together by the first walk, and a later pass lists
 the file again once it is readable.
 
-Under the opt-in Claude terminal-off switch the pass does not start: its own
-identity-aware rediscovery is the listing there, and it upgrades a pending
-re-listing root to its full walk. This is a temporary exception deleted with
-the switch (#1026).
-
 New files no longer wait for the oversized/unhealthy 6-hour floor: the pass
 finds them within about 30 minutes, without a hint or a restart.
 
