@@ -3,6 +3,9 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+const ERASURE_DEADLINE: Duration = Duration::from_secs(86400);
+const ERASURE_WORK_BUDGET: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy)]
 pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
@@ -14,8 +17,8 @@ pub(in super::super) struct PurgePolicy {
 impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_secs(24 * 60 * 60),
-            work: Duration::from_secs(2),
+            deadline: ERASURE_DEADLINE,
+            work: ERASURE_WORK_BUDGET,
             space: free_space,
             save_ceiling: SAVE_CEILING_BYTES,
         }
@@ -186,6 +189,7 @@ fn free_space(path: &Path) -> Option<u64> {
 }
 
 impl Sqlite {
+    #[cfg(test)]
     pub(in super::super) fn set_purge_policy(
         &mut self,
         deadline: Duration,

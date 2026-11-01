@@ -636,18 +636,6 @@ impl Sqlite {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("state_v2_connection_unavailable"))
     }
-    /// Immutable identity probe must precede a read-write open, WAL recovery,
-    /// settings changes, and SHM creation. The expected identity comes from the
-    /// independently read fence, never from the candidate database.
-    #[cfg(test)]
-    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
-        Self::open_with_policy(
-            path,
-            identity,
-            Duration::from_secs(86400),
-            Duration::from_secs(2),
-        )
-    }
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
@@ -666,16 +654,10 @@ impl Sqlite {
         ensure!(actual == *identity, "state_v2_foreign_binding");
         Ok(())
     }
-    pub(super) fn open_with_policy(
-        path: &Path,
-        identity: &super::Identity,
-        deadline: Duration,
-        work: Duration,
-    ) -> Result<Self> {
-        ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
-            "state_v2_purge_policy"
-        );
+    /// Immutable identity probe must precede a read-write open, WAL recovery,
+    /// settings changes, and SHM creation. The expected identity comes from the
+    /// independently read fence, never from the candidate database.
+    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -747,7 +729,6 @@ impl Sqlite {
             clean: false,
             save_failure: None,
         };
-        store.set_purge_policy(deadline, work)?;
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
