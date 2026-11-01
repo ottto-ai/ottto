@@ -104,6 +104,104 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
     populate(index, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
+/// [regress] previous-layout stores default only newly introduced kinds, then
+/// save them and their inventory atomically; damage in supported kinds refuses.
+#[test]
+fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damage() {
+    let previous_layout = 1;
+    // The released format has no layout control. Also exercise an explicitly
+    // recorded older layout so future additions use the same upgrade rule.
+    for recorded in [false, true] {
+        let (scratch, mut db) = Scratch::store();
+        let index = fixture();
+        commit_populate(&mut db, &index);
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let mut presence: BTreeMap<String, bool> =
+            db.read_control("field_presence").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let mut v1 = serde_json::to_value(&index).unwrap();
+        for (kind, field, introduced) in catalogue::LAYOUTS {
+            if *introduced > previous_layout {
+                mapper::rows(&mut tx, kind, |tx, h| mapper::remove(tx, &h.key)).unwrap();
+                v1.as_object_mut().unwrap().remove(*field);
+                presence.remove(*field);
+            }
+        }
+        tx.delete(&RowKey::Meta("catalogue_layout".into())).unwrap();
+        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+        db.control("field_presence", &presence).unwrap();
+        if recorded {
+            db.control("catalogue_layout", &previous_layout).unwrap();
+        }
+        // Recreate the released writer capability, without the current commit
+        // hook advancing it again. Both controls retain their checksums.
+        sqlite::delete_row_for_test(&db, &RowKey::Meta("minimum_writer_capability".into()));
+        db.control("minimum_writer_capability", &1_u64).unwrap();
+        db.finish_import().unwrap();
+        let mut db =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        db.path_extractor(private_paths);
+        db.reference_extractor(references);
+        let mut expected: ScanIndex = serde_json::from_value(v1).unwrap();
+        expected.generation = 2;
+        let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(cx.layout, previous_layout);
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert!(restored.decode_holds.same_as(&expected.decode_holds));
+        let baseline = baseline(&restored, &mut cx).unwrap();
+        assert!(!baseline
+            .rows
+            .contains_key(&RowKey::Meta("catalogue_layout".into())));
+        assert!(!baseline
+            .rows
+            .contains_key(&RowKey::Meta("field_presence".into())));
+        for (kind, _, introduced) in catalogue::LAYOUTS {
+            if *introduced > previous_layout {
+                assert!(!baseline
+                    .rows
+                    .contains_key(&mapper::key(kind, "", 0).unwrap()));
+            }
+        }
+        super::save_graph(&mut db, &identity, baseline, &mut restored, &mut cx).unwrap();
+        assert_eq!(
+            db.read_control::<u32>("catalogue_layout").unwrap(),
+            Some(catalogue::LAYOUT)
+        );
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for (kind, _, introduced) in catalogue::LAYOUTS {
+                if *introduced > previous_layout {
+                    assert!(
+                        tx.get(&mapper::key(kind, "", 0).unwrap())
+                            .unwrap()
+                            .is_some(),
+                        "{kind}"
+                    );
+                }
+            }
+        }
+        drop(db);
+        let mut db =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        db.path_extractor(private_paths);
+        db.reference_extractor(references);
+        let (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(cx.layout, catalogue::LAYOUT);
+        assert!(cx.presence.contains_key("upload_context_proof"));
+        assert_persisted(&mut db, &restored);
+        assert_eq!(reopened.generation, 3);
+        // A root that the saved layout includes is still damage.
+        sqlite::delete_row_for_test(
+            &db,
+            &mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
+        );
+        assert!(hydrate(&mut db, Scratch::binding()).is_err());
+    }
+}
+
 /// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
 #[test]
 fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {

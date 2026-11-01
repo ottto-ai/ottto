@@ -592,8 +592,6 @@ fn recovery_emission_boundaries(
 
 #[test]
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
-    let _resumed_prefix = e2::ResumedPrefixForTest::set(true);
-    use claude_request_money::e2;
     for map in 0..3 {
         let fixture = Fixture::new();
         let healthy = fixture.load();
