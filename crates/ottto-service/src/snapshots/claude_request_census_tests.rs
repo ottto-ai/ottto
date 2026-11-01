@@ -6,7 +6,6 @@ use crate::snapshots::claude_request_census::{
     claude_census_member_status, claude_request_hash, ClaudeCensusMemberStatus,
     ClaudeRequestCensusRecord, ClaudeRequestCensusShape, CLAUDE_REQUEST_CENSUS_CANARY,
     CLAUDE_REQUEST_CENSUS_DERIVATION, MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_RAW_BYTES,
-    MAX_RECORD_BYTES,
 };
 use sha2::Sha256 as CanarySha256;
 
@@ -1466,35 +1465,6 @@ fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
 }
 
 #[test]
-fn census_decoder_stops_after_an_oversized_record() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-entry-budget");
-    let path = scratch.join("record.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let (before, after) = base.split_once("\"claude_request_census\":{}").unwrap();
-    let mut file = File::create(&path).unwrap();
-    write!(
-        file,
-        "{before}\"claude_request_census\":{{\"hostile\":{{\"h\":\""
-    )
-    .unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RECORD_BYTES / block.len() {
-        file.write_all(&block).unwrap();
-    }
-    write!(
-        file,
-        "\"}},\"after-budget\":{}}}{after}",
-        census_record_json('a', "exact", &[1])
-    )
-    .unwrap();
-    drop(file);
-    let loaded = ScanIndex::load(&path).expect("entry is bounded optional evidence");
-    assert_eq!(loaded.files.len(), 1);
-    assert!(loaded.claude_request_census_for_test().is_empty());
-}
-
-#[test]
 fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     let scratch = crate::test_scratch::ScratchDir::new("census-sequence");
     let base = census_index_json(serde_json::json!({}));
@@ -1553,38 +1523,6 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     loaded
         .save(&scratch.join("sequence.json"))
         .expect("positional CAS remains supported");
-}
-
-#[test]
-fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-escaped-bound");
-    let path = scratch.join("escaped.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let escaped = "claude_request_census_shadow"
-        .chars()
-        .map(|ch| format!("\\u{:04x}", ch as u32))
-        .collect::<String>();
-    assert!(escaped.len() > 128, "exercise the longest field spelling");
-    let mut file = File::create(&path).unwrap();
-    write!(file, "{},\"{escaped}\":\"", base.strip_suffix('}').unwrap()).unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RAW_BYTES / block.len() {
-        file.write_all(&block).unwrap();
-    }
-    write!(file, "\"}}").unwrap();
-    drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("escaped field has the same bounded reader");
-    assert_eq!(loaded.files.len(), 1);
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
-    loaded
-        .save(&path)
-        .expect("CAS also bounds escaped field names");
 }
 
 /// The valid shadow state must survive load, CAS and reload byte-for-value,

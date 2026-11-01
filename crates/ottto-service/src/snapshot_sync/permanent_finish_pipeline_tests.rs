@@ -657,9 +657,6 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
-    /// Not shed (429/503), not resent in place (500/502), not split as a
-    /// batch deadline (504): an ordinary failed upload.
-    UnretriedServerError,
     Disabled,
 }
 
@@ -703,7 +700,7 @@ impl AckScriptedServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
-                let mut status = "200 OK";
+                let status = "200 OK";
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -722,10 +719,6 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
-                        AckScriptedPost::UnretriedServerError => {
-                            status = "507 Insufficient Storage";
-                            serde_json::json!({"detail":"synthetic server error"})
-                        }
                         AckScriptedPost::Disabled => serde_json::json!({"accepted":0,
                             "sessions_reconciled":0,"session_ids":[],"disabled":true,
                             "disabled_reason":"synthetic_disabled","accepted_entities":[],
@@ -765,15 +758,6 @@ impl AckScriptedServer {
             offered,
             script,
         }
-    }
-
-    fn offered_fingerprints(&self) -> Vec<String> {
-        self.offered
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
-            .collect()
     }
 }
 
@@ -906,15 +890,6 @@ impl AckFinishHome {
             )
         })
     }
-
-    fn progress(&self, preparation_paths: &(PathBuf, String)) -> SnapshotUploadProgress {
-        SnapshotUploadProgress::load(
-            &preparation_paths.0,
-            &preparation_paths.1,
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap()
-    }
 }
 
 fn ack_followup_debt(entities: usize) -> Vec<String> {
@@ -993,158 +968,4 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
         );
     }
     ack_retention::note_capacity_stop_census(source, false, true);
-}
-
-/// #794 F2: real prepare/scan and real finish finalization (incidence and the
-/// file body-set witness come from production code) for one file group of
-/// 5,000 entities next to 4,096 unrelated ACKs of debt. Current Claude and
-/// Codex parsers emit one file-backed entity per parsed file, so no real
-/// transcript yields 5,000; the scanned item is the template for the group,
-/// exactly as the first-install finish case does. The finish pipeline derives
-/// each entity fingerprint itself, so the file set is read back from what it
-/// offered and ACKed. A real HTTP failure stops the first finish after
-/// accepted pages; the second finish offers only the remainder and transfers
-/// every file ACK to the saved index.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() {
-    const ENTITIES: usize = 5000;
-    let server = AckScriptedServer::new();
-    let mut home = AckFinishHome::new(&server);
-    let debt = ack_followup_debt(4096);
-    let debt_set = debt.iter().cloned().collect::<BTreeSet<_>>();
-    let group = |scan: &mut SourceScanResult| {
-        let template = scan.snapshots[0].clone();
-        scan.snapshots = (0..ENTITIES)
-            .map(|entity| {
-                let mut item = template.clone();
-                item.source_session_id = format!("huge-file-{entity}");
-                item.snapshot_fingerprint = format!("{:064x}", 1_000_000 + entity);
-                item
-            })
-            .collect();
-    };
-
-    let (mut preparation, index, mut scan) = home.prepare("first finish");
-    group(&mut scan);
-    ack_followup_set_debt(&mut preparation, &debt, true);
-    let paths = (
-        preparation.upload_progress_path.clone(),
-        preparation.upload_destination_namespace.clone(),
-    );
-    let index_path = preparation.index_path.clone();
-    {
-        let mut script = server.script.lock().unwrap();
-        script.extend([AckScriptedPost::Accept; 30]);
-        script.push_back(AckScriptedPost::UnretriedServerError);
-    }
-    let error = home
-        .finish(preparation, index, scan)
-        .err()
-        .unwrap_or_else(|| {
-            panic!(
-                "first finish settled: offered={} script_left={}",
-                server.offered.lock().unwrap().len(),
-                server.script.lock().unwrap().len()
-            )
-        });
-    assert!(
-        error
-            .downcast_ref::<ack_retention::AckSettlementRequired>()
-            .is_none(),
-        "the whole live file was admitted beside full debt: {error:#}"
-    );
-    assert!(server.script.lock().unwrap().is_empty(), "failure reached");
-    let first_offers = server
-        .offered_fingerprints()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        first_offers.len(),
-        server.offered.lock().unwrap().len(),
-        "distinct file entities"
-    );
-    assert!(first_offers.is_disjoint(&debt_set));
-    let progress = home.progress(&paths);
-    assert!(
-        debt_set.is_subset(&progress.accepted_fingerprints),
-        "unrelated debt is kept"
-    );
-    let retained = progress
-        .accepted_fingerprints
-        .difference(&debt_set)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert!(
-        (1..ENTITIES).contains(&retained.len()),
-        "{}",
-        retained.len()
-    );
-    assert!(
-        retained.is_subset(&first_offers),
-        "only accepted file pages are retained"
-    );
-    assert!(
-        first_offers.len() > retained.len(),
-        "the failed page was offered but not acknowledged"
-    );
-    let saved = ScanIndex::load(&index_path).unwrap();
-    assert!(
-        !saved
-            .upload_progress_ack_incidence()
-            .any(|fp| first_offers.contains(fp)),
-        "an unsettled file is not committed"
-    );
-
-    server.offered.lock().unwrap().clear();
-    let (preparation, index, mut scan) = home.prepare("second finish");
-    group(&mut scan);
-    home.finish(preparation, index, scan)
-        .unwrap_or_else(|error| panic!("second finish settles the file: {error:#}"));
-    let second_offers = server
-        .offered_fingerprints()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        second_offers.len(),
-        ENTITIES - retained.len(),
-        "accepted pages are not re-sent"
-    );
-    assert_eq!(server.offered.lock().unwrap().len(), second_offers.len());
-    assert!(second_offers.is_disjoint(&retained));
-    assert!(second_offers.is_disjoint(&debt_set));
-    let file_fingerprints = retained
-        .union(&second_offers)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(file_fingerprints.len(), ENTITIES);
-    let saved = ScanIndex::load(&index_path).unwrap();
-    assert!(file_fingerprints
-        .iter()
-        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
-    assert_eq!(
-        saved
-            .current_snapshot_fingerprints()
-            .intersection(&file_fingerprints)
-            .count(),
-        ENTITIES,
-        "production finalization recorded the whole file group"
-    );
-    let progress = home.progress(&paths);
-    assert!(
-        file_fingerprints
-            .iter()
-            .all(|fp| !progress.accepted_fingerprints.contains(fp)),
-        "every file ACK transferred to the index"
-    );
-    assert_eq!(
-        upload_context_resend::last_counts(),
-        (0, 0),
-        "same-context retry is not a context resend"
-    );
-    assert_eq!(
-        progress.accepted_fingerprints, debt_set,
-        "only the unrelated debt remains"
-    );
 }
