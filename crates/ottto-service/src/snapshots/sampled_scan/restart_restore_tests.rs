@@ -7,10 +7,6 @@ use crate::snapshots::RestartRestoreForTest;
 fn on_without_discovery_is_off_and_diagnostic_counts_one_refused_request() {
     let _refused = RestartRestoreForTest::requested_without_dependency();
     assert!(!restart_restore::enabled());
-    let summary =
-        Counters::default().summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
-    assert!(summary.contains("restart_restore=off"));
-    assert!(summary.contains("restart_restore_on_refused{reason=discovery_dependency}=1"));
     // Exercise the same restart route under the refused request, rather than
     // merely checking the boolean. The nested OFF guard restores this request.
     assert_eq!(restart_restore::on_refused_discovery_dependency(), 1);

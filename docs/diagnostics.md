@@ -1869,41 +1869,19 @@ Conflicting retained predecessors also require their existing writer/receipt
 settlement before another witness can be installed. A failed stat/read is never
 proven absence; unlink's pending directory sync stays in key custody.
 
-`retire_exact_held_first_attempt{source}` is a **process proxy**, emitted with
-`process_id` on the same per-source pass carrier. It counts keys whose first
-retirement attempt in this process lacked authority; a first success followed
-by a later hold does not count. It resets on restart and stores no restart
-streak. Alarm on the server/log side when this proxy is non-zero across more
-than three consecutive starts. It cannot identify a repeated key. If a first
-observation cannot be funded or is reclaimed, the process latches
-`retire_exact_first_attempt_tracking_closed` and stops enrolling first attempts;
-the cumulative total is then a lower bound and a returning key cannot count
-twice. These observations use the existing bounded key custody and do not
-change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
 Codex and Pi report `restored_behind_accepted.published` only when a complete
 restored Tail body below the frozen accepted extent reaches publication.
 
-`rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
-**proxies**, emitted once per source pass as cumulative process totals on the
-existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
-whose first eligible non-quiet (b) restore attempt in this process failed, including
-a fence drop; later failures of the same key do not increment it, and a first
-success followed by failure does not count. Its diagnostic marker shares the
-bounded key custody. Under capacity pressure, idle diagnostic observations and
-expired pacing can be reclaimed; live receipt, discovery and retirement custody
-remain protected. If any first-result marker is forgotten or cannot be funded,
-`rederive_first_attempt_tracking_closed` latches true and no more first results
-are enrolled for this process. The first-failure total is then a lower bound;
-returning keys cannot be counted twice, and diagnostics cannot pin write capacity. The quiet proxy
-counts metadata-only restores returning Pending with zero transcript input.
+`restore_pending_quiet{source}` is emitted once per source pass as a cumulative
+process total on the existing `durable_tail_alarm` carrier with `process_id`.
+It counts metadata-only restores returning Pending with zero transcript input.
 It does not decode obligations and cannot establish `pending_no_obligation`.
-Neither proxy measures a per-key restart streak. Compare process totals using
-`process_id`; they reset on restart and carry no key identity. Full-spend time
-and near-cap use for funded keys also live in key custody, so evicting the paid
-pace node cannot renew either allowance.
+Compare totals using `process_id`; they reset on restart and carry no key identity.
+Full-spend time and near-cap use for funded keys live in key custody, so evicting
+the paid pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 

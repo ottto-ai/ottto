@@ -302,14 +302,8 @@ fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
-    /// Per-process totals, emitted together once at the source pass boundary.
-    rederive_failed_first_attempt: [u64; 3],
     /// Missing authority at the closed set of retirement decision edges.
     pub(crate) retire_exact_held: BTreeMap<&'static str, u64>,
-    /// Process proxy only: no persisted key identity or restart streak.
-    retire_exact_held_first_attempt: [u64; 3],
-    retire_exact_first_attempt_tracking_closed: bool,
-    rederive_first_attempt_tracking_closed: bool,
     restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
     pub(crate) durable_restore_after_selection_clear: u64,
@@ -3329,33 +3323,10 @@ impl SharedCache {
                 stores.owed_overflow[source.slot()] = true;
             }
         }
-        self.record_first_retire_result(source, key, true);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.properties().snapshot.api_slug(),
             &serde_json::json!({"retire_exact_held":{(edge.label()):1}, "retire_exact_held_exit":exit}),
         );
-    }
-
-    fn record_first_retire_result(&self, source: DurableSource, key: store::Digest32, held: bool) {
-        let Some(mut stores) = self.durable() else {
-            return;
-        };
-        if stores.counters.retire_exact_first_attempt_tracking_closed {
-            return;
-        }
-        if stores.fund_debt(key).is_none() {
-            stores.counters.retire_exact_first_attempt_tracking_closed = true;
-            return;
-        }
-        if stores.counters.retire_exact_first_attempt_tracking_closed {
-            return;
-        }
-        let debt = stores.key_debt.get_mut(&key).expect("funded");
-        if debt.first_retire_held.is_none() {
-            debt.first_retire_held = Some(held);
-            stores.counters.retire_exact_held_first_attempt
-                [diagnostic_source_slot(source.properties().snapshot)] += u64::from(held);
-        }
     }
 
     fn retire_or_hold(
@@ -3391,13 +3362,6 @@ impl SharedCache {
     ) {
         #[cfg(test)]
         super::test_hooks::fire(super::test_hooks::Point::BeforeRetireWitness);
-        // Early metadata/object edit edges can fence-drop before scoped
-        // content replay. They share the same first-attempt observation.
-        self.record_first_rederive_result(
-            source.properties().snapshot,
-            record.record.binding.key,
-            true,
-        );
         let Some(mut stores) = self.durable() else {
             return;
         };
@@ -3434,8 +3398,6 @@ impl SharedCache {
         let debt = stores.fund_debt(key).expect("funded");
         debt.retire_source = Some(source);
         debt.rederive_hold = Some(source);
-        drop(stores);
-        self.record_first_retire_result(source, key, false);
     }
 
     /// Head-once is an extent discriminator, never predecessor authority.
@@ -3722,7 +3684,7 @@ impl SharedCache {
                 }
             }
         };
-        if record.format == store::FORMAT_V3 && !crate::heap_layout_bound::layout_supported() {
+        if !crate::heap_layout_bound::layout_supported() {
             let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
             let slot = stores.slot(source).as_mut().ok_or(MissClass::Unavailable)?;
             if slot.decided.len() >= slot.indexed.saturating_add(2 * store::MAX_RECORDS)
@@ -3750,7 +3712,7 @@ impl SharedCache {
             .flatten();
             return Err(MissClass::LayoutUnavailable(audit_debt).into());
         }
-        let original_expected = expected(
+        let mut expected = expected(
             source,
             snapshot_source,
             key,
@@ -3784,10 +3746,9 @@ impl SharedCache {
                 return Err(MissClass::AcceptedFloor.into());
             }
             if source == DurableSource::ClaudeCode
-                && record.format == store::FORMAT_V3
                 && a.strict
                 && a.verified_extent
-                && record.record.binding.context == original_expected.binding.context
+                && record.record.binding.context == expected.binding.context
                 && record.record.certificate.sealed_offset < a.end
             {
                 // A binary without the store may have accepted a newer Full.
@@ -3811,20 +3772,6 @@ impl SharedCache {
         if source == DurableSource::ClaudeCode && interpretation.accepted.is_none() {
             return Err(self.stale("accepted_floor_missing"));
         }
-        let mut expected = expected(
-            source,
-            snapshot_source,
-            key,
-            scope,
-            index,
-            interpretation,
-            Some((
-                record.format,
-                record.record.allowlist,
-                effective_revision(snapshot_source),
-            )),
-        )
-        .ok_or(MissClass::NoEntry)?;
         if source == DurableSource::ClaudeCode {
             let (original, _) = match claude_expected(key, scope, index, interpretation, &record) {
                 Ok(proof) => proof,
@@ -3863,7 +3810,7 @@ impl SharedCache {
                                             false,
                                             source,
                                             &record,
-                                            &original_expected,
+                                            &expected,
                                             RetirementEdge::IndependentEdit,
                                         );
                                         return Err(MissClass::Failure(Failure::Certificate(
@@ -3885,18 +3832,16 @@ impl SharedCache {
             };
             expected = original;
         }
-        if record.format == store::FORMAT_V3 {
-            let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
-            let current = effective_revision(snapshot_source);
-            if acquisition.acquired_revision != current {
-                return Err(self.stale(if acquisition.acquired_revision > current {
-                    "revision_downgrade"
-                } else {
-                    "revision_adoption_required"
-                }));
-            }
-            expected.binding.scope = record.record.binding.scope;
+        let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
+        let current = effective_revision(snapshot_source);
+        if acquisition.acquired_revision != current {
+            return Err(self.stale(if acquisition.acquired_revision > current {
+                "revision_downgrade"
+            } else {
+                "revision_adoption_required"
+            }));
         }
+        expected.binding.scope = record.record.binding.scope;
         let restored = self.durable_restore_record_scoped(
             snapshot_source,
             &record,
@@ -4140,20 +4085,7 @@ impl SharedCache {
         lease: &mut store::ActiveLease,
         v3: Option<V3RestoreScope<'_>>,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
-        let scoped = v3.is_some();
-        let result =
-            self.restore_record_content(source, record, expected, path, scope, held, lease, v3);
-        // Eligible scoped failures include certificate/fence drops. Quiet is
-        // an observation, not a content attempt. OFF uses the native M1 path.
-        if scoped
-            && !matches!(
-                result,
-                Err(Failure::Resource("rederive_quiet") | Failure::Ineligible(_))
-            )
-        {
-            self.record_first_rederive_result(source, record.record.binding.key, result.is_err());
-        }
-        result
+        self.restore_record_content(source, record, expected, path, scope, held, lease, v3)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4235,26 +4167,24 @@ impl SharedCache {
                 "skill_label_consent_off",
             )));
         }
-        if record.format == store::FORMAT_V3 {
-            let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
-            let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
-            let acquired = record
-                .record
-                .acquisition
-                .ok_or(Failure::Corrupt)?
-                .acquired_revision;
-            if record.record.binding.scope
-                != v3_replay_scope(
-                    source,
-                    scope,
-                    inputs.index,
-                    inputs.interpretation,
-                    acquired,
-                    &counting,
-                )
-            {
-                return Err(Failure::Ineligible(store::Ineligible::Scope));
-            }
+        let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
+        let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
+        let acquired = record
+            .record
+            .acquisition
+            .ok_or(Failure::Corrupt)?
+            .acquired_revision;
+        if record.record.binding.scope
+            != v3_replay_scope(
+                source,
+                scope,
+                inputs.index,
+                inputs.interpretation,
+                acquired,
+                &counting,
+            )
+        {
+            return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
         if decoded
             .cutover()
@@ -4329,35 +4259,7 @@ impl SharedCache {
         Ok((checkpoint, reduction, receipt))
     }
 
-    fn record_first_rederive_result(
-        &self,
-        source: SnapshotSource,
-        digest: store::Digest32,
-        failed: bool,
-    ) {
-        let Some(mut stores) = self.durable() else {
-            return;
-        };
-        if stores.counters.rederive_first_attempt_tracking_closed {
-            return;
-        }
-        if stores.fund_debt(digest).is_none() {
-            stores.close_first_rederive_tracking();
-            return;
-        }
-        // Funding may have reclaimed an idle diagnostic marker.
-        if stores.counters.rederive_first_attempt_tracking_closed {
-            return;
-        }
-        let debt = stores.key_debt.get_mut(&digest).expect("funded");
-        if debt.first_rederive_failed.is_none() {
-            debt.first_rederive_failed = Some(failed);
-            stores.counters.rederive_failed_first_attempt[diagnostic_source_slot(source)] +=
-                u64::from(failed);
-        }
-    }
-
-    /// Aggregate process proxies on the existing carrier, once per source pass.
+    /// Metadata-only quiet restores on the existing carrier, once per source pass.
     pub(crate) fn durable_rederive_proxies(&self, source: SnapshotSource) {
         if !restart_restore::enabled() {
             return;
@@ -4366,20 +4268,12 @@ impl SharedCache {
             return;
         };
         let slot = diagnostic_source_slot(source);
-        let failed = stores.counters.rederive_failed_first_attempt[slot];
         let quiet = stores.counters.restore_pending_quiet[slot];
-        let retire_held = stores.counters.retire_exact_held_first_attempt[slot];
-        let retire_tracking_closed = stores.counters.retire_exact_first_attempt_tracking_closed;
-        let stores_tracking_closed = stores.counters.rederive_first_attempt_tracking_closed;
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
             &serde_json::json!({
-                "rederive_failed_first_attempt": failed,
                 "restore_pending_quiet": quiet,
-                "rederive_first_attempt_tracking_closed": stores_tracking_closed,
-                "retire_exact_held_first_attempt": retire_held,
-                "retire_exact_first_attempt_tracking_closed": retire_tracking_closed,
             }),
         );
     }

@@ -3350,11 +3350,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
             assert!(!old.ineligible.contains_key("selection_cleared"));
             assert_eq!(old.ineligible["history_owed"], 1);
             assert_eq!(old.durable_held, [0; 9]);
-            let text = old.summary(source, &disk);
-            assert!(!text.contains("restore_attempts="));
-            assert!(text.contains("disk_records="));
-            assert!(text.contains("not_persisted="));
-            // No new record or recovery operation is performed by these diagnostics.
+            // Inspecting counters performs no record or recovery I/O.
             assert_eq!(disk.records_read, 0);
         } else {
             assert!(cache.durable_counters(source).is_none());
@@ -8461,14 +8457,6 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
                     [diagnostic_source_slot(source)],
                 1
             );
-            assert_eq!(
-                cache
-                    .durable()
-                    .unwrap()
-                    .counters
-                    .rederive_failed_first_attempt,
-                [0; 3]
-            );
             assert!(samples.is_empty());
             assert_eq!(content_reads, 0);
             lease.release();
@@ -8581,9 +8569,9 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
 
 // F4: all certificate edit reasons dominate decode on the production scoped
 // entry. This portable row complements the macOS writer/retirement matrix.
-/// [format] bounded restore certificate edit reasons precede decode and count first failure.
+/// [format] bounded restore certificate edit reasons precede decode.
 #[test]
-fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failure() {
+fn bounded_restore_certificate_edit_reasons_precede_decode() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::{Seek, SeekFrom, Write};
     for reason in [
@@ -8674,14 +8662,6 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             "{reason:?}"
         );
         assert_eq!(reads, 0);
-        assert_eq!(
-            cache
-                .durable()
-                .unwrap()
-                .counters
-                .rederive_failed_first_attempt[1],
-            1
-        );
         lease.release();
     }
 }
@@ -8828,11 +8808,8 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
             .unwrap()
             .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
             .unwrap();
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            cache.queue_rederive_retirement(ds, &record, &expected, edge);
-            cache.queue_rederive_retirement(ds, &record, &expected, edge);
-            cache.durable_rederive_proxies(source);
-        });
+        cache.queue_rederive_retirement(ds, &record, &expected, edge);
+        cache.queue_rederive_retirement(ds, &record, &expected, edge);
         assert_eq!(std::fs::read(&record_path).unwrap(), original);
         assert!(cache.owes_discovery(source, &key));
         {
@@ -8844,16 +8821,7 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
                 stores.counters.retire_exact_held.get(edge.label()),
                 Some(&2)
             );
-            assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         }
-        assert!(rows
-            .iter()
-            .any(|r| r["counts"]["retire_exact_held"][edge.label()] == 1
-                && r["counts"]["retire_exact_held_exit"] == "revalidated_retire_exact"));
-        assert!(rows
-            .iter()
-            .any(|r| r["counts"]["retire_exact_held_first_attempt"] == 1
-                && r["process_id"] == std::process::id()));
         // Named exit: the next verified read re-establishes the same eligible
         // predecessor, then the existing post-save writer runs retire_exact.
         let current = {
@@ -8875,7 +8843,6 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
             stores.counters.ineligible.get("rederive_retire.retired"),
             Some(&1)
         );
-        assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         assert_eq!(stores.key_debt[&binding.key].retire_source, None);
         assert!(!stores.key_debt[&binding.key].retire_sync);
     }
