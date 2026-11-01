@@ -137,6 +137,12 @@ impl ColdSession {
         let view = resident(&cold);
         (cold, view)
     }
+    /// Whether this pass's claim-only growth save moved the store past
+    /// `index`, the working graph a page still saves from.
+    pub(crate) fn claimed_ahead(&self, index: &ScanIndex) -> bool {
+        super::super::sampled_audit::own_growth_claim_generation(index, &self.path)
+            .is_some_and(|generation| generation > index.generation)
+    }
 }
 impl Drop for ColdSession {
     fn drop(&mut self) {

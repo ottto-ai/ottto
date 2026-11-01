@@ -661,7 +661,7 @@ fn cold_row(name: &str) {
         input_clock(&path);
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        let (_custody, v2) = crate::snapshots::StateV2ColdSession::publish(
+        let (custody, v2) = crate::snapshots::StateV2ColdSession::publish(
             &v1,
             &c.base.canonicalize().unwrap().join("cold-session"),
         );
@@ -675,6 +675,12 @@ fn cold_row(name: &str) {
             page.enrich(&c);
             page.finish();
         }
+        // The pass's growth claim saved the store one generation past the
+        // page graph before the page ran; its loads still read at the claim.
+        assert!(
+            custody.claimed_ahead(&pages[1].index),
+            "a claim-only save precedes the cold page"
+        );
         // The cold page read ROOT's stored value: it is loaded (or removed
         // by a decision that loaded it), never left as an unread head.
         assert!(
