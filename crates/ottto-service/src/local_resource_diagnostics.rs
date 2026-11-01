@@ -450,8 +450,9 @@ pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bo
 
 /// A vanished file's index entry was retired while its parsed body was not
 /// ACKed; nothing holds or resends that body. `usage` is the resident
-/// reduction's `(requests, tokens)`; `None` (no copy in RAM) counts in
-/// `totals_unknown_files`, so `requests`/`tokens` are at least. Counted after
+/// reduction's `(requests, tokens)`; `None` (no copy in RAM, or Claude
+/// responses not yet folded) counts in `totals_unknown_files`, so
+/// `requests`/`tokens` are at least. Counted after
 /// the retirement; never a gate.
 pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u64)>) {
     let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
