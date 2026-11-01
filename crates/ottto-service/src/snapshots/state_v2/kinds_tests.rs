@@ -832,7 +832,6 @@ pub(in crate::snapshots) fn compact_reopened_for_test(
         tx.commit(cold.generation - 1, cold.generation),
         DurableCommitOutcome::Committed(cold.generation)
     );
-    drop(tx);
     let counts = serde_json::to_value(&cx.compaction.counts).unwrap();
     db.validate_references().unwrap();
     drop(db);
