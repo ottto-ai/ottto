@@ -1122,6 +1122,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             cache_observations: _, // K (None on Claude)
             cache_observations_state: _, // K (None at into_items)
             cache_base_head_etag: _, // K (None at into_items)
+            cache_conflict_answer: _, // K (None at into_items)
             cache_requests: _, // R
             cache_requests_complete: _, // I
             avg_duration_ms: _, // I

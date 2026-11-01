@@ -161,7 +161,7 @@ fn cause(index: &ScanIndex, key: &str, now: u64) -> Option<&'static str> {
 
     let cause = if contract_retry {
         "activity_or_quarantine_retry"
-    } else if entry.source_file_fingerprint.is_empty() {
+    } else if entry.rearmed() {
         "cleared_fingerprint"
     } else if !entry.has_unverified_source()
         && entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)

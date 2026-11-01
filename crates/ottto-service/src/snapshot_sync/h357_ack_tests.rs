@@ -87,6 +87,7 @@ fn response_with_reason(
         vec![refs.remove(0)]
     };
     SnapshotBatchResponse {
+        conflict_rescans: Default::default(),
         accepted: (items.len() - rejected) as u64,
         sessions_reconciled: 0,
         session_ids: Vec::new(),
@@ -812,6 +813,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
+        evidence_owed: false,
     }
 }
 
@@ -1374,6 +1376,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
                     code: None,
                 })),
                 _ => Ok(SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 0,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),

@@ -1321,3 +1321,68 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         assert_eq!(actual_wire, cold_wire, "complete money and identity bodies survive cold reopen");
     });
 }
+
+/// Invoked by the existing challenge fixture: exercise the same emitted-body
+/// oracle with real account evidence, without adding a second test/receipt name.
+pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
+    assert!(crate::heap_layout_bound::layout_supported(), "placement oracle must execute");
+    with_e2(|| {
+        let mut c = corpus("head-conflict-account-placement");
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":org}}).to_string()+"\n";
+        let path = c.root(ROOT, &(marker(org_a) + &line(ROOT, "r1", AT, 10)));
+        input_clock(&path);
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let disk = Disk::new(&c);
+        let retained = E2ScanFixture::capturing_identity();
+        disk.begin(&retained, SnapshotSource::ClaudeCode);
+        let mut warm = c.raw(&retained, ScanIndex::default(), 100, true, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+        assert!(disk.records() > 0);
+        let switch = json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"session_context","context":{}}}).to_string()+"\n";
+        append(&path, &(switch + &marker(org_b) + &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)));
+        c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
+        input_clock(&path);
+        let restart = E2ScanFixture::capturing_identity();
+        disk.begin(&restart, SnapshotSource::ClaudeCode);
+        let cold = E2ScanFixture::capturing_identity();
+        let mut pages = [
+            c.raw(&retained, prior.clone(), 100, true, &[]),
+            c.raw(&cold, prior.clone(), 100, true, &[]),
+            c.raw(&restart, prior, 100, true, &[]),
+        ];
+        assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
+        assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
+        assert_eq!(pages[2].modes, (0, 1, 0), "restored Tail");
+        assert_eq!(durable_restores(&restart.cache, SnapshotSource::ClaudeCode).1, 1);
+        finish_claude_pages(&c, &mut pages);
+        let receipt = compare_claude_uploads(&pages);
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let item = receipt.items.iter().find(|item| item.source_session_id == ROOT).unwrap();
+        assert_eq!((item.request_count, item.input_tokens), (2, 30));
+        assert_eq!(item.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.0003"));
+        let mut placement = Vec::new();
+        for row in &item.model_usage {
+            let row = serde_json::to_value(row).unwrap();
+            let parts = row.get("identity_parts").and_then(Value::as_array);
+            let parts = parts.map_or(std::slice::from_ref(&row), Vec::as_slice);
+            for part in parts {
+                let evidence = &item.request_evidence[part["evidence_ref"].as_u64().unwrap() as usize];
+                placement.push((evidence.provider_workspace_hash.clone().unwrap(),
+                    part["request_count"].as_u64().unwrap(), part["input_tokens"].as_u64().unwrap(),
+                    part["cost_usd"].as_str().unwrap().to_string()));
+            }
+        }
+        placement.sort();
+        let mut expected = vec![(a, 1, 10, "0.0001".to_string()), (b, 1, 20, "0.0002".to_string())];
+        expected.sort();
+        assert_eq!(placement, expected, "non-vacuous totals AND account placement across all three arms");
+        println!("HEAD_CONFLICT_MONEY_ORACLE VERIFIED arms=cold_full,ram_tail,restored_tail accounts=2 requests=2 input_tokens=30 cost_usd=0.0003");
+    });
+}
