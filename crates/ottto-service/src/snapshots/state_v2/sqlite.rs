@@ -800,6 +800,10 @@ impl Sqlite {
         }
     }
     #[cfg(test)]
+    pub(super) fn validate_references(&self) -> Result<()> {
+        references::verify_counts(self.conn()?, self.references)
+    }
+    #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
         let conn = self.conn()?;
         // A bounded row scan verifies all owner lengths/digests. The separate

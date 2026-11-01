@@ -24,6 +24,9 @@ pub(super) struct KindCx {
     /// Outcomes of the store-only rollovers this save writes. A sibling's
     /// committed rollovers are skipped, and a failed save's are discarded.
     pub(super) archived: Archived,
+    /// Archive reads an ordinary save may spend compacting whole families.
+    pub(super) compact_allowance: Option<usize>,
+    pub(super) compaction: kinds_accounts::Compaction,
     valid: bool,
 }
 
@@ -188,6 +191,7 @@ pub(super) fn delta(
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
     cx.archived = Archived::default();
+    cx.compaction = Default::default();
     let result = (|| {
         let mut rows = mapper::Rows {
             tx: Some(tx),
@@ -269,9 +273,10 @@ pub(super) fn save_graph(
                     count += u64::from(n > 64);
                     windows += n;
                     max = max.max(n);
-                    family
-                        .previous_windows
-                        .saved(ids.split_last().map_or(&[][..], |(_, archived)| archived));
+                    family.previous_windows.saved(
+                        ids.split_last().map_or(&[][..], |(_, archived)| archived),
+                        pending.compaction.done.contains(root),
+                    );
                     uncollapsed += family.previous_windows.uncollapsed() as u64;
                 }
                 if count != 0 {
@@ -285,6 +290,7 @@ pub(super) fn save_graph(
                         "replaced": pending.archived.replaced, "pushed": pending.archived.pushed
                     }),
                 );
+                telemetry::event("account_windows_compacted", &pending.compaction.counts);
                 Ok(digests)
             }
             DurableCommitOutcome::Published(generation) => {
@@ -394,4 +400,4 @@ thread_local! {
 
 #[cfg(test)]
 #[path = "kinds_tests.rs"]
-mod tests;
+pub(super) mod tests;

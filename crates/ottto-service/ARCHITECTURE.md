@@ -32,6 +32,12 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
   accepted: per-file progress and fingerprints, full-scan state, account and usage evidence. It is
   saved atomically under the state directory's single-writer lock.
+- **Account history.** Ordinary Claude state-v2 saves compact stored account-window
+  runs after custody merge and retirement, using the same checked summary as resident
+  retention. Families go in key order and work stops between whole families once
+  the archive-read allowance is spent; a refused family waits for the next load.
+  Queued rollovers and opaque decode holds defer compaction. Row deletion and exact cold
+  metadata publish together; loading stays read-only and idle maintenance owns reclaim.
 - **Record store** (`durable_tail_store.rs`, `durable_tail_codec.rs`): one record per retained
   transcript entry with its running reduction, so a restart can continue from where the RAM cache
   (`transcript_cache.rs`) stopped. It is a cache, never an authority: a record restores only under

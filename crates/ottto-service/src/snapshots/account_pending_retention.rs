@@ -156,13 +156,16 @@ impl ArchivedWindows {
     }
 
     /// After a committed save the store holds the replayed archive.
-    pub(super) fn saved(&mut self, archived: &[u64]) {
+    pub(super) fn saved(&mut self, archived: &[u64], compacted: bool) {
         match self {
             Self::Resident(_) => {}
             Self::Cold(cold) => {
                 cold.stored = archived.len();
                 cold.last_id = archived.last().copied();
                 cold.rolled = Vec::new();
+                if compacted {
+                    cold.uncollapsed = 0;
+                }
             }
         }
     }
@@ -312,6 +315,17 @@ impl ClaudeAccountFamilyPending {
             }
         }
     }
+}
+
+/// One family-level adapter for resident and stored history. Return the original
+/// ordinals only after the shared summary check has accepted their deletion.
+pub(super) fn checked_collapse(
+    windows: &mut Vec<ClaudeAccountFamilyPendingWindow>,
+    current_end: &str,
+) -> Option<Vec<usize>> {
+    let retained = collapse_plan(windows, current_end)?;
+    apply_checked_plan(windows, retained.clone())?;
+    Some(retained)
 }
 
 fn apply_checked_plan(
@@ -512,26 +526,21 @@ impl ScanIndex {
             let before = window_bytes(windows);
             counts.window_bytes_before = counts.window_bytes_before.saturating_add(before);
             let mut after = before;
+            let original = windows.len();
             let plan = if opaque_holds && !windows.is_empty() {
                 None
             } else {
-                collapse_plan(windows, &pending.current.census_window_end)
+                checked_collapse(windows, &pending.current.census_window_end)
             };
             match plan {
                 None => counts.roots_refused = counts.roots_refused.saturating_add(1),
-                Some(retained) => {
-                    // Check proposed summaries before deleting anything. A
-                    // mismatch leaves this root unchanged, without a backup.
-                    match apply_checked_plan(windows, retained) {
-                        None => counts.roots_refused = counts.roots_refused.saturating_add(1),
-                        Some(0) => {}
-                        Some(removed) => {
-                            after = window_bytes(windows);
-                            counts.roots_collapsed = counts.roots_collapsed.saturating_add(1);
-                            counts.windows_collapsed =
-                                counts.windows_collapsed.saturating_add(removed as u64);
-                        }
-                    }
+                Some(_) if original == windows.len() => {}
+                Some(_) => {
+                    after = window_bytes(windows);
+                    counts.roots_collapsed = counts.roots_collapsed.saturating_add(1);
+                    counts.windows_collapsed = counts
+                        .windows_collapsed
+                        .saturating_add((original - windows.len()) as u64);
                 }
             }
             counts.window_bytes_after = counts.window_bytes_after.saturating_add(after);

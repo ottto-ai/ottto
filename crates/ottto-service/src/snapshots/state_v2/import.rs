@@ -117,6 +117,7 @@ pub(super) fn save(
         next.retire_committed_claude_account_pending_windows();
     }
     super::super::lenient_decode::check_held_output(next)?;
+    cx.compact_allowance = (!claim_only).then_some(128);
     kinds::save_graph(db, identity, previous, next, cx)
 }
 
