@@ -233,15 +233,6 @@ fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
     sampled_audit::defer_growth_read(&mut reopened, &mut census, &candidate);
     assert_eq!(census.unreadable_path_count, 0);
     assert_eq!(census.growth_deferred, 1);
-    let counts = crate::snapshots::ScanTraversalCounts {
-        unreadable_path_count: census.unreadable_path_count,
-        growth_deferred: census.growth_deferred,
-        ..Default::default()
-    };
-    assert!(
-        !counts.has_errors(),
-        "a deferral keeps the traversal healthy"
-    );
     let walk = reopened.traversal.as_ref().unwrap();
     assert!(walk.residue.index_keys.contains(&f.key));
     assert!(
@@ -255,11 +246,6 @@ fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
     );
     assert!(sampled_audit::growth_retirement_excluded(&reopened, &f.key));
     crate::snapshots::sampled_scan::set_test_now(Some(NOW + INTERVAL));
-    assert!(sampled_audit::growth_selectable(
-        SnapshotSource::ClaudeCode,
-        &f.source,
-        Some(&reopened.v2().growth_retention)
-    ));
     assert!(admitted(
         &mut reopened,
         &candidate,

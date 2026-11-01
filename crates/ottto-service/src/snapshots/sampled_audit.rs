@@ -2101,15 +2101,15 @@ pub(super) fn queue_growth_retry(index: &mut ScanIndex, candidate: &CandidateFil
     );
 }
 
-/// A refused growth read is a deferral, never an unreadable: the file stays
-/// pending with its debt. A recent claim is not re-queued, since every page
-/// would refuse it again; selection resumes once the claim ages out.
+/// A paced growth read (recent claim) is a deferral, never an unreadable: it
+/// keeps its debt and is not re-queued, since every page would refuse it
+/// again. Any other refusal keeps the re-queue and its unreadable Reduction.
+#[track_caller]
 pub(super) fn defer_growth_read(
     index: &mut ScanIndex,
     census: &mut ScanCensus,
     candidate: &CandidateFile,
 ) {
-    census.growth_deferred = census.growth_deferred.saturating_add(1);
     let key = local_index_key(&candidate.path);
     let now = sampled_scan::now_seconds();
     if !index
@@ -2118,8 +2118,10 @@ pub(super) fn defer_growth_read(
         .get(&key)
         .is_some_and(|state| growth_claim_recent(state, now))
     {
-        return queue_growth_retry(index, candidate);
+        queue_growth_retry(index, candidate);
+        return census.record_unreadable(UnreadableCause::Reduction, 1);
     }
+    census.growth_deferred = census.growth_deferred.saturating_add(1);
     if let Some(walk) = index.traversal.as_mut() {
         walk.residue.index_keys.insert(key);
     }
