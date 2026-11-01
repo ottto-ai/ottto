@@ -86,35 +86,20 @@ pruning and restart. Before release, measure local files, holder groups, copied
 requests, longest resume chain and charged bytes; occupancy above 50% needs
 review before release.
 
-## Default-off release switch
+## Release switch (removed)
 
-The complete resumed-prefix behavior above ships OFF. The one local setting is
-the owner's support-dir marker `claude_resumed_prefix_dedupe_enabled` (a
-regular file, never a symlink or directory), checked like
-`claude_terminal_off_enabled`. Absent keeps released behavior. (It replaced the
-original `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE` environment key, which the
-Companion-owned LaunchAgent could never carry.)
-This controls resumed dedupe, saved-removal use/writes, prefix retry selection
-and expiry, metadata recovery, marker re-derivation and prefix flags/counters.
-Existing all-copy and certified-writer decisions retain their released path
-when OFF. A frozen pre-change native builder from main `d0dcfbc72` pins actual
-upload bytes, hashes and ACK witnesses for a six-file old-writer demo family
-in full and sampled scans. Existing resumed-prefix fixtures explicitly opt in.
-
-For a later authorized local enable, create that marker in the support
-directory. The daemon and the re-read CLI read it once per process, so a
-running daemon applies it from its next start; deleting the marker and
-restarting turns it OFF. This task does not create the marker, restart the
-daemon or inspect private source data.
-Enabling first requires the operator's typed authorization and a money PLAN
-with expected removed requests/dollars and expected own-turn requests for the
-same measurement cohort. Default-ON needs a later release and money review.
+The resumed-prefix behavior above first shipped behind a default-OFF local
+support-dir marker. That switch is gone: resumed-prefix dedupe, saved-removal
+use and writes, prefix retry selection and expiry, metadata recovery, marker
+re-derivation and prefix flags/counters always apply to Claude. The released
+holder path and the frozen pre-change builder that pinned the OFF bytes were
+deleted with it. Codex and Pi are unchanged.
 
 The independent wire capability remains OFF unless the backend advertises
-`copy_unproven:v1`, and cannot bypass local OFF. ON qualifies the upload
-context separately from that capability, so retry bodies cannot cross a local
-mode change. OFF preserves the released context. Stored removal decisions are
-retained but ignored while OFF, ready for a later authorized ON launch.
+`copy_unproven:v1`. Claude upload contexts are qualified by the resumed-prefix
+mode, separately from that capability, so retry bodies persisted under the
+released context cannot replay. Unaffected receipts earned under the released
+base context stay current.
 
 For the post-enable counts-only check, use existing schema-2
 `native_collection_page` records with `source: "claude_code"` and `counts.money`:
@@ -198,11 +183,10 @@ state or upload.
 After the change is merged and installed, money sign-off and a same-cohort
 PLAN are prerequisites for the authorized operator to replace `--estimate`
 with `--apply`. Apply publishes one private create-new request under
-`snapshots/claude-copy-prefix-reread.json`; it does not enable the local switch,
-restart the service, read transcript bodies or upload. Existing intent is never
-overwritten. Only the ordinary daemon, with the existing local switch ON,
-processes it under its sync lock. No helper or implementing agent runs apply,
-enables the switch or starts this re-read.
+`snapshots/claude-copy-prefix-reread.json`; it does not restart the service,
+read transcript bodies or upload. Existing intent is never overwritten. Only
+the ordinary daemon processes it under its sync lock. No helper or
+implementing agent runs apply or starts this re-read.
 
 The daemon rechecks the same closure and validates every member remains indexed, lies inside the
 configured Claude roots and has the same size, creation time and modification
@@ -239,7 +223,7 @@ current daemon readiness and measured page work when scheduling the operation.
 `copy_prefix_families_corrected` is an additional sparse diagnostic count on
 `native_collection_page.counts.money`: distinct families on that page whose
 successfully rebuilt native body removed a proven copied request from an
-uncertified resumed file that local OFF would have emitted. Certified skips,
+uncertified resumed file that the released path would have emitted. Certified skips,
 all-copy files, unresolved holds and unproven emitted prefixes add zero.
 This is a per-page decision event, not a process-wide unique-family ledger;
 repeated reads can count a family again. Add the sum of this field to the
@@ -248,13 +232,13 @@ unproven residuals, held/expired counts and unchanged own-turn counts.
 
 ## Scoped context adoption
 
-Turning the local switch ON alone must not reacquire unchanged unrelated
+Upgrading to resumed-prefix dedupe alone must not reacquire unchanged unrelated
 transcripts. Retry pages, quarantine witnesses and ACK candidates retain the
 source-wide mode-qualified context, so stale bodies and ACKs cannot cross a
 local-mode or wire-capability change. Acquisition receipts use a separate
 expected context: the exact closure members, marked by the one-shot bit, use
 the qualified context; every unrequested file uses the original base context.
-Unchanged unrelated receipts survive ON, capability ON and OFF transitions.
+Unchanged unrelated receipts survive the mode and capability changes.
 Already settled legacy entries without per-file receipts recognize only mode
 variants of the same base. A real privacy-policy, destination or attribution
 context change still uses ordinary context adoption. Planning never creates
@@ -275,10 +259,9 @@ Release disclosure: missing or expired proof, lost removal metadata and later
 expiry of unrecorded removals can preserve the original overcount. These
 residuals are counted and disclosed; unknown usage is never silently zeroed.
 Removed and unproven dollars include only priced telemetry and are partial.
-The local switch remains default OFF, and the separate wire capability is OFF
-without the exact advertised token. Money-owner sign-off, an installed merged
-build and a same-cohort PLAN still precede any authorized operator enable or
-application of a re-read request. Implementation and review do not perform
+The separate wire capability is OFF without the exact advertised token.
+Money-owner sign-off, an installed merged build and a same-cohort PLAN still
+precede any authorized application of a re-read request. Implementation and review do not perform
 those runtime actions.
 
 The request binds that window. Runtime validation uses the SAME effective
