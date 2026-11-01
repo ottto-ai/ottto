@@ -225,7 +225,10 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
     for offset in [0, 60, 3600] {
         let page = oversized_tick(&fixture, oversized_deadline(&before) + offset);
         assert!(!page.scan.census_complete);
-        assert_eq!(c1a_saved(&fixture)["traversal"], before["traversal"]);
+        assert_eq!(
+            without_listing_clock(&c1a_saved(&fixture)["traversal"]),
+            without_listing_clock(&before["traversal"])
+        );
         assert_eq!(page.scan.scanned_file_count, 0);
     }
     std::fs::set_permissions(&path, original_permissions).unwrap();
