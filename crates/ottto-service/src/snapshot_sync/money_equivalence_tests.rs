@@ -435,11 +435,10 @@ fn claude_case(name: &str) {
         }
         let disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
-        let mode: (usize, usize, usize);
-        match name {
+        let mode = match name {
             "quiet_sidecar_growth" => {
                 c.evidence(&[api("r1", 10, 100), api("late-side", 5, 50)], &[]);
-                mode = (0, 0, 1);
+                (0, 0, 1)
             }
             "failed_then_healthy_telemetry" => {
                 // Incomplete telemetry on a live session publishes a token-only
@@ -598,8 +597,8 @@ fn claude_case(name: &str) {
                 receipt(name, &[failed_wire, healthy_wire]);
                 return;
             }
-            _ => mode = claude_change(&c, &path, name),
-        }
+            _ => claude_change(&c, &path, name),
+        };
         if mode.1 > 0 {
             input_clock(&path);
         }
