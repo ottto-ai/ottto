@@ -943,7 +943,6 @@ fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed()
             &[],
             false,
             true,
-            true,
         );
         assert!(
             scan.identified_candidates.is_empty(),
