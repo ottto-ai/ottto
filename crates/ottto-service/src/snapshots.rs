@@ -48211,13 +48211,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
     }
     // `opened_object_identity` stays the live identity: the parse-time TOCTOU
     // check compares against it. Only the re-read trigger uses the adoption.
-    let Ok(adopted_identity) = adopt_stored_changed_time(
-        source,
-        &mut candidate,
-        retention.files,
-        live,
-        &mut opened_file,
-    ) else {
+    let Ok(adopted_identity) =
+        adopt_stored_changed_time(&mut candidate, retention.files, live, &mut opened_file)
+    else {
         census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
         return None;
     };
@@ -48477,7 +48473,6 @@ fn opened_object_identity_and_stat_retained(
 /// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_stored_changed_time(
-    source: SnapshotSource,
     candidate: &mut CandidateFile,
     files: &BTreeMap<String, ScanIndexEntry>,
     live: Option<OpenedObjectStat>,
