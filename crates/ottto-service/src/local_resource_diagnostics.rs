@@ -905,7 +905,7 @@ impl Probe {
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
-                Default::default()
+                self.page_events.with_current().retained_cache_only()
             },
             collection: counts,
             pending,
@@ -2629,6 +2629,12 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
+            // Another source's page: its retained-cache events and nothing else.
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
             probe.collection(
                 "codex",
                 CollectionCounts {
@@ -2651,9 +2657,10 @@ mod tests {
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
-        assert!(rows[1]["counts"]
-            .get("retained_cache_page_events")
-            .is_none());
+        assert_eq!(
+            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
         assert_eq!(rows[2]["stage"], "native_comparison_decision");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],

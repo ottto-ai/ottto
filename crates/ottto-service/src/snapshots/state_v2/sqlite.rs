@@ -374,10 +374,18 @@ fn lock_owner(path: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)?;
     private_file(&path)?;
-    ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "state_v2_exclusive_owner_busy"
-    );
+    // A flock belongs to the open file description, which a concurrent fork
+    // shares until the child execs. A just-released owner can therefore look
+    // busy for a moment; keep retrying for about BUSY before reporting it.
+    let started = Instant::now();
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        ensure!(
+            io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+                && started.elapsed() < BUSY,
+            "state_v2_exclusive_owner_busy"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let owned = file.metadata()?;
     let named = fs::symlink_metadata(&path)?;
     ensure!(
@@ -1799,7 +1807,7 @@ impl Sqlite {
             };
             if *position == 0 {
                 ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-                expected = Some(super::mapper::read::<usize>(tx, &header)?);
+                expected = Some(super::mapper::read::<usize>(tx, &header, None)?);
             } else {
                 ensure!(*position == 1, "state_v2_member_position");
                 let path = super::mapper::family(key_bytes)?;

@@ -3925,7 +3925,8 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
-    /// Runtime leases backed by claims saved in both checkpoints before scanning.
+    /// Runtime file owners for this cycle's quarantine retries. Contract-origin
+    /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
     /// Runtime-only: this index's path was loaded in this process with no
@@ -4383,6 +4384,17 @@ pub struct SnapshotQuarantineWitness {
     pub item_wire_byte_limit: usize,
 }
 
+impl SnapshotQuarantineWitness {
+    /// Build/parser labels alone neither correct a body nor change its retry contract.
+    pub(crate) fn same_retry_contract(&self, other: &Self) -> bool {
+        self.contract == other.contract
+            && self.scan_identity_version == other.scan_identity_version
+            && self.snapshot_schema_version == other.snapshot_schema_version
+            && self.entity_ack_contract == other.entity_ack_contract
+            && self.item_wire_byte_limit == other.item_wire_byte_limit
+    }
+}
+
 const fn legacy_snapshot_item_wire_byte_limit() -> usize {
     128 * 1024
 }
@@ -4467,7 +4479,7 @@ pub(crate) fn quarantine_context_only_changed(
     }
     let mut normalized = previous.clone();
     normalized.contract.clone_from(&active.contract);
-    normalized == *active
+    normalized.same_retry_contract(active)
 }
 
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
@@ -8964,7 +8976,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .iter()
         .filter(|(_, pending)| {
             pending.invalid
-                || !pending.previous_windows.is_empty()
+                || pending.has_history()
                 || pending
                     .member_requests
                     .values()
@@ -20803,33 +20815,18 @@ impl SnapshotAccumulator {
         .then(|| self.codex_creator_evidence.clone())
         .flatten()
         .filter(|evidence| {
-            let created = evidence
-                .source_created_at
-                .as_deref()
-                .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok());
-            created.is_some_and(|created| {
-                [self.started_at.as_deref(), Some(collected_at)]
-                    .into_iter()
-                    .all(|timestamp| {
-                        timestamp
-                            .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok())
-                            .is_some_and(|observed| created <= observed)
-                    })
-            })
+            creator_time_precedes_start(
+                evidence.source_created_at.as_deref(),
+                self.started_at.as_deref(),
+            )
         });
         if self.source == SnapshotSource::ClaudeCode {
             let mut evidence = self.claude_desktop_identity.clone().unwrap_or_else(|| {
                 ClaudeTitleMetadata::default().session_account_evidence(&source_session_id)
             });
-            evidence.source_created_at =
-                evidence.source_created_at.as_deref().and_then(|timestamp| {
-                    let created = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
-                    let observed =
-                        OffsetDateTime::parse(self.started_at.as_deref()?, &Rfc3339).ok()?;
-                    let collected = OffsetDateTime::parse(collected_at, &Rfc3339).ok()?;
-                    (created.unix_timestamp() >= 0 && created <= observed && observed <= collected)
-                        .then(|| timestamp.to_string())
-                });
+            evidence.source_created_at = evidence.source_created_at.take().filter(|created| {
+                creator_time_precedes_start(Some(created), self.started_at.as_deref())
+            });
             if evidence.source_created_at.is_none()
                 && evidence.identity_disposition == Some("complete")
             {
@@ -26742,9 +26739,8 @@ impl OwnedSourceScan {
         }
 
         let audit_now = sampled_scan::now_seconds();
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            source == SnapshotSource::ClaudeCode,
-        );
+        // Every source: a non-Claude page emits only its retained-cache events.
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
         let index = &mut owned_index;
@@ -27589,9 +27585,7 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            self.source == SnapshotSource::ClaudeCode,
-        );
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         self.index.archive_pass.started = false;
         let archive_cpu = (!self.index.archives.is_empty())
@@ -29475,9 +29469,11 @@ impl OwnedSourceScan {
                 // and an unsampled read keep the step-start budget. Any other
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
-                // A Tail/Unchanged singleton (shape F) also decides whether a
-                // release of lower-ranked residents would make its copy
-                // fit; that release is deferred into its retention, after
+                // A Tail/Unchanged singleton, or a Full with an owned finish
+                // bound (`prove_release` refuses a legacy one), also decides,
+                // under blocking locks, whether a release of lower-ranked
+                // residents would make its copy fit; that release is deferred
+                // into its retention, after
                 // every non-budget gate. Nothing is evicted here. Each branch
                 // also returns the walk behind its budget (`copy_measure`, for
                 // `retire_proof_beside_copy`); `copy_budget` is the
@@ -29500,7 +29496,18 @@ impl OwnedSourceScan {
                         None,
                     )
                 } else if active.sampling.is_some() {
-                    if sampled_scan::borrows_only_retained_reduction(&active) {
+                    let full = active.sampling.as_ref().is_some_and(|sampling| {
+                        matches!(
+                            sampling.mode,
+                            crate::transcript_acquisition::ReadMode::Full(_)
+                        )
+                    });
+                    let legacy_full = full
+                        && matches!(
+                            sampled_scan::x_out_for(source, || None),
+                            sampled_scan::XOut::Legacy
+                        );
+                    if sampled_scan::releases_at_completion(&active) && !legacy_full {
                         sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
                     } else {
                         let (budget, measure) = sampled_scan::copy_budget_step(
@@ -30076,8 +30083,9 @@ impl OwnedSourceScan {
                             // #667: the decode peak is reserved from the budget the
                             // copy is admitted against: main's `copy_budget` above for
                             // a granted one. M-a (S-a): only now, after main's proof
-                            // retirement and that reservation, may a shape-F release be
-                            // proven; its `budget_after` is peak-reserved the same way.
+                            // retirement and that reservation, may a releasing completion
+                            // (`releases_at_completion`) prove its release; its
+                            // `budget_after` is peak-reserved the same way.
                             // X_out (#665): Claude's finish-output bound, only for a
                             // proof. The repository identity it measured (U3) is the
                             // one `finish` takes below; a miss refuses.
@@ -31725,6 +31733,40 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
+                // A failed/held ordinary owner cannot strand a readable copy.
+                // At this boundary every selected candidate has ended; queued
+                // work still owns its lease. Reuse the existing hint queue for
+                // the next incidence, leaving the unsent deadline due.
+                let retry_copies = index
+                    .terminal_contract_retries
+                    .iter()
+                    .filter(|(fp, _)| {
+                        index
+                            .quarantined_snapshot_fingerprints
+                            .get(*fp)
+                            .is_some_and(|r| r.contract_retry_claims.is_none())
+                            && !snapshots
+                                .iter()
+                                .any(|item| &item.snapshot_fingerprint == *fp)
+                            && !index.quarantine_retry_is_queued(fp)
+                    })
+                    .filter_map(|(fp, owner)| {
+                        index
+                            .file_snapshot_fingerprints
+                            .range((
+                                std::ops::Bound::Excluded(owner.clone()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .find(|(_, fingerprints)| fingerprints.contains(fp))
+                            .map(|(key, _)| (fp.clone(), key.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (fp, key) in retry_copies {
+                    index.terminal_contract_retries.insert(fp, key.clone());
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        enqueue_watcher_hints(source, traversal, &[PathBuf::from(key)], false);
+                    }
+                }
                 if codex_page.continuation() {
                     let cap_counts = index
                         .traversal
@@ -37713,6 +37755,19 @@ fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
         && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
             u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
         })
+}
+
+/// A session's creator time is certified only when it is no later than the
+/// transcript's first retained activity, so a resumed or truncated suffix never
+/// manufactures a creator. The scan's `collected_at` is the cycle start, not
+/// this file's read time: a session born after the cycle started is still read
+/// by it, so `collected_at` is no bound here.
+fn creator_time_precedes_start(created: Option<&str>, started_at: Option<&str>) -> bool {
+    let parse = |timestamp: &str| OffsetDateTime::parse(timestamp, &Rfc3339).ok();
+    match (created.and_then(parse), started_at.and_then(parse)) {
+        (Some(created), Some(started)) => created.unix_timestamp() >= 0 && created <= started,
+        _ => false,
+    }
 }
 
 /// Capture the first physical header before applying the ownership boundary.
@@ -49628,7 +49683,9 @@ impl ScanIndex {
                     return self.terminal_contract_retries.contains_key(fingerprint);
                 }
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
+                    && (self.terminal_contract_retries.contains_key(fingerprint)
+                        || !persisted.witness.same_retry_contract(active)
+                        || persisted.retry_after_unix_seconds <= now)
             })
     }
 
@@ -49641,7 +49698,10 @@ impl ScanIndex {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
     }
 
-    pub(crate) fn activate_terminal_contract_retries(&mut self, leases: BTreeSet<String>) {
+    pub(crate) fn activate_terminal_contract_retries(
+        &mut self,
+        leases: BTreeSet<String>,
+    ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
         // selects one owning file, never every duplicate incidence.
@@ -49652,6 +49712,50 @@ impl ScanIndex {
                     .or_insert_with(|| key.clone());
             }
         }
+        // A prior page's failed owner queued its next copy. That durable queue
+        // keeps the fallback ahead of the first incidence after save/reload.
+        for (fingerprint, owner) in &mut self.terminal_contract_retries {
+            if self
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|r| r.contract_retry_claims.is_none())
+            {
+                if let Some(pending) = self
+                    .traversal
+                    .iter()
+                    .flat_map(|walk| walk.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .find(|pending| {
+                        self.file_snapshot_fingerprints
+                            .get(&local_index_key(&pending.path))
+                            .is_some_and(|fingerprints| fingerprints.contains(fingerprint))
+                    })
+                {
+                    *owner = local_index_key(&pending.path);
+                }
+            }
+        }
+        // Use the same revalidated candidate admission as exact refusal re-offers.
+        // Distinct entities in one file and duplicate incidences own one hint.
+        self.terminal_contract_retries
+            .values()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// A leased file still queued for a bounded page has not reached a hold.
+    pub(crate) fn quarantine_retry_is_queued(&self, fingerprint: &str) -> bool {
+        self.terminal_contract_retries
+            .get(fingerprint)
+            .is_some_and(|key| {
+                self.traversal
+                    .iter()
+                    .flat_map(|traversal| traversal.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .any(|pending| pending.path == Path::new(key))
+            })
     }
 
     /// Arm this cycle's exact refusal re-offer leases and return the indexed
@@ -49714,7 +49818,10 @@ impl ScanIndex {
                 .is_some_and(|(body_witness, record)| {
                     record.disposition == SnapshotQuarantineDisposition::RetryPending
                         && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
-                        && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                        && self
+                            .active_quarantine_witness
+                            .as_ref()
+                            .is_some_and(|active| record.witness.same_retry_contract(active))
                 })
     }
 
@@ -50162,9 +50269,6 @@ impl ScanIndex {
             {
                 continue;
             }
-            let Some(current_window) = rfc3339_unix_seconds(&pending.census_window_end) else {
-                continue;
-            };
             // Retiring old windows requires an identity committed for this
             // newer window, not only unchanged survivors from an older one.
             if !pending.member_requests.iter().any(|(member, requests)| {
@@ -50175,56 +50279,35 @@ impl ScanIndex {
             }) {
                 continue;
             }
-            let mut latest: BTreeMap<
-                String,
-                (
-                    u64,
-                    account_pending_retention::ConsumerProjection<'_>,
-                    Option<&String>,
-                ),
-            > = BTreeMap::new();
-            let mut valid = true;
-            for (boundary, projection, is_current) in pending.retirement_observations() {
-                let Some(time) = boundary else {
-                    valid = false;
-                    break;
-                };
-                if time > current_window || (time == current_window && !is_current) {
-                    valid = false;
-                    break;
-                }
-                for (member, revision) in projection.members() {
-                    if !live_members
-                        .get(root)
-                        .is_some_and(|members| members.contains(member))
-                    {
-                        if !pending.confirmed_absent_members.contains(member)
-                            && !empty_members
-                                .get(root)
-                                .is_some_and(|members| members.contains(member))
-                        {
-                            valid = false;
-                        }
-                        continue;
-                    }
-                    if latest
-                        .get(member)
-                        .map_or(true, |(previous, _, _)| time > *previous)
-                    {
-                        latest.insert(member.clone(), (time, projection, revision));
-                    }
-                }
-            }
+            let Some(latest) = pending.history_summary().with_current(pending) else {
+                continue;
+            };
             let mut revisions = BTreeMap::new();
-            for (member, (_, window, revision)) in latest {
-                if window.invalid
-                    || window.account_identifier_hash != pending.account_identifier_hash
-                    || revision.is_none()
+            let mut valid = true;
+            for (member, (_, account, invalid, revision)) in latest {
+                if !live_members
+                    .get(root)
+                    .is_some_and(|members| members.contains(&member))
                 {
-                    valid = false;
-                    break;
+                    if !pending.confirmed_absent_members.contains(&member)
+                        && !empty_members
+                            .get(root)
+                            .is_some_and(|members| members.contains(&member))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    continue;
                 }
-                revisions.insert(member, revision.expect("checked revision").clone());
+                match revision {
+                    Some(revision) if !invalid && account == pending.account_identifier_hash => {
+                        revisions.insert(member, revision);
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
             }
             if valid && !revisions.is_empty() {
                 candidates.insert(root.clone(), revisions);
@@ -53031,10 +53114,9 @@ impl ScanIndex {
                                 self.quarantined_snapshot_fingerprints
                                     .get(fingerprint)
                                     .is_some_and(|record| {
-                                        self.active_quarantine_witness.as_ref()
-                                            == Some(&record.witness)
-                                            && !self
-                                                .quarantine_retry_selects_file(fingerprint, &key)
+                                        self.active_quarantine_witness.as_ref().is_some_and(
+                                            |active| record.witness.same_retry_contract(active),
+                                        ) && !self.quarantine_retry_selects_file(fingerprint, &key)
                                     })
                             })
                     });
@@ -56944,6 +57026,7 @@ mod tests {
         assert_eq!(index.manifest(SnapshotSource::Codex, 183).entity_count, 2);
     }
 
+    /// [regress] A release label keeps the deadline; a contract change retries.
     #[test]
     fn scan_index_retries_same_fingerprint_after_quarantine_contract_upgrade() {
         let path = PathBuf::from("/opaque/session.jsonl");
@@ -57017,6 +57100,18 @@ mod tests {
             ..ScanIndex::default()
         };
         index.activate_quarantine_witness(SnapshotSource::Codex);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .values_mut()
+            .next()
+            .unwrap()
+            .witness
+            .contract
+            .push_str("-old");
         assert_eq!(
             index.candidate_decision(&candidate),
             CandidateDecision::Parse
@@ -81637,6 +81732,14 @@ mod tests {
     }
 
     fn codex_creator_item(headers: &[Value], path_session_id: &str) -> SnapshotItem {
+        codex_creator_item_collected_at(headers, path_session_id, "2026-09-30T10:05:00Z")
+    }
+
+    fn codex_creator_item_collected_at(
+        headers: &[Value],
+        path_session_id: &str,
+        collected_at: &str,
+    ) -> SnapshotItem {
         // Parallel creator cases share the same session filename. Clock-only
         // directories can collide and mutate another case's opened fixture.
         let root = crate::test_scratch::ScratchDir::new("codex-creator");
@@ -81652,7 +81755,7 @@ mod tests {
         let body = records.iter().map(|v| format!("{v}\n")).collect::<String>();
         fs::write(&path, &body).expect("write creator fixture");
         let source_file_fingerprint = sha256_hex(&["codex_creator_fixture_source:v1"]);
-        parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
+        parse_codex_jsonl_file(&path, collected_at, source_file_fingerprint)
             .expect("parse creator fixture")
             .into_iter()
             .next()
@@ -82473,6 +82576,26 @@ mod tests {
             body,
             serde_json::to_value(&legacy).unwrap(),
             "missing evidence retains legacy wire"
+        );
+    }
+
+    /// [regress] CX1 2026-10-31: a rollout born after its scan cycle started
+    /// (`collected_at` = cycle start) but before the page read it lost its
+    /// creator pair, so its first body went out without one (M4: 3 of 231
+    /// Codex first admissions in 14 h).
+    #[test]
+    fn codex_creator_pair_survives_rollout_created_after_cycle_start() {
+        let header = codex_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let born_after_cycle_start = codex_creator_item_collected_at(
+            std::slice::from_ref(&header),
+            id,
+            "2026-09-30T09:59:53Z",
+        );
+        assert!(born_after_cycle_start.session_account_evidence.is_some());
+        assert_eq!(
+            born_after_cycle_start.session_account_evidence,
+            codex_creator_item(std::slice::from_ref(&header), id).session_account_evidence
         );
     }
 
@@ -83310,6 +83433,32 @@ mod tests {
             "an unaccepted entity keeps its committed entry so the next scan retries it"
         );
 
+        // Persist accepted siblings even when a page leaves a held file and
+        // missing prior files behind. Rebuild the next subset before saving it.
+        let retry = scanned.committable_subset_with_local_holds(
+            &committable,
+            &BTreeSet::from(["bb".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["cc".to_string()]),
+        );
+        assert_eq!(
+            retry.files["pending.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old")
+        );
+        let accepted_retry = scanned.committable_subset(
+            &retry,
+            &BTreeSet::from(["bb".to_string(), "cc".to_string()]),
+            &BTreeMap::new(),
+        );
+        let mut removed = accepted_retry.clone();
+        removed.files.remove("accepted.jsonl");
+        state_v2::money_test_support::assert_selected_saves(
+            &committed,
+            &[committable.clone(), retry, accepted_retry, removed],
+        );
+
         // A first-time file that was not accepted has no committed entry to fall
         // back to, so it must not appear at all.
         let mut fresh = ScanIndex::default();
@@ -83462,9 +83611,9 @@ mod tests {
             .is_empty());
     }
 
-    /// O1: an exact-body cooldown defers only the ordinary retry of its own
+    /// [regress] O1: an exact-body cooldown defers only the ordinary retry of its own
     /// retained conflict on an unchanged file. A changed file, a lease, a
-    /// changed quarantine witness, another body or an unrelated due sibling
+    /// changed quarantine contract, another body or an unrelated due sibling
     /// in the same file still selects it. The conflict debt is untouched,
     /// the view is runtime only, and deferrals count distinct entities.
     #[test]
@@ -83606,10 +83755,18 @@ mod tests {
             reread
         );
 
-        // A changed quarantine witness (a new parser or contract) re-reads.
+        // A release label alone keeps the cooldown; a changed contract re-reads.
         index.activate_reason_reoffer_cooldowns(cooldown.clone());
         let mut older = conflict.clone();
         older.witness.parser_version.push_str("-older");
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), older.clone());
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            (CandidateDecision::Skip, None)
+        );
+        older.witness.contract.push_str("-older");
         index
             .quarantined_snapshot_fingerprints
             .insert("refused-entity".into(), older);
@@ -83795,6 +83952,15 @@ mod tests {
                 .entity_count,
             1,
             "quarantine is checkpointed but never advertised as server-held"
+        );
+        let retry = scanned.committable_subset(
+            &committable,
+            &scanned.file_snapshot_fingerprints["split.jsonl"],
+            &BTreeMap::new(),
+        );
+        state_v2::money_test_support::assert_selected_saves(
+            &ScanIndex::default(),
+            &[committable, retry],
         );
     }
 

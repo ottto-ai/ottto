@@ -581,10 +581,10 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         published(&f.path).unwrap()
     )
     .unwrap());
-    // The committed graph is the next page's baseline; idle releases it.
+    // Committed row digests seed the next page; idle releases them.
     with_state(&f.path, |state| {
         assert_eq!(
-            state.save_baseline.as_ref().map(|b| b.generation),
+            state.save_digests.as_ref().map(|b| b.generation),
             Some(G + 1)
         );
         Ok(())
@@ -593,18 +593,23 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     // A cycle that errors skips idle; its drop guard still releases it.
     drop(BaselineRelease::new(&f.path, &index));
     with_state(&f.path, |state| {
-        assert!(state.save_baseline.is_none());
-        state.save_baseline = Some(index.clone());
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_locked(&f.path, &mut index, false, None, true).unwrap());
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_some());
         Ok(())
     })
     .unwrap();
     let _ = idle(&f.path, &index, true);
     with_state(&f.path, |state| {
-        assert!(state.save_baseline.is_none());
+        assert!(state.save_digests.is_none());
         Ok(())
     })
     .unwrap();
-    assert_eq!(index.generation, G + 1);
+    assert_eq!(index.generation, G + 2);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")
@@ -1298,6 +1303,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let mut seed: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
     seed.generation = 0;
     let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
+    let committed = current.clone();
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
@@ -1310,15 +1316,32 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         published(&f.path).unwrap()
     )
     .is_err());
-    let restored = load_locked(&f.path, None, published(&f.path).unwrap())
-        .unwrap_or_else(|e| {
-            panic!(
-                "reload after FULL: {e:#}; cause={:?}",
-                telemetry::latest_for_test("db_unavailable_cause")
-            )
-        })
-        .0
-        .unwrap();
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    // Publication returns a public load, which settles the tombstone marker.
+    // Compare at that same boundary after rollback, including load settlement.
+    let restored = ScanIndex::load(&f.path).unwrap_or_else(|e| {
+        panic!(
+            "reload after FULL: {e:#}; cause={:?}",
+            telemetry::latest_for_test("db_unavailable_cause")
+        )
+    });
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&committed).unwrap()
+    );
+    assert!(restored.decode_holds.same_as(&committed.decode_holds));
+    assert_eq!(
+        restored.decode_holds.v2_provenance(),
+        committed.decode_holds.v2_provenance()
+    );
+    assert_eq!(
+        restored.v2().growth_retention,
+        committed.v2().growth_retention
+    );
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.upload_context_fingerprint, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
