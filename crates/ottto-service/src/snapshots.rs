@@ -32725,6 +32725,36 @@ impl OwnedSourceScan {
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
+            if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
+                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
+            }
+            if preflight_source_file_fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
+            {
+                // A quarantined candidate changed after the family prepass. Do not
+                // parse a mixed family or refresh its retry record; keep this
+                // generation non-terminal and retry the new exact object together.
+                disappearance_diagnostics::increment(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::PreflightFingerprintChanged,
+                );
+                pending!();
+            }
+            // The preflight fences physical/sidecar identity. Local launcher facts
+            // are semantic context and must not contaminate that two-open witness.
+            if let Some(context) = attribution_context {
+                let workers =
+                    launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
+                if let Some(witness) = context.launch_witness(&workers) {
+                    candidate.source_file_fingerprint = sha256_hex(&[
+                        "launcher_worker_context:v1",
+                        &candidate.source_file_fingerprint,
+                        &witness,
+                    ]);
+                }
+            }
             let slot_owner_base_fingerprint = candidate.source_file_fingerprint.clone();
             let slot_owner = session_slot_owner::owner_for(
                 &candidate.path,
@@ -32755,36 +32785,6 @@ impl OwnedSourceScan {
                         .is_some_and(codex_frozen_census_valid))
             {
                 candidate.source_file_fingerprint = selected_fingerprint;
-            }
-            if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
-                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
-            }
-            if preflight_source_file_fingerprint
-                .as_ref()
-                .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
-            {
-                // A quarantined candidate changed after the family prepass. Do not
-                // parse a mixed family or refresh its retry record; keep this
-                // generation non-terminal and retry the new exact object together.
-                disappearance_diagnostics::increment(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Cause::PreflightFingerprintChanged,
-                );
-                pending!();
-            }
-            // The preflight fences physical/sidecar identity. Local launcher facts
-            // are semantic context and must not contaminate that two-open witness.
-            if let Some(context) = attribution_context {
-                let workers =
-                    launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
-                if let Some(witness) = context.launch_witness(&workers) {
-                    candidate.source_file_fingerprint = sha256_hex(&[
-                        "launcher_worker_context:v1",
-                        &candidate.source_file_fingerprint,
-                        &witness,
-                    ]);
-                }
             }
             // Constructor preflight has only physical identities. Reconcile its
             // family retry decision once launcher context is prepared, while keeping
