@@ -6,7 +6,7 @@
 // `assert_held` reads the driver's accepted map, so these rows also assert
 // whole-body equality (`whole_body`) and the index's own body
 // fingerprint/witness (`stored_bodies`); the populated Pi body's byte identity
-// is the codec fixture (`plain_trailing_pi_body_counts_and_round_trips`).
+// is the codec fixture (`pi_registered_body_rows_preserve_populated_body_bytes`).
 //
 // A binary without Pi support meeting Pi files and a Pi store is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
@@ -450,212 +450,131 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
     assert_eq!(f.restarts, 2);
 }
 
-// Restore path (restart or RAM miss; Pi has no accepted floor): an
-// older surviving record on the same object, same head, whose restored Tail
-// ends behind the accepted extent restores and PUBLISHES the smaller body. It
-// equals a cold Full of the file, today's Pi behaviour: the floor is
-// Claude-only (`Interpretation::of`). No hold and no Full; the accepted state
-// moves down with it. The extent regression is known independently from the
-// index. `restored_behind_accepted.published` counts exactly this offer. An
-// equal-or-larger extent POSTs normally and leaves it at 0. The RAM-resident
-// cut is the in-process control below.
-/// [money] A restored Tail behind the accepted extent publishes the smaller
-/// body, equal to cold Full.
+/// [money] Smaller Tail/Unchanged survivors and a RAM-resident shrink retain
+/// their distinct read modes and publish the complete cold body without a floor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
-fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
+fn pi_smaller_extent_routes_publish_the_cold_body() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_smaller") {
         return;
     }
-    let mut f = PiDriver::warm("transition-pi-smaller", &pi_seed());
-    let older = f.disk.record_bytes();
-    let sealed = std::fs::read(&f.path).unwrap();
-    f.grow(&[
-        pi_turn("message", Some("accepted-one"), 20, "2026-10-27T06:01:00Z"),
-        pi_turn("message", Some("accepted-two"), 30, "2026-10-27T06:02:00Z"),
-    ]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let route = f.emit_bodies(Mode::Restart);
-    money_oracle::assert_equivalent(&cold, &route);
-    whole_body(&cold, &route);
-    assert_eq!(f.restored_behind(Mode::Restart), 0, "past accepted");
-    f.save_gc(Mode::Restart);
-    let grown = std::fs::read(&f.path).unwrap();
-    // The predecessor survives in place of its successor (an A/B survivor),
-    // and the same file is back at the sealed prefix plus one short turn.
-    assert_eq!(
-        f.disk.record_bytes().keys().collect::<Vec<_>>(),
-        older.keys().collect::<Vec<_>>()
-    );
-    for (path, bytes) in &older {
-        std::fs::write(path, bytes).unwrap();
+    for arm in ["tail", "unchanged", "ram"] {
+        let mode = if arm == "ram" {
+            Mode::Ram
+        } else {
+            Mode::Restart
+        };
+        let mut f = PiDriver::warm(&format!("transition-pi-smaller-{arm}"), &pi_seed());
+        let older = f.disk.record_bytes();
+        let sealed = std::fs::read(&f.path).unwrap();
+        if arm == "unchanged" {
+            f.grow(&[pi_turn(
+                "message",
+                Some("accepted-growth"),
+                20,
+                "2026-10-27T06:02:00Z",
+            )]);
+        } else {
+            f.grow(&[
+                pi_turn("message", Some("accepted-one"), 20, "2026-10-27T06:01:00Z"),
+                pi_turn("message", Some("accepted-two"), 30, "2026-10-27T06:02:00Z"),
+            ]);
+        }
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let grown_route = f.emit_bodies(mode);
+        assert_eq!(
+            (grown_route.modes, grown_route.restored),
+            ((0, 1, 0), u64::from(arm != "ram"))
+        );
+        assert_eq!(f.restored_behind(mode), 0, "{arm}: past accepted");
+        money_oracle::assert_equivalent(&cold, &grown_route);
+        whole_body(&cold, &grown_route);
+        f.save_gc(mode);
+        let accepted = f.accepted.clone();
+        let grown = std::fs::read(&f.path).unwrap();
+        let key = fixture::local_key(&f.path);
+        let accepted_size = f.prior.files[&key].size_bytes;
+        assert_eq!(
+            f.disk.record_bytes().keys().collect::<Vec<_>>(),
+            older.keys().collect::<Vec<_>>()
+        );
+        if arm != "ram" {
+            f.reset_store(&older);
+        }
+        std::fs::write(&f.path, &sealed).unwrap();
+        if arm == "unchanged" {
+            input_clock(&f.path); // Equal-length survivor certificate mtime.
+        } else {
+            pi_grow(
+                &f.path,
+                pi_turn("message", Some("short"), 1, "2026-10-27T06:03:00Z"),
+            );
+        }
+        let head = |bytes: &[u8]| bytes.split(|&b| b == b'\n').next().unwrap().to_vec();
+        assert_eq!(head(&std::fs::read(&f.path).unwrap()), head(&grown));
+        if arm != "ram" {
+            f.restart();
+        }
+        let extent = std::fs::metadata(&f.path).unwrap().len();
+        assert!(extent < accepted_size, "{arm}: below accepted");
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let published = f.emit_bodies(mode);
+        let expected = match arm {
+            "tail" => ((0, 1, 0), 1),
+            "unchanged" => ((0, 0, 1), 1),
+            "ram" => ((1, 0, 0), 0),
+            _ => unreachable!(),
+        };
+        assert_eq!((published.modes, published.restored), expected, "{arm}");
+        assert_eq!(f.restored_behind(mode), u64::from(arm == "tail"));
+        assert_eq!(f.restored_behind(Mode::ColdFull), 0, "Full never counts");
+        if arm == "ram" {
+            assert_eq!(published.io.consumed, extent);
+        }
+        let (_, refused, t14) = f.counters(mode);
+        assert_eq!((refused, t14), (0, 0), "{arm}");
+        assert_eq!(f.holds(mode), ([0; 9], 0), "{arm}: no hold");
+        money_oracle::assert_equivalent(&cold, &published);
+        whole_body(&cold, &published);
+        assert_eq!(published.batches.len(), 1, "{arm}: smaller offer");
+        assert_eq!(
+            cold.accepted[&f.entity].body["request_count"],
+            json!(if arm == "unchanged" { 2 } else { 3 })
+        );
+        assert_eq!(
+            published.snapshots[&f.entity]["request_count"],
+            json!(if arm == "unchanged" { 1 } else { 2 })
+        );
+        let emitted = f.pages[&mode].emitted[&f.entity].clone();
+        f.save_gc(mode);
+        assert_ne!(f.accepted, accepted, "{arm}: accepted moved down");
+        assert_eq!(f.accepted[&f.entity], emitted);
+        assert_eq!(f.prior.files[&key].size_bytes, extent);
+        assert!(f.prior.files[&key].size_bytes < accepted_size);
+        if arm == "tail" {
+            // A larger file with the same older survivor publishes normally.
+            f.reset_store(&older);
+            std::fs::write(&f.path, &grown).unwrap();
+            pi_grow(
+                &f.path,
+                pi_turn("message", Some("larger"), 40, "2026-10-27T06:04:00Z"),
+            );
+            f.restart();
+            let extent = std::fs::metadata(&f.path).unwrap().len();
+            let behind = extent < f.prior.files[&key].size_bytes;
+            assert!(!behind);
+            let cold = f.emit_bodies(Mode::ColdFull);
+            let restored = f.emit_bodies(Mode::Restart);
+            assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
+            assert_eq!(f.restored_behind(Mode::Restart), 0, "past accepted");
+            money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &restored, &cold, behind);
+            whole_body(&cold, &restored);
+        }
     }
-    std::fs::write(&f.path, &sealed).unwrap();
-    pi_grow(
-        &f.path,
-        pi_turn("message", Some("short"), 1, "2026-10-27T06:03:00Z"),
-    );
-    f.restart();
-    let key = fixture::local_key(&f.path);
-    let extent = std::fs::metadata(&f.path).unwrap().len();
-    let behind = extent < f.prior.files[&key].size_bytes;
-    assert!(behind, "the fixture must regress the accepted extent");
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let published = f.emit_bodies(Mode::Restart);
-    assert_eq!((published.modes, published.restored), ((0, 1, 0), 1));
-    assert_eq!(f.restored_behind(Mode::Restart), 1, "the counted event");
-    assert_eq!(f.restored_behind(Mode::ColdFull), 0, "a Full never counts");
-    assert_eq!(f.holds(Mode::Restart), ([0; 9], 0), "no hold of any class");
-    money_oracle::assert_equivalent(&cold, &published);
-    whole_body(&cold, &published);
-    assert_eq!(published.batches.len(), 1);
-    // `cold` carries the accepted map as of this restart: the grown body.
-    let requests = |body: &Value| body["request_count"].as_u64().unwrap();
-    assert_eq!(requests(&cold.accepted[&f.entity].body), 3);
-    assert_eq!(requests(&published.snapshots[&f.entity]), 2, "smaller body");
-    let emitted = f.pages[&Mode::Restart].emitted[&f.entity].clone();
-    f.save_gc(Mode::Restart);
-    assert_eq!(f.accepted[&f.entity], emitted, "accepted moved down");
-    assert_eq!(f.prior.files[&key].size_bytes, extent);
-    // Control: the same survivor below an extent at or past accepted POSTs.
-    for (path, bytes) in &older {
-        std::fs::write(path, bytes).unwrap();
-    }
-    std::fs::write(&f.path, &grown).unwrap();
-    pi_grow(
-        &f.path,
-        pi_turn("message", Some("larger"), 40, "2026-10-27T06:04:00Z"),
-    );
-    f.restart();
-    let extent = std::fs::metadata(&f.path).unwrap().len();
-    let behind = extent < f.prior.files[&key].size_bytes;
-    assert!(!behind);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let restored = f.emit_bodies(Mode::Restart);
-    assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
-    assert_eq!(f.restored_behind(Mode::Restart), 0, "past accepted");
-    money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &restored, &cold, behind);
-    whole_body(&cold, &restored);
-}
-
-/// [money] An unchanged survivor below the accepted extent still finalizes its
-/// older body. Count the offer and the downward accepted/index transition
-/// explicitly.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_unchanged_smaller") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-unchanged-smaller", &pi_seed());
-    let older = f.disk.record_bytes();
-    let sealed = std::fs::read(&f.path).unwrap();
-    f.grow(&[pi_turn(
-        "message",
-        Some("accepted-growth"),
-        20,
-        "2026-10-27T06:02:00Z",
-    )]);
-    f.emit_bodies(Mode::Restart);
-    f.save_gc(Mode::Restart);
-    let accepted = f.accepted.clone();
-    let key = fixture::local_key(&f.path);
-    let accepted_size = f.prior.files[&key].size_bytes;
-    for (path, bytes) in older {
-        std::fs::write(path, bytes).unwrap();
-    }
-    std::fs::write(&f.path, &sealed).unwrap();
-    input_clock(&f.path); // Preserve the survivor certificate's equal-length mtime.
-    f.restart();
-    let extent = sealed.len() as u64;
-    assert!(extent < accepted_size);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let unchanged = f.emit_bodies(Mode::Restart);
-    assert_eq!((unchanged.modes, unchanged.restored), ((0, 0, 1), 1));
-    assert_eq!(
-        unchanged.batches.len(),
-        1,
-        "the Unchanged read makes an upload offer"
-    );
-    whole_body(&cold, &unchanged);
-    assert_eq!(f.restored_behind(Mode::Restart), 1);
-    let emitted = f.pages[&Mode::Restart].emitted[&f.entity].clone();
-    f.save_gc(Mode::Restart);
-    assert_ne!(
-        f.accepted, accepted,
-        "accepted changed to the smaller offer"
-    );
-    assert_eq!(f.accepted[&f.entity], emitted);
-    assert_eq!(f.prior.files[&key].size_bytes, extent);
-    assert!(f.prior.files[&key].size_bytes < accepted_size);
-}
-
-// In-process control (RAM resident): the same object cut below the
-// accepted extent with the same head, its entry still in RAM, is classified
-// Shrunk by the certificate/ReadPlan and takes one A2 Full
-// `real_edit.<check>` outside the restore seam.
-/// [money] A RAM-resident cut below the accepted extent reads one real-edit
-/// Full equal to cold Full.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_smaller_ram") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-smaller-ram", &pi_seed());
-    let sealed = std::fs::read(&f.path).unwrap();
-    f.grow(&[
-        pi_turn("message", Some("accepted-one"), 20, "2026-10-27T06:01:00Z"),
-        pi_turn("message", Some("accepted-two"), 30, "2026-10-27T06:02:00Z"),
-    ]);
-    let grown = f.emit_bodies(Mode::Ram);
-    assert_eq!(
-        (grown.modes, grown.restored),
-        ((0, 1, 0), 0),
-        "RAM resident"
-    );
-    f.save_gc(Mode::Ram);
-    let head = |bytes: &[u8]| bytes.split(|&b| b == b'\n').next().unwrap().to_vec();
-    let accepted_head = head(&std::fs::read(&f.path).unwrap());
-    std::fs::write(&f.path, &sealed).unwrap();
-    pi_grow(
-        &f.path,
-        pi_turn("message", Some("short"), 1, "2026-10-27T06:03:00Z"),
-    );
-    let key = fixture::local_key(&f.path);
-    let extent = std::fs::metadata(&f.path).unwrap().len();
-    assert!(
-        extent < f.prior.files[&key].size_bytes,
-        "cut below accepted"
-    );
-    assert_eq!(head(&std::fs::read(&f.path).unwrap()), accepted_head);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let edited = f.emit_bodies(Mode::Ram);
-    assert_eq!(
-        (edited.modes, edited.restored),
-        ((1, 0, 0), 0),
-        "one in-process Shrunk Full"
-    );
-    assert_eq!(edited.io.consumed, extent);
-    assert_eq!(f.restored_behind(Mode::Ram), 0, "not restored, not Tailed");
-    let (_, refused, t14) = f.counters(Mode::Ram);
-    let (format_hold, held) = f.holds(Mode::Ram);
-    assert_eq!((refused, t14, held), (0, 0, 0));
-    assert_eq!(format_hold, [0; 9]);
-    money_oracle::assert_equivalent(&cold, &edited);
-    whole_body(&cold, &edited);
 }
 
 // Stale survivor (D-N1-HOLD, source=pi): a real write + cleanup double fault at
@@ -746,178 +665,138 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
     }
 }
 
-// Rewrite, restart arms: Pi's own writer rewrites the same inode at a version
-// upgrade. v1->v3 grows (HeadChanged) and v2->v3 shrinks (Shrunk); the cheap
-// checks classify either before restore, so a restarted owner reads exactly
-// ONE A2 Full equal to cold Full, counted by its certificate class, never T14
-// or a hold, its bytes under the page's completed native bytes. It writes a new
-// record: a quiet restart reads nothing, and the next growth restores that
-// record and Tails, so no second Full follows. Neither later stage refuses a
-// certificate: that count belongs to the rewrite alone. The shrink arm's Full
-// ends below accepted, but it is not a restored Tail.
-/// [money] A same-inode version rewrite reads one Full equal to cold Full after
-/// a restart, then restores and Tails.
+/// [money] A same-inode version rewrite reads one real-edit Full, then Tails.
+/// [format] An index-only downgrade preserves the record for re-upgrade.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
-fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
+fn pi_native_lifecycle_rewrite_and_reupgrade_preserve_cold_bodies() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::MetadataExt;
-    if !supported("pi_transition_rewrite") {
+    if !supported("pi_transition_lifecycle") {
         return;
     }
-    for (arm, version, class) in [("grow", 1, "head_changed"), ("shrink", 2, "shrunk")] {
-        let name = format!("transition-pi-rewrite-{arm}");
+    for (arm, version, class) in [
+        ("grow", 1, "head_changed"),
+        ("shrink", 2, "shrunk"),
+        ("downgrade", 3, ""),
+    ] {
         let stored = format!("\"version\":{version}");
         let initial = pi_seed().replacen("\"version\":3", &stored, 1);
-        let mut f = PiDriver::warm(&name, &initial);
+        let mut f = PiDriver::warm(&format!("transition-pi-lifecycle-{arm}"), &initial);
         let record = f.disk.record_bytes();
         f.restart();
-        let mut migrated = initial.replacen(&stored, "\"version\":3", 1);
-        if arm == "shrink" {
-            migrated = migrated
-                .lines()
-                .filter(|line| !line.contains("Synthetic system instruction."))
-                .map(|line| format!("{line}\n"))
-                .collect();
-        }
-        migrated += &pi_json(pi_turn(
-            "message",
-            Some("after-migration"),
-            30,
-            "2026-10-27T06:02:00Z",
-        ));
-        let before = std::fs::metadata(&f.path).unwrap();
-        std::fs::write(&f.path, migrated).unwrap();
-        input_clock(&f.path);
-        let after = std::fs::metadata(&f.path).unwrap();
-        assert_eq!(before.ino(), after.ino(), "{arm}: same inode");
-        assert_eq!(after.len() > before.len(), arm == "grow", "{arm}");
+        let tail = if arm == "downgrade" {
+            f.grow(&[pi_turn(
+                "message",
+                Some("downgrade-growth"),
+                20,
+                "2026-10-27T06:01:00Z",
+            )]);
+            let cold = f.emit_bodies(Mode::ColdFull);
+            // The downgraded process has sampled RAM but no durable store pass.
+            let downgraded = E2ScanFixture::default();
+            let (mut down, mut index, emitted) =
+                pi_route(&f.c, &downgraded, f.prior.clone(), Mode::ColdFull);
+            assert_eq!(down.modes, (1, 0, 0));
+            down.accepted = f.accepted.clone();
+            money_oracle::assert_equivalent(&cold, &down);
+            index.save(&f.disk.index).unwrap(); // Index only: no record write or GC.
+            f.accepted.extend(emitted);
+            assert_eq!(f.disk.record_bytes(), record, "downgrade keeps the record");
+            f.restart();
+            f.grow(&[pi_turn(
+                "message",
+                Some("reupgrade-growth"),
+                30,
+                "2026-10-27T06:02:00Z",
+            )])
+        } else {
+            let mut migrated = initial.replacen(&stored, "\"version\":3", 1);
+            if arm == "shrink" {
+                migrated = migrated
+                    .lines()
+                    .filter(|line| !line.contains("Synthetic system instruction."))
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+            }
+            migrated += &pi_json(pi_turn(
+                "message",
+                Some("after-migration"),
+                30,
+                "2026-10-27T06:02:00Z",
+            ));
+            let before = std::fs::metadata(&f.path).unwrap();
+            std::fs::write(&f.path, migrated).unwrap();
+            input_clock(&f.path);
+            let after = std::fs::metadata(&f.path).unwrap();
+            assert_eq!(before.ino(), after.ino(), "{arm}: same inode");
+            assert_eq!(after.len() > before.len(), arm == "grow", "{arm}");
+            after.len()
+        };
         let cold = f.emit_bodies(Mode::ColdFull);
-        let edited = f.emit_bodies(Mode::Restart);
-        let rows = &f.pages[&Mode::Restart].diagnostics;
-        assert_eq!(
-            (edited.modes, edited.restored),
-            ((1, 0, 0), 0),
-            "{arm}: ONE Full, no restore"
-        );
-        assert_eq!(edited.io.consumed, after.len(), "{arm}");
-        assert_eq!(
-            page_reads(rows),
-            (1, 0, after.len()),
-            "{arm}: the Full's bytes are counted"
-        );
-        assert_eq!(f.certificate_refused(Mode::Restart, class), 1, "{arm}");
-        assert_eq!(f.certificates_refused(Mode::Restart), 1, "{arm}");
-        assert_eq!(f.restored_behind(Mode::Restart), 0, "{arm}: not a Tail");
-        let (_, refused, t14) = f.counters(Mode::Restart);
-        assert_eq!((refused, t14), (0, 0), "{arm}: never T14");
-        assert_eq!(f.holds(Mode::Restart), ([0; 9], 0), "{arm}: never a hold");
-        assert_eq!(edited.snapshots[&f.entity]["request_count"], json!(2));
-        money_oracle::assert_equivalent(&cold, &edited);
-        whole_body(&cold, &edited);
+        let route = f.emit_bodies(Mode::Restart);
+        if arm == "downgrade" {
+            assert_eq!((route.modes, route.restored), ((0, 1, 0), 1));
+            assert!(
+                route.io.consumed >= tail,
+                "Tail from the kept record's extent"
+            );
+        } else {
+            assert_eq!(
+                (route.modes, route.restored),
+                ((1, 0, 0), 0),
+                "{arm}: one Full"
+            );
+            assert_eq!(route.io.consumed, tail);
+            assert_eq!(
+                page_reads(&f.pages[&Mode::Restart].diagnostics),
+                (1, 0, tail)
+            );
+            assert_eq!(f.certificate_refused(Mode::Restart, class), 1, "{arm}");
+            assert_eq!(f.certificates_refused(Mode::Restart), 1, "{arm}");
+            assert_eq!(f.restored_behind(Mode::Restart), 0, "{arm}: not a Tail");
+            let (_, refused, t14) = f.counters(Mode::Restart);
+            assert_eq!((refused, t14), (0, 0), "{arm}: never T14");
+            assert_eq!(f.holds(Mode::Restart), ([0; 9], 0), "{arm}: never a hold");
+            assert_eq!(route.snapshots[&f.entity]["request_count"], json!(2));
+        }
+        money_oracle::assert_equivalent(&cold, &route);
+        whole_body(&cold, &route);
         f.save_gc(Mode::Restart);
-        assert_ne!(f.disk.record_bytes(), record, "{arm}: new record");
-        f.restart();
-        let quiet = f.emit_bodies(Mode::Restart);
-        assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0), "{arm}: no 2nd Full");
-        assert!(quiet.batches.is_empty(), "{arm}: quiet restart POSTed");
-        assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: quiet");
+        assert_ne!(f.disk.record_bytes(), record, "{arm}: new receipt");
+        if arm != "downgrade" {
+            f.restart();
+            let quiet = f.emit_bodies(Mode::Restart);
+            assert_eq!(
+                (quiet.modes.0, quiet.modes.1),
+                (0, 0),
+                "{arm}: no second Full"
+            );
+            assert!(quiet.batches.is_empty(), "{arm}: quiet restart POSTed");
+            assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: quiet");
+        }
         f.restart();
         let tail = f.grow(&[pi_turn(
             "message",
-            Some("after-rewrite"),
+            Some(if arm == "downgrade" {
+                "next-restart"
+            } else {
+                "after-rewrite"
+            }),
             40,
             "2026-10-27T06:03:00Z",
         )]);
         let cold = f.emit_bodies(Mode::ColdFull);
         let restored = f.emit_bodies(Mode::Restart);
-        assert_eq!(
-            (restored.modes, restored.restored),
-            ((0, 1, 0), 1),
-            "{arm}: the new record Tails"
-        );
+        assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
         assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: Tail");
         assert_eq!(restored.io.consumed, tail);
         money_oracle::assert_equivalent(&cold, &restored);
         whole_body(&cold, &restored);
     }
-}
-
-// Downgrade/upgrade: a binary without a Pi durable pass (an index-only
-// downgrade) reads the growth Full and commits a newer entry, leaving the
-// format-3 record untouched. On re-upgrade that record's valid prefix
-// restores and the Tail catches up past the accepted extent; its own receipt
-// then restores again after the next restart.
-/// [format] After a downgrade reads Full without the store, the re-upgraded
-/// binary restores the kept record and Tails.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_downgrade") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-downgrade", &pi_seed());
-    let record = f.disk.record_bytes();
-    f.restart();
-    f.grow(&[pi_turn(
-        "message",
-        Some("downgrade-growth"),
-        20,
-        "2026-10-27T06:01:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    // The downgraded process: sampled RAM only, no durable slot or store pass.
-    let downgraded = E2ScanFixture::default();
-    let (mut down, mut index, emitted) =
-        pi_route(&f.c, &downgraded, f.prior.clone(), Mode::ColdFull);
-    assert_eq!(down.modes, (1, 0, 0));
-    down.accepted = f.accepted.clone();
-    money_oracle::assert_equivalent(&cold, &down);
-    index.save(&f.disk.index).unwrap(); // index only: no record write or GC
-    f.accepted.extend(emitted);
-    assert_eq!(
-        f.disk.record_bytes(),
-        record,
-        "the downgrade leaves the record"
-    );
-    f.restart();
-    let tail = f.grow(&[pi_turn(
-        "message",
-        Some("reupgrade-growth"),
-        30,
-        "2026-10-27T06:02:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let upgraded = f.emit_bodies(Mode::Restart);
-    assert_eq!((upgraded.modes, upgraded.restored), ((0, 1, 0), 1));
-    assert!(
-        upgraded.io.consumed >= tail,
-        "Tail from the record's extent"
-    );
-    money_oracle::assert_equivalent(&cold, &upgraded);
-    whole_body(&cold, &upgraded);
-    f.save_gc(Mode::Restart);
-    assert_ne!(f.disk.record_bytes(), record, "re-upgrade receipted anew");
-    f.restart();
-    let tail = f.grow(&[pi_turn(
-        "message",
-        Some("next-restart"),
-        40,
-        "2026-10-27T06:03:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let restored = f.emit_bodies(Mode::Restart);
-    assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
-    assert_eq!(restored.io.consumed, tail);
-    money_oracle::assert_equivalent(&cold, &restored);
-    whole_body(&cold, &restored);
 }
 
 // Pi beside a Claude row in one state directory and one process owner.
@@ -1178,41 +1057,6 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     }
 }
 
-/// [money] restore→Tail on a body with a header cwd and a first prompt: one
-/// Tail and the whole body equal to a cold Full, first-prompt title and money
-/// included. The record stores only its H fence; bounded replay rebuilds the
-/// prompt.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_first_prompt") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-first-prompt", &pi_seed());
-    let cold_title = f.accepted[&f.entity].body["session_display_name"].clone();
-    assert_eq!(cold_title, json!("Synthetic first prompt."));
-    f.restart();
-    f.grow(&[pi_turn(
-        "message",
-        Some("after-restart"),
-        20,
-        "2026-10-27T06:02:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let restored = f.emit_bodies(Mode::Restart);
-    assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
-    assert_eq!(
-        restored.snapshots[&f.entity]["session_display_name"],
-        cold_title
-    );
-    assert_eq!(f.counters(Mode::Restart).1, 0);
-    whole_body(&cold, &restored);
-}
-
 /// [format] A first prompt beyond the head bound cannot create a durable content
 /// proof. The next growing restart therefore takes a counted native Full.
 #[test]
@@ -1364,6 +1208,8 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
         1,
     );
     let mut f = PiDriver::warm("pi-fork-cuts", &initial);
+    let title = f.accepted[&f.entity].body["session_display_name"].clone();
+    assert_eq!(title, json!("Synthetic first prompt."));
     let mut requests = 1_u64;
     let mut lines = Vec::new();
     for kind in [
@@ -1409,6 +1255,8 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
             assert_eq!(route.io.consumed, tail + route.io.rederive_head);
             money_oracle::assert_equivalent(&cold, &route);
             whole_body(&cold, &route);
+            assert_eq!(route.snapshots[&f.entity]["session_display_name"], title);
+            assert_eq!(f.counters(mode).1, 0);
             for batch in &route.batches {
                 assert_private("fork upload", batch);
             }
@@ -1421,14 +1269,14 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
     }
 }
 
-/// [regress] A fork of an unknown parent counts its skipped copies without
-/// uploading the parent, and its lower corrected money publishes.
+/// [regress] Pre-header copies are excluded, including lower and zero
+/// corrections and a parent/fork pair with exact double-count removal.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
-fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_publishes() {
+fn pi_fork_pre_header_copies_reduce_double_counted_money() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_fork_lower") {
         return;
@@ -1459,7 +1307,6 @@ fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_
             counts.pi_fork_copies_skipped_tokens,
             if all_copied { 128 } else { 109 }
         );
-        assert_eq!(counts.pi_fork_parent_unseen, if all_copied { 2 } else { 1 });
         assert_eq!(
             route.snapshots[&f.entity]["request_count"],
             json!(u64::from(!all_copied))
@@ -1487,19 +1334,6 @@ fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_
             "a copied-only fork is complete, with no repeated Full"
         );
         assert_eq!(quiet.io.consumed, 0);
-    }
-}
-
-/// [regress] Copied Pi usage with a realistic envelope time before the fork header is skipped.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_fork_pre_header_copies_reduce_double_counted_money() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_fork_pre_header") {
-        return;
     }
     let mut f = PiDriver::warm("pi-fork-pre-header", &pi_seed());
     let fork = f.c.root.join("fork.jsonl");

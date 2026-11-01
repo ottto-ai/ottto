@@ -5256,9 +5256,19 @@ fn a0h_row(id: &str, input: u64) -> String {
 }
 
 fn a0h_wire(root: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
-    let source = SnapshotSource::ClaudeCode;
-    crate::snapshot_sync::apply_claude_local_evidence_to_scan(root, scan, index);
-    index.veto_claude_history_emission(source, &mut scan.snapshots);
+    source_wire(SnapshotSource::ClaudeCode, root, index, scan)
+}
+
+fn source_wire(
+    source: SnapshotSource,
+    root: &Path,
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) -> Vec<u8> {
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(root, scan, index);
+        index.veto_claude_history_emission(source, &mut scan.snapshots);
+    }
     index.bind_session_accounts(source, "a0h-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     finalize_scan_after_policy(source, scan, index);
@@ -6973,15 +6983,21 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
 }
 
 /// [money] b4 structural growth paced no record reselection no prune and restart.
+/// [format] Unfundable Pi growth keeps its predecessor and paces native fallback.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    b4_structural_transition(false);
-    b4_structural_transition(true);
+    for (source, near_cap) in [
+        (SnapshotSource::ClaudeCode, false),
+        (SnapshotSource::ClaudeCode, true),
+        (SnapshotSource::Pi, false),
+    ] {
+        b4_structural_transition(source, near_cap);
+    }
 }
 
-fn b4_structural_transition(near_cap: bool) {
+fn b4_structural_transition(source: SnapshotSource, near_cap: bool) {
     use std::io::Write;
     struct ResetCap;
     impl Drop for ResetCap {
@@ -7000,21 +7016,49 @@ fn b4_structural_transition(near_cap: bool) {
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
     let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let source = SnapshotSource::ClaudeCode;
+    let row = |id: &str, input: u64| match source {
+        SnapshotSource::Pi => {
+            serde_json::json!({"type":"message","id":id,"parentId":"a0000000",
+            "timestamp":"2026-10-27T07:00:01Z","message":{"role":"assistant",
+                "provider":"openai","model":"gpt-5.4","api":"openai-responses",
+                "timestamp":"2026-10-27T07:00:01Z","stopReason":"stop",
+                "content":[{"type":"text","text":"Synthetic answer."}],"responseId":id,
+                "usage":{"input":input,"output":2,"cacheRead":0,"cacheWrite":0,
+                    "totalTokens":input+2,"cost":{"total":0.001}}}})
+            .to_string()
+                + "\n"
+        }
+        _ => a0h_row(id, input).replace(
+            "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+            "11111111-2222-4333-8444-555555555555",
+        ),
+    };
+    let is_claude = source == SnapshotSource::ClaudeCode;
+    let slot = if is_claude { 0 } else { 2 };
+    if is_claude {
+        native_fixture(&path);
+    } else {
+        let header = serde_json::json!({"type":"session","version":3,"id":"synthetic-pi-bound",
+            "timestamp":"2026-10-27T06:00:00Z","cwd":"/synthetic/pi-work"})
+        .to_string()
+            + "\n";
+        std::fs::write(&path, header + &row("seed", 10)).unwrap();
+    }
     let key = local_index_key(&path);
     let namespace = Scope("b4-structural".into());
     let index_path = root.join("index.json");
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
-    let run = |cache: Arc<SharedCache>, mut index: ScanIndex, at: &str| {
-        index.activate_effective_upload_body_witness_revision(effective_revision(source));
-        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+    let run = |cache: Arc<SharedCache>, mut index: ScanIndex| {
+        if is_claude {
+            index.activate_effective_upload_body_witness_revision(effective_revision(source));
+        }
+        let scan = || {
             let scan = OwnedSourceScan::new_with_identity_capture(
                 source,
                 std::slice::from_ref(&sessions),
                 index,
-                at,
+                "2026-10-29T12:00:00Z",
                 1,
                 100,
                 false,
@@ -7025,37 +7069,56 @@ fn b4_structural_transition(near_cap: bool) {
             )
             .with_sampled_acquisition(cache, namespace.clone());
             fixture::scan_reads(scan, 10_000)
-        })
+        };
+        if is_claude {
+            claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, scan)
+        } else {
+            scan()
+        }
     };
-    let (mut index, mut first, _) =
-        run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
-    assert_eq!(first.snapshots.len(), 1);
-    assert!(index.claude_request_census.get(&key).is_some());
-    a0h_wire(&root, &mut index, &mut first);
-    index.record_accepted_snapshot_fingerprints(
-        &first
-            .snapshots
+    let commit = |index: &mut ScanIndex, scan: &SourceScanResult, check_native: bool| {
+        index.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&index_path).unwrap();
+        if check_native {
+            assert_native_write_before_save(&cache, lock, source, index, &key);
+        }
+        crate::snapshots::durable_after_save_and_retire(&cache, &root, source, index, &index_path);
+    };
+    let has_event = |events: &[serde_json::Value], pointer: &str, value: serde_json::Value| {
+        events
             .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect(),
-    );
-    assert!(
-        index
-            .file_snapshot_fingerprints
-            .get(&key)
-            .is_some_and(|set| !set.is_empty()),
-        "real accepted incidence before holding growth"
-    );
-    index.save(&index_path).unwrap();
-    assert_native_write_before_save(&cache, lock, source, &index, &key);
+            .any(|e| e["source"] == source.api_slug() && e.pointer(pointer) == Some(&value))
+    };
+    let (mut index, mut first, modes) = run(cache.clone(), ScanIndex::default());
+    assert_eq!(first.snapshots.len(), 1);
+    assert_eq!(modes.0, 1, "first native acquisition");
+    assert_eq!(first.snapshots[0].request_count, 1);
+    if is_claude {
+        assert!(index.claude_request_census.get(&key).is_some());
+    }
+    source_wire(source, &root, &mut index, &mut first);
+    commit(&mut index, &first, true);
+    if is_claude {
+        assert!(
+            index
+                .file_snapshot_fingerprints
+                .get(&key)
+                .is_some_and(|set| !set.is_empty()),
+            "real accepted incidence before holding growth"
+        );
+    }
     cache.retained().unwrap().clear();
     let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    assert!(!original_disk.is_empty(), "native receipt before any bound");
     let append =
-        |id: &str| {
-            let text = a0h_row(id, 25).replace(
-                "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
-                "11111111-2222-4333-8444-555555555555",
-            );
+        |id: &str, input: u64| {
+            let text = row(id, input);
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
@@ -7070,7 +7133,7 @@ fn b4_structural_transition(near_cap: bool) {
                 ))
                 .unwrap();
         };
-    append("growth-1");
+    append("growth-1", if is_claude { 25 } else { 20 });
     let end = std::fs::metadata(&path).unwrap().len();
     let now = std::time::SystemTime::now();
     cache.durable().unwrap().retail_full_now = Some(now);
@@ -7081,11 +7144,22 @@ fn b4_structural_transition(near_cap: bool) {
         + 4 * key.len() as u64;
     store::active::set_active_budget_for_test(Some(limit));
     let oracle_prior = index.clone();
-    let ((mut next, mut caught, modes), reads) =
-        a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+    let records_read = cache.durable_counters(source).unwrap().1.records_read;
+    let (((mut next, mut caught, modes), reads), events) =
+        crate::local_resource_diagnostics::capture(|| a0h_observe(|| run(cache.clone(), index)));
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1.records_read - records_read,
+        1,
+        "the record was reached and refused at decode"
+    );
     assert_eq!(modes, (1, 0, end));
     assert_eq!(reads.1, end, "actual single Full input extent");
-    assert_eq!(caught.snapshots[0].input_tokens, 125);
+    assert_eq!(caught.snapshots.len(), 1);
+    assert_eq!(caught.snapshots[0].request_count, 2);
+    assert_eq!(
+        caught.snapshots[0].input_tokens,
+        if is_claude { 125 } else { 30 }
+    );
     assert_eq!(
         next.files[&key].size_bytes, end,
         "paced read commits catch-up"
@@ -7098,39 +7172,68 @@ fn b4_structural_transition(near_cap: bool) {
         store_snapshot(&store::store_dir_for_index(&index_path)),
         original_disk
     );
-    let actual = a0h_wire(&root, &mut next, &mut caught);
-    let (mut oracle_index, mut oracle, oracle_modes) = run(
-        Arc::new(SharedCache::default()),
-        oracle_prior,
-        "2026-10-29T12:00:00Z",
-    );
+    {
+        let stores = cache.durable().unwrap();
+        assert_eq!(stores.counters.active_bound[slot], [1, 0]);
+        for other in (0..3).filter(|other| *other != slot) {
+            assert_eq!(stores.counters.active_bound[other], [0, 0]);
+        }
+        assert_eq!(stores.counters.pace_evicted[slot], 0);
+    }
+    assert!(has_event(
+        &events,
+        "/counts/degraded_no_record/active_bound",
+        serde_json::json!([1, 1])
+    ));
+    assert!(has_event(
+        &events,
+        "/counts/full_reads/degraded_no_record/active_bound",
+        serde_json::json!(1)
+    ));
+    assert!(!events
+        .iter()
+        .any(|e| e["source"] == source.api_slug() && e.pointer("/counts/pace_evicted").is_some()));
+    let actual = source_wire(source, &root, &mut next, &mut caught);
+    let (mut oracle_index, mut oracle, oracle_modes) =
+        run(Arc::new(SharedCache::default()), oracle_prior);
     assert_eq!(oracle_modes, (1, 0, end), "independent cold Full control");
     assert_eq!(oracle.snapshots.len(), 1);
-    assert_eq!(actual, a0h_wire(&root, &mut oracle_index, &mut oracle));
-    next.record_accepted_snapshot_fingerprints(
-        &caught
-            .snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect(),
+    assert_eq!(
+        actual,
+        source_wire(source, &root, &mut oracle_index, &mut oracle)
     );
-    next.save(&index_path).unwrap();
+    commit(&mut next, &caught, false);
     index = next;
-    append("growth-2");
+    append("growth-2", if is_claude { 25 } else { 30 });
     let old_incidence = index.file_snapshot_fingerprints.clone();
     let old_carried = index.accepted_rebuild_incidence.clone();
     let old_accepted = index.accepted_snapshot_fingerprints.clone();
-    assert!(old_incidence[&key]
-        .iter()
-        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
-    assert!(
-        old_incidence.get(&key).is_some_and(|set| !set.is_empty()),
-        "nonempty prune premise"
-    );
+    if is_claude {
+        assert!(old_incidence[&key]
+            .iter()
+            .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+        assert!(
+            old_incidence.get(&key).is_some_and(|set| !set.is_empty()),
+            "nonempty prune premise"
+        );
+    }
     let old_census = serde_json::to_value(&index.claude_request_census).unwrap();
-    for _ in 0..2 {
-        let ((held, output, modes), reads) =
-            a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+    let old_entry = serde_json::to_value(&index.files[&key]).unwrap();
+    for pass in 0..2 {
+        let (((held, output, modes), reads), events) =
+            crate::local_resource_diagnostics::capture(|| {
+                a0h_observe(|| run(cache.clone(), index))
+            });
+        assert!(has_event(
+            &events,
+            "/counts/active_bound_delay/active_bound",
+            serde_json::json!([1, pass + 1])
+        ));
+        assert_eq!(
+            serde_json::to_value(&held.files[&key]).unwrap(),
+            old_entry,
+            "whole entry preserved"
+        );
         assert!(output.snapshots.is_empty());
         assert_eq!(modes, (0, 0, 0));
         assert_eq!(reads.1, 0);
@@ -7152,24 +7255,24 @@ fn b4_structural_transition(near_cap: bool) {
         assert_eq!(output.oversized_file_count, 0, "no size prune");
         index = held;
     }
-    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [1, 2]);
+    assert_eq!(cache.durable().unwrap().counters.active_bound[slot], [1, 2]);
     if near_cap {
         // Scale the SAME discovery cap and pace threshold, preserving actual
         // accepted-prefix/native-read/terminal-settlement transitions.
         let before = std::fs::metadata(&path).unwrap().len();
-        let row = a0h_row("growth-3", 25);
-        let cap = before + row.len() as u64 + 1;
+        let text = row("growth-3", 25);
+        let cap = before + text.len() as u64 + 1;
         TEST_JSONL_FILE_CAP.set(Some(cap));
         assert!(
             !near_source_cap(source, before),
             "prior refusal was below 90%"
         );
-        append("growth-3");
+        append("growth-3", 25);
         let high = std::fs::metadata(&path).unwrap().len();
         assert!(high < cap && near_source_cap(source, high));
         let (((caught_index, caught, modes), reads), events) =
             crate::local_resource_diagnostics::capture(|| {
-                a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
+                a0h_observe(|| run(cache.clone(), index))
             });
         assert_eq!(modes, (1, 0, high));
         assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
@@ -7177,10 +7280,10 @@ fn b4_structural_transition(near_cap: bool) {
         assert_eq!(caught_index.files[&key].size_bytes, high);
         assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
             && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
-        append("growth-4");
+        append("growth-4", 25);
         assert!(std::fs::metadata(&path).unwrap().len() > cap);
         let ((oversized, disclosure, modes), reads) =
-            a0h_observe(|| run(cache.clone(), caught_index, "2026-10-29T12:00:00Z"));
+            a0h_observe(|| run(cache.clone(), caught_index));
         assert_eq!(modes, (0, 0, 0));
         assert_eq!(reads.1, 0);
         assert!(
@@ -7192,21 +7295,29 @@ fn b4_structural_transition(near_cap: bool) {
     }
     cache.durable().unwrap().retail_full_now =
         Some(now + std::time::Duration::from_secs(PACE_SECS));
-    let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+    let prior = index.clone();
+    let (mut index, mut caught, modes) = run(cache.clone(), index);
     let final_end = std::fs::metadata(&path).unwrap().len();
     assert_eq!(modes, (1, 0, final_end));
-    assert_eq!(caught.snapshots[0].input_tokens, 150);
+    assert_eq!(
+        caught.snapshots[0].input_tokens,
+        if is_claude { 150 } else { 60 }
+    );
+    assert_eq!(caught.snapshots[0].request_count, 3);
     assert_eq!(index.files[&key].size_bytes, final_end);
-    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [2, 2]);
-    index.save(&index_path).unwrap();
+    assert_eq!(cache.durable().unwrap().counters.active_bound[slot], [2, 2]);
+    let actual = source_wire(source, &root, &mut index, &mut caught);
+    let (mut cold_index, mut cold, cold_modes) = run(Arc::new(SharedCache::default()), prior);
+    assert_eq!(cold_modes, (1, 0, final_end));
+    assert_eq!(
+        actual,
+        source_wire(source, &root, &mut cold_index, &mut cold)
+    );
+    commit(&mut index, &caught, false);
     drop(cache);
     let restarted = Arc::new(SharedCache::default());
     restarted.durable_begin_pass(source, &index_path, &namespace, true);
-    let (index, idle, modes) = run(
-        restarted,
-        ScanIndex::load(&index_path).unwrap(),
-        "2026-10-29T12:00:00Z",
-    );
+    let (index, idle, modes) = run(restarted, ScanIndex::load(&index_path).unwrap());
     assert!(idle.snapshots.is_empty());
     assert_eq!(modes, (0, 0, 0));
     // After catch-up normal quiet-file retirement is safe; the restart
@@ -11718,19 +11829,17 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
     }
 }
 
-/// [format] Pi live preparation refuses an oversized ledger without truncation.
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::ScratchDir::new("pi-live-ledger-cap");
+fn with_live_preparation(
+    source: SnapshotSource,
+    check: impl FnOnce(&SharedCache, &mut dyn FnMut(&SnapshotAccumulator) -> PrepareOutcome),
+) {
+    let root = crate::test_scratch::ScratchDir::new("live-preparation");
     let _lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
     std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
-    let source = SnapshotSource::Pi;
-    let scope = Scope("pi-live-ledger-cap".into());
+    let scope = Scope("live-preparation".into());
     let (_, checkpoint) = native_record_of(&path, &scope, source);
-    let mut accumulator = SnapshotAccumulator::new(source);
+    let accumulator = SnapshotAccumulator::new(source);
     let report = JsonlReadReport::default();
     let index_path = root.join("index.json");
     let mut index = ScanIndex::default();
@@ -11756,38 +11865,50 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
             &counting,
         )
         .unwrap();
-    for over_cap in [false, true] {
-        *accumulator.seen_pi_usage_keys.usage_keys_mut() = (0..codec::pi::PI_LEDGER_MAX_KEYS
-            + usize::from(over_cap))
-            .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
-            .collect();
+    let mut prepare = |accumulator: &SnapshotAccumulator| {
         let view = LiveFinishView::new(
-            PreFinalization::new(&accumulator, &report, (0, 0, false)),
+            PreFinalization::new(accumulator, &report, (0, 0, false)),
             &checkpoint,
             &chain,
             jsonl_line_cap() as u64,
         )
         .unwrap();
-        match cache.prepare_live(&mut lease, view) {
-            PrepareOutcome::Prepared(prepared) if !over_cap => cache.discard_prepared(prepared),
-            PrepareOutcome::NotPersisted(NotPersisted::EntryCap) if over_cap => {}
-            _ => panic!("expected prepared at cap, EntryCap above cap"),
-        }
-        let counts = &cache.durable().unwrap().counters;
-        assert_eq!(
-            counts
-                .not_persisted
-                .get("wa.entry_cap")
-                .copied()
-                .unwrap_or(0),
-            u64::from(over_cap)
-        );
-    }
+        cache.prepare_live(&mut lease, view)
+    };
+    check(&cache, &mut prepare);
     lease.release();
+    assert_eq!(cache.durable_counters(source).unwrap().1.disk_records, 0);
 }
 
-#[path = "durable_tail_pi_bound_tests.rs"]
-mod pi_bound;
+/// [format] Pi live preparation refuses an oversized ledger without truncation.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    with_live_preparation(SnapshotSource::Pi, |cache, prepare| {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
+        for over_cap in [false, true] {
+            *accumulator.seen_pi_usage_keys.usage_keys_mut() = (0..codec::pi::PI_LEDGER_MAX_KEYS
+                + usize::from(over_cap))
+                .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
+                .collect();
+            match prepare(&accumulator) {
+                PrepareOutcome::Prepared(prepared) if !over_cap => cache.discard_prepared(prepared),
+                PrepareOutcome::NotPersisted(NotPersisted::EntryCap) if over_cap => {}
+                _ => panic!("expected prepared at cap, EntryCap above cap"),
+            }
+            let counts = &cache.durable().unwrap().counters;
+            assert_eq!(
+                counts
+                    .not_persisted
+                    .get("wa.entry_cap")
+                    .copied()
+                    .unwrap_or(0),
+                u64::from(over_cap)
+            );
+        }
+    });
+}
 
 /// [format] A Claude or Codex live encode carrying fork state is refused,
 /// counted and writes no record.
@@ -11796,64 +11917,26 @@ mod pi_bound;
 fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let root = crate::test_scratch::ScratchDir::new("non-pi-fork-refused");
-        let _lock = test_locks::hold(&root);
-        let path = root.join("fixture.jsonl");
-        std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
-        let scope = Scope("non-pi-fork-refused".into());
-        let (_, checkpoint) = native_record_of(&path, &scope, source);
-        let mut accumulator = SnapshotAccumulator::new(source);
-        let report = JsonlReadReport::default();
-        let index_path = root.join("index.json");
-        let mut index = ScanIndex::default();
-        index.save(&index_path).unwrap();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &scope, false);
-        let store::LeaseWait::Granted(mut lease) = cache.acquire_active(source, 0) else {
-            panic!("isolated active lease");
-        };
-        let key = local_index_key(&path);
-        let held = File::open(&path).unwrap();
-        let counting = ImmutableCounting::from_accumulator(&accumulator).unwrap();
-        let chain = cache
-            .durable_capture_chain(
-                &mut lease,
-                source,
-                &key,
-                "synthetic-object",
-                &held,
-                &checkpoint,
-                &index,
-                true,
-                &counting,
-            )
-            .unwrap();
-        accumulator.seen_pi_usage_keys = PiLedger::from_parts(BTreeMap::new(), true, Some(1));
-        let view = LiveFinishView::new(
-            PreFinalization::new(&accumulator, &report, (0, 0, false)),
-            &checkpoint,
-            &chain,
-            jsonl_line_cap() as u64,
-        )
-        .unwrap();
-        match cache.prepare_live(&mut lease, view) {
-            PrepareOutcome::NotPersisted(NotPersisted::Codec) => {}
-            _ => panic!("a non-Pi fork must refuse"),
-        }
-        let counts = &cache.durable().unwrap().counters;
-        assert_eq!(
-            counts
-                .not_persisted
-                .get("wa.entry_cap")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-        assert_eq!(
-            counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
-            1
-        );
-        lease.release();
-        assert_eq!(cache.durable_counters(source).unwrap().1.disk_records, 0);
+        with_live_preparation(source, |cache, prepare| {
+            let mut accumulator = SnapshotAccumulator::new(source);
+            accumulator.seen_pi_usage_keys = PiLedger::from_parts(BTreeMap::new(), true, Some(1));
+            match prepare(&accumulator) {
+                PrepareOutcome::NotPersisted(NotPersisted::Codec) => {}
+                _ => panic!("a non-Pi fork must refuse"),
+            }
+            let counts = &cache.durable().unwrap().counters;
+            assert_eq!(
+                counts
+                    .not_persisted
+                    .get("wa.entry_cap")
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert_eq!(
+                counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
+                1
+            );
+        });
     }
 }
