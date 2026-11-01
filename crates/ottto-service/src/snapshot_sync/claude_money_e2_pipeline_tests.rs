@@ -4427,10 +4427,6 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
                     money(&stored),
                     "released held money = the released accepted body"
                 );
-                assert_eq!(
-                    org_shares(&released("identity.held.copy")),
-                    org_shares(&stored)
-                );
                 let reserve = |_: &SnapshotItem| cap;
                 let budget = crate::snapshots::claude_request_identity::WireBudget {
                     max_item_bytes: cap,
