@@ -1115,6 +1115,7 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         let mut archive = ArchiveEvidence::from_metadata(fs::metadata(&path).unwrap()).unwrap();
         archive.owner = Some("synthetic".into());
         archive.disposition = disposition;
+        archive.work.as_mut().unwrap().decoded = true;
         let owed = archive.owed_cause().is_some();
         index.archives.insert(key.clone(), archive);
         // Settled archive custody wins even over a re-armed ordinary entry.

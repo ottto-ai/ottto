@@ -368,7 +368,7 @@ impl ArchiveEvidence {
         file.metadata()
             .is_ok_and(|metadata| self.matches_metadata(&metadata))
     }
-    pub(super) fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
+    pub(super) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
         crate::transcript_acquisition::FileStamp::capture(metadata.clone())
             .is_ok_and(|s| self.stamp.as_ref().is_some_and(|old| old.same_content(&s)))
     }
