@@ -1306,13 +1306,13 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
 /// callback). `None`: the whole kind, complete by its manifest count. Each
 /// value comes with its row digest as stored. A graph not at the generation
 /// its save would commit over (its own, or its confirmed growth claim's),
-/// or a store changed elsewhere, holds. Returns the store stamp it read at.
+/// or a store changed elsewhere, holds.
 pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
     index: &ScanIndex,
     kind: &str,
     roots: Option<&std::collections::BTreeSet<String>>,
     f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
-) -> Result<(u64, u64)> {
+) -> Result<()> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1369,7 +1369,7 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
         expected.map_or(true, |expected| expected == count),
         "state_v2_missing_member"
     );
-    Ok(stamp)
+    Ok(())
 }
 
 /// Cold usage pending: load the families a page names before it
@@ -1451,14 +1451,13 @@ pub(in super::super) fn load_usage_shaped(
 /// Every usage-pending family (`None`) or the named ones (`Some`), one at a
 /// time, as this graph holds it: its loaded value, else its stored row,
 /// which must still match its head. Keeps nothing and visits in no set
-/// order. Returns the store stamp it read at (`None`: it read no row).
-/// Unknown, counted: a row unlike its head, a head without a row, or a store
-/// this graph does not hold.
+/// order. Unknown, counted: a row unlike its head, a head without a row, or a
+/// store this graph does not hold.
 pub(in super::super) fn visit_usage(
     index: &ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
     f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
-) -> Result<Option<(u64, u64)>> {
+) -> Result<()> {
     let wanted = |root: &str| roots.map_or(true, |roots| roots.contains(root));
     let usage = &index.claude_usage_family_pending;
     let Some(cold) = usage.cold() else {
@@ -1467,7 +1466,7 @@ pub(in super::super) fn visit_usage(
                 f(root.as_str(), family);
             }
         }
-        return Ok(None);
+        return Ok(());
     };
     for (root, family) in cold.loaded() {
         if wanted(root.as_str()) {
@@ -1479,7 +1478,7 @@ pub(in super::super) fn visit_usage(
         None => usage.unloaded(cold.head_roots().map(String::as_str)),
     };
     if unread.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
     let mut seen = 0_usize;
     let read = read_cold(
@@ -1496,9 +1495,9 @@ pub(in super::super) fn visit_usage(
             Ok(())
         },
     );
-    let result = read.and_then(|stamp| {
+    let result = read.and_then(|()| {
         ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
-        Ok(Some(stamp))
+        Ok(())
     });
     if result.is_err() {
         telemetry::count("usage_pending_unknown", 1);

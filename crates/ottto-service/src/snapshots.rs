@@ -6435,7 +6435,7 @@ fn claude_fence_closed_retry_carry_observed(
     let mut carried = BTreeSet::new();
     let mut request_owners = Vec::<([u8; 32], &str)>::new();
     let roots = candidates.keys().cloned().collect::<BTreeSet<_>>();
-    let first = state_v2::visit_usage(index, Some(&roots), &mut |root, pending| {
+    state_v2::visit_usage(index, Some(&roots), &mut |root, pending| {
         let Some((root_session_id, members)) = candidates.get_key_value(root) else {
             return;
         };
@@ -6464,7 +6464,7 @@ fn claude_fence_closed_retry_carry_observed(
     // Pass 2: every family's requests against those owners.
     let mut shared_owners = BTreeSet::new();
     if !request_owners.is_empty() {
-        let second = state_v2::visit_usage(index, None, &mut |root_session_id, pending| {
+        state_v2::visit_usage(index, None, &mut |root_session_id, pending| {
             for request_hash in pending
                 .member_request_id_hashes
                 .values()
@@ -6481,12 +6481,6 @@ fn claude_fence_closed_retry_carry_observed(
             }
         })
         .map_err(|_| usage_pending::Unknown)?;
-        if first
-            .zip(second)
-            .is_some_and(|(first, second)| first != second)
-        {
-            return Err(usage_pending::Unknown);
-        }
     }
     drop(request_owners);
     carried.retain(|root_session_id| {
@@ -43223,7 +43217,6 @@ fn ensure_bounded_traversal(
         let mut covered_roots = None;
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
         let owed_route = evidence_owed::enabled();
-        let mut usage_unknown = false;
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
@@ -43243,7 +43236,7 @@ fn ensure_bounded_traversal(
                     debt_scope,
                 )
             };
-            match whole {
+            Ok(match whole {
                 Ok(carry) => carry,
                 Err(refusal) if owed_route => {
                     // No new batch admission: every stale root returns to the
@@ -43292,13 +43285,13 @@ fn ensure_bounded_traversal(
                         return TraversalProgress::Resumed;
                     }
                 }
-            }
+            })
         } else if !window_scratch_admitted {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::WindowScratch,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else if scoped_retry_allowed || full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry_observed(
                 index,
@@ -43309,16 +43302,12 @@ fn ensure_bounded_traversal(
                 &mut stale_carry_rejection_counts,
                 debt_scope,
             )
-            .unwrap_or_else(|_| {
-                usage_unknown = true;
-                ClaudeStaleFamilyCarry::default()
-            })
         } else if retry_can_reopen {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::ProvenanceOrContext,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::ProvenanceOrContext,
@@ -43335,19 +43324,15 @@ fn ensure_bounded_traversal(
                 &mut stale_carry_rejection_counts,
                 debt_scope,
             )
-            .unwrap_or_else(|_| {
-                usage_unknown = true;
-                ClaudeStaleFamilyCarry::default()
-            })
         };
-        if usage_unknown {
+        let Ok(carry) = carry else {
             return claude_stale_retry_usage_unknown(
                 index,
                 prior_unsettled_upload,
                 prior_unsettled_causes,
                 prior_held_family_roots,
             );
-        }
+        };
         let ClaudeStaleFamilyCarry {
             roots: mut carried_roots,
             replay: initial_replay,

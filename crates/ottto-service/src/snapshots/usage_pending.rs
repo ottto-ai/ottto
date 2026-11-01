@@ -380,8 +380,8 @@ impl ColdUsage {
     }
 }
 
-/// A request hash as a full 256-bit join key: equal hashes give equal keys,
-/// whatever their spelling, so a streamed join never needs the strings.
+/// A request hash as a full 256-bit join key over its exact string: equal
+/// strings give equal keys, so a streamed join never needs the strings.
 pub(super) fn request_key(hash: &str) -> [u8; 32] {
     use sha2::Digest;
     sha2::Sha256::digest(hash.as_bytes()).into()
