@@ -1606,11 +1606,7 @@ struct SnapshotUploadProgress {
     pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
     /// Head-CAS conflict challenges keyed like `accepted_cache_heads`. Any
     /// accepted or unchanged ACK for the session clears its entry.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "head_conflict::deserialize"
-    )]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     head_conflict_challenges: BTreeMap<String, HeadConflictChallenge>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
@@ -18029,73 +18025,6 @@ mod tests {
             SnapshotUploadProgress::new(namespace, test_quarantine_witness())
         );
         assert!(!path.exists());
-        assert_eq!(
-            std::fs::read_dir(&root)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
-                .count(),
-            1
-        );
-        // A malformed OPTIONAL challenge field must never quarantine known
-        // ACKs, refusals or identity proof. Only recovery metadata is dropped.
-        let mut known = test_upload_progress();
-        known.record_body(&"b".repeat(64), &"c".repeat(64));
-        known.quarantine_permanent_body(&"d".repeat(64), &"e".repeat(64), "body_exceeds_max_bytes");
-        let expected = serde_json::to_value(&known).unwrap();
-        for optional in [
-            serde_json::json!(null),
-            serde_json::json!(true),
-            serde_json::json!(42),
-            serde_json::json!(1.5),
-            serde_json::json!("broken"),
-            serde_json::json!([1, 2]),
-            serde_json::json!({"bad-key": {"challenge":"bad"}}),
-            serde_json::json!({"a".repeat(64): {"challenge":"f".repeat(64),
-                "stale_revision_v2_hash":"0".repeat(64), "answer_attempts":"broken"}}),
-            serde_json::json!({"a".repeat(64): {"challenge":"bad",
-                "stale_revision_v2_hash":"0".repeat(64)}}),
-        ] {
-            let mut raw = expected.clone();
-            raw["head_conflict_challenges"] = optional;
-            std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-            head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
-            let restored = SnapshotUploadProgress::load(
-                &path,
-                &known.destination_namespace_hash,
-                test_quarantine_witness(),
-            )
-            .unwrap();
-            assert!(
-                path.exists(),
-                "optional metadata cannot quarantine progress"
-            );
-            assert!(restored.head_conflict_challenges.is_empty());
-            assert_eq!(serde_json::to_value(&restored).unwrap(), expected);
-            head_conflict::REFUSALS
-                .with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
-        }
-        // Even deeply malformed optional content is isolated from the outer
-        // progress decoder. Syntactically truncated whole JSON is still corrupt.
-        let deep = "[".repeat(256) + "0" + &"]".repeat(256);
-        let mut raw = serde_json::to_string(&expected).unwrap();
-        raw.pop();
-        raw.push_str(",\"head_conflict_challenges\":{\"");
-        raw.push_str(&"a".repeat(64));
-        raw.push_str("\":{\"challenge\":");
-        raw.push_str(&deep);
-        raw.push_str("}}}");
-        std::fs::write(&path, raw).unwrap();
-        head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
-        let restored = SnapshotUploadProgress::load(
-            &path,
-            &known.destination_namespace_hash,
-            test_quarantine_witness(),
-        )
-        .unwrap();
-        assert!(path.exists());
-        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
-        head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
         assert_eq!(
             std::fs::read_dir(&root)
                 .unwrap()

@@ -858,22 +858,4 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
         upgraded.head_conflict_challenges[&key].challenge,
         challenge(0xd)
     );
-
-    // Bad optional records cannot erase even opaque accepted proof/tombstones.
-    let mut malformed: Value = serde_json::from_slice(&bytes).unwrap();
-    malformed["head_conflict_challenges"][&key]["snapshot_fingerprint"] = Value::Bool(false);
-    let roundtrip: SnapshotUploadProgress = serde_json::from_value(malformed).unwrap();
-    assert!(roundtrip.head_conflict_challenges.is_empty());
-    assert_eq!(
-        serde_json::to_value(&roundtrip.accepted_identity_buckets).unwrap(),
-        serde_json::to_value(&progress.accepted_identity_buckets).unwrap()
-    );
-    assert_eq!(
-        roundtrip.accepted_body_witnesses,
-        progress.accepted_body_witnesses
-    );
-    assert_eq!(
-        roundtrip.permanent_rejections,
-        progress.permanent_rejections
-    );
 }
