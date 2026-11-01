@@ -2807,8 +2807,8 @@ fn settled_history_cut_measures_the_tagged_body() {
     assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
     // Cut-time tags equal the unsegmented tags from the same ledger state:
     // empty, then the whole body ACKed and the oldest request's account
-    // changed, so the whole body and the segment holding it (reading the
-    // live entry) both refuse its accepted share (#909).
+    // changed. The segment holding it reads the live entry, so a segment that
+    // ignored that entry would place the row differently from the whole body.
     let cut = Cut {
         now,
         trigger: trigger / 2,
