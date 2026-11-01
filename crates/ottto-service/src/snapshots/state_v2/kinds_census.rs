@@ -24,16 +24,15 @@ pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> 
     }
     scan_index_fields!(each save);
     // Census owns the membership cardinality, derived once from selected usage.
-    rows.put(
-        mapper::key("family.requests", "", 0)?,
-        &next.claude_usage_family_pending.len(),
-    )?;
-    for (root, pending) in &next.claude_usage_family_pending {
+    let mut families = 0_usize;
+    for (root, pending) in next.claude_usage_family_pending.views() {
+        families += 1;
         rows.put(
             mapper::key("family.requests", root, 1)?,
-            &pending.member_request_id_hashes.len(),
+            &pending.hash_member_count(),
         )?;
     }
+    rows.put(mapper::key("family.requests", "", 0)?, &families)?;
     Ok(())
 }
 pub(super) fn hydrate_txn(
@@ -75,10 +74,13 @@ pub(super) fn hydrate_txn(
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
-            let h = tx
-                .get(&mapper::key($kind, "", 0)?)?
-                .context("state_v2_census_missing")?;
-            index.$f = mapper::read(tx, &h, Some(&mut cx.digests))?;
+            index.$f = mapper::field_read(
+                tx,
+                $kind,
+                mapper::Members::Field,
+                Some(&mut cx.digests),
+                || ScanIndex::default().$f,
+            )?;
         };
         ($($t:tt)*) => {};
     }
@@ -93,8 +95,8 @@ pub(super) fn hydrate_txn(
         ensure!(
             index
                 .claude_usage_family_pending
-                .get(&root)
-                .is_some_and(|p| p.member_request_id_hashes.len() == count),
+                .view(&root)
+                .is_some_and(|p| p.hash_member_count() == count),
             "state_v2_census_membership"
         );
     }
@@ -127,9 +129,9 @@ pub(super) fn hydrate_cas_families(
     let members: BTreeMap<String, usize> =
         mapper::read_map(tx, "family.requests", Some(roots), None)?;
     for root in roots {
-        let pending = index.claude_usage_family_pending.get(root);
+        let pending = index.claude_usage_family_pending.view(root);
         ensure!(
-            members.get(root).copied() == pending.map(|p| p.member_request_id_hashes.len()),
+            members.get(root).copied() == pending.map(|p| p.hash_member_count()),
             "state_v2_census_membership"
         );
     }

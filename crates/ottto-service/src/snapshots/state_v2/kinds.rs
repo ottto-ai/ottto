@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 pub(super) struct KindCx {
     pub(super) binding: Option<super::super::scan_index_persistence::Binding>,
     pub(super) ambiguous: bool,
+    /// Catalogue committed in the store, before defaulting newly added kinds.
+    pub(super) layout: u32,
+    pub(super) layout_recorded: bool,
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
     // Hydration scratch, consumed when the baseline is seeded.
@@ -41,6 +44,10 @@ fn enumerate(
     windows: &BTreeMap<String, kinds_accounts::WindowBaseline>,
     cx: &mut KindCx,
 ) -> Result<BTreeMap<String, kinds_accounts::WindowBaseline>> {
+    rows.raw(
+        RowKey::Meta("catalogue_layout".into()),
+        &serde_json::to_vec(&catalogue::LAYOUT)?,
+    )?;
     kinds_misc::rows(index, rows, cx)?;
     kinds_files::rows(index, rows)?;
     let windows = kinds_accounts::rows(index, rows, windows, cx)?;
@@ -53,9 +60,23 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         ..Default::default()
     };
     let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
+    let mut stored = rows.finish()?;
+    // Defaults are logical state, not rows the older store actually owns. They
+    // must be absent from the baseline so the first save writes them all.
+    stored.retain(|key, _| match key {
+        RowKey::Record { kind, .. } => {
+            catalogue::introduced(kind.name()).is_ok_and(|v| v <= cx.layout)
+        }
+        RowKey::Meta(name) => match name.as_str() {
+            "catalogue_layout" => cx.layout_recorded && cx.layout == catalogue::LAYOUT,
+            "field_presence" => cx.layout == catalogue::LAYOUT,
+            _ => true,
+        },
+        _ => true,
+    });
     Ok(Baseline {
         generation: index.generation,
-        rows: rows.finish()?,
+        rows: stored,
         windows,
     })
 }
@@ -86,6 +107,10 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
         Ok(())
     })();
     cx.valid = result.is_ok();
+    if cx.valid {
+        cx.layout = catalogue::LAYOUT;
+        cx.layout_recorded = true;
+    }
     result
 }
 
@@ -146,6 +171,8 @@ pub(super) fn hydrate_txn(
     let mut index = ScanIndex::default();
     let mut cx = KindCx {
         binding: Some(binding),
+        layout: mapper::layout(tx)?,
+        layout_recorded: tx.get(&RowKey::Meta("catalogue_layout".into()))?.is_some(),
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
@@ -180,6 +207,10 @@ pub(super) fn delta(
         })
     })();
     cx.valid = result.is_ok();
+    if cx.valid {
+        cx.layout = catalogue::LAYOUT;
+        cx.layout_recorded = true;
+    }
     result
 }
 
@@ -197,9 +228,7 @@ pub(super) fn save_graph(
         "state_v2_context_invalid"
     );
     let generation = previous.generation;
-    let started = std::time::Instant::now();
-    let before = store.save_row_attempts();
-    let mut span_outcome = "error";
+    let mut span = SaveSpan::begin(store);
     let mut pending = std::mem::take(committed);
     let mut published = false;
     let result = (|| {
@@ -213,11 +242,7 @@ pub(super) fn save_graph(
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;
         let outcome = tx.commit(generation, next.generation);
-        span_outcome = match outcome {
-            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
-            DurableCommitOutcome::NotPublished => "not_published",
-            DurableCommitOutcome::Ambiguous => "ambiguous",
-        };
+        span.outcome(&outcome);
         published = !matches!(outcome, DurableCommitOutcome::NotPublished);
         match outcome {
             DurableCommitOutcome::Committed(generation) => {
@@ -227,6 +252,14 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
+                // Loaded usage families now match the rows this save left.
+                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
+                    let rows = &digests.rows;
+                    cold.saved(|root| {
+                        let key = mapper::key("usage.pending", root, 1).ok()?;
+                        rows.get(&key).copied()
+                    });
+                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
@@ -280,16 +313,42 @@ pub(super) fn save_graph(
             next.generation = generation;
         }
     }
-    let after = store.save_row_attempts();
-    telemetry::event(
-        "save_span",
-        &serde_json::json!({
-            "duration_ms": started.elapsed().as_millis(), "outcome": span_outcome,
-            "generation": next.generation, "rows_put": after.0.saturating_sub(before.0),
-            "rows_removed": after.1.saturating_sub(before.1)
-        }),
-    );
+    span.emit(store, next.generation);
     result
+}
+/// One `save_span` per write attempt: duration, commit outcome ("error"
+/// before any commit), resulting generation and rows put or removed.
+pub(super) struct SaveSpan {
+    started: std::time::Instant,
+    before: (u64, u64),
+    outcome: &'static str,
+}
+impl SaveSpan {
+    pub(super) fn begin(store: &sqlite::Sqlite) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            before: store.save_row_attempts(),
+            outcome: "error",
+        }
+    }
+    pub(super) fn outcome(&mut self, outcome: &DurableCommitOutcome) {
+        self.outcome = match outcome {
+            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
+            DurableCommitOutcome::NotPublished => "not_published",
+            DurableCommitOutcome::Ambiguous => "ambiguous",
+        };
+    }
+    pub(super) fn emit(self, store: &sqlite::Sqlite, generation: u64) {
+        let after = store.save_row_attempts();
+        telemetry::event(
+            "save_span",
+            &serde_json::json!({
+                "duration_ms": self.started.elapsed().as_millis(), "outcome": self.outcome,
+                "generation": generation, "rows_put": after.0.saturating_sub(self.before.0),
+                "rows_removed": after.1.saturating_sub(self.before.1)
+            }),
+        );
+    }
 }
 
 pub(super) fn private_paths(

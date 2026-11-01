@@ -1069,6 +1069,15 @@ fn handle_command(
             status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
+            // Doctor only: ordinary status polls must not walk the store.
+            #[cfg(unix)]
+            if retry_relay_authorization {
+                if let Ok((files, bytes)) =
+                    crate::claude_local_otel::support_health::store_size(&default_support_dir())
+                {
+                    value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
+            }
             Ok(value)
         }
         LocalControlCommand::Receipts {
@@ -17740,7 +17749,7 @@ mod tests {
                 r#"#!/usr/bin/python3
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open({runs:?}, "a") as runs:
     runs.write("run\n")
@@ -17994,7 +18003,7 @@ if args == ["login"]:
     os.rename(path + ".tmp", path)
     sys.stderr.write("Successfully logged in\n")
     sys.exit(0)
-if args != ["app-server", "--stdio"]:
+if args[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open(os.path.join(BIN, "app-server-runs"), "a") as f:
     f.write("run\n")
@@ -30870,36 +30879,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn publish_scan_result_accepts_response_slower_than_generic_timeout() {
-        let api_base_url = delayed_setup_scan_result_server(
-            "setup_slow_scan",
-            BACKEND_REQUEST_TIMEOUT + Duration::from_secs(1),
-        );
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_slow_scan".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let mut credentials = SetupRunCredentials {
-            setup_run_token: "otsr_test".to_string(),
-            connection,
-        };
-
-        let started = Instant::now();
-        let detail = publish_scan_result(
-            &api_base_url,
-            &mut credentials,
-            &minimal_setup_scan_payload(),
-        )
-        .expect("scan-result POST should use setup-specific timeout");
-
-        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
-        assert_eq!(detail.run.id, "setup_slow_scan");
-    }
-
-    #[test]
     #[serial]
     fn install_source_action_uses_rebound_credentials_for_install_session_and_completion() {
         let _guard = lock_backend_test_env();
@@ -31311,24 +31290,6 @@ X-API-Key = "otel_redacted"
 
     fn setup_run_cancelled_scan_server() -> String {
         setup_run_terminal_scan_server("setup_cancelled", "Setup run cancelled")
-    }
-
-    fn delayed_setup_scan_result_server(setup_run_id: &'static str, delay: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept setup scan");
-            let request = read_complete_http_request(&mut stream);
-            assert!(request.contains(&format!(
-                "/api/v1/setup-runs/{setup_run_id}/local-client/scan-result"
-            )));
-            thread::sleep(delay);
-            let body = format!(
-                r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
-            );
-            write_json_response(&mut stream, 200, "OK", &body);
-        });
-        format!("http://{address}")
     }
 
     fn delayed_setup_verification_server(setup_run_id: &'static str, delay: Duration) -> String {
@@ -31764,20 +31725,6 @@ X-API-Key = "otel_redacted"
             }
         }
         String::from_utf8_lossy(&request).to_string()
-    }
-
-    fn minimal_setup_scan_payload() -> SetupScanPayload {
-        SetupScanPayload {
-            machine: BTreeMap::from([
-                ("id".to_string(), json!("machine_test")),
-                ("name".to_string(), json!("Test Mac")),
-            ]),
-            companion: BTreeMap::from([("client_name".to_string(), json!(OTTTO_CLIENT_NAME))]),
-            relay_runtime: BTreeMap::from([("state".to_string(), json!("unknown"))]),
-            service: BTreeMap::from([("state".to_string(), json!("running"))]),
-            sources: Vec::new(),
-            missing_fields: Vec::new(),
-        }
     }
 
     fn http_request_complete(request: &[u8]) -> bool {

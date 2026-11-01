@@ -15911,7 +15911,8 @@ fn collect_codex_app_server_usage_for_home(
 }
 
 /// One log line per failed app-server probe: wall-clock time, the session
-/// stage, the error kind, a digest of the Codex home and the elapsed time.
+/// stage, the error kind, the JSON-RPC error code, a digest of the Codex home
+/// and the elapsed time.
 /// Built from the fixed producer text only; no path, account or provider text.
 fn codex_probe_failure_log_line(
     message: &str,
@@ -15920,12 +15921,17 @@ fn codex_probe_failure_log_line(
     now: u64,
 ) -> String {
     let (stage, kind) = codex_probe_failure_stage_and_kind(message);
+    // The JSON-RPC error code from `codex_app_server_rpc_failure`, digits only.
+    let code = message
+        .split_once("RPC failed with code ")
+        .and_then(|(_, rest)| rest.trim_end_matches('.').parse::<i64>().ok())
+        .map_or_else(|| "none".to_string(), |code| code.to_string());
     let mut digest = Sha256::new();
     digest.update(b"ottto:codex-home-log:v1\0");
     digest.update(codex_home.as_os_str().as_encoded_bytes());
     let home = format!("{:x}", digest.finalize());
     format!(
-        "codex usage probe failed: at={} stage={stage} kind={kind} home={} elapsed_ms={}",
+        "codex usage probe failed: at={} stage={stage} kind={kind} code={code} home={} elapsed_ms={}",
         rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
         &home[..12],
         elapsed.as_millis()
@@ -16276,7 +16282,19 @@ fn run_codex_app_server_rate_limits_for_home(
         return Err("Codex app-server user identity was unavailable.".to_string());
     };
     let mut command = Command::new(program_path);
-    command.args(["app-server", "--stdio"]).env_clear();
+    // Turn off Codex's startup installers, which write into the account's home:
+    // the bundled system-skill install and the curated plugin sync. A CLI that
+    // lacks either key warns and keeps its default.
+    command
+        .args([
+            "-c",
+            "skills.bundled.enabled=false",
+            "-c",
+            "features.plugins=false",
+            "app-server",
+            "--stdio",
+        ])
+        .env_clear();
     command
         .env("HOME", &identity.home_dir)
         .env("USER", identity.account_name)
@@ -16327,10 +16345,12 @@ fn run_codex_app_server_rate_limits_for_home(
         }
     });
     let initialized = serde_json::json!({"method": "initialized"});
+    // Codex refreshes its own login when the token nears expiry; the probe
+    // never forces a refresh on top of that.
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": true}
+        "params": {"refreshToken": false}
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it (design R7).
@@ -22517,7 +22537,7 @@ if sys.argv[1:] == ["login", "status"]:
 if sys.argv[1:] == ["debug", "models", "--bundled"]:
     print('{"models":[{"id":"synthetic-model"}]}')
     sys.exit(0)
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 
 for line in sys.stdin:
@@ -23809,6 +23829,10 @@ for line in sys.stdin:
         .is_none());
     }
 
+    /// [behaviour] The probe starts Codex with its home-writing startup
+    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
+    /// keys and keeps stdin open until the asynchronous answer arrives. It
+    /// never forces a token refresh, in the default home or an account home.
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
@@ -23818,27 +23842,31 @@ for line in sys.stdin:
         let helper = dir.join("fake_codex.py");
         std::fs::write(
             &helper,
-            r#"import os
+            r#"import json
+import os
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[1:] != [
+    "-c", "skills.bundled.enabled=false", "-c", "features.plugins=false", "app-server", "--stdio"
+]:
     sys.exit(1)
 if os.environ.get("CODEX_SQLITE_HOME") != os.environ.get("CODEX_HOME"):
     sys.exit(2)
 if "OPENAI_API_KEY" in os.environ:
     sys.exit(3)
 
-account_refreshed = False
+account_read = False
 for line in sys.stdin:
     if '"id":1' in line:
         print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
     if '"id":"ottto_account"' in line:
-        if '"refreshToken":true' not in line:
-            sys.exit(4)
-        account_refreshed = True
+        account_read = True
+        refresh = json.loads(line)["params"]["refreshToken"]
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh.log"), "a") as log:
+            log.write(json.dumps(refresh) + "\n")
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     if "account/rateLimits/read" in line:
-        if not account_refreshed:
+        if not account_read:
             sys.exit(5)
         print('{"id":"ottto_rate_limits","result":{"rateLimitResetCredits":{"availableCount":2},"rateLimitsByLimitId":{},"rateLimits":{}}}', flush=True)
 "#,
@@ -23873,6 +23901,18 @@ for line in sys.stdin:
                 .pointer("/rateLimitResetCredits/availableCount")
                 .and_then(Value::as_u64),
             Some(2)
+        );
+
+        let slot = crate::test_scratch::ScratchDir::canonical("codex-slot-refresh");
+        call_codex_app_server_rate_limits_for_home(&slot, CodexHomeTrust::Managed, &|_, _, _| {
+            false
+        })
+        .expect("account home rate limits");
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(
+            refreshes.lines().collect::<Vec<_>>(),
+            ["false", "false"],
+            "default home, account home"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -23925,7 +23965,7 @@ import os
 import signal
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 mode = os.environ["FAKE_CODEX_MODE"]
 if mode in ("early_exit", "signal_exit", "line_bound", "message_bound", "total_bound"):
@@ -24025,6 +24065,8 @@ for line in sys.stdin:
         );
     }
 
+    /// [behaviour] A failed probe names its phase and the numeric JSON-RPC
+    /// code only; provider error text and data never reach the message.
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -32956,46 +32998,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 .retry_after
                 .is_none()
         );
-    }
-
-    /// A 429 names the read and the time Claude asked Ottto to wait until;
-    /// slot status keeps a fixed per-read text and the bound deadline.
-    #[test]
-    fn rate_limited_diagnostic_names_the_read_and_wait_time() {
-        // 2026-10-11T12:58:57Z.
-        let deadline = 1_791_723_537;
-        for (read, live, slot) in [
-            (
-                claude_credit_pools::ClaudeUsageRead::Plain,
-                "Claude asked Ottto to wait until 12:58 UTC before the next usage read.",
-                CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE,
-            ),
-            (
-                claude_credit_pools::ClaudeUsageRead::SavedResets,
-                "Claude asked Ottto to wait until 12:58 UTC before the next saved-resets read.",
-                CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE,
-            ),
-        ] {
-            let diagnostic =
-                claude_oauth_usage_rate_limited_diagnostic(read, deadline, deadline - 3_600)
-                    .with_quota_binding(
-                        Some("account".to_string()),
-                        Some("organization".to_string()),
-                    );
-            assert_eq!(diagnostic.code, CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE);
-            assert_eq!(diagnostic.message, live);
-            assert_eq!(
-                diagnostic.retry_after.as_deref(),
-                Some("2026-10-11T12:58:57Z")
-            );
-            let safe = safe_claude_slot_check_diagnostics(&[diagnostic], "account", "organization");
-            assert_eq!(safe[0].message, slot);
-            assert_eq!(safe[0].retry_after.as_deref(), Some("2026-10-11T12:58:57Z"));
-            assert_eq!(
-                safe_claude_slot_check_diagnostics(&safe, "account", "organization"),
-                safe
-            );
-        }
     }
 
     #[test]

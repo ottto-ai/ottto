@@ -8,9 +8,8 @@ use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ottto_core::{
-    compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
-    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalDeviceBinding,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, ControlTokenStore, FileDeviceStore, FilePendingDeviceCredentialStore,
+    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
@@ -34,29 +33,59 @@ const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbea
 const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
 const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
-/// The backend rejected a snapshot batch because the payload did not satisfy the
-/// strict daemon/backend contract. Carries the redacted response body so support
-/// can see the actual validator failure instead of guessing schema-version drift.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A payload rejection carries only validated request-local locations, never
+/// response text. Locations are transient and are not acknowledgement evidence.
+#[derive(Clone, PartialEq, Eq)]
 pub struct BatchRejected {
     pub status: u16,
-    pub body_excerpt: Option<String>,
+    pub snapshot_indexes: Option<Vec<usize>>,
+}
+
+impl BatchRejected {
+    pub(crate) fn from_response(status: u16, reader: impl std::io::Read, count: usize) -> Self {
+        let snapshot_indexes = (|| {
+            if status != 422 {
+                return None;
+            }
+            let body: serde_json::Value = serde_json::from_reader(reader).ok()?;
+            let errors = body.get("errors")?.as_array()?;
+            if errors.is_empty() {
+                return None;
+            }
+            let mut indexes = std::collections::BTreeSet::new();
+            for error in errors {
+                let loc = error.get("loc")?.as_array()?;
+                if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
+                    return None;
+                }
+                let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
+                if index >= count {
+                    return None;
+                }
+                indexes.insert(index);
+            }
+            Some(indexes.into_iter().collect())
+        })();
+        Self {
+            status,
+            snapshot_indexes,
+        }
+    }
 }
 
 impl std::fmt::Display for BatchRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.body_excerpt.as_deref() {
-            Some(body) => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {} body_excerpt={}",
-                self.status, body
-            ),
-            None => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {}",
-                self.status
-            ),
+        write!(f, "reason=validation_reject status={}", self.status)?;
+        if let Some(indexes) = &self.snapshot_indexes {
+            write!(f, " count={}", indexes.len())?;
         }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -137,15 +166,21 @@ fn gzip(body: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-/// Keep encoded requests inside the backend's independent gzip budgets.
-/// Identity requests retain the existing exact 4 MiB preflight and packing.
-fn gzip_snapshot_batch(body: &[u8], enabled: bool) -> Option<Vec<u8>> {
-    const MAX_DECODED_BYTES: usize = 1024 * 1024;
-    const MAX_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
-    if !enabled || body.len() > MAX_DECODED_BYTES {
+/// Keep encoded requests inside the backend's independent gzip budgets. A
+/// receiver advertising items over 2 MiB decodes a whole request; an older one
+/// decodes 1 MiB, so larger bodies keep identity encoding and the exact preflight.
+fn gzip_snapshot_batch(body: &[u8], enabled: bool, item_cap: usize) -> Option<Vec<u8>> {
+    const OLDER_RECEIVER_ITEM_BYTES: usize = 2 * 1024 * 1024;
+    const OLDER_RECEIVER_DECODED_BYTES: usize = 1024 * 1024;
+    let max_decoded = if item_cap > OLDER_RECEIVER_ITEM_BYTES {
+        crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES
+    } else {
+        OLDER_RECEIVER_DECODED_BYTES
+    };
+    if !enabled || body.len() > max_decoded {
         return None;
     }
-    gzip(body).filter(|encoded| encoded.len() <= MAX_COMPRESSED_BYTES)
+    gzip(body).filter(|encoded| encoded.len() <= 2 * max_decoded)
 }
 
 /// A rejection that means "I could not read your encoding", as opposed to "your
@@ -2124,13 +2159,30 @@ impl SnapshotApiClient {
             .and_then(decode_activity_hint)
     }
 
+    #[cfg(test)]
     pub fn upload_batch(
         &self,
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, None)
+        self.upload_batch_with_item_cap(
+            relay_token,
+            request,
+            enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+        )
+    }
+
+    /// `item_cap` is this pass's receiver limit; it selects the gzip budget.
+    pub(crate) fn upload_batch_with_item_cap(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+        item_cap: usize,
+    ) -> Result<SnapshotBatchResponse> {
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, item_cap, None)
     }
 
     /// Optional retry transport: fresh authority at every physical POST, one
@@ -2150,6 +2202,7 @@ impl SnapshotApiClient {
             relay_token,
             request,
             enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
             Some((budget, validate)),
         )
     }
@@ -2159,6 +2212,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
+        item_cap: usize,
         mut retry: Option<(
             &mut crate::snapshot_retry::RetryBudget,
             &mut dyn FnMut() -> Result<()>,
@@ -2189,7 +2243,7 @@ impl SnapshotApiClient {
             .as_ref()
             .map(|(budget, _)| budget.gzip_enabled(default_gzip))
             .unwrap_or(default_gzip);
-        let compressed = gzip_snapshot_batch(&body, gzip_enabled);
+        let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
                 validate()?;
@@ -2315,10 +2369,8 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            // Validation-like statuses mean the backend refused the payload
-            // contract. Keep a redacted/truncated body excerpt so field logs show
-            // the exact validator failure (for example, missing usage_buckets)
-            // without leaking tokens, paths, account IDs, or machine IDs.
+            // A validation response supplies no ACK. Parse complete locations
+            // before discarding all backend text, which may contain user values.
             Err(ureq::Error::Status(code @ (400 | 422), response)) => {
                 self.record_batch_http_failure(
                     request,
@@ -2328,10 +2380,14 @@ impl SnapshotApiClient {
                     None,
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(BatchRejected {
-                    status: code,
-                    body_excerpt: response_body_excerpt(response),
-                }))
+                // Keep the HTTP client's existing complete-body size bound.
+                // A failed read has no usable locations and stays whole-batch.
+                let body = response.into_string().ok();
+                Err(anyhow::Error::new(BatchRejected::from_response(
+                    code,
+                    body.as_deref().unwrap_or_default().as_bytes(),
+                    request.snapshots.len(),
+                )))
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.record_batch_http_failure(
@@ -3445,35 +3501,6 @@ fn response_has_request_id(response: &ureq::Response) -> bool {
     .any(|header| response.header(header).is_some())
 }
 
-fn response_body_excerpt(response: ureq::Response) -> Option<String> {
-    response
-        .into_string()
-        .ok()
-        .and_then(|body| safe_response_body_excerpt(&body))
-}
-
-fn safe_response_body_excerpt(body: &str) -> Option<String> {
-    let compact = body
-        .split_whitespace()
-        .take(80)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return None;
-    }
-    Some(truncate_diagnostic(&redact_inline(&compact)))
-}
-
-fn truncate_diagnostic(value: &str) -> String {
-    const MAX_DIAGNOSTIC_CHARS: usize = 500;
-    if value.chars().count() <= MAX_DIAGNOSTIC_CHARS {
-        return value.to_string();
-    }
-    let mut truncated = value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
 /// Fence relay admission once confirmation may have reached the server and
 /// until the candidate is fully promoted into local active state. Persisted
 /// pre-confirm guards are the crash boundary immediately before the request:
@@ -3893,18 +3920,28 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejection_body_excerpt_is_redacted_and_bounded() {
-        let token = format!("ghp_{}", "AbCdEf1234567890aaaaaaaaaaaaaaaaaa");
-        let body = format!(
-            "{{\"detail\":\"usage_buckets are required Authorization: Bearer {token} machine_id otm_1234567890abcdef path /Users/ron/.codex/sessions/a.jsonl\"}}"
+    fn snapshot_rejection_locations_require_a_complete_entity_local_set() {
+        for body in [
+            r#"{"detail":"synthetic validator text"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":[] }]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",2]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",-1]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","other"]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]}]"#,
+        ] {
+            assert!(BatchRejected::from_response(422, body.as_bytes(), 2)
+                .snapshot_indexes
+                .is_none());
+        }
+        let body = br#"{"errors":[{"loc":["body","snapshots",1,"session_artifacts",0]},{"loc":["body","snapshots",1,"session_artifacts",1]}]}"#;
+        assert_eq!(
+            BatchRejected::from_response(422, body.as_slice(), 2).snapshot_indexes,
+            Some(vec![1])
         );
-        let excerpt = safe_response_body_excerpt(&body).expect("excerpt");
-        assert!(excerpt.contains("usage_buckets"));
-        assert!(excerpt.contains("[REDACTED]"));
-        assert!(excerpt.contains("[machine_id]"));
-        assert!(excerpt.contains("[path]"));
-        assert!(!excerpt.contains("/Users/ron"));
-        assert!(excerpt.chars().count() <= 503);
+        assert!(BatchRejected::from_response(400, body.as_slice(), 2)
+            .snapshot_indexes
+            .is_none());
     }
 
     #[test]
@@ -4026,21 +4063,27 @@ mod tests {
                     state as u8
                 })
                 .collect::<Vec<_>>();
-            let encoded = gzip_snapshot_batch(&body, true).expect("within budgets");
+            let encoded = gzip_snapshot_batch(&body, true, 655_360).expect("within budgets");
             assert!(encoded.len() <= 2 * 1024 * 1024);
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(encoded.as_slice())
                 .read_to_end(&mut decoded)
                 .unwrap();
             assert_eq!(decoded, body);
-            assert!(gzip_snapshot_batch(&body, false).is_none());
+            assert!(gzip_snapshot_batch(&body, false, 655_360).is_none());
         }
         for size in [1024 * 1024 + 1, 2 * 640 * 1024, 2 * 1024 * 1024] {
             assert!(
-                gzip_snapshot_batch(&vec![b'x'; size], true).is_none(),
+                gzip_snapshot_batch(&vec![b'x'; size], true, 2 * 1024 * 1024).is_none(),
                 "identity fallback preserves large packed requests without a gzip 413"
             );
         }
+        // Only a receiver advertising over 2 MiB gets a large encoded request.
+        let max = crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES;
+        let item_cap = 8 * 1024 * 1024;
+        assert!(gzip_snapshot_batch(&vec![b'x'; 1024 * 1024 + 1], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max + 1], true, item_cap).is_none());
     }
 
     #[test]
@@ -5201,6 +5244,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 }
 
 #[cfg(test)]
-pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
-    gzip_snapshot_batch(body, true)
+pub(crate) fn retention_gzip_probe(body: &[u8], item_cap: usize) -> Option<Vec<u8>> {
+    gzip_snapshot_batch(body, true, item_cap)
 }

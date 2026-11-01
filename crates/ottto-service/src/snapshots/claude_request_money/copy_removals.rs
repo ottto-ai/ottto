@@ -62,10 +62,9 @@ impl CopyRemovals {
         self.files.is_empty()
     }
     /// Only an empty undamaged store is omitted from the index: an absent
-    /// field then reads back as exactly that (Lead B F4). Switch off keeps
-    /// the released bytes: an empty store is never written.
+    /// field then reads back as exactly that.
     pub(crate) fn is_unwritten(&self) -> bool {
-        self.is_empty() && (!self.metadata_lost || !super::e2::resumed_prefix_enabled())
+        self.is_empty() && !self.metadata_lost
     }
 
     /// The charged bytes held now (at most `MAX_BYTES`).
