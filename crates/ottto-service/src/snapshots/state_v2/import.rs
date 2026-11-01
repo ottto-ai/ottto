@@ -1316,7 +1316,7 @@ mod application_cases {
             )
             .unwrap();
             db.control("generation", &index.generation).unwrap();
-            ClaudeMapper
+            Mapper
                 .import_graph(&mut db, &index, Some(&original))
                 .unwrap();
             let presence: BTreeMap<String, bool> =
@@ -1327,7 +1327,7 @@ mod application_cases {
             );
             // Main's hydration rule accepts only its original field names.
             assert!(presence.keys().all(|name| fields.contains(&name.as_str())));
-            let (restored, mut actual) = ClaudeMapper.hydrate_context(&mut db).unwrap();
+            let (restored, mut actual) = Mapper.hydrate_context(&mut db).unwrap();
             let mut control = KindCx::default();
             control.binding = Some(c.binding());
             control.presence = expected;
