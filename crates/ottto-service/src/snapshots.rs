@@ -2764,13 +2764,8 @@ struct ScanTraversalCheckpoint {
     listing_started_unix_seconds: Option<u64>,
     /// Owed files with an unchanged stamp that a re-listing pass queued,
     /// with that pass's start. Bounded: past the bound the oldest stamp is
-    /// dropped, so the bound can only bring a re-queue forward. Decoded
-    /// leniently (`deserialize_listing_owed_paces`), never failing the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_listing_owed_paces"
-    )]
+    /// dropped, so the bound can only bring a re-queue forward.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
 
@@ -3492,6 +3487,8 @@ pub(crate) struct UploadAckRetirementHandoff {
     pub pending_bodies: BTreeMap<String, String>,
 }
 
+/// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
+/// each new field's save rule there (serde `skip_serializing*` keys here are inert).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
     /// V2-only custody and growth debt; absent on ordinary v1 paths.
@@ -3522,12 +3519,12 @@ pub struct ScanIndex {
     /// fingerprint in this index was produced. A policy transition keeps the
     /// policy-neutral entity identity but must force one complete correction
     /// pass before this witness advances.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     upload_context_fingerprint: Option<String>,
     pub files: SharedMap<String, ScanIndexEntry>,
     /// Hash-only owner proof keyed by machine and session in this source index.
     /// A later current login can never replace it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     session_account_bindings: BTreeMap<String, SessionAccountBinding>,
     /// Files whose oversized physical lines were skipped once under a bounded
     /// parser generation. The path key plus exact opened-object-derived source
@@ -3535,21 +3532,21 @@ pub struct ScanIndex {
     /// repeated work for an unchanged object. Keyed identically to `files` and
     /// retired with it, so this map is a subset of `files`, never its own
     /// independently growing store - see `prune_terminal_jsonl_dispositions`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     terminal_jsonl_dispositions: BTreeMap<String, TerminalJsonlDisposition>,
     /// Configured roots that have successfully resolved at least once for this
     /// destination/source index. A root that never existed is optional, but a
     /// root that disappears after contributing an authoritative census must
     /// fail the generation red instead of reconciling every entity beneath it
     /// away as if the directory had been observed empty.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     known_configured_scan_roots: BTreeSet<String>,
     /// Pre-root-witness index paths not currently covered by any resolved root.
     /// This is the upgrade-safe witness for a configured symlink whose old
     /// canonical target cannot be reconstructed while the link is missing.
     /// Inference requires a prior traversal with the same root-context proof;
     /// paths clear when a resolved root covers them or the root context changes.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     legacy_unresolved_root_file_witnesses: BTreeSet<String>,
     /// Last accepted semantic fingerprint for Codex sessions that exist only
     /// in the local state database and have no usage-bearing rollout file.
@@ -3558,88 +3555,76 @@ pub struct ScanIndex {
     /// their fingerprints beside the file index lets a successful upload
     /// acknowledge them exactly like file-backed snapshots, without turning
     /// every later state-database observation into another upload.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
     /// Codex rollout sessions whose physical file is known to contain an
     /// inherited prefix but whose exclusive ownership boundary is unresolved.
     /// Persisting the session id prevents a later incremental page (where the
     /// unchanged rollout is not reparsed) from publishing inclusive
     /// `state_5.sqlite.tokens_used` as session-local usage.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     /// L-SB: what each local index key's latest settleable disclosure blocked
     /// (strict disclosures add). A re-parse or memo replay that no longer
     /// blocks an id releases it unless another holder remains. Never pruned by
     /// census absence. Never a settling rule.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_by_file: BTreeMap<String, BTreeSet<String>>,
     /// Ids the group paths block with no file attribution: queued or paused
     /// join owners and capture-boundary held owners.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_unattributed: BTreeSet<String>,
     /// Ids blocked before L-SB existed: never released by attribution.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_legacy: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     codex_state_only_blocked_attributed: bool,
     /// Parent ids requested by unresolved legacy ordinary forks. This bounded
     /// set forces an unchanged parent through one structural prepass instead
     /// of retaining every Codex transcript signature in the index.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_parent_ownership_refs: BTreeSet<String>,
     /// Content-free ordered evidence for only the referenced parent sessions.
     /// Missing, overflowed, or incomplete ledgers are never authoritative.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     /// U1a-2a: paced side requests for unchanged parent rollouts, keyed by
     /// the parent's index key. Pacing only, never evidence; the process side
     /// ledger holds any charge made since the last save. Decoded per entry
     /// (D4): a malformed request is dropped and counted, never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_codex_side_requests"
-    )]
+    #[serde(default, deserialize_with = "deserialize_codex_side_requests")]
     codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// U1a-2a: side records for unchanged parent rollouts, keyed by the
     /// parent's index key. Decoded per entry: an undecodable record is
     /// dropped (P then has no record), never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_parent_side: BTreeMap<String, CodexParentSide>,
     /// Index-global and monotone: never reset by replay, so a re-created
     /// record never reuses a generation a waiting child saw.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_side_generation: u64,
     /// Completed proof-cursor sweeps; the record epoch prune's clock.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_proof_wrap_epoch: u64,
     /// U1a-2a (row 34): per fork child's index key, its parent-prefix proof
     /// or the proof it is owed. Decoded per entry, then semantically at
     /// load (`retain_decodable_codex_parent_state`); never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_parent_prefix_proofs: BTreeMap<String, CodexParentProofState>,
     /// The proof due scan's resume key (key order, wrapping).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     codex_parent_proof_cursor: Option<String>,
     /// The side-record prune's resume key (key order, wrapping).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     codex_parent_side_cursor: Option<String>,
     /// Index-wide and monotone, never cleared by replay: each owe sets
     /// `entry.seq = ++seq`, and a finish applies only to an equal `seq`.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_proof_seq: u64,
     /// This index's proof incarnation; `""` = unminted, which no proof job
     /// binds to. Adopted from `codex_proof_index_minted` at its first use;
     /// carried by the subset and `Clone`; not cleared by replay.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     codex_proof_index_incarnation: String,
     /// RAM only (row 35): the incarnation `load` minted or reused, persisted
     /// only once a use binds it (an owe, a proof job), so an index with no
@@ -3655,22 +3640,22 @@ pub struct ScanIndex {
     /// Durable, local-only index of Claude Desktop naming sidecars. Paging the
     /// store without retaining these safe extracted fields would make titles
     /// disappear whenever their file was outside the current bounded page.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_desktop_title_files: SharedMap<String, ClaudeDesktopTitleIndexEntry>,
     /// Proven root/child account families survive incremental child-only
     /// reparses. The witness is local-only, carries no raw account identifier,
     /// and is created only from a complete filesystem census plus exact request
     /// coverage.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_account_family_witnesses: BTreeMap<String, ClaudeAccountFamilyWitness>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_account_family_pending: BTreeMap<String, ClaudeAccountFamilyPending>,
     /// Complete Claude request-ownership witnesses. These are local-only and
     /// persist only content-free request-set fingerprints; raw provider request
     /// ids remain in the transcript/API sidecars that produced them.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_family_witnesses: SharedMap<String, ClaudeUsageFamilyWitness>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
     /// Slice D1: one request-census record per Claude transcript index key,
     /// bound to the candidate fingerprint and census window of the parse that
@@ -3678,13 +3663,10 @@ pub struct ScanIndex {
     /// provider request ids); never proof, usage or upload input, and no
     /// decision reads it. Decoded per entry: a malformed record is dropped,
     /// never the index.
-    #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
+    #[serde(default)]
     claude_request_census: ClaudeRequestCensus,
     /// Slice D1: count-only shadow memory between complete terminals.
-    #[serde(
-        default,
-        skip_serializing_if = "ClaudeRequestCensusShadowState::is_empty"
-    )]
+    #[serde(default)]
     claude_request_census_shadow: ClaudeRequestCensusShadowState,
     /// Families whose current transcript revision could not reconstruct a
     /// previously proven session-exclusive usage witness. Unlike backend
@@ -3692,7 +3674,7 @@ pub struct ScanIndex {
     /// upload or manifest set. The prior witness and the current content-free
     /// pending proof remain durable so a later complete family scan can
     /// re-prove authority without trusting the older body itself.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_authority_quarantine: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
     /// Path-(a) absence retirement: SHA-256 of each RetryPending family root
     /// a raw-complete census retired as wholly absent, to its retirement unix
@@ -3721,16 +3703,12 @@ pub struct ScanIndex {
     /// missing counts as absent) fits under the cap and its repair budget,
     /// those roots are tombstoned and the fence comes down. A non-boolean
     /// value decodes as set.
-    #[serde(
-        default,
-        skip_serializing_if = "is_false",
-        deserialize_with = "deserialize_fail_closed_flag"
-    )]
+    #[serde(default, deserialize_with = "deserialize_fail_closed_flag")]
     claude_retired_family_tombstones_uncertain: bool,
     /// Hash-only duplicate request ownership discovered by a complete Claude
     /// census. This keeps later incremental reparses fail-closed even after
     /// the terminal pending census is released.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_duplicate_request_owners: BTreeMap<String, BTreeSet<ClaudeDuplicateRequestOwner>>,
     /// A duplicate witness that exceeds the local bound cannot be represented
     /// partially. Fail all Claude posture closed and force a full corrective
@@ -3743,7 +3721,7 @@ pub struct ScanIndex {
     /// parsed on an earlier page can be reselected once and emitted on the
     /// following pass instead of leaving its first `ownership_unresolved` body
     /// permanent.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_owned_start_census: BTreeMap<String, ClaudeOwnedStartCensusWitness>,
     /// Index keys whose parsed revision is held locally because its session
     /// ownership could not be bound, mapped to that held source fingerprint.
@@ -3753,30 +3731,26 @@ pub struct ScanIndex {
     /// when a later parse resolves it or rooted no-follow lookup proves it absent;
     /// until then discovery ignores its age (`DiscoveryRetention`), so a
     /// present held file is always observed and only an absent one is pruned.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     // Correctness hold: recorded ownership debt survives age and growth. Only
     // approved interim withheld_reparse{start,evidence,growth} may Full here.
     claude_account_deferred_holds: BTreeMap<String, String>,
     /// Scheduling-only backoff for full duplicate-fence re-arms while the
     /// fence stays closed. Losing either field schedules one immediate full
     /// re-arm; neither field can open the fence.
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    #[serde(default)]
     claude_duplicate_fence_rearm_attempt: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_duplicate_fence_next_full_rearm_unix_seconds: Option<u64>,
     /// Scheduling-only memory that suppresses whole-index re-arms which
     /// cannot make progress. Losing it costs re-arms, never an opening.
-    #[serde(
-        default,
-        skip_serializing_if = "ClaudeFullRearmProgress::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     claude_full_rearm_progress: ClaudeFullRearmProgress,
     /// Contract-5 identity contract observed when the current traversal
     /// started: the full collector token under a permit, `""` without one, or
     /// a placeholder that matches no contract once it changed mid-traversal.
     /// `None` is unknown (an old index, or one an old decoder rewrote).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_request_identity_contract: Option<String>,
     /// Set whenever a prepared Claude cycle sees a contract that differs from
     /// the record above, including an unknown record. While set, no unchanged
@@ -3784,11 +3758,11 @@ pub struct ScanIndex {
     /// terminal that re-arms every family file (a duplicate-fence full re-arm,
     /// or this latch's own re-arm while the fence stays closed), and whose
     /// whole traversal ran under the contract that terminal sees, clears it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     claude_request_identity_contract_changed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_upper_bound: Option<String>,
     #[serde(default)]
     claude_desktop_store_sweep_had_errors: bool,
@@ -3804,26 +3778,26 @@ pub struct ScanIndex {
     claude_desktop_lineage_census_complete: bool,
     /// When the last complete, error-free Desktop store sweep finished, bound
     /// to this process and store inventory. Absent (unknown) for older indexes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_census_witness: Option<claude_request_identity::DesktopCensusWitness>,
     #[serde(default)]
     claude_desktop_store_retry_attempt: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_retry_not_before_unix_seconds: Option<u64>,
     /// Lexicographic path cursor for a bounded sweep when a source has more
     /// eligible transcripts than one cycle may parse. Kept in the v2-only
     /// index so an older daemon can neither clobber nor misread it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_after_path: Option<String>,
     /// Frozen lexicographic ceiling for the current bounded sweep. Files that
     /// arrive after the sweep starts wait for the next generation instead of
     /// keeping a hot tail full forever and starving older prefix keys.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_upper_bound_path: Option<String>,
     /// Observation boundary paired with `resume_upper_bound_path`. A sweep
     /// that spans cycles may publish only through the time at which its frozen
     /// path generation was captured, never through the later finishing tick.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_census_window_end: Option<String>,
     /// At least one earlier page in this frozen sweep was only partially
     /// settled. The final page may finish discovery, but one clean follow-up
@@ -3840,50 +3814,42 @@ pub struct ScanIndex {
     /// Reset with the flag.
     /// Read through `unsettled_cause_bits`, which reports none without the
     /// flag and `Unattributed` for a flag with no recorded cause.
-    #[serde(
-        default,
-        skip_serializing_if = "is_zero_u16",
-        deserialize_with = "deserialize_unsettled_causes"
-    )]
+    #[serde(default, deserialize_with = "deserialize_unsettled_causes")]
     bounded_sweep_unsettled_causes: u16,
     /// Durable bounded filesystem census. It is intentionally destination-
     /// scoped with the rest of the scan index: missed watcher events, daemon
     /// restarts, deletions, and roots created after startup all converge via
     /// this finite queue without an O(all paths) tick.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     traversal: Option<ScanTraversalCheckpoint>,
     /// C1b: the stale Claude families the current traversal's start carried,
     /// with the replay buffer it funded for their cancellations. Every
     /// traversal start replaces it.
-    #[serde(default, skip_serializing_if = "ClaudeStaleFamilyCarry::is_empty")]
+    #[serde(default)]
     claude_stale_family_carry: ClaudeStaleFamilyCarry,
     /// Residue named by the last completed census, see `ScanResidueWitness`.
     /// Absent while the last completed census was clean.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     scan_residue_witness: Option<ScanResidueWitness>,
     /// Destination-scoped historical bootstrap/replay generation currently
     /// being paged. Matching generations resume; a new reviewed revision
     /// clears only derived transcript settlement state once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     historical_replay_generation: Option<String>,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     /// The three curve replay slots retired with full context-curve upload.
-    #[serde(rename = "context_curve_capability_enabled", default, skip_serializing)]
+    #[serde(rename = "context_curve_capability_enabled", default)]
     retired_context_curve_capability_enabled: serde::de::IgnoredAny,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
-    #[serde(rename = "context_curve_replay_epoch", default, skip_serializing)]
+    #[serde(rename = "context_curve_replay_epoch", default)]
     retired_context_curve_replay_epoch: serde::de::IgnoredAny,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
-    #[serde(
-        rename = "completed_context_curve_replay_generation",
-        default,
-        skip_serializing
-    )]
+    #[serde(rename = "completed_context_curve_replay_generation", default)]
     retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
     /// Files that were fully read and valid but intentionally produced no
     /// snapshot. Separate from `last_snapshot_fingerprint=None`, which legacy
     /// indexes can only treat as unknown/incomplete.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     pub confirmed_empty_files: BTreeSet<String>,
     /// Scan-local moved-session evidence from the existing bounded header
     /// inventory. Never serialized or used as file/body settlement evidence.
@@ -3892,30 +3858,30 @@ pub struct ScanIndex {
     /// Final post-policy entity fingerprints produced by each transcript.
     /// Most files contain one session; the set preserves exact entity grain
     /// for split/provider files instead of hiding all but an arbitrary last.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub file_snapshot_fingerprints: SharedMap<String, BTreeSet<String>>,
     /// Server-reconstructible semantic activity clock for each final entity.
     /// This mirrors the accepted-log `occurred_at` rule and never uses local
     /// file mtime or the collector observation clock.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub snapshot_activity_at: SharedMap<String, Option<String>>,
     /// Exact entity ACK identities known durable at the backend. Older indexes
     /// deserialize this empty. The separate version bit distinguishes that
     /// legacy absence from a current, authoritatively empty ledger.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     accepted_snapshot_fingerprints: Shared<BTreeSet<String>>,
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    #[serde(default)]
     accepted_snapshot_fingerprint_ledger_version: u8,
     /// Restart-stable lexicographic cursor for bounded re-entry of ambiguous
     /// pre-ledger entities through the existing snapshot entity-ACK contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     legacy_settlement_reconcile_after_fingerprint: Option<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
     /// contract that produced the rejection. They are excluded from the
     /// server-agreement manifest while that witness is current, but are
     /// automatically re-derived after a repair changes any witness component.
     /// This isolates poison without turning quarantine into a permanent fence.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub quarantined_snapshot_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     /// Runtime-only witness used to decide whether a persisted quarantine is
     /// stale. It is reconstructed from the current source before every scan.
@@ -3980,7 +3946,6 @@ pub struct ScanIndex {
     /// and is dropped on load with the gate marker (lenient decode).
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_lenient_claude_history_cutoff"
     )]
     claude_history_cutoff_unix_seconds: Option<u64>,
@@ -3988,55 +3953,35 @@ pub struct ScanIndex {
     /// (StateMissing M3). Without it, an index a pre-gate daemon built, or
     /// rebuilt only partly, gets its cutoff on the first gated load. Any
     /// stored value but `true` reads as `false` (lenient decode, fail closed).
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_true"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_true")]
     claude_history_gate_loaded: bool,
     /// Claude only: this index's cutoff was recorded for history another
     /// destination received, under a claim policy other than an explicit
     /// `full` (SOURCE ruling, cross-org move). Kept, so the hold outlives this
     /// destination's own bootstrap; only an explicit `full` claim clears it.
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_move_hold"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_move_hold")]
     claude_history_move_not_full: bool,
     /// Claude only: an explicit `full` claim was seen for this destination,
     /// which releases its move hold for good, even while the evidence still
     /// reads as a move (its own bootstrap and uploads not yet done).
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_true"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_true")]
     claude_history_move_released: bool,
     /// Legacy carry marker. New carries have bounded per-file incidence below;
     /// old marker-only checkpoints migrate to bounded unknown incidence on read.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     accepted_incidence_pending_census: bool,
     /// Accepted incidence carried by Repair, separate from current membership.
     /// Empty key means an old ACK whose file could not be named. This bounded
     /// debt survives census/held files and retires only at that file's complete,
     /// policy-permitted reconstruction. It never admits newly recorded ACKs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     accepted_rebuild_incidence: BTreeMap<String, BTreeSet<String>>,
     /// Visibility only: oldest outstanding carried set, including unknown
     /// incidence. Never used for admission, release or eviction.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     accepted_rebuild_pending_since_unix_seconds: Option<u64>,
     /// Persisted alarm throttle; a future value stays throttled on rollback.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     accepted_rebuild_last_alarm_unix_seconds: Option<u64>,
     /// Hash-only counting evidence of retired, unprotected Codex entries, by
     /// owner, so a moved session's evidence outlives its old entry being
@@ -4044,32 +3989,24 @@ pub struct ScanIndex {
     /// `codex_counting_version::MAX_COUNTING_TOMBSTONES`. Never file/body
     /// settlement evidence. Type damage decodes as empty, like a lost index.
     /// Appended serialized slot, so older positional indexes keep their slots.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     #[serde(rename = "reread_guard", default, skip_serializing)]
     retired_reread_guard: serde::de::IgnoredAny,
     /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
     /// serialized slot; old indexes default empty, damaged values are dropped.
-    #[serde(
-        default,
-        skip_serializing_if = "codex_counting_version::EvictedLegacyOwners::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     codex_counting_evicted_legacy: codex_counting_version::EvictedLegacyOwners,
     /// Scan-local cap eviction events by safety class; drained into receipts.
     #[serde(skip)]
     codex_counting_evictions: [u64; 3],
     /// Appended persisted field: preserve every older positional index slot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
     /// One paced native audit outside the sampled-marker slot pool. This is
     /// scheduling only; the census hold remains the authority until Full.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     held_audit_progress: Option<sampled_audit::HeldAuditProgress>,
     /// Runtime-only, Claude only: what owed history does this cycle where no
     /// list is intended, set with the cutoff before scanning.
@@ -4079,11 +4016,7 @@ pub struct ScanIndex {
     #[serde(skip)]
     claude_history_emission: HistoryEmission,
     // Append persisted fields last: positional serde indexes must stay stable.
-    #[serde(
-        default,
-        skip_serializing_if = "claude_money_birth_store::BirthStore::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
     /// Inventory fence for the Desktop pagination cursor, never identity proof.
     /// The version prefix rejects #851's legacy digest; an absent/mismatched
@@ -4103,7 +4036,6 @@ pub struct ScanIndex {
     /// the current proof decides.
     #[serde(
         default,
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
@@ -4817,12 +4749,7 @@ fn deserialize_codex_side_requests<'de, D: serde::Deserializer<'de>>(
 fn take_dropped_codex_side_requests() -> u64 {
     DROPPED_CODEX_SIDE_REQUESTS.with(|count| count.replace(0))
 }
-fn valid_codex_protected_owner(owner: &str) -> bool {
-    owner.len() == 64
-        && owner
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+use crate::hex::is_sha256_lower as valid_codex_protected_owner;
 fn codex_protected_owner(session: &str) -> String {
     sha256_hex(&["codex_protected_owner:v1", &resolve_codex_identity(session)])
 }
@@ -15307,13 +15234,11 @@ pub(crate) fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) 
 
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION: u64 = 9;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION: u64 = 10;
-pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION: u64 = 11;
-pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 12;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION: u64 = 23;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 24;
 
 /// Backend-compatible, hash-neutral witness version for additive snapshot-body
-/// evidence. Creator-bearing bodies use v23/v24, retaining curve/tool fields.
+/// evidence. Creator-bearing bodies use v23/v24, retaining tool fields.
 /// Public ACKs select v7/v8 for creator-only and v13/v14 when cache is declared. Missing creator evidence
 /// preserves previous versions and digests. Semantic identity remains owned
 /// exclusively by the component/content hashes.
@@ -15328,19 +15253,7 @@ pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Optio
         });
     }
     if item.cache_observations.is_some() {
-        return Some(match (item.context_curve.is_some(), exclusive) {
-            (false, false) => 15,
-            (false, true) => 16,
-            (true, false) => 19,
-            (true, true) => 20,
-        });
-    }
-    if item.context_curve.is_some() {
-        return Some(if exclusive {
-            SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-        } else {
-            SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-        });
+        return Some(if exclusive { 16 } else { 15 });
     }
     if item.tool_usage.is_some() || item.tool_usage_truncated {
         return Some(if exclusive {
@@ -15365,11 +15278,8 @@ fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Valu
             }),
         );
     }
-    if let Some(context_curve) = &item.context_curve {
-        payload.insert("context_curve".to_string(), json!(context_curve));
-    }
-    // Curve-free legacy tool witnesses include both defaults whenever either
-    // tool leaf is declared. Creator/cache/curve domains retain wire presence.
+    // Legacy tool witnesses include both defaults whenever either tool leaf
+    // is declared. Creator/cache domains retain wire presence.
     if payload.is_empty() && (item.tool_usage.is_some() || item.tool_usage_truncated) {
         payload.insert(
             "tool_usage".into(),
@@ -15565,21 +15475,28 @@ pub(crate) fn snapshot_revision_v2_hash(
     format!("{:x}", digest.finalize())
 }
 
+impl SnapshotItem {
+    /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
+    /// The backend refuses a base token combined with a challenge; the answer
+    /// replaces the stale base rather than adding to it.
+    fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
+        match &self.cache_conflict_answer {
+            Some((challenge, revision)) => {
+                (None, Some(challenge.clone()), Some(revision.clone()), true)
+            }
+            None => (self.cache_base_head_etag.clone(), None, None, false),
+        }
+    }
+}
+
 pub(crate) fn snapshot_semantic_envelope(
     source: SnapshotSource,
     item: &SnapshotItem,
     upload_policy: SnapshotUploadPolicy,
 ) -> SnapshotSemanticEnvelope {
     let component_hashes = snapshot_semantic_component_hashes(source, item);
-    // The backend refuses a base token combined with a challenge; the answer
-    // replaces the stale base rather than adding to it.
-    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash) =
-        match &item.cache_conflict_answer {
-            Some((challenge, stale_revision)) => {
-                (None, Some(challenge.clone()), Some(stale_revision.clone()))
-            }
-            None => (item.cache_base_head_etag.clone(), None, None),
-        };
+    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash, forced_full_rescan) =
+        item.cache_handshake();
     SnapshotSemanticEnvelope {
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
@@ -15593,9 +15510,9 @@ pub(crate) fn snapshot_semantic_envelope(
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
         base_head_etag,
-        forced_full_rescan: conflict_head_challenge.is_some(),
         conflict_head_challenge,
         rescan_from_revision_hash,
+        forced_full_rescan,
         component_hashes,
     }
 }
@@ -28906,6 +28823,7 @@ impl OwnedSourceScan {
                 context_read_budget.record(
                     index,
                     &active.candidate,
+                    active.cursor.is_some(),
                     active
                         .parser
                         .reader
@@ -31517,40 +31435,6 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
-                // A failed/held ordinary owner cannot strand a readable copy.
-                // At this boundary every selected candidate has ended; queued
-                // work still owns its lease. Reuse the existing hint queue for
-                // the next incidence, leaving the unsent deadline due.
-                let retry_copies = index
-                    .terminal_contract_retries
-                    .iter()
-                    .filter(|(fp, _)| {
-                        index
-                            .quarantined_snapshot_fingerprints
-                            .get(*fp)
-                            .is_some_and(|r| r.contract_retry_claims.is_none())
-                            && !snapshots
-                                .iter()
-                                .any(|item| &item.snapshot_fingerprint == *fp)
-                            && !index.quarantine_retry_is_queued(fp)
-                    })
-                    .filter_map(|(fp, owner)| {
-                        index
-                            .file_snapshot_fingerprints
-                            .range((
-                                std::ops::Bound::Excluded(owner.clone()),
-                                std::ops::Bound::Unbounded,
-                            ))
-                            .find(|(_, fingerprints)| fingerprints.contains(fp))
-                            .map(|(key, _)| (fp.clone(), key.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                for (fp, key) in retry_copies {
-                    index.terminal_contract_retries.insert(fp, key.clone());
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        enqueue_watcher_hints(source, traversal, &[PathBuf::from(key)], false);
-                    }
-                }
                 if codex_page.continuation() {
                     let cap_counts = index
                         .traversal
@@ -31768,6 +31652,7 @@ impl OwnedSourceScan {
                     .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 let account_members = index.observed_account_members();
+                let unacked = index.unacked_bodies(census.removed_index_keys.iter());
                 for index_key in census.removed_index_keys.iter() {
                     if source == SnapshotSource::ClaudeCode
                         && !census.claude_vanished_index_keys.contains(index_key)
@@ -31830,6 +31715,11 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                index.count_unacked_retired(
+                    source,
+                    unacked,
+                    sampling.as_ref().map(|context| &*context.cache),
+                );
                 // G1: only census members hold discovery. A pending re-read
                 // (growth after this generation processed its path) is
                 // next-generation evidence; retiring drops it and the next
@@ -31950,7 +31840,12 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(index, codex_side_drop, source)
+                    reconcile_missing_index_entries_bounded(
+                        index,
+                        codex_side_drop,
+                        sampling.as_ref().map(|context| &*context.cache),
+                        source,
+                    )
                 } else {
                     false
                 };
@@ -41171,47 +41066,44 @@ fn load_codex_logs2_priority_turns(
     if !path.exists() {
         return true;
     }
-    let Ok(connection) =
-        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return false;
-    };
-    let _ = connection.busy_timeout(std::time::Duration::from_millis(
-        CODEX_LOGS2_BUSY_TIMEOUT_MS,
-    ));
-    // Only `response.create` request rows carry the *requested* service_tier.
-    // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
-    // then filters to the sparse request rows (hundreds, not the full table).
-    let Ok(mut statement) = connection.prepare(
-        "SELECT feedback_log_body FROM logs \
-         WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
-         ORDER BY ts DESC LIMIT ?2",
+    let Ok(connection) = codex_sqlite_read::CodexSqliteRead::open(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        std::time::Duration::from_millis(CODEX_LOGS2_BUSY_TIMEOUT_MS),
     ) else {
         return false;
     };
-    let Ok(rows) = statement.query_map(
-        rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
-        |row| row.get::<_, String>(0),
-    ) else {
+    let Ok((turns, complete, read)) = connection.read(|connection| {
+        // Only `response.create` request rows carry the *requested* service_tier.
+        // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
+        // then filters to the sparse request rows (hundreds, not the full table).
+        let mut statement = connection.prepare(
+            "SELECT feedback_log_body FROM logs \
+             WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
+             ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut complete = true;
+        let mut read = 0_u64;
+        let mut turns = Vec::new();
+        for body in rows {
+            let Ok(body) = body else {
+                complete = false;
+                continue;
+            };
+            read += 1;
+            turns.extend(codex_logs2_priority_turn_from_body(&body));
+        }
+        if read == CODEX_LOGS2_MAX_ROWS as u64 {
+            CapCounts::record("codex", 3, 1);
+        }
+        Ok((turns, complete, read))
+    }) else {
         return false;
     };
-    let mut complete = true;
-    let mut read = 0_u64;
-    let mut turns = Vec::new();
-    for body in rows {
-        let Ok(body) = body else {
-            complete = false;
-            continue;
-        };
-        read += 1;
-        turns.extend(codex_logs2_priority_turn_from_body(&body));
-    }
-    if read == CODEX_LOGS2_MAX_ROWS as u64 {
-        CapCounts::record("codex", 3, 1);
-    }
-    if connection.verify().is_err() {
-        return false;
-    }
     priority_turns.extend(turns);
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
@@ -41324,20 +41216,12 @@ fn load_codex_sqlite_titles(
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex title database")?;
     let loaded = connection.read(|connection| {
-        let mut statement = connection
-            .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex title census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let loaded = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex title census row")?;
-        Ok(loaded)
+        census_rows(
+            connection,
+            "SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''",
+            "Codex title census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
     })?;
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
@@ -41383,39 +41267,28 @@ fn load_codex_sqlite_state_threads(
             sqlite_select_expr(&columns, "model", "NULL"),
             sqlite_select_expr(&columns, "rollout_path", "NULL"),
         );
-        let mut statement = connection
-            .prepare(sql.as_str())
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex state thread census")?;
-        let rows = statement
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let title: Option<String> = row.get(1)?;
-                let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-                let archived = row.get::<_, i64>(3)? != 0;
-                let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-                let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-                let model: Option<String> = row.get(8)?;
-                let rollout_path: Option<String> = row.get(9)?;
-                Ok((
-                    id,
-                    CodexStateThread {
-                        title,
-                        tokens_used,
-                        archived,
-                        created_at,
-                        updated_at,
-                        model,
-                        rollout_path,
-                    },
-                ))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex state thread census row")?;
-        Ok(rows)
+        census_rows(connection, &sql, "Codex state thread census", |row| {
+            let id: String = row.get(0)?;
+            let title: Option<String> = row.get(1)?;
+            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
+            let archived = row.get::<_, i64>(3)? != 0;
+            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
+            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
+            let model: Option<String> = row.get(8)?;
+            let rollout_path: Option<String> = row.get(9)?;
+            Ok((
+                id,
+                CodexStateThread {
+                    title,
+                    tokens_used,
+                    archived,
+                    created_at,
+                    updated_at,
+                    model,
+                    rollout_path,
+                },
+            ))
+        })
     })?;
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
@@ -41508,26 +41381,19 @@ fn load_codex_rollout_extents(
             return Err(anyhow::Error::new(IncompleteShape)
                 .context("Codex thread-history database has an incomplete projection schema"));
         }
-        let mut statement = connection
-            .prepare(
-                "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
-                 FROM thread_history_projection_state",
-            )
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex rollout-extent census")?;
-        let rows = statement
-            .query_map([], |row| {
+        census_rows(
+            connection,
+            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
+             FROM thread_history_projection_state",
+            "Codex rollout-extent census",
+            |row| {
                 let thread_id: String = row.get(0)?;
                 let next_byte_offset: i64 = row.get(1)?;
                 let next_ordinal: i64 = row.get(2)?;
                 Ok((thread_id, next_byte_offset, next_ordinal))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex rollout-extent census row")?;
-        Ok(Some(rows))
+            },
+        )
+        .map(Some)
     })?
     else {
         return Ok(());
@@ -41606,23 +41472,13 @@ fn load_codex_sqlite_spawn_edges(
                 )));
             }
         }
-        let mut statement = connection
-            .prepare(
-                "SELECT id, first_user_message FROM threads \
-                 WHERE thread_source = 'agent_created_thread'",
-            )
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex created-thread census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex created-thread census row")?;
-        Ok(rows)
+        census_rows(
+            connection,
+            "SELECT id, first_user_message FROM threads \
+             WHERE thread_source = 'agent_created_thread'",
+            "Codex created-thread census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
     })?;
     let mut raw_created_ids_by_key = BTreeMap::new();
     let mut created_in_database = Vec::new();
@@ -41660,20 +41516,13 @@ fn load_codex_sqlite_spawn_edges(
         if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
             return Ok(None);
         }
-        let mut statement = connection
-            .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex spawn-edge census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let loaded = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex spawn-edge census row")?;
-        Ok(Some(loaded))
+        census_rows(
+            connection,
+            "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges",
+            "Codex spawn-edge census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map(Some)
     })?
     else {
         // Without the edge table, a missing edge is not evidence of no parent.
@@ -41796,6 +41645,8 @@ fn record_codex_identity_key(
 /// So does CANTOPEN when Codex removed the `-wal` after that check.
 const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
 const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long a sidecar census statement waits on a lock Codex holds.
+const CODEX_SIDECAR_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Open a Codex sidecar database read-only and read its schema, which opens
 /// the WAL and its index for the connection's later statements. A transient
@@ -41807,7 +41658,11 @@ fn open_codex_sidecar_database(
     open: &mut SidecarOpenCounts,
 ) -> Result<codex_sqlite_read::CodexSqliteRead> {
     let connection = retry_transient_sqlite(&mut open.retries, || {
-        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        codex_sqlite_read::CodexSqliteRead::open(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            CODEX_SIDECAR_BUSY_TIMEOUT,
+        )
     })?;
     if connection.is_snapshot() {
         open.snapshots = open.snapshots.saturating_add(1);
@@ -41845,16 +41700,32 @@ fn retry_transient_sqlite<T>(
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
+    let columns = census_rows(
+        connection,
+        &format!("PRAGMA table_info({table_name})"),
+        "SQLite table census",
+        |row| row.get::<_, String>(1),
+    )?;
+    Ok(columns.into_iter().collect())
+}
+
+/// Every row of one census query. Failures carry their loader stage and
+/// "prepare {label}" or "read {label} row".
+fn census_rows<T>(
+    connection: &Connection,
+    sql: &str,
+    label: &str,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    use crate::codex_scan_diagnostics::LoaderStage;
     let mut statement = connection
-        .prepare(format!("PRAGMA table_info({table_name})").as_str())
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare SQLite table census")?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
-        .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-        .context("read SQLite table census")
+        .prepare(sql)
+        .context(LoaderStage::Prepare)
+        .with_context(|| format!("prepare {label}"))?;
+    let rows = statement.query_map([], map).context(LoaderStage::Query)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context(LoaderStage::Row)
+        .with_context(|| format!("read {label} row"))
 }
 
 fn sqlite_select_expr(columns: &BTreeSet<String>, column: &str, fallback: &str) -> String {
@@ -43582,10 +43453,7 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
         traversal.listing_started_unix_seconds = Some(now);
         return;
     };
-    // A clock moved backwards cannot postpone the pass indefinitely.
-    if now < started.saturating_add(LISTING_INTERVAL_SECONDS)
-        && started <= now.saturating_add(LISTING_INTERVAL_SECONDS)
-    {
+    if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
         return;
     }
     traversal.listing_started_unix_seconds = Some(now);
@@ -43603,13 +43471,12 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
 
 /// Whether this re-listing pass may queue an owed file whose stamp is
 /// unchanged: once per file per `LISTING_OWED_PACE_SECONDS`, measured from
-/// the start of the pass that queued it. A stamp from a clock that moved
-/// backwards expires rather than holds.
+/// the start of the pass that queued it.
 fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool {
     let Some(now) = traversal.listing_started_unix_seconds else {
         return true;
     };
-    let fresh = |at: &u64| *at <= now && now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
+    let fresh = |at: &u64| now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
     let paced = &mut traversal.listing_owed_requeued_unix_seconds;
     if paced.get(key).is_some_and(&fresh) {
         return false;
@@ -43637,17 +43504,6 @@ fn trim_listing_owed_paces(paces: &mut BTreeMap<String, u64>, bound: usize) -> u
         paces.remove(&key);
     }
     excess as u64
-}
-
-/// The owed re-queue pacing map through the lenient map decoder: a stamp
-/// this binary cannot decode is dropped, and past the bound the oldest are
-/// dropped. Either only brings a re-queue forward; the traversal is kept.
-fn deserialize_listing_owed_paces<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, u64>, D::Error> {
-    let mut paces = deserialize_lenient_map(deserializer)?;
-    trim_listing_owed_paces(&mut paces, MAX_LISTING_OWED_PACES);
-    Ok(paces)
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -44709,25 +44565,28 @@ fn candidate_from_traversal_path_at(
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
     reconcile_missing_index_entries_with_side(
         index,
         MAX_BACKFILL_FILES_PER_SOURCE,
         codex_side_drop,
+        cache,
         source,
     )
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, SnapshotSource::ClaudeCode)
+    reconcile_missing_index_entries_with_side(index, limit, None, None, SnapshotSource::ClaudeCode)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
@@ -44786,6 +44645,7 @@ fn reconcile_missing_index_entries_with_side(
     }
     let mut growth_queued = false;
     let account_members = index.observed_account_members();
+    let unacked = index.unacked_bodies(&page);
     for key in &page {
         let observed = index
             .traversal
@@ -44856,6 +44716,7 @@ fn reconcile_missing_index_entries_with_side(
             index.drop_codex_proof_items(key, codex_side_drop);
         }
     }
+    index.count_unacked_retired(source, unacked, cache);
     let done = regular_done && residue_count < limit;
     if let Some(traversal) = index.traversal.as_mut() {
         traversal.reconciliation_started = true;
@@ -49228,29 +49089,6 @@ impl ScanIndex {
                     .or_insert_with(|| key.clone());
             }
         }
-        // A prior page's failed owner queued its next copy. That durable queue
-        // keeps the fallback ahead of the first incidence after save/reload.
-        for (fingerprint, owner) in &mut self.terminal_contract_retries {
-            if self
-                .quarantined_snapshot_fingerprints
-                .get(fingerprint)
-                .is_some_and(|r| r.contract_retry_claims.is_none())
-            {
-                if let Some(pending) = self
-                    .traversal
-                    .iter()
-                    .flat_map(|walk| walk.pending_candidates.iter())
-                    .chain(self.claude_stale_family_carry.replay.iter())
-                    .find(|pending| {
-                        self.file_snapshot_fingerprints
-                            .get(&local_index_key(&pending.path))
-                            .is_some_and(|fingerprints| fingerprints.contains(fingerprint))
-                    })
-                {
-                    *owner = local_index_key(&pending.path);
-                }
-            }
-        }
         // Use the same revalidated candidate admission as exact refusal re-offers.
         // Distinct entities in one file and duplicate incidences own one hint.
         self.terminal_contract_retries
@@ -51981,6 +51819,43 @@ impl ScanIndex {
         self.remove_file_entry_unless_held(key, false);
     }
 
+    /// Of `keys`, those whose entry holds a parsed, nonempty body witness that
+    /// is not ACKed: deleting the file now loses that usage. Withheld-account
+    /// keys keep their own deletion count. Taken before a vanished-key retirement.
+    fn unacked_bodies<'a>(&self, keys: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+        keys.into_iter()
+            .filter(|key| {
+                !self.claude_account_deferred_holds.contains_key(*key)
+                    && self
+                        .file_snapshot_fingerprints
+                        .get(*key)
+                        .is_some_and(|entities| !entities.is_empty())
+                    && self.files.get(*key).is_some_and(|entry| {
+                        entry.last_upload_body_witness.is_some()
+                            && !claude_index_file_body_accepted(self, key, entry)
+                    })
+            })
+            .collect()
+    }
+
+    /// Counts each of `unacked` the retirement removed; it holds or resends nothing.
+    fn count_unacked_retired(
+        &self,
+        source: SnapshotSource,
+        unacked: Vec<&String>,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) {
+        for key in unacked
+            .into_iter()
+            .filter(|key| !self.files.contains_key(*key))
+        {
+            crate::local_resource_diagnostics::unacked_usage_lost_to_deletion(
+                source.api_slug(),
+                cache.and_then(|cache| cache.resident_usage(source, key)),
+            );
+        }
+    }
+
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
         if !self.persistence_available() {
             return;
@@ -54027,25 +53902,6 @@ pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> Snapsho
         serde_json::from_slice(&fs::read(path).expect("read curve fixture")).expect("json");
     serde_json::from_value(value.pointer(pointer).expect("curve pointer").clone())
         .expect("curve fixture decodes")
-}
-
-/// Test-only vehicle for the retained curve-bearing body path: attaches the
-/// stored Codex cache golden curve. Curves are hash-neutral, so only the body
-/// witness sees it. With `tracks_body` every point takes the item's input
-/// tokens, as the retired builder's curve followed the body.
-#[cfg(test)]
-pub(crate) fn attach_retained_context_curve(items: &mut [SnapshotItem], tracks_body: bool) {
-    let curve =
-        context_curve_golden_fixture("cache_observation_codex_v1.json", "/snapshot/context_curve");
-    for item in items {
-        let mut curve = curve.clone();
-        if tracks_body {
-            for point in &mut curve.points {
-                point.effective_input_tokens = item.input_tokens.max(1);
-            }
-        }
-        item.context_curve = Some(curve);
-    }
 }
 
 #[cfg(test)]
@@ -70878,29 +70734,6 @@ mod tests {
         // truth and must still round-trip byte-for-byte.
         let codex = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         let claude = context_curve_golden_fixture("context-curve-v1-golden.json", "/claude_code");
-        let witness = |curve: SnapshotContextCurve,
-                       tool_usage: Option<Vec<SnapshotToolUsage>>,
-                       tool_usage_truncated: bool| {
-            let mut item = sample_session_artifact_item();
-            item.context_curve = Some(curve);
-            item.tool_usage = tool_usage;
-            item.tool_usage_truncated = tool_usage_truncated;
-            json!({
-                "version": snapshot_upload_body_witness_version(&item),
-                "digest": snapshot_upload_body_witness(&item),
-            })
-        };
-        let body_witnesses = json!({
-            "codex_curve_only_v11": witness(codex.clone(), None, false),
-            "claude_curve_only_v11": witness(claude.clone(), None, false),
-            "curve_with_empty_tool_usage_v11": witness(codex.clone(), Some(Vec::new()), false),
-            "curve_with_truncated_only_v11": witness(codex.clone(), None, true),
-            "curve_with_both_tool_fields_v11": witness(
-                codex.clone(),
-                Some(vec![SnapshotToolUsage { name: "Read".to_string(), count: 2 }]),
-                true,
-            ),
-        });
         let fixture = json!({
             "fixture_version": "local_context_curve_wire:v1",
             "codex": codex,
@@ -70949,7 +70782,6 @@ mod tests {
                 "claude_ownership": "claude_owned_request_start_proof:v2",
                 "claude_model_window_evidence": "claude_transcript_model:v1",
             },
-            "body_witnesses": body_witnesses,
         });
         let canonical_manifest =
             crate::canonical_json::canonicalize(&manifest).expect("curve manifest canonicalizes");
@@ -70995,150 +70827,7 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_requires_exact_durable_entity_ack_proof() {
-        let curve = single_request_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            "2026-08-20T12:00:00.003Z",
-            42,
-            "gpt-5.5",
-            Some(258_400),
-        );
-        let mut item = sample_session_artifact_item();
-        item.context_curve = Some(curve);
-        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "claude_code".to_string(),
-            machine_id: "machine".to_string(),
-            collector_version: None,
-            snapshots: vec![item.clone()],
-            upload_policy: SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
-        let response = |version: Option<u64>, digest: Option<String>| {
-            crate::snapshot_client::SnapshotBatchResponse {
-                conflict_rescans: Default::default(),
-                accepted: 1,
-                sessions_reconciled: 0,
-                session_ids: Vec::new(),
-                disabled: false,
-                disabled_reason: None,
-                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
-                accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                    source_session_id: item.source_session_id.clone(),
-                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                    occurrence_count: 1,
-                    body_witness_version: version,
-                    body_witness_digest: digest,
-                    head_etag: None,
-                    head_challenge: None,
-                    unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
-                }],
-                unchanged_entities: Vec::new(),
-                rejected_entities: Vec::new(),
-                conflict_entities: Vec::new(),
-            }
-        };
-        let legacy = crate::snapshot_client::SnapshotBatchResponse {
-            conflict_rescans: Default::default(),
-            accepted: 1,
-            sessions_reconciled: 0,
-            session_ids: Vec::new(),
-            disabled: false,
-            disabled_reason: None,
-            entity_ack_contract: None,
-            accepted_entities: Vec::new(),
-            unchanged_entities: Vec::new(),
-            rejected_entities: Vec::new(),
-            conflict_entities: Vec::new(),
-        };
-        legacy
-            .validate_entity_ack(&request)
-            .expect_err("legacy/routing-off ACK cannot settle curve evidence");
-        response(None, None)
-            .validate_entity_ack(&request)
-            .expect_err("generic entity ACK cannot settle curve evidence");
-        response(Some(5), Some("0".repeat(64)))
-            .validate_entity_ack(&request)
-            .expect_err("mismatched durable proof cannot settle curve evidence");
-        response(
-            Some(SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION),
-            Some(snapshot_upload_body_witness(&item)),
-        )
-        .validate_entity_ack(&request)
-        .expect_err("internal envelope proof cannot replace the public ACK version");
-        response(
-            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-            Some("0".repeat(64)),
-        )
-        .validate_entity_ack(&request)
-        .expect_err("mismatched durable proof cannot settle curve evidence");
-        response(
-            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-            Some(snapshot_upload_body_witness(&item)),
-        )
-        .validate_entity_ack(&request)
-        .expect("exact released accepted-log proof settles curve evidence");
-
-        let mut exclusive_item = item.clone();
-        exclusive_item.usage_accounting_contract =
-            Some("session_exclusive_reported_usage:v1".to_string());
-        exclusive_item.snapshot_fingerprint =
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, &exclusive_item);
-        let exclusive_request = SnapshotBatchRequest {
-            snapshots: vec![exclusive_item.clone()],
-            ..request
-        };
-        let exclusive_response = |version| crate::snapshot_client::SnapshotBatchResponse {
-            conflict_rescans: Default::default(),
-            accepted: 1,
-            sessions_reconciled: 0,
-            session_ids: Vec::new(),
-            disabled: false,
-            disabled_reason: None,
-            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
-            accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                source_session_id: exclusive_item.source_session_id.clone(),
-                snapshot_fingerprint: exclusive_item.snapshot_fingerprint.clone(),
-                occurrence_count: 1,
-                body_witness_version: Some(version),
-                body_witness_digest: Some(snapshot_upload_body_witness(&exclusive_item)),
-                head_etag: None,
-                head_challenge: None,
-                unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
-            }],
-            unchanged_entities: Vec::new(),
-            rejected_entities: Vec::new(),
-            conflict_entities: Vec::new(),
-        };
-        exclusive_response(SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION)
-            .validate_entity_ack(&exclusive_request)
-            .expect_err("internal v12 alias cannot replace released v6 ACK proof");
-        exclusive_response(6)
-            .validate_entity_ack(&exclusive_request)
-            .expect("released v6 accepted-log proof settles internal v12 curve evidence");
-    }
-
-    #[test]
     fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
-        let curve = single_request_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            "2026-08-30T12:00:00Z",
-            42,
-            "claude-opus-4-8",
-            None,
-        );
-        let mut nonexclusive = sample_session_artifact_item();
-        nonexclusive.context_curve = Some(curve.clone());
-        let mut exclusive = nonexclusive.clone();
-        exclusive.usage_accounting_contract =
-            Some("session_exclusive_reported_usage:v1".to_string());
         // Evidence-bearing legacy bodies reserve v21/v22. Envelope evidence
         // uses v23/v24, so public normalization must be an explicit mapping.
         let mappings = [
@@ -71146,12 +70835,8 @@ mod tests {
             (8, 2),
             (9, 3),
             (10, 4),
-            (11, 5),
-            (12, 6),
             (15, 13),
             (16, 14),
-            (19, 17),
-            (20, 18),
             (23, 7),
             (24, 8),
         ]
@@ -71164,7 +70849,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let header = codex_creator_header();
-        let creator_case = |exclusive: bool, with_curve: bool| {
+        let creator_case = |exclusive: bool| {
             // Exercise the actual original-session parser and its model/hourly
             // usage fold rather than a metadata-only item with positive totals.
             let mut item = codex_creator_item(
@@ -71176,14 +70861,6 @@ mod tests {
             if !exclusive {
                 item.usage_accounting_contract = None;
             }
-            // The parser no longer builds curves; the curve case carries its
-            // stored golden curve.
-            item.context_curve = with_curve.then(|| {
-                context_curve_golden_fixture(
-                    "body-witness-ack-normalization-v1.json",
-                    "/session_account_cases/exclusive_with_curve/wire/snapshots/0/context_curve",
-                )
-            });
             assert_eq!(
                 (item.input_tokens, item.output_tokens, item.request_count),
                 (100, 5, 1)
@@ -71261,24 +70938,11 @@ mod tests {
                 "legacy_content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
             },
             "session_account_cases": {
-                "nonexclusive": creator_case(false, false),
-                "exclusive": creator_case(true, false),
-                "exclusive_with_curve": creator_case(true, true),
+                "nonexclusive": creator_case(false),
+                "exclusive": creator_case(true),
             },
             "mappings": mappings,
             "declared_cache_session_account_ack_mappings": {"23": 13, "24": 14},
-            "curve_cases": {
-                "nonexclusive": {
-                    "internal_version": snapshot_upload_body_witness_version(&nonexclusive),
-                    "released_ack_version": 5,
-                    "digest": snapshot_upload_body_witness(&nonexclusive),
-                },
-                "exclusive": {
-                    "internal_version": snapshot_upload_body_witness_version(&exclusive),
-                    "released_ack_version": 6,
-                    "digest": snapshot_upload_body_witness(&exclusive),
-                },
-            },
         });
         let mut canonical = crate::canonical_json::canonicalize(&fixture)
             .expect("ACK normalization fixture canonicalizes");
@@ -71450,155 +71114,141 @@ mod tests {
         assert!(parsed.session_account_evidence.is_some());
         assert!(parsed.cache_observations.is_some());
         assert!(parsed.context_curve.is_none());
-        // The parser no longer builds curves; curve cases carry a retained one.
-        let retained_curve = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
         let mut cases = Vec::new();
         for capability in ["creator", "cache", "combined", "legacy"] {
             for exclusive in [false, true] {
-                for curve in [false, true] {
-                    for tools in [
-                        "omitted",
-                        "empty_default_only",
-                        "nonempty",
-                        "truncated_only",
-                    ] {
-                        let mut item = parsed.clone();
-                        if capability == "cache" || capability == "legacy" {
-                            item.session_account_evidence = None;
-                        }
-                        if capability == "creator" || capability == "legacy" {
-                            item.cache_observations = None;
-                            item.cache_observations_state = None;
-                        }
-                        if !exclusive {
-                            item.usage_accounting_contract = None;
-                        }
-                        item.context_curve = curve.then(|| retained_curve.clone());
-                        item.tool_usage = match tools {
-                            "empty_default_only" => Some(vec![]),
-                            "nonempty" => Some(vec![SnapshotToolUsage {
-                                name: "Read".into(),
-                                count: 2,
-                            }]),
-                            _ => None,
-                        };
-                        item.tool_usage_truncated = tools == "truncated_only";
-                        let mut request = valid_v6_batch_request();
-                        request.source = "codex".into();
-                        request.snapshots = vec![item];
-                        apply_upload_policy(
-                            SnapshotSource::Codex,
-                            &mut request.snapshots,
-                            request.upload_policy,
-                        );
-                        request.snapshots[0].snapshot_fingerprint =
-                            snapshot_fingerprint(SnapshotSource::Codex, &request.snapshots[0]);
-                        let item = &request.snapshots[0];
-                        // These are exact normal HTTP body bytes, not reconstructed
-                        // canonical JSON or a mutation of the serialized leaves.
-                        let wire_bytes = serde_json::to_vec(&request).unwrap();
-                        let wire: Value = serde_json::from_slice(&wire_bytes).unwrap();
-                        let projection = snapshot_upload_body_witness_payload(item);
-                        let internal = snapshot_upload_body_witness_version(item);
-                        let public = internal.map(|version| match version {
-                            9 => 3,
-                            10 => 4,
-                            11 => 5,
-                            12 => 6,
-                            15 => 13,
-                            16 => 14,
-                            19 => 17,
-                            20 => 18,
-                            23 => {
-                                if item.cache_observations.is_some() {
-                                    13
-                                } else {
-                                    7
-                                }
-                            }
-                            24 => {
-                                if item.cache_observations.is_some() {
-                                    14
-                                } else {
-                                    8
-                                }
-                            }
-                            _ => panic!("unexpected paired domain"),
-                        });
-                        let digest = internal.map(|_| snapshot_upload_body_witness(item));
-                        for field in [
-                            "context_curve",
-                            "tool_usage",
-                            "tool_usage_truncated",
-                            "session_account_evidence",
-                        ] {
-                            if let Some(declared) = wire["snapshots"][0].get(field) {
-                                assert_eq!(projection.get(field), Some(declared));
-                            } else if capability != "legacy" || curve || tools == "omitted" {
-                                assert!(projection.get(field).is_none());
-                            }
-                        }
-                        let response = |version, proof, unchanged| {
-                            let reference = crate::snapshot_client::SnapshotEntityRef {
-                                source_session_id: item.source_session_id.clone(),
-                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                occurrence_count: 1,
-                                body_witness_version: version,
-                                body_witness_digest: proof,
-                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
-                                head_challenge: None,
-                                unchanged_basis: None,
-                                retained_proof_missing: Vec::new(),
-                            };
-                            crate::snapshot_client::SnapshotBatchResponse {
-                                conflict_rescans: Default::default(),
-                                accepted: 1,
-                                sessions_reconciled: 0,
-                                session_ids: vec![],
-                                disabled: false,
-                                disabled_reason: None,
-                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
-                                accepted_entities: if unchanged {
-                                    vec![]
-                                } else {
-                                    vec![reference.clone()]
-                                },
-                                unchanged_entities: if unchanged {
-                                    vec![reference]
-                                } else {
-                                    vec![]
-                                },
-                                rejected_entities: vec![],
-                                conflict_entities: vec![],
-                            }
-                        };
-                        for unchanged in [false, true] {
-                            response(public, digest.clone(), unchanged)
-                                .validate_entity_ack(&request)
-                                .unwrap();
-                            if capability != "legacy" || curve {
-                                assert!(response(public, Some("0".repeat(64)), unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                                assert!(response(None, None, unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                                assert!(response(Some(99), digest.clone(), unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                            }
-                        }
-                        cases.push(json!({"admission":"first_admission","capability":capability,"exclusive":exclusive,"curve":curve,"tools":tools,
-                            "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
-                            "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
-                            "internal_version":internal,"released_ack_version":public,"digest":digest,
-                            "body_projection":projection,"cache_observations_state":item.cache_observations_state}));
+                for tools in [
+                    "omitted",
+                    "empty_default_only",
+                    "nonempty",
+                    "truncated_only",
+                ] {
+                    let mut item = parsed.clone();
+                    if capability == "cache" || capability == "legacy" {
+                        item.session_account_evidence = None;
                     }
+                    if capability == "creator" || capability == "legacy" {
+                        item.cache_observations = None;
+                        item.cache_observations_state = None;
+                    }
+                    if !exclusive {
+                        item.usage_accounting_contract = None;
+                    }
+                    item.tool_usage = match tools {
+                        "empty_default_only" => Some(vec![]),
+                        "nonempty" => Some(vec![SnapshotToolUsage {
+                            name: "Read".into(),
+                            count: 2,
+                        }]),
+                        _ => None,
+                    };
+                    item.tool_usage_truncated = tools == "truncated_only";
+                    let mut request = valid_v6_batch_request();
+                    request.source = "codex".into();
+                    request.snapshots = vec![item];
+                    apply_upload_policy(
+                        SnapshotSource::Codex,
+                        &mut request.snapshots,
+                        request.upload_policy,
+                    );
+                    request.snapshots[0].snapshot_fingerprint =
+                        snapshot_fingerprint(SnapshotSource::Codex, &request.snapshots[0]);
+                    let item = &request.snapshots[0];
+                    // These are exact normal HTTP body bytes, not reconstructed
+                    // canonical JSON or a mutation of the serialized leaves.
+                    let wire_bytes = serde_json::to_vec(&request).unwrap();
+                    let wire: Value = serde_json::from_slice(&wire_bytes).unwrap();
+                    let projection = snapshot_upload_body_witness_payload(item);
+                    let internal = snapshot_upload_body_witness_version(item);
+                    let public = internal.map(|version| match version {
+                        9 => 3,
+                        10 => 4,
+                        15 => 13,
+                        16 => 14,
+                        23 => {
+                            if item.cache_observations.is_some() {
+                                13
+                            } else {
+                                7
+                            }
+                        }
+                        24 => {
+                            if item.cache_observations.is_some() {
+                                14
+                            } else {
+                                8
+                            }
+                        }
+                        _ => panic!("unexpected paired domain"),
+                    });
+                    let digest = internal.map(|_| snapshot_upload_body_witness(item));
+                    for field in [
+                        "tool_usage",
+                        "tool_usage_truncated",
+                        "session_account_evidence",
+                    ] {
+                        if let Some(declared) = wire["snapshots"][0].get(field) {
+                            assert_eq!(projection.get(field), Some(declared));
+                        } else if capability != "legacy" || tools == "omitted" {
+                            assert!(projection.get(field).is_none());
+                        }
+                    }
+                    let response = |version, proof, unchanged| {
+                        let reference = crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version: version,
+                            body_witness_digest: proof,
+                            head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                            head_challenge: None,
+                            unchanged_basis: None,
+                            retained_proof_missing: Vec::new(),
+                        };
+                        crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
+                            accepted: 1,
+                            sessions_reconciled: 0,
+                            session_ids: vec![],
+                            disabled: false,
+                            disabled_reason: None,
+                            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                            accepted_entities: if unchanged {
+                                vec![]
+                            } else {
+                                vec![reference.clone()]
+                            },
+                            unchanged_entities: if unchanged { vec![reference] } else { vec![] },
+                            rejected_entities: vec![],
+                            conflict_entities: vec![],
+                        }
+                    };
+                    for unchanged in [false, true] {
+                        response(public, digest.clone(), unchanged)
+                            .validate_entity_ack(&request)
+                            .unwrap();
+                        if capability != "legacy" {
+                            assert!(response(public, Some("0".repeat(64)), unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                            assert!(response(None, None, unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                            assert!(response(Some(99), digest.clone(), unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                        }
+                    }
+                    cases.push(json!({"admission":"first_admission","capability":capability,"exclusive":exclusive,"tools":tools,
+                        "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
+                        "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
+                        "internal_version":internal,"released_ack_version":public,"digest":digest,
+                        "body_projection":projection,"cache_observations_state":item.cache_observations_state}));
                 }
             }
         }
-        assert_eq!(cases.len(), 64);
+        assert_eq!(cases.len(), 32);
     }
 
     fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, ScanIndex) {
@@ -72014,7 +71664,7 @@ mod tests {
             format!("{base}{}", "{}\n".repeat(revision)),
         )
         .expect("write forced-parse fixture");
-        let mut result = scan_source_roots_with_limit(
+        let result = scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
             index,
@@ -72025,24 +71675,20 @@ mod tests {
         )
         .expect("scan forced-parse fixture");
         assert_eq!(result.snapshots.len(), 1);
-        result.snapshots[0].context_curve = Some(unavailable_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "ownership_unresolved",
-            0,
-            0,
-        ));
+        assert!(!result.snapshots[0].tool_usage_truncated);
         result
     }
 
-    fn curve_omitted_body_witness(item: &SnapshotItem) -> String {
+    /// A delivery-only projection: it declares a witnessed leaf the raw body
+    /// omits, so the effective witness differs from the raw one.
+    fn projected_body_witness(item: &SnapshotItem) -> String {
         assert_eq!(
             item.snapshot_fingerprint,
             snapshot_fingerprint(SnapshotSource::ClaudeCode, item),
             "effective witness runs after semantic fingerprint recomputation"
         );
         let mut effective = item.clone();
-        effective.context_curve = None;
+        effective.tool_usage_truncated = true;
         snapshot_upload_body_witness(&effective)
     }
 
@@ -72059,7 +71705,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
-            curve_omitted_body_witness,
+            projected_body_witness,
         );
         assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
         let semantic_state = index.file_snapshot_fingerprints.clone();
@@ -72077,7 +71723,7 @@ mod tests {
                 &mut index,
                 |item| {
                     if omitted {
-                        curve_omitted_body_witness(item)
+                        projected_body_witness(item)
                     } else {
                         assert_eq!(item.snapshot_fingerprint, raw.snapshot_fingerprint);
                         snapshot_upload_body_witness(item)
@@ -72104,11 +71750,11 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
-            curve_omitted_body_witness,
+            projected_body_witness,
         );
         let item = &first.snapshots[0];
         let raw_witness = snapshot_upload_body_witness(item);
-        let effective_witness = curve_omitted_body_witness(item);
+        let effective_witness = projected_body_witness(item);
         assert_ne!(raw_witness, effective_witness);
         let scan = body_witness_finalizer_scan(&root, &mut index, 2);
         for (witness, expected_count) in [(effective_witness, 0), (raw_witness, 1)] {
@@ -72127,84 +71773,13 @@ mod tests {
                 &mut retry_index,
                 |item| {
                     calls.set(calls.get() + 1);
-                    curve_omitted_body_witness(item)
+                    projected_body_witness(item)
                 },
             );
             assert_eq!(calls.get(), 2, "file fold and quarantine share the witness");
             assert_eq!(retry.snapshots.len(), expected_count);
             assert_eq!(retry.semantic_noop_count, 1 - expected_count);
         }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn context_curve_body_witness_uploads_absent_present_corrections_once() {
-        let root = temp_dir("context-curve-body-witness");
-        let path = root.join("curve-session.jsonl");
-        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
-        let curve = |tokens| {
-            single_request_context_curve(
-                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                "claude_owned_request_start_proof:v1",
-                "claude_transcript_model:v1",
-                "2026-08-20T12:00:01Z",
-                tokens,
-                "claude-opus-4-8",
-                None,
-            )
-        };
-        let curve_a = curve(100);
-        let curve_b = curve(125);
-        let mut index = ScanIndex::default();
-        let mut revision = 0_usize;
-        let mut run = |curve: Option<SnapshotContextCurve>| {
-            revision += 1;
-            fs::write(&path, format!("{base}{}", "{}\n".repeat(revision)))
-                .expect("write forced-parse fixture");
-            let mut result = scan_source_roots_with_limit(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-08-20T12:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("scan forced-parse fixture");
-            assert_eq!(result.snapshots.len(), 1);
-            result.snapshots[0].context_curve = curve;
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-            (
-                result.snapshots.len(),
-                result.semantic_noop_count,
-                index
-                    .files
-                    .get(&local_index_key(&path))
-                    .and_then(|entry| entry.last_upload_body_witness.clone())
-                    .expect("body witness persisted"),
-            )
-        };
-
-        let (baseline_count, _, baseline_witness) = run(None);
-        assert_eq!(baseline_count, 1);
-        let (present_count, _, curve_a_witness) = run(Some(curve_a.clone()));
-        assert_eq!(present_count, 1, "absent -> present uploads once");
-        assert_ne!(baseline_witness, curve_a_witness);
-        let (identical_count, identical_noops, identical_witness) = run(Some(curve_a.clone()));
-        assert_eq!((identical_count, identical_noops), (0, 1));
-        assert_eq!(curve_a_witness, identical_witness);
-        let (corrected_count, _, curve_b_witness) = run(Some(curve_b));
-        assert_eq!(corrected_count, 1, "curve A -> B uploads");
-        assert_ne!(curve_a_witness, curve_b_witness);
-        let (restored_count, _, restored_witness) = run(Some(curve_a));
-        assert_eq!(restored_count, 1, "curve B -> A uploads");
-        assert_eq!(restored_witness, curve_a_witness);
-        let (rollback_count, _, rollback_witness) = run(None);
-        assert_eq!(rollback_count, 1, "rollback omission uploads once");
-        assert_eq!(rollback_witness, baseline_witness);
-        let (settled_count, settled_noops, _) = run(None);
-        assert_eq!((settled_count, settled_noops), (0, 1));
-
         let _ = fs::remove_dir_all(root);
     }
 
@@ -72804,182 +72379,167 @@ mod tests {
         let mut declared_cases = Vec::new();
         for disposition in ["complete", "missing", "conflict"] {
             for cache in [false, true] {
-                for curve in [false, true] {
-                    let mut item = complete.clone();
-                    if disposition == "missing" {
-                        item = claude_original_carrier_fixture(
-                            &claude_original_carrier_missing_metadata(),
-                            "",
-                        );
-                    } else if disposition == "conflict" {
-                        let mut metadata = claude_original_carrier_metadata();
-                        let mut other = metadata.original_identity_evidence["native-session"]
-                            .first()
-                            .unwrap()
-                            .clone();
-                        other.provider_workspace_hash = Some("c".repeat(64));
-                        metadata
-                            .original_identity_evidence
-                            .get_mut("native-session")
-                            .unwrap()
-                            .insert(other);
-                        item = claude_original_carrier_fixture(&metadata, "");
+                let mut item = complete.clone();
+                if disposition == "missing" {
+                    item = claude_original_carrier_fixture(
+                        &claude_original_carrier_missing_metadata(),
+                        "",
+                    );
+                } else if disposition == "conflict" {
+                    let mut metadata = claude_original_carrier_metadata();
+                    let mut other = metadata.original_identity_evidence["native-session"]
+                        .first()
+                        .unwrap()
+                        .clone();
+                    other.provider_workspace_hash = Some("c".repeat(64));
+                    metadata
+                        .original_identity_evidence
+                        .get_mut("native-session")
+                        .unwrap()
+                        .insert(other);
+                    item = claude_original_carrier_fixture(&metadata, "");
+                }
+                prepare_cache_observations(&mut item, None);
+                if !cache {
+                    item.cache_observations = None;
+                    item.cache_observations_state = None;
+                }
+                let source_item = item;
+                for tools in [
+                    "omitted",
+                    "empty_default_only",
+                    "nonempty",
+                    "truncated_only",
+                ] {
+                    let mut item = source_item.clone();
+                    match tools {
+                        "omitted" | "truncated_only" => item.tool_usage = None,
+                        "empty_default_only" => item.tool_usage = Some(vec![]),
+                        _ => {}
                     }
-                    prepare_cache_observations(&mut item, None);
-                    if !cache {
-                        item.cache_observations = None;
-                        item.cache_observations_state = None;
-                    }
-                    // The parser no longer builds curves; curve cases carry the
-                    // stored golden curve.
-                    item.context_curve = curve.then(|| {
-                        context_curve_golden_fixture(
-                            "claude-original-source-corpus-v1.json",
-                            "/cases/1/wire/snapshots/0/context_curve",
+                    item.tool_usage_truncated = tools == "truncated_only";
+                    let mut request = valid_v6_batch_request();
+                    request.source = "claude_code".into();
+                    request.snapshots = vec![item];
+                    apply_upload_policy(
+                        SnapshotSource::ClaudeCode,
+                        &mut request.snapshots,
+                        request.upload_policy,
+                    );
+                    request.snapshots[0].snapshot_fingerprint =
+                        snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
+                    let item = &request.snapshots[0];
+                    assert_eq!(
+                        item.session_account_evidence
+                            .as_ref()
+                            .unwrap()
+                            .identity_disposition,
+                        Some(disposition)
+                    );
+                    assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
+                    assert_eq!(item.cache_observations.is_some(), cache);
+                    assert_eq!(
+                        item.session_account_evidence,
+                        source_item.session_account_evidence
+                    );
+                    assert_eq!(
+                        (item.input_tokens, item.output_tokens, item.request_count),
+                        (
+                            source_item.input_tokens,
+                            source_item.output_tokens,
+                            source_item.request_count
                         )
-                    });
-                    let source_item = item;
-                    for tools in [
-                        "omitted",
-                        "empty_default_only",
-                        "nonempty",
-                        "truncated_only",
+                    );
+                    assert_eq!(item.model_usage, source_item.model_usage);
+                    assert_eq!(item.usage_buckets, source_item.usage_buckets);
+                    let bytes = serde_json::to_vec(&request).unwrap();
+                    let wire: Value = serde_json::from_slice(&bytes).unwrap();
+                    let projection = snapshot_upload_body_witness_payload(item);
+                    for field in [
+                        "session_account_evidence",
+                        "tool_usage",
+                        "tool_usage_truncated",
                     ] {
-                        let mut item = source_item.clone();
-                        match tools {
-                            "omitted" | "truncated_only" => item.tool_usage = None,
-                            "empty_default_only" => item.tool_usage = Some(vec![]),
-                            _ => {}
-                        }
-                        item.tool_usage_truncated = tools == "truncated_only";
-                        let mut request = valid_v6_batch_request();
-                        request.source = "claude_code".into();
-                        request.snapshots = vec![item];
-                        apply_upload_policy(
-                            SnapshotSource::ClaudeCode,
-                            &mut request.snapshots,
-                            request.upload_policy,
-                        );
-                        request.snapshots[0].snapshot_fingerprint =
-                            snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
-                        let item = &request.snapshots[0];
                         assert_eq!(
-                            item.session_account_evidence
-                                .as_ref()
-                                .unwrap()
-                                .identity_disposition,
-                            Some(disposition)
+                            projection.get(field),
+                            wire["snapshots"][0].get(field),
+                            "original Claude declared presence: {field}/{tools}"
                         );
-                        assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
-                        assert_eq!(item.cache_observations.is_some(), cache);
-                        assert_eq!(
-                            item.session_account_evidence,
-                            source_item.session_account_evidence
-                        );
-                        assert_eq!(
-                            (item.input_tokens, item.output_tokens, item.request_count),
-                            (
-                                source_item.input_tokens,
-                                source_item.output_tokens,
-                                source_item.request_count
-                            )
-                        );
-                        assert_eq!(item.model_usage, source_item.model_usage);
-                        assert_eq!(item.usage_buckets, source_item.usage_buckets);
-                        let bytes = serde_json::to_vec(&request).unwrap();
-                        let wire: Value = serde_json::from_slice(&bytes).unwrap();
-                        let projection = snapshot_upload_body_witness_payload(item);
-                        for field in [
-                            "session_account_evidence",
-                            "context_curve",
-                            "tool_usage",
-                            "tool_usage_truncated",
-                        ] {
-                            assert_eq!(
-                                projection.get(field),
-                                wire["snapshots"][0].get(field),
-                                "original Claude declared presence: {field}/{tools}"
-                            );
-                        }
-                        assert_eq!(
-                            wire["snapshots"][0].get("tool_usage_truncated"),
-                            (tools == "truncated_only").then_some(&Value::Bool(true))
-                        );
-                        let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
-                        let digest = snapshot_upload_body_witness(item);
-                        assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
-                        let public = if cache { 13 } else { 7 };
-                        let response = |version, proof, unchanged| {
-                            let reference = crate::snapshot_client::SnapshotEntityRef {
-                                source_session_id: item.source_session_id.clone(),
-                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                occurrence_count: 1,
-                                body_witness_version: version,
-                                body_witness_digest: proof,
-                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
-                                head_challenge: None,
-                                unchanged_basis: None,
-                                retained_proof_missing: Vec::new(),
-                            };
-                            crate::snapshot_client::SnapshotBatchResponse {
-                                conflict_rescans: Default::default(),
-                                accepted: 1,
-                                sessions_reconciled: 0,
-                                session_ids: vec![],
-                                disabled: false,
-                                disabled_reason: None,
-                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
-                                accepted_entities: if unchanged {
-                                    vec![]
-                                } else {
-                                    vec![reference.clone()]
-                                },
-                                unchanged_entities: if unchanged {
-                                    vec![reference]
-                                } else {
-                                    vec![]
-                                },
-                                rejected_entities: vec![],
-                                conflict_entities: vec![],
-                            }
-                        };
-                        for unchanged in [false, true] {
-                            response(Some(public), Some(digest.clone()), unchanged)
-                                .validate_entity_ack(&request)
-                                .unwrap();
-                            for (version, proof) in [
-                                (Some(public), Some("0".repeat(64))),
-                                (None, None),
-                                (Some(23), Some(digest.clone())),
-                                (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
-                            ] {
-                                assert!(response(version, proof, unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                            }
-                        }
-                        let case = json!({"disposition":disposition,"cache":cache,"curve":curve,
-                        "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
-                        "wire":wire,
-                        "wire_body_utf8":String::from_utf8(bytes).unwrap(),
-                        "internal_version":snapshot_upload_body_witness_version(item),
-                        "released_ack_version":public,
-                        "digest":digest,
-                        "body_projection":projection,
-                        "cache_observations_state":item.cache_observations_state});
-                        if tools == "nonempty" {
-                            cases.push(case.clone());
-                        }
-                        let mut declared_case = case;
-                        declared_case["tools"] = json!(tools);
-                        declared_case["body_projection_canonical_utf8"] =
-                            json!(String::from_utf8(canonical).unwrap());
-                        declared_cases.push(declared_case);
                     }
+                    assert_eq!(
+                        wire["snapshots"][0].get("tool_usage_truncated"),
+                        (tools == "truncated_only").then_some(&Value::Bool(true))
+                    );
+                    let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
+                    let digest = snapshot_upload_body_witness(item);
+                    assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
+                    let public = if cache { 13 } else { 7 };
+                    let response = |version, proof, unchanged| {
+                        let reference = crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version: version,
+                            body_witness_digest: proof,
+                            head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                            head_challenge: None,
+                            unchanged_basis: None,
+                            retained_proof_missing: Vec::new(),
+                        };
+                        crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
+                            accepted: 1,
+                            sessions_reconciled: 0,
+                            session_ids: vec![],
+                            disabled: false,
+                            disabled_reason: None,
+                            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                            accepted_entities: if unchanged {
+                                vec![]
+                            } else {
+                                vec![reference.clone()]
+                            },
+                            unchanged_entities: if unchanged { vec![reference] } else { vec![] },
+                            rejected_entities: vec![],
+                            conflict_entities: vec![],
+                        }
+                    };
+                    for unchanged in [false, true] {
+                        response(Some(public), Some(digest.clone()), unchanged)
+                            .validate_entity_ack(&request)
+                            .unwrap();
+                        for (version, proof) in [
+                            (Some(public), Some("0".repeat(64))),
+                            (None, None),
+                            (Some(23), Some(digest.clone())),
+                            (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
+                        ] {
+                            assert!(response(version, proof, unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                        }
+                    }
+                    let case = json!({"disposition":disposition,"cache":cache,
+                    "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
+                    "wire":wire,
+                    "wire_body_utf8":String::from_utf8(bytes).unwrap(),
+                    "internal_version":snapshot_upload_body_witness_version(item),
+                    "released_ack_version":public,
+                    "digest":digest,
+                    "body_projection":projection,
+                    "cache_observations_state":item.cache_observations_state});
+                    if tools == "nonempty" {
+                        cases.push(case.clone());
+                    }
+                    let mut declared_case = case;
+                    declared_case["tools"] = json!(tools);
+                    declared_case["body_projection_canonical_utf8"] =
+                        json!(String::from_utf8(canonical).unwrap());
+                    declared_cases.push(declared_case);
                 }
             }
         }
-        assert_eq!(cases.len(), 12);
+        assert_eq!(cases.len(), 6);
         let bytes = serde_json::to_vec_pretty(
             &json!({"contract_version":"claude_original_wire_corpus:v1", "cases":cases}),
         )
@@ -72994,7 +72554,7 @@ mod tests {
         if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_CORPUS_OUT") {
             fs::write(output, &bytes).unwrap();
         }
-        assert_eq!(declared_cases.len(), 48);
+        assert_eq!(declared_cases.len(), 24);
         if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_DECLARED_CORPUS_OUT") {
             fs::write(output, serde_json::to_vec_pretty(
                 &json!({"contract_version":"claude_original_declared_wire_corpus:v1", "cases":declared_cases})
@@ -77480,9 +77040,8 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    /// [behaviour] Routing by name. A database with a second hard link is
-    /// refused for good (not retried), and a link added after a snapshot was
-    /// taken fails that snapshot's rows as busy. An idle database reached
+    /// [behaviour] Routing by name. A link added after a snapshot was taken
+    /// fails that snapshot's rows as busy. An idle database reached
     /// through a symlink is read as a snapshot of its target. A database with
     /// a `-wal` takes the plain open: with no connection attached, its frames
     /// are read through a private index, also through a symlink, and an
@@ -77513,26 +77072,10 @@ mod tests {
         assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
 
         let other_name = codex_dir.join("other.sqlite");
-        fs::hard_link(&history_path, &other_name).expect("hard-link history fixture");
-        let (ordinal, open) = rollout_ordinal(&history_path);
-        let linked = ordinal.expect_err("second hard link refused");
-        assert!(linked
-            .downcast_ref::<crate::codex_scan_diagnostics::LinkedDatabase>()
-            .is_some());
-        assert_eq!((open.retries, open.snapshots), (0, 0));
-        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
-        evidence.observe_root(&Err(linked), open, false, "codex root");
-        assert_eq!(
-            evidence.reason,
-            crate::codex_scan_diagnostics::LoaderReason::LinkedDatabase
-        );
-        assert_eq!(evidence.transient_retries, 0);
-        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
-        fs::remove_file(&other_name).expect("unlink second name");
-
         let snapshot = codex_sqlite_read::CodexSqliteRead::open(
             &history_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
+            CODEX_SIDECAR_BUSY_TIMEOUT,
         )
         .expect("open idle snapshot");
         assert!(snapshot.is_snapshot());
@@ -77646,6 +77189,7 @@ mod tests {
             let snapshot = codex_sqlite_read::CodexSqliteRead::open(
                 &history_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
             )
             .expect("open idle snapshot");
             assert!(snapshot.is_snapshot());
@@ -83790,8 +83334,6 @@ pub(crate) mod cache_adapter_tests {
                 None,
             )
             .remove(0);
-        // The parser no longer builds curves; restore the stored golden curve.
-        super::attach_retained_context_curve(std::slice::from_mut(&mut item), false);
         prepare_cache_observations(&mut item, None);
         item
     }
@@ -83952,7 +83494,7 @@ pub(crate) mod cache_adapter_tests {
             item.cache_observations.as_ref().unwrap().operations.len(),
             1
         );
-        assert_eq!(snapshot_upload_body_witness_version(&item), Some(20));
+        assert_eq!(snapshot_upload_body_witness_version(&item), Some(16));
         let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::Codex,&item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(&item),"body_witness_digest":snapshot_upload_body_witness(&item)});
         let golden: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/cache_observation_codex_v1.json"
@@ -83976,8 +83518,8 @@ pub(crate) mod cache_adapter_tests {
                 "codex",
                 "OTTTO_CACHE_FIXTURE_OUT",
                 SnapshotSource::Codex,
-                20,
-                18,
+                16,
+                14,
             ),
             (
                 "claude",
@@ -84025,7 +83567,7 @@ pub(crate) mod cache_adapter_tests {
             "duration_policy":"nonnegative_whole_seconds_floor",
             "head_cas_contract":SNAPSHOT_HEAD_CAS_CONTRACT,
             "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
-            "normalized_public_body_witness_map":{"15":13,"16":14,"19":17,"20":18},
+            "normalized_public_body_witness_map":{"15":13,"16":14},
             "fixtures":fixtures,
         });
         if let Some(output) = output {

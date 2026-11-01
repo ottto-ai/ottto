@@ -721,12 +721,6 @@ crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, sn
 const RECEIPT_VERSION: u16 = 1;
 const MAX_APPLIED_TIERS: usize = 512;
 pub(super) const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,10 +825,10 @@ impl TierReplay {
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
                 || receipt.scope != scope
                 || receipt.records == 0
-                || !is_sha256_hex(&receipt.prefix_digest)
+                || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
                 || receipt.tiers.len() > MAX_APPLIED_TIERS
                 || receipt.tiers.iter().any(|(key, source)| {
-                    !is_sha256_hex(key)
+                    !crate::hex::is_sha256_lower(key)
                         || source.is_empty()
                         || source.len() > 64
                         || !source

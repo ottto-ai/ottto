@@ -379,11 +379,9 @@ fn codex_folders(
     let connection = CodexSqliteRead::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        Duration::from_millis(100),
     )
     .map_err(|_| "codex_database")?;
-    connection
-        .busy_timeout(Duration::from_millis(100))
-        .map_err(|_| "codex_database")?;
     // SQLite must stop CPU-bound scans too, not only lock waits. The callback
     // borrows this stack deadline only until connection/statement destruction.
     unsafe extern "C" fn progress(context: *mut std::ffi::c_void) -> libc::c_int {

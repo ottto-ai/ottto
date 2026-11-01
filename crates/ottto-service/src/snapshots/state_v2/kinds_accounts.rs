@@ -155,89 +155,17 @@ pub(super) fn hydrate_txn(
 ) -> Result<()> {
     hydrate_filtered(tx, index, cx, None)
 }
-// A family has few rows of a kind, usually one.
-const FAMILY_PAGE: usize = 8;
-/// One family's rows of one kind, every position, in key order.
-fn family_rows(tx: &mut dyn Transaction, kind: &str, family: &str) -> Result<Vec<Header>> {
-    let kind = RecordKind::parse(kind)?;
-    let mut found = Vec::new();
-    let mut after = None;
-    loop {
-        let page = tx.scan_record_key(&kind, family.as_bytes(), after, FAMILY_PAGE)?;
-        let more = page.len() == FAMILY_PAGE;
-        if let Some(RowKey::Record { position, .. }) = page.last().map(|h| &h.key) {
-            after = Some(*position);
-        }
-        found.extend(page);
-        if !more {
-            return Ok(found);
-        }
-    }
-}
-/// A full hydrate visits the whole kind; a filtered one only the requested
-/// families.
-fn visit(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    roots: Option<&BTreeSet<String>>,
-    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
-) -> Result<()> {
-    let Some(roots) = roots else {
-        return mapper::rows(tx, kind, f);
-    };
-    for family in roots {
-        for h in family_rows(tx, kind, family)? {
-            f(tx, h)?;
-        }
-    }
-    Ok(())
-}
-/// `mapper::read_map` for the requested names, with its row checks. Its member
-/// count needs the whole kind, so only the full hydrate proves that.
-fn family_map<T: serde::de::DeserializeOwned + Serialize>(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    roots: &BTreeSet<String>,
-) -> Result<std::collections::BTreeMap<String, T>> {
-    let manifest = tx
-        .get(&mapper::key(kind, "", 0)?)?
-        .context("state_v2_missing_manifest")?;
-    mapper::read::<usize>(tx, &manifest, None)?;
-    let mut result = std::collections::BTreeMap::new();
-    visit(tx, kind, Some(roots), |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            anyhow::bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-            return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
-        result.insert(dependency_family(key_bytes)?, mapper::read(tx, &h, None)?);
-        Ok(())
-    })?;
-    Ok(result)
-}
 pub(super) fn hydrate_filtered(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
     cx: &mut KindCx,
-    filter: Option<(&BTreeSet<String>, bool)>,
+    roots: Option<&BTreeSet<String>>,
 ) -> Result<()> {
-    let roots = filter.map(|(roots, _)| roots);
     // Only a complete hydrate seeds a baseline; CAS views stay unhashed.
-    let mut seed = filter.is_none().then_some(&mut cx.digests);
+    let mut seed = roots.is_none().then_some(&mut cx.digests);
     macro_rules! load {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = match roots {
-                Some(roots) => mapper::FieldMap::from_rows(family_map(tx, $kind, roots)?),
-                None => mapper::read_field_map(tx, $kind, None, seed.as_deref_mut())?,
-            };
+            index.$f = mapper::read_field_map(tx, $kind, roots, seed.as_deref_mut())?;
         };
         ($($t:tt)*) => {};
     }
@@ -249,7 +177,7 @@ pub(super) fn hydrate_filtered(
     let mut count = 0;
     let mut controls = 0;
     let mut seen = BTreeSet::new();
-    visit(tx, "account.current", roots, |tx, h| {
+    mapper::visit(tx, "account.current", roots, |tx, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -311,11 +239,11 @@ pub(super) fn hydrate_filtered(
     );
     cx.account_controls = expected.1;
     // Unreferenced windows must not silently disappear on hydration.
-    visit(tx, "account_window", roots, |_, h| {
+    mapper::visit(tx, "account_window", roots, |_, h| {
         ensure!(seen.contains(&h.key), "accounts_orphan_window");
         Ok(())
     })?;
-    visit(tx, "account.absent_members", roots, |_, h| {
+    mapper::visit(tx, "account.absent_members", roots, |_, h| {
         let RowKey::Record {
             key_bytes,
             position,

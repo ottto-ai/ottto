@@ -3277,18 +3277,27 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
 }
 
-/// The production-shaped 2,800-member revalidation backlog must not spend
-/// the byte budget before a new session or an appended, processed session.
-/// A persisted yield then gives the census a whole ordinary page even when
+/// [regress #789] A large revalidation backlog of owed old census re-reads
+/// must not spend the byte budget before fresh data. Each page's singleton
+/// budget is four fixture files, and the fresh bypass triggers once the
+/// pending bytes exceed it, so `MEMBERS` only has to dwarf a few pages.
+/// Two discovery arms share one warm fixture:
+/// (a) a new session and an appended, processed session (hinted). A
+/// persisted yield then gives the census a whole ordinary page even when
 /// fresh data continues to arrive. No upload fingerprints or totals change.
+/// (b) a new Codex day is a new date directory. Retained-roster refresh
+/// finds it with no watcher hint; its rollout must still reach the
+/// post-policy upload set within two ordinary pages.
 #[test]
-fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
+fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    const MEMBERS: usize = 300;
     const NEW: &str = "019fa111-2222-7333-8444-888888888888";
     const NEXT: &str = "019fa111-2222-7333-8444-888888888889";
-    let ids = (0..2800)
+    const NEW_DAY: &str = "019fa111-2222-7333-8444-888888888890";
+    let ids = (0..MEMBERS)
         .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
         .collect::<Vec<_>>();
     let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
@@ -3296,7 +3305,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     let fixture = ScanRoot::with_sessions(&sessions);
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 1);
     for id in &ids {
         index
             .files
@@ -3334,8 +3343,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         assert!(!scan.census_complete);
         let window = scan.census_window_end.clone();
         let old_pending = index.traversal.as_ref().unwrap().pending_candidates.len();
-        assert!(old_pending > 2700);
+        assert!(old_pending > MEMBERS - 100);
 
+        // Arm (a): hinted append plus a new session.
         let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
             "type": "session_meta", "payload": {"id": NEW}}));
         body.extend(token_line(1));
@@ -3389,13 +3399,48 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         );
         assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
-        let (_, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
+        let (next, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
+        index = next;
         let published = fresh
             .snapshots
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
+
+        // Pay the owed ordinary turn so arm (b) starts, like a cold backlog,
+        // with no freshness yield pending.
+        let (next, ordinary) = published_scan(&fixture, &cache, index, &collected_at(4), &[]);
+        index = next;
+        assert!(
+            ordinary.snapshots.is_empty(),
+            "unchanged-output revalidation"
+        );
+        assert!(!ordinary.census_complete);
+        assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > MEMBERS - 100);
+
+        // Arm (b): an unhinted new date directory.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_dated_rollout(&fixture, "2026/10/08", NEW_DAY);
+        cache.clear();
+        let mut published = BTreeSet::new();
+        for page in 1..=2 {
+            let (next, scan) =
+                published_scan(&fixture, &cache, index, &collected_at(4 + page), &[]);
+            index = next;
+            assert_eq!(scan.census_window_end, window, "same open generation");
+            assert!(!scan.census_complete);
+            published.extend(
+                scan.snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.clone()),
+            );
+            if published.contains(NEW_DAY) {
+                break;
+            }
+        }
+        assert_eq!(published, BTreeSet::from([NEW_DAY.to_string()]));
     });
 }
 
@@ -3540,78 +3585,6 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         .is_empty());
     assert_eq!(flags(&index, &new), Some((true, true, true)));
     assert_eq!(flags(&index, &old), Some((true, false, false)));
-}
-
-/// A new Codex day is a new date directory. Retained-roster refresh finds it
-/// with no watcher hint; its rollout must still reach the post-policy upload
-/// set within two ordinary pages instead of waiting behind 2,800 owed old
-/// census members.
-#[test]
-fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    const NEW: &str = "019fa111-2222-7333-8444-888888888890";
-    let ids = (0..2800)
-        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
-        .collect::<Vec<_>>();
-    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
-    sessions.push((SESSION, 4));
-    let fixture = ScanRoot::with_sessions(&sessions);
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
-    for id in &ids {
-        index
-            .files
-            .get_mut(&local_index_key(&fixture.file(id)))
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-    }
-    ensure_bounded_traversal(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        &mut index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-    );
-    advance_bounded_directory_traversal(
-        SnapshotSource::Codex,
-        &mut index,
-        BACKFILL_WINDOW_DAYS,
-        None,
-    );
-    let budget = fixture.len(SESSION) * 4;
-    cache.clear();
-    with_test_limits(2048, budget, 64, || {
-        let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
-        index = next;
-        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
-        assert!(!scan.census_complete);
-        let window = scan.census_window_end.clone();
-        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > 2700);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        write_dated_rollout(&fixture, "2026/10/08", NEW);
-        cache.clear();
-        let mut published = BTreeSet::new();
-        for page in 1..=2 {
-            let (next, scan) = published_scan(&fixture, &cache, index, &collected_at(page), &[]);
-            index = next;
-            assert_eq!(scan.census_window_end, window, "same open generation");
-            assert!(!scan.census_complete);
-            published.extend(
-                scan.snapshots
-                    .iter()
-                    .map(|item| item.source_session_id.clone()),
-            );
-            if published.contains(NEW) {
-                break;
-            }
-        }
-        assert_eq!(published, BTreeSet::from([NEW.to_string()]));
-    });
 }
 
 /// G1 carry: a census that closes while a re-read is still waiting hands it
