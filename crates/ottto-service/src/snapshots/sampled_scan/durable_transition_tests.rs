@@ -1180,10 +1180,12 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             "transition-codex-tier-v2"
         });
         let disk = Disk::new(&c);
-        let files = [
-            (c.root.join("rollout.jsonl"), ROOT),
-            (c.root.join("rollout-second.jsonl"), SECOND),
-        ];
+        // The session id in the file name is what lets each header's creator
+        // pair reach the row as account evidence.
+        let files = [ROOT, SECOND].map(|session| {
+            let name = format!("rollout-2026-10-27T07-00-00-{session}.jsonl");
+            (c.root.join(name), session)
+        });
         let grow = |text: &str| {
             for (path, session) in &files {
                 append(path, &text.replace(ROOT, session));
@@ -1201,19 +1203,21 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
         }
         grow(&(settings("2026-10-27T07:00:00Z", Some("priority")) + &codex_rows("turn-a", 10)));
         let scanner = disk.owner(source);
-        let (mut live, scan, modes) = {
+        // The record binds the cutover active at its commit.
+        let (mut live, mut prior) = {
             let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
-            other_page(&c, &scanner, source, ScanIndex::default())
+            let (mut live, scan, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (2, 0, 0));
+            live.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            let prior = disk.commit(&scanner.cache, source, &mut live);
+            (live, prior)
         };
-        assert_eq!(modes, (2, 0, 0));
-        live.record_accepted_snapshot_fingerprints(
-            &scan
-                .snapshots
-                .iter()
-                .map(|s| s.snapshot_fingerprint.clone())
-                .collect(),
-        );
-        let mut prior = disk.commit(&scanner.cache, source, &mut live);
         let _cutover = crate::snapshots::TestCutover::set(0);
         if legacy {
             // A real prior Legacy ACK keeps this file Legacy under the cutover.
