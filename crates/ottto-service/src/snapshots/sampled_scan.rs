@@ -2114,6 +2114,8 @@ pub(super) mod test_hooks {
     }
 
     /// Change test inputs after selection, before acquisition; restore nested hooks on unwind.
+    /// Its only caller is a native-layout restore test, which is macOS-only.
+    #[cfg(target_os = "macos")]
     pub(in crate::snapshots) fn with_after_selection<T>(
         hook: impl FnOnce(&mut super::super::ScanIndex, Option<super::super::CandidateParseReason>)
             + 'static,
