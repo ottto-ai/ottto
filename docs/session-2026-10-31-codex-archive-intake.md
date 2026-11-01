@@ -75,8 +75,8 @@ states. Correction retains the marker owner without creating header-less
 work. Receipt-waiting Pending is quiet only with its exact file incidence and
 before the saved deadline; an unaccepted expired body takes a paced native retry.
 Partial checkpoints retain the previous witness-bearing marker outside accepted safe keys, and
-reservation saves copy only their own new reservations. Header-less Reserve and
-marker creation by correctness/structural refusal are refused by the owner.
+reservation saves copy only their own new reservations. Header-less Reserve is
+refused; an absent-key refusal records deferred debt without minting a marker.
 
 Per-marker acquisition context drives correction even before source context promotion.
 A newly acquired archive under the active context is not correction debt. Physically
@@ -87,3 +87,5 @@ stays paced. Latched structural headers are never refreshed on an unchanged stam
 Bounded reconciliation owns marker deletion. A persisted deferred-population alarm
 count suppresses repeated alarms after reload; its additive positional slot follows
 archives and leaves historical slots unchanged. This count grants no read or ACK.
+The Claude-only typed store excludes both archive fields and refuses archive
+state on save, preserving its existing rows and field-presence metadata.

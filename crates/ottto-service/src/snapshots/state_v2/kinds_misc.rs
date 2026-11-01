@@ -321,6 +321,10 @@ pub(super) fn merge_cas_at(
 }
 
 pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut KindCx) -> Result<()> {
+    ensure!(
+        index.archives.is_empty() && index.archive_deferred_alarm_count == 0,
+        "state_v2_archive_state_unsupported"
+    );
     rows.raw(
         RowKey::Meta("schema_version".into()),
         &serde_json::to_vec(&index.schema_version)?,
@@ -363,10 +367,6 @@ pub(super) fn hydrate_txn(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    index.archives = std::mem::take(&mut index.archives)
-        .into_iter()
-        .map(|(key, a)| (key, a.checked()))
-        .collect();
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

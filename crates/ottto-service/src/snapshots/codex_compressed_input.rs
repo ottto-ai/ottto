@@ -3321,13 +3321,24 @@ pub(in crate::snapshots) mod tests {
                     .count(),
                 1
             );
-            let checkpoint = fixture(&serde_json::to_vec(&index).unwrap(), ".json");
+            let checkpoint = fixture(b"", ".json");
+            fs::remove_file(&checkpoint.0).unwrap();
+            index.save(&checkpoint.0).unwrap();
+            let wire: serde_json::Value =
+                serde_json::from_slice(&fs::read(&checkpoint.0).unwrap()).unwrap();
+            assert_eq!(wire["archive_deferred_alarm_count"], 1);
             let mut loaded = ScanIndex::load(&checkpoint.0).unwrap();
             loaded.archive_pass.deferred.insert(key);
             let (_, logs) =
                 crate::local_resource_diagnostics::capture(|| loaded.disclose_archive_debt());
             assert!(!logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
             assert_eq!(loaded.archive_owed_count(), 1);
+            loaded.archive_pass.deferred.clear();
+            loaded.disclose_archive_debt();
+            loaded.save(&checkpoint.0).unwrap();
+            let wire: serde_json::Value =
+                serde_json::from_slice(&fs::read(&checkpoint.0).unwrap()).unwrap();
+            assert!(wire.get("archive_deferred_alarm_count").is_none());
         }
     }
 
@@ -3378,10 +3389,13 @@ pub(in crate::snapshots) mod tests {
     }
     fn downgrade_seed(index: &mut ScanIndex, path: &Path) {
         let mut a = ArchiveEvidence::from_metadata(fs::metadata(path).unwrap()).unwrap();
+        a.owner = Some("synthetic-owner".into());
+        a.context = Some("synthetic-context".into());
         a.transition(ArchiveTransition::Correctness(
             CodexZstCause::FamilyUnproven,
         ));
         index.archives.insert(local_index_key(path), a);
+        index.archive_deferred_alarm_count = 1;
         index
             .files
             .entry(local_index_key(path))
@@ -3412,6 +3426,10 @@ pub(in crate::snapshots) mod tests {
         index.save(&out.join("branch.json")).unwrap();
         let mut control = serde_json::to_value(&index).unwrap();
         control.as_object_mut().unwrap().remove("archives");
+        control
+            .as_object_mut()
+            .unwrap()
+            .remove("archive_deferred_alarm_count");
         fs::write(
             out.join("as-today.json"),
             serde_json::to_vec(&control).unwrap(),

@@ -307,6 +307,7 @@ impl Serialize for ScanIndex {
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
         field!(archives, BTreeMap::is_empty);
+        field!(archive_deferred_alarm_count, is_zero_u64);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
