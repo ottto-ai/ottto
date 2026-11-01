@@ -622,6 +622,30 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
         Some(Some(false)),
         "the held root is excluded"
     );
+
+    // [money] Cold under state v2: the same graph on a live session keeps
+    // the family as a head (Unknown, not absent), and the terminal join,
+    // run after a whole-kind load, decides as the resident view does.
+    let dir = crate::test_scratch::canonical_private_dir("unchanged-proof-cold");
+    let (custody, cold) = state_v2::money_test_support::ColdSession::publish(&held, &dir);
+    assert!(cold.claude_usage_family_pending.family(&root).is_err());
+    let resident = state_v2::money_test_support::resident(&cold);
+    let joined = |index: &ScanIndex| {
+        let mut index = index.clone();
+        state_v2::load_usage(&mut index, None).unwrap();
+        unchanged(&index)
+    };
+    let release = |index: &ScanIndex| {
+        let mut index = index.clone();
+        index.claude_usage_authority_quarantine.remove(&root);
+        index
+    };
+    assert_eq!(joined(&release(&cold)), unchanged(&release(&resident)));
+    assert_eq!(joined(&release(&cold)), Some(Some(true)));
+    assert_eq!(joined(&cold), unchanged(&resident));
+    assert_eq!(joined(&cold), Some(Some(false)));
+    drop(custody);
+    let _ = fs::remove_dir_all(dir);
 }
 
 // A held key keeps its committed revision, its activity and accepted
