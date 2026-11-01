@@ -22,20 +22,20 @@
 //! that is not only added roots, a backfill or an upload-context change.
 use super::*;
 
-super::terminal_off_policy::local_switch!(
+super::local_switch::local_switch!(
     "claude_evidence_owed_enabled",
     marker_enables = true,
     test_default = false
 );
 #[cfg(test)]
 pub(super) struct EvidenceOwedForTest {
-    _switch: super::terminal_off_policy::ThreadSwitchForTest,
+    _switch: super::local_switch::ThreadSwitchForTest,
 }
 #[cfg(test)]
 impl EvidenceOwedForTest {
     pub(super) fn on() -> Self {
         Self {
-            _switch: super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true),
+            _switch: super::local_switch::ThreadSwitchForTest::set(&ENABLED, true),
         }
     }
 }
@@ -161,15 +161,6 @@ pub(super) fn context_change_owes(
             inputs.active_upload_context.as_deref(),
             inputs.backfill_window_days,
         ) == inputs.rootless
-}
-
-/// Under ON an unACKed head is a real invalidation; it keeps main's
-/// cleared fingerprint, never an owed one.
-pub(super) fn reoffer_clears(entry: &mut ScanIndexEntry) {
-    if entry.evidence_owed {
-        entry.evidence_owed = false;
-        entry.source_file_fingerprint.clear();
-    }
 }
 
 /// A reverted (held) entry keeps the working entry's re-arm debt: main clears

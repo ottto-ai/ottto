@@ -118,7 +118,6 @@ macro_rules! scan_index_fields {
             active_quarantine_witness => Misc (runtime none) [] side,
             active_upload_context_fingerprint => Files (runtime none) [] side,
             file_upload_context_enabled => Files (runtime none) [] side,
-            mixed_context_view => Files (runtime none) [] side,
             context_read_counts => Files (runtime none) [] side,
             active_effective_upload_body_witness_revision => Files (runtime none) [] side,
             active_effective_upload_body_witness_revision_monotone => Files (runtime none) [] side,
