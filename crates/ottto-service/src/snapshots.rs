@@ -3350,7 +3350,8 @@ pub(crate) fn begin_continuation_read_ranges_for_test() {
 }
 #[derive(Debug)]
 pub(crate) struct CodexContinuationEvidence {
-    inventory: codex_file_join::HeaderInventory, // Complete roster, including ledger paths.
+    // The page's roster; a minted ticket keeps only the paused job's share.
+    inventory: codex_file_join::HeaderInventory,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     codex: CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
@@ -3359,6 +3360,49 @@ crate::heap_layout_bound::fields!(CodexContinuationEvidence; inventory, ledgers,
 impl CodexContinuationEvidence {
     pub(crate) fn content_unchanged(&self) -> bool {
         self.inventory.content_unchanged()
+    }
+    /// The paused singleton's share of its page's evidence: the rows its
+    /// path's reduction fingerprint reads, its owner's headers and the parent
+    /// ledgers its read can still look up (all while its header is undecided,
+    /// none after: only the header's decision reads them). Traces stay whole
+    /// for turns not yet read. None, counted `not_mintable`, unless the share
+    /// gives the resume check the full fingerprint, so a continuation never
+    /// fails a check its page's evidence would pass.
+    fn for_paused_job(
+        mut self,
+        cache: Option<&sampled_scan::SharedCache>,
+        ticket: &sampled_scan::codex_cursor::CodexCursorTicket,
+    ) -> Option<Self> {
+        let job = cache.and_then(|cache| cache.paused_singleton(ticket));
+        let narrowed = job.and_then(|(path, owner, decided)| {
+            let codex = self.codex.narrowed_to(&path);
+            #[cfg(test)]
+            let codex = {
+                let mut codex = codex;
+                sampled_scan::codex_cursor::tests::constrain_narrowed(&mut codex, &path);
+                codex
+            };
+            if codex.path_reduction_fingerprint(&path)
+                != self.codex.path_reduction_fingerprint(&path)
+            {
+                return None;
+            }
+            self.inventory.keep_job_share(|header| {
+                Some(&header.owner) == owner.as_ref() || header.candidate.path == path
+            });
+            Some(Self {
+                inventory: self.inventory,
+                ledgers: self
+                    .ledgers
+                    .map(|whole| if decided { Arc::default() } else { whole }),
+                codex,
+                traces: self.traces,
+            })
+        });
+        if narrowed.is_none() {
+            crate::local_resource_diagnostics::codex_continuation_mint("not_mintable");
+        }
+        narrowed
     }
 }
 /// Continuation excludes G7, side-due work, the proof hook and the sweep.
@@ -31422,14 +31466,21 @@ impl OwnedSourceScan {
                         .as_mut()
                         .map(|t| t.counts.caps.drain(source.api_slug()))
                         .unwrap_or_default();
-                    let continuation_evidence = codex_join_inventory.map(|inventory| {
-                        Arc::new(Mutex::new(Some(CodexContinuationEvidence {
+                    let continuation_evidence = codex_join_inventory
+                        .map(|inventory| CodexContinuationEvidence {
                             inventory,
                             ledgers: codex_parent_ownership_ledgers,
                             codex: codex_title_metadata,
                             traces: codex_turn_traces,
-                        })))
-                    });
+                        })
+                        .and_then(|evidence| match continuation_ticket.as_ref() {
+                            Some(ticket) => evidence.for_paused_job(
+                                sampling.as_ref().map(|context| context.cache.as_ref()),
+                                ticket,
+                            ),
+                            None => Some(evidence),
+                        })
+                        .map(|evidence| Arc::new(Mutex::new(Some(evidence))));
                     return Ok(OwnedSourceScanStep::Complete {
                         index: index_storage,
                         terminal_native_traversal: None,
@@ -32239,6 +32290,14 @@ impl OwnedSourceScan {
                         },
                     );
                 }
+                let continuation_evidence = continuation_evidence
+                    .zip(continuation_ticket.as_ref())
+                    .and_then(|(evidence, ticket)| {
+                        evidence.for_paused_job(
+                            sampling.as_ref().map(|context| context.cache.as_ref()),
+                            ticket,
+                        )
+                    });
                 let scan = SourceScanResult {
                     census_status,
                     cap_counts: counts.caps,
@@ -40541,6 +40600,86 @@ impl CodexTitleMetadata {
             depth += 1;
         }
         Some((parent, root, depth))
+    }
+
+    /// The rows `path_reduction_fingerprint(path)` reads: the path's identity
+    /// candidates, every spawn edge reachable from them, one child edge each,
+    /// every home's sidecar roots and all census flags. Diagnostics are not
+    /// carried. Callers compare the two fingerprints before using it.
+    fn narrowed_to(&self, path: &Path) -> Self {
+        let ids = codex_session_id_candidates_from_path(path)
+            .into_iter()
+            .flat_map(|id| [resolve_codex_identity(&id), id])
+            .collect::<BTreeSet<_>>();
+        fn rows<V: Clone>(
+            map: &BTreeMap<String, V>,
+            ids: &BTreeSet<String>,
+        ) -> BTreeMap<String, V> {
+            ids.iter()
+                .filter_map(|id| map.get_key_value(id))
+                .map(|(id, row)| (id.clone(), row.clone()))
+                .collect()
+        }
+        let mut edges = BTreeMap::new();
+        for id in &ids {
+            if let Some((child, parent)) =
+                self.spawn_parents.iter().find(|(_, parent)| *parent == id)
+            {
+                edges.insert(child.clone(), parent.clone());
+            }
+            let mut at = id;
+            while let Some((child, parent)) = self.spawn_parents.get_key_value(at) {
+                if edges.insert(child.clone(), parent.clone()).is_some() {
+                    break;
+                }
+                at = parent;
+            }
+        }
+        let nodes = ids
+            .iter()
+            .chain(edges.keys())
+            .chain(edges.values())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let sidecar = |sidecar: &codex_root_copies::RootSidecar| codex_root_copies::RootSidecar {
+            threads: rows(&sidecar.threads, &ids),
+            extents: rows(&sidecar.extents, &ids),
+        };
+        Self {
+            local_diagnostics: Default::default(),
+            titles: rows(&self.titles, &ids),
+            state_threads: rows(&self.state_threads, &ids),
+            rollout_extents: rows(&self.rollout_extents, &ids),
+            root_sidecars: self
+                .root_sidecars
+                .iter()
+                .map(|(root, home)| (root.clone(), sidecar(home)))
+                .collect(),
+            state_created_threads: self
+                .state_created_threads
+                .intersection(&ids)
+                .cloned()
+                .collect(),
+            spawn_parent_conflicts: self
+                .spawn_parent_conflicts
+                .intersection(&nodes)
+                .cloned()
+                .collect(),
+            spawn_parents: edges,
+            identity_conflicts: self
+                .identity_conflicts
+                .intersection(&ids)
+                .cloned()
+                .collect(),
+            state_census_incomplete: self.state_census_incomplete,
+            sidecar_census_incomplete: self.sidecar_census_incomplete,
+            state_census_unscoped_incomplete: self.state_census_unscoped_incomplete,
+            sidecar_census_unscoped_incomplete: self.sidecar_census_unscoped_incomplete,
+            created_thread_census_failed_homes: self.created_thread_census_failed_homes.clone(),
+            created_thread_scoped: rows(&self.created_thread_scoped, &ids),
+            legacy_sidecar_fingerprint: self.legacy_sidecar_fingerprint.clone(),
+            legacy_config_file_present: self.legacy_config_file_present,
+        }
     }
 
     #[cfg(test)]

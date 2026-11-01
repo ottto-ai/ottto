@@ -5891,7 +5891,8 @@ struct SourcePreparation {
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
     cache_observations_enabled: bool,
-    scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
+    /// `None` only on a continuation page's preparation, which never finishes.
+    scan_agent_status_collection: Option<std::sync::Arc<AgentStatusCollection>>,
     attribution_context: Option<SessionAttributionContext>,
     upload_policy: SnapshotUploadPolicy,
     upload_destination_namespace: String,
@@ -7116,7 +7117,7 @@ fn prepare_sync_source_inner(
         activity_hint,
         receipt_window_days,
         cache_observations_enabled,
-        scan_agent_status_collection,
+        scan_agent_status_collection: Some(scan_agent_status_collection),
         attribution_context,
         upload_policy,
         upload_destination_namespace,
@@ -7149,7 +7150,8 @@ struct ContinuationInputs {
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
     cache_observations_enabled: bool,
-    scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
+    /// The one status input a continuation page reads: its finish never runs.
+    codex_scan_homes: Vec<PathBuf>,
     attribution_context: Option<SessionAttributionContext>,
     upload_policy: SnapshotUploadPolicy,
     upload_destination_namespace: String,
@@ -7162,7 +7164,7 @@ struct ContinuationInputs {
 
 crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, cache_observations_enabled,
-    scan_agent_status_collection, attribution_context, upload_policy,
+    codex_scan_homes, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
 
 impl ContinuationInputs {
@@ -7217,9 +7219,11 @@ fn take_continuation_inputs(
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
         cache_observations_enabled: preparation.cache_observations_enabled,
-        scan_agent_status_collection: std::sync::Arc::clone(
-            &preparation.scan_agent_status_collection,
-        ),
+        codex_scan_homes: preparation
+            .scan_agent_status_collection
+            .as_ref()
+            .map(|collection| collection.codex_scan_homes.clone())
+            .unwrap_or_default(),
         attribution_context: preparation.attribution_context.take(),
         upload_policy: preparation.upload_policy,
         upload_destination_namespace: preparation.upload_destination_namespace.clone(),
@@ -7469,11 +7473,7 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
-    let roots = crate::snapshot_roots::scan_roots(
-        source,
-        home,
-        &inputs.scan_agent_status_collection.codex_scan_homes,
-    )?;
+    let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
@@ -7512,7 +7512,7 @@ fn prepare_continuation_source(
         activity_hint: inputs.activity_hint.clone(),
         receipt_window_days: inputs.receipt_window_days,
         cache_observations_enabled: inputs.cache_observations_enabled,
-        scan_agent_status_collection: std::sync::Arc::clone(&inputs.scan_agent_status_collection),
+        scan_agent_status_collection: None,
         attribution_context: inputs.attribution_context.take(),
         upload_policy: inputs.upload_policy,
         upload_destination_namespace: inputs.upload_destination_namespace.clone(),
@@ -7659,6 +7659,8 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let scan_agent_status_collection =
+        scan_agent_status_collection.context("a continuation preparation reached its finish")?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
         activity_hint.max_snapshot_item_bytes,
     );
