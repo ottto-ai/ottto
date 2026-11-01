@@ -1341,10 +1341,14 @@ mod application_cases {
             // Main's hydration rule accepts only its original field names.
             assert!(presence.keys().all(|name| fields.contains(&name.as_str())));
             let (restored, mut actual) = ClaudeMapper.hydrate_context(&mut db).unwrap();
-            let actual = kinds::baseline(&restored, &mut actual).unwrap().rows;
             let mut control = KindCx::default();
             control.binding = Some(c.binding());
             control.presence = expected;
+            // Baseline enumeration consumes the hydrated ordinal inventory;
+            // both projections refer to this same committed store's windows.
+            control.account_ids = actual.account_ids.clone();
+            control.account_controls = actual.account_controls;
+            let actual = kinds::baseline(&restored, &mut actual).unwrap().rows;
             let mut control_index = index.clone();
             control_index.generation += 1;
             let control = kinds::baseline(&control_index, &mut control).unwrap().rows;

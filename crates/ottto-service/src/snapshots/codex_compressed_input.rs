@@ -1567,7 +1567,6 @@ pub(in crate::snapshots) mod tests {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(cache, Scope("archive-intake-test".into()));
         scan.identified_candidates = candidates;
@@ -2966,7 +2965,6 @@ pub(in crate::snapshots) mod tests {
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(
                 Arc::new(sampled_scan::SharedCache::default()),
@@ -3258,7 +3256,6 @@ pub(in crate::snapshots) mod tests {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             Arc::new(sampled_scan::SharedCache::default()),
@@ -3495,7 +3492,6 @@ pub(in crate::snapshots) mod tests {
                 false,
                 None,
                 &[],
-                false,
                 false,
             );
             scan.index.archive_pass.gates =

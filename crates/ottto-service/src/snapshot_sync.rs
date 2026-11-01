@@ -13173,7 +13173,7 @@ mod tests {
             activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,
                 "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
                 "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
-            receipt_window_days: 7, context_curve_enabled: true, cache_observations_enabled: false,
+            receipt_window_days: 7, cache_observations_enabled: false,
             scan_agent_status_collection: Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() }),
             attribution_context: None, upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: destination.clone(), receipt_client: client.clone(),
@@ -13209,20 +13209,19 @@ mod tests {
         );
         assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_some());
         index = ScanIndex::load(&path).unwrap();
-        assert_eq!(
-            serde_json::to_value(&index).unwrap()["archives"]
-                .as_object()
-                .unwrap()
-                .len(),
-            expected_markers
-        );
+        match serde_json::to_value(&index).unwrap().get("archives") {
+            Some(markers) => assert_eq!(markers.as_object().unwrap().len(), expected_markers),
+            None => assert_eq!(expected_markers, 0, "empty archive map is omitted"),
+        }
         let fp = "a".repeat(64);
         let mut progress =
             SnapshotUploadProgress::load(&progress_path, &destination, test_quarantine_witness())
                 .unwrap();
-        for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-            progress.quarantine([fp.as_str()]);
-        }
+        progress.quarantine([fp.as_str()]);
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
         progress
             .quarantined_fingerprints
             .get_mut(&fp)
