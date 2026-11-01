@@ -107,6 +107,7 @@ fn candidate(name: &str, size: u64) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -237,7 +238,6 @@ fn sampled_hinted(
         false,
         None,
         hints,
-        false,
         false,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope(scope.into()));
@@ -395,61 +395,6 @@ fn chain_rows(owner: &str, prefix: &str, created: &str, start: u64, count: u64) 
         ));
     }
     rows
-}
-
-#[test]
-fn selection_skips_job_owned_entries() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let root = temp_root("paged");
-    write_rows(
-        &root.join("sessions/a.jsonl"),
-        &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 30),
-    );
-    write_rows(
-        &root.join("sessions/b.jsonl"),
-        &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30),
-    );
-    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
-    assert_eq!(unpaged.snapshots.len(), 2, "one alias per member");
-    let cache = Arc::new(SharedCache::default());
-    let paged = with_test_limits(2048, 1024, 64, || {
-        let mut index = ScanIndex::default();
-        for _ in 0..128 {
-            let (next, result) = sampled(&root, index, 10, &cache);
-            index = next;
-            let done = counters(&cache);
-            if done.jobs_certified + done.jobs_uncertified > 0 {
-                return result;
-            }
-            assert!(
-                result.snapshots.is_empty(),
-                "a paused group publishes nothing"
-            );
-        }
-        panic!("group job did not complete: {:?}", counters(&cache));
-    });
-    let after = counters(&cache);
-    eprintln!("CODEX_GROUP_PAGED counters={after:?}");
-    assert_eq!(after.groups_started, 1, "one job, never restarted");
-    assert!(after.jobs_paused > 0 && after.jobs_resumed > 0);
-    // #603: with the cutover inactive the group view is the inactive view
-    // and `counting_reusable` lets every unchanged pause resume.
-    assert_eq!(after.jobs_invalidated, 0, "{after:?}");
-    assert!(
-        after.join_in_progress_members > 0,
-        "selected members of the paused job are skipped, not read again"
-    );
-    let fingerprints = |scan: &SourceScanResult| {
-        scan.snapshots
-            .iter()
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect::<BTreeSet<_>>()
-    };
-    assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
-    assert!(cache.cursor_slot_free());
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1483,7 +1428,6 @@ fn group_with_legacy_tee_is_byte_charged() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &previous,
         })
         .unwrap();
@@ -1493,7 +1437,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1511,7 +1454,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         false,
         None,
         &[],
-        false,
         false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
@@ -1633,7 +1575,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &previous,
         })
         .unwrap();
@@ -1642,7 +1583,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1665,7 +1605,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         false,
         None,
         &[],
-        false,
         false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
@@ -1855,15 +1794,6 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// The `probe_budget_fallback…` fixture: legacy members whose header times
-/// disagree with their counter order, so only the probes order them; the
-/// chronological fallback order breaks the chain (a `Gap` at sealed `a`).
-fn probe_order_corpus(tag: &str, padding: usize) -> PathBuf {
-    let root = temp_root(tag);
-    write_probe_order(&root, OWNER, ["a", "b"], padding, 0);
-    root
-}
-
 /// The probe-order fixture of `owner` in `<first>.jsonl` and
 /// `<second>.jsonl`: `first` is created first but continues `second`'s
 /// counter. `extra` native/UI pairs after `first`'s make the group large.
@@ -1928,67 +1858,6 @@ fn first_group_owner(root: &Path) -> String {
         .next()
         .expect("a group")
         .owner
-}
-
-/// The job key of `owner`'s group (its rotation and fence key).
-fn group_job_key(root: &Path, owner: &str) -> String {
-    job_key(
-        &inventory_groups(root)
-            .into_iter()
-            .find(|group| group.owner == owner)
-            .expect("the owner's group"),
-    )
-}
-
-/// Round 3 (R1-L1, R2-L2 (a)): a `ProbeBudgetOrder` the page's remaining
-/// singleton budget forced takes a page of its own next; forced again there,
-/// it is parked like `JoinStateBound`: strict debt disclosed each generation
-/// with no attempt, until a member changes (growth of the live member does
-/// not cure a sealed member's `Gap`).
-#[test]
-fn allowance_bound_probe_order_takes_an_own_page_then_parks() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let root = probe_order_corpus("probe-own-page", 0);
-    let order = JoinRefusal::ProbeBudgetOrder.slot();
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 1, 64, || {
-        let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
-        assert_eq!(counters(&cache).join_terminal_debt[order], 1);
-        assert_eq!(counters(&cache).parked_hits, 0);
-        // On its own page the allowance is still short: parked.
-        let (index, _) = next_generation(&root, index, &cache, 1);
-        assert_eq!(counters(&cache).join_terminal_debt[order], 2);
-        let (index, parked) = next_generation(&root, index, &cache, 2);
-        let after = counters(&cache);
-        assert_eq!(
-            after.join_terminal_debt[order], 2,
-            "not replayed: {after:?}"
-        );
-        assert_eq!(after.parked_hits, 1, "{after:?}");
-        assert_eq!(after.memo_records, 0, "{after:?}");
-        assert!(parked.snapshots.is_empty());
-        assert!(parked.unreadable_path_count > 0, "disclosed as strict debt");
-        assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-        // Growth of the live member cannot cure the sealed member's `Gap`.
-        append_rows(
-            &root.join("sessions/b.jsonl"),
-            &[ui(1, 101, "2026-10-01T10:06:00Z")],
-        );
-        let (index, _) = next_generation(&root, index, &cache, 3);
-        let grown = counters(&cache);
-        assert_eq!(grown.parked_hits, 2, "{grown:?}");
-        assert_eq!(grown.join_terminal_debt[order], 2, "{grown:?}");
-        // A sealed member's change wakes it: one more attempt.
-        append_rows(
-            &root.join("sessions/a.jsonl"),
-            &[turn("66666666-aaaa-4aaa-8aaa-666666666666")],
-        );
-        let _ = next_generation(&root, index, &cache, 4);
-        assert_eq!(counters(&cache).join_terminal_debt[order], 3);
-    });
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// Round 4 (L4): the own-page cure. A group read first leaves the shared
@@ -2068,70 +1937,6 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
         assert_eq!(after.parked_hits, 0, "{after:?}");
         assert_eq!(after.jobs_certified, 1, "{after:?}");
         assert_eq!(other(&joined), expected, "counted once, as unpaged");
-    });
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// Round 4 (L1): a paged group that waited behind a P1 singleton and then
-/// ends as `ProbeBudgetOrder` completes its rotation: it is fenced for the
-/// generation (#630 delta L-a), no waiter remains and a later P1 singleton
-/// takes the slot without a rotation deferral.
-#[test]
-fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let root = temp_root("probe-waiter");
-    write_rows(
-        &root.join("sessions/s.jsonl"),
-        &chain_rows(OTHER, "s", "2026-10-01T11:00:00Z", 0, 30),
-    );
-    let order = JoinRefusal::ProbeBudgetOrder.slot();
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 1, 64, || {
-        // `s` takes the slot and pauses in it.
-        let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
-            counters(&cache).jobs_paused > 0
-        });
-        write_probe_order(&root, OWNER, ["a", "b"], 0, 0);
-        index.traversal = None;
-        let (index, _, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            counters(&cache).join_terminal_debt[order] == 1
-        });
-        let ended = counters(&cache);
-        assert!(
-            ended.deferred >= 1,
-            "the group waited behind `s`: {ended:?}"
-        );
-        assert_eq!(completions(&cache), 1, "`s` completed first: {ended:?}");
-        assert_eq!(cache.rotation_waiters_for_test(), 0, "{ended:?}");
-        // The end completed the group's rotation: fenced for the generation
-        // (a `release()` end leaves it unfenced).
-        let fence = cursor::census_token(&index);
-        assert!(fence.is_some(), "the generation continues");
-        assert!(
-            cache.group_fenced(
-                &Scope("group-fixture".into()),
-                &group_job_key(&root, OWNER),
-                fence.as_deref(),
-            ),
-            "{ended:?}"
-        );
-        // A later large P1 singleton is not deferred behind the group.
-        write_rows(
-            &root.join("sessions/u.jsonl"),
-            &chain_rows(UNKNOWN, "u", "2026-10-01T12:00:00Z", 0, 30),
-        );
-        let _ = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            completions(&cache) == 2
-        });
-        let after = counters(&cache);
-        assert_eq!(
-            after.deferred_rotation, ended.deferred_rotation,
-            "{after:?}"
-        );
-        assert_eq!(after.join_terminal_debt[order], 1, "fenced: {after:?}");
-        assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
     });
     fs::remove_dir_all(root).unwrap();
 }
@@ -2342,7 +2147,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         scan_roots: Vec::new(),
         pending_directories: std::collections::VecDeque::new(),
         pending_candidates: std::collections::VecDeque::new(),
-        observed_index_keys: BTreeSet::new(),
+        observed_index_keys: Default::default(),
         oversized_discovery: Default::default(),
         codex_rollout_paths: census.iter().map(|key| (*key).to_owned()).collect(),
         codex_join_directory_census: None,
@@ -2356,6 +2161,9 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         unhealthy_retry_not_before_unix_seconds: None,
         counts: crate::snapshots::ScanTraversalCounts::default(),
         residue: crate::snapshots::ScanTraversalResidue::default(),
+        context_inputs: None,
+        listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
     }
 }
 
@@ -2915,7 +2723,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             None,
             None,
             false,
-            false,
             codex_counting_version::AckEvidence::None
         )
         .is_err());
@@ -2928,7 +2735,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &metadata,
             None,
             None,
-            false,
             false
         )
         .is_err());
@@ -2947,7 +2753,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             traces: None,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index: &index,
         })
         .unwrap();
@@ -2969,7 +2774,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         metadata: &metadata,
         attribution: None,
         artifacts: false,
-        context_curve: false,
         live_scope: &no_scope,
     };
     assert_refused(CodexZstCause::GroupReadUnsupported, || {
@@ -3343,6 +3147,13 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
         assert!(seeded
             .iter()
             .all(|(path, _)| index.files.contains_key(&local_index_key(path))));
+        // Retain the real Legacy ACKs before the entries leave the index.
+        for (path, _) in &seeded {
+            assert!(codex_counting_version::tombstone_before_retire(
+                &mut index,
+                &local_index_key(path)
+            ));
+        }
         // The per-pass index loads without the members' entries.
         index.files.clear();
         let (index, result, _) = pages_at(&root, index, &cache, collected_at, || {

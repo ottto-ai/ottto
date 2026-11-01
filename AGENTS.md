@@ -3,6 +3,7 @@
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md). The root Cargo workspace owns
   runtime/CLI/protocol; `crates/Cargo.toml` owns connector SDK/testkit. Check both
   only when the change affects both.
+- Daemon (`crates/ottto-service`) work: read [its ARCHITECTURE.md](crates/ottto-service/ARCHITECTURE.md) first.
 - Make small, cohesive changes. Read callers and state ownership first; separate
   mechanical refactoring from behavior changes. Use private modules and narrow
   interfaces; preserve public paths. File length alone does not justify a split.
@@ -33,33 +34,42 @@
   share one machine. For compile and test feedback, push a branch and run the
   free Linux lane on it: `gh workflow run linux-tests.yml --ref <branch>`, then
   read `Rust tests (Linux)`. Pull-request runs use no macOS runner either: the
-  macOS `Rust contracts` job runs only in the merge queue, on `main` pushes and
-  on manual dispatch. Build locally only when
+  macOS `Rust contracts` job runs only in the merge queue, on manual dispatch and
+  in the daily `main` cache refresh. Build locally only when
   no CI path works: one changed crate, one build at a time, on an idle machine,
   and say why in your report. Linux unit-test builds also run the heap-layout
   (`layout_supported()`) paths; macOS APIs, tools and `cfg(target_os = "macos")`
   tests still run only on the Mac. A Linux green is fast feedback, not Mac evidence;
   the macOS `Rust contracts` job in the merge queue stays the merge gate.
-- CI runs on pull requests. Push to the PR branch; do not also start Public CI by
-  hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
+- CI runs on ready pull requests. Draft pushes start no jobs; marking the PR
+  ready (the merge guard does) starts both workflows. For feedback on a draft,
+  dispatch `linux-tests.yml` on its branch. Do not also start Public CI by
+  hand on a branch whose ready PR is open and mergeable. GitHub starts no pull-request
   run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
   onto `main` and push. Start Public CI by hand (`workflow_dispatch`) only for a
   `main` commit with no push run, a branch with no PR (for example a red-test
   proof), a dispatch-only job the branch adds, or macOS evidence before you
   enqueue a change with macOS-only risk (native code, clippy `-D warnings`,
-  macOS-only tests): `gh workflow run ci.yml --ref <branch>`; one run per head, and never
-  restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
+  macOS-only tests, `scripts/mac_batch.py detect` exit 10): `gh workflow run ci.yml
+  --ref <branch>`. Every macOS dispatch (full, `rust_test_filter` partial or
+  `money_equivalence`) runs once per head and only after `Rust tests (Linux)` is
+  green on that head (the `Linux green first` job fails the dispatch otherwise);
+  never restart a run because it is queued. A `linux-tests.yml` dispatch on a head
+  that already passed or is still running skips its jobs. Do not put `[skip ci]` in PR commits. Merge
   only after a green pull-request run on the final head.
 - Several PRs waiting for macOS evidence share one run:
   `scripts/mac_batch.py plan <pr> <pr>...` merges their heads onto `main` in
   memory and names conflicting pairs; `dispatch --gate <script>` pushes a
   temporary `mac-batch/*` branch and starts one `ci.yml` run after the gate says
-  go; `report --run <id> --delete-branch` maps failing tests to PRs. `detect <pr>`
+  go; `report --run <id> --delete-branch` maps failing tests to PRs, and also
+  reads a merge-queue run (a train PR's members are its `train: merge #<n>`
+  commits). `detect <pr>`
   tells from the diff alone whether a PR needs macOS evidence (exit 10).
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
-  ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
-  commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency
-  review`; macOS `Rust contracts` is skipped on pull requests), and enqueues
+  ready, waits until the pull-request checks on the PR's head commit pass
+  (`ci.yml`: `Public surface checks`, `Rust advisory audit`, `Dependency review`,
+  with macOS `Rust contracts` skipped on pull requests; `linux-tests.yml`: `Rust
+  tests (Linux)`, `Rust format (Linux)`), and enqueues
   exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
   checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
   not evidence, and no Linux job stands in for the macOS `Rust contracts` job.

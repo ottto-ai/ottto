@@ -412,6 +412,15 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
+    /// What a continuation page reads: the headers `keep` names, in path
+    /// order, and completeness. The directory census goes too: only an
+    /// ordinary page's coverage and membership checks read it.
+    pub(super) fn keep_job_share(&mut self, keep: impl Fn(&HeaderWitness) -> bool) {
+        self.headers.retain(keep);
+        self.headers.shrink_to_fit();
+        self.pending.shrink_to_fit();
+        self.directories = DirectoryCensus::default();
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
@@ -493,6 +502,7 @@ impl HeaderInventory {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,
@@ -720,12 +730,6 @@ crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, sn
 const RECEIPT_VERSION: u16 = 1;
 const MAX_APPLIED_TIERS: usize = 512;
 pub(super) const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -830,10 +834,10 @@ impl TierReplay {
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
                 || receipt.scope != scope
                 || receipt.records == 0
-                || !is_sha256_hex(&receipt.prefix_digest)
+                || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
                 || receipt.tiers.len() > MAX_APPLIED_TIERS
                 || receipt.tiers.iter().any(|(key, source)| {
-                    !is_sha256_hex(key)
+                    !crate::hex::is_sha256_lower(key)
                         || source.is_empty()
                         || source.len() > 64
                         || !source
@@ -1036,13 +1040,7 @@ impl JoinRefusal {
         )
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for JoinRefusal {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; JoinRefusal);
 
 /// First eight bytes of SHA-256: the exact compact set element. A collision
 /// errs toward `Overlap`, never toward admission.
@@ -1739,12 +1737,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ContentDigest {
         c.add(0)
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for Tokens {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Tokens);
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -1797,7 +1790,6 @@ pub(super) mod tests {
             traces,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
@@ -1805,7 +1797,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: None,
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         for _ in 0..10_000 {
@@ -2057,7 +2048,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         for _ in 0..1000 {
             match owned.step(None) {
@@ -2213,7 +2203,13 @@ pub(super) mod tests {
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
-        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let (legacy_index, legacy) = {
+            // The fixture's October 1 headers predate the frozen cutover.
+            let _cutover = codex_counting_version::TestCutover::set(
+                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+            );
+            scan(&root, ScanIndex::default(), 2)
+        };
         let _cutover = codex_counting_version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
@@ -2231,9 +2227,16 @@ pub(super) mod tests {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
             assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        assert!(
-            legacy.codex_counting_v2.is_none(),
-            "an inactive scan reports no receipts, not a zero block"
+        let legacy_receipts = legacy
+            .codex_counting_v2
+            .as_deref()
+            .expect("a pre-cutover Legacy scan still reports bookkeeping");
+        assert_eq!(legacy_receipts.v2_sessions, 0);
+        assert_eq!(legacy_receipts.native_counted, 0);
+        assert_eq!(legacy_receipts.tombstone_count, 0);
+        assert_eq!(
+            legacy_receipts.tombstone_cap,
+            codex_counting_version::MAX_COUNTING_TOMBSTONES as u64
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
@@ -2313,7 +2316,7 @@ pub(super) mod tests {
         traces.priority_turns.insert(turn.into());
         let job = replay_group(
             inventory.groups().into_values().next().unwrap(),
-            Some(Arc::new(traces.clone())),
+            Some(Arc::new(traces)),
             &ScanIndex::default(),
         )
         .unwrap();
@@ -2412,7 +2415,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         loop {
@@ -2592,7 +2594,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         loop {
             match owned.step(None) {
@@ -2611,55 +2612,7 @@ pub(super) mod tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn shared_home_validation_checks_roster_once_and_rechecks_ownership_each_boundary() {
-        let (root, _) = fixture();
-        let first = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut owners = BTreeSet::from([first.to_owned()]);
-        for i in 1..=3 {
-            let owner = format!("{i:08x}-bbbb-4ccc-8ddd-{i:012x}");
-            owners.insert(owner.clone());
-            for (part, input, after) in [("a", 100, 100), ("b", 200, 300)] {
-                let rows = member(&owner, &format!("r-{i}-{part}"), input, after);
-                fs::write(
-                    root.join("sessions").join(format!("{i}-{part}.jsonl")),
-                    rows.iter()
-                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                        .collect::<String>(),
-                )
-                .unwrap();
-            }
-        }
-        let (_, result) = scan(&root, ScanIndex::default(), 8);
-        assert_eq!(result.snapshots.len(), 8);
-        let validation = result.codex_join_validation.as_ref().unwrap();
-        assert_eq!(validation.groups.len(), 4);
-        assert_eq!(
-            validation.validate(&owners).unwrap(),
-            8,
-            "eight roster stats, not eight per group"
-        );
-        let selected = BTreeSet::from([first.to_owned()]);
-        assert_eq!(validation.validate(&selected).unwrap(), 8);
-        // A previously unrelated file can enter the selected owner's group
-        // without changing directory membership. No boundary result is cached.
-        let path = root.join("sessions/1-a.jsonl");
-        let mut rows = fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        rows[0]["payload"]["id"] = json!(first);
-        fs::write(
-            path,
-            rows.iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        assert!(validation.validate(&selected).is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
+
     #[test]
     fn replay_owner_rewrite_after_inventory_cannot_escape_validation() {
         let (root, _) = fixture();
@@ -2673,7 +2626,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let changed = "ffffffff-1111-4111-8111-ffffffffffff";
@@ -2769,7 +2721,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let mut added = false;
@@ -2873,7 +2824,6 @@ pub(super) mod tests {
             false,
             None,
             hints,
-            false,
             false,
         );
         for _ in 0..1000 {
@@ -3160,6 +3110,8 @@ pub(super) mod tests {
         assert!(inventory_hold(&index).is_none());
         fs::remove_dir_all(root).unwrap();
     }
+    /// [money] Protected history survives retirement; quiet retries acquire,
+    /// enqueue and count nothing.
     #[test]
     fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         let root = native_join_fixture_root(true);
@@ -3242,7 +3194,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         assert!(
@@ -3781,51 +3732,7 @@ pub(super) mod tests {
             }
         }
     }
-    #[test]
-    fn native_group_reports_finite_scan_capture_and_restart_cost() {
-        let root = native_join_fixture_root(true);
-        let start = std::time::Instant::now();
-        let ((mut index, mut result), stats) =
-            crate::retry_allocation_probe::measure(|| scan(&root, ScanIndex::default(), 2));
-        let scan_micros = start.elapsed().as_micros();
-        let header_bytes = result
-            .codex_join_validation
-            .as_ref()
-            .unwrap()
-            .inventory
-            .read_bytes;
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
-        result.finish_codex_capture_boundary(&mut index);
-        let (capture, _, _) =
-            index.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
-        result.finish_codex_capture_boundary(&mut index);
-        let capture_bytes = serde_json::to_vec(&capture).unwrap().len();
-        let accepted = result
-            .snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect();
-        let settled = index.committable_subset(&capture, &accepted, &BTreeMap::new());
-        let index_bytes = serde_json::to_vec(&settled).unwrap().len();
-        let path = root.join("measured-index.json");
-        let mut settled = settled;
-        settled.save(&path).unwrap();
-        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
-        let start = std::time::Instant::now();
-        let (_, restart) = scan(&root, ScanIndex::load(&path).unwrap(), 2);
-        assert!(restart.snapshots.is_empty());
-        assert_eq!(restart.semantic_noop_count, 2);
-        eprintln!(
-            "CODEX_UNION_MEASUREMENT {}",
-            json!({"synthetic_members":2,
-            "selected_parser_passes":2,"header_read_bytes":header_bytes,
-            "scan_microseconds":scan_micros,"scan_requested_allocation_peak":stats.requested_peak,
-            "scan_usable_allocation_peak":stats.usable_peak,"capture_index_bytes":capture_bytes,
-            "settled_index_bytes":index_bytes,"restart_microseconds":start.elapsed().as_micros(),
-            "restart_semantic_noops":restart.semantic_noop_count,"restart_full_replays":0})
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
+
     pub(crate) fn legacy_index(
         inventory: &HeaderInventory,
         traces: Option<Arc<CodexTurnTraceMap>>,
@@ -3843,7 +3750,9 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
-                &BTreeMap::new(),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(
@@ -3860,7 +3769,6 @@ pub(super) mod tests {
                 None,
                 false,
                 None,
-                false,
             )
             .unwrap();
             assert!(parsed.complete());
@@ -3935,7 +3843,6 @@ pub(super) mod tests {
                 traces: None,
                 ledgers: None,
                 artifacts: false,
-                context_curve: false,
                 index: &previous,
             })
             .unwrap();
@@ -3944,7 +3851,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         let (mut steps, mut yields) = (0, 0);

@@ -170,7 +170,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             None,
             &[],
             false,
-            true,
         );
         let hint: crate::snapshot_client::ActivityHintResponse =
             serde_json::from_value(serde_json::json!({
@@ -198,14 +197,13 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             scan_started_at: "2026-10-05T00:00:00Z".into(),
             activity_hint: hint,
             receipt_window_days: 30,
-            context_curve_enabled: false,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
                 codex_home_bindings: vec![],
-            }),
+            })),
             attribution_context: None,
             upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: "offline-native".into(),
@@ -216,7 +214,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "owned".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),

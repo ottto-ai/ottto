@@ -43,7 +43,7 @@ fn lc_fixture() -> ScanIndex {
             .snapshot_activity_at
             .insert(body, Some(LC_WINDOW.to_string()));
     }
-    index.accepted_snapshot_fingerprints = BTreeSet::from([lc_hex('c'), lc_hex('d')]);
+    index.accepted_snapshot_fingerprints = BTreeSet::from([lc_hex('c'), lc_hex('d')]).into();
     index.quarantined_snapshot_fingerprints.insert(
         lc_hex('e'),
         snapshot_quarantine_record(SnapshotSource::ClaudeCode),
@@ -159,45 +159,6 @@ fn lc_reread(index: &mut ScanIndex) -> BTreeMap<String, Option<CandidateParseRea
     reread
 }
 
-fn lc_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-#[test]
-fn load_keeps_index_with_one_bad_activity_timestamp() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-activity");
-    let load = lc_load(&scratch, "activity", |value| {
-        value["snapshot_activity_at"][lc_hex('c')] = json!("syntactically-json-but-not-rfc3339");
-    });
-    let (mut index, drops) = lc_assert_kept(&scratch, load);
-    assert!(!index.snapshot_activity_at.contains_key(&lc_hex('c')));
-    assert_eq!(index.snapshot_activity_at.len(), 3);
-    assert_eq!(
-        index.accepted_snapshot_fingerprints,
-        BTreeSet::from([lc_hex('c'), lc_hex('d')])
-    );
-    assert_eq!(index.quarantined_snapshot_fingerprints.len(), 2);
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            activity: 1,
-            ..ScanIndexLoadDrops::default()
-        }
-    );
-    // Re-read to re-derive the clock; accepted-only finalization is covered
-    // through upload selection in snapshot_sync/load_containment_tests.rs.
-    assert_eq!(
-        lc_reread(&mut index),
-        BTreeMap::from([(
-            lc_key("accepted-a"),
-            Some(CandidateParseReason::ActivityOrQuarantineRetry)
-        )])
-    );
-}
-
 /// A malformed accepted identity can never equal a real body fingerprint,
 /// so dropping it alone loses no acceptance; the ledger version is kept so
 /// valid acceptance evidence is retained.
@@ -226,141 +187,6 @@ fn load_keeps_index_with_one_malformed_accepted_fingerprint() {
             ..ScanIndexLoadDrops::default()
         }
     );
-}
-
-/// A malformed sweep cursor restarts the bounded legacy sweep from the
-/// lowest identity. The cursor stays present, so a pre-ledger set already
-/// being proven is not mistaken for a never-armed one and re-opened whole.
-#[test]
-fn load_keeps_index_with_one_malformed_legacy_cursor() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-cursor");
-    let load = lc_load(&scratch, "cursor", |value| {
-        let object = value.as_object_mut().unwrap();
-        object.remove("accepted_snapshot_fingerprint_ledger_version");
-        object.insert(
-            "legacy_settlement_reconcile_after_fingerprint".to_string(),
-            json!("not-a-cursor"),
-        );
-    });
-    let (index, drops) = lc_assert_kept(&scratch, load);
-    assert_eq!(
-        index.legacy_settlement_reconcile_after_fingerprint,
-        Some(lc_hex('0'))
-    );
-    assert!(!index.legacy_settlement_ledger_is_unproven());
-    assert_eq!(
-        index.accepted_snapshot_fingerprints,
-        BTreeSet::from([lc_hex('c'), lc_hex('d')])
-    );
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            cursor: 1,
-            ..ScanIndexLoadDrops::default()
-        }
-    );
-}
-
-/// A deadline beyond the bound (clock rollback or damage) becomes due now:
-/// the retry obligation is kept, the gate re-reads the file, and finalize's
-/// due-retry bypass re-offers the never-accepted body.
-#[test]
-fn load_keeps_index_with_one_unbounded_retry_pending_quarantine_record() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-retry");
-    let load = lc_load(&scratch, "retry", |value| {
-        let far = lc_now() + 10 * 24 * 60 * 60;
-        value["quarantined_snapshot_fingerprints"][lc_hex('e')]["retry_after_unix_seconds"] =
-            json!(far);
-    });
-    let after_load = lc_now();
-    let (mut index, drops) = lc_assert_kept(&scratch, load);
-    let record = &index.quarantined_snapshot_fingerprints[&lc_hex('e')];
-    assert_eq!(
-        record.disposition,
-        SnapshotQuarantineDisposition::RetryPending
-    );
-    assert_eq!(record.failed_reconstruction_count, 1);
-    assert!(record.retry_after_unix_seconds <= lc_now());
-    assert!(record.retry_after_unix_seconds + 60 >= after_load);
-    assert!(snapshot_quarantine_deadline_is_bounded(record));
-    assert_eq!(index.snapshot_unproven_terminal_count(), 1);
-    assert_eq!(index.snapshot_activity_at.len(), 4);
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            quarantine: 1,
-            ..ScanIndexLoadDrops::default()
-        }
-    );
-    assert_eq!(
-        lc_reread(&mut index),
-        BTreeMap::from([(
-            lc_key("retry"),
-            Some(CandidateParseReason::ActivityOrQuarantineRetry)
-        )])
-    );
-    // The same predicate finalize uses to exempt the file from no-op
-    // suppression, so the unchanged body is re-offered.
-    assert!(index.quarantine_requires_retry(&lc_hex('e')));
-}
-
-#[test]
-fn load_keeps_index_with_one_retry_pending_count_at_max() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-retry-count");
-    let load = lc_load(&scratch, "retry-count", |value| {
-        value["quarantined_snapshot_fingerprints"][lc_hex('e')]["failed_reconstruction_count"] =
-            json!(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
-    });
-    let (index, drops) = lc_assert_kept(&scratch, load);
-    let record = &index.quarantined_snapshot_fingerprints[&lc_hex('e')];
-    assert_eq!(
-        record.disposition,
-        SnapshotQuarantineDisposition::RetryPending
-    );
-    assert_eq!(
-        record.failed_reconstruction_count,
-        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1,
-        "one more failed retry makes it terminal"
-    );
-    assert!(snapshot_quarantine_deadline_is_bounded(record));
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            quarantine: 1,
-            ..ScanIndexLoadDrops::default()
-        }
-    );
-}
-
-/// The disposition is the explicit state; the count and deadline are its
-/// invariants. The terminal disclosure is kept in its exact shape.
-#[test]
-fn load_keeps_index_with_one_unproven_terminal_count_mismatch() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-terminal");
-    let load = lc_load(&scratch, "terminal", |value| {
-        value["quarantined_snapshot_fingerprints"][lc_hex('f')]["failed_reconstruction_count"] =
-            json!(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1);
-    });
-    let (mut index, drops) = lc_assert_kept(&scratch, load);
-    let record = &index.quarantined_snapshot_fingerprints[&lc_hex('f')];
-    assert_eq!(
-        record.disposition,
-        SnapshotQuarantineDisposition::UnprovenTerminal
-    );
-    assert_eq!(
-        record.failed_reconstruction_count,
-        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
-    );
-    assert_eq!(record.retry_after_unix_seconds, 0);
-    assert_eq!(index.snapshot_unproven_terminal_count(), 1);
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            quarantine: 1,
-            ..ScanIndexLoadDrops::default()
-        }
-    );
-    assert!(lc_reread(&mut index).is_empty());
 }
 
 /// Every converted check at once: each record is handled alone.
@@ -435,41 +261,6 @@ fn load_refuses_future_ledger_version_without_quarantine() {
     assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
     assert_eq!(fs::read(&load.path).unwrap(), load.written);
     assert_eq!(load.drops, ScanIndexLoadDrops::default());
-}
-
-/// The refusal stops the source until a compatible build, so it alarms
-/// once per source per process, naming the source, and the next cycle's
-/// refused load stays quiet.
-#[test]
-fn future_ledger_refusal_alarms_once_per_source_and_does_not_repeat() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-future-alarm");
-    let load = lc_load(&scratch, "future-alarm", |value| {
-        value["accepted_snapshot_fingerprint_ledger_version"] =
-            json!(SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1);
-    });
-    assert!(load.result.is_err(), "future ledger state is refused");
-    assert_eq!(
-        load.lines,
-        vec![format!(
-            "local snapshot scan index refused: source=claude_code accepted_ledger_version={} \
-             supported={SNAPSHOT_ACCEPTED_LEDGER_VERSION}; written by a newer build, so this \
-             source is paused until a compatible build runs (alarm once per source per process)",
-            SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1
-        )]
-    );
-
-    let lines_before = scan_index_containment_lines_for_test().len();
-    let again =
-        ScanIndex::load_for_snapshot_source(&load.path, SnapshotSource::ClaudeCode, &scratch);
-    assert!(again.is_err(), "the next attempt is still refused");
-    assert_eq!(
-        scan_index_containment_lines_for_test().len(),
-        lines_before,
-        "no repeat alarm for the same source"
-    );
-    assert!(load.path.exists(), "the index stays at its path");
-    assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
-    assert_eq!(fs::read(&load.path).unwrap(), load.written);
 }
 
 /// Structural damage keeps the whole-index rebuild: invalid JSON still

@@ -144,12 +144,22 @@ impl FamilyRef {
             root: member.root.to_owned(),
         })
     }
+
+    pub(super) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub(super) fn root(&self) -> &str {
+        &self.root
+    }
 }
 
 /// The families one page's selection touched, deduplicated and bounded.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Touched {
-    families: Vec<FamilyRef>,
+    // Immutable after selection: summarize the owned heaps once rather than
+    // visiting two strings per family on every parked-frame bound.
+    families: crate::owned_heap::OwnedVec<FamilyRef>,
     over_cap: u64,
 }
 
@@ -175,14 +185,14 @@ impl Touched {
             }
         }
         Self {
-            families: families.into_iter().collect(),
+            families: families.into_iter().collect::<Vec<_>>().into(),
             over_cap,
         }
     }
 }
 
 crate::heap_layout_bound::fields!(FamilyRef; prefix, root);
-crate::heap_layout_bound::fields!(Touched; families, over_cap);
+crate::heap_layout_bound::split_fields!(Touched; inline: [over_cap]; heap: [families]);
 
 /// One entry of the per-pass skipped set.
 #[derive(Debug, Clone, Copy)]
@@ -195,8 +205,7 @@ pub(super) struct Skipped<'a> {
 /// The per-pass skipped set as a queue+replay view: census members still
 /// queued at page end plus stale-carry replay (including work replayed
 /// again after a refusal), exactly what `skipped_file_count_due_to_limit`
-/// counts. Cap refusals are not in it, and it is not `scan_cap_hit` (which
-/// #899 also raises for withheld terminal effects). No stat or read.
+/// counts. Cap refusals are not in it, and it is not `scan_cap_hit`. No stat or read.
 pub(super) fn skipped_view(index: &ScanIndex) -> impl Iterator<Item = Skipped<'_>> + '_ {
     index
         .traversal
@@ -954,10 +963,7 @@ impl<'a> View<'a> {
             .iter()
             .zip(&names)
             .map(|(key, member)| {
-                let entry = index
-                    .files
-                    .get(*key)
-                    .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
+                let entry = index.files.get(*key).filter(|entry| !entry.rearmed())?;
                 let finalized = proven?
                     .member_requests
                     .get(member)?
@@ -1563,7 +1569,9 @@ pub(super) fn evaluate_page<'p>(
         traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
     let history_gates = index.claude_history_emission.files.len();
     let parsed_count = parsed_keys.len();
-    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES).families;
+    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES)
+        .families
+        .into_vec();
     let cost = Cost {
         predicate_cpu_us: super::codex_compressed_input::thread_cpu_micros()
             .saturating_sub(started),

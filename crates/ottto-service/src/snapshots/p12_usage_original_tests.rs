@@ -37,7 +37,9 @@ struct Family {
 
 impl Family {
     fn new() -> Self {
-        let (dir, root_session_id, _) = claude_account_family_fixture();
+        // Ordinary (legacy reported-usage) money: the oracle's family
+        // members are parsed through the real paused-adoption input.
+        let (dir, root_session_id, _) = claude_account_family_fixture(true);
         let parent_path = dir.join(format!("{root_session_id}.jsonl"));
         let child_path = dir
             .join(&root_session_id)
@@ -76,8 +78,12 @@ impl Family {
         }
     }
 
+    /// Parses through the real paused-adoption exclusion input, so the
+    /// member keeps its ordinary reported body (the oracle's legacy money),
+    /// as production does for a listed family.
     fn parse(&self, path: &Path, window: &str, seed: u64) -> Vec<SnapshotItem> {
-        parse_claude_code_jsonl_file(path, window, revision(seed)).expect("parse family member")
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(path, window, revision(seed))
+            .expect("parse family member")
     }
 
     fn parent(&self, window: &str) -> Vec<SnapshotItem> {
@@ -163,6 +169,7 @@ impl Family {
                     .expect("exact parsed member key");
                 let old = &previous.files[key];
                 PendingIndexFinalization {
+                    withheld_content: None,
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
                     index_key: key.clone(),
@@ -499,7 +506,7 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
         return;

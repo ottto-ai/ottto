@@ -86,6 +86,7 @@ pub struct SnapshotAuditReport {
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
+    // Kept for the v4 report schema; always 0 since the daemon builds no curves.
     pub context_curve_present_session_count: usize,
     pub context_curve_available_session_count: usize,
     pub context_curve_unavailable_session_count: usize,
@@ -116,28 +117,6 @@ pub struct SnapshotAuditSession {
     pub request_count: u64,
     pub model_usage_row_count: usize,
     pub usage_bucket_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_curve: Option<SnapshotAuditContextCurve>,
-}
-
-/// Content-free measurements from the production context-curve parser.
-///
-/// The audit deliberately omits point values, timestamps, model names, and
-/// every source identity. This is sufficient to size a future local cache and
-/// compare complete, sampled, and unavailable coverage without turning the
-/// audit report into a second curve transport.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotAuditContextCurve {
-    pub coverage: String,
-    pub parser_revision: String,
-    pub ownership_revision: String,
-    pub sampling_revision: String,
-    pub total_owned_request_count: u64,
-    pub retained_point_count: u64,
-    pub total_compaction_boundary_count: u64,
-    pub retained_boundary_count: u64,
-    pub model_window_count: usize,
-    pub serialized_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -238,7 +217,6 @@ pub fn run_snapshot_audit<W: Write>(
         true,
         Some(&attribution_context),
         options.claude_support_dir.as_deref(),
-        true,
         &[],
         false,
     )?;
@@ -352,47 +330,16 @@ pub fn run_snapshot_audit<W: Write>(
                 request_count: snapshot.request_count,
                 model_usage_row_count: snapshot.model_usage.len(),
                 usage_bucket_count: snapshot.usage_buckets.len(),
-                context_curve: snapshot.context_curve.as_ref().map(audit_context_curve),
             })
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.session_key.cmp(&right.session_key));
 
-    let context_curve_present_session_count = sessions
-        .iter()
-        .filter(|session| session.context_curve.is_some())
-        .count();
-    let context_curve_available_session_count = sessions
-        .iter()
-        .filter_map(|session| session.context_curve.as_ref())
-        .filter(|curve| context_curve_is_available(&curve.coverage))
-        .count();
-    let context_curve_unavailable_session_count = sessions
-        .iter()
-        .filter_map(|session| session.context_curve.as_ref())
-        .filter(|curve| !context_curve_is_available(&curve.coverage))
-        .count();
-    let context_curve_retained_point_count = sessions
-        .iter()
-        .filter_map(|session| session.context_curve.as_ref())
-        .map(|curve| curve.retained_point_count)
-        .sum();
-    let context_curve_retained_boundary_count = sessions
-        .iter()
-        .filter_map(|session| session.context_curve.as_ref())
-        .map(|curve| curve.retained_boundary_count)
-        .sum();
-    let context_curve_serialized_bytes = sessions
-        .iter()
-        .filter_map(|session| session.context_curve.as_ref())
-        .map(|curve| curve.serialized_bytes)
-        .sum();
-
     if let Some(path) = options.private_upload_payload_out.as_deref() {
         let mut uploadable_snapshots = scan.snapshots.clone();
         // Production keeps the full scan for local consumers, then withholds
         // only authority-demoting revisions at the network boundary. The
-        // audit report measures local curves; its optional private payload
+        // audit report covers the full local scan; its optional private payload
         // reproduces the narrower production upload exactly.
         claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
         let request = SnapshotBatchRequest {
@@ -450,12 +397,12 @@ pub fn run_snapshot_audit<W: Write>(
         zero_snapshot_usage_evidence_count: scan.zero_snapshot_usage_evidence_count,
         dropped_usage_record_count: scan.dropped_usage_record_count,
         emitted_session_count: sessions.len(),
-        context_curve_present_session_count,
-        context_curve_available_session_count,
-        context_curve_unavailable_session_count,
-        context_curve_retained_point_count,
-        context_curve_retained_boundary_count,
-        context_curve_serialized_bytes,
+        context_curve_present_session_count: 0,
+        context_curve_available_session_count: 0,
+        context_curve_unavailable_session_count: 0,
+        context_curve_retained_point_count: 0,
+        context_curve_retained_boundary_count: 0,
+        context_curve_serialized_bytes: 0,
         sessions,
     };
 
@@ -470,29 +417,6 @@ pub fn run_snapshot_audit<W: Write>(
     write_private_json(&index_path, &index)?;
 
     Ok(report)
-}
-
-fn audit_context_curve(
-    curve: &crate::snapshots::SnapshotContextCurve,
-) -> SnapshotAuditContextCurve {
-    SnapshotAuditContextCurve {
-        coverage: curve.coverage.clone(),
-        parser_revision: curve.parser_revision.clone(),
-        ownership_revision: curve.ownership_revision.clone(),
-        sampling_revision: curve.sampling_revision.clone(),
-        total_owned_request_count: curve.total_owned_request_count,
-        retained_point_count: curve.retained_point_count,
-        total_compaction_boundary_count: curve.total_compaction_boundary_count,
-        retained_boundary_count: curve.retained_boundary_count,
-        model_window_count: curve.model_windows.len(),
-        serialized_bytes: serde_json::to_vec(curve)
-            .expect("validated context curve serializes")
-            .len(),
-    }
-}
-
-fn context_curve_is_available(coverage: &str) -> bool {
-    matches!(coverage, "complete" | "sampled")
 }
 
 fn blinded_component_keys(
@@ -797,57 +721,6 @@ mod tests {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([11_u8; 32]);
         fs::write(&path, encoded).expect("write attribution key");
         path
-    }
-
-    #[test]
-    fn context_curve_measurement_is_content_free_and_sizes_the_real_wire_shape() {
-        let curve = crate::snapshots::SnapshotContextCurve {
-            contract_version: "session_context_curve:v1".to_string(),
-            parser_revision: "claude-code-jsonl:v1".to_string(),
-            ownership_revision: "owned-request:v1".to_string(),
-            sampling_revision: "bounded-sampling:v1".to_string(),
-            coverage: "complete".to_string(),
-            total_owned_request_count: 1,
-            retained_point_count: 1,
-            total_compaction_boundary_count: 0,
-            retained_boundary_count: 0,
-            points: vec![crate::snapshots::SnapshotContextCurvePoint {
-                owned_request_ordinal: 1,
-                observed_at: "2099-01-02T03:04:05Z".to_string(),
-                effective_input_tokens: 987_654_321,
-                model_window_index: 0,
-                segment_ordinal: 0,
-                retention_flags: 1,
-                compaction_before_request_boundary_index: None,
-                compaction_after_request_boundary_index: None,
-            }],
-            boundaries: Vec::new(),
-            model_windows: vec![crate::snapshots::SnapshotContextCurveModelWindow {
-                model_window_index: 0,
-                model: "private-model-witness".to_string(),
-                context_window_tokens: Some(1_000_000),
-                evidence_kind: "fixture".to_string(),
-                evidence_revision: "fixture:v1".to_string(),
-            }],
-        };
-
-        let measurement = audit_context_curve(&curve);
-        let encoded = serde_json::to_string(&measurement).expect("serialize measurement");
-        assert_eq!(measurement.coverage, "complete");
-        assert_eq!(measurement.retained_point_count, 1);
-        assert_eq!(measurement.model_window_count, 1);
-        assert_eq!(
-            measurement.serialized_bytes,
-            serde_json::to_vec(&curve).unwrap().len()
-        );
-        assert!(!encoded.contains("987654321"));
-        assert!(!encoded.contains("2099-01-02T03:04:05Z"));
-        assert!(!encoded.contains("private-model-witness"));
-        assert!(!encoded.contains("1000000"));
-        assert!(context_curve_is_available("complete"));
-        assert!(context_curve_is_available("sampled"));
-        assert!(!context_curve_is_available("ownership_unresolved"));
-        assert!(!context_curve_is_available("payload_budget_exceeded"));
     }
 
     #[test]

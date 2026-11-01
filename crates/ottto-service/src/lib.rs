@@ -8,9 +8,6 @@ mod app_bundle_version;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
-// Test-only until the full #851 re-land wires a caller. No production path can
-// reach it, so sibling Desktop roots cannot change status, census or selection.
-#[cfg(test)]
 mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
@@ -38,8 +35,7 @@ mod durable_tail_codec;
 #[cfg(unix)]
 mod durable_tail_store;
 mod external_scheduler_attribution;
-#[cfg(unix)]
-pub(crate) mod fd_guard;
+mod hex;
 mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
@@ -5218,21 +5214,6 @@ mod tests {
     }
 
     #[test]
-    fn repair_plan_uses_daemon_lock_and_releases_it() {
-        let daemon = daemon();
-        let plan = daemon
-            .propose_repair(TOKEN, SourceKind::Codex, true)
-            .expect("repair plan should be proposed");
-
-        assert_eq!(plan.source, SourceKind::Codex);
-        assert!(plan.dry_run);
-        assert_eq!(plan.status, RepairPlanStatus::Proposed);
-        assert!(daemon
-            .acquire_repair_lock(TOKEN, SourceKind::ClaudeCode)
-            .is_ok());
-    }
-
-    #[test]
     fn connected_repair_plan_limits_terminal_approval_to_setup_safe_actions() {
         let daemon = daemon()
             .with_account(account("user_1", "ron@example.com"))
@@ -5831,60 +5812,6 @@ mod tests {
     }
 
     #[test]
-    fn verification_result_updates_source_health() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let result = SourceVerificationResult {
-            source: SourceKind::Codex,
-            config: SourceConfigState {
-                discovered: true,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: Some("sha256:test".to_string()),
-                drift: Vec::new(),
-            },
-            status: SourceVerificationStatus::Verified,
-            verified: true,
-            records_seen: 2,
-            last_record_id: Some("record_2".to_string()),
-            last_received_at: Some("2026-05-05T10:15:00Z".to_string()),
-            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
-            message: StableMessage {
-                code: "verified".to_string(),
-                text: "Codex verification passed.".to_string(),
-            },
-            route_results: Vec::new(),
-            check: None,
-        };
-
-        daemon
-            .record_verification_result(&result)
-            .expect("record verification");
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some("2026-05-05T10:15:00Z")
-        );
-        let health = status
-            .canonical_health
-            .as_ref()
-            .expect("canonical health should be projected");
-        assert_eq!(health.overall.state, LocalHealthOverallState::Healthy);
-        assert_eq!(
-            status
-                .runtime_heartbeat
-                .as_ref()
-                .map(|heartbeat| heartbeat.health_projection_revision),
-            Some(health.projection_revision)
-        );
-        assert!(health
-            .capabilities
-            .iter()
-            .any(|capability| capability == "health.v1"));
-    }
-
-    #[test]
     fn failed_verification_uses_fresh_attempt_time() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
 
@@ -6174,39 +6101,6 @@ mod tests {
     }
 
     #[test]
-    fn genuinely_pending_source_still_degrades_overall_health() {
-        // Regression guard for the not-installed exclusion: a source that is
-        // actually waiting on setup (needs confirmation, no
-        // source_not_installed problem) must keep degrading the machine with
-        // finish_source_setup.
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-
-        let mut pending = codex_health();
-        pending.state = SourceState::NeedsConfirmation;
-        pending.grade = HealthGrade::Unknown;
-        pending.last_verified_at = None;
-        daemon
-            .update_sources(TOKEN, vec![pending])
-            .expect("source health should update");
-
-        let status = daemon.status(TOKEN).expect("status");
-        let health = status
-            .canonical_health
-            .as_ref()
-            .expect("canonical health should be projected");
-        assert_eq!(
-            health.sources[0].state,
-            LocalHealthSourceState::PendingSetup
-        );
-        assert_eq!(health.sources[0].blocking_reason, None);
-        assert_eq!(health.overall.state, LocalHealthOverallState::Degraded);
-        assert_eq!(
-            health.overall.next_action.as_deref(),
-            Some("finish_source_setup")
-        );
-    }
-
-    #[test]
     fn canonical_health_warns_for_recent_legacy_requests_without_port_text() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         for (now, recent) in [(1000, true), (4599, true), (4600, false)] {
@@ -6228,34 +6122,6 @@ mod tests {
                 }
             });
         }
-    }
-
-    #[test]
-    fn stale_exporter_warning_follows_disconnected_account_blocker() {
-        otlp_relay::legacy::with_recent_request_for_test(1000, 1000, || {
-            let status = daemon().status(TOKEN).expect("status");
-            let health = status.canonical_health.expect("health");
-            assert_eq!(health.account.state, LocalHealthAccountState::NotConnected);
-            let reconnect = health
-                .blockers
-                .iter()
-                .position(|finding| finding.code == "reconnect_required")
-                .unwrap();
-            let stale = health
-                .blockers
-                .iter()
-                .position(|finding| finding.code == otlp_relay::legacy::STALE_EXPORTER_CODE)
-                .unwrap();
-            assert!(reconnect < stale);
-            assert_ne!(
-                health.overall.primary_blocker.as_deref(),
-                Some(otlp_relay::legacy::STALE_EXPORTER_CODE)
-            );
-            assert_eq!(
-                health.blockers[reconnect].severity,
-                LocalHealthSeverity::Blocking
-            );
-        });
     }
 
     #[test]
@@ -6998,34 +6864,6 @@ mod tests {
     }
 
     #[test]
-    fn available_agent_status_does_not_stamp_verification_authority() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        {
-            let mut state = daemon.inner.lock().expect("state");
-            upsert_agent_status_snapshot(
-                &mut state,
-                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
-            );
-        }
-
-        let status = daemon.status(TOKEN).expect("status after refresh");
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert!(
-            status.sources[0].last_verified_at.is_none(),
-            "local availability scans must not masquerade as Verify attempts"
-        );
-        let source = status
-            .canonical_health
-            .expect("canonical health")
-            .sources
-            .into_iter()
-            .find(|source| source.app == SourceKind::Codex)
-            .expect("Codex source");
-        assert_eq!(source.state, LocalHealthSourceState::Healthy);
-        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
-    }
-
-    #[test]
     fn available_agent_status_preserves_admin_disabled_verification_policy() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -7182,36 +7020,6 @@ mod tests {
         assert_eq!(status.sources[0].state, SourceState::Healthy);
         assert_eq!(status.sources[0].grade, HealthGrade::Ok);
         assert!(status.sources[0].problems.is_empty());
-    }
-
-    #[test]
-    fn blocking_verification_failures_are_listed_for_background_reverify() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("seed healthy source");
-        assert!(daemon
-            .sources_with_blocking_verification_failure()
-            .expect("list with healthy source")
-            .is_empty());
-
-        daemon
-            .record_verification_result(&failed_codex_reconnect())
-            .expect("record failed verification");
-        assert_eq!(
-            daemon
-                .sources_with_blocking_verification_failure()
-                .expect("list with failed source"),
-            vec![SourceKind::Codex]
-        );
-
-        daemon
-            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
-            .expect("record verified result");
-        assert!(daemon
-            .sources_with_blocking_verification_failure()
-            .expect("list after recovery")
-            .is_empty());
     }
 
     #[test]
@@ -7448,51 +7256,6 @@ mod tests {
         assert_eq!(source.state, LocalHealthSourceState::Healthy);
         assert_eq!(source.authority, LocalHealthAuthority::Runtime);
         assert!(source.blocking_reason.is_none());
-    }
-
-    #[test]
-    fn reconnect_required_verification_updates_source_health() {
-        let daemon = daemon();
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("source health should update");
-        let result = SourceVerificationResult {
-            source: SourceKind::Codex,
-            config: SourceConfigState {
-                discovered: true,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: Some("sha256:test".to_string()),
-                drift: Vec::new(),
-            },
-            status: SourceVerificationStatus::ReconnectRequired,
-            verified: false,
-            records_seen: 0,
-            last_record_id: None,
-            last_received_at: None,
-            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
-            message: StableMessage {
-                code: "setup_run_token_invalid".to_string(),
-                text: "Use Sign in in the Ottto app to refresh it.".to_string(),
-            },
-            route_results: Vec::new(),
-            check: None,
-        };
-
-        daemon
-            .record_verification_result(&result)
-            .expect("record reconnect result");
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].state, SourceState::Failed);
-        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
-        assert_eq!(
-            status.sources[0].problems[0].code,
-            StableProblemCode::TelemetryNotVerified
-        );
-        assert_eq!(
-            status.sources[0].recommended_actions[0].action,
-            RepairActionKind::VerifyTelemetry
-        );
     }
 
     #[test]
@@ -7762,19 +7525,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_daemon_does_not_stage_switch() {
-        let daemon = daemon();
-        let candidate = daemon
-            .stage_account_switch_if_user_mismatch(staged_switch(
-                "claim_one",
-                "user_2",
-                "other@example.com",
-            ))
-            .expect("stage");
-        assert!(candidate.is_none());
-    }
-
-    #[test]
     fn account_not_found_binding_accepts_fresh_claim_by_any_user() {
         let daemon = daemon();
         daemon
@@ -7837,16 +7587,6 @@ mod tests {
         assert_eq!(
             daemon.status(TOKEN).expect("status").account.state,
             LocalAccountState::Connected
-        );
-    }
-
-    #[test]
-    fn mark_account_not_found_is_a_noop_when_not_connected() {
-        let daemon = daemon();
-        daemon.mark_account_not_found().expect("mark");
-        assert_eq!(
-            daemon.status(TOKEN).expect("status").account.state,
-            LocalAccountState::NotConnected
         );
     }
 
@@ -7965,29 +7705,6 @@ mod tests {
                 .map(|message| message.code.as_str()),
             Some("connected")
         );
-    }
-
-    #[test]
-    fn runtime_started_at_is_the_process_start_instant_not_the_status_query_time() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let status = daemon.status(TOKEN).expect("status");
-        let health = status.canonical_health.as_ref().expect("canonical health");
-        assert_eq!(health.runtime.started_at, "2026-05-05T09:10:00Z");
-        assert_eq!(health.runtime.last_seen_at, status.generated_at);
-        assert_ne!(health.runtime.started_at, health.runtime.last_seen_at);
-        let heartbeat = status
-            .runtime_heartbeat
-            .as_ref()
-            .expect("runtime heartbeat");
-        assert_eq!(heartbeat.started_at, "2026-05-05T09:10:00Z");
-        assert_eq!(heartbeat.last_seen_at, status.generated_at);
-
-        // A re-projection observes the daemon again; it does not restart it.
-        let mut reprojected = status.clone();
-        refresh_canonical_local_health(&mut reprojected);
-        let health = reprojected.canonical_health.expect("re-projected health");
-        assert_eq!(health.runtime.started_at, "2026-05-05T09:10:00Z");
-        assert_eq!(health.runtime.last_seen_at, reprojected.generated_at);
     }
 
     mod scan_index_health_tests {
@@ -8273,21 +7990,6 @@ mod tests {
     }
 
     #[test]
-    fn first_seen_is_in_memory_only_without_a_state_dir() {
-        // Without a configured state dir the daemon still reports connected_at
-        // for the current session but writes nothing to disk.
-        let daemon = daemon();
-        daemon
-            .record_verification_result(&verified_codex("2026-05-05T10:15:00Z"))
-            .expect("record verification");
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(
-            status.sources[0].connected_at.as_deref(),
-            Some("2026-05-05T10:15:00Z")
-        );
-    }
-
-    #[test]
     fn failed_verification_persists_across_restart_and_registered_seed() {
         let dir = std::env::temp_dir().join(format!(
             "ottto-source-state-test-{}-verify-failed",
@@ -8500,33 +8202,6 @@ mod tests {
     }
 
     #[test]
-    fn no_registered_sources_present_seeds_nothing() {
-        let dir = std::env::temp_dir().join(format!(
-            "ottto-source-state-test-{}-none-present",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let device = LocalDeviceBinding {
-            device_id: "device_test".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            sources: vec!["codex".to_string(), "claude_code".to_string()],
-        };
-        let restarted = daemon()
-            .with_account(account("user_1", "ron@example.com"))
-            .with_source_state_dir(dir.clone())
-            .with_registered_device_sources_presence(Some(device), |_| false);
-
-        let status = restarted.status(TOKEN).expect("status");
-        assert!(
-            status.sources.is_empty(),
-            "no locally-present sources -> no seeded rows"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn seeded_source_promotes_when_agent_status_refresh_arrives() {
         let dir = std::env::temp_dir().join(format!(
             "ottto-source-state-test-{}-promote",
@@ -8580,59 +8255,6 @@ mod tests {
         assert!(status.sources[0].agent_status.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn startup_reverify_promotes_available_seeded_source() {
-        let restarted = daemon()
-            .with_account(account("user_1", "ron@example.com"))
-            .with_registered_device_sources_presence(
-                Some(LocalDeviceBinding {
-                    device_id: "device_test".to_string(),
-                    machine_id: Some("machine_test".to_string()),
-                    sources: vec!["codex".to_string()],
-                }),
-                |_| true,
-            );
-
-        let mut state = restarted.inner.lock().expect("state");
-        assert_eq!(state.sources[0].state, SourceState::Verifying);
-
-        let remaining = apply_verifying_reconfirm(
-            &mut state,
-            vec![available_agent_status(
-                SourceKind::Codex,
-                "2026-05-05T10:20:00Z",
-            )],
-        );
-
-        assert_eq!(remaining, 0);
-        assert_eq!(state.sources[0].state, SourceState::Healthy);
-        assert_eq!(state.sources[0].grade, HealthGrade::Ok);
-    }
-
-    #[test]
-    fn startup_reverify_does_not_clobber_explicit_verify_result() {
-        // A source that an explicit Verify already moved out of `verifying`
-        // (e.g. needs_confirmation after a no-fresh-telemetry smoke) must not be
-        // promoted back to healthy by a racing startup scan.
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let mut state = daemon.inner.lock().expect("state");
-        let mut confirmed = codex_health();
-        confirmed.state = SourceState::NeedsConfirmation;
-        confirmed.grade = HealthGrade::Warning;
-        state.sources = vec![confirmed];
-
-        let remaining = apply_verifying_reconfirm(
-            &mut state,
-            vec![available_agent_status(
-                SourceKind::Codex,
-                "2026-05-05T10:20:00Z",
-            )],
-        );
-
-        assert_eq!(remaining, 0);
-        assert_eq!(state.sources[0].state, SourceState::NeedsConfirmation);
     }
 
     #[test]

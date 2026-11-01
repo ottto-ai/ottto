@@ -522,7 +522,7 @@ fn recovery_emission_boundaries(
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
-    e2::decide_page_copies(&mut items, index);
+    e2::decide_page_copies(&mut items, index, None);
     e2::attach_page(&mut items, evidence);
     let unresolved = e2::side_calls_page(
         &mut items,
@@ -533,7 +533,13 @@ fn recovery_emission_boundaries(
         &Default::default(),
         index,
     );
-    let held = e2::finish_page(&mut items, index, e2::TelemetryRead::Loaded);
+    let held = e2::finish_page(
+        &mut items,
+        index,
+        e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
     if index.persistence_available() {
         assert_eq!(items.len(), 1, "positive E2 body before finalization");
         assert!(matches!(
@@ -562,6 +568,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),
@@ -585,19 +592,20 @@ fn recovery_emission_boundaries(
 
 #[test]
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
+    let _resumed_prefix = e2::ResumedPrefixForTest::set(true);
     use claude_request_money::e2;
     for map in 0..3 {
         let fixture = Fixture::new();
         let healthy = fixture.load();
-        let (prepared, evidence) = e2::with_enabled(|| prepared_recovery_page(&fixture, &healthy));
+        let (prepared, evidence) = { prepared_recovery_page(&fixture, &healthy) };
         assert_eq!(prepared.len(), 1, "positive prepared E2 page");
         let mut control = healthy.clone();
         let ((control_scan, control_manifest, control_held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    e2::with_enabled(|| {
+                    {
                         recovery_emission_boundaries(prepared.clone(), &evidence, &mut control)
-                    })
+                    }
                 })
             });
         assert!(reads.is_empty());
@@ -634,21 +642,19 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let ((held_scan, manifest, held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    e2::with_enabled(|| {
-                        unknown.retire_committed_claude_account_pending_windows();
-                        assert!(matches!(
-                            unknown.lower_claude_retired_family_tombstone_fence(
-                                &BTreeSet::new(),
-                                &BTreeSet::new()
-                            ),
-                            ClaudeTombstoneFenceRepair::Kept { .. }
-                        ));
-                        assert!(!claude_stale_rearm_can_reopen_fence(
-                            &unknown,
+                    unknown.retire_committed_claude_account_pending_windows();
+                    assert!(matches!(
+                        unknown.lower_claude_retired_family_tombstone_fence(
+                            &BTreeSet::new(),
                             &BTreeSet::new()
-                        ));
-                        recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
-                    })
+                        ),
+                        ClaudeTombstoneFenceRepair::Kept { .. }
+                    ));
+                    assert!(!claude_stale_rearm_can_reopen_fence(
+                        &unknown,
+                        &BTreeSet::new()
+                    ));
+                    recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })
             });
         assert!(
@@ -677,9 +683,9 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
                         !unknown.persistence_available(),
                         "old views never clear in place"
                     );
-                    let (scan, manifest, held) = e2::with_enabled(|| {
+                    let (scan, manifest, held) = {
                         recovery_emission_boundaries(prepared.clone(), &evidence, &mut restored)
-                    });
+                    };
                     (restored, scan, manifest.unwrap(), held)
                 })
             });
@@ -769,6 +775,42 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert!(reads.is_empty());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
+}
+
+/// [off=main] off large v1 manifest load cas and containment match compact v1.
+#[test]
+fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
+    let compact = Fixture::new();
+    let large = Fixture::new();
+    assert_eq!(large.manifest["storage_format"], json!(1));
+    let mut bytes = fs::read(&large.root).unwrap();
+    bytes.extend_from_slice(&vec![b' '; 8192]);
+    assert!(bytes.len() > 4096);
+    assert!(bytes.len() < scan_index_persistence::MAX_ROOT_BYTES);
+    fs::write(&large.root, &bytes).unwrap();
+    // No sentinel or environment opt-in: exercise the real source-aware OFF
+    // route, v1 CAS writer, and the shared containment admission guard.
+    let mut expected = compact.load();
+    let mut actual = large.load();
+    assert!(actual.v2().persistence_v2.is_none());
+    assert!(actual.persistence_available());
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(fs::read(&large.root).unwrap(), bytes);
+    {
+        let _lock = CheckpointLock::acquire(&large.root).unwrap();
+        state_v2::guard_containment_locked(&large.root).unwrap();
+    }
+    expected.save(&compact.root).unwrap();
+    actual.save(&large.root).unwrap();
+    assert_eq!(
+        fs::read(&large.root).unwrap(),
+        fs::read(&compact.root).unwrap()
+    );
+    assert!(large.load().persistence_available());
+    assert!(!large.root.with_extension("json.v2.sqlite").exists());
 }
 
 // Snapshot every file in this bounded synthetic index, including storage

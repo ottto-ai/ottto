@@ -60,6 +60,7 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -190,7 +191,6 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
         None,
         None,
         None,
-        false,
         false,
     )
     .unwrap();

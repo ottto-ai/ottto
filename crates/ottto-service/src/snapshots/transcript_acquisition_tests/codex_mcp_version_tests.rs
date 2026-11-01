@@ -39,7 +39,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -55,7 +55,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        crate::snapshots::DiscoveryRetention::unverified(&index.files),
     )
     .unwrap()
     .0
@@ -91,7 +91,6 @@ fn codex_prelude_ld_and_mcp_eof_share_one_primary_read() {
         None,
         &[],
         false,
-        true,
     )
     .with_line_observer("codex_prelude", preludes.observer(roots))
     .with_codex_versions(versions.clone());

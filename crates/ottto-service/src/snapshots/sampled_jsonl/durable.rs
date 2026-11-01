@@ -388,7 +388,6 @@ pub(crate) fn rederive_parser(
         None,
         None,
         acc.artifacts_enabled,
-        acc.context_curve_enabled,
     )?;
     parser.accumulator.claude_request_identity_capture = acc.claude_request_identity_capture;
     Ok(parser)

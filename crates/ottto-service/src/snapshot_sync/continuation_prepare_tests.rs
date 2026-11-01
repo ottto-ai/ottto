@@ -101,7 +101,7 @@ impl ContinuationFixture {
             );
         }
         assert!(!index.legacy_settlement_ledger_needs_migration());
-        let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
+        let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
         let now = reason_reoffer::now_unix_seconds();
         let _ = prepare_upload_progress_for_cycle_with_reoffer(
             &mut progress,
@@ -147,14 +147,13 @@ impl ContinuationFixture {
             scan_started_at: "2026-10-24T00:00:00Z".into(),
             activity_hint: continuation_hint(true),
             receipt_window_days: 30,
-            context_curve_enabled: false,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
                 codex_home_bindings: vec![],
-            }),
+            })),
             attribution_context: attribution.then(|| {
                 SessionAttributionContext::from_activity_hint(
                     SnapshotSource::Codex,
@@ -177,7 +176,6 @@ impl ContinuationFixture {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "ordinary".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
@@ -249,20 +247,53 @@ pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
     ContinuationFixture::quiescent("continuation-mint-finish").preparation(true)
 }
 
+/// An ordinary preparation at a real machine's size: its status collection
+/// alone exceeds a ticket's walk, with five scan homes and 120 schedules.
+pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation {
+    let fixture = ContinuationFixture::quiescent("continuation-mint-realistic");
+    for n in 0..120 {
+        let schedule = fixture.home.join(format!(".codex/automations/schedule-{n}"));
+        std::fs::create_dir_all(&schedule).unwrap();
+        std::fs::write(
+            schedule.join("automation.toml"),
+            format!(
+                "id = \"schedule-{n}\"\nname = \"Synthetic\"\n\
+                 prompt = \"Inspect the landing queue and report safe results {n}.\"\n\
+                 rrule = \"FREQ=HOURLY\"\nstatus = \"ACTIVE\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let mut preparation = fixture.preparation(true);
+    let status = test_agent_status(SourceKind::Codex);
+    preparation.scan_agent_status_collection = Some(std::sync::Arc::new(AgentStatusCollection {
+        snapshots: vec![status.clone(); 1_000],
+        source_health_snapshot: status,
+        codex_scan_homes: (0..5)
+            .map(|n| fixture.home.join(format!("scan-home-{n}")))
+            .collect(),
+        codex_home_bindings: vec![],
+    }));
+    preparation
+}
+
 /// K2: cached inputs for the continuation tests, with a drop sentinel (the
-/// status collection's `Arc`, whose count falls back to one when the inputs,
-/// and the context with them, are dropped).
+/// prelude feed's `Arc`, whose count falls back to one when the inputs, and
+/// the context with them, are dropped).
 pub(super) fn continuation_inputs_for_test(
     attribution: bool,
-) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
+) -> (
+    ContinuationInputs,
+    std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
+    let sentinel = std::sync::Arc::default();
     let inputs = take_continuation_inputs(
         &mut preparation,
-        &std::sync::Arc::default(),
+        &sentinel,
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
-    let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
 }
@@ -276,9 +307,10 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
+    let sentinel = std::sync::Arc::default();
     let inputs = take_continuation_inputs(
         &mut preparation,
-        &std::sync::Arc::default(),
+        &sentinel,
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
     assert!(
@@ -290,11 +322,10 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         inputs.activity_hint.session_attribution_hmac_key.is_none(),
         "the cached hint holds no raw key"
     );
-    let sentinel = &preparation.scan_agent_status_collection;
-    assert_eq!(std::sync::Arc::strong_count(sentinel), 2);
+    assert_eq!(std::sync::Arc::strong_count(&sentinel), 2);
     drop(inputs);
     assert_eq!(
-        std::sync::Arc::strong_count(sentinel),
+        std::sync::Arc::strong_count(&sentinel),
         1,
         "dropped, with its context"
     );
@@ -325,15 +356,20 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert_eq!(prepared.source, SnapshotSource::Codex);
     assert_eq!(prepared.account_witness, minted.account_witness);
     assert_eq!(prepared.receipt_window_days, minted.receipt_window_days);
-    assert_eq!(prepared.context_curve_enabled, minted.context_curve_enabled);
     assert_eq!(
         prepared.cache_observations_enabled,
         minted.cache_observations_enabled
     );
-    assert!(std::sync::Arc::ptr_eq(
-        &prepared.scan_agent_status_collection,
-        &minted.scan_agent_status_collection
-    ));
+    // A continuation page never finishes: its scan roots came from the homes.
+    assert!(prepared.scan_agent_status_collection.is_none());
+    assert_eq!(
+        inputs.codex_scan_homes,
+        minted
+            .scan_agent_status_collection
+            .as_ref()
+            .unwrap()
+            .codex_scan_homes
+    );
     assert_eq!(prepared.upload_policy, minted.upload_policy);
     assert_eq!(
         prepared.upload_destination_namespace,
@@ -386,8 +422,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         &mut index,
         &mut progress,
     );
-    let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
-    assert_eq!(prepared.replay_generation, generation);
+    let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
     let now = reason_reoffer::now_unix_seconds();
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
         &mut progress,
@@ -455,36 +490,24 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
     use crate::snapshots::claude_request_identity::captures;
     let witness = [3u8; 32];
     let index_path = Path::new("/tmp/ottto-continuation-scope-index.json");
-    for (source, curve, golden) in [
+    // The retired curve flag stays in the scope as a literal `false`.
+    for (source, golden) in [
         (
             SnapshotSource::ClaudeCode,
-            false,
             "c58cf74dc52ebcdb56cce301dde881fac71e0045ddf127d0137ed7d16b80ae55",
         ),
         (
-            SnapshotSource::ClaudeCode,
-            true,
-            "2d63534231ce46641c37958033fe49bdfb683d2592f1648ddd715ac412022292",
-        ),
-        (
             SnapshotSource::Codex,
-            false,
             "26648c9996bbbd2102f21bab2bd0a6c2fc6a522bb3b159ba6869d5c645d9df04",
-        ),
-        (
-            SnapshotSource::Codex,
-            true,
-            "a9cd90d380262e8c616ed6ff63cb6bbc1b568a8b375526a90b32a94f6537103d",
         ),
     ] {
         let scope = cycle_sampled_scope(
             &witness,
             CONTINUATION_NAMESPACE,
             index_path,
-            curve,
             captures(source),
         );
-        assert_eq!(scope.0, golden, "{source:?} curve={curve}");
+        assert_eq!(scope.0, golden, "{source:?}");
     }
 }
 
@@ -649,7 +672,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     assert!(prepare_upload_progress_for_cycle_with_reoffer(
         &mut selected,
         &index,
-        &cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
+        &cycle_replay_generation(SnapshotSource::Codex, CONTINUATION_NAMESPACE),
         false,
         Some(&reason_reoffer::Scope {
             index: &index,

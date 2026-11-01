@@ -191,6 +191,29 @@ fn snapshot_packing_count_preserves_exact_byte_count_and_oversize_boundaries() {
     assert_eq!(SNAPSHOT_BATCH_LIMIT, 50);
 }
 
+/// [behaviour] A receiver-sized 3 MiB item exceeds the packing target, passes
+/// the unchanged 4 MiB wire bound and ships alone between small items.
+#[test]
+fn advertised_cap_single_item_ships_alone() {
+    let mut large = item(1, json!(""), false);
+    let framing = serde_json::to_vec(&large).unwrap().len();
+    large.payload = json!("x".repeat(3_145_728 - framing));
+    assert_eq!(serde_json::to_vec(&large).unwrap().len(), 3_145_728);
+    assert!(
+        serde_json::to_vec(&large).unwrap().len() < crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES
+    );
+    let (batches, accepted) = actual_batches(
+        &[
+            item(0, json!("before"), false),
+            large,
+            item(2, json!("after"), false),
+        ],
+        test_upload_progress(),
+    );
+    assert_eq!(batches, vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(accepted, 3);
+}
+
 #[derive(Clone)]
 struct FailingPackingItem {
     fingerprint: String,

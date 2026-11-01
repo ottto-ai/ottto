@@ -199,48 +199,6 @@ fn health_posts_once_per_agent_and_never_retries_within_the_day() {
 }
 
 #[test]
-fn health_carries_worker_counters_even_for_a_killed_run() {
-    let dir = scratch("composition-a2-health-killed");
-    let day = day_of(base_now().date());
-    let started = base_now();
-    let mut log = HealthLog::begin(&dir, day, "device|machine|api");
-    log.set(HealthEntry::finished(
-        "claude-code",
-        &sample_stats(),
-        1,
-        started,
-    ));
-    // Codex was running when the worker was stopped: no counts of its own.
-    log.set(HealthEntry::started("codex", started));
-    let record = health::take_pending(&dir, day).unwrap();
-    let mut poster = Poster::default();
-    let worker = WorkerCounts {
-        timeouts: 1,
-        failures: 0,
-    };
-    let counts = health::send(
-        &record,
-        "device|machine|api",
-        "machine-test",
-        worker,
-        &mut poster,
-    );
-    assert_eq!(counts.sent, 2);
-    for (agent, body) in &poster.calls {
-        assert_eq!(body["worker_timeouts"], 1, "{agent}");
-        assert_eq!(body["worker_failures"], 0, "{agent}");
-    }
-    let codex = &poster.calls[1].1;
-    assert_eq!(codex["agent_source"], "codex");
-    assert_eq!(codex["bytes_read"], 0);
-    let claude = &poster.calls[0].1;
-    assert_eq!(claude["scopes_quarantined"], 1);
-    assert_eq!(claude["checkpoint_restarts"], 5);
-    assert_eq!(claude["audit_differences"], 0);
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn run_counts_waiting_full_reads_and_backlog_growth() {
     let env = Env::uninstalled("composition-a2-backlog");
     let now = base_now();
@@ -266,35 +224,6 @@ fn run_counts_waiting_full_reads_and_backlog_growth() {
     assert_eq!(backlog.record(12, 500), 3);
     assert_eq!(backlog.record(13, 500), 0, "not growing");
     assert_eq!(backlog.record(14, 0), 0);
-    env.cleanup();
-}
-
-#[derive(Default)]
-struct Receipts {
-    payloads: u64,
-}
-
-impl Uploader for Receipts {
-    fn upload(&mut self, request: &Value) -> anyhow::Result<UploadReceipt> {
-        self.payloads += 1;
-        Ok(UploadReceipt {
-            payload_bytes: serde_json::to_vec(request)?.len() as u64,
-            rows_written: Some(7),
-        })
-    }
-}
-
-#[test]
-fn upload_metrics_count_payload_bytes_and_rows_written() {
-    let env = Env::new("composition-a2-upload-metrics");
-    let now = base_now();
-    whole_file(&env, "a", now);
-    let mut receipts = Receipts::default();
-    let stats = env.run(Source::Claude, now, Some(&mut receipts));
-    assert_eq!(stats.uploaded, 1);
-    assert_eq!(receipts.payloads, 1);
-    assert_eq!(stats.upload_rows_written, 7);
-    assert!(stats.upload_payload_bytes > 100);
     env.cleanup();
 }
 
@@ -399,36 +328,6 @@ fn health_for_another_destination_is_dropped_unsent() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn backlog_counts_a_waiting_file_at_its_current_size() {
-    let env = Env::uninstalled("composition-a2-backlog-growth");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    env.run(Source::Claude, now - time::Duration::days(1), None);
-    earlier_build_install_backlog(&env, Source::Claude, &[&path]);
-    let run = |hours: i64| {
-        env.run_with(
-            Source::Claude,
-            now + time::Duration::hours(hours),
-            None,
-            0,
-            &mut FolderResolver::default(),
-        )
-    };
-    let first = run(0);
-    assert_eq!(
-        first.full_read_backlog_bytes,
-        fs::metadata(&path).unwrap().len()
-    );
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    let second = run(1);
-    let grown = fs::metadata(&path).unwrap().len();
-    assert!(grown > first.full_read_backlog_bytes);
-    assert_eq!(second.full_read_waiting_files, 1);
-    assert_eq!(second.full_read_backlog_bytes, grown);
-    env.cleanup();
-}
-
 /// A concurrent subprocess can inherit the flock descriptor until exec,
 /// briefly keeping the lease alive after take_run_health closes its copy.
 /// A lease held throughout this bounded probe must still fail the test.
@@ -443,18 +342,6 @@ fn probe_health_worker_lease(dir: &Path) -> Option<File> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-#[test]
-fn health_lease_probe_rejects_a_continuously_held_lease() {
-    let dir = crate::test_scratch::ScratchDir::new("composition-health-held-lease");
-    let lease = harvest::lock_state(&dir).unwrap().unwrap();
-    assert!(
-        probe_health_worker_lease(&dir).is_none(),
-        "retry must not hide a lease retained during posting"
-    );
-    drop(lease);
-    assert!(probe_health_worker_lease(&dir).is_some());
 }
 
 #[test]

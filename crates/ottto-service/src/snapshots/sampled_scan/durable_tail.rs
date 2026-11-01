@@ -419,7 +419,7 @@ fn replay_scope_for(
         } else {
             0
         },
-        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == SnapshotSource::ClaudeCode,
     )
 }
 
@@ -1599,20 +1599,6 @@ impl SharedCache {
         let counters = stores.counters.clone();
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
-    }
-
-    /// Dev-only inspection of an existing slot. Never initializes a store or
-    /// opens records; the caller inventories its own scratch after releasing
-    /// this lock. The path must never enter aggregate output.
-    #[cfg(feature = "replay-harness")]
-    pub(crate) fn durable_replay_store(
-        &self,
-        snapshot_source: SnapshotSource,
-    ) -> Option<(PathBuf, Option<&'static str>)> {
-        let source = durable_source(snapshot_source)?;
-        let mut stores = self.durable()?;
-        let slot = stores.slot(source).as_ref()?;
-        Some((slot.dir.clone(), slot.store.disabled()))
     }
 }
 

@@ -8,7 +8,6 @@
 // `KeepStaleClaudeFamilyRearmForTest`, which carries nothing. Fixtures are
 // synthetic and content-free.
 use super::*;
-use super::terminal_off_tests::claude_terminal_reconstructed;
 
 const CARRY_FAILED: &str = "2026-08-02T07:10:00Z";
 const CARRY_RETRY: &str = "2026-08-02T07:20:00Z";
@@ -69,6 +68,8 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         member_occurrences: BTreeMap::new(),
         invalid: false,
         idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
     };
     let mut witness = ClaudeUsageFamilyWitness {
         evidence_fingerprint: "e".repeat(64),
@@ -1082,62 +1083,6 @@ fn c1b_unfunded_replay_after_a_passed_member_restarts_the_traversal() {
     }
 }
 
-/// R2, defensive reset: factored out of the cancel, whose debug assertion
-/// rules it out. It re-arms every member, the parsed one included, queues the
-/// passed member into the funded replay buffer without growing it or the
-/// candidate queue, drops the family from the carry and is counted. The
-/// family is then no longer carried, so a later parse cancels nothing.
-#[test]
-fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut index = carry_cancel_index(1);
-    let [root_key, agent_key] = carry_family_keys();
-    let before = index.clone();
-    let queue = &before.traversal.as_ref().unwrap().pending_candidates;
-    let (queued, queue_capacity) = (queue.len(), queue.capacity());
-    let replay_capacity = index.claude_stale_family_carry.replay.capacity();
-    let cancellations = claude_stale_family_carry_cancellations_for_test();
-    let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
-    claude_family_carry_defensive_reset(&mut index, CARRY_ROOT, &root_key, &VecDeque::new());
-    assert_eq!(
-        claude_stale_family_carry_cancellation_refusals_for_test(),
-        refusals + 1
-    );
-    for key in carry_family_keys() {
-        assert!(
-            index.files[&key].source_file_fingerprint.is_empty(),
-            "{key} is re-armed"
-        );
-    }
-    for key in [
-        carry_key(CARRY_OTHER, None),
-        carry_key(CARRY_UNWITNESSED, None),
-    ] {
-        assert_eq!(
-            index.files[&key].source_file_fingerprint,
-            before.files[&key].source_file_fingerprint
-        );
-    }
-    let queue = &index.traversal.as_ref().unwrap().pending_candidates;
-    assert_eq!((queue.len(), queue.capacity()), (queued, queue_capacity));
-    let carry = &index.claude_stale_family_carry;
-    assert_eq!(carry.replay, vec![carry_replayed(&agent_key)]);
-    assert_eq!(carry.replay.capacity(), replay_capacity);
-    assert!(carry.roots.is_empty());
-    carry_cancel(&mut index);
-    assert_eq!(
-        claude_stale_family_carry_cancellations_for_test(),
-        cancellations
-    );
-    assert_eq!(
-        claude_stale_family_carry_cancellation_refusals_for_test(),
-        refusals + 1
-    );
-    assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
-}
-
 // Fix 2: after a full re-arm terminal, the traversal that re-read every
 // family (started at CARRY_FAILED) finished needing a clean follow-up. Its
 // follow-up carries the unchanged witnessed family under the C1b family
@@ -1376,39 +1321,6 @@ fn fix2_window_from_another_context_or_process_is_base() {
             index.claude_full_rearm_progress.full_rearm_window.is_none(),
             "{case}: the window is dropped"
         );
-    }
-}
-
-/// Reuse C1b's boundary controls at the clean-follow-up entry. Only the two
-/// entry conditions intentionally changed by Fix 2 are omitted.
-#[test]
-fn fix2_clean_followup_preserves_c1b_family_refusals() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for control in carry_controls() {
-        if matches!(
-            control.name,
-            "no_retained_traversal" | "prior_unsettled_upload"
-        ) {
-            continue;
-        }
-        let mut fix = window_index();
-        (control.mutate)(&mut fix);
-        let mut base = fix.clone();
-        let row = carry_start(&mut fix, CARRY_RETRY, control.days);
-        let _base_row = {
-            let _base = KeepStaleClaudeFamilyRearmForTest::new();
-            carry_start(&mut base, CARRY_RETRY, control.days)
-        };
-        assert_eq!(row["carried_pending_families"], 0, "{}", control.name);
-        for (key, entry) in &fix.files {
-            assert_eq!(
-                entry.source_file_fingerprint, base.files[key].source_file_fingerprint,
-                "{}: {key}",
-                control.name
-            );
-        }
     }
 }
 
@@ -1906,7 +1818,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
@@ -1947,7 +1858,7 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
     }
 }
 
-fn scoped_retry_record(
+pub(super) fn scoped_retry_record(
     key: &str,
     value: serde_json::Value,
 ) -> claude_request_census::ClaudeRequestCensusRecord {
@@ -2100,7 +2011,6 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
@@ -3699,7 +3609,7 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
+
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::E2_GROUPING,
@@ -3873,24 +3783,6 @@ fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
 }
 
 #[test]
-fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates() {
-    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let mut index = ScanIndex {
-        claude_request_identity_contract: Some(String::new()),
-        ..Default::default()
-    };
-    index.observe_claude_request_identity_contract(true);
-    index.observe_claude_request_identity_contract(true);
-    index.observe_claude_request_identity_contract(false);
-    index.observe_claude_request_identity_contract(false);
-    let counts = scope.finish().contract;
-    assert_eq!(counts.identity_contract_transition.from_empty, 1);
-    assert_eq!(counts.identity_contract_transition.to_empty, 1);
-    assert_eq!(counts.identity_contract_latch.set, 1);
-    assert_eq!(counts.identity_contract_latch.cleared, 0);
-}
-
-#[test]
 fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -3983,7 +3875,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         None,
         &[],
         false,
-        false,
         true,
     );
     assert_eq!(
@@ -4018,7 +3909,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         &[],
         false,
         false,
-        false,
     );
     assert_eq!(
         scan.index.claude_request_identity_contract.as_deref(),
@@ -4030,636 +3920,1046 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
     );
 }
 
-
-mod terminal_off_admission_tests {
-    use super::*;
-
-    /// [behaviour] Containment contract: four batches resume across mid admission restart.
-    #[test]
-    fn terminal_off_four_batches_resume_across_mid_admission_restart() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        // 385 roots = three full 128-root batches plus one; scaled from 8,500.
-        if !crate::heap_layout_bound::layout_supported() {
-            return;
-        }
-        let mut fixture = retry_durable_fixture(1, 384);
-        let root = fixture._scratch.to_path_buf();
-        retry_test_context(&mut fixture.index, &root);
-        {
-            let t = fixture.index.traversal.as_mut().unwrap();
-            t.pending_directories.clear();
-            t.pending_candidates.clear();
-            t.counts = ScanTraversalCounts::default();
-        }
-        let window = fixture
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .census_window_end
-            .clone();
-        // Seed stale data independently of the window; all 385 are old roots.
-        for p in fixture.index.claude_usage_family_pending.values_mut() {
-            p.census_window_end = "2026-08-01T07:00:00Z".into();
-        }
-        let stale = claude_terminal_stale_roots(&fixture.index, &window);
-        let context = fixture
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .context_fingerprint
-            .clone();
-        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-            context_fingerprint: context,
-            process: claude_full_rearm_process(),
-            full_rearm_window: false,
-            admission: Some(claude_retry_admission_start(
-                &fixture.index,
-                &stale,
-                CARRY_RETRY,
-                None,
-            )),
-        });
-        let original = fixture
-            .index
-            .files
-            .iter()
-            .map(|(k, e)| (k.clone(), e.source_file_fingerprint.clone()))
-            .collect::<BTreeMap<_, _>>();
-        for batch in 0..4 {
-            assert_eq!(
-                ensure_bounded_traversal(
-                    SnapshotSource::ClaudeCode,
-                    std::slice::from_ref(&root),
-                    &mut fixture.index,
-                    CARRY_RETRY,
-                    BACKFILL_WINDOW_DAYS
-                ),
-                TraversalProgress::Resumed
-            );
-            let state = fixture
-                .index
-                .claude_stale_family_carry
-                .origin
-                .as_ref()
-                .unwrap()
-                .admission
-                .as_ref()
-                .unwrap();
-            let covered = ((batch + 1) * 128).min(385);
-            assert_eq!(
-                state.after_root.as_deref(),
-                Some(fixture.roots[covered - 1].as_str())
-            );
-            assert!(state.progressed);
-            assert_eq!(
-                fixture.index.traversal.as_ref().unwrap().census_window_end,
-                window
-            );
-            for (k, fp) in &original {
-                assert_eq!(&fixture.index.files[k].source_file_fingerprint, fp);
-            }
-            assert!(
-                !fixture
-                    .index
-                    .claude_stale_family_carry
-                    .contains(&fixture.roots[0]),
-                "held family never credited"
-            );
-            let (families, age) = carry_admission_debt(&fixture.index, CARRY_RETRY);
-            assert_eq!(
-                families,
-                385 - fixture.index.claude_stale_family_carry.roots.len()
-            );
-            assert_eq!(
-                age,
-                rfc3339_unix_seconds(CARRY_RETRY).unwrap()
-                    - rfc3339_unix_seconds("2026-08-01T07:00:00Z").unwrap()
-            );
-            if batch == 1 {
-                // Real old-decoder-compatible JSON roundtrip, then simulate the
-                // next process's invalid old-process carry provenance.
-                fixture.index = retry_test_reload(&mut fixture.index, &root.join("index.json"));
-                fixture
-                    .index
-                    .claude_stale_family_carry
-                    .origin
-                    .as_mut()
-                    .unwrap()
-                    .process = claude_full_rearm_process().wrapping_add(1);
-            }
-        }
-        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
-        assert!(
-            fixture
-                .index
-                .claude_stale_family_carry
-                .origin
-                .as_ref()
-                .unwrap()
-                .admission
-                .as_ref()
-                .unwrap()
-                .roots_complete
-        );
-        assert!(!claude_terminal_authority(&fixture.index, true, &window));
-    }
-
-    /// [behaviour] Containment contract: rejected with holds resumes but real loss retries.
-    #[test]
-    fn terminal_off_rejected_with_holds_resumes_but_real_loss_retries() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        let mut fixture = retry_durable_fixture(1, 2);
-        let root = fixture._scratch.to_path_buf();
-        retry_test_context(&mut fixture.index, &root);
-        let t = fixture.index.traversal.as_mut().unwrap();
-        t.pending_directories.clear();
-        t.pending_candidates.clear();
-        t.counts = ScanTraversalCounts::default();
-        let window = t.census_window_end.clone();
-        let stale = fixture.roots.iter().cloned().collect();
-        let state = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
-        let context = fixture
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .context_fingerprint
-            .clone();
-        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-            context_fingerprint: context,
-            process: claude_full_rearm_process(),
-            full_rearm_window: false,
-            admission: Some(state),
-        });
-        fixture
-            .index
-            .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
-        let bits = fixture.index.unsettled_cause_bits();
-        assert_eq!(
-            ensure_bounded_traversal(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root),
-                &mut fixture.index,
-                CARRY_RETRY,
-                BACKFILL_WINDOW_DAYS
-            ),
-            TraversalProgress::Resumed
-        );
-        assert_eq!(
-            fixture.index.unsettled_cause_bits(),
-            bits,
-            "scheduling does not settle rejection/transport debt"
-        );
-        assert_eq!(
-            fixture.index.traversal.as_ref().unwrap().census_window_end,
-            window
-        );
-        fixture
-            .index
-            .traversal
-            .as_mut()
-            .unwrap()
-            .counts
-            .disappeared_file_count = 1;
-        assert_eq!(
-            ensure_bounded_traversal(
-                SnapshotSource::ClaudeCode,
-                &[root],
-                &mut fixture.index,
-                CARRY_RETRY,
-                BACKFILL_WINDOW_DAYS
-            ),
-            TraversalProgress::Started
-        );
-    }
-
-    /// [behaviour] Containment contract: cancel refund and passed rewind never overwrite debt.
-    #[test]
-    fn terminal_off_cancel_refund_and_passed_rewind_never_overwrite_debt() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        let mut index = carry_index();
-        let [root, child] = carry_family_keys();
-        let original = index.files[&child].source_file_fingerprint.clone();
-        let window = index.traversal.as_ref().unwrap().census_window_end.clone();
-        let t = index.traversal.as_mut().unwrap();
-        t.scan_roots = vec![PathBuf::from("/carry/projects")];
-        t.observed_index_keys.insert(child.clone());
-        index
-            .claude_stale_family_carry
-            .roots
-            .insert(CARRY_ROOT.into());
-        {
-            let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
-            assert!(refund_claude_stale_family_carry(&mut index));
-        }
-        assert_eq!(index.files[&child].source_file_fingerprint, original);
-        assert_eq!(index.traversal.as_ref().unwrap().census_window_end, window);
-        assert!(!index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_directories
-            .is_empty());
-        index
-            .files
-            .get_mut(&root)
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-        index
-            .claude_stale_family_carry
-            .roots
-            .insert(CARRY_ROOT.into());
-        let (cleared, _) =
-            replay_and_rearm_claude_family(&mut index, CARRY_ROOT, &root, &VecDeque::new(), false);
-        assert_eq!(cleared, 0);
-        assert_eq!(index.files[&child].source_file_fingerprint, original);
-        assert!(index.files[&root].source_file_fingerprint.is_empty());
-    }
-
-    /// [behaviour] Containment contract: hard gate rejects partial coverage even with matching certificate.
-    #[test]
-    fn terminal_off_hard_gate_rejects_partial_coverage_even_with_matching_certificate() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        let mut index = carry_index();
-        let member = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
-        let pending = index
-            .claude_usage_family_pending
-            .get_mut(CARRY_ROOT)
-            .unwrap();
-        pending.census_window_end = CARRY_RETRY.into();
-        pending.member_request_id_hashes.remove(&member);
-        pending.member_occurrences.remove(&member);
-        let origin = ClaudeFullRearmWindow {
-            context_fingerprint: "scope".into(),
-            process: claude_full_rearm_process(),
-            window_ends: BTreeSet::from([CARRY_RETRY.into()]),
-            member_digests: BTreeMap::new(),
-        };
-        index.claude_full_rearm_progress.traversal_origin = Some(origin.clone());
-        index.claude_full_rearm_progress.complete_rebuild_read = Some(ClaudeCompleteRebuildRead {
-            origin,
-            members_digest: claude_rebuild_members_digest(&index),
-        });
-        assert!(
-            !claude_terminal_reconstructed(&index, CARRY_RETRY),
-            "matching revisions cannot substitute for unread child coverage"
-        );
-        assert!(!claude_terminal_authority(&index, true, CARRY_RETRY));
-    }
-
-    /// [behaviour] Containment contract: completed admission still services a new due horizon.
-    #[test]
-    fn terminal_off_completed_admission_still_services_a_new_due_horizon() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        let mut fixture = retry_durable_fixture(1, 2);
-        let root = fixture._scratch.to_path_buf();
-        retry_test_context(&mut fixture.index, &root);
-        let t = fixture.index.traversal.as_mut().unwrap();
-        t.counts = ScanTraversalCounts::default();
-        t.pending_directories.clear();
-        t.pending_candidates.clear();
-        let context = t.context_fingerprint.clone();
-        let stale = fixture.roots.iter().cloned().collect();
-        let mut state = claude_retry_admission_start(&fixture.index, &stale, CARRY_FAILED, None);
-        state.after_root = stale.last().cloned();
-        state.roots_complete = true;
-        state.due_complete = true;
-        state.complete = true;
-        let cutoff = state.due_through;
-        fixture
-            .index
-            .claude_usage_authority_quarantine
-            .get_mut(&fixture.roots[0])
-            .unwrap()
-            .retry_after_unix_seconds = cutoff + 1;
-        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-            context_fingerprint: context,
-            process: claude_full_rearm_process(),
-            full_rearm_window: false,
-            admission: Some(state),
-        });
-        assert_eq!(
-            ensure_bounded_traversal(
-                SnapshotSource::ClaudeCode,
-                &[root],
-                &mut fixture.index,
-                CARRY_RETRY,
-                BACKFILL_WINDOW_DAYS
-            ),
-            TraversalProgress::Resumed
-        );
-        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
-        let state = fixture
-            .index
-            .claude_stale_family_carry
-            .origin
-            .as_ref()
-            .unwrap()
-            .admission
-            .as_ref()
-            .unwrap();
-        assert_eq!(state.served_before, cutoff);
-        assert!(state.due_through > cutoff);
-        assert!(fixture
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .any(|p| claude_index_path_member_ref(&p.path)
-                .is_some_and(|m| m.root == fixture.roots[0])));
-    }
-
-    /// [behaviour] Containment contract: new due horizon advances 64 missing paths then next after reload.
-    #[test]
-    fn terminal_off_new_due_horizon_advances_64_missing_paths_then_next_after_reload() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-        if !crate::heap_layout_bound::layout_supported() {
-            return;
-        }
-        let mut fixture = retry_durable_fixture(65, 0);
-        let root = fixture._scratch.to_path_buf();
-        retry_test_context(&mut fixture.index, &root);
-        let t = fixture.index.traversal.as_mut().unwrap();
-        t.counts = ScanTraversalCounts::default();
-        t.pending_directories.clear();
-        t.pending_candidates.clear();
-        let context = t.context_fingerprint.clone();
-        let window = t.census_window_end.clone();
-        let stale = fixture.roots.iter().cloned().collect();
-        let mut state = claude_retry_admission_start(&fixture.index, &stale, CARRY_FAILED, None);
-        state.after_root = stale.last().cloned();
-        state.roots_complete = true;
-        state.due_complete = true;
-        state.complete = true;
-        let cutoff = state.due_through;
-        for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
-            record.retry_after_unix_seconds = cutoff + 1;
-        }
-        let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
-        for key in &keys {
-            fs::remove_file(key).unwrap();
-        }
-        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-            context_fingerprint: context,
-            process: claude_full_rearm_process(),
-            full_rearm_window: false,
-            admission: Some(state),
-        });
-        let (index, page, _) = retry_test_page(fixture.index, &root, CARRY_RETRY, 64);
-        fixture.index = index;
-        assert_eq!(page.scanned_file_count, 0);
-        let state = fixture
-            .index
-            .claude_stale_family_carry
-            .origin
-            .as_ref()
-            .unwrap()
-            .admission
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            state.due_after_path.as_ref(),
-            Some(&keys[63]),
-            "actual selection records service past the frozen census clock"
-        );
-        assert_eq!(
-            fixture.index.traversal.as_ref().unwrap().census_window_end,
-            window
-        );
-        fixture.index = retry_test_reload(&mut fixture.index, &root.join("due-index.json"));
-        let (index, _, _) = retry_test_page(fixture.index, &root, CARRY_RETRY, 64);
-        fixture.index = index;
-        let state = fixture
-            .index
-            .claude_stale_family_carry
-            .origin
-            .as_ref()
-            .unwrap()
-            .admission
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            state.due_after_path.as_ref(),
-            keys.last(),
-            "later missing path is not starved by the first 64"
-        );
-        assert_eq!(
-            fixture.index.traversal.as_ref().unwrap().census_window_end,
-            window
-        );
-    }
-}
-
+/// [regress] A resumed Codex page erased outstanding Claude full_cause tags.
 #[test]
-fn stale_start_clear_cause_matches_the_actual_traversal_start_reason() {
+fn resumed_codex_page_preserves_claude_full_cause() {
     use crate::transcript_acquisition::{FullReason, ReadMode};
-    use rearm_cause::Cause;
-    for (cause, days, no_traversal, label) in [
-        (
-            Cause::TerminalUnhealthyRetry,
-            BACKFILL_WINDOW_DAYS,
-            false,
-            "terminal_unhealthy_retry",
-        ),
-        (
-            Cause::ContextChanged,
-            BACKFILL_WINDOW_DAYS + 1,
-            false,
-            "context_changed",
-        ),
-        (
-            Cause::NoRetainedTraversal,
-            BACKFILL_WINDOW_DAYS,
-            true,
-            "no_retained_traversal",
-        ),
-    ] {
-        let mut index = carry_index();
-        if no_traversal {
-            index.traversal = None;
-        }
-        let _base = KeepStaleClaudeFamilyRearmForTest::new();
-        let start = carry_start(&mut index, CARRY_RETRY, days);
-        assert_eq!(start["reason"], label);
-        let key = carry_key(CARRY_UNWITNESSED, None);
-        assert!(index.files[&key].source_file_fingerprint.is_empty());
-        let mode = ReadMode::Full(FullReason::StateMissing);
-        let probe = crate::local_resource_diagnostics::Probe::start();
-        probe.rearm_full_selected(&key, mode);
-        probe.rearm_full_completed(&key, mode, 123);
-        assert_eq!(
-            serde_json::to_value(probe.rearm_fulls()).unwrap(),
-            json!({
-                format!("rearm_cleared{{{label}}}"): {"count": 1, "completed_native_bytes": 123}
-            })
-        );
-        // The expected cause is a closed enum rather than a stored string.
-        let mut entry = index.files[&key].clone();
-        entry.source_file_fingerprint = "proven".into();
-        rearm_cause::clear(&key, &mut entry, cause);
-        rearm_cause::reproven(&key);
-    }
-}
+    let key = carry_key(CARRY_ROOT, None);
+    let mut entry = manifest_index_entry(Some("accepted"));
+    entry.source_file_fingerprint = "proven".into();
+    rearm_cause::clear(&key, &mut entry, rearm_cause::Cause::ContextChanged);
 
-
-const TERMINAL_OFF_DESTINATION: &str = "terminal-off-destination";
-
-/// Containment's red-retry fixture: the same failed window and families as
-/// `carry_index`, with an explicit upload context and contract latch.
-fn terminal_off_rearm_index(context: Option<&str>, latched: bool) -> ScanIndex {
-    let mut index = ScanIndex {
-        claude_request_identity_contract: Some(
-            crate::snapshots::claude_request_identity::COLLECTOR.to_string(),
-        ),
-        claude_request_identity_contract_changed: latched,
-        upload_context_fingerprint: context.map(str::to_string),
-        active_upload_context_fingerprint: Some(TERMINAL_OFF_DESTINATION.to_string()),
-        claude_duplicate_request_witness_overflowed: true,
-        ..ScanIndex::default()
-    };
-    carry_file(&mut index, CARRY_OTHER, None);
+    let mut codex = ScanIndex::default();
     ensure_bounded_traversal(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         &[],
-        &mut index,
+        &mut codex,
         CARRY_FAILED,
         BACKFILL_WINDOW_DAYS,
     );
-    carry_family(&mut index, CARRY_ROOT, &[None, Some(CARRY_AGENT)], true);
-    carry_family(&mut index, CARRY_UNWITNESSED, &[None], false);
-    carry_red(&mut index, CARRY_FAILED, 1);
-    index
-}
-
-/// A real red-retry start: the red traversal's retry is due and the sweep
-/// left an unsettled upload.
-fn terminal_off_red_retry_start(index: &mut ScanIndex, at: &str) -> serde_json::Value {
-    index.bounded_sweep_had_unsettled_upload = true;
-    carry_start(index, at, BACKFILL_WINDOW_DAYS)
-}
-
-fn terminal_off_stale_member_keys() -> [String; 3] {
-    [
-        carry_key(CARRY_ROOT, None),
-        carry_key(CARRY_ROOT, Some(CARRY_AGENT)),
-        carry_key(CARRY_UNWITNESSED, None),
-    ]
-}
-
-/// What the first start's re-read under this generation commits again: each
-/// member's unchanged revision.
-fn terminal_off_reread_stale_members(index: &mut ScanIndex) {
-    for (root, subagent) in [
-        (CARRY_ROOT, None),
-        (CARRY_ROOT, Some(CARRY_AGENT)),
-        (CARRY_UNWITNESSED, None),
-    ] {
-        let entry = index.files.get_mut(&carry_key(root, subagent)).unwrap();
-        assert!(entry.source_file_fingerprint.is_empty(), "the first start owed this read");
-        entry.source_file_fingerprint = format!("rev-{}", carry_member(root, subagent));
-    }
-}
-
-/// Lead B B-P5: neither the contract latch nor source-wide context adoption
-/// discharges under containment. Two red-retry starts in one generation re-arm
-/// the stale families once; a new generation re-arms them once more.
-fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, latched: bool) {
-    let mut index = terminal_off_rearm_index(context, latched);
-    assert!(claude_terminal_off());
-    assert!(
-        !claude_redundant_stale_clear_suppressed(&index),
-        "this generation owes the semantic clear"
-    );
-    // AutoReview: a start whose working index is discarded (cancelled page,
-    // failed checkpoint save) serves nothing to the reloaded index.
-    let mut discarded = index.clone();
-    let lost = terminal_off_red_retry_start(&mut discarded, CARRY_RETRY);
-    assert_eq!(lost["rearmed_index_files"], 3);
-    drop(discarded);
-    let first = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
-    assert_eq!(first["stale_pending_families"], 2);
-    assert_eq!(first["rearmed_index_files"], 3, "one semantic re-read per member");
-    assert!(!index.files[&carry_key(CARRY_OTHER, None)]
-        .source_file_fingerprint
-        .is_empty());
-    terminal_off_reread_stale_members(&mut index);
-    carry_red(&mut index, CARRY_RETRY, 2);
-
-    let second = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
-    assert_eq!(second["stale_pending_families"], 2, "the families stay stale");
     assert_eq!(
-        second["rearmed_index_files"], 0,
-        "the same generation never re-arms its stale families again"
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[],
+            &mut codex,
+            CARRY_FAILED,
+            BACKFILL_WINDOW_DAYS,
+        ),
+        TraversalProgress::Resumed,
     );
-    for key in terminal_off_stale_member_keys() {
-        assert!(!index.files[&key].source_file_fingerprint.is_empty(), "{key}");
+    let mode = ReadMode::Full(FullReason::StateMissing);
+    let probe = crate::local_resource_diagnostics::Probe::start();
+    probe.rearm_full_selected(&key, mode);
+    probe.rearm_full_completed(&key, mode, 123);
+    assert_eq!(
+        serde_json::to_value(probe.rearm_fulls()).unwrap(),
+        json!({"rearm_cleared{context_changed}": {"count": 1, "completed_native_bytes": 123}}),
+    );
+}
+
+/// Evidence-owed fixture: the scoped-retry families, each member's census record bound
+/// to the request ids its stored pending holds, after one whole-set re-arm
+/// (BASE start: nothing carried) under `on`.
+fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
+    let mut fixture = scoped_retry_fixture(0, healthy, false);
+    for candidate in &fixture.candidates {
+        let key = local_index_key(&candidate.path);
+        let (root, member) = claude_index_path_family_member(&candidate.path).unwrap();
+        let hashes = &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes
+            [&member];
+        let record = scoped_retry_record(
+            &key,
+            serde_json::json!({
+                "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+                "fp": fixture.index.files[&key].source_file_fingerprint,
+                "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+                "s": "exact",
+                "h": hashes.iter().map(|hash| &hash[..16]).collect::<String>(),
+                "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+                "bd": 1, "bn": 1,
+            }),
+        );
+        fixture.index.claude_request_census.insert(key, record);
     }
-    // Containment discharged nothing: the generation is still the same.
-    assert_eq!(index.upload_context_fingerprint.as_deref(), context);
-    assert_eq!(index.claude_request_identity_contract_changed, latched);
-
-    // A new generation (here a destination toggle) is owed exactly one more.
-    index.active_upload_context_fingerprint = Some("terminal-off-toggled-destination".into());
-    carry_red(&mut index, CARRY_SECOND_RETRY, 3);
-    let toggled = terminal_off_red_retry_start(&mut index, "2026-08-02T07:40:00Z");
-    assert_eq!(toggled["rearmed_index_files"], 3);
+    {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["rearmed_index_files"], healthy);
+    }
+    let window = fixture.index.traversal.as_ref().unwrap().census_window_end.clone();
+    (fixture, window)
 }
 
-/// [regress] Containment regression: red retries with no adopted context rearm stale families once.
-#[test]
-fn terminal_off_red_retries_with_no_adopted_context_rearm_stale_families_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    terminal_off_red_retries_rearm_once_per_generation(None, false);
+/// The traversal's selection with the owed resolver: the members it parses.
+fn owed_selected_parses(
+    index: &mut ScanIndex,
+    page: &mut evidence_owed::Page,
+    candidates: &[CandidateFile],
+    window: &str,
+) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let (mut decision, mut reason) = index.candidate_decision_with_reason_at(candidate, 0);
+            evidence_owed::resolve(index, page, candidate, window, &mut decision, &mut reason);
+            decision == CandidateDecision::Parse
+        })
+        .count()
 }
 
-/// [regress] Containment regression: red retries with a latched contract rearm stale families once.
+/// [regress] Most Claude Full reads were `selection_cleared`: a whole-set
+/// re-arm of unchanged ACKed families reads
+/// every member on main; with evidence owed it reads none of them, and a
+/// changed member is read once.
 #[test]
-fn terminal_off_red_retries_with_a_latched_contract_rearm_stale_families_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    terminal_off_red_retries_rearm_once_per_generation(Some(TERMINAL_OFF_DESTINATION), true);
+fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for on in [false, true] {
+        let (mut fixture, window) = owed_rearmed(4, on);
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let mut candidates = fixture.candidates.clone();
+        candidates[0].source_file_fingerprint = "f".repeat(64);
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let parsed = owed_selected_parses(
+            &mut fixture.index,
+            &mut evidence_owed::Page::default(),
+            &candidates,
+            &window,
+        );
+        assert_eq!(parsed, if on { 1 } else { 4 }, "on={on}");
+        // Every owed visit is counted by outcome and evidence age.
+        let counts = scope.finish().contract.evidence_owed;
+        if on {
+            assert_eq!((counts.restamped, counts.changed, counts.read), (3, 1, 0));
+            let aged = counts.age_le_1h
+                + counts.age_le_1d
+                + counts.age_le_7d
+                + counts.age_gt_7d
+                + counts.age_unknown;
+            assert_eq!(aged, 4);
+        } else {
+            assert_eq!(counts, Default::default());
+        }
+        let owed = fixture.index.files.values().filter(|e| e.evidence_owed);
+        assert_eq!(owed.count(), usize::from(on), "only the changed member stays owed");
+    }
 }
 
-/// [regress] Containment regression: suppressed start still rearms an unacked head.
-/// Lead B B-P2: with the redundant stale clear suppressed, a member whose head
-/// body the server never ACKed is still cleared (Parse); ACKed members keep
-/// their revision (Skip).
+/// [money] A re-stamp's proof equals a fresh
+/// Full's (the family pending a Full folds in this window: same ids, same
+/// occurrences, observed for fence coverage), including a confirmed-empty
+/// member with no pending re-stamped from its census record (a Full folds
+/// nothing for it); both arms also against a real parse and fold of the same
+/// bytes and from an identity-incomplete record of the same revision; an
+/// owed cap-invalid family gets no read and no credit
+/// unless its recorded requests fit the cap; and census completion retires
+/// only proven families.
 #[test]
-fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    let mut index = terminal_off_rearm_index(Some(TERMINAL_OFF_DESTINATION), false);
-    let unacked = carry_key(CARRY_UNWITNESSED, None);
-    assert!(index
-        .accepted_snapshot_fingerprints
-        .remove(&format!("body-{}", carry_member(CARRY_UNWITNESSED, None))));
-    assert!(claude_redundant_stale_clear_suppressed(&index));
-    let row = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
-    assert_eq!(row["stale_pending_families"], 2);
-    assert_eq!(row["rearmed_index_files"], 1, "only the unaccepted head");
-    assert!(
-        index.files[&unacked].source_file_fingerprint.is_empty(),
-        "unaccepted debt stays debt: Parse"
+fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    owed_restamp_equals_a_real_fold_of_the_same_bytes();
+    owed_identity_incomplete_restamp_equals_a_full();
+    let (mut fixture, window) = owed_rearmed(2, true);
+    let before = fixture.index.claude_usage_family_pending.clone();
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&fixture.index, &window),
+        2,
+        "owed members are not observed before their selection"
     );
-    for key in carry_family_keys() {
-        assert!(
-            !index.files[&key].source_file_fingerprint.is_empty(),
-            "the ACKed control keeps its suppressed clear: Skip"
+    let parsed = owed_selected_parses(
+        &mut fixture.index,
+        &mut evidence_owed::Page::default(),
+        &fixture.candidates,
+        &window,
+    );
+    assert_eq!(parsed, 0);
+    for (root, pending) in &before {
+        let full = ClaudeUsageFamilyPending {
+            census_window_end: window.clone(),
+            ..pending.clone()
+        };
+        assert_eq!(fixture.index.claude_usage_family_pending[root], full);
+    }
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&fixture.index, &window),
+        0
+    );
+
+    // A confirmed-empty member whose family has no pending (retired at a
+    // completion): its record is current and holds no requests, so it
+    // re-stamps from the record with no read. Pending stays exactly as a Full
+    // leaves it (the empty parse yields no snapshot to fold) and the member
+    // counts as observed. Under the latch, or with requests in the record, it
+    // still reads.
+    let (fixture, window) = owed_rearmed(2, true);
+    let candidates = &fixture.candidates[1..];
+    let key = local_index_key(&candidates[0].path);
+    let (root, _) = claude_index_path_family_member(&candidates[0].path).unwrap();
+    let record = |hashes: Option<&str>| {
+        let mut value = serde_json::json!({
+            "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": fixture.index.files[&key].source_file_fingerprint,
+            "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "s": if hashes.is_some() { "exact" } else { "empty" },
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
+        });
+        if let Some(hashes) = hashes {
+            value["h"] = hashes.into();
+        }
+        scoped_retry_record(&key, value)
+    };
+    let mut empty = fixture.index.clone();
+    empty.claude_request_identity_contract =
+        Some(claude_request_identity::cycle_contract(true).into());
+    empty.claude_usage_family_pending.remove(&root);
+    empty.confirmed_empty_files.insert(key.clone());
+    empty
+        .claude_request_census
+        .insert(key.clone(), record(None));
+    let full = empty.claude_usage_family_pending.clone();
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&empty, &window),
+        2
+    );
+    let mut index = empty.clone();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let parsed = owed_selected_parses(
+        &mut index,
+        &mut evidence_owed::Page::default(),
+        candidates,
+        &window,
+    );
+    assert_eq!(parsed, 0);
+    assert_eq!(scope.finish().contract.evidence_owed.restamped_from_record, 1);
+    assert_eq!(index.claude_usage_family_pending, full);
+    assert!(!index.files[&key].evidence_owed);
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+        1
+    );
+    for (latched, requests) in [(true, false), (false, true)] {
+        let mut index = empty.clone();
+        index.claude_request_identity_contract_changed = latched;
+        if requests {
+            index
+                .claude_request_census
+                .insert(key.clone(), record(Some("0123456789abcdef")));
+        }
+        let parsed = owed_selected_parses(
+            &mut index,
+            &mut evidence_owed::Page::default(),
+            candidates,
+            &window,
+        );
+        assert_eq!(parsed, 1, "latched={latched} requests={requests}");
+        assert!(index.files[&key].evidence_owed);
+    }
+
+    // Cap-invalid: invalid, evidence-free pending from the record's window.
+    let (mut fixture, window) = owed_rearmed(1, true);
+    let root = fixture.roots[0].clone();
+    let pending = fixture.index.claude_usage_family_pending.get_mut(&root).unwrap();
+    pending.member_occurrences.clear();
+    pending.member_request_id_hashes.clear();
+    pending.invalid = true;
+    let invalid = pending.clone();
+    // Under the identity-contract latch it is read, never kept waiting.
+    for (cap, latched, parsed) in [
+        (0, false, 0),
+        (MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, false, 1),
+        (0, true, 1),
+    ] {
+        let mut index = fixture.index.clone();
+        index.claude_request_identity_contract_changed = latched;
+        let mut page = evidence_owed::Page {
+            cap,
+            ..Default::default()
+        };
+        assert_eq!(
+            owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
+            parsed,
+            "cap {cap} latched {latched}"
+        );
+        assert_eq!(index.claude_usage_family_pending[&root], invalid);
+        assert!(index.files.values().all(|entry| entry.evidence_owed));
+        assert_eq!(
+            claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+            1
         );
     }
-    // The next start in the same generation still owes the unACKed head.
-    index.files.get_mut(&unacked).unwrap().source_file_fingerprint =
-        format!("rev-{}", carry_member(CARRY_UNWITNESSED, None));
-    carry_red(&mut index, CARRY_RETRY, 2);
-    let again = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
-    assert_eq!(again["rearmed_index_files"], 1);
+
+    // An indexed family this census did not prove stays owed.
+    let indexed = BTreeSet::from([root.clone()]);
+    assert!(evidence_owed::owed_at_completion(
+        &root, &invalid, false, &indexed
+    ));
+    assert!(!evidence_owed::owed_at_completion(
+        &root, &invalid, true, &indexed
+    ));
+    assert!(!evidence_owed::owed_at_completion(
+        &root,
+        &invalid,
+        false,
+        &BTreeSet::new()
+    ));
+}
+
+/// Both re-stamp arms against a real parse and fold of the same bytes (the
+/// account family fixture's root and child, plus two members whose transcripts
+/// parse to no snapshot: one with no response, one whose only response is an
+/// API error, an id with no usage, recorded identity incomplete): the pending
+/// a Full folds in this window, with its ids and per-request usage, equals the
+/// earlier window's real fold re-stamped from pending and from the census
+/// records, with no read; each record stays as the Full rewrites it, and fence
+/// coverage is the Full's. No body is re-emitted: the bodies the earlier fold
+/// emitted equal a Full's (the emitted-money oracle, with placement), so the
+/// accepted totals and placement stand.
+fn owed_restamp_equals_a_real_fold_of_the_same_bytes() {
+    let (dir, parent, items) = claude_account_family_fixture(false);
+    let subagents = dir.join(&parent).join("subagents");
+    let empty = subagents.join("agent-b4d1585d310070d0f.jsonl");
+    fs::write(
+        &empty,
+        format!(
+            "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"user\",\"sessionId\":\"{parent}\",\"agentId\":\"b4d1585d310070d0f\",\"isSidechain\":true,\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    let api_error = subagents.join("agent-c4d1585d310070d0f.jsonl");
+    fs::write(
+        &api_error,
+        format!(
+            "{{\"timestamp\":\"2026-08-02T07:00:06Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"agentId\":\"c4d1585d310070d0f\",\"isSidechain\":true,\"requestId\":\"req_err\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    for path in [&empty, &api_error] {
+        assert!(
+            parse_claude_code_jsonl_file(path, CARRY_FAILED, "empty".to_string())
+                .unwrap()
+                .is_empty(),
+            "a confirmed-empty parse"
+        );
+    }
+    let paths = [
+        dir.join(format!("{parent}.jsonl")),
+        subagents.join("agent-a4d1585d310070d0f.jsonl"),
+        empty,
+        api_error.clone(),
+    ];
+    let (mut index, candidates) = real_family_index(&paths);
+    index
+        .confirmed_empty_files
+        .insert(local_index_key(&paths[2]));
+    index
+        .confirmed_empty_files
+        .insert(local_index_key(&paths[3]));
+    let mut full = index.clone();
+    let full_bodies = fold_real(&mut full, &items, CARRY_RETRY);
+    let folded = &full.claude_usage_family_pending[&parent];
+    assert!(
+        !folded.invalid && folded.member_occurrences.len() == 2,
+        "{folded:?}"
+    );
+
+    let mut owed = index;
+    let earlier_bodies = fold_real(&mut owed, &items, CARRY_FAILED);
+    assert_bodies_equal_a_full(&full_bodies, &earlier_bodies);
+    let api_error = local_index_key(&api_error);
+    for path in &paths {
+        let key = local_index_key(path);
+        let (_, member) = claude_index_path_family_member(path).unwrap();
+        let fingerprint = owed.files[&key].source_file_fingerprint.clone();
+        let hashes = owed.claude_usage_family_pending[&parent]
+            .member_request_id_hashes
+            .get(&member)
+            .map(|hashes| hashes.iter().map(|hash| &hash[..16]).collect::<String>());
+        let mut record = serde_json::json!({
+            "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": fingerprint,
+            "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "s": if hashes.is_some() { "exact" } else { "empty" },
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
+        });
+        if let Some(hashes) = hashes {
+            record["h"] = hashes.into();
+        }
+        if key == api_error {
+            record["s"] = "identity_incomplete".into();
+            record["h"] = format!("{:x}", Sha256::digest(b"req_err"))[..16].into();
+        }
+        let record = scoped_retry_record(&key, record);
+        owed.claude_request_census
+            .insert(key.clone(), record.clone());
+        full.claude_request_census.insert(key.clone(), record);
+        evidence_owed::clear(owed.files.get_mut(&key).unwrap());
+    }
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    for candidate in &candidates {
+        let (mut decision, mut reason) = (CandidateDecision::Skip, None);
+        evidence_owed::resolve(
+            &mut owed,
+            &mut evidence_owed::Page::default(),
+            candidate,
+            CARRY_RETRY,
+            &mut decision,
+            &mut reason,
+        );
+        assert_eq!(decision, CandidateDecision::Skip, "no read");
+    }
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!(
+        (counts.restamped, counts.restamped_from_record, counts.read),
+        (2, 2, 0),
+        "{counts:?}"
+    );
+    assert!(owed.files.values().all(|entry| !entry.evidence_owed));
+    assert_eq!(
+        owed.claude_usage_family_pending,
+        full.claude_usage_family_pending
+    );
+    assert_eq!(owed.claude_request_census, full.claude_request_census);
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&owed, CARRY_RETRY),
+        claude_duplicate_fence_coverage_missing_member_count(&full, CARRY_RETRY),
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Index entries and unchanged candidates for real transcripts, under the
+/// recorded cycle contract.
+fn real_family_index(paths: &[PathBuf]) -> (ScanIndex, Vec<CandidateFile>) {
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(
+            claude_request_identity::cycle_contract(true).to_string(),
+        ),
+        ..ScanIndex::default()
+    };
+    let mut candidates = Vec::new();
+    for path in paths {
+        let key = local_index_key(path);
+        let mut entry = manifest_index_entry(None);
+        entry.source_file_fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        let mut candidate = test_candidate(path.clone());
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        candidate.legacy_source_file_fingerprint = entry.source_file_fingerprint.clone();
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        index.files.insert(key, entry);
+        candidates.push(candidate);
+    }
+    (index, candidates)
+}
+
+/// A real fold of `page` in `window`; returns the folded bodies a Full emits.
+fn fold_real(index: &mut ScanIndex, page: &[SnapshotItem], window: &str) -> Vec<SnapshotItem> {
+    let mut page = page.to_vec();
+    apply_claude_reported_usage_with_index_and_limits(
+        &mut page,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        },
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        index,
+        false,
+        window,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+    );
+    page
+}
+
+/// A census record of this revision, read in the earlier window.
+fn real_record(
+    index: &ScanIndex,
+    key: &str,
+    shape: &str,
+    hashes: impl IntoIterator<Item = String>,
+) -> claude_request_census::ClaudeRequestCensusRecord {
+    let prefixes = hashes
+        .into_iter()
+        .map(|hash| hash[..16].to_string())
+        .collect::<BTreeSet<_>>();
+    let mut record = serde_json::json!({
+        "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+        "fp": index.files[key].source_file_fingerprint,
+        "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+        "s": shape,
+        "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+        "bd": 1, "bn": 1,
+    });
+    if !prefixes.is_empty() {
+        record["h"] = prefixes.into_iter().collect::<String>().into();
+    }
+    scoped_retry_record(key, record)
+}
+
+/// Resolve each owed candidate in `window`, then record the ones it reads as
+/// the scan does after their parse; returns them.
+fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str) -> Vec<PathBuf> {
+    let mut reads = Vec::new();
+    for candidate in candidates {
+        let (mut decision, mut reason) = (CandidateDecision::Skip, None);
+        evidence_owed::resolve(
+            index,
+            &mut evidence_owed::Page::default(),
+            candidate,
+            window,
+            &mut decision,
+            &mut reason,
+        );
+        if decision == CandidateDecision::Parse {
+            reads.push(candidate.path.clone());
+        }
+    }
+    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
+        index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+    }
+    reads
+}
+
+/// An owed member re-stamps from this revision's identity-incomplete census
+/// record (an id-less response or a repeated id; the incompleteness is a
+/// function of the file's own bytes) when its stored ids are exactly the
+/// record's, one per stored request: pending and records equal a Full's, fence
+/// coverage is the Full's and the earlier fold's bodies equal a Full's. A
+/// record that also holds an id the pending lacks (an API error's) refuses and
+/// reads. Real id-less and repeated-id transcripts, through the real fold and
+/// census record generation, get an identity-incomplete record and invalid
+/// pending (fewer ids than requests), so they never re-stamp: each is read and
+/// ends equal to a Full (pending, records, fence coverage, emitted money).
+fn owed_identity_incomplete_restamp_equals_a_full() {
+    let (dir, parent, items) = claude_account_family_fixture(false);
+    let paths = [
+        dir.join(format!("{parent}.jsonl")),
+        dir.join(&parent)
+            .join("subagents")
+            .join("agent-a4d1585d310070d0f.jsonl"),
+    ];
+    for api_error in [false, true] {
+        let (index, candidates) = real_family_index(&paths);
+        let mut owed = index.clone();
+        let earlier = fold_real(&mut owed, &items, CARRY_FAILED);
+        let mut full = index;
+        assert_bodies_equal_a_full(&fold_real(&mut full, &items, CARRY_RETRY), &earlier);
+        for path in &paths {
+            let key = local_index_key(path);
+            let (_, member) = claude_index_path_family_member(path).unwrap();
+            let mut hashes =
+                owed.claude_usage_family_pending[&parent].member_request_id_hashes[&member].clone();
+            if api_error && member == parent {
+                hashes.insert(format!("{:x}", Sha256::digest(b"req_err")));
+            }
+            let record = real_record(&owed, &key, "identity_incomplete", hashes);
+            owed.claude_request_census
+                .insert(key.clone(), record.clone());
+            full.claude_request_census.insert(key.clone(), record);
+            evidence_owed::clear(owed.files.get_mut(&key).unwrap());
+        }
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let counts = scope.finish().contract.evidence_owed;
+        assert_eq!(
+            (counts.restamped, counts.refused_record, reads.len()),
+            if api_error { (1, 1, 1) } else { (2, 0, 0) },
+            "api_error={api_error}"
+        );
+        let read = items
+            .iter()
+            .filter(|item| {
+                reads.iter().any(|path| {
+                    claude_index_path_family_member(path)
+                        .is_some_and(|(_, member)| member == item.source_session_id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        fold_real(&mut owed, &read, CARRY_RETRY);
+        assert_eq!(
+            owed.claude_usage_family_pending, full.claude_usage_family_pending,
+            "api_error={api_error}"
+        );
+        assert_eq!(owed.claude_request_census, full.claude_request_census);
+        assert_eq!(
+            claude_duplicate_fence_coverage_missing_member_count(&owed, CARRY_RETRY),
+            claude_duplicate_fence_coverage_missing_member_count(&full, CARRY_RETRY),
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+
+    let response = |session: &str, request: Option<&str>, message: &str, second: u32| {
+        let mut value = serde_json::json!({
+            "timestamp": format!("2026-08-02T07:00:{second:02}Z"),
+            "type": "assistant",
+            "sessionId": session,
+            "message": {
+                "id": message,
+                "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            },
+        });
+        if let Some(request) = request {
+            value["requestId"] = request.into();
+        }
+        format!("{value}\n")
+    };
+    for (session, lines) in [
+        (
+            "2338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+            [(Some("req_a"), "msg_a"), (None, "msg_b")],
+        ),
+        (
+            "3338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+            [(Some("req_r"), "msg_r1"), (Some("req_r"), "msg_r2")],
+        ),
+    ] {
+        let dir = crate::test_scratch::private_dir("claude-owed-identity-incomplete");
+        let path = dir.join(format!("{session}.jsonl"));
+        let body = lines
+            .iter()
+            .enumerate()
+            .map(|(second, (request, message))| response(session, *request, message, second as u32))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+        let items =
+            parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".to_string()).unwrap();
+        assert!(
+            items.len() == 1 && !items[0].claude_context_curve_identity_complete,
+            "{session}"
+        );
+        let (index, candidates) = real_family_index(std::slice::from_ref(&path));
+        let key = local_index_key(&path);
+        let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        let census = |index: &mut ScanIndex, window: &str| {
+            claude_request_census::record_claude_request_census(
+                index,
+                claude_request_census::ClaudeRequestCensusParse {
+                    path: &path,
+                    index_key: &key,
+                    source_file_fingerprint: &fingerprint,
+                    census_window_end: window,
+                    complete: true,
+                    lossy: false,
+                    source_verified: true,
+                    unchanged_source: false,
+                    itemless_request_hashes: Vec::new(),
+                    opened_birth: None,
+                    modified_unix_seconds: 0,
+                },
+                &items,
+            )
+        };
+        let mut owed = index.clone();
+        fold_real(&mut owed, &items, CARRY_FAILED);
+        census(&mut owed, CARRY_FAILED);
+        let mut full = index;
+        let full_bodies = fold_real(&mut full, &items, CARRY_RETRY);
+        census(&mut full, CARRY_RETRY);
+        assert!(
+            owed.claude_request_census
+                .get(&key)
+                .is_some_and(|record| record.idless_native_for(&fingerprint)),
+            "{session}: identity incomplete"
+        );
+        assert!(
+            owed.claude_usage_family_pending[session].invalid,
+            "{session}"
+        );
+        evidence_owed::clear(owed.files.get_mut(&key).unwrap());
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let counts = scope.finish().contract.evidence_owed;
+        assert_eq!(
+            (
+                counts.refused_pending_invalid,
+                counts.restamped,
+                reads.len()
+            ),
+            (1, 0, 1),
+            "{session}: read"
+        );
+        let bodies = fold_real(&mut owed, &items, CARRY_RETRY);
+        census(&mut owed, CARRY_RETRY);
+        assert_bodies_equal_a_full(&full_bodies, &bodies);
+        assert_eq!(
+            owed.claude_request_census, full.claude_request_census,
+            "{session}"
+        );
+        assert_eq!(
+            claude_duplicate_fence_coverage_missing_member_count(&owed, CARRY_RETRY),
+            claude_duplicate_fence_coverage_missing_member_count(&full, CARRY_RETRY),
+        );
+        assert_eq!(
+            owed.claude_usage_family_pending, full.claude_usage_family_pending,
+            "{session}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// The emitted-money oracle (`assert_equivalent`, placement included) over
+/// folded pages: `full` is what a Full of these bytes emits, `kept` the bodies
+/// a route leaves accepted without re-emitting them.
+pub(super) fn assert_bodies_equal_a_full(full: &[SnapshotItem], kept: &[SnapshotItem]) {
+    let route = |items: &[SnapshotItem]| {
+        let mut scan = SourceScanResult::empty(SnapshotSource::ClaudeCode);
+        scan.snapshots = items.to_vec();
+        sampled_scan::transition_fixture::scan_money(
+            SnapshotSource::ClaudeCode,
+            &ScanIndex::default(),
+            &scan,
+        )
+    };
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(&route(full), &route(kept));
+}
+
+/// [money] With the identity-contract latch SET, a family whose pending is
+/// stamped with the recorded, real contract re-stamps with no read and its
+/// pending equals a Full's fold, but every member stays owed so fence
+/// coverage, family proof and retirement stay vetoed. A legacy (None), mixed
+/// (other contract or body-witness revision) or placeholder-recorded family
+/// reads. A contract-unproven family proves its contract only through its own
+/// stamp.
+#[test]
+fn owed_evidence_contract_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let (mut fixture, window) = owed_rearmed(2, true);
+    fixture.index.claude_request_identity_contract =
+        Some(claude_request_identity::cycle_contract(true).into());
+    fixture.index.claude_request_identity_contract_changed = true;
+    let current = evidence_owed::EvidenceContract::current(&fixture.index);
+    assert!(current.is_some());
+    let mut mixed = fixture.index.clone();
+    mixed.active_effective_upload_body_witness_revision += 1;
+    let mixed = evidence_owed::EvidenceContract::current(&mixed);
+    let stamp = |index: &mut ScanIndex, stamp| {
+        for pending in index.claude_usage_family_pending.values_mut() {
+            pending.identity_contract = stamp;
+        }
+    };
+    let visit = |index: &mut ScanIndex| {
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let parsed = owed_selected_parses(
+            index,
+            &mut evidence_owed::Page::default(),
+            &fixture.candidates,
+            &window,
+        );
+        (parsed, scope.finish().contract.evidence_owed)
+    };
+
+    let mut index = fixture.index.clone();
+    stamp(&mut index, current);
+    let before = index.claude_usage_family_pending.clone();
+    let (parsed, counts) = visit(&mut index);
+    assert_eq!(parsed, 0);
+    assert_eq!((counts.restamped_under_latch, counts.restamped), (2, 0));
+    for (root, pending) in &before {
+        let full = ClaudeUsageFamilyPending {
+            census_window_end: window.clone(),
+            ..pending.clone()
+        };
+        assert_eq!(index.claude_usage_family_pending[root], full);
+    }
+    assert!(index.claude_request_identity_contract_changed, "latch untouched");
+    assert!(index.files.values().all(|entry| entry.evidence_owed));
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+        2,
+        "no fence coverage under the latch"
+    );
+    assert_eq!(
+        evidence_owed::owed_roots(&index),
+        fixture.roots.iter().cloned().collect(),
+        "family proof skips owed roots"
+    );
+
+    let mut placeholder = fixture.index.clone();
+    stamp(&mut placeholder, current);
+    placeholder.claude_request_identity_contract =
+        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL.into());
+    for (name, mut index) in [
+        ("legacy", fixture.index.clone()),
+        ("mixed", {
+            let mut index = fixture.index.clone();
+            stamp(&mut index, mixed);
+            index
+        }),
+        ("placeholder", placeholder),
+    ] {
+        let (parsed, counts) = visit(&mut index);
+        assert_eq!(parsed, 2, "{name}");
+        assert_eq!(
+            (counts.refused_contract_latch, counts.restamped_under_latch),
+            (2, 0),
+            "{name}"
+        );
+    }
+
+    // After an exempt latch clear and the quarantine lifting, the family
+    // proves its contract only through its own stamp: without it every owed
+    // member takes the Full path, never a re-stamp through the cleared latch.
+    for (stamped, parsed, restamped, refused) in [(false, 2, 0, 2), (true, 0, 2, 0)] {
+        let mut index = fixture.index.clone();
+        index.claude_request_identity_contract_changed = false;
+        stamp(&mut index, stamped.then_some(current).flatten());
+        for pending in index.claude_usage_family_pending.values_mut() {
+            pending.contract_unproven = true;
+        }
+        let (got, counts) = visit(&mut index);
+        assert_eq!(
+            (got, counts.restamped, counts.refused_contract_unproven),
+            (parsed, restamped, refused),
+            "stamped={stamped}"
+        );
+    }
+}
+
+/// [behaviour] Owed Fulls share ONE per-page allowance
+/// (the paced history-upgrade re-read budget). Past it an owed read is
+/// deferred, counted, and requeued as a non-member re-read, still owed.
+#[test]
+fn owed_evidence_reads_are_capped_per_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let (mut fixture, window) = owed_rearmed(3, true);
+    // No pending to re-stamp from and requests in the record: each must read.
+    fixture.index.claude_usage_family_pending.clear();
+    let mut index = fixture.index.clone();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let parsed = owed_selected_parses(
+        &mut index,
+        &mut evidence_owed::Page::default(),
+        &fixture.candidates,
+        &window,
+    );
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!(
+        (parsed, counts.read, counts.refused_no_pending, counts.restamped),
+        (3, 3, 3, 0)
+    );
+
+    let queued = fixture.index.traversal.as_ref().unwrap().pending_candidates.len();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let mut page = evidence_owed::Page {
+        read_cap: 1,
+        ..Default::default()
+    };
+    let parsed = owed_selected_parses(&mut fixture.index, &mut page, &fixture.candidates, &window);
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
+    let traversal = fixture.index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.pending_candidates.len(), queued + 2);
+    assert!(traversal.pending_candidates.iter().skip(queued).all(|path| !path.census_member));
+    assert!(fixture.index.files.values().all(|entry| entry.evidence_owed));
+}
+
+/// [regress] A persisted unfinished admission vetoed traversal health for
+/// good (a deadlock). Main keeps the admission;
+/// evidence owed ON drops the unfinished one at the next start, creates no
+/// batch admission, counts the drop, and its stale members keep their
+/// fingerprints (owed, never credited by the dropped carry).
+#[test]
+fn owed_evidence_start_drops_an_unfinished_admission() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let start = |on: bool| {
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let mut fixture = contract_debt_fixture(3);
+        let invalid = fixture.roots[2].clone();
+        let pending = fixture
+            .index
+            .claude_usage_family_pending
+            .get_mut(&invalid)
+            .unwrap();
+        pending.member_request_id_hashes.clear();
+        pending.member_occurrences.clear();
+        pending.invalid = true;
+        let stale = fixture.roots.iter().cloned().collect();
+        let admission = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
+        assert!(!admission.complete);
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: fixture
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone(),
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(admission),
+        });
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        (row, fixture)
+    };
+    let admission = |fixture: &ScopedRetryFixture| {
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.clone())
+    };
+    let (off, off_fixture) = start(false);
+    assert!(admission(&off_fixture).is_some(), "main keeps an admission");
+    assert!(off.get("admissions_dropped").is_none());
+
+    let (on, on_fixture) = start(true);
+    assert!(admission(&on_fixture).is_none(), "ON leaves no admission");
+    assert_eq!(on["admissions_dropped"], 1);
+    assert!(on.get("due_retained").is_none());
+    let cleared = on_fixture
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            on_fixture.index.files[&local_index_key(&candidate.path)]
+                .source_file_fingerprint
+                .is_empty()
+        })
+        .count();
+    assert_eq!(cleared, 0, "re-armed members stay owed with their fingerprint");
+
+    // A healthy start is not completion: while members stay owed they give no
+    // fence coverage, no family proof, no retirement and no latch clear.
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let index = &on_fixture.index;
+    let window = index.traversal.as_ref().unwrap().census_window_end.clone();
+    let indexed = on_fixture.roots.iter().cloned().collect::<BTreeSet<_>>();
+    let owed = evidence_owed::owed_roots(index);
+    assert!(!owed.is_empty() && owed.is_subset(&indexed));
+    assert!(claude_duplicate_fence_coverage_missing_member_count(index, &window) > 0);
+    let pending = index
+        .claude_usage_family_pending
+        .iter()
+        .filter(|(root, _)| owed.contains(*root))
+        .collect::<Vec<_>>();
+    assert!(!pending.is_empty());
+    for (root, pending) in pending {
+        assert!(evidence_owed::owed_at_completion(root, pending, false, &indexed));
+    }
+    assert_eq!(evidence_owed::latch_clearable(index, &window, &indexed), None);
+}
+
+/// [behaviour] An unfinished admission dropped at an evidence-owed start keeps
+/// only its due cursor while due service is unoffered: every due path is then
+/// offered through that cursor exactly once, none is orphaned, and the
+/// finished cursor owes nothing.
+#[test]
+fn owed_evidence_drop_keeps_unserved_due_service_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let mut fixture = retry_durable_fixture(2, 1);
+    fixture.index.bounded_sweep_had_unsettled_upload = false;
+    fixture.index.bounded_sweep_unsettled_causes = 0;
+    fixture.index.claude_request_identity_contract_changed = true;
+    for family in fixture.roots.iter().take(2) {
+        let record = fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(family)
+            .unwrap();
+        record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
+        record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+        record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+        record.retry_after_unix_seconds = 0;
+        record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+            proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+            owed_member_ids: BTreeSet::from([family.clone()]),
+        });
+    }
+    let now = rfc3339_unix_seconds(CARRY_RETRY).unwrap();
+    let stale = fixture.roots.iter().cloned().collect();
+    let admission = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
+    let due = fixture
+        .index
+        .files
+        .keys()
+        .filter(|key| {
+            claude_retry_path_due(
+                &admission,
+                &fixture.index.claude_usage_authority_quarantine,
+                key,
+                now,
+            )
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(due.len(), 2);
+    fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(admission),
+    });
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["due_retained"], 1);
+    assert!(row.get("admissions_dropped").is_none());
+    let retained = |index: &ScanIndex| {
+        index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.clone())
+            .expect("the due cursor is retained")
+    };
+    let state = retained(&fixture.index);
+    assert!(state.roots_complete && !state.complete);
+
+    let root = fixture._scratch.to_path_buf();
+    let path = root.join("due-state.json");
+    retry_test_context(&mut fixture.index, &root);
+    let mut offered = Vec::new();
+    for _ in 0..4 {
+        fixture.index = retry_test_reload(&mut fixture.index, &path);
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        let state = retained(&fixture.index);
+        let mut selected = Vec::new();
+        let traversal = fixture.index.traversal.as_mut().unwrap();
+        claude_retry_select_due_paths(
+            &state,
+            &fixture.index.claude_usage_authority_quarantine,
+            &mut traversal.pending_candidates,
+            &mut selected,
+            now,
+            1,
+        );
+        claude_retry_note_offered(&mut fixture.index, &selected, CARRY_RETRY);
+        offered.extend(selected.iter().map(|path| local_index_key(&path.path)));
+    }
+    assert_eq!(offered.len(), due.len(), "none served twice");
+    assert_eq!(
+        offered.into_iter().collect::<BTreeSet<_>>(),
+        due,
+        "none orphaned"
+    );
+    let state = retained(&fixture.index);
+    assert!(state.due_complete && state.complete);
+    assert!(!evidence_owed::due_unoffered(&fixture.index, &state, CARRY_RETRY));
 }

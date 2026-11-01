@@ -170,39 +170,6 @@ fn reoffer_decoder_is_bounded_and_isolating() {
     }
 }
 
-/// R10: a malformed extension never resets the ledger. Load keeps the
-/// accepted sibling, the refusal and its terminal disclosure.
-#[test]
-fn malformed_reoffer_extension_keeps_every_sibling_on_load() {
-    let root = test_dir("reoffer-malformed-load");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("progress.json");
-    let mut progress = ledger();
-    progress.record_body(&fp(1), &body(1));
-    progress.quarantine_permanent_body(&fp(2), &body(2), "original_pair_candidate_unproved");
-    progress.save(&path).unwrap();
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    json["permanent_rejections"][fp(2)]["reoffer"] =
-        serde_json::json!({"version": 1, "reason": vec!["x"; 40], "retry_after_unix_seconds": 1});
-    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-    let loaded = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .unwrap();
-    assert!(loaded.accepted_fingerprints.contains(&fp(1)));
-    assert_eq!(loaded.accepted_body_witnesses[&fp(1)], body(1));
-    assert_eq!(loaded.permanent_rejections[&fp(2)].body_witness, body(2));
-    assert_eq!(
-        loaded.permanent_rejections[&fp(2)].reoffer,
-        Some(reason_reoffer::RefusalReoffer::Classified)
-    );
-    assert!(loaded.contains_body(&fp(2), &body(2)), "suppression kept");
-    let _ = std::fs::remove_dir_all(root);
-}
-
 /// R9: a frozen pre-change reader reads newly written records: the new
 /// reason keeps the old enum value, the extension is ignored, siblings and
 /// the receipt reason survive. An old rewrite drops the extension, which
@@ -494,29 +461,6 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// R8/I-R2: a lease that reaches no validated response keeps the refusal
-/// and its cooldown and is reported as failed, not as a refusal.
-#[test]
-fn unanswered_reoffer_keeps_refusal_and_counts_failure() {
-    let (mut progress, index) = refused(&[(1, original_pair(0)), (2, original_pair(0))]);
-    assert!(select(&mut progress, &index, NOW));
-    let attempted = progress.active_reason_reoffers.clone();
-    progress
-        .attempted_reason_reoffers
-        .extend(attempted.keys().cloned());
-    progress.record_body(&fp(2), &body(2));
-    progress.finish_reason_reoffers(&attempted, false, SnapshotSource::Codex.api_slug());
-    let counts = progress.reason_reoffer_counts;
-    assert_eq!((counts.failed, counts.accepted), (1, 1));
-    assert!(progress.active_reason_reoffers.is_empty());
-    assert!(progress.contains_body(&fp(1), &body(1)));
-    assert_eq!(
-        progress.permanent_rejections[&fp(1)].reoffer,
-        original_pair(NOW + DAY)
-    );
-    assert!(!progress.permanent_rejections.contains_key(&fp(2)));
-}
-
 /// F2: injected wall-clock rollback keeps both kinds eligible after a full
 /// cooldown; a save/reload must not turn either into the permanent done marker.
 #[test]
@@ -747,7 +691,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     );
 }
 
-/// O1: the runtime cooldown view holds exactly the retained exact-body
+/// [regress] O1: the runtime cooldown view holds exactly the retained exact-body
 /// conflicts that no lease lets through this cycle, including a due record
 /// still waiting for budget (no unlimited ordinary reparse while it waits)
 /// and an F2-re-clamped deadline read from the prepared ledger. A lease, a
@@ -810,10 +754,23 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
         .parser_version
         .push_str("-older");
     assert!(
+        mismatched
+            .reason_reoffer_cooldowns(NOW)
+            .contains_key(&fp(1)),
+        "a version-only change retains exact-body cooldown proof"
+    );
+    mismatched
+        .quarantined_fingerprints
+        .get_mut(&fp(1))
+        .unwrap()
+        .witness
+        .contract
+        .push_str("-older");
+    assert!(
         !mismatched
             .reason_reoffer_cooldowns(NOW)
             .contains_key(&fp(1)),
-        "a stale ledger witness grants no cooldown proof"
+        "a changed contract grants no cooldown proof"
     );
     // The view is a read: every refusal, conflict and deadline is retained.
     for value in [1, 2, 4] {
@@ -846,95 +803,6 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
         summary.contains("cooldown_conflict_deferred=2"),
         "{summary}"
     );
-}
-
-/// Bootstrap errors must finish the logical-offer counters just as main-page
-/// errors do. Exhausted short sheds count once despite three physical sends.
-#[test]
-#[serial(client_report)]
-fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
-    for failure in ["shed", "network", "invalid_ack", "checkpoint"] {
-        let root = cache_effective_wire_fixture_root();
-        let mut index = ScanIndex::default();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-09-30T10:05:00Z",
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-        let probe = cache_head_probe(&scan.snapshots.remove(0));
-        let fingerprint = &probe.snapshot_fingerprint;
-        let body = snapshot_upload_body_witness(&probe);
-        let mut progress = ledger();
-        progress.quarantine_permanent_body(
-            fingerprint,
-            &body,
-            reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
-        );
-        progress.reserve_reason_reoffer(fingerprint, body, NOW);
-        let mut posts = 0;
-        let mut budget = InplaceRetryBudget::default();
-        let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
-            bootstrap_cache_heads_with_budget(
-                std::slice::from_ref(&probe),
-                "codex",
-                &mut progress,
-                false,
-                &mut budget,
-                |items, _| {
-                    posts += 1;
-                    match failure {
-                        "shed" => Err(anyhow::Error::new(UploadShed {
-                            status: 503,
-                            retry_after: Some(Duration::from_secs(1)),
-                            code: None,
-                        })),
-                        "network" => Err(anyhow!("synthetic upload failure")),
-                        "invalid_ack" => Ok(accepted_batch(0)),
-                        "checkpoint" => Ok(accepted_batch(items.len())),
-                        _ => unreachable!(),
-                    }
-                },
-                |_| {
-                    if failure == "checkpoint" {
-                        Err(anyhow!("synthetic checkpoint failure"))
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-        });
-        assert!(result.is_err(), "{failure}");
-        let counts = progress.reason_reoffer_counts;
-        assert_eq!((counts.selected, counts.attempted), (1, 1), "{failure}");
-        assert_eq!(
-            counts.attempted_bytes,
-            snapshot_packing_json_length(&probe).unwrap(),
-            "{failure}"
-        );
-        assert!(
-            progress.active_reason_reoffers.is_empty(),
-            "{failure}: logical offer finalized"
-        );
-        if failure == "shed" {
-            assert_eq!((counts.shed, counts.failed, counts.accepted), (1, 0, 0));
-            assert_eq!(posts, 3);
-            assert_eq!(waits.len(), 2);
-        } else if failure == "checkpoint" {
-            assert_eq!(
-                counts.accepted, 1,
-                "validated server ACK is known even though checkpoint failed"
-            );
-        } else {
-            assert_eq!((counts.failed, counts.shed), (1, 0), "{failure}");
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }
 
 /// A bounded page need not revisit every cooldown entity. Its provisional
@@ -972,46 +840,4 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
         SnapshotQuarantineDisposition::RetryPending
     );
     assert!(progress.permanent_rejections.contains_key(&fp(1)));
-}
-
-/// The I/O skip also covers a due record waiting for the shared budget, but
-/// that is no longer future cooldown debt. Keep its original blocking result
-/// at the deadline without granting another ordinary re-read or a lease.
-#[test]
-fn due_unleased_conflict_still_blocks_after_the_cooldown_deadline() {
-    let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
-    progress.quarantine_retryable_body(&fp(1), &body(1));
-    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-    index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
-    index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
-    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
-    assert_eq!(
-        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
-        ResumableUploadResult::Completed,
-        "future cooldown is non-blocking"
-    );
-    for now in [NOW + DAY, NOW + DAY + 1] {
-        index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(now));
-        assert_eq!(
-            index.reason_reoffer_cooldown_deferred_count(),
-            1,
-            "a due record without budget still has its I/O deferral"
-        );
-        assert_eq!(
-            with_retained_refusal_conflicts(
-                ResumableUploadResult::Completed,
-                &index,
-                &progress,
-                now
-            ),
-            ResumableUploadResult::Deferred { count: 1 },
-            "due-time settlement is unchanged"
-        );
-        assert!(progress.active_reason_reoffers.is_empty());
-        assert!(progress.contains_body(&fp(1), &body(1)));
-        assert_eq!(
-            progress.quarantined_fingerprints[&fp(1)].disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-    }
 }

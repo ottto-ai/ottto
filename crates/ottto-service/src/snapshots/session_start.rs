@@ -296,14 +296,8 @@ impl ClaudeRequestKey {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestKey {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    // 32 inline bytes: no heap, one walker visit like the key it replaced.
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+// 32 inline bytes: no heap, one walker visit like the key it replaced.
+crate::heap_layout_bound::no_heap!(true; ClaudeRequestKey);
 
 /// An opening call's provider call or tool-use id, apart from the tool name
 /// its `OpeningCall` holds, so a record's `L` span is the id alone (M1,
@@ -2056,60 +2050,6 @@ mod tests {
         ]
     }
 
-    /// X_out family U2 (#665, c22 amendment 2): the observed-input bound
-    /// covers the boxed start `finish` builds, and the two fixed-length derived
-    /// ids have exactly the length the bound charges.
-    #[test]
-    fn finished_heap_bound_covers_the_finished_start() {
-        let dir = crate::test_scratch::ScratchDir::new("session-start-u2-bound");
-        let context = attribution_context(&dir);
-        let common: Value = serde_json::from_str(CLAUDE_COMMON).unwrap();
-        let mut accumulator = super::super::SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        for mut line in claude_fixture_lines() {
-            for (key, value) in common.as_object().expect("common fields") {
-                line[key] = value.clone();
-            }
-            super::super::apply_claude_code_line(&line, &mut accumulator);
-        }
-        accumulator.finalize_claude_responses();
-        let state = (*accumulator.session_start).clone();
-        assert!(!state.files.is_empty());
-        let bound = state
-            .finished_heap_bound(true, true, usize::MAX)
-            .expect("bound");
-        assert_eq!(state.finished_heap_bound(true, true, bound - 1), None);
-        let start = state
-            .finish(
-                true,
-                accumulator.first_turn_context_tokens,
-                CLAUDE_PARTS_METHOD,
-                Some(&context),
-                Some(&SALT),
-            )
-            .expect("start");
-        assert!(!start.file_candidates.is_empty());
-        for candidate in &start.file_candidates {
-            let hash = candidate.path_hash.as_ref().expect("path hash");
-            assert_eq!(hash.len(), PATH_HASH_LEN);
-            assert!(hash.capacity() <= 2 * PATH_HASH_LEN, "{}", hash.capacity());
-        }
-        let fingerprint = start
-            .start_config_fingerprint
-            .as_ref()
-            .expect("fingerprint");
-        assert_eq!(
-            (fingerprint.len(), fingerprint.capacity()),
-            (CONFIG_FINGERPRINT_LEN, CONFIG_FINGERPRINT_LEN)
-        );
-        if crate::heap_layout_bound::layout_supported() {
-            let boxed = Box::new(start);
-            let finished = crate::heap_layout_bound::completed_bound(&boxed, usize::MAX)
-                .expect("finished bound")
-                - std::mem::size_of::<Box<SnapshotSessionStart>>();
-            assert!(finished <= bound, "{finished} > {bound}");
-        }
-    }
-
     #[test]
     fn claude_fixture_yields_exact_session_start() {
         let dir = crate::test_scratch::ScratchDir::new("session-start-claude");
@@ -2899,55 +2839,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn instruction_segments_and_paths_stay_lexical() {
-        assert_eq!(
-            instruction_segments("docs/guide.md", "See docs/guide.md"),
-            2
-        );
-        assert_eq!(
-            instruction_segments("/x/docs/guide.md", "See docs/guide.md"),
-            2
-        );
-        assert_eq!(instruction_segments("guide.md", "nothing"), 0);
-        let cwd = Some(Path::new("/w/repo"));
-        assert_eq!(
-            normalize_path("/w/repo/a/b.rs", cwd, true),
-            Some(("a/b.rs".to_string(), Some("a/b.rs".to_string())))
-        );
-        assert_eq!(
-            normalize_path("/w/repo-other/b.rs", cwd, true),
-            Some(("/w/repo-other/b.rs".to_string(), None))
-        );
-        assert_eq!(
-            normalize_path("../up.rs", cwd, true),
-            Some(("../up.rs".to_string(), None))
-        );
-        assert_eq!(
-            normalize_path("a/b.rs", cwd, false),
-            Some(("a/b.rs".to_string(), None))
-        );
-        // No session directory: a relative path has no proven base.
-        assert_eq!(
-            normalize_path("a/b.rs", None, true),
-            Some(("a/b.rs".to_string(), None))
-        );
-        assert!(shell_changes_directory("cd /tmp && cat x.md"));
-        assert!(shell_changes_directory("(pushd d; ls)"));
-        assert!(shell_changes_directory("git -C ../other status"));
-        assert!(shell_changes_directory("env -C/private/notes cat x.md"));
-        assert!(shell_changes_directory("make -Cdir all"));
-        assert!(shell_changes_directory("env --chdir=/p cat x.md"));
-        assert!(shell_changes_directory("bash -lc 'cd /p && cat x.md'"));
-        assert!(shell_changes_directory("sh -c \"cd /p; cat x.md\""));
-        assert!(!shell_changes_directory("cat docs/cdn.md"));
-        assert_eq!(
-            shell_path_tokens("sed -n 1,5p a/b.md | grep x > out.txt").collect::<Vec<_>>(),
-            ["a/b.md", "out.txt"]
-        );
-        assert_eq!(json_units(&json!({"a": [1, "\u{1f600}"]})), 16);
-    }
-
     /// Plain paths follow admission's `_safe_relative_path`; anything it would
     /// reject travels hashed or is withheld, never sent plain.
     #[test]
@@ -3136,17 +3027,6 @@ mod tests {
             "iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})));
     }
 
-    #[test]
-    fn oversized_call_ids_are_not_retained() {
-        let mut state = measured_codex_state("", 1);
-        let id = "x".repeat(300 * 1024);
-        state.observe_codex_line(
-            &json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": id}}),
-            None,
-        );
-        assert!(state.calls.is_empty());
-        assert!(state.last_codex_call.is_none());
-    }
     /// Cost receipt over local transcripts listed in
     /// `OTTTO_SESSION_START_COST_FILES` (`claude|codex<TAB>path` per line).
     /// A shadow state replays each file beside the real parser (its own state

@@ -1,7 +1,6 @@
 use crate::snapshots::{
     snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
-    SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION,
-    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION,
+    SnapshotSource, SnapshotSourceManifest,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
@@ -22,8 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION: u64 = 5;
-pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
@@ -115,33 +112,15 @@ impl std::fmt::Display for SnapshotAckRejected {
 
 impl std::error::Error for SnapshotAckRejected {}
 
-/// Whether snapshot batch bodies are gzip-encoded.
-///
-/// Default OFF, deliberately. Response compression is universal, but nothing
-/// decompresses a *request* body unless a route opts in, and the batch route does
-/// not yet — the OTLP route is the only one in the estate with a request
-/// decompression path. Shipping this enabled would 4xx every upload from an
-/// upgraded daemon against today's server.
-///
-/// So the encoder ships now (the release train is the long pole) behind
-/// `OTTTO_SNAPSHOT_UPLOAD_GZIP=1`, and the default flips in the release AFTER the
-/// batch route decompresses. The refusal fallback below means a premature flip
-/// degrades to identity encoding instead of stopping sync.
-static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(false);
-static SNAPSHOT_UPLOAD_GZIP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Gzip is enabled until the backend refuses an encoded snapshot batch.
+/// Size budgets and encoding failures still fall back to identity per request.
+static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn snapshot_upload_gzip_enabled() -> bool {
-    if !SNAPSHOT_UPLOAD_GZIP_INITIALIZED.swap(true, Ordering::Relaxed) {
-        let enabled = std::env::var("OTTTO_SNAPSHOT_UPLOAD_GZIP")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        SNAPSHOT_UPLOAD_GZIP.store(enabled, Ordering::Relaxed);
-    }
     SNAPSHOT_UPLOAD_GZIP.load(Ordering::Relaxed)
 }
 
 fn disable_snapshot_upload_gzip() {
-    SNAPSHOT_UPLOAD_GZIP_INITIALIZED.store(true, Ordering::Relaxed);
     if SNAPSHOT_UPLOAD_GZIP.swap(false, Ordering::Relaxed) {
         eprintln!(
             "ottto-service: snapshot upload gzip disabled for this process — the backend refused \
@@ -559,6 +538,11 @@ impl UploadFailureDiagnostics {
         self.status_family
     }
 
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
+    }
+
     /// Whether a snapshot page exceeded the client or gateway read deadline.
     ///
     /// Keep this endpoint-scoped: a relay-token timeout happened before the
@@ -680,11 +664,6 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
-    /// Durable accepted-log capability for content-free request-index curves.
-    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
-    /// emits curves that the server cannot durably acknowledge.
-    #[serde(default)]
-    pub session_context_curve_contract: Option<String>,
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
@@ -696,6 +675,14 @@ pub struct ActivityHintResponse {
     /// the field off, so older servers never receive it.
     #[serde(default)]
     pub session_request_identity_retained_contract: Option<String>,
+    /// Server capability for `request_evidence.account_source` (carried
+    /// accounts as placement, never proof). Missing/null/unknown keeps it off,
+    /// so older servers never receive the field.
+    #[serde(default)]
+    pub session_request_account_source_contract: Option<String>,
+    /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
+    #[serde(skip)]
+    pub max_snapshot_item_bytes: Option<u64>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -710,6 +697,9 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
+    /// Exact backend admission for non-terminal census progress/block status.
+    #[serde(default)]
+    pub census_status_contract: Option<String>,
     /// Retired per-account cohort token for contract-5 request identity rows.
     /// Contract 5 is always on for Claude Code, so this daemon decodes the
     /// field for compatibility and never reads it; the server keeps sending
@@ -724,6 +714,7 @@ pub struct ActivityHintResponse {
 pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
     let mut hint = ActivityHintResponse::deserialize(&value)
         .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.max_snapshot_item_bytes = value.get("max_snapshot_item_bytes").and_then(Value::as_u64);
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
@@ -758,6 +749,18 @@ pub struct SnapshotBatchResponse {
     pub rejected_entities: Vec<SnapshotEntityRejection>,
     #[serde(default)]
     pub conflict_entities: Vec<SnapshotEntityRef>,
+    /// Local-only, keyed by conflicted snapshot fingerprint. Bound from the
+    /// request at the network boundary; never read from the response wire.
+    #[serde(skip)]
+    pub(crate) conflict_rescans: std::collections::BTreeMap<String, SnapshotConflictRescan>,
+}
+
+/// The exact refused request body a head-CAS challenge was minted over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotConflictRescan {
+    pub(crate) revision_v2_hash: String,
+    /// The refused body already carried an answer to an earlier challenge.
+    pub(crate) answered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -848,38 +851,22 @@ fn default_occurrence_count() -> u64 {
 pub(crate) fn snapshot_ack_body_witness_version(
     item: &crate::snapshots::SnapshotItem,
 ) -> Result<Option<u64>> {
-    if item.context_curve.is_none()
-        && item.session_account_evidence.is_none()
-        && item.cache_observations.is_none()
-    {
+    if item.session_account_evidence.is_none() && item.cache_observations.is_none() {
         return Ok(None);
     }
     let version = snapshot_upload_body_witness_version(item)
         .filter(|version| {
             matches!(
                 *version,
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                    | 15
-                    | 16
-                    | 19
-                    | 20
+                15 | 16
                     | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
                     | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
             )
         })
         .ok_or_else(|| anyhow!("snapshot evidence has no supported body witness version"))?;
     let public_version = match version {
-        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
-            SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
-        }
-        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
-            SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
-        }
         15 => 13,
         16 => 14,
-        19 => 17,
-        20 => 18,
         SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
             if item.cache_observations.is_some() {
                 13
@@ -900,6 +887,36 @@ pub(crate) fn snapshot_ack_body_witness_version(
 }
 
 impl SnapshotBatchResponse {
+    /// Bind each challenged head-CAS conflict to the revision v2 hash its
+    /// request body carried, recomputed with the same envelope function the
+    /// serializer used. A later upload answers the challenge through the
+    /// backend's existing rescan handshake. Call after ACK validation.
+    pub(crate) fn bind_conflict_rescans(&mut self, request: &SnapshotBatchRequest) {
+        let Some(source) = crate::snapshots::snapshot_source_from_api_slug(&request.source) else {
+            return;
+        };
+        for reference in &self.conflict_entities {
+            if !valid_snapshot_head_token(reference.head_challenge.as_deref()) {
+                continue;
+            }
+            let Some(item) = request.snapshots.iter().find(|item| {
+                item.source_session_id == reference.source_session_id
+                    && item.snapshot_fingerprint == reference.snapshot_fingerprint
+            }) else {
+                continue;
+            };
+            let envelope =
+                crate::snapshots::snapshot_semantic_envelope(source, item, request.upload_policy);
+            self.conflict_rescans.insert(
+                reference.snapshot_fingerprint.clone(),
+                SnapshotConflictRescan {
+                    revision_v2_hash: envelope.revision_v2_hash,
+                    answered: envelope.conflict_head_challenge.is_some(),
+                },
+            );
+        }
+    }
+
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -945,7 +962,6 @@ impl SnapshotBatchResponse {
                 }
                 if request.snapshots.iter().any(|item| {
                     crate::snapshots::claude_request_money::is_request_owned_literal(item)
-                        || item.context_curve.is_some()
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()
                 }) {
@@ -1036,6 +1052,7 @@ impl SnapshotBatchResponse {
 
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
+        let mut answered = std::collections::BTreeSet::new();
         for item in &request.snapshots {
             let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
@@ -1044,6 +1061,9 @@ impl SnapshotBatchResponse {
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
+            if item.cache_conflict_answer.is_some() {
+                answered.insert(key.clone());
+            }
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())
@@ -1069,6 +1089,13 @@ impl SnapshotBatchResponse {
             if reference.body_witness_version.as_ref() != Some(expected_version)
                 || reference.body_witness_digest.as_ref() != Some(expected_digest)
             {
+                if answered.contains(&key) {
+                    warn_answered_body_witness_rejection(
+                        &reference.source_session_id,
+                        *expected_version,
+                        reference.body_witness_version,
+                    );
+                }
                 return Err(anyhow!(
                     "snapshot ACK lacks exact durable context curve body witness proof"
                 ));
@@ -1161,13 +1188,35 @@ impl SnapshotBatchResponse {
     }
 }
 
+/// The one residual risk of a head-CAS challenge answer: the server stored
+/// it, but its ACK echoes a different body witness, so this cycle cannot
+/// settle. The next upload conflicts again and the existing refused-answer
+/// count and window take over. Session hash and versions only; no content.
+fn warn_answered_body_witness_rejection(
+    source_session_id: &str,
+    expected_version: u64,
+    echoed_version: Option<u64>,
+) {
+    let line = format!(
+        "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
+         witness_version={expected_version} echoed_witness_version={} \
+         reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
+        crate::snapshot_sync::SessionHash::of(source_session_id),
+        echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
+    );
+    eprintln!("{line}");
+    #[cfg(test)]
+    ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANSWERED_WITNESS_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn valid_snapshot_head_token(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    value.is_some_and(crate::hex::is_sha256_lower)
 }
 
 fn record_snapshot_ack_occurrences(
@@ -1224,11 +1273,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     ) {
         (None, None) => {}
         (Some(version), Some(digest))
-            if matches!(version, 3..=20)
-                && digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
+            if matches!(version, 3..=20) && crate::hex::is_sha256_lower(digest) => {}
         _ => return Err(anyhow!("snapshot ACK body witness proof is malformed")),
     }
     Ok(())
@@ -1274,6 +1319,22 @@ pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
 /// failure: the receipt carrying it also carries `last_success_at` and zero
 /// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
 pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
+
+/// Activity-hint admission; unknown or absent tokens preserve legacy bytes.
+pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
+
+/// Content-free first failed census gate, in the shared receipt builder's order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusBlockCause {
+    UnreadableEvents,
+    DisappearedFiles,
+    CarryAdmission,
+    StateLoader,
+    TransportReservation,
+    OwnershipIncomplete,
+    Other,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
@@ -1371,6 +1432,11 @@ pub struct SnapshotStatusRequest {
     pub last_census_residue_archived_rollout_count: u64,
     #[serde(default)]
     pub last_census_residue_blocked_session_count: u64,
+    /// Census-member queue plus carry replay, only under census_status:v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_pending_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_block_cause: Option<CensusBlockCause>,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
@@ -1453,6 +1519,8 @@ impl SnapshotStatusRequest {
             last_census_residue_index_key_count,
             last_census_residue_archived_rollout_count,
             last_census_residue_blocked_session_count,
+            last_census_pending_file_count,
+            last_census_block_cause,
             consecutive_failures,
             next_retry_at,
             // Build identity, unrelated to any scan.
@@ -1487,6 +1555,12 @@ impl SnapshotStatusRequest {
         }
         if last_error_message.is_some() {
             return Some("last_error_message");
+        }
+        if last_census_pending_file_count.is_some() {
+            return Some("last_census_pending_file_count");
+        }
+        if last_census_block_cause.is_some() {
+            return Some("last_census_block_cause");
         }
         if next_retry_at.is_some() {
             return Some("next_retry_at");
@@ -2179,10 +2253,6 @@ impl SnapshotApiClient {
                 };
                 match decoded {
                     Ok(response) => {
-                        #[cfg(feature = "replay-harness")]
-                        crate::snapshot_sync::replay_harness::observe_emitted_batch(
-                            request, &body,
-                        )?;
                         self.record_batch_success(
                             request,
                             status,
@@ -3904,6 +3974,43 @@ mod tests {
         assert_eq!(parse_retry_after("later", now), None);
     }
 
+    /// [behaviour] A fresh default client sends eligible batches as gzip.
+    #[test]
+    fn default_snapshot_client_sends_gzip() {
+        // Refusals in other tests must not change this process-default proof.
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            let body =
+                r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response.validate_entity_ack(&request).unwrap();
+        let captured = server.join().unwrap();
+        let headers = captured.split_once("\r\n\r\n").unwrap().0;
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
     #[test]
     fn snapshot_gzip_respects_decoded_and_compressed_budgets() {
         for size in [128 * 1024, 640 * 1024, 1024 * 1024] {
@@ -4005,6 +4112,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.123".to_string()),
@@ -4187,6 +4296,14 @@ mod tests {
                 Box::new(|r| r.last_terminal_over_line_cap_count = 1),
             ),
             (
+                "last_census_pending_file_count",
+                Box::new(|r| r.last_census_pending_file_count = Some(0)),
+            ),
+            (
+                "last_census_block_cause",
+                Box::new(|r| r.last_census_block_cause = Some(CensusBlockCause::Other)),
+            ),
+            (
                 "last_census_residue_settled",
                 Box::new(|r| r.last_census_residue_settled = true),
             ),
@@ -4299,6 +4416,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
@@ -4371,6 +4490,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.120".to_string()),
@@ -4482,6 +4603,7 @@ mod tests {
         accepted_entities: Vec<SnapshotEntityRef>,
     ) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted,
             sessions_reconciled: 0,
             session_ids: Vec::new(),
@@ -4500,7 +4622,6 @@ mod tests {
         use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
         let support = crate::test_scratch::private_dir("composition-ack-verdict");
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
         item.cache_observations = None;
         item.session_account_evidence = None;
         item.session_start = Some(Box::new(SnapshotSessionStart {
@@ -4566,8 +4687,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let ack = entity_ack(
             1,
             vec![SnapshotEntityRef {
@@ -5052,7 +5172,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

@@ -218,8 +218,12 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
         "settled control saves Legacy"
     );
     assert_ne!(
-        loaded.files[&control_key].last_upload_body_witness,
-        baseline.files[&control_key].last_upload_body_witness
+        loaded.files[&control_key].last_snapshot_fingerprint,
+        baseline.files[&control_key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        loaded.files[&control_key].last_snapshot_fingerprint,
+        working.files[&control_key].last_snapshot_fingerprint
     );
     assert_eq!(
         loaded.files[&control_key].last_upload_body_witness,

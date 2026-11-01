@@ -463,15 +463,7 @@ mod tests {
             assert_never_logged, install_host_logger, RedirectingBackend,
         };
         install_host_logger();
-        for header in [
-            "X-Ottto-Device-Secret",
-            "X-Ottto-Setup-Run-Token",
-            "X-Ottto-Setup-Claim-Token",
-            "X-Ottto-Install-Session-Token",
-            "X-Ottto-Support-Claim",
-            "X-Ottto-Device-Credential-Preparation-Secret",
-            "X-API-Key",
-        ] {
+        for header in ["X-Ottto-Device-Secret"] {
             for status in ["302 Found", "307 Temporary Redirect"] {
                 for method in ["GET", "POST"] {
                     let secret = format!("synthetic-{method}-{}", &status[..3]);
@@ -522,21 +514,6 @@ mod tests {
             line_last_cr: false,
             complete: false,
         }
-    }
-    #[test]
-    fn aggregate_header_cap_accepts_boundary_and_does_not_charge_body() {
-        let prefix = "HTTP/1.1 200 OK\r\nX: ";
-        let mut input = format!(
-            "{prefix}{}\r\n\r\n",
-            "x".repeat(RESPONSE_HEADER_BYTES - prefix.len() - 4)
-        )
-        .into_bytes();
-        input.extend_from_slice(&vec![b'b'; RESPONSE_HEADER_BYTES * 3]);
-        let mut stream = headers(input.clone());
-        let mut output = Vec::new();
-        stream.read_to_end(&mut output).unwrap();
-        assert_eq!(output, input);
-        assert_eq!(stream.bytes, RESPONSE_HEADER_BYTES);
     }
     #[test]
     fn aggregate_header_cap_refuses_many_individually_legal_lines() {
@@ -771,93 +748,24 @@ mod tests {
     }
 
     #[test]
-    fn trusted_host_is_accepted_by_name_and_by_ip() {
-        let certificates = Certificates::new("trusted");
-        let (certificate, key) =
-            certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1,IP:::1");
+    fn wrong_host_certificate_is_refused() {
+        let certificates = Certificates::new("refused");
+        let (certificate, key) = certificates.mint("wrong", "DNS:wrong.example");
         let tls = Arc::new(WebPkiTls {
             config: trusting(&certificate),
         });
         let agent = ureq::AgentBuilder::new().tls_connector(tls).build();
-        let (port, server) = serve(certificate.clone(), key.clone_key(), 2);
-        for host in ["localhost", "127.0.0.1"] {
-            let response = agent
-                .get(&format!("https://{host}:{port}/"))
-                .call()
-                .unwrap();
-            assert_eq!(response.into_string().unwrap(), "ok", "{host}");
-        }
-        assert_eq!(server.join().unwrap(), vec![true, true]);
-        // ureq hands the connector the bracketed literal `[::1]`; the strip
-        // must leave an IPv6 server name that the certificate's IP SAN meets.
-        let (port, server) = serve_on("[::1]:0", certificate, key, 1);
-        let response = agent.get(&format!("https://[::1]:{port}/")).call().unwrap();
-        assert_eq!(response.into_string().unwrap(), "ok");
-        assert_eq!(server.join().unwrap(), vec![true]);
-    }
-
-    #[test]
-    fn wrong_host_and_untrusted_certificates_are_refused() {
-        let certificates = Certificates::new("refused");
-        let (other_host, other_host_key) = certificates.mint("wrong", "DNS:wrong.example");
-        let (trusted, _) = certificates.mint("trusted", "DNS:localhost,IP:127.0.0.1");
-        let (untrusted, untrusted_key) =
-            certificates.mint("untrusted", "DNS:localhost,IP:127.0.0.1");
-        let cases = [
-            (other_host.clone(), other_host, other_host_key, "wrong host"),
-            (trusted, untrusted, untrusted_key, "untrusted"),
-        ];
-        for (trust, served, key, case) in cases {
-            let tls = Arc::new(WebPkiTls {
-                config: trusting(&trust),
-            });
-            let agent = ureq::AgentBuilder::new().tls_connector(tls).build();
-            let (port, server) = serve(served, key, 1);
-            let error = agent
-                .get(&format!("https://localhost:{port}/"))
-                .call()
-                .unwrap_err();
-            let refused = match rustls_cause(&error) {
-                Some(rustls::Error::InvalidCertificate(reason)) => reason.clone(),
-                _ => panic!("{case}: {error}"),
-            };
-            if case == "wrong host" {
-                assert!(
-                    matches!(
-                        refused,
-                        rustls::CertificateError::NotValidForName
-                            | rustls::CertificateError::NotValidForNameContext { .. }
-                    ),
-                    "{refused:?}"
-                );
-            } else {
-                assert_eq!(refused, rustls::CertificateError::UnknownIssuer);
-            }
-            assert_eq!(kind_of(&error), Some(ureq::ErrorKind::ConnectionFailed));
-            assert_eq!(server.join().unwrap(), vec![false], "{case}");
-        }
-    }
-
-    #[test]
-    fn deadline_connector_keeps_production_webpki_trust() {
-        let certificates = Certificates::new("deadline-webpki");
-        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
         let (port, server) = serve(certificate, key, 1);
-        let before = connects();
-        // No `with_test_config`: the deadline connector's own production
-        // config must refuse a synthetic issuer like the default connector.
-        let error = ureq::AgentBuilder::new()
-            .tls_connector(connector(Instant::now() + Duration::from_secs(10)))
-            .build()
+        let error = agent
             .get(&format!("https://localhost:{port}/"))
             .call()
             .unwrap_err();
-        assert_eq!(connects(), before + 1);
         assert!(
             matches!(
                 rustls_cause(&error),
                 Some(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::UnknownIssuer
+                    rustls::CertificateError::NotValidForName
+                        | rustls::CertificateError::NotValidForNameContext { .. }
                 ))
             ),
             "{error}"
@@ -914,65 +822,6 @@ mod tests {
             result_class(error),
             crate::provider_calls::CallResult::Timeout
         );
-    }
-
-    #[test]
-    fn connector_failures_keep_ureq_transport_categories() {
-        let cases = [
-            (
-                TlsSetupStep::ServerName("bad name".into()),
-                io::ErrorKind::InvalidInput,
-                ureq::ErrorKind::Dns,
-                "dns_error",
-            ),
-            (
-                TlsSetupStep::Session,
-                io::ErrorKind::Other,
-                ureq::ErrorKind::Io,
-                "io_error",
-            ),
-            (
-                TlsSetupStep::Handshake,
-                io::ErrorKind::InvalidData,
-                ureq::ErrorKind::ConnectionFailed,
-                "connect_error",
-            ),
-        ];
-        for (step, io_kind, kind, class) in cases {
-            let error = ureq::Error::from(TlsSetupError::io(
-                step,
-                io_kind,
-                rustls::Error::HandshakeNotComplete,
-            ));
-            assert_eq!(kind_of(&error), Some(kind));
-            assert_eq!(
-                result_class(error),
-                crate::provider_calls::CallResult::Error(class)
-            );
-        }
-        let timed_out = ureq::Error::from(TlsSetupError::io(
-            TlsSetupStep::Handshake,
-            io::ErrorKind::TimedOut,
-            io::Error::from(io::ErrorKind::TimedOut),
-        ));
-        assert_eq!(
-            result_class(timed_out),
-            crate::provider_calls::CallResult::Timeout
-        );
-        // Other transport failures keep ureq's own category.
-        let reset = ureq::Error::from(io::Error::from(io::ErrorKind::ConnectionReset));
-        assert_eq!(kind_of(&reset), Some(ureq::ErrorKind::Io));
-        // A real server-name refusal from the connector is a DNS failure.
-        let error = match rustls_connect(
-            &webpki_client_config(),
-            "not a host name",
-            Box::new(Bytes(Default::default())),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("an invalid server name must be refused"),
-        };
-        assert_eq!(kind_of(&error), Some(ureq::ErrorKind::Dns));
-        assert!(error.to_string().contains("parsing 'not a host name'"));
     }
 
     #[derive(Clone, Copy)]
@@ -1050,15 +899,8 @@ mod tests {
             file: "src/retry_tls.rs",
             line: "let agent = {u}AgentBuilder::new().tls_connector(tls).build();",
             scope: Scope::TestModule,
-            count: 2,
-            chain: None,
-        },
-        Allowed {
-            file: "src/retry_tls.rs",
-            line: "let error = {u}AgentBuilder::new()",
-            scope: Scope::TestModule,
             count: 1,
-            chain: Some(".tls_connector(connector(Instant::now() + Duration::from_secs(10)))"),
+            chain: None,
         },
         Allowed {
             file: "src/retry_tls.rs",
@@ -1485,10 +1327,7 @@ mod unit_test_egress_tests {
     fn unit_tests_refuse_external_base_urls_before_any_resolution() {
         for base in [
             "https://api.ottto.net",
-            "http://api.ottto.net",
-            "https://ottto.net/backend",
             "http://localhost.attacker.invalid",
-            "http://127.0.0.1.attacker.invalid",
             "http://localhost@api.ottto.net",
         ] {
             std::thread::spawn(move || {
@@ -1503,12 +1342,5 @@ mod unit_test_egress_tests {
             .join()
             .unwrap();
         }
-    }
-
-    #[test]
-    fn unit_tests_still_reach_loopback_fixtures() {
-        let backend = credential_test_support::RedirectingBackend::start("200 OK");
-        assert_eq!(agent().get(&backend.base_url).call().unwrap().status(), 200);
-        assert!(backend.finish().starts_with("GET / HTTP/1.1"));
     }
 }

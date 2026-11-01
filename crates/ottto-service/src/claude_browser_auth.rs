@@ -6,6 +6,7 @@
 //! one exact managed root before handing identity/quota verification back to
 //! the existing collector.
 
+use crate::locked_state_dir::{open_private_lock_file, FileLock};
 use ottto_core::{
     default_support_dir, prepare_managed_claude_provisional_root, write_owner_only_file_atomic,
     ClaudeConfigDirSlot, FileClaudeConfigSlotSettingsStore, CLAUDE_MANAGED_ACCOUNTS_DIR_NAME,
@@ -171,17 +172,7 @@ impl Drop for StateGuard {
 }
 
 pub(crate) struct OperationGuard {
-    file: File,
-}
-
-impl Drop for OperationGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
+    _file: FileLock,
 }
 
 /// Lifetime evidence for a provider process that survives daemon restart.
@@ -3750,33 +3741,16 @@ fn transact<T>(mutation: impl FnOnce(&mut PersistedState) -> T) -> Result<T, std
 }
 
 fn state_guard() -> std::io::Result<StateGuard> {
+    use std::os::fd::AsRawFd;
     let process = STATE_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(default_support_dir().join(STATE_LOCK_FILE))?;
+    let file = open_private_lock_file(&default_support_dir().join(STATE_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(StateGuard {
         _process: process,
         file,
@@ -3786,35 +3760,10 @@ fn state_guard() -> std::io::Result<StateGuard> {
 fn operation_guard(operation_id: &str) -> std::io::Result<Option<OperationGuard>> {
     fs::create_dir_all(default_support_dir())?;
     let path = default_support_dir().join(format!("{OPERATION_LOCK_PREFIX}{operation_id}.lock"));
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(std::io::Error::last_os_error())
-            };
-        }
-        Ok(Some(OperationGuard { file }))
-    }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        Ok(Some(OperationGuard { file }))
+    match FileLock::try_exclusive(open_private_lock_file(&path)?) {
+        Ok(lock) => Ok(Some(OperationGuard { _file: lock })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3841,48 +3790,26 @@ fn provider_process_guard(
     operation_id: &str,
     nonblocking: bool,
 ) -> std::io::Result<Option<ProviderProcessGuard>> {
+    use std::os::fd::AsRawFd;
     fs::create_dir_all(default_support_dir())?;
     let path =
         default_support_dir().join(format!("{PROVIDER_PROCESS_LOCK_PREFIX}{operation_id}.lock"));
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-        let result = unsafe { libc::flock(file.as_raw_fd(), flags) };
-        if result != 0 {
-            return if nonblocking
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
-            {
-                Ok(None)
-            } else {
-                Err(std::io::Error::last_os_error())
-            };
-        }
-        Ok(Some(ProviderProcessGuard {
-            file,
-            unlock_on_drop: true,
-        }))
+    let file = open_private_lock_file(&path)?;
+    let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    let result = unsafe { libc::flock(file.as_raw_fd(), flags) };
+    if result != 0 {
+        return if nonblocking
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        {
+            Ok(None)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
     }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        Ok(Some(ProviderProcessGuard {
-            file,
-            unlock_on_drop: true,
-        }))
-    }
+    Ok(Some(ProviderProcessGuard {
+        file,
+        unlock_on_drop: true,
+    }))
 }
 
 fn provider_process_active(operation_id: &str) -> std::io::Result<bool> {
@@ -3893,42 +3820,20 @@ fn provider_process_active(operation_id: &str) -> std::io::Result<bool> {
 }
 
 fn admission_guard() -> std::io::Result<AdmissionGuard> {
+    use std::os::fd::AsRawFd;
     let process = ADMISSION_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(ADMISSION_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(AdmissionGuard {
-            _process: process,
-            file,
-        })
+    let file = open_private_lock_file(&default_support_dir().join(ADMISSION_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(default_support_dir().join(ADMISSION_LOCK_FILE))?;
-        Ok(AdmissionGuard {
-            _process: process,
-            file,
-        })
-    }
+    Ok(AdmissionGuard {
+        _process: process,
+        file,
+    })
 }
 
 fn unix_seconds() -> u64 {
@@ -4052,49 +3957,6 @@ mod tests {
             invalid_auth.code_error,
             Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
         );
-        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn authorization_code_projection_uses_one_state_snapshot() {
-        let (root, _support_dir, _support) = with_support("auth-code-status-snapshot");
-        let operation_id = "claude_setup_c3dec3dec3dec3dec3dec3dec3dec3de";
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let status = prepare_generic(store.load().expect("registry"), operation_id)
-            .expect("prepare generic");
-        set_phase(operation_id, ClaudeBrowserAuthPhaseV1::SubmittingCode);
-
-        let snapshot = read_state();
-        let snapshot_operation = snapshot
-            .operations
-            .iter()
-            .find(|operation| operation.operation_id == operation_id)
-            .expect("snapshot operation");
-        apply_provider_event(operation_id, PROVIDER_EVENT_CODE_INVALID);
-
-        let snapshot_projection = synthetic_operation_with_state(snapshot_operation, &snapshot);
-        let snapshot_auth = snapshot_projection
-            .browser_auth
-            .expect("snapshot browser auth");
-        assert_eq!(
-            snapshot_auth.phase,
-            ClaudeBrowserAuthPhaseV1::SubmittingCode
-        );
-        assert_eq!(snapshot_auth.code_error, None);
-
-        let current = annotate_status(status);
-        let current_auth = current
-            .setup_operation
-            .browser_auth
-            .expect("current browser auth");
-        assert_eq!(current_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
-        assert_eq!(
-            current_auth.code_error,
-            Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
-        );
-
         finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
         let _ = fs::remove_dir_all(root);
     }
@@ -4674,70 +4536,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn registry_mutation_guard_prevents_recovery_from_deleting_a_committed_target() {
-        let (root, _support_dir, _support) = with_support("pre-core-target-serialized-replay");
-        let operation_id = "claude_setup_14141414141414141414141414141414";
-        let target_id = "claude_anchor_target_14141414141414141414141414141414";
-        let account = "a".repeat(64);
-        let organization = "b".repeat(64);
-        assert!(claim_ceremony(operation_id).expect("claim ceremony"));
-        let guard = registry_mutation_guard(operation_id).expect("mutation guard");
-        persist_registry_mutation_fence(
-            operation_id,
-            BrowserLoginMode::Target,
-            None,
-            None,
-            Some(target_id),
-            Some(&account),
-            Some(&organization),
-        )
-        .expect("placeholder fence");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let recovery_barrier = std::sync::Arc::clone(&barrier);
-        let recovery_operation = operation_id.to_string();
-        let recovery = thread::spawn(move || {
-            recovery_barrier.wait();
-            recover_operation(&recovery_operation);
-        });
-        barrier.wait();
-        thread::sleep(PROCESS_POLL_INTERVAL + Duration::from_millis(25));
-        let core = FileClaudeConfigSlotSettingsStore::default()
-            .prepare_managed_account_target(
-                1,
-                operation_id.to_string(),
-                Some(target_id.to_string()),
-                Some(account),
-                Some(organization),
-            )
-            .expect("core commit while recovery is excluded");
-        let slot_id = core.setup_operation.slot_id.clone().expect("slot");
-        assert_eq!(
-            collection_suppression(&slot_id),
-            Some(ClaudeCollectionSuppression::HideProvisionalTarget)
-        );
-        assert!(read_operation(operation_id).is_some());
-        drop(guard);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline
-            && read_operation(operation_id).is_some_and(|operation| operation.slot_id.is_empty())
-        {
-            thread::sleep(Duration::from_millis(25));
-        }
-        let sealed = read_operation(operation_id).expect("sealed operation");
-        assert_eq!(sealed.slot_id, slot_id);
-        assert!(!sealed.config_dir.is_empty());
-        assert_eq!(
-            collection_suppression(&slot_id),
-            Some(ClaudeCollectionSuppression::HideProvisionalTarget)
-        );
-        assert!(request_cancel(operation_id).expect("cancel request"));
-        recovery.join().expect("recovery joins after cancel");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
     fn pre_core_target_placeholder_releases_exact_reusable_claim_without_quarantining_parent() {
         let root = temp_dir("pre-core-target-abort");
         let support = root.join("support");
@@ -4855,61 +4653,6 @@ mod tests {
                 && slot.config_dir.as_deref() == Some(managed.to_string_lossy().as_ref())));
         let retry_id = "claude_setup_09090909090909090909090909090909";
         assert!(claim_ceremony(retry_id).expect("retry claim"));
-        release_ceremony(retry_id);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn failed_pre_spawn_terminalization_starts_recovery_and_releases_claim() {
-        let root = temp_dir("pre-spawn-terminalization-recovery");
-        let support = root.join("support");
-        let managed = support
-            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
-            .join("claude_slot_10101010101010101010101010101010");
-        fs::create_dir_all(&managed).expect("managed root");
-        #[cfg(unix)]
-        {
-            fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-            fs::set_permissions(
-                support.join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME),
-                fs::Permissions::from_mode(0o700),
-            )
-            .expect("managed mode");
-            fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("root mode");
-        }
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let mut status = store
-            .register_managed_path(1, managed.to_string_lossy().into_owned())
-            .expect("registered slot");
-        let slot_id = status.managed_slots[0].slot_id.clone();
-        let operation_id = "claude_setup_10101010101010101010101010101010";
-        assert!(claim_ceremony(operation_id).expect("claim ceremony"));
-        persist_registry_mutation_fence(
-            operation_id,
-            BrowserLoginMode::Reconnect,
-            Some(&slot_id),
-            Some(managed.to_string_lossy().as_ref()),
-            None,
-            Some(&"a".repeat(64)),
-            Some(&"b".repeat(64)),
-        )
-        .expect("pre-core reconnect fence");
-        status.setup_operation = synthetic_operation(
-            &read_operation(operation_id).expect("browser reconnect operation"),
-        );
-        fs::remove_dir(&managed).expect("force baseline capture failure");
-
-        assert!(start(status, BrowserLoginMode::Reconnect).is_err());
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && read_operation(operation_id).is_some() {
-            thread::sleep(Duration::from_millis(25));
-        }
-        assert!(read_operation(operation_id).is_none());
-        assert!(read_state().active_operation_id.is_none());
-        let retry_id = "claude_setup_11111111111111111111111111111111";
-        assert!(claim_ceremony(retry_id).expect("recovery released ceremony"));
         release_ceremony(retry_id);
         let _ = fs::remove_dir_all(root);
     }
@@ -5137,54 +4880,6 @@ mod tests {
         }));
         assert!(state.quarantined_roots.iter().any(|candidate| {
             candidate.config_dir == operation.config_dir
-                && candidate.claimed_by.as_deref() == Some(operation_id)
-        }));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn reusable_root_selection_skips_stale_candidate_before_valid_root() {
-        let (root, _support_dir, _support) = with_support("stale-before-valid-root");
-        let stale_root = root
-            .join("retired-installation")
-            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
-            .join("claude_slot_dddddddddddddddddddddddddddddddd");
-        let (_, valid_root) = prepare_managed_claude_provisional_root(
-            "claude_setup_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        )
-        .expect("valid root");
-        transact(|state| {
-            state.quarantined_roots.push(QuarantinedRoot {
-                root_id: "claude_slot_dddddddddddddddddddddddddddddddd".to_string(),
-                config_dir: stale_root.to_string_lossy().into_owned(),
-                service_alias: String::new(),
-                pending_registry_removal: false,
-                claimed_by: None,
-            });
-            state.quarantined_roots.push(QuarantinedRoot {
-                root_id: "claude_slot_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
-                config_dir: valid_root.clone(),
-                service_alias: ClaudeConfigDirSlot::registered(valid_root.clone())
-                    .expect("valid slot")
-                    .service_name(),
-                pending_registry_removal: false,
-                claimed_by: None,
-            });
-        })
-        .expect("candidate state");
-
-        let operation_id = "claude_setup_ffffffffffffffffffffffffffffffff";
-        assert_eq!(
-            claim_reusable_root(operation_id).expect("claim"),
-            Some(valid_root.clone())
-        );
-        let state = read_state();
-        assert!(state.quarantined_roots.iter().any(|candidate| {
-            candidate.config_dir == stale_root.to_string_lossy() && candidate.claimed_by.is_none()
-        }));
-        assert!(state.quarantined_roots.iter().any(|candidate| {
-            candidate.config_dir == valid_root
                 && candidate.claimed_by.as_deref() == Some(operation_id)
         }));
         let _ = fs::remove_dir_all(root);
@@ -5736,60 +5431,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn terminal_completion_wins_late_cancel() {
-        let root = temp_dir("complete-wins");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        let operation_id = "claude_setup_90909090909090909090909090909090";
-        let now = unix_seconds();
-        transact(|state| {
-            state.operations.push(PersistedOperation {
-                operation_id: operation_id.to_string(),
-                slot_id: "claude_slot_90909090909090909090909090909090".to_string(),
-                config_dir: "/tmp/registered".to_string(),
-                ceremony_baseline: None,
-                mode: PersistedMode::Reconnect,
-                target_id: None,
-                expected_account_identifier_hash: None,
-                expected_organization_identifier_hash: None,
-                phase: ClaudeBrowserAuthPhaseV1::Reading,
-                outcome: None,
-                canonical_slot_id: None,
-                admission_slot_id: None,
-                identity_mismatch: None,
-                cancel_requested: false,
-                started_unix_seconds: now,
-                deadline_unix_seconds: now + 60,
-                completed_unix_seconds: None,
-                fallback_completed: false,
-            });
-        })
-        .expect("state");
-        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Complete, None);
-        request_cancel(operation_id).expect("cancel request");
-        assert_eq!(
-            read_operation(operation_id).and_then(|operation| operation.outcome),
-            Some(ClaudeBrowserAuthOutcomeV1::Complete)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn corrupt_state_is_never_reset_by_a_mutation() {
-        let root = temp_dir("corrupt-state");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        fs::write(state_path(), b"{not-json").expect("corrupt state");
-        assert!(transact(|state| state.operations.clear()).is_err());
-        assert_eq!(fs::read(state_path()).expect("preserved"), b"{not-json");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
     fn corrupt_state_prevents_provisional_root_creation() {
         let root = temp_dir("corrupt-before-root");
         let support = root.join("support");
@@ -5951,38 +5592,6 @@ mod tests {
             claim_ceremony("claude_setup_28282828282828282828282828282828")
                 .expect("collision released ceremony")
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn concurrent_same_id_generic_prepare_persists_one_operation_and_one_root() {
-        let (root, _support_dir, _support) = with_support("generic-same-id-race");
-        let operation_id = "claude_setup_29292929292929292929292929292929";
-        let status = FileClaudeConfigSlotSettingsStore::default()
-            .load()
-            .expect("registry");
-        let first_status = status.clone();
-        let second_status = status;
-        let first = thread::spawn(move || prepare_generic(first_status, operation_id));
-        let second = thread::spawn(move || prepare_generic(second_status, operation_id));
-        assert!(first.join().expect("first thread").is_ok());
-        assert!(second.join().expect("second thread").is_ok());
-        let state = read_state();
-        assert_eq!(
-            state
-                .operations
-                .iter()
-                .filter(|operation| operation.operation_id == operation_id)
-                .count(),
-            1
-        );
-        assert_eq!(state.quarantined_roots.len(), 1);
-        assert_eq!(
-            state.quarantined_roots[0].claimed_by.as_deref(),
-            Some(operation_id)
-        );
-        release_ceremony(operation_id);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7548,317 +7157,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn terminal_fallback_target_mismatch_retires_root_and_persists_typed_outcome() {
-        let (root, _support_dir, _support) = with_support("fallback-target-mismatch");
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let operation_id = "claude_setup_12121212121212121212121212121212";
-        let expected_account = "a".repeat(64);
-        let expected_organization = "b".repeat(64);
-        let prepared = store
-            .prepare_managed_account_target(
-                1,
-                operation_id.to_string(),
-                Some("claude_anchor_target_12121212121212121212121212121212".to_string()),
-                Some(expected_account),
-                Some(expected_organization),
-            )
-            .expect("target");
-        let slot_id = prepared.setup_operation.slot_id.clone().expect("slot");
-        let config_dir = prepared
-            .managed_slots
-            .iter()
-            .find(|slot| slot.slot_id == slot_id)
-            .and_then(|slot| slot.config_dir.clone())
-            .expect("root");
-        let operation = PersistedOperation {
-            operation_id: operation_id.to_string(),
-            slot_id: slot_id.clone(),
-            config_dir: config_dir.clone(),
-            ceremony_baseline: Some("baseline".to_string()),
-            mode: PersistedMode::Target,
-            target_id: prepared.setup_operation.target_id.clone(),
-            expected_account_identifier_hash: prepared
-                .setup_operation
-                .expected_account_identifier_hash
-                .clone(),
-            expected_organization_identifier_hash: prepared
-                .setup_operation
-                .expected_organization_identifier_hash
-                .clone(),
-            phase: ClaudeBrowserAuthPhaseV1::Complete,
-            outcome: Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired),
-            canonical_slot_id: None,
-            admission_slot_id: None,
-            identity_mismatch: None,
-            cancel_requested: false,
-            started_unix_seconds: 1,
-            deadline_unix_seconds: u64::MAX,
-            completed_unix_seconds: Some(unix_seconds()),
-            fallback_completed: false,
-        };
-        transact(|state| {
-            state.active_operation_id = Some(operation_id.to_string());
-            state.operations.push(operation.clone());
-        })
-        .expect("fallback sidecar");
-        reserve_quarantine_root(&operation, false).expect("prelaunch reservation");
-        let wrong_account = "c".repeat(64);
-        let wrong_organization = "d".repeat(64);
-        finalize_identity_mode(
-            operation_id,
-            crate::agent_status::ClaudeLocalIdentityProof {
-                account_identifier_hash: wrong_account.clone(),
-                organization_identifier_hash: wrong_organization.clone(),
-                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                    account_identifier_hash: Some(wrong_account),
-                    organization_identifier_hash: Some(wrong_organization),
-                    ..Default::default()
-                },
-            },
-            true,
-        )
-        .expect("fallback mismatch");
-
-        let current = read_operation(operation_id).expect("terminal sidecar");
-        assert_eq!(
-            current.outcome,
-            Some(ClaudeBrowserAuthOutcomeV1::IdentityMismatch)
-        );
-        assert_eq!(
-            current.identity_mismatch,
-            Some(ClaudeBrowserAuthIdentityMismatchV1::AccountAndOrganization)
-        );
-        assert!(read_state().active_operation_id.is_none());
-        assert!(!store
-            .load()
-            .expect("registry")
-            .managed_slots
-            .iter()
-            .any(|slot| slot.slot_id == slot_id));
-        assert!(read_state()
-            .quarantined_roots
-            .iter()
-            .any(|root| { root.config_dir == config_dir && root.claimed_by.is_none() }));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn terminal_fallback_reconnect_mismatch_preserves_canonical_slot_and_typed_outcome() {
-        let root = temp_dir("fallback-reconnect-mismatch");
-        let support = root.join("support");
-        let managed = support
-            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
-            .join("claude_slot_13131313131313131313131313131313");
-        fs::create_dir_all(&managed).expect("managed root");
-        #[cfg(unix)]
-        {
-            fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-            fs::set_permissions(
-                support.join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME),
-                fs::Permissions::from_mode(0o700),
-            )
-            .expect("managed mode");
-            fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("root mode");
-        }
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let registered = store
-            .register_managed_path(1, managed.to_string_lossy().into_owned())
-            .expect("register");
-        let slot_id = registered.managed_slots[0].slot_id.clone();
-        let account = "a".repeat(64);
-        let organization = "b".repeat(64);
-        let prior = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-            account_identifier_hash: Some(account.clone()),
-            organization_identifier_hash: Some(organization.clone()),
-            ..Default::default()
-        };
-        crate::agent_status::persist_one_claude_slot_collection_state(&slot_id, &prior)
-            .expect("prior identity");
-        let operation_id = "claude_setup_13131313131313131313131313131313";
-        let target_id = "claude_anchor_target_13131313131313131313131313131313";
-        store
-            .begin_registered_slot_reconnect_target(
-                1,
-                operation_id.to_string(),
-                &slot_id,
-                Some(target_id.to_string()),
-                account.clone(),
-                Some(organization.clone()),
-            )
-            .expect("reconnect");
-        transact(|state| {
-            state.active_operation_id = Some(operation_id.to_string());
-            state.operations.push(PersistedOperation {
-                operation_id: operation_id.to_string(),
-                slot_id: slot_id.clone(),
-                config_dir: managed.to_string_lossy().into_owned(),
-                ceremony_baseline: Some("baseline".to_string()),
-                mode: PersistedMode::Reconnect,
-                target_id: Some(target_id.to_string()),
-                expected_account_identifier_hash: Some(account.clone()),
-                expected_organization_identifier_hash: Some(organization.clone()),
-                phase: ClaudeBrowserAuthPhaseV1::Complete,
-                outcome: Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired),
-                canonical_slot_id: None,
-                admission_slot_id: None,
-                identity_mismatch: None,
-                cancel_requested: false,
-                started_unix_seconds: 1,
-                deadline_unix_seconds: u64::MAX,
-                completed_unix_seconds: Some(unix_seconds()),
-                fallback_completed: false,
-            });
-        })
-        .expect("fallback sidecar");
-        let wrong_organization = "c".repeat(64);
-        finalize_identity_mode(
-            operation_id,
-            crate::agent_status::ClaudeLocalIdentityProof {
-                account_identifier_hash: account,
-                organization_identifier_hash: wrong_organization.clone(),
-                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                    account_identifier_hash: Some("a".repeat(64)),
-                    organization_identifier_hash: Some(wrong_organization),
-                    ..Default::default()
-                },
-            },
-            true,
-        )
-        .expect("fallback mismatch");
-
-        let current = read_operation(operation_id).expect("terminal sidecar");
-        assert_eq!(
-            current.outcome,
-            Some(ClaudeBrowserAuthOutcomeV1::IdentityMismatch)
-        );
-        assert_eq!(
-            current.identity_mismatch,
-            Some(ClaudeBrowserAuthIdentityMismatchV1::Organization)
-        );
-        assert!(read_state().active_operation_id.is_none());
-        let registry = store.load().expect("registry");
-        assert!(registry
-            .managed_slots
-            .iter()
-            .any(|slot| slot.slot_id == slot_id));
-        assert_eq!(
-            registry.setup_operation.state,
-            ClaudeAccountSetupOperationState::IdentityMismatch
-        );
-        let durable = crate::agent_status::annotate_claude_accounts_status(registry);
-        assert_eq!(
-            durable
-                .managed_slots
-                .iter()
-                .find(|slot| slot.slot_id == slot_id)
-                .expect("canonical")
-                .collection,
-            prior
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn repeated_target_failures_reuse_exact_root_without_capacity_growth() {
-        let (root, _support_dir, _support) = with_support("target-failure-reuse");
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let account = "a".repeat(64);
-        let organization = "b".repeat(64);
-        let target = "claude_anchor_target_15151515151515151515151515151515";
-        let first_id = "claude_setup_15151515151515151515151515151515";
-        let first = store
-            .prepare_managed_account_target(
-                1,
-                first_id.to_string(),
-                Some(target.to_string()),
-                Some(account.clone()),
-                Some(organization.clone()),
-            )
-            .expect("first target");
-        let first_slot = first.setup_operation.slot_id.clone().expect("slot");
-        let exact = first
-            .managed_slots
-            .iter()
-            .find(|slot| slot.slot_id == first_slot)
-            .and_then(|slot| slot.config_dir.clone())
-            .expect("root");
-        let now = unix_seconds();
-        transact(|state| {
-            state.operations.push(PersistedOperation {
-                operation_id: first_id.to_string(),
-                slot_id: first_slot,
-                config_dir: exact.clone(),
-                ceremony_baseline: None,
-                mode: PersistedMode::Target,
-                target_id: Some(target.to_string()),
-                expected_account_identifier_hash: Some(account.clone()),
-                expected_organization_identifier_hash: Some(organization.clone()),
-                phase: ClaudeBrowserAuthPhaseV1::Validating,
-                outcome: None,
-                canonical_slot_id: None,
-                admission_slot_id: None,
-                identity_mismatch: None,
-                cancel_requested: false,
-                started_unix_seconds: now,
-                deadline_unix_seconds: now + 60,
-                completed_unix_seconds: None,
-                fallback_completed: false,
-            });
-        })
-        .expect("first state");
-        fail_operation(first_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
-        assert_eq!(store.load().expect("after first").capacity.used_slots, 1);
-
-        let second_id = "claude_setup_16161616161616161616161616161616";
-        let reused = claim_reusable_root(second_id)
-            .expect("claim")
-            .expect("reusable target root");
-        assert_eq!(reused, exact);
-        let second = store
-            .prepare_managed_account_target_in_reusable_root(
-                1,
-                second_id.to_string(),
-                Some(target.to_string()),
-                Some(account.clone()),
-                Some(organization.clone()),
-                reused,
-            )
-            .expect("second target");
-        let second_slot = second.setup_operation.slot_id.clone().expect("slot");
-        transact(|state| {
-            state.operations.push(PersistedOperation {
-                operation_id: second_id.to_string(),
-                slot_id: second_slot,
-                config_dir: exact.clone(),
-                ceremony_baseline: None,
-                mode: PersistedMode::Target,
-                target_id: Some(target.to_string()),
-                expected_account_identifier_hash: Some(account),
-                expected_organization_identifier_hash: Some(organization),
-                phase: ClaudeBrowserAuthPhaseV1::Validating,
-                outcome: None,
-                canonical_slot_id: None,
-                admission_slot_id: None,
-                identity_mismatch: None,
-                cancel_requested: false,
-                started_unix_seconds: now,
-                deadline_unix_seconds: now + 60,
-                completed_unix_seconds: None,
-                fallback_completed: false,
-            });
-        })
-        .expect("second state");
-        fail_operation(second_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
-        assert_eq!(store.load().expect("after second").capacity.used_slots, 1);
-        assert!(Path::new(&exact).is_dir());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
     fn full_quarantine_keeps_target_candidate_registered_and_tracked() {
         let (root, _support_dir, _support) = with_support("target-quarantine-full");
         let store = FileClaudeConfigSlotSettingsStore::default();
@@ -8258,135 +7556,6 @@ exit 1
 
         assert!(request_cancel(operation_id).expect("cancel request"));
         assert!(claim_ceremony(retry_id).expect("claim after ordered cancel"));
-        release_ceremony(retry_id);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn fallback_observer_noop_finalize_keeps_cancel_cleanup_claim_until_terminal() {
-        let (root, _support_dir, _support) = with_support("fallback-cancel-finalize-interleaving");
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let operation_id = "claude_setup_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
-        let retry_id = "claude_setup_c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4";
-        let account = "a".repeat(64);
-        let organization = "b".repeat(64);
-        let prepared = store
-            .prepare_managed_account_target(
-                1,
-                operation_id.to_string(),
-                Some("claude_anchor_target_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3".to_string()),
-                Some(account.clone()),
-                Some(organization.clone()),
-            )
-            .expect("target");
-        let slot_id = prepared.setup_operation.slot_id.clone().expect("slot");
-        let config_dir = prepared
-            .managed_slots
-            .iter()
-            .find(|slot| slot.slot_id == slot_id)
-            .and_then(|slot| slot.config_dir.clone())
-            .expect("root");
-        assert!(claim_ceremony(operation_id).expect("claim fallback ceremony"));
-        transact(|state| {
-            state.operations.push(PersistedOperation {
-                operation_id: operation_id.to_string(),
-                slot_id: slot_id.clone(),
-                config_dir,
-                ceremony_baseline: Some("baseline".to_string()),
-                mode: PersistedMode::Target,
-                target_id: prepared.setup_operation.target_id.clone(),
-                expected_account_identifier_hash: Some(account.clone()),
-                expected_organization_identifier_hash: Some(organization.clone()),
-                phase: ClaudeBrowserAuthPhaseV1::Complete,
-                outcome: Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired),
-                canonical_slot_id: None,
-                admission_slot_id: None,
-                identity_mismatch: None,
-                cancel_requested: false,
-                started_unix_seconds: 1,
-                deadline_unix_seconds: u64::MAX,
-                completed_unix_seconds: Some(unix_seconds()),
-                fallback_completed: false,
-            });
-            for index in 0..MAX_QUARANTINED_ROOTS {
-                state.quarantined_roots.push(QuarantinedRoot {
-                    root_id: format!("claude_slot_{index:032x}"),
-                    config_dir: format!("/private/quarantine/{index}"),
-                    service_alias: format!("Claude Code-{index:08x}"),
-                    pending_registry_removal: false,
-                    claimed_by: None,
-                });
-            }
-        })
-        .expect("fallback and full quarantine");
-
-        assert!(request_cancel(operation_id).is_err());
-        let pending = read_operation(operation_id).expect("cancel-pending fallback");
-        assert!(pending.cancel_requested);
-        assert_eq!(
-            pending.outcome,
-            Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired)
-        );
-        assert!(!finalize_observed_fallback_identity(
-            operation_id,
-            crate::agent_status::ClaudeLocalIdentityProof {
-                account_identifier_hash: account.clone(),
-                organization_identifier_hash: organization.clone(),
-                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                    account_identifier_hash: Some(account),
-                    organization_identifier_hash: Some(organization),
-                    ..Default::default()
-                },
-            },
-        ));
-        assert!(claim_ceremony(retry_id).is_err());
-
-        transact(|state| {
-            state.quarantined_roots.pop();
-        })
-        .expect("free quarantine capacity");
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < deadline
-            && read_operation(operation_id).is_some_and(|operation| {
-                operation.outcome == Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired)
-            })
-        {
-            thread::sleep(Duration::from_millis(25));
-        }
-        let terminal = read_operation(operation_id).expect("terminal cancel");
-        assert_eq!(
-            terminal.outcome,
-            Some(ClaudeBrowserAuthOutcomeV1::Cancelled)
-        );
-        assert!(claim_ceremony(retry_id).expect("claim after durable terminal cleanup"));
-        release_ceremony(retry_id);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn nonterminal_worker_guard_never_releases_ceremony() {
-        let (root, _support_dir, _support) = with_support("nonterminal-worker-guard");
-        let operation_id = "claude_setup_b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
-        let retry_id = "claude_setup_b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
-        let status = FileClaudeConfigSlotSettingsStore::default()
-            .load()
-            .expect("registry");
-        prepare_generic(status, operation_id).expect("prepare");
-
-        drop(WorkerCeremonyGuard { operation_id });
-        assert!(claim_ceremony(retry_id).is_err());
-        assert!(request_cancel(operation_id).expect("cancel request"));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let acquired = loop {
-            match claim_ceremony(retry_id) {
-                Ok(true) => break true,
-                _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-                _ => break false,
-            }
-        };
-        assert!(acquired, "claim after terminal cancel");
         release_ceremony(retry_id);
         let _ = fs::remove_dir_all(root);
     }

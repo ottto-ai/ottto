@@ -1,5 +1,110 @@
 # ScanIndex staged persistence: reader release N
 
+## State-v2 store
+
+State-v2 is the Claude scan-index store. A daemon load that names its support
+directory converts a Claude v1 index to it, publishes a durable fence and uses the
+store from then on. A load without a support directory (unit tests, tools) stays
+on v1 unless the store is already published. Codex and Pi keep the reader and
+legacy-write behavior below.
+
+Its format-1 schema uses four physical tables: control, records, shared_values
+and value_chunks. Typed per-kind headers project bounded selection fields;
+values preserve presence, spelling and exact accounting evidence. Variable
+values use at most 256 parts of 256 KiB each, or inline storage up to 512 bytes.
+Unchunked keys and strings have a checked 4 KiB fallback cap.
+
+Whole v1 traversal fields have these per-value logical JSON admission caps,
+applied before compression and again during bounded decompression:
+
+| Record kind | Cap |
+| --- | --- |
+| `scan_state.traversal` | 16 MiB |
+| `scan_state.scan_residue_witness` | 16 MiB |
+| `scan_state.claude_stale_family_carry` | 16 MiB |
+
+These fields already hold their complete queues and sets in memory in v1.
+Measured traversal members reached 2,848,835 bytes; residue and stale-family
+carry members reached 24,083 and 1,171 bytes respectively. The bounded exception
+allows collection-wide queues to grow without splitting their semantic members.
+Stored bytes still use the same optional zstd codec and `value_chunks` (256 KiB
+per part); compression cannot bypass the logical cap. Other kind caps are
+unchanged, including the existing 8 MiB birth-store allowance. This exception
+does not raise mutable account/usage caps or replace their segmentation policy
+(64 KiB target / 1 MiB segment cap).
+
+Above-cap values refuse with `state_v2_value_admission`. Before a durable fence,
+the existing import pause and alarm retain v1 collection and leave upload progress
+unchanged. After a fence, the existing named storage hold and diagnostics apply;
+no stale-v1 fallback or reset is permitted. See the recovery guidance below.
+
+Request-set lookup commitments are nonunique. Reuse requires streamed equality
+of the complete evidence tuple, including encoding, payload, full fingerprint,
+optional identity revision and count presence. Reference updates preserve the
+value bytes; last-reference removal deletes the owner and all parts in the same
+transaction. String vocabularies use monotonically allocated, nonreused ordinals;
+resolving a string reads directly into the final owned string without loading a
+whole dictionary. Semantic caller mapping and reference-closure checks across
+owners remain prerequisites for routing this backend.
+
+### Deferred erasure maintenance
+
+Removing potentially private keys or values marks the first pending generation
+and its start time in that same transaction. Later removals preserve the oldest
+deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale text
+may remain in gaps in live pages. Completion requires in-place VACUUM, successful
+TRUNCATE with a measured zero-length WAL, and a durable metadata-only clear.
+
+SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
+
+The default deadline is 24 hours; shorter deadlines are allowed. A longer
+policy requires SOURCE approval and is capped at 72 hours; erasure is never
+disabled. That cap is a policy limit, never a grace period for overdue debt.
+Idle attempts start around 12 hours. At 20 hours (scaled down for shorter
+policies), a maintenance pause takes precedence over Ottto's own acquisition
+work and locks. The pause reserves the next checkpoint-lock turn before waiting
+up to two seconds for an existing Ottto owner; new normal work yields to it.
+Own-lock failure remains a failure and an overdue breach. Another process's lock is a counted breach if it prevents
+completion within the deadline. Failed attempts retain debt and back off within
+the remaining deadline. Successful runs normally have a 24-hour cadence, which
+yields to the forced maintenance pause and overdue recovery.
+
+Preparation and every acquisition continuation check maintenance before normal
+collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE,
+run at the recovery boundary before collection resumes, overriding retry and
+successful-run cooldowns. Recovery has at most two consecutive bounded attempts;
+if they fail, collection continues with debt and the overdue alarm retained,
+and retries resume with pacing. An ordinary failed idle attempt does not arm this
+recovery boundary. Previously committed data remains committed. A missing or regressed deletion
+clock uses the same conservative overdue posture, rather than postponing purge.
+Privacy work precedes optional daily reference verification.
+
+Admission requires available space of at least twice the larger of the main
+file length and the logical database size, including pages still in WAL.
+An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM has a
+configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
+plus the existing bounded busy wait. Failed attempts increase the next work
+allowance geometrically, capped at 60 seconds per attempt. This is interruptible
+work, not a hard latency guarantee. Failures back off inside the remaining deadline;
+overdue retries back off up to five minutes. Debt clears only after success. Its WAL may grow approximately with database size; the 64 MiB WAL
+alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
+still require platform qualification before routing or enabling conversion.
+
+Verified completion covers the current DB/WAL/SHM and the removed migration
+backup. The retained read-only v1 baseline is an explicit policy exception:
+it is never used to resurrect a forgotten file, and its 14-day hard age raises
+an escalation alarm. Forget, uninstall and source removal immediately delete
+that source's DB/WAL/SHM, v1-readonly and private remnants under their existing
+exclusive cleanup owner. Temporary remnants and external restart records have
+separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
+APFS snapshots and physical SSD erasure are outside the promise. No application
+deletion or money-debt retirement is authorized merely by this storage maintenance.
+
+There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
+Conversion does not add a re-pin admission gate or require transcript re-read hours.
+
+## Active reader behavior
+
 This is the reader component. It reads legacy logical-schema-2 JSON and storage
 format 1, and always writes legacy JSON with the existing semantic serializer.
 After a sharded load, the next synchronous save atomically replaces the manifest
@@ -372,3 +477,129 @@ objects reachable only from a prior root: a downgrade can lose that future
 restore option while preserving current-root correctness. This reservation
 does not implement retention, restore, an acquisition cause or a repair exit.
 The minimum-N/downgrade-stall release-note requirement above remains binding.
+
+## State-v2 ACK crash reconciliation
+
+The upload body and entity-ACK protocol stay unchanged. For an authenticated v2
+source, an owner-only `<index>.v2-ack-receipt` companion durably records the exact
+next upload-progress bytes before replacing the existing progress file. It binds
+the DB identity (including source and destination namespace), source generation,
+progress generation, and both predecessor and replacement digests. The progress
+file's format remains unchanged. OFF/v1 and Codex/Pi do not create companions.
+The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
+recovery or substitute for a missing exact receipt.
+
+For **receipt-first** crashes, replay the newest companion before applying any
+source-DB handoff. Only its exact predecessor or replacement is accepted; replay
+restores complete cache-head/refusal state as well as exact accepted body witnesses.
+The runtime route performs this replay before returning a fresh or cached graph,
+under its checkpoint lock and the existing progress lock. Progress loading repeats
+that idempotent check before decoding; no recovery path reacquires the route lock.
+For **DB-first** crashes, the committed `accepted.ack_handoff` retains the original
+exact-body cleanup obligation. Reconcile progress first, durably remove only matching
+ACKs, and then clear the DB handoff. A newer body receipt cannot be retired by an
+older body's handoff. An upload error creates no acceptance, and an index save error
+creates no retirement authority. Delivery is not claimed to be exactly once.
+
+Missing/unbound receipts, identity mismatches, source rollback, corrupted receipts
+and unexpected progress bytes hold the source without quarantine/reset. Counts-only
+`ack_recovery_hold` and `ack_receipt_reconciled` events expose refusal/replay. Receipt
+encoding is capped at 64 MiB. Before each POST, conservative admission reserves
+the current progress plus the page's possible ACK, identity, cache, head and refusal
+additions. Serialized progress must fit `(64 MiB - 16 KiB) / 6` (about 10.66 MiB),
+allowing worst-case JSON escaping and receipt controls. Exhaustion is counted as
+`ack_recovery_hold{size_before_upload}` and requests local ACK settlement before any
+remote write; it never evicts accepted shares. Admission then prunes the cache
+evidence (state and head) of settled sessions, those with no pending head obligation
+and not in the page, counted as `ack_custody_pruned`; a pruned session that reopens
+takes the ordinary missing-head bootstrap. If live custody alone still exceeds the
+bound, nothing changes and the route holds (`hold{ack_custody}`): no collection or
+POST until one retry per `GROWTH_FULL_INTERVAL` (6 h); owed debt stays in the
+unchanged index and progress. Empty v2
+progress remains durable so a missing ledger cannot silently reopen old work.
+
+Before publication, the import owner must seal the proved original progress bytes
+with `ProgressRecovery::seal_import`; this operation does not infer ownership from a
+filename. The import owner independently reads back the receipt and verifies its
+DB identity/generation against the closed-over source snapshot while holding the
+progress lock through database fsync and fence publication. Original inventory
+commitments and the copied `v1-readonly` baseline are verified before publication.
+There is one retained pre-import baseline, including its referenced immutable
+shards; saves and hydration create no additional backup copies. The baseline
+retains its explicit erasure exception and 14-day hard-age escalation. Source
+erasure, forget and uninstall delete it and its shards immediately alongside the
+DB/WAL/SHM, import remnants, exact ACK companion and restart records.
+
+Schema revision one uses the forward-only `user_version` runner and checks
+`minimum_writer_capability` before writes. Nonempty revision-zero layouts are
+refused rather than adopted. There are no destructive migration steps or automatic
+backup restoration; newer schema/writer capabilities hold the source. Exact ACK
+receipt reconciliation remains required before collection or settlement.
+
+Explicit source erasure also removes the exact ACK companion. Maintenance reports
+its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
+or GC authority. Baseline age/escalation gauges refresh after import preservation,
+on authenticated saves and at maintenance/load boundaries.
+
+Each steady save publishes its complete dirty delta in one `BEGIN IMMEDIATE` /
+`COMMIT`: progress, census, evidence, ACK retirement, shared references, restart
+checkpoints and generation advance together. Restart planning, preflight and
+fsynced staging precede BEGIN. The restart owner receives `post_commit` only after
+an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
+
+If restart staging excludes any file, the complete save is discarded and the
+committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement,
+owned-start census or account-window retirement from that attempt is published.
+The route retains excluded keys through a 60-second parsing backoff while
+independent files can commit. Excluded keys stay in bounded discovery and age
+retention; their committed extent, prior restart reference and owed debt remain
+unchanged. The existing growth retention metadata keeps them eligible even when
+they age outside the ordinary scan window. Backoff expiry permits a normal retry;
+only a durably staged replacement or witnessed finish resolves the exclusion.
+`v2_resume_stage_excluded` counts retained keys per Claude source pass and
+`v2_resume_excluded_growth_bytes` counts additional bytes observed while held.
+`v2_resume_stage_excluded_alarm` reports the same key still excluded after three
+passes or six hours. These retry clocks are process-local; durable file/ref/debt
+custody survives restart. Directory-fsync or store-level failures refuse the whole
+transaction and must not be reported by the adapter as a per-file exclusion.
+
+The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
+target still commits and halves the next page; a collection save under target
+grows it by 25 files up to the requested page. Claim-only saves preserve the page
+limit and any save-pressure hold. Charged work includes old/new values, chunks,
+reference updates, metadata, tombstones and restart staging. More than 256 MiB
+rolls back the whole save, reloads the committed graph and halves the page for a
+retry from committed checkpoints. If a page of one is still too large, the source
+holds with `state_v2_save_oversize` and an alarm. Uploads and ACKs stay fenced
+until a completed native retry and its recovery save succeed. UnACKed file
+entries keep their accepted progress during recovery. That file retries at most
+once per six hours, using the existing durable growth Full claim before payload
+acquisition; intervening passes skip its transcript reads. The source-wide fence
+remains because upload recovery and accepted progress share the source owner.
+A held cycle uses the existing local partial-checkpoint settlement path before
+any upload, then starts a fresh pass; unACKed file progress stays owed.
+SQLITE_FULL likewise rolls back and holds for retry. No partial publication or deferred-work journal exists; transcripts and
+committed checkpoints retain retry custody. Unknown persisted kinds are refused.
+
+WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
+transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
+8 MiB and idle TRUNCATE remain in effect.
+Each save or import that writes rows reports `row_cap_max`, the largest written
+row's logical bytes as a percent of its cap with its kind name, and
+`row_cap_alarm` at 75% or more; digest-unchanged rows are not rewritten or seen.
+
+For an unknown field or other state-v2 load failure, an unpublished source keeps
+collecting through v1 and reports `import_paused` / `import_paused_alarm`.
+After the durable fence, collection holds. A key, kind, control or version
+written by a newer build holds as "update Ottto" (downgrade); any other failure
+holds with a named state-v2 error and the existing local-data repair status and
+alarm. Keep the database, fence, baseline
+and upload-progress bytes as found. Do not reset, rewrite or delete them to clear
+the hold. Growth-retained files remain discoverable so a compatible build can
+catch up by Tail after the hold clears.
+
+If a local-data hold lasts **24 hours**, escalate to **Ottto state recovery support**
+with the counts-only diagnostics and named hold reason. Source applications can
+age out their original transcript files while collection is held; an extended
+hold can therefore lose usage. Prioritize a compatible build and preservation
+of source files. A counter alone is not a recovery action.

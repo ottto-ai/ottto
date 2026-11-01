@@ -701,13 +701,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Whether `digest` has `sha256_hex`'s shape: 64 lowercase hex digits.
-fn digest_shaped(digest: &str) -> bool {
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+use crate::hex::is_sha256_lower as digest_shaped;
 
 /// The parts of a prior certificate `prepare`'s decision reads, borrowed from
 /// a `Checkpoint` or a `PrefixSeal`.

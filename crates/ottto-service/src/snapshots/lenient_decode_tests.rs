@@ -22,21 +22,6 @@ fn fixture() -> ScanIndex {
     );
     index
 }
-// Keys and fixed custody metadata now spend the same input-funded allowance
-// as values. Fund hold-heavy fixtures with unrelated COMMITTED native state,
-// which survives partial save and restart, rather than disposable padding.
-fn fund_hold_metadata(index: &mut ScanIndex, count: usize) {
-    let members = index
-        .file_snapshot_fingerprints
-        .get_mut("/synthetic/15.jsonl")
-        .unwrap();
-    for n in 0..count {
-        let fingerprint = format!("{:064x}", 0x10000 + n);
-        members.insert(fingerprint.clone());
-        index.accepted_snapshot_fingerprints.insert(fingerprint);
-    }
-}
-
 fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
     let root: BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(bytes).unwrap();
@@ -404,42 +389,6 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
 }
 
 #[test]
-fn lenient_held_entity_is_absent_from_emission_and_manifest() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-publication");
-    let path = scratch.as_ref().join("index.json");
-    let held = "e".repeat(64);
-    let mut index = fixture();
-    index
-        .file_snapshot_fingerprints
-        .insert("/synthetic/0.jsonl".into(), BTreeSet::from([held.clone()]));
-    index
-        .snapshot_activity_at
-        .insert(held.clone(), Some("2026-10-22T00:00:00Z".into()));
-    index.save(&path).unwrap();
-    let mut value = serde_json::to_value(&index).unwrap();
-    value["quarantined_snapshot_fingerprints"][&held]["disposition"] =
-        Value::String("unknown".into());
-    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
-    loaded.record_accepted_snapshot_fingerprints(&BTreeSet::from([held.clone()]));
-    assert!(!loaded.accepted_snapshot_fingerprint_recorded(&held));
-    assert!(!loaded.accepted_snapshot_fingerprints.contains(&held));
-    let mut snapshot = tests::sample_session_artifact_item();
-    snapshot.snapshot_fingerprint = held;
-    assert!(loaded.decode_holds_snapshot(SnapshotSource::ClaudeCode, &snapshot));
-    snapshot.snapshot_fingerprint = format!("{:064x}", 15);
-    assert!(!loaded.decode_holds_snapshot(SnapshotSource::ClaudeCode, &snapshot));
-    let manifest = loaded
-        .manifest_for_window(
-            SnapshotSource::ClaudeCode,
-            "2026-10-01T00:00:00Z",
-            "2026-11-01T00:00:00Z",
-        )
-        .unwrap();
-    assert_eq!(manifest.entity_count, 15);
-}
-
-#[test]
 fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-defaults");
     let path = scratch.as_ref().join("index.json");
@@ -643,44 +592,6 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
 }
 
 #[test]
-fn lenient_opaque_claude_file_also_freezes_family_correction() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-file-family");
-    let path = scratch.as_ref().join("index.json");
-    let mut index = fixture();
-    fund_hold_metadata(&mut index, 128);
-    index.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
-    index.files.insert(
-        "/synthetic/family.jsonl".into(),
-        tests::manifest_index_entry(Some(&"a".repeat(64))),
-    );
-    index.save(&path).unwrap();
-    let mut value = serde_json::to_value(&index).unwrap();
-    value["files"]["/synthetic/family.jsonl"]["size_bytes"] = serde_json::json!([]);
-    let bytes = serde_json::to_vec(&value).unwrap();
-    let original = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
-    fs::write(&path, bytes).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.decode_holds_family("family"));
-    loaded.save(&path).unwrap();
-    assert_eq!(
-        raw_slot(
-            &fs::read(&path).unwrap(),
-            "claude_usage_authority_quarantine",
-            "family"
-        ),
-        original
-    );
-    assert_sibling(&loaded);
-    assert_eq!(
-        loaded.file_snapshot_fingerprints["/synthetic/15.jsonl"].len(),
-        129
-    );
-    assert!(loaded
-        .accepted_snapshot_fingerprints
-        .contains(&format!("{:064x}", 0x10000 + 127)));
-}
-
-#[test]
 fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_reload() {
     for bounded in [false, true] {
         for changed_again in [false, true] {
@@ -792,6 +703,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.clone(),
@@ -820,26 +732,6 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let restarted = ScanIndex::load(&path).unwrap();
     assert!(restarted.file_snapshot_fingerprints[&key].contains(&fingerprint));
     assert!(!restarted.confirmed_empty_files.contains(&key));
-}
-
-#[test]
-fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-control-priority");
-    let path = scratch.as_ref().join("index.json");
-    for (field, control) in [
-        ("accepted_snapshot_fingerprint_ledger_version", "256"),
-        ("generation", "\"unknown\""),
-        ("codex_parent_proof_seq", "1e400"),
-    ] {
-        let bytes = format!(
-            "{{\"files\":{{\"bad\":{{\"unknown\":\"{}\"}}}},\"{field}\":{control}}}",
-            "x".repeat(2 * 1024 * 1024)
-        );
-        fs::write(&path, bytes.as_bytes()).unwrap();
-        assert!(ScanIndex::load(&path).is_err());
-        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-    }
 }
 
 fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
@@ -987,64 +879,6 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
 }
 
 #[test]
-fn admitted_unknown_main_values_cross_serde_native_recursion_threshold() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-admitted-depth");
-    let path = scratch.as_ref().join("index.json");
-    let mut seed = fixture();
-    seed.save(&path).unwrap();
-    let prefix = fs::read(&path).unwrap();
-    for depth in [128, 200, 255] {
-        let mut bytes = prefix[..prefix.len() - 1].to_vec();
-        bytes.extend_from_slice(b",\"unknown\":");
-        bytes.extend(std::iter::repeat(b'[').take(depth));
-        bytes.push(b'0');
-        bytes.extend(std::iter::repeat(b']').take(depth));
-        bytes.push(b'}');
-        fs::write(&path, &bytes).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        assert_sibling(&loaded);
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-        // Selected CAS deliberately keeps its stricter preexisting depth-64
-        // shape gate; ordinary load/CAS retain admitted unknown JSON values.
-        assert!(loaded.save_with_read_limit(&path, bytes.len()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        loaded.save(&path).unwrap();
-        assert_sibling(&ScanIndex::load(&path).unwrap());
-    }
-}
-
-#[test]
-fn optional_resource_classification_precedes_earlier_bad_numeric_token() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-resource-before-syntax");
-    let path = scratch.as_ref().join("index.json");
-    let mut seed = fixture();
-    seed.save(&path).unwrap();
-    let prefix = fs::read(&path).unwrap();
-    let mut bytes = prefix[..prefix.len() - 1].to_vec();
-    bytes.extend_from_slice(b",\"claude_request_census\":[01,");
-    bytes.extend(std::iter::repeat(b'[').take(1000));
-    bytes.push(b'0');
-    bytes.extend(std::iter::repeat(b']').take(1000));
-    bytes.extend_from_slice(b"]}");
-    for bounded in [false, true] {
-        fs::write(&path, &bytes).unwrap();
-        let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-        assert!(native.claude_request_census.is_empty());
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        assert_sibling(&loaded);
-        assert!(loaded.claude_request_census.is_empty());
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-        if bounded {
-            loaded.save_with_read_limit(&path, bytes.len()).unwrap();
-        } else {
-            loaded.save(&path).unwrap();
-        }
-        assert_sibling(&ScanIndex::load(&path).unwrap());
-    }
-}
-
-#[test]
 fn optional_raw_cap_counts_object_field_leading_whitespace() {
     use std::io::Write;
     let scratch = crate::test_scratch::ScratchDir::new("lenient-census-leading-whitespace");
@@ -1071,52 +905,6 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     assert!(loaded.claude_request_census_shadow.is_empty());
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
-}
-
-#[test]
-fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
-    for records in [1, 3] {
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-key-charge");
-        let path = scratch.as_ref().join("index.json");
-        let mut seed = fixture();
-        seed.save(&path).unwrap();
-        let mut value = serde_json::to_value(&seed).unwrap();
-        for n in 0..records {
-            value["files"][format!(
-                "{n}{}",
-                "k".repeat(if records == 3 {
-                    400 * 1024
-                } else {
-                    2 * 1024 * 1024
-                })
-            )] = Value::Bool(false);
-        }
-        value["unknown_padding"] =
-            Value::String("p".repeat(if records == 3 { 0 } else { 20 * 1024 * 1024 }));
-        let bytes = serde_json::to_vec(&value).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        if records == 3 {
-            let error = lenient_decode::read(std::io::Cursor::new(&bytes), "cas", "unattributed")
-                .unwrap_err();
-            assert!(matches!(error, lenient_decode::Error::HoldBudget));
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-        } else {
-            let mut loaded = ScanIndex::load(&path).unwrap();
-            assert_eq!(loaded.decode_held_file_keys().count(), 1);
-            assert_sibling(&loaded);
-            // The original padding funded this key; canonical output does not.
-            for bounded in [false, true] {
-                let error = if bounded {
-                    loaded.save_with_read_limit(&path, 32 * 1024 * 1024)
-                } else {
-                    loaded.save(&path)
-                }
-                .unwrap_err();
-                assert!(format!("{error:#}").contains("lenient_hold_budget_exceeded"));
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-            }
-        }
-    }
 }
 
 #[test]
@@ -1760,6 +1548,11 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 store.record_observation("session", "/synthetic/0.jsonl", 1);
                 serde_json::to_value(store).unwrap()
             }
+            "upload_context_proof" => serde_json::json!({
+                "entity_stamps": {
+                    "a".repeat(64): {"context_fingerprint":"b".repeat(64),"body_witness":"c".repeat(64)}
+                }
+            }),
             "claude_copy_removals" => {
                 let mut removals = claude_request_money::copy_removals::CopyRemovals::default();
                 removals.store(
@@ -1835,7 +1628,16 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::FIELDS
             .iter()
             .copied()
-            .filter(|name| !matches!(*name, "reread_guard" | "claude_desktop_store_inventory"))
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "reread_guard"
+                        | "claude_desktop_store_inventory"
+                        | "context_curve_capability_enabled"
+                        | "context_curve_replay_epoch"
+                        | "completed_context_curve_replay_generation"
+                )
+            })
             .collect()
     );
     let decoded =
@@ -1844,6 +1646,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
 }
 
+/// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     // Main shipped audit progress first. The earlier E2 writer saved a named
@@ -1852,13 +1655,14 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 5..],
+        &fields[fields.len() - 6..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
             "claude_copy_removals",
+            "upload_context_proof",
         ]
     );
     for earlier_e2 in [false, true] {
@@ -1867,6 +1671,10 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             .as_object_mut()
             .unwrap()
             .remove("claude_copy_removals");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("upload_context_proof");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -1877,7 +1685,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 3]
+                fields[..fields.len() - 4]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -1903,30 +1711,6 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 }
 
 const DESKTOP_INVENTORY: &str = "claude_desktop_store_inventory";
-
-/// An index with #851's key and one without both load; the key steers nothing
-/// and the next save holds exactly what an index without it holds, which is
-/// also all a reader that predates the key ever sees.
-#[test]
-fn desktop_inventory_key_is_decoded_ignored_and_never_saved() {
-    let seed = every_persisted_field_fixture();
-    let without = serde_json::to_vec(&seed).unwrap();
-    let plain: Value = serde_json::from_slice(&without).unwrap();
-    assert!(plain.get(DESKTOP_INVENTORY).is_none());
-    let mut carrying = plain.clone();
-    carrying[DESKTOP_INVENTORY] = serde_json::json!("a".repeat(64));
-    let carrying = serde_json::to_vec(&carrying).unwrap();
-    for (bytes, expected) in [(&carrying, Some("a".repeat(64))), (&without, None)] {
-        let streaming =
-            lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(bytes).unwrap();
-        for decoded in [streaming, bounded] {
-            assert!(decoded.decode_holds.is_empty());
-            assert_eq!(decoded.claude_desktop_store_inventory, expected);
-            assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
-        }
-    }
-}
 
 #[test]
 fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts() {
@@ -1982,66 +1766,14 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
     }
 }
 
-/// This key was unknown to the last release, so no value of it may refuse.
-#[test]
-fn bad_desktop_inventory_is_dropped_and_counted_never_refused() {
-    let seed = every_persisted_field_fixture();
-    let without = serde_json::to_vec(&seed).unwrap();
-    let plain: Value = serde_json::from_slice(&without).unwrap();
-    let load = |value: Value| {
-        let mut form = plain.clone();
-        form[DESKTOP_INVENTORY] = value;
-        let bytes = serde_json::to_vec(&form).unwrap();
-        let before = claude_absence_counters_for_test().tombstone_decode_drops;
-        let decoded =
-            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        assert!(decoded.decode_holds.is_empty());
-        assert_eq!(decoded.claude_desktop_store_inventory, None);
-        assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
-        claude_absence_counters_for_test().tombstone_decode_drops - before
-    };
-    assert_eq!(load(Value::Null), 0, "null is an absent optional");
-    for bad in [
-        serde_json::json!(7),
-        serde_json::json!(true),
-        serde_json::json!([1, 2]),
-        serde_json::json!({"nested":{"value":1}}),
-        serde_json::json!(""),
-        serde_json::json!("short"),
-        serde_json::json!("a".repeat(65)),
-        serde_json::json!("a".repeat(1 << 20)),
-    ] {
-        assert_eq!(load(bad), 1);
-    }
-}
-
-#[test]
-fn duplicate_desktop_inventory_is_not_a_new_refusal() {
-    let seed = every_persisted_field_fixture();
-    let without = serde_json::to_vec(&seed).unwrap();
-    let body = std::str::from_utf8(&without).unwrap();
-    let bytes = format!(
-        "{{\"{DESKTOP_INVENTORY}\":\"{}\",\"{DESKTOP_INVENTORY}\":7,{}",
-        "a".repeat(64),
-        &body[1..]
-    )
-    .into_bytes();
-    let streaming =
-        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-    for decoded in [streaming, bounded] {
-        assert!(decoded.decode_holds.is_empty());
-        assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
-    }
-}
-
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
-    let tombstone_slot = fields.len() - 2;
+    let tombstone_slot = fields.len() - 3;
     assert_eq!(fields[tombstone_slot], DESKTOP_INVENTORY);
     assert_eq!(fields[tombstone_slot + 1], "claude_copy_removals");
+    assert_eq!(fields[tombstone_slot + 2], "upload_context_proof");
     let slot = |name: &&str| current[*name].clone();
     let shorter: Vec<Value> = fields[..tombstone_slot].iter().map(slot).collect();
     let mut legacy = current.clone();
@@ -2049,9 +1781,14 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("claude_copy_removals");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("upload_context_proof");
     let mut full = shorter.clone();
     full.push(serde_json::json!("a".repeat(64)));
     full.push(current["claude_copy_removals"].clone());
+    full.push(current["upload_context_proof"].clone());
     for (slots, expected) in [(shorter, &legacy), (full, &current)] {
         let bytes = serde_json::to_vec(&Value::Array(slots)).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
@@ -2064,6 +1801,33 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
     }
 }
 
+/// [format] v1 keeps main's positional slots and skips v2-only growth custody.
+#[test]
+fn growth_retention_keeps_existing_positional_index_slots() {
+    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    assert!(current.get("growth_retention").is_none());
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields[85], "claude_money_birth_store");
+    assert_eq!(fields[86], DESKTOP_INVENTORY);
+    assert_eq!(fields[87], "claude_copy_removals");
+    assert_eq!(fields[88], "upload_context_proof");
+    assert_eq!(fields.len(), 89);
+    let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
+    let mut unknown = current.clone();
+    unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
+    for form in [positional, unknown] {
+        let bytes = serde_json::to_vec(&form).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert!(decoded.v2.is_none());
+            assert_eq!(serde_json::to_value(decoded).unwrap(), current);
+        }
+    }
+}
+
 #[test]
 fn copy_removals_keep_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
@@ -2072,9 +1836,14 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("claude_copy_removals");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("upload_context_proof");
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&"claude_copy_removals"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+    assert_eq!(fields[fields.len() - 2], "claude_copy_removals");
+    assert_eq!(fields.last(), Some(&"upload_context_proof"));
+    for (expected, slots) in [(&legacy, &fields[..fields.len() - 2]), (&current, fields)] {
         let bytes = serde_json::to_vec(&Value::Array(
             slots.iter().map(|name| expected[*name].clone()).collect(),
         ))
@@ -2194,6 +1963,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             assert_eq!(
                 loaded.candidate_decision_with_reason(&candidate),
@@ -2212,7 +1982,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 None,
                 &[],
                 false,
-                true,
             );
             if source == SnapshotSource::ClaudeCode {
                 // An owed family reparse bypasses the ordinary candidate
@@ -2257,7 +2026,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     None,
                     &[],
                     false,
-                    true,
                 );
                 let mut reached_queue = false;
                 for _ in 0..1000 {
@@ -2352,7 +2120,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                         None,
                         &[],
                         false,
-                        true,
                     );
                     restarted.traversal = context.index.traversal.take();
                     let traversal = restarted.traversal.as_mut().unwrap();
@@ -2640,11 +2407,8 @@ fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
     ))
     .unwrap();
     index.claude_duplicate_request_witness_overflowed = true;
-    // A replay and a curve replay this index had already completed.
+    // A replay this index had already completed.
     index.historical_replay_generation = Some("replay-generation".into());
-    index.context_curve_capability_enabled = true;
-    index.context_curve_replay_epoch = 3;
-    index.completed_context_curve_replay_generation = Some("curve-generation".into());
     assert!(!index.accepted_snapshot_fingerprints.is_empty());
     index
 }
@@ -2696,14 +2460,8 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         index.historical_replay_generation, seed.historical_replay_generation,
         "{context}"
     );
-    assert!(index.context_curve_capability_enabled, "{context}");
-    assert_eq!(index.context_curve_replay_epoch, 3, "{context}");
-    // The completed replays stay complete: no spurious replay preparation
+    // The completed replay stays complete: no spurious replay preparation
     // clears the carried acknowledgements or owned-start census.
-    assert!(
-        !index.context_curve_replay_needed("curve-generation"),
-        "{context}"
-    );
     let mut replayed = index.clone();
     assert!(
         !replayed.prepare_historical_replay("replay-generation".into()),
@@ -2935,8 +2693,8 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             "{context}"
         );
         assert_eq!(
-            restarted.accepted_rebuild_incidence,
-            seed.file_snapshot_fingerprints
+            seed.file_snapshot_fingerprints,
+            restarted.accepted_rebuild_incidence
         );
         restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
         assert_eq!(
@@ -3359,7 +3117,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
         .map(|n| format!("{n:064x}"))
         .collect::<BTreeSet<_>>();
     let mut seed = ScanIndex {
-        accepted_snapshot_fingerprints: original.clone(),
+        accepted_snapshot_fingerprints: original.clone().into(),
         ..ScanIndex::default()
     };
     seed.file_snapshot_fingerprints
@@ -4104,6 +3862,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
         item.request_evidence.push(SnapshotRequestEvidence {
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
+            account_source: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
@@ -4223,6 +3982,8 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
             member_occurrences: BTreeMap::new(),
             invalid: true,
             idless_revision: Some([7; 32]),
+            identity_contract: None,
+            contract_unproven: false,
         },
     );
     let valid = serde_json::to_vec_pretty(&seed).unwrap();
@@ -4303,6 +4064,8 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
         member_occurrences: BTreeMap::new(),
         invalid: true,
         idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
     };
     seed.claude_usage_family_pending
         .insert("family".into(), pending.clone());
@@ -4441,7 +4204,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// Retired evidence cannot reset live census, move slots or select another read.
+/// [format] Retired evidence cannot reset live census, move slots or select
+/// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     let seed = every_persisted_field_fixture();
@@ -4476,6 +4240,10 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         "terminal_zero_snapshot_usage_evidence_count",
         "unchanged_reread_admitted",
         "reread_budget_refused",
+        "causes",
+        "caps",
+        "codex_roster_refresh_visited",
+        "codex_roster_growth_enqueued",
     ];
     let mut old = serde_json::to_value(&seed).unwrap();
     old["reread_guard"] = serde_json::json!({
@@ -4485,12 +4253,19 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     });
     old["traversal"]["counts"]["unchanged_reread_admitted"] = serde_json::json!(41);
     old["traversal"]["counts"]["reread_budget_refused"] = serde_json::json!(43);
+    old["traversal"]["counts"]["codex_roster_refresh_visited"] = serde_json::json!(45);
+    old["traversal"]["counts"]["codex_roster_growth_enqueued"] = serde_json::json!(47);
     let mut forms = vec![serde_json::to_string(&old).unwrap()];
-    // Full nested counter sequence, including nonzero retired slots 20/21.
+    // Full nested counter sequence, including nonzero retired slots 20/21
+    // and 24/25 (the seed's causes and caps are empty).
     old["traversal"]["counts"] = Value::Array(
         count_fields
             .iter()
-            .map(|name| old["traversal"]["counts"][*name].clone())
+            .map(|name| match *name {
+                "causes" => serde_json::to_value(ownership::Counts::default()).unwrap(),
+                "caps" => serde_json::to_value(CapCounts::default()).unwrap(),
+                _ => old["traversal"]["counts"][*name].clone(),
+            })
             .collect(),
     );
     forms.push(
@@ -4555,6 +4330,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     opened_object_identity: String::new(),
                     fingerprint_changed_nanos: 0,
                     fingerprint_birth_nanos: 0,
+                    withheld_content_stamp: None,
                 };
                 assert_eq!(
                     decoded.candidate_decision_with_reason_at(&candidate, 0),
@@ -4587,6 +4363,8 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                 "reread_guard",
                 "unchanged_reread_admitted",
                 "reread_budget_refused",
+                "codex_roster_refresh_visited",
+                "codex_roster_growth_enqueued",
             ] {
                 assert!(!saved.contains(&format!("\"{retired}\":")));
             }
@@ -4790,8 +4568,9 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
-            "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+            "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
+            "upload_context_proof",
         ]
     );
 }

@@ -88,9 +88,12 @@ review before release.
 
 ## Default-off release switch
 
-The complete resumed-prefix behavior above ships OFF. The one local process
-setting is `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`; only the exact value `1`
-enables it. Unset, `0`, invalid or non-Unicode values keep released behavior.
+The complete resumed-prefix behavior above ships OFF. The one local setting is
+the owner's support-dir marker `claude_resumed_prefix_dedupe_enabled` (a
+regular file, never a symlink or directory), using the support-directory
+sentinel pattern. Absent keeps released behavior. (It replaced the
+original `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE` environment key, which the
+Companion-owned LaunchAgent could never carry.)
 This controls resumed dedupe, saved-removal use/writes, prefix retry selection
 and expiry, metadata recovery, marker re-derivation and prefix flags/counters.
 Existing all-copy and certified-writer decisions retain their released path
@@ -98,12 +101,11 @@ when OFF. A frozen pre-change native builder from main `d0dcfbc72` pins actual
 upload bytes, hashes and ACK witnesses for a six-file old-writer demo family
 in full and sampled scans. Existing resumed-prefix fixtures explicitly opt in.
 
-For a later authorized local enable, set that environment key in the daemon's
-launch environment (for a manual launch, prefix the existing daemon command
-with `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`). Exporting it in another shell does
-not change an already-running daemon; the operator must arrange the next
-launch using the existing service management procedure. This task does not
-set the environment, restart the daemon or inspect private source data.
+For a later authorized local enable, create that marker in the support
+directory. The daemon and the re-read CLI read it once per process, so a
+running daemon applies it from its next start; deleting the marker and
+restarting turns it OFF. This task does not create the marker, restart the
+daemon or inspect private source data.
 Enabling first requires the operator's typed authorization and a money PLAN
 with expected removed requests/dollars and expected own-turn requests for the
 same measurement cohort. Default-ON needs a later release and money review.
@@ -134,6 +136,32 @@ A separate counts-only local-state measurement still needs files, holder
 groups, saved copied requests, longest resume chain and charged bytes. The
 4 MiB bound and 2 MiB escalation threshold remain. No such measurement has
 been performed by this implementation task.
+
+## Copy-invalidated wire flag (X-B1)
+
+With the switch ON, a contract-5 bucket row whose accepted proof a copied
+marker lent is tombstoned before upload (SOURCE F5). Lead B's X-B1 ruling
+(2026-10-31) makes that tombstone explicit on the wire. Such a row carries
+`copy_invalidated: true`, so a retaining receiver drops that row's retained
+proof for good. A later refusal-bearing upload can then never re-apply it.
+The flag goes on this pass's copy-derived rows and on rows the option (ii)
+ledger still holds as the `INVALIDATED_PROOF` tombstone. A later witnessed
+proof that replaces the tombstone ends the flag. Like `identity_retained`, it
+is sent only when the server advertises option (ii) retention. Only such a
+receiver holds proof to drop, and it mirrors the flag in its identity leaf.
+`row_leaf` hashes the flag into the `request_identity` leaf, so a body that
+differs only by the flag is a new revision. A cycle without the capability
+sends none and keeps the ledger tombstone.
+
+The flag is one bool per bucket row, omitted when false. OFF bytes are main's,
+and older receivers ignore the member. Its bytes are reserved before the
+identity caps like `identity_retained` markers. Beside a stripped fallback
+body, flags fit before markers, newest buckets first. An unfit flag is
+counted as `copy_invalidated_unfit`; its row stays tombstoned locally.
+`copy_invalidated_rows` counts flags sent. The shared row golden is
+`crates/ottto-service/src/snapshots/fixtures/claude_copy_invalidated_row.jsonl`.
+Ordering gate: copy-prefix ON and option (ii) retention must not coexist until
+COST's receiver honours `copy_invalidated` (PR-B #14454).
 
 ## Scoped re-read and counts-only estimate
 

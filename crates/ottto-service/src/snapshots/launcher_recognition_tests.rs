@@ -79,7 +79,6 @@ fn run_with_limit(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(
         cache.clone(),
@@ -177,7 +176,6 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
         None,
         &[],
         false,
-        true,
     );
     // A directory change after completed lookup forces the candidate-side
     // continuation to yield. Its physical prepass identity must survive that.
@@ -561,6 +559,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let physical = candidate.source_file_fingerprint.clone();
     candidate.source_file_fingerprint = sha256_hex(&[

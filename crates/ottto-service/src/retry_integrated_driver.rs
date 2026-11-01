@@ -116,19 +116,24 @@ fn integrated_ack(
         .snapshots
         .iter()
         .map(|item| {
+            // Ordinary fixtures have no witness domain, so the backend's entity
+            // ACK carries no version and no digest.
+            let version = crate::snapshots::snapshot_upload_body_witness_version(item);
+            assert!(
+                matches!(
+                    version,
+                    None | Some(
+                        crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
+                            | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
+                    )
+                ),
+                "unexpected retained ordinary fixture witness: {version:?}"
+            );
             serde_json::json!({
                 "source_session_id":item.source_session_id,
                 "snapshot_fingerprint":item.snapshot_fingerprint,
-                "occurrence_count":1,"body_witness_version":match crate::snapshots::snapshot_upload_body_witness_version(item) {
-                Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION) =>
-                    Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-                Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION) =>
-                    Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION),
-                None | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION)
-                    | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION) => None,
-                other => panic!("unexpected retained ordinary fixture witness: {other:?}"),
-            },
-                "body_witness_digest":snapshot_upload_body_witness(item)
+                "occurrence_count":1,"body_witness_version":null,
+                "body_witness_digest":null
             })
         })
         .collect::<Vec<_>>();
@@ -322,6 +327,8 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         &mut scan.snapshots,
         &working,
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
     );
     assert!(withheld.is_empty(), "{withheld:?}");
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut working);

@@ -70,10 +70,35 @@ pub(super) struct Starting {
     pub(super) stale_rearm_capped_families: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) stale_rearm_capped_files: usize,
+    /// Evidence owed ON: an unfinished retry admission this start dropped,
+    /// and one kept as its due cursor only. Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) admissions_dropped: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) due_retained: usize,
+    /// Evidence owed ON: a context change that only added roots, changed the
+    /// backfill or the active upload context owes evidence instead of
+    /// clearing (1). Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) context_change_owed: usize,
+    /// Evidence owed ON: families exempted from an identity-contract latch
+    /// clear while quarantined, still waiting to prove their contract.
+    /// Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) contract_unproven_families: usize,
+    /// Evidence owed ON: request occurrences of pending kept from earlier
+    /// windows at this start. They use the shared pending occurrence cap a new
+    /// window's families and owed cap-room reads also need. Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_pending_occurrences: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
 impl Starting {
+    /// This start's re-arm owes evidence (keeps the fingerprint) under ON.
+    pub(super) fn owes(&self) -> bool {
+        super::evidence_owed::owes(self.rearm_cause()) || self.context_change_owed != 0
+    }
     pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
         use crate::local_resource_diagnostics::rearm_cause::Cause;
         match self.reason {
@@ -107,6 +132,7 @@ impl Starting {
                 .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
                 .flatten(),
         );
+        let owed = super::evidence_owed::enabled();
         Self {
             prior_held_family_roots,
             prior_held_family_set_digest,
@@ -135,6 +161,28 @@ impl Starting {
             rearm_window_rearmed_families: 0,
             stale_rearm_capped_families: 0,
             stale_rearm_capped_files: 0,
+            admissions_dropped: 0,
+            due_retained: 0,
+            context_change_owed: 0,
+            contract_unproven_families: if owed {
+                index
+                    .claude_usage_family_pending
+                    .values()
+                    .filter(|pending| pending.contract_unproven)
+                    .count()
+            } else {
+                0
+            },
+            stale_pending_occurrences: if owed {
+                index
+                    .claude_usage_family_pending
+                    .values()
+                    .filter(|pending| pending.census_window_end != now)
+                    .map(super::ClaudeUsageFamilyPending::occurrences)
+                    .fold(0, usize::saturating_add)
+            } else {
+                0
+            },
         }
     }
 
@@ -415,6 +463,8 @@ mod tests {
                 member_occurrences: Default::default(),
                 invalid: false,
                 idless_revision: None,
+                identity_contract: None,
+                contract_unproven: false,
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
@@ -790,6 +840,8 @@ mod tests {
                     member_occurrences: Default::default(),
                     invalid: false,
                     idless_revision: None,
+                    identity_contract: None,
+                    contract_unproven: false,
                 },
             );
             plain.bounded_sweep_had_unsettled_upload = flag;
@@ -916,9 +968,11 @@ mod tests {
             "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],
             "not_found_sites":([[u64::MAX, u64::MAX]; 5]),
             "vanished_audit_debt_dropped":u64::MAX,
-            "vanished_request_census_removed":u64::MAX,"overflowed":true})
+            "vanished_request_census_removed":u64::MAX,
+            "parent_missing_removals":u64::MAX,"vanished_pin_refusals":u64::MAX,
+            "overflowed":true})
         );
-        assert_eq!(totals.as_object().unwrap().len(), 7);
+        assert_eq!(totals.as_object().unwrap().len(), 9);
         assert_eq!(row["observation"]["wall_elapsed_us"], 0);
         for field in [
             "shared_process_cpu_delta_us",

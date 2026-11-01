@@ -22,14 +22,63 @@ fn subagent_key(dir: &str, root: &str, agent: usize) -> String {
     format!("{SCAN_ROOT}/{dir}/{root}/subagents/agent-{agent}.jsonl")
 }
 
-fn traversal() -> ScanTraversalCheckpoint {
+/// [regress] N1: touched-family strings exhausted a parkable frame's visit cap.
+#[test]
+fn freshness_touched_families_do_not_refuse_a_parkable_frame() {
+    use crate::heap_layout_bound::{bound, layout_supported};
+    if !layout_supported() {
+        return;
+    }
+    // Reuse the I/O-free scan constructor; the bound walks the same fields
+    // for every source. Removed keys model the rest of a busy Claude page.
+    let mut frame =
+        OwnedSourceScan::new_continuation(&[], index(), WINDOW, 30, 10_000, false, None, None);
+    frame.source = SnapshotSource::ClaudeCode;
+    frame.census.removed_index_keys = (0..2_500)
+        .map(|n| root_key("removed", &root_id(n)))
+        .collect();
+    let limit = crate::source_rotation::PARKED_BUDGET;
+    let baseline = bound(&frame, limit).expect("the page without shadow state is parkable");
+    // More selected families than even the whole walk's visit cap; the
+    // shadow still evaluates only its existing bounded selection.
+    let paths = (0..4_097)
+        .map(|n| PathBuf::from(root_key("selected", &root_id(n))))
+        .collect::<Vec<_>>();
+    let (touched, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        Box::new(Touched::from_paths(paths.iter().map(PathBuf::as_path)))
+    });
+    let counts = evaluate_page(
+        &mut Runtime::default(),
+        &frame.index,
+        &touched,
+        std::iter::empty(),
+        false,
+        "scope",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(counts.touched_families, MAX_TOUCHED_FAMILIES as u64);
+    assert_eq!(
+        counts.touched_families_over_cap,
+        4_097 - MAX_TOUCHED_FAMILIES as u64
+    );
+    frame.claude_family_shadow = Some(touched);
+    let charged = bound(&frame, limit).expect("N1: the shadow must not force serial fallback");
+    assert!(charged >= baseline + allocation.requested_live as usize);
+    assert!(
+        bound(&frame, charged - 1).is_none(),
+        "byte limits still apply"
+    );
+}
+
+pub(super) fn traversal() -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
         context_fingerprint: "context".to_string(),
         census_window_end: WINDOW.to_string(),
         scan_roots: vec![PathBuf::from(SCAN_ROOT)],
         pending_directories: VecDeque::new(),
         pending_candidates: VecDeque::new(),
-        observed_index_keys: BTreeSet::new(),
+        observed_index_keys: Default::default(),
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,
@@ -43,6 +92,9 @@ fn traversal() -> ScanTraversalCheckpoint {
         oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
+        context_inputs: None,
+        listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
     }
 }
 
@@ -81,7 +133,7 @@ fn pending(members: &[String], window: &str, seed: usize) -> ClaudeAccountFamily
             member_requests,
             invalid: false,
         },
-        previous_windows: Vec::new(),
+        previous_windows: Default::default(),
         confirmed_absent_members: BTreeSet::new(),
     }
 }
@@ -621,6 +673,7 @@ fn unchanged_member() -> (ScanIndex, CandidateFile) {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     (index, candidate)
 }

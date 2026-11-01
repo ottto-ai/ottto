@@ -21,7 +21,7 @@ fn fixture() -> ScanIndex {
             scan_roots: Vec::new(),
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -35,6 +35,9 @@ fn fixture() -> ScanIndex {
             oversized_discovery: BTreeMap::new(),
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
+            context_inputs: None,
+            listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         }),
         ..ScanIndex::default()
     }
@@ -292,6 +295,7 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         shadow::attest_equality_skip(&index, &candidate, &None, NOW);
@@ -310,7 +314,6 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         false,
         None,
         &[],
-        false,
         false,
         false,
         &[],

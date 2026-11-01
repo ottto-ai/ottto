@@ -9,11 +9,31 @@ fn items(count: usize) -> Vec<SnapshotItem> {
             item.source_session_id = format!("synthetic-{i}");
             item.cache_observations = None;
             item.cache_observations_state = None;
+            // Creator evidence puts every body in an exact-witness ACK domain.
+            item.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "openai",
+                account_identifier_hash: Some("b".repeat(64)),
+                provider_workspace_hash: Some("c".repeat(64)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "codex_creator_header:v1",
+                identity_disposition: None,
+                source_created_at: Some("2026-09-30T10:00:00Z".into()),
+            });
             item.snapshot_fingerprint =
                 crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
             item
         })
         .collect()
+}
+
+/// A hash-neutral change to a witnessed leaf: same entity, different body.
+fn change_witnessed_body(item: &mut SnapshotItem) {
+    item.tool_usage
+        .get_or_insert_with(Vec::new)
+        .push(crate::snapshots::SnapshotToolUsage {
+            name: "Read".into(),
+            count: 1,
+        });
 }
 
 fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
@@ -32,12 +52,8 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
     let version = crate::snapshots::snapshot_upload_body_witness_version(item).map(|v| match v {
         9 => 3,
         10 => 4,
-        11 => 5,
-        12 => 6,
         15 => 13,
         16 => 14,
-        19 => 17,
-        20 => 18,
         21 | 23 => {
             if item.cache_observations.is_some() {
                 13
@@ -87,6 +103,7 @@ fn response_with_reason(
         vec![refs.remove(0)]
     };
     SnapshotBatchResponse {
+        conflict_rescans: Default::default(),
         accepted: (items.len() - rejected) as u64,
         sessions_reconciled: 0,
         session_ids: Vec::new(),
@@ -285,12 +302,7 @@ fn h357_exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
         .unwrap();
     let old = snapshot_upload_body_witness(settled);
     // A hash-neutral body change must not inherit another body's ACK.
-    settled
-        .context_curve
-        .as_mut()
-        .expect("curve-bearing fixture")
-        .points[0]
-        .effective_input_tokens += 1;
+    change_witnessed_body(settled);
     assert_ne!(snapshot_upload_body_witness(settled), old);
     assert!(!ledger.contains_body(
         &settled.snapshot_fingerprint,
@@ -336,6 +348,7 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: deferred_entity_state(false),
         },
         false,
+        false,
     )
     .unwrap();
     assert_eq!(partial.last_uploaded_count, 43);
@@ -355,12 +368,15 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: CollectorState::Success,
         },
         false,
+        false,
     )
     .unwrap();
     assert!(clean.last_error_code.is_none());
     assert_eq!(clean.last_success_at, clean.last_scan_finished_at);
 }
 
+/// [regress] H359 server-permanent exact bodies cannot resend after restart,
+/// even when version-only witness normalization needs a diagnostic save.
 #[test]
 #[serial_test::serial(client_report)]
 fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_timer() {
@@ -397,7 +413,19 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     let mut stale = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
     stale.upload_body_witness = Some(body.clone());
     stale.retry_after_unix_seconds = 0; // Earlier deadline cannot revoke server permanence.
-    assert!(!restarted.prepare_quarantine_retries(&BTreeMap::from([(fp.clone(), stale)])));
+    let stale_index = BTreeMap::from([(fp.clone(), stale)]);
+    assert!(restarted.prepare_quarantine_retries(&stale_index));
+    assert!(restarted.active_quarantine_retries.is_empty());
+    assert_eq!(restarted.quarantined_fingerprints[&fp].witness, witness);
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].failed_reconstruction_count,
+        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+    );
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].retry_after_unix_seconds,
+        0
+    );
+    assert!(!restarted.prepare_quarantine_retries(&stale_index));
     // A replay can also have no surviving index quarantine to normalize.
     restarted.quarantined_fingerprints.clear();
     let mut accepted = 0;
@@ -425,7 +453,7 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
         Some(body.as_str())
     );
     let mut changed = item.clone();
-    changed.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut changed);
     let outcome = upload_resumable_batches_with_body_witness(
         &[changed],
         "codex",
@@ -508,6 +536,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
+        false,
     )
     .unwrap();
     assert_eq!(status.last_uploaded_count, 0);
@@ -751,7 +780,7 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
     )
     .unwrap();
     let mut changed = probes[1].clone();
-    changed.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut changed);
     assert!(!restarted.contains_body(&rejected_fp, &snapshot_upload_body_witness(&changed)));
     // Missing proof without an exact refusal still fails closed.
     let mut missing = snapshots[0].clone();
@@ -773,6 +802,7 @@ fn with_cache(item: &SnapshotItem) -> SnapshotItem {
 
 fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntry {
     crate::snapshots::ScanIndexEntry {
+        codex_fragment: None,
         size_bytes: 1,
         modified_unix_seconds: 1,
         modified_unix_nanos: Some(1),
@@ -794,6 +824,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
+        evidence_owed: false,
     }
 }
 
@@ -902,7 +933,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     // Same session, a different semantic entity, and different additive bytes.
     let mut held = base[0].clone();
     held.output_tokens += 1;
-    held.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut held);
     held.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &held);
     let mut probes = vec![held, base[0].clone(), base[1].clone()];
@@ -1356,6 +1387,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
                     code: None,
                 })),
                 _ => Ok(SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 0,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),
@@ -1395,7 +1427,7 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
     let body = snapshot_upload_body_witness(&probe);
     let cache_bearing = with_cache(&probe);
     let mut older = probe.clone();
-    older.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut older);
     assert_eq!(
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &older),
         fp
@@ -1461,7 +1493,6 @@ fn h360_legacy_count_only_cas_ack_still_fails_closed_without_head() {
         .unwrap_or_else(|p| p.into_inner());
     // A count-only response can acknowledge only evidence-free bodies.
     let mut probe = items(1).remove(0);
-    probe.context_curve = None;
     probe.session_account_evidence = None;
     probe.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &probe);

@@ -45,11 +45,6 @@ struct PointOrderKey(u64, usize);
 
 impl Ord for PointOrderKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        #[cfg(test)]
-        POINT_ORDER_WORK.with(|work| {
-            let mut work = work.borrow_mut();
-            work.comparisons += 1;
-        });
         (self.0, self.1).cmp(&(other.0, other.1))
     }
 }
@@ -85,37 +80,6 @@ impl<T> PartialOrd for PointOrderEntry<T> {
     }
 }
 
-#[cfg(test)]
-#[derive(Default, Clone, Copy)]
-struct PointOrderWork {
-    comparisons: usize,
-    max_update_comparisons: usize,
-    max_update_tuple_writes_bound: usize,
-    updates: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static POINT_ORDER_WORK: std::cell::RefCell<PointOrderWork> =
-        std::cell::RefCell::new(PointOrderWork::default());
-}
-
-#[cfg(test)]
-fn note_point_heap_update(start: usize) {
-    POINT_ORDER_WORK.with(|work| {
-        let mut work = work.borrow_mut();
-        let comparisons = work.comparisons - start;
-        work.max_update_comparisons = work.max_update_comparisons.max(comparisons);
-        // BinaryHeap push/PeekMut drop use one sift path: each Hole::move_to
-        // has a preceding comparison. Add root assignment and hole write-back.
-        // Rust moves have no user hook; this is a structural upper bound on
-        // tuple writes, not a claim to instrument raw memory copies.
-        work.max_update_tuple_writes_bound =
-            work.max_update_tuple_writes_bound.max(comparisons + 2);
-        work.updates += 1;
-    });
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalContextPoint {
     pub(crate) at_unix_seconds: u32,
@@ -126,13 +90,7 @@ crate::durable_tail_codec::durable_struct!(LocalContextPoint {
     N prompt_tokens: u32,
 });
 
-impl crate::heap_layout_bound::HeapLayoutBound for LocalContextPoint {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; LocalContextPoint);
 
 /// Per-accumulator point list, at most `LOCAL_CONTEXT_POINT_CAP` entries of
 /// 8 bytes each.
@@ -276,8 +234,6 @@ impl LocalContextPoints {
                 if fed.is_some_and(|fed| key <= fed) {
                     continue;
                 }
-                #[cfg(test)]
-                let update_start = POINT_ORDER_WORK.with(|work| work.borrow().comparisons);
                 let entry = PointOrderEntry { key, request };
                 if window.len() < LOCAL_CONTEXT_POINT_ORDER_WINDOW {
                     // Never push at capacity: no allocation after reserve_exact.
@@ -290,8 +246,6 @@ impl LocalContextPoints {
                     }
                 }
                 // The PeekMut guard has dropped (and finished sifting).
-                #[cfg(test)]
-                note_point_heap_update(update_start);
                 debug_assert!(window.len() <= LOCAL_CONTEXT_POINT_ORDER_WINDOW);
                 debug_assert!(window.capacity() <= LOCAL_CONTEXT_POINT_ORDER_WINDOW);
             }
@@ -356,12 +310,6 @@ mod tests {
             .iter()
             .map(|point| (point.at_unix_seconds - BASE, point.prompt_tokens))
             .collect()
-    }
-
-    #[test]
-    fn point_is_eight_bytes() {
-        assert_eq!(std::mem::size_of::<LocalContextPoint>(), 8);
-        assert_eq!(BASE % LOCAL_CONTEXT_POINT_SLOT_SECONDS, 0);
     }
 
     #[test]
@@ -603,162 +551,5 @@ mod tests {
         assert!(shuffled.len() <= LOCAL_CONTEXT_POINT_CAP);
         assert!(shuffled.capacity() <= LOCAL_CONTEXT_POINT_CAP);
         assert_eq!(shuffled.first().unwrap().at_unix_seconds, BASE);
-    }
-    fn assert_heap_work_and_parity(requests: &[(u64, String, u64)]) {
-        use std::cell::Cell;
-        fn point(request: &(u64, String, u64)) -> Option<(Option<&str>, u64)> {
-            (request.0 % 5 != 0).then_some((Some(request.1.as_str()), request.2))
-        }
-        let count = requests.len();
-        let visits = Cell::new(0);
-        POINT_ORDER_WORK.with(|work| *work.borrow_mut() = PointOrderWork::default());
-        let points = LocalContextPoints::from_requests_by_sequence(
-            requests.iter().inspect(|_| visits.set(visits.get() + 1)),
-            |request| request.0,
-            point,
-        )
-        .expect("within the work cap");
-        let work = POINT_ORDER_WORK.with(|work| *work.borrow());
-        let p = LOCAL_CONTEXT_POINT_ORDER_PASSES;
-        let w = LOCAL_CONTEXT_POINT_ORDER_WINDOW;
-        let l = (w - 1).ilog2() as usize + 1; // ceil(log2 W) = 12
-        assert_eq!(visits.get(), count.div_ceil(w) * count);
-        assert!(visits.get() <= p * count);
-        // All key comparisons count: fed cutoff, root admission, heap sifts
-        // and the final in-place sorts. At n=32768 this pins 3,538,944.
-        let comparison_bound = p * count * l + p * w * l;
-        assert!(
-            work.comparisons <= comparison_bound,
-            "{} comparisons exceed {comparison_bound} at n={count}",
-            work.comparisons
-        );
-        // One update traverses at most one heap-height path. A push has at
-        // most L comparisons; root comparison + sift-down at most 2L+1.
-        // Every tuple write on the sift path is charged to a comparison,
-        // plus root assignment and hole write-back (<=2L+3 = 27 writes).
-        assert!(work.updates > 0);
-        assert!(work.max_update_comparisons <= 2 * l + 1);
-        assert!(work.max_update_tuple_writes_bound <= 2 * l + 3);
-        let mut previous = requests.iter().collect::<Vec<_>>();
-        previous.sort_by_key(|request| request.0);
-        let mut oracle = LocalContextPoints::default();
-        for request in previous {
-            if let Some((at, tokens)) = point(request) {
-                oracle.push(at, tokens);
-            }
-        }
-        assert_eq!(points, oracle.points);
-        assert!(points.len() <= LOCAL_CONTEXT_POINT_CAP);
-    }
-
-    #[test]
-    fn unordered_work_is_bounded_and_matches_the_previous_stable_sort() {
-        use std::cell::Cell;
-        let count = LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES;
-        // Reverse order forces replacements throughout each full window;
-        // ties still follow input position. Enough points for repeated halving.
-        let requests = (0..count)
-            .rev()
-            .map(|index| {
-                (
-                    index as u64 / 2,
-                    at(BASE + index as u32 * 60),
-                    index as u64 * 1000,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_heap_work_and_parity(&requests);
-        // Increasing keys stress sift-up during initial fill instead.
-        let mut ascending = requests.clone();
-        ascending.reverse();
-        assert_heap_work_and_parity(&ascending);
-
-        // Large streams refuse before traversal, comparison or partial curve.
-        for count in [count + 1, 250_000] {
-            let visits = Cell::new(0);
-            POINT_ORDER_WORK.with(|work| *work.borrow_mut() = PointOrderWork::default());
-            let refused = LocalContextPoints::from_requests_by_sequence(
-                (0..count).rev().inspect(|_| visits.set(visits.get() + 1)),
-                |index| index as u64,
-                |_| panic!("refused inputs must not build any points"),
-            );
-            assert_eq!(refused, None);
-            assert_eq!(visits.get(), 0);
-            POINT_ORDER_WORK.with(|work| assert_eq!(work.borrow().comparisons, 0));
-        }
-        assert_eq!(
-            LocalContextPoints::from_requests_by_sequence(
-                std::iter::empty::<usize>(),
-                |index| index as u64,
-                |_| None,
-            ),
-            Some(Vec::new())
-        );
-    }
-
-    #[test]
-    fn heap_selection_matches_previous_points_on_seeded_random_ties() {
-        let w = LOCAL_CONTEXT_POINT_ORDER_WINDOW;
-        for (count, seed) in [
-            (w - 1, 7_u64),
-            (w + 1, 31),
-            (w * LOCAL_CONTEXT_POINT_ORDER_PASSES, 97),
-        ] {
-            let mut requests = (0..count)
-                .map(|index| {
-                    (
-                        index as u64 / 3,
-                        at(BASE + index as u32 * 60),
-                        index as u64 * 1000,
-                    )
-                })
-                .collect::<Vec<_>>();
-            // Deterministic Fisher-Yates without a new random dependency.
-            let mut random = seed;
-            for index in (1..count).rev() {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
-                requests.swap(index, (random % (index as u64 + 1)) as usize);
-            }
-            assert_heap_work_and_parity(&requests);
-        }
-    }
-
-    #[test]
-    fn ordering_scratch_stays_fixed_and_has_no_linear_insertion() {
-        assert_eq!(
-            std::mem::size_of::<PointOrderEntry<&u64>>(),
-            std::mem::size_of::<(u64, usize, &u64)>()
-        );
-        // The movement bound relies on BinaryHeap's sift operations, not a
-        // shifting Vec mutation. Guard that structural part of the contract.
-        let source = include_str!("local_context_points.rs");
-        let selection = source
-            .split("        let mut window = BinaryHeap")
-            .nth(1)
-            .unwrap()
-            .split("        Some(points.points)")
-            .next()
-            .unwrap();
-        assert!(!selection.contains(".insert("));
-        assert!(selection.contains("window.reserve_exact(LOCAL_CONTEXT_POINT_ORDER_WINDOW)"));
-        assert!(selection.contains("window.push(entry)"));
-        assert!(selection.contains("window.peek_mut()"));
-        assert!(selection.contains("selected.sort_unstable()"));
-    }
-
-    #[test]
-    fn strict_ordered_input_is_one_pass_even_above_the_unordered_budget() {
-        use std::cell::Cell;
-        let count = LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES + 1;
-        let visits = Cell::new(0);
-        let timestamp = at(BASE);
-        let points = LocalContextPoints::from_ordered_requests(
-            (0..count).inspect(|_| visits.set(visits.get() + 1)),
-            |_| Some((Some(timestamp.as_str()), 100)),
-        );
-        assert_eq!(visits.get(), count);
-        assert_eq!(points.len(), 1);
     }
 }

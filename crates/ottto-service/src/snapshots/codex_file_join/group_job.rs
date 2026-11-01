@@ -23,7 +23,6 @@ const PROBE_BYTES: usize = 1024 * 1024;
 /// (#603 `configure_group_once`). Only the reader is swapped per member, so
 /// no member reconfigures it. The legacy tee (`legacy_tee`) stays
 /// unconfigured: it is baseline evidence, not a second counted stream.
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(in crate::snapshots) fn new_group_parser(
     file: File,
     member: &CandidateFile,
@@ -31,7 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
-    context_curve: bool,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<OwnedJsonlParser> {
     refuse_compressed_codex(
@@ -48,7 +46,6 @@ pub(in crate::snapshots) fn new_group_parser(
         traces,
         ledgers,
         artifacts,
-        context_curve,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(parser)
@@ -408,15 +405,18 @@ impl GroupBoot {
             }
         }
         let mut census = ScanCensus::default();
-        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue(
+        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue_at(
             SnapshotSource::Codex,
             candidate,
             &mut census,
-            None,
-            0,
-            // The entry's stored ctime lets a ctime-only change keep the
-            // stored fingerprint (fresh samples hashed, no re-read).
-            &index.files,
+            CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 0,
+                // The entry's stored ctime lets a ctime-only change keep the
+                // stored fingerprint (fresh samples hashed, no re-read).
+                retention: discovery_retention!(index),
+                growth: None,
+            },
             false,
             cache,
         ) else {
@@ -636,7 +636,6 @@ impl GroupBoot {
             inputs.traces.clone(),
             inputs.ledgers.clone(),
             inputs.artifacts,
-            inputs.context_curve,
         )?;
         let mut parser = new_group_parser(
             file,
@@ -645,7 +644,6 @@ impl GroupBoot {
             inputs.traces,
             inputs.ledgers,
             inputs.artifacts,
-            inputs.context_curve,
             evidence,
         )
         .map_err(|_| GroupEnd::Strict)?;
@@ -673,6 +671,7 @@ impl GroupBoot {
             source_file_fingerprint: last.source_file_fingerprint.clone(),
             candidate: first,
             decision: CandidateDecision::Parse,
+            parse_reason: None,
             parser,
             aliases: members.clone(),
             applied_receipts: BTreeMap::new(),
@@ -718,7 +717,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     pub(in crate::snapshots) artifacts: bool,
-    pub(in crate::snapshots) context_curve: bool,
     pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
@@ -740,7 +738,6 @@ fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, Gro
 /// A member that was indexed as its own file before it joined keeps its
 /// legacy pricing baseline: the same records, applied to a second parser in
 /// the same pass (no extra read), finished like the pre-P2 proof parser.
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn legacy_tee(
     legacy_expected: &BTreeMap<String, String>,
     member: &CandidateFile,
@@ -749,7 +746,6 @@ fn legacy_tee(
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
-    context_curve: bool,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
     refuse_compressed_codex(
         Some(&member.path),
@@ -770,7 +766,6 @@ fn legacy_tee(
         traces,
         ledgers,
         artifacts,
-        context_curve,
     )
     .map(|tee| Some(Box::new(tee)))
     .map_err(|_| GroupEnd::Strict)
@@ -903,7 +898,6 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
     pub(in crate::snapshots) artifacts: bool,
-    pub(in crate::snapshots) context_curve: bool,
     /// The live member's acquisition scope (cursor jobs), computed on demand.
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
@@ -1226,7 +1220,6 @@ fn open_member(
             .codex_parent_ownership_ledgers
             .clone(),
         inputs.artifacts,
-        inputs.context_curve,
     )?;
     let previous = group
         .previous_receipts

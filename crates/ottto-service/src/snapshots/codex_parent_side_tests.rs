@@ -519,6 +519,7 @@ fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
 
 fn file_entry() -> ScanIndexEntry {
     ScanIndexEntry {
+        codex_fragment: None,
         size_bytes: 42,
         modified_unix_seconds: 1_700_000_000,
         modified_unix_nanos: None,
@@ -540,6 +541,7 @@ fn file_entry() -> ScanIndexEntry {
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
+        evidence_owed: false,
     }
 }
 

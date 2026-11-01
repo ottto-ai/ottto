@@ -69,13 +69,7 @@ impl<'de> Deserialize<'de> for ClaudeHistoryListIntent {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeHistoryListIntent {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeHistoryListIntent);
 
 /// Persisted bookkeeping: which parser versions have been retroactively
 /// reconciled. The daemon stores one entry per source slug.
@@ -595,7 +589,6 @@ pub fn run_backfill(
             artifacts_enabled,
             attribution_context,
             None,
-            false,
             &[],
             false,
         )?;
@@ -748,6 +741,7 @@ mod tests {
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,
+            cache_conflict_answer: None,
             cache_requests: Vec::new(),
             cache_requests_complete: true,
             avg_duration_ms: None,

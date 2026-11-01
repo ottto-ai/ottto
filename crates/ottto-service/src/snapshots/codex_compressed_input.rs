@@ -442,7 +442,6 @@ pub(in crate::snapshots) mod tests {
             None,
             None,
             false,
-            true,
         )
         .unwrap()
     }

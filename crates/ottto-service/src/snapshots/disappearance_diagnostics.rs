@@ -6,6 +6,16 @@ use super::SnapshotSource;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// Opt-in (default OFF): settle Claude members of deleted directories as
+// removals. Declared beside the NotFound sites it splits so this module's
+// fixtures set it on their own thread; no options seam reaches the candidate
+// and walk sites. The counters below stay diagnostics only.
+super::local_switch::local_switch!(
+    "claude_vanished_directory_removal_enabled",
+    marker_enables = true,
+    test_default = false
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cause {
     NotFound,
@@ -85,6 +95,8 @@ struct Counters {
     counts: [AtomicU64; 4],
     not_found_sites: [AtomicU64; SITES * OUTCOMES],
     vanished: [AtomicU64; VANISHED],
+    parent_missing_removals: AtomicU64,
+    vanished_pin_refusals: AtomicU64,
     overflowed: AtomicBool,
 }
 impl Counters {
@@ -93,6 +105,8 @@ impl Counters {
             counts: [const { AtomicU64::new(0) }; 4],
             not_found_sites: [const { AtomicU64::new(0) }; SITES * OUTCOMES],
             vanished: [const { AtomicU64::new(0) }; VANISHED],
+            parent_missing_removals: AtomicU64::new(0),
+            vanished_pin_refusals: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
         }
     }
@@ -124,6 +138,8 @@ impl Counters {
                 .load(Ordering::Relaxed),
             vanished_request_census_removed: self.vanished[Vanished::RequestCensusRemoved.index()]
                 .load(Ordering::Relaxed),
+            parent_missing_removals: self.parent_missing_removals.load(Ordering::Relaxed),
+            vanished_pin_refusals: self.vanished_pin_refusals.load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
         }
     }
@@ -136,6 +152,10 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
 /// and root NotFounds have no site. The `vanished_*` counts are what the
 /// page merge dropped with a vanished Claude member's retired entry.
+/// `parent_missing_removals` (omitted at zero) counts the NotFound
+/// removals settled below a missing parent; they are also in the site split.
+/// `vanished_pin_refusals` counts absence witnesses refused by the shared pin
+/// budget.
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
@@ -145,6 +165,10 @@ pub(super) struct Totals {
     not_found_sites: [[u64; OUTCOMES]; SITES],
     vanished_audit_debt_dropped: u64,
     vanished_request_census_removed: u64,
+    #[serde(skip_serializing_if = "super::is_zero_u64")]
+    parent_missing_removals: u64,
+    #[serde(skip_serializing_if = "super::is_zero_u64")]
+    vanished_pin_refusals: u64,
     overflowed: bool,
 }
 
@@ -199,6 +223,18 @@ pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
             events.set(Some(counts));
         }
     });
+}
+
+/// A census member below a missing parent settled as a removal.
+pub(super) fn parent_missing_removal(source: SnapshotSource) {
+    let counters = &TOTALS[source_index(source)];
+    counters.bump(&counters.parent_missing_removals);
+}
+
+/// The shared pin budget refused a new absence witness.
+pub(super) fn vanished_pin_refused(source: SnapshotSource) {
+    let counters = &TOTALS[source_index(source)];
+    counters.bump(&counters.vanished_pin_refusals);
 }
 
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
@@ -274,6 +310,8 @@ impl Totals {
             not_found_sites: [[u64::MAX; OUTCOMES]; SITES],
             vanished_audit_debt_dropped: u64::MAX,
             vanished_request_census_removed: u64::MAX,
+            parent_missing_removals: u64::MAX,
+            vanished_pin_refusals: u64::MAX,
             overflowed: true,
         }
     }
@@ -289,7 +327,6 @@ mod tests {
     };
     use super::*;
     use std::{
-        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
     };
@@ -315,6 +352,7 @@ mod tests {
         file_limit: usize,
         hints: &[PathBuf],
     ) -> SourceScanResult {
+        super::super::withheld_account::support::clock(&index.withheld_memo);
         scan_source_roots_with_limit_and_attribution(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
@@ -397,7 +435,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             assert!(candidate.is_none());
@@ -431,9 +469,9 @@ mod tests {
         let (_, events) = observe(|| {
             advance_bounded_directory_traversal(
                 SnapshotSource::Pi,
-                index.traversal.as_mut().unwrap(),
+                &mut index,
                 BACKFILL_WINDOW_DAYS,
-                &index.files,
+                None,
             )
         });
         assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
@@ -540,7 +578,7 @@ mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             )
             .unwrap();
             assert!(census.observed_index_keys.contains(&key));
@@ -552,7 +590,9 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    crate::snapshots::DiscoveryRetention::unverified(
+                        &crate::snapshots::SharedMap::default(),
+                    ),
                 )
             });
             assert!(opened.is_none());
@@ -602,7 +642,6 @@ mod tests {
             false,
             None,
             &[],
-            false,
             false,
             false,
         );
@@ -743,7 +782,7 @@ mod tests {
         }
     }
 
-    /// N-T3: main records the forced member's NotFound as loss in every such
+    /// [behaviour] N-T3: main records the forced member's NotFound as loss in every such
     /// generation. With the parent present the first one is a removal that
     /// retires the entry together with its unverified audit marker (SOURCE N2,
     /// counted), so the next generation no longer enumerates the member and
@@ -763,7 +802,14 @@ mod tests {
         index
             .claude_account_deferred_holds
             .insert(member_key.clone(), "held-member-revision".to_string());
-        for at in [NOW, RETRY] {
+        super::super::sampled_scan::set_test_now(Some(1_000));
+        claude_generation(&mut index, &fixture.dir, NOW, 10, &[]);
+        assert!(index
+            .claude_account_deferred_holds
+            .contains_key(&member_key));
+        assert!(index.files[&member_key].has_unverified_source());
+        for (at, now) in [(LATER, 1_600), (RETRY, 2_200)] {
+            super::super::sampled_scan::set_test_now(Some(now));
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
                 observe_vanished(|| {
                     observe_sites(|| {
@@ -772,7 +818,7 @@ mod tests {
                 })
             });
             let (((pages, events), sites), vanished) = result;
-            let retired = u64::from(at == NOW);
+            let retired = u64::from(at == LATER);
             // Pin the shared #799 keys and meanings independently of the
             // temporary stage/carrier, including zero on the next generation.
             // Count across ALL records so a second emitter cannot hide behind
@@ -834,6 +880,7 @@ mod tests {
                 "positively absent account hold is released"
             );
         }
+        super::super::sampled_scan::set_test_now(None);
     }
 
     /// Control for N-T3: the same member with its parent directory missing is
@@ -868,6 +915,208 @@ mod tests {
             .files
             .get(&member_key)
             .is_some_and(|entry| entry.has_unverified_source()));
+    }
+
+    /// One bounded walk per `(at, now)` over a deleted session directory, as
+    /// observed: a fresh census window whose discovery is still pending
+    /// (`pending_directories` > 0), the indexed member enumerated at the forced
+    /// index site, then the queued `directory` (if any) read. Returns, per
+    /// walk, the member's (disappeared, removed) and the directory's disappeared.
+    #[cfg(unix)]
+    fn deleted_directory_walk(
+        index: &mut ScanIndex,
+        root: &Path,
+        (at, now): (&str, u64),
+        member: &Path,
+        directory: Option<&Path>,
+    ) -> (usize, bool, usize) {
+        super::super::sampled_scan::set_test_now(Some(now));
+        super::super::withheld_account::support::clock(&index.withheld_memo);
+        index.traversal = None;
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        assert!(
+            !traversal.pending_directories.is_empty(),
+            "discovery pending"
+        );
+        if let Some(directory) = directory {
+            traversal.pending_directories.push_front(ScanTraversalPath {
+                scan_root: root.to_path_buf(),
+                path: directory.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            });
+        }
+        let mut census = ScanCensus::default();
+        assert!(super::super::candidate_from_traversal_path_at(
+            SnapshotSource::ClaudeCode,
+            Site::CandidateForcedIndex,
+            ScanTraversalPath {
+                scan_root: root.to_path_buf(),
+                path: member.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut crate::snapshots::CandidateDiscovery::new(index, None),
+        )
+        .is_none());
+        let removed = census.removed_index_keys.contains(&local_index_key(member));
+        let before = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .disappeared_file_count;
+        if directory.is_some() {
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, 7, None);
+        }
+        let directory_lost = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .disappeared_file_count
+            - before;
+        (census.disappeared_file_count, removed, directory_lost)
+    }
+
+    /// A live real root with one indexed subagent member whose whole session
+    /// directory was deleted (the common observed shape), plus a gone directory
+    /// that was still queued under the live root.
+    #[cfg(unix)]
+    fn deleted_directory_index(root: &Path) -> (ScanIndex, PathBuf, PathBuf) {
+        let member = root
+            .join("c4444444-4444-4444-8444-444444444444")
+            .join("subagents")
+            .join("agent-a4d1585d310070d0f.jsonl");
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&member),
+            super::super::tests::manifest_index_entry(Some("acked-member-body")),
+        );
+        (index, member, root.join("gone-tool-results"))
+    }
+
+    const WALKS: [(&str, u64); 3] = [(NOW, 1_000), (LATER, 1_600), (RETRY, 2_200)];
+
+    /// [off=main] With the switch OFF a member below a deleted directory and a
+    /// vanished queued directory stay loss in every walk, as on main.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_stays_loss_when_switch_off() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-off");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, member, directory) = deleted_directory_index(&root);
+        for walk in WALKS {
+            assert_eq!(
+                deleted_directory_walk(&mut index, &root, walk, &member, Some(&directory)),
+                (1, false, 1)
+            );
+        }
+        super::super::sampled_scan::set_test_now(None);
+        // Only a regular-file owner marker enables it; fixtures never read it.
+        let support = crate::test_scratch::ScratchDir::new("vanished-directory-marker");
+        let marker = support.join("claude_vanished_directory_removal_enabled");
+        fs::create_dir(&marker).unwrap();
+        assert!(!enabled_at(&support));
+        fs::remove_dir(&marker).unwrap();
+        fs::write(&marker, b"").unwrap();
+        assert!(enabled_at(&support));
+        assert!(!enabled());
+    }
+
+    /// [regress] Observed: every Claude walk ended red with 47-71
+    /// CandidateForcedIndex losses per process, all members of deleted
+    /// directories, observed while discovery was still pending. ON: the first
+    /// NotFound stays loss and a strictly later walk settles it; a vanished
+    /// queued directory below its live parent settles the same way.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_is_removal_after_a_later_walk() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-on");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, member, directory) = deleted_directory_index(&root);
+        let _on = super::super::local_switch::ThreadSwitchForTest::set(&ENABLED, true);
+        let [first, second, _] = WALKS;
+        assert_eq!(
+            deleted_directory_walk(&mut index, &root, first, &member, Some(&directory)),
+            (1, false, 1)
+        );
+        assert_eq!(
+            deleted_directory_walk(&mut index, &root, second, &member, Some(&directory)),
+            (0, true, 0)
+        );
+        assert!(snapshot(SnapshotSource::ClaudeCode).parent_missing_removals >= 1);
+        super::super::sampled_scan::set_test_now(None);
+    }
+
+    /// [money] Settling the deleted member through the page
+    /// merge drops its entry exactly as a live-parent removal does. The
+    /// accepted (ACKed) ledger stays byte-for-byte, and no zero or removal
+    /// body is built for its family.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_keeps_acked_usage_accepted() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-money");
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::write(
+            root.join(format!("{FORCED_ROOT}.jsonl")),
+            claude_line(FORCED_ROOT, "request-root"),
+        )
+        .unwrap();
+        // A rejected symlink keeps family membership non-authoritative, so
+        // the forced enumeration reaches the indexed member in this tiny tree.
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("zz-link")).unwrap();
+        let member = root
+            .join(FORCED_ROOT)
+            .join("subagents")
+            .join("agent-a4d1585d310070d0f.jsonl");
+        let key = local_index_key(&member);
+        let acked = "acked-member-body".to_string();
+        let mut index = ScanIndex::default();
+        index.insert_retry_pending_claude_authority_for_test(FORCED_ROOT);
+        index.files.insert(
+            key.clone(),
+            super::super::tests::manifest_index_entry(Some(&acked)),
+        );
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), [acked.clone()].into());
+        index.accepted_snapshot_fingerprints.insert(acked.clone());
+        let ledger = |index: &ScanIndex| {
+            serde_json::to_vec(&(
+                &index.accepted_snapshot_fingerprints,
+                index.accepted_snapshot_fingerprint_ledger_version,
+            ))
+            .unwrap()
+        };
+        let before = ledger(&index);
+        let _on = super::super::local_switch::ThreadSwitchForTest::set(&ENABLED, true);
+        let mut pages = Vec::new();
+        for (at, now) in WALKS {
+            super::super::sampled_scan::set_test_now(Some(now));
+            pages = claude_generation(&mut index, &root, at, 10, &[]);
+            if !index.files.contains_key(&key) {
+                break;
+            }
+        }
+        super::super::sampled_scan::set_test_now(None);
+        assert!(!index.files.contains_key(&key), "the member was retired");
+        assert_eq!(ledger(&index), before, "the accepted ledger is unchanged");
+        for snapshot in pages.iter().flat_map(|page| &page.snapshots) {
+            assert!(snapshot.removed_usage.is_none());
+            assert!(snapshot.removed_request_count.is_none());
+            assert!(snapshot.input_tokens + snapshot.output_tokens > 0);
+        }
     }
 
     /// Control: the quarantined family losing one member through N leaves the
@@ -953,71 +1202,103 @@ mod tests {
         assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
     }
 
-    /// The audit-debt path (SOURCE N2) also drops the member's request-census
+    /// [behaviour] The audit-debt path (SOURCE N2) also drops the member's request-census
     /// (D1) record with its entry and counts both retirements, while the
     /// member's snapshot fingerprints stay (N3).
     #[test]
     fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
-        let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
-        let first = "a1111111-1111-4111-8111-111111111111";
-        let second = "b2222222-2222-4222-8222-222222222222";
-        let first_path = dir.join(format!("{first}.jsonl"));
-        let second_path = dir.join(format!("{second}.jsonl"));
-        let second_key = local_index_key(&second_path);
-        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
-        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
-        let mut index = ScanIndex::default();
-        assert!(
-            claude_generation(&mut index, &dir, NOW, 1, &[])
-                .last()
+        for account_held in [false, true] {
+            let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
+            let first = "a1111111-1111-4111-8111-111111111111";
+            let second = "b2222222-2222-4222-8222-222222222222";
+            let first_path = dir.join(format!("{first}.jsonl"));
+            let second_path = dir.join(format!("{second}.jsonl"));
+            let second_key = local_index_key(&second_path);
+            fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+            fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+            let mut index = ScanIndex::default();
+            assert!(
+                claude_generation(&mut index, &dir, NOW, 1, &[])
+                    .last()
+                    .unwrap()
+                    .census_complete
+            );
+            // The next generation walks both and selects only the first.
+            claude_page(&mut index, &dir, LATER, 1, &[]);
+            assert!(index
+                .traversal
+                .as_ref()
                 .unwrap()
-                .census_complete
-        );
-        // The next generation walks both and selects only the first.
-        claude_page(&mut index, &dir, LATER, 1, &[]);
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .any(|pending| pending.path == second_path && pending.census_member));
-        assert!(
-            index
+                .pending_candidates
+                .iter()
+                .any(|pending| pending.path == second_path && pending.census_member));
+            assert!(
+                index
+                    .claude_request_census_for_test()
+                    .get(&second_key)
+                    .is_some(),
+                "precondition: the real parse recorded the member's census"
+            );
+            let entry = index.files.get_mut(&second_key).unwrap();
+            entry.scan_identity_version = Some(format!(
+                "{}:4000000000",
+                super::super::sampled_audit::UNVERIFIED_IDENTITY
+            ));
+            assert!(entry.has_unverified_source());
+            if account_held {
+                index
+                    .claude_account_deferred_holds
+                    .insert(second_key.clone(), entry.source_file_fingerprint.clone());
+            }
+            let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
+            fs::remove_file(&second_path).unwrap();
+            super::super::sampled_scan::set_test_now(Some(1_000));
+            let ((pages, sites), vanished) = observe_vanished(|| {
+                observe_sites(|| {
+                    let mut pages = claude_generation(&mut index, &dir, LATER, 1, &[]);
+                    if account_held {
+                        assert!(index
+                            .claude_account_deferred_holds
+                            .contains_key(&second_key));
+                        assert!(index.files[&second_key].has_unverified_source());
+                        assert!(index
+                            .claude_request_census_for_test()
+                            .get(&second_key)
+                            .is_some());
+                        super::super::sampled_scan::set_test_now(Some(1_600));
+                        // A healthy first generation may have retired its
+                        // checkpoint while the account hold still needs F4.
+                        super::super::line_delivery_tests::next_walk(
+                            &mut index,
+                            &[dir.to_path_buf()],
+                            LATER,
+                            BACKFILL_WINDOW_DAYS,
+                        );
+                        pages.extend(claude_generation(&mut index, &dir, RETRY, 1, &[]));
+                    }
+                    pages
+                })
+            });
+            super::super::sampled_scan::set_test_now(None);
+            let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+            expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
+            assert_eq!(sites, expected_sites);
+            assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+            assert!(
+                !index.files.contains_key(&second_key),
+                "the entry and its marker are gone"
+            );
+            assert!(index
                 .claude_request_census_for_test()
                 .get(&second_key)
-                .is_some(),
-            "precondition: the real parse recorded the member's census"
-        );
-        let entry = index.files.get_mut(&second_key).unwrap();
-        entry.scan_identity_version = Some(format!(
-            "{}:4000000000",
-            super::super::sampled_audit::UNVERIFIED_IDENTITY
-        ));
-        assert!(entry.has_unverified_source());
-        let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
-        fs::remove_file(&second_path).unwrap();
-        let ((pages, sites), vanished) = observe_vanished(|| {
-            observe_sites(|| claude_generation(&mut index, &dir, LATER, 1, &[]))
-        });
-        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
-        expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
-        assert_eq!(sites, expected_sites);
-        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
-        assert!(
-            !index.files.contains_key(&second_key),
-            "the entry and its marker are gone"
-        );
-        assert!(index
-            .claude_request_census_for_test()
-            .get(&second_key)
-            .is_none());
-        assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
-        assert_eq!(
-            index.file_snapshot_fingerprints.get(&second_key),
-            fingerprints_before.as_ref()
-        );
-        assert!(index.files.contains_key(&local_index_key(&first_path)));
+                .is_none());
+            assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
+            assert_eq!(
+                index.file_snapshot_fingerprints.get(&second_key),
+                fingerprints_before.as_ref()
+            );
+            assert!(index.files.contains_key(&local_index_key(&first_path)));
+        }
     }
 
     /// D11 through the real pipeline: an indexed Claude file is in the frozen
@@ -1062,7 +1343,6 @@ mod tests {
             None,
             &[],
             false,
-            true,
         );
         assert!(
             state
@@ -1176,7 +1456,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             assert!(candidate.is_none());
@@ -1201,7 +1481,7 @@ mod tests {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         fs::rename(&project, dir.join("project-renamed")).unwrap();
@@ -1212,7 +1492,9 @@ mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
         });
         assert!(opened.is_none());
@@ -1250,7 +1532,7 @@ mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             )
         });
         fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1280,7 +1562,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
                 .is_none());
                 fs::write(&path, b"{}\n").unwrap();
@@ -1290,7 +1572,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
                 .unwrap();
                 fs::remove_file(&path).unwrap();
@@ -1300,7 +1582,9 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &BTreeMap::new(),
+                    crate::snapshots::DiscoveryRetention::unverified(
+                        &crate::snapshots::SharedMap::default()
+                    ),
                 )
                 .is_none());
             }
@@ -1327,246 +1611,14 @@ mod tests {
         let (_, sites) = observe_sites(|| {
             advance_bounded_directory_traversal(
                 SnapshotSource::ClaudeCode,
-                index.traversal.as_mut().unwrap(),
+                &mut index,
                 BACKFILL_WINDOW_DAYS,
-                &index.files,
+                None,
             )
         });
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];
         expected[1][Site::WalkDirectory.index()] = [1, 0];
         assert_eq!(sites, expected, "a vanished queued directory stays loss");
-    }
-
-    #[test]
-    fn isolated_sources_classes_order_and_sticky_wrap() {
-        let totals = [const { Counters::new() }; 3];
-        let causes = [
-            Cause::NotFound,
-            Cause::RootResolutionUnresolved,
-            Cause::PreflightFingerprintChanged,
-            Cause::ComparisonTargetRevisionChanged,
-        ];
-        for (s, source) in [
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Pi,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (c, cause) in causes.into_iter().enumerate() {
-                for _ in 0..s * 4 + c + 1 {
-                    totals[source_index(source)].record(cause);
-                }
-            }
-        }
-        for (s, counters) in totals.iter().enumerate() {
-            let value = serde_json::to_value(counters.snapshot()).unwrap();
-            let expected_counts: [u64; 4] = std::array::from_fn(|c| (s * 4 + c + 1) as u64);
-            assert_eq!(
-                value,
-                serde_json::json!({"version":1,
-                "scope":"process_lifetime_not_window",
-                "counts":expected_counts,
-                "not_found_sites":([[0, 0]; SITES]),
-                "vanished_audit_debt_dropped":0,
-                "vanished_request_census_removed":0,
-                "overflowed":false})
-            );
-        }
-        let counters = Counters::new();
-        counters.counts[0].store(u64::MAX, Ordering::Relaxed);
-        counters.record(Cause::NotFound);
-        assert_eq!(counters.snapshot().counts, [0; 4]);
-        assert!(counters.snapshot().overflowed);
-        counters.record(Cause::ComparisonTargetRevisionChanged);
-        assert!(counters.snapshot().overflowed);
-
-        // Site slots are [loss, removal] in Site order and share the sticky flag.
-        let sites = Counters::new();
-        for (site, removal) in [
-            (Site::WalkDirectory, false),
-            (Site::WalkEntry, false),
-            (Site::CandidateWalk, true),
-            (Site::CandidateForcedIndex, true),
-            (Site::Open, false),
-            (Site::Open, true),
-        ] {
-            sites.record_not_found_site(site, removal);
-        }
-        assert_eq!(
-            sites.snapshot().not_found_sites,
-            [[1, 0], [1, 0], [0, 1], [0, 1], [1, 1]]
-        );
-        assert_eq!(sites.snapshot().counts, [0; 4]);
-        assert!(!sites.snapshot().overflowed);
-        sites.not_found_sites[0].store(u64::MAX, Ordering::Relaxed);
-        sites.record_not_found_site(Site::WalkDirectory, false);
-        assert_eq!(sites.snapshot().not_found_sites[0], [0, 0]);
-        assert!(sites.snapshot().overflowed);
-
-        // Vanished-member counts are their own slots and share the sticky flag.
-        let vanished = Counters::new();
-        vanished.record_vanished(Vanished::AuditDebtDropped);
-        vanished.record_vanished(Vanished::RequestCensusRemoved);
-        vanished.record_vanished(Vanished::RequestCensusRemoved);
-        let snapshot = vanished.snapshot();
-        assert_eq!(
-            (
-                snapshot.vanished_audit_debt_dropped,
-                snapshot.vanished_request_census_removed
-            ),
-            (1, 2)
-        );
-        assert_eq!(snapshot.counts, [0; 4]);
-        assert_eq!(snapshot.not_found_sites, [[0; OUTCOMES]; SITES]);
-        assert!(!snapshot.overflowed);
-        vanished.vanished[0].store(u64::MAX, Ordering::Relaxed);
-        vanished.record_vanished(Vanished::AuditDebtDropped);
-        assert_eq!(vanished.snapshot().vanished_audit_debt_dropped, 0);
-        assert!(vanished.snapshot().overflowed);
-
-        // Model the observable between-instructions state of a wrapping writer.
-        // Isolated primitive test only: this is NOT a scanner producer fixture.
-        let between = Counters::new();
-        between.counts[0].store(u64::MAX, Ordering::Relaxed);
-        assert_eq!(between.counts[0].fetch_add(1, Ordering::Relaxed), u64::MAX);
-        assert_eq!(between.snapshot().counts[0], 0);
-        assert!(
-            !between.snapshot().overflowed,
-            "false does not rule out an already visible concurrent wrap"
-        );
-        between.overflowed.store(true, Ordering::Relaxed);
-        assert!(between.snapshot().overflowed);
-    }
-
-    #[test]
-    fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 408);
-        assert!(std::mem::size_of::<Totals>() <= 152);
-    }
-
-    #[test]
-    fn all_eleven_producers_and_only_original_operational_increments() {
-        let source = include_str!("../snapshots.rs");
-        let calls = |name: &str| -> Vec<&str> {
-            source
-                .split(&format!("disappearance_diagnostics::{name}("))
-                .skip(1)
-                .map(|piece| piece.split(");").next().unwrap())
-                .collect()
-        };
-        // Eleven operational producers: seven cause increments, then four
-        // NotFound sites that stay loss unless excused.
-        let increments = calls("increment");
-        let expected = [
-            (
-                "census.disappeared_file_count",
-                "PreflightFingerprintChanged",
-            ),
-            (
-                "census.disappeared_file_count",
-                "ComparisonTargetRevisionChanged",
-            ),
-            ("census.disappeared_file_count", "RootResolutionUnresolved"),
-            ("census.disappeared_file_count", "RootResolutionUnresolved"),
-            ("census.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
-        ];
-        assert_eq!(increments.len(), expected.len());
-        for (call, (counter, cause)) in increments.into_iter().zip(expected) {
-            assert!(call.contains(counter));
-            assert!(call.contains(&format!("Cause::{cause}")));
-        }
-        let not_found = calls("not_found");
-        let expected = [
-            (
-                "traversal.counts.disappeared_file_count",
-                "Site::WalkDirectory",
-            ),
-            ("traversal.counts.disappeared_file_count", "Site::WalkEntry"),
-            ("census.disappeared_file_count", "site"),
-            ("census.disappeared_file_count", "Site::Open"),
-        ];
-        assert_eq!(not_found.len(), expected.len());
-        for (call, (counter, site)) in not_found.into_iter().zip(expected) {
-            assert!(call.contains(counter));
-            assert!(call.contains(site));
-        }
-        // Process-only removals: Claude candidate and open sites, each in the
-        // parent-present branch, never an operational count.
-        let removals = calls("not_found_removal");
-        assert_eq!(removals.len(), 2);
-        for (call, site) in removals.into_iter().zip(["site", "Site::Open"]) {
-            assert!(call.contains(site));
-            assert!(!call.contains("disappeared_file_count"));
-        }
-        assert_eq!(
-            source.matches("claude_absence_is_removal(source, ").count(),
-            2
-        );
-        // Only those two parent-present branches mark a key vanished, and
-        // only the page merge drops its audit debt or counts its retirement.
-        assert_eq!(
-            source
-                .matches("census.claude_vanished_index_keys.insert(")
-                .count(),
-            2
-        );
-        assert_eq!(
-            source
-                .matches(".retire_vanished_claude_audit_debt_entry(")
-                .count(),
-            3
-        );
-        let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 4);
-        for (call, kind) in vanished.into_iter().zip([
-            "AuditDebtDropped",
-            "RequestCensusRemoved",
-            "AuditDebtDropped",
-            "RequestCensusRemoved",
-        ]) {
-            assert!(call.contains(&format!("Vanished::{kind}")));
-        }
-        assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);
-        assert_eq!(source.matches("Site::CandidateForcedIndex,").count(), 1);
-        assert!(!source.contains("disappeared_file_count += 1;"));
-        assert!(source
-            .contains("traversal.counts.disappeared_file_count += census.disappeared_file_count;"));
-        assert_eq!(
-            source
-                .matches("resolve_configured_scan_root(source, root, &mut census)")
-                .count(),
-            1
-        );
-        assert!(source.contains("disappeared_file_count: census.disappeared_file_count,"));
-        assert!(source.contains("disappeared_file_count: counts.disappeared_file_count,"));
-        let transition = include_str!("traversal_transition.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert_eq!(
-            transition
-                .matches("disappearance_diagnostics::snapshot(source)")
-                .count(),
-            2
-        );
-        let point = include_str!("../local_resource_diagnostics.rs")
-            .split("fn traversal_point(")
-            .nth(1)
-            .unwrap()
-            .split("/// One preparation/page observation")
-            .next()
-            .unwrap();
-        assert!(!point.contains("process_sample("));
-        assert_eq!(point.matches("emit(&Record").count(), 1);
-        // The status/wire producer has no reason field or diagnostic dependency.
-        // No new visibility seam is needed in that private production module.
-        let status = include_str!("../snapshot_sync.rs");
-        assert!(!status.contains("disappearance_process_totals_v1"));
-        assert!(!status.contains("disappearance_diagnostics"));
     }
 }
 
@@ -1663,7 +1715,10 @@ mod absence_parent_counts_tests {
                         &mut census,
                         None,
                         BACKFILL_WINDOW_DAYS,
-                        &BTreeMap::new(),
+                        &mut crate::snapshots::CandidateDiscovery::new(
+                            &mut ScanIndex::default(),
+                            None,
+                        ),
                     )
                 });
                 let removal = suffix.is_empty();
@@ -1727,7 +1782,10 @@ mod absence_parent_counts_tests {
                         &mut census,
                         None,
                         BACKFILL_WINDOW_DAYS,
-                        &BTreeMap::new(),
+                        &mut crate::snapshots::CandidateDiscovery::new(
+                            &mut ScanIndex::default(),
+                            None,
+                        ),
                     )
                 });
                 assert!(candidate.is_none());
@@ -1768,7 +1826,7 @@ mod absence_parent_counts_tests {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         fs::remove_file(&path).unwrap();
@@ -1781,7 +1839,9 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
         });
         assert_eq!(events[1][Site::Open.index()], [1, 0]);
@@ -1841,7 +1901,7 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             );
             assert_eq!(counts(scope), serde_json::json!({}));
         }

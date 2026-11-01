@@ -147,7 +147,7 @@ impl ScanIndex {
 
     pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
         let Some(entry) = self.files.get_mut(key).filter(|entry| {
-            entry.source_file_fingerprint == fingerprint
+            entry.observed_fingerprint() == fingerprint
                 && entry.has_unverified_source()
                 && !entry.has_prefix_provenance()
         }) else {
@@ -172,7 +172,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -194,7 +194,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -218,7 +218,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -236,9 +236,6 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        if claude_terminal_off() {
-            with_open_backoff(|backoff| backoff.keys.remove(key));
-        }
         true
     }
 }
@@ -247,26 +244,31 @@ impl ScanIndex {
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
 pub(super) fn path_requires_verification(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files.get(&local_index_key(path)).is_some_and(|entry| {
-        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
-    })
+    files
+        .get(&local_index_key(path))
+        .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
 }
 
-pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    for entry in index
-        .files
-        .values_mut()
-        .filter(|entry| entry.has_unverified_source())
-    {
-        if entry
+fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
+    entry.has_unverified_source()
+        && entry
             .scan_identity_version
             .as_ref()
             .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
-        {
-            entry.set_unverified_deadline(0);
+}
+
+/// Runs every Claude and Codex scan, so an index with nothing to normalize
+/// stays shared with the committed baseline.
+pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
+    if !index.files.values().any(marker_storage_oversized) {
+        return;
+    }
+    for (_, entry) in index.files.slots_mut() {
+        if marker_storage_oversized(entry) {
+            entry.make_mut().set_unverified_deadline(0);
         }
     }
 }
@@ -370,20 +372,11 @@ pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<Au
 }
 
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    if !claude_terminal_off() {
-        return debt_for_key_main(index, key, now);
-    }
-
-    index
+    let obligation = index
         .files
         .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
-        .into_iter()
-        .chain(progress_debt(index, key, now))
-        .map(|debt| debt.due_unix_seconds)
-        .chain(failed_open_debt(key, now))
-        .min()
-        .map(|due_unix_seconds| AuditDebt { due_unix_seconds })
+        .and_then(|entry| entry.audit_obligation(now));
+    obligation.or_else(|| progress_debt(index, key, now))
 }
 
 /// A held key the slot may serve: bounded, still awaiting restoration, and
@@ -511,10 +504,9 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            (!claude_terminal_off() || failure.failures > 0)
-                && (failure.failures >= OPEN_PARK_FAILURES
-                    || (self.page < failure.retry_page
-                        && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+            (failure.failures >= OPEN_PARK_FAILURES
+                || (self.page < failure.retry_page
+                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
                 && open_stamp(key) == failure.stamp
         })
     }
@@ -582,30 +574,6 @@ fn open_blocked(key: &str, now: u64) -> bool {
     with_open_backoff(|backoff| backoff.blocked(key, now))
 }
 
-/// All candidate admissions share this stat-wake check, before secure open.
-pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
-    if !claude_terminal_off() {
-        return false;
-    }
-    open_blocked(key, now)
-}
-/// Scheduling only: an existing failed-open obligation may retry when its
-/// own throttle expires; a successful ordinary open is not such a retry.
-pub(super) fn failed_open_retry_ready(key: &str, now: u64) -> bool {
-    if !claude_terminal_off() {
-        return false;
-    }
-    with_open_backoff(|memo| {
-        memo.keys.get(key).is_some_and(|f| f.failures > 0) && !memo.blocked(key, now)
-    })
-}
-pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
-    if !claude_terminal_off() {
-        return None;
-    }
-    with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
-}
-
 /// Census-line counts: keys whose progress open failed and are still owed
 /// (backing off or parked), and the age of the oldest first failure.
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
@@ -640,28 +608,18 @@ pub(super) fn reset_open_backoff_for_test() {
 #[cfg(test)]
 mod open_backoff_tests;
 
-/// Secure open spends this key's progress turn and clears throttling, NOT
-/// the owed verification. Another key may own the slot, so retain the exact
-/// numeric due in the bounded map until a marker/native acquisition carries
-/// it or a completed source verification retires it.
+/// The queued progress Full for `key` passed its secure open: the slot's
+/// turn is spent, so the next preparation rotates to a fresh interval, and
+/// any failed-open backoff ends.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
-    if !claude_terminal_off() {
-        return progress_opened_main(index, key);
-    }
-
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
+        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
-    with_open_backoff(|backoff| {
-        if let Some(failure) = backoff.keys.get_mut(key) {
-            failure.failures = 0;
-            failure.retry_page = backoff.page;
-        }
-    });
 }
 
 #[derive(Serialize)]
@@ -686,43 +644,21 @@ fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
     }
     recorded
 }
-pub(super) fn candidate_open_failed(key: &str, now: u64) {
-    if !claude_terminal_off() {
-        return;
-    }
-    if let Some(due) = failed_open_debt(key, now) {
-        record_open_failure(key, due, now);
-    }
-}
 
 /// The queued progress Full for `key` failed its secure open. Back the key
 /// off (or park it), then rotate the turn, wrapping to `key` itself when no
 /// other member is eligible, but keep the owed due: a failed open never
 /// re-arms a later deadline.
 pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
-    if !claude_terminal_off() {
-        return progress_open_failed_main(index, key, now);
-    }
-
     let Some(due) = index
         .held_audit_progress
         .as_ref()
         .filter(|slot| slot.key == key && !slot.attempted)
         .map(|slot| slot.due)
-        .or_else(|| failed_open_debt(key, now))
     else {
         return;
     };
     let recorded = record_open_failure(key, due, now);
-    // An ordinary admission can be a previously failed key while another
-    // member owns the progress slot. Its failure must not steal that turn.
-    if index
-        .held_audit_progress
-        .as_ref()
-        .is_some_and(|slot| slot.key != key)
-    {
-        return;
-    }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
@@ -746,14 +682,9 @@ fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<Strin
         // Restoring a plain-v2 hold changes its representation, not its
         // failed-open obligation. Keep the same-stat park and original D
         // until source verification discharges them (or the entry is gone).
-        backoff.keys.retain(|key, _| {
-            awaits_hold_deadline_restoration(index, key)
-                || claude_terminal_off()
-                    && index
-                        .files
-                        .get(key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source)
-        });
+        backoff
+            .keys
+            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
     });
     let previous = index.held_audit_progress.clone();
     let keep = previous.as_ref().is_some_and(|slot| {
@@ -811,6 +742,7 @@ impl OwnedSourceScan {
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         // Mirror candidate conversion's census observation. An old queued
         // age rejection must not delete a successful recovery at settlement.
@@ -893,7 +825,7 @@ impl SourceScanResult {
                     && index
                         .files
                         .get(key)
-                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
+                        .is_some_and(|entry| entry.observed_fingerprint() == fingerprint)
                     && index.stage_sampled_audit(key, fingerprint, debt)
                 {
                     reserved += 1;
@@ -965,6 +897,7 @@ mod tests {
             opened_object_identity: "opened".into(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         }
     }
     fn index() -> ScanIndex {
@@ -974,6 +907,75 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    /// [behaviour] Virtual recovery keeps grown keys observed without reading before due.
+    #[test]
+    fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
+        use crate::snapshots::claude_request_census::{
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+        };
+        let mut index = index();
+        let mut candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        let record =
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true);
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record);
+        let now = 10 * 86_400;
+        let due = now + 100;
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: key.clone(),
+            due,
+            attempted: false,
+        });
+        candidate.size_bytes += 1;
+        candidate.source_file_fingerprint = "changed".into();
+        assert!(awaits_hold_deadline_restoration(&index, &key));
+        assert!(
+            discovery_retention!(index).owes_with_len(
+                SnapshotSource::ClaudeCode,
+                &candidate.path,
+                candidate.size_bytes
+            ),
+            "growth stays discoverable, never dropped"
+        );
+        let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
+            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+        };
+        let mut recent = candidate.clone();
+        recent.modified_unix_seconds = now;
+        assert_eq!(
+            decide(&index, &recent, now),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            ),
+            "recent growth preserves main's immediate selection"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Skip,
+            "scheduling future virtual debt cannot acquire the grown file"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due),
+            (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
+            "due read retains its counted audit cause"
+        );
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Parse,
+            "genuine external rearm is not hidden by the virtual delay"
+        );
+    }
+
     #[test]
     fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
         let mut index = index();
@@ -1430,17 +1432,7 @@ mod provenance_tests {
         assert!(!index.files["file"].has_prefix_provenance());
         assert!(!index.files["file"].has_unverified_source());
     }
-    #[test]
-    fn provenance_marker_stays_inside_existing_marker_budget() {
-        // Native comparison's unchanged charge rounds this legacy bound to 64.
-        let budget = (UNVERIFIED_IDENTITY.len() + 1 + 20).next_power_of_two();
-        for prefix in [false, true] {
-            let tag = provenance_marker(u64::MAX, prefix);
-            assert!(tag.capacity() <= MAX_MARKER_BYTES);
-            assert!(tag.capacity() <= budget);
-            assert_eq!(decode_marker(&tag), Some((u64::MAX, prefix)));
-        }
-    }
+
     /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
     /// or legacy entry (never a prefix, SOURCE Option 1) re-recorded without
     /// verification or obligation becomes the clean identity; the same
@@ -1460,10 +1452,11 @@ mod provenance_tests {
             opened_object_identity: "opened".into(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
@@ -1497,18 +1490,30 @@ mod provenance_tests {
 /// restores its marker. Preserve the actual read's root: guessing from nested
 /// roots could change the acquisition scope. A committed retirement skips it.
 pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
+    queue_pending(index, Path::new(key), || scan_root, false, false);
+}
+
+/// The one deduplicated pending-candidate insert. Callers keep their own side
+/// effects (rearm cause, growth residue); an absent traversal queues nothing.
+/// The root is produced only on insertion.
+fn queue_pending(
+    index: &mut ScanIndex,
+    path: &Path,
+    scan_root: impl FnOnce() -> PathBuf,
+    census_member: bool,
+    watcher_hint: bool,
+) {
     if let Some(traversal) = index.traversal.as_mut() {
-        let path = Path::new(key);
         if !traversal
             .pending_candidates
             .iter()
             .any(|queued| queued.path == path)
         {
             traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root,
+                scan_root: scan_root(),
                 path: path.to_owned(),
-                census_member: false,
-                watcher_hint: false,
+                census_member,
+                watcher_hint,
             });
         }
     }
@@ -1528,44 +1533,103 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
             crate::local_resource_diagnostics::rearm_cause::Cause::AuditCapDelay,
         );
     }
-    if let Some(traversal) = index.traversal.as_mut() {
-        if !traversal
-            .pending_candidates
-            .iter()
-            .any(|path| path.path == candidate.path)
-        {
-            traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root: candidate.scan_root.clone(),
-                path: candidate.path.clone(),
-                census_member: true,
-                watcher_hint: true,
-            });
-        }
-    }
+    queue_pending(
+        index,
+        &candidate.path,
+        || candidate.scan_root.clone(),
+        true,
+        true,
+    );
 }
 
-// To be replaced by #876's implementation at merge. Exact round-18 copy
-// from e3/withheld-age-exempt at 5df3fc370c10b3ce0e0d9f98ec46f044c2388c54.
 /// Positive removal only: a file or intermediate directory is NotFound beneath
 /// a readable ancestor securely reached from a configured, readable root.
 /// Missing roots, symlinks and permission errors keep the audit and account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    absence_parent(path, roots).is_some()
+}
+
+/// Pin the nearest existing parent so its inode cannot be reused between probes.
+/// Depth binds the missing component when an intermediate directory is absent.
+#[derive(Debug)]
+pub(super) struct AbsenceParent {
+    directory: File,
+    depth: usize,
+}
+impl AbsenceParent {
+    pub(super) fn same_parent(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.depth == other.depth
+                && self
+                    .directory
+                    .metadata()
+                    .ok()
+                    .zip(other.directory.metadata().ok())
+                    .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
     #[cfg(unix)]
     {
-        roots
-            .iter()
-            .any(|root| proven_absent_beneath_root(path, root).unwrap_or(false))
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = (path, roots);
-        false
+        None
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            directory: _,
+            depth: _,
+        } = self;
+        c.add(0)
+    }
+}
+
+pub(super) fn absence_parent(path: &Path, roots: &[PathBuf]) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots
+            .iter()
+            .find_map(|root| proven_absent_beneath_root(path, root).ok().flatten())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
     }
 }
 
 #[cfg(unix)]
-fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool> {
+fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<Option<AbsenceParent>> {
     fn open_directory(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
         // Match open_candidate_beneath_root: every directory is readable and
         // no component below the configured root may redirect through a link.
@@ -1614,26 +1678,26 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
             .components()
             .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
-        return Ok(false);
+        return Ok(None);
     }
     // Preserve the nofollow check on the root's final component even when its
     // configured spelling has a trailing separator or `/.`.
     let root: PathBuf = root.components().collect();
     let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut names = Vec::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
-            return Ok(false);
+            return Ok(None);
         };
         let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-            return Ok(false);
+            return Ok(None);
         };
         names.push(name);
     }
     let Some((final_name, parents)) = names.split_last() else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut root_options = fs::OpenOptions::new();
     root_options
@@ -1654,7 +1718,7 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
         }
     }
     if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     // A removed/replaced ancestor can leave a readable but detached descriptor.
@@ -1663,15 +1727,21 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     // or recreation (even an empty directory) keeps the debt.
     let mut directory = root_options.open(&root)?;
     if !same_directory(&directory, &directories[0])? {
-        return Ok(false);
+        return Ok(None);
     }
     for (name, original) in parents.iter().zip(&directories[1..]) {
         directory = open_directory(&directory, name)?;
         if !same_directory(&directory, original)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    name_absent(&directory, missing_name)
+    if !name_absent(&directory, missing_name)? {
+        return Ok(None);
+    }
+    Ok(Some(AbsenceParent {
+        directory,
+        depth: directories.len(),
+    }))
 }
 
 #[cfg(all(test, unix))]
@@ -1836,54 +1906,1418 @@ mod absence_non_unix_tests {
     }
 }
 
-pub(super) fn debt_for_key_main(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    index
-        .files
-        .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
-        .or_else(|| progress_debt(index, key, now))
+/// V2-only selection bookkeeping. The key keeps the index key's PL class;
+/// sizes, generations and consecutive uncertainty are N. It conveys no proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct GrowthRetention {
+    predecessor_size: Option<u64>,
+    uncertain_passes: u32,
+    pub(super) checked_generation: Option<u64>,
+    last_growth_full_unix: Option<u64>,
+}
+crate::heap_layout_bound::fields!(GrowthRetention; predecessor_size, uncertain_passes, checked_generation, last_growth_full_unix);
+
+/// Whether this graph generation already revalidated `key` (runtime-only memo).
+pub(super) fn growth_checked(index: &ScanIndex, key: &str) -> bool {
+    let (generation, keys) = &index.v2().growth_checked;
+    *generation == index.generation && keys.contains(key)
 }
 
-pub(super) fn progress_opened_main(index: &mut ScanIndex, key: &str) {
-    if let Some(slot) = index
-        .held_audit_progress
-        .as_mut()
-        .filter(|slot| slot.key == key)
-    {
-        slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
-    }
+pub(super) fn growth_active(index: &ScanIndex) -> bool {
+    crate::snapshots::state_v2::state_v2_growth_retention_active(index)
 }
 
-pub(super) fn progress_open_failed_main(index: &mut ScanIndex, key: &str, now: u64) {
-    let Some(due) = index
-        .held_audit_progress
-        .as_ref()
-        .filter(|slot| slot.key == key && !slot.attempted)
-        .map(|slot| slot.due)
-    else {
+/// Owed native growth debt. Fresh growth (`len > size_bytes`) is main's
+/// owes_stamped/codex_fragment::grown, which every age gate checks first.
+pub(super) fn growth_selectable(
+    source: SnapshotSource,
+    path: &Path,
+    growth: Option<&BTreeMap<String, GrowthRetention>>,
+) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && growth.is_some_and(|growth| {
+            growth
+                .get(&local_index_key(path))
+                .is_some_and(|state| state.predecessor_size.is_some())
+        })
+}
+
+fn retain_growth(index: &mut ScanIndex, key: &str, len: Option<u64>) {
+    let Some(entry) = index.files.get(key) else {
         return;
     };
-    let (recorded, keys) =
-        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked {
-        // Counts only; no path or id. Once per park.
-        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
-            held_audit_open_failures: parked.failures,
-            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
-            held_audit_open_failed_keys: keys,
-        });
+    let size = entry.size_bytes;
+    let state = index
+        .v2_mut()
+        .growth_retention
+        .entry(key.to_owned())
+        .or_default();
+    if state.predecessor_size.is_none() {
+        state.predecessor_size = Some(size);
+        crate::local_resource_diagnostics::v2_growth_retained(
+            len.unwrap_or(size).saturating_sub(size),
+        );
     }
-    let previous = index.held_audit_progress.take();
-    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
-    // and its owed due moves into the slot: the debt is never dropped.
-    let (evicted, evicted_due) = recorded.evicted.unzip();
-    index.held_audit_progress = evicted
-        .filter(|evicted| progress_eligible(index, evicted))
-        .or_else(|| next_progress_key(index, Some(key), now))
-        .map(|next| {
-            let mut slot = progress_slot(next, due, previous.as_ref());
-            slot.due = evicted_due.map_or(slot.due, |owed| slot.due.min(owed));
-            slot
-        });
+    if let Some(walk) = index.traversal.as_mut() {
+        walk.residue.index_keys.insert(key.to_owned());
+    }
+}
+
+pub(super) fn retain_candidate_growth(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+) {
+    if !growth_active(index) {
+        return;
+    }
+    let key = local_index_key(&candidate.path);
+    // Selection, not an age gate: fresh growth starts its debt here.
+    let grown = source == SnapshotSource::ClaudeCode
+        && index
+            .files
+            .get(&key)
+            .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
+    if grown || growth_selectable(source, &candidate.path, Some(&index.v2().growth_retention)) {
+        retain_growth(index, &key, Some(candidate.size_bytes));
+    }
+}
+
+/// Metadata only, through the acquisition path's configured-root/no-follow open.
+/// A failed open is never negative growth evidence. Positive absence keeps the
+/// existing independent absence rules (including unreadable/missing roots).
+pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathBuf]) -> bool {
+    if !growth_active(index) || !index.files.contains_key(key) {
+        return false;
+    }
+    let path = Path::new(key);
+    let root = roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count());
+    let len = root.and_then(|root| {
+        let candidate = CandidateFile {
+            physical_identity: None,
+            scan_root: root.clone(),
+            path: path.to_owned(),
+            size_bytes: 0,
+            modified_unix_seconds: 0,
+            modified_unix_nanos: 0,
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        open_candidate_beneath_root(&candidate)
+            .ok()?
+            .metadata()
+            .ok()
+            .filter(|stat| stat.is_file())
+            .map(|stat| stat.len())
+    });
+    let uncertain = len.is_none() && !proven_absent(path, roots);
+    crate::local_resource_diagnostics::v2_growth_revalidate(uncertain);
+    let retained = uncertain
+        || index
+            .v2()
+            .growth_retention
+            .get(key)
+            .is_some_and(|state| state.predecessor_size.is_some())
+            && len.is_some()
+        || len.is_some_and(|len| len > index.files[key].size_bytes);
+    if retained {
+        retain_growth(index, key, len);
+    }
+    let generation = index.generation;
+    // Restored residue needs a known status, or every page would re-select it.
+    let residue = index
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.residue.index_keys.contains(key));
+    let v2 = index.v2_mut();
+    note_growth_checked(v2, generation, key);
+    if uncertain {
+        let state = v2.growth_retention.entry(key.to_owned()).or_default();
+        if state.checked_generation != Some(generation) {
+            state.checked_generation = Some(generation);
+            state.uncertain_passes = state.uncertain_passes.saturating_add(1);
+            if state.uncertain_passes > 3 {
+                crate::local_resource_diagnostics::v2_growth_uncertain_alarm(
+                    state.uncertain_passes,
+                );
+            }
+        }
+    } else if let Some(state) = v2.growth_retention.get_mut(key) {
+        // Persist only a status change: no per-generation rewrite.
+        state.uncertain_passes = 0;
+        state.checked_generation.get_or_insert(generation);
+    } else if residue {
+        // Other check-only results (aged or kept-overlap retirement
+        // candidates) persist nothing; the runtime memo bounds the work.
+        v2.growth_retention.insert(
+            key.to_owned(),
+            GrowthRetention {
+                checked_generation: Some(generation),
+                ..GrowthRetention::default()
+            },
+        );
+    }
+    if !retained {
+        return false;
+    }
+    if let Some(root) = root {
+        queue_growth_path(index, key, root.clone(), true);
+    }
+    true
+}
+
+fn queue_growth_path(index: &mut ScanIndex, key: &str, scan_root: PathBuf, census_member: bool) {
+    queue_pending(index, Path::new(key), || scan_root, census_member, false);
+    if let Some(walk) = index.traversal.as_mut() {
+        walk.residue.index_keys.insert(key.to_owned());
+    }
+}
+
+pub(super) fn queue_growth_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
+    queue_growth_path(
+        index,
+        &local_index_key(&candidate.path),
+        candidate.scan_root.clone(),
+        false,
+    );
+}
+
+/// Only witnessed growth debt excludes retirement. An undiscovered range or
+/// residue without a growth entry conveys no retention authority.
+pub(super) fn growth_excluded_parts(
+    key: &str,
+    growth: &BTreeMap<String, GrowthRetention>,
+    walk: Option<&ScanTraversalCheckpoint>,
+    terminal_residue: Option<&BTreeSet<String>>,
+) -> bool {
+    growth.get(key).is_some_and(|state| {
+        state.predecessor_size.is_some()
+            || state.checked_generation.is_none()
+                && (walk.is_some_and(|walk| walk.residue.index_keys.contains(key))
+                    || terminal_residue.is_some_and(|keys| keys.contains(key)))
+    })
+}
+
+pub(super) fn growth_retirement_excluded(index: &ScanIndex, key: &str) -> bool {
+    growth_active(index)
+        && growth_excluded_parts(
+            key,
+            &index.v2().growth_retention,
+            index.traversal.as_ref(),
+            None,
+        )
+}
+
+/// Only native completion calls this; opens, length equality, progress saves,
+/// audit retirement and delivery ACKs do not settle source growth.
+pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
+    if growth_active(index) {
+        let _ = state_v2::save_read_completed(index, key);
+        let generation = index.generation;
+        let v2 = index.v2_mut();
+        if let Some(state) = v2.growth_retention.get_mut(key) {
+            state.predecessor_size = None;
+            state.uncertain_passes = 0;
+            state.checked_generation = Some(generation);
+            note_growth_checked(v2, generation, key);
+        }
+    }
+}
+
+/// Checked this generation: retirement must not revalidate (and re-retain) it.
+fn note_growth_checked(v2: &mut state_v2::IndexState, generation: u64, key: &str) {
+    if v2.growth_checked.0 != generation {
+        v2.growth_checked = (generation, BTreeSet::new());
+    }
+    v2.growth_checked.1.insert(key.to_owned());
+}
+
+pub(super) fn growth_subset(
+    index: &ScanIndex,
+    previous: &ScanIndex,
+    safe: &BTreeSet<String>,
+) -> BTreeMap<String, GrowthRetention> {
+    let mut debt = index.v2().growth_retention.clone();
+    if !growth_active(index) {
+        return debt;
+    }
+    for (key, state) in &previous.v2().growth_retention {
+        if !safe.contains(key) {
+            let current = debt.entry(key.clone()).or_insert_with(|| state.clone());
+            if state.predecessor_size.is_some() {
+                current.predecessor_size = state.predecessor_size;
+            }
+        }
+    }
+    merge_growth_claims(&mut debt, &previous.v2().growth_retention);
+    debt
+}
+
+pub(super) const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
+
+pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
+    let files = &index.files;
+    let Some(v2) = index.v2.as_mut() else { return };
+    let before = v2.growth_retention.len();
+    v2.growth_retention.retain(|key, state| {
+        files.contains_key(key)
+            || state
+                .last_growth_full_unix
+                .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+    });
+    let reclaimed = before - v2.growth_retention.len();
+    if reclaimed > 0 && growth_active(index) {
+        crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
+            "growth_claim_reclaimed": reclaimed
+        }));
+    }
+}
+
+/// A load lineage shares only the generation of its own claim-only commits.
+/// Ordinary saves replace this context, so stale clones cannot skip their CAS.
+/// No transcript, checkpoint payload or second pacing store lives here.
+#[derive(Debug)]
+pub(super) struct GrowthClaimContext {
+    path: PathBuf,
+    base_generation: u64,
+    v2_owner: Option<std::sync::Weak<state_v2::Runtime>>,
+    receipt: Mutex<Option<(u64, (u64, u64))>>,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for GrowthClaimContext {
+    // The only heap allocation is the immutable path; the mutable receipt
+    // contains only inline integers, so its heap charge cannot change.
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.path, c)
+    }
+}
+pub(super) fn bind_growth_claims(index: &mut ScanIndex, path: &Path) {
+    index.v2_mut().growth_claim_context = Some(Arc::new(GrowthClaimContext {
+        path: path.to_owned(),
+        base_generation: index.generation,
+        v2_owner: index.v2().persistence_v2.as_ref().map(Arc::downgrade),
+        receipt: Mutex::new(None),
+    }));
+}
+pub(super) fn renew_growth_claims(index: &mut ScanIndex, path: &Path) {
+    if index.v2().growth_claim_context.is_some() {
+        bind_growth_claims(index, path);
+    }
+}
+pub(super) fn own_growth_claim_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
+    let context = index.v2().growth_claim_context.as_ref()?;
+    let (generation, stamp) = (*context.receipt.lock().ok()?)?;
+    let matches = growth_owner_matches(index, context)
+        && state_v2::confirmed_growth_stamp(index, path).ok() == Some(stamp)
+        && stamp.0 == generation;
+    (context.path == path
+        && index.generation == context.base_generation
+        && generation > context.base_generation
+        && matches)
+        .then_some(generation)
+}
+
+fn growth_owner_matches(index: &ScanIndex, context: &GrowthClaimContext) -> bool {
+    match (&index.v2().persistence_v2, &context.v2_owner) {
+        (Some(runtime), Some(owner)) => owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(runtime, &owner)),
+        _ => false,
+    }
+}
+
+fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> {
+    let context = index
+        .v2()
+        .growth_claim_context
+        .as_ref()
+        .context("growth claim context missing")?;
+    anyhow::ensure!(
+        context.path == path && growth_owner_matches(index, context),
+        "growth claim owner changed"
+    );
+    let expected = own_growth_claim_generation(index, path).unwrap_or(index.generation);
+    anyhow::ensure!(
+        state_v2::confirmed_growth_stamp(index, path)?.0 == expected,
+        "growth claim needs index reload"
+    );
+    Ok(())
+}
+
+/// Called by save while the checkpoint lock still protects this publication.
+/// A same-generation replacement must not become a claim-lineage CAS bypass.
+pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Result<()> {
+    let context = index
+        .v2()
+        .growth_claim_context
+        .as_ref()
+        .context("growth claim context missing")?;
+    anyhow::ensure!(context.path == path, "growth claim path changed");
+    anyhow::ensure!(
+        growth_owner_matches(index, context),
+        "growth claim owner changed"
+    );
+    let stamp = state_v2::confirmed_growth_stamp(index, path)?;
+    anyhow::ensure!(
+        stamp.0 == index.generation,
+        "growth claim publication changed"
+    );
+    *context
+        .receipt
+        .lock()
+        .map_err(|_| anyhow::anyhow!("growth claim receipt unavailable"))? =
+        Some((index.generation, stamp));
+    Ok(())
+}
+
+/// Claims are monotonic even when a subset restores an older file entry or
+/// native completion clears its selection debt. A failed read still spent it.
+pub(super) fn merge_growth_claims(
+    target: &mut BTreeMap<String, GrowthRetention>,
+    committed: &BTreeMap<String, GrowthRetention>,
+) {
+    for (key, state) in committed {
+        if let Some(claim) = state.last_growth_full_unix {
+            let current = target.entry(key.clone()).or_default();
+            current.last_growth_full_unix =
+                Some(current.last_growth_full_unix.unwrap_or(0).max(claim));
+        }
+    }
+}
+
+fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
+    let recent = |state: &GrowthRetention| {
+        state
+            .last_growth_full_unix
+            .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+    };
+    if index.v2().growth_retention.get(key).is_some_and(recent)
+        || index.decode_holds.contains("growth_retention", key)
+    {
+        return Ok(false);
+    }
+    let context = index
+        .v2()
+        .growth_claim_context
+        .clone()
+        .context("growth Full needs a committed scan index")?;
+    // Decode the committed index, not the working page: persisting a claim
+    // must never publish unaccepted bodies, progress or census changes.
+    authenticate_growth_generation(index, &context.path)?;
+    let mut committed = ScanIndex::load(&context.path)?;
+    anyhow::ensure!(
+        growth_owner_matches(&committed, &context),
+        "growth claim owner changed"
+    );
+    authenticate_growth_generation(index, &context.path)?;
+    let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
+    anyhow::ensure!(
+        committed.generation == expected,
+        "growth claim needs index reload"
+    );
+    committed.require_persistence_available()?;
+    if committed.v2().growth_retention.get(key).is_some_and(recent)
+        || committed.decode_holds.contains("growth_retention", key)
+    {
+        merge_growth_claims(
+            &mut index.v2_mut().growth_retention,
+            &committed.v2().growth_retention,
+        );
+        return Ok(false);
+    }
+    let mut claim = index
+        .v2()
+        .growth_retention
+        .get(key)
+        .cloned()
+        .unwrap_or_default();
+    claim.last_growth_full_unix = Some(now);
+    committed
+        .v2_mut()
+        .growth_retention
+        .insert(key.to_owned(), claim);
+    // Existing save owns lock, full CAS, atomic publication and fsync. If it
+    // fails (including ambiguous publication), no acquisition is authorized.
+    committed.v2_mut().growth_claim_context = Some(context.clone());
+    committed.save_growth_claim(&context.path)?;
+    let _lock = CheckpointLock::acquire(&context.path)?;
+    publish_growth_claim_receipt(&committed, &context.path)?;
+    merge_growth_claims(
+        &mut index.v2_mut().growth_retention,
+        &committed.v2().growth_retention,
+    );
+    Ok(true)
+}
+
+/// Identity has already been checked by open_and_identify and ReadPlan.
+/// Rewrites/shrinks keep their own counted cause; a missing reusable checkpoint
+/// takes the existing Full only after a durable six-hour claim.
+pub(super) fn growth_read_admitted(
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+    mode: crate::transcript_acquisition::ReadMode,
+) -> bool {
+    if !growth_active(index) {
+        return true;
+    }
+    growth_read_admitted_at(index, candidate, mode, sampled_scan::now_seconds())
+}
+pub(super) fn growth_read_admitted_at(
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+    mode: crate::transcript_acquisition::ReadMode,
+    now: u64,
+) -> bool {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    if !growth_active(index) {
+        return true;
+    }
+    let key = local_index_key(&candidate.path);
+    let oversize = match state_v2::save_oversize_active(index) {
+        Ok(held) => held,
+        Err(_) => return false,
+    };
+    // A stale graph must not erase committed growth debt and bypass pacing.
+    // Authenticate even rewrite Fulls before consulting working-page debt.
+    if index.v2().persistence_v2.is_some() && (oversize || matches!(mode, ReadMode::Full(_))) {
+        let valid = (|| -> Result<()> {
+            let path = &index
+                .v2()
+                .growth_claim_context
+                .as_ref()
+                .context("growth claim context missing")?
+                .path;
+            let _lock = CheckpointLock::acquire(path)?;
+            authenticate_growth_generation(index, path)
+        })();
+        if valid.is_err() {
+            state_v2::growth_claim_refused("lineage");
+            return false;
+        }
+    }
+    let held = index.decode_holds.contains("growth_retention", &key);
+    if !oversize
+        && !held
+        && !index
+            .v2()
+            .growth_retention
+            .get(&key)
+            .is_some_and(|state| state.predecessor_size.is_some())
+    {
+        return true;
+    }
+    if oversize
+        || matches!(
+            mode,
+            ReadMode::Full(
+                FullReason::StateMissing
+                    | FullReason::InvalidCheckpoint
+                    | FullReason::UnsupportedIdentity
+            )
+        )
+    {
+        return match claim_growth_full(index, &key, now) {
+            Ok(admitted) => {
+                if oversize && admitted {
+                    crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
+                        "save_oversize_growth_full": 1
+                    }));
+                }
+                admitted
+            }
+            Err(_) => {
+                if index.v2().persistence_v2.is_some() {
+                    state_v2::growth_claim_refused("publication");
+                }
+                false
+            }
+        };
+    }
+    true
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::super::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use super::*;
+
+    const ACCEPTED: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    struct Fixture {
+        root: PathBuf,
+        path: PathBuf,
+        key: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = crate::test_scratch::canonical_private_dir("ottto-v2-growth");
+            let path = root.join("session.jsonl");
+            fs::write(&path, b"old\n").unwrap();
+            let key = local_index_key(&path);
+            Self { root, path, key }
+        }
+        fn index(&self) -> ScanIndex {
+            let index = self.legacy_index();
+            self.persist(&index);
+            ScanIndex::load(&self.storage_path()).unwrap()
+        }
+        fn legacy_index(&self) -> ScanIndex {
+            let mut index = ScanIndex::default();
+            let entry = serde_json::from_value(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1, "modified_unix_nanos": 1,
+                "source_file_fingerprint": "a".repeat(64), "last_snapshot_fingerprint": ACCEPTED,
+                "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+            }))
+            .unwrap();
+            index.files.insert(self.key.clone(), entry);
+            index.accepted_snapshot_fingerprints.insert(ACCEPTED.into());
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                vec![7],
+            )
+            .with_modified_for_test(Some(1));
+            index
+                .claude_request_census
+                .insert_for_test(&self.key, record);
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                &mut index,
+                "2026-10-07T12:00:00Z",
+                30,
+            );
+            let walk = index.traversal.as_mut().unwrap();
+            // The old directory has already been visited and age-skipped.
+            walk.pending_directories.clear();
+            walk.pending_candidates.clear();
+            walk.observed_index_keys.clear();
+            walk.reconciliation_upper_bound = Some(self.key.clone());
+            index
+        }
+        fn storage_path(&self) -> PathBuf {
+            self.root
+                .join("snapshots/destinations")
+                .join("a".repeat(64))
+                .join("claude_code-test-scan-index.json")
+        }
+        fn persist(&self, index: &ScanIndex) {
+            let path = self.storage_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let progress = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3,
+                "destination_namespace_hash": "a".repeat(64),
+            }))
+            .unwrap();
+            if index.v2().persistence_v2.is_some() {
+                index.clone().save(&path).unwrap();
+            } else {
+                state_v2::money_test_support::publish(index, &path, &progress);
+            }
+        }
+        fn grow(&self) {
+            fs::write(&self.path, b"old\nappend\n").unwrap();
+        }
+        fn pending(&self) -> ScanTraversalPath {
+            ScanTraversalPath {
+                scan_root: self.root.clone(),
+                path: self.path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let path = self.storage_path();
+            if path.parent().is_some_and(Path::exists) {
+                state_v2::money_test_support::erase_published(&path);
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    fn restart_lenient(index: &ScanIndex) -> ScanIndex {
+        if index.v2.is_some() || index.decode_holds.contains_field("growth_retention") {
+            let root = crate::test_scratch::canonical_private_dir("growth-row-restart");
+            let mut restored = state_v2::money_test_support::roundtrip_rows(
+                index,
+                &root.join("state.v2.sqlite.import"),
+            );
+            super::super::lenient_decode::post_decode_hydrated(
+                &mut restored,
+                "fixture",
+                "claude_code",
+            )
+            .unwrap();
+            fs::remove_dir_all(root).unwrap();
+            restored.v2_mut().persistence_v2 = index.v2().persistence_v2.clone();
+            restored
+        } else {
+            let mut bytes = Vec::new();
+            super::super::lenient_decode::write_index(&mut bytes, index).unwrap();
+            super::super::lenient_decode::read(
+                std::io::Cursor::new(bytes),
+                "fixture",
+                "claude_code",
+            )
+            .unwrap()
+        }
+    }
+    fn restart(index: &ScanIndex) -> ScanIndex {
+        // V1 deliberately drops this field. Its independent v2 rows retain it.
+        let serde: ScanIndex = serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap();
+        assert!(serde.v2.is_none());
+        let stored = restart_lenient(index);
+        assert_eq!(stored.v2().growth_retention, index.v2().growth_retention);
+        stored
+    }
+
+    /// [money] f1 resumed reconciliation keeps growth after hold and restart.
+    #[test]
+    fn f1_resumed_reconciliation_keeps_growth_after_hold_and_restart() {
+        for age_days in [31, 40] {
+            let fixture = Fixture::new();
+            let held = fixture.index();
+            fixture.grow();
+            let mut resumed = restart(&held);
+            let ((done, ()), rows) = crate::local_resource_diagnostics::capture(|| {
+                let done = reconcile_missing_index_entries_with_limit(&mut resumed, 1);
+                (done, ())
+            });
+            assert!(!done, "new census work defers terminal");
+            assert_eq!(resumed.files[&fixture.key].size_bytes, 4);
+            assert!(resumed.accepted_snapshot_fingerprints.contains(ACCEPTED));
+            assert_eq!(resumed.claude_request_census.hash_total_for_test(), 1);
+            assert!(resumed
+                .traversal
+                .as_ref()
+                .unwrap()
+                .residue
+                .index_keys
+                .contains(&fixture.key));
+            assert_eq!(
+                resumed
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .reconciliation_after
+                    .as_deref(),
+                Some(fixture.key.as_str())
+            );
+            assert!(rows
+                .iter()
+                .any(|row| row["counts"]["v2_growth_revalidate"]["stats"] == 1));
+            resumed = restart(&resumed);
+            let bounded = restart_lenient(&resumed);
+            assert_eq!(bounded.v2().growth_retention, resumed.v2().growth_retention);
+            assert!(resumed.v2().growth_retention[&fixture.key]
+                .predecessor_size
+                .is_some());
+            let mut census = ScanCensus::default();
+            let now = unix_seconds(SystemTime::now()).unwrap() + age_days * 86400;
+            let candidate = candidate_from_traversal_path(
+                SnapshotSource::ClaudeCode,
+                fixture.pending(),
+                &mut census,
+                Some(now),
+                30,
+                // v2 growth follows the index (production derivation).
+                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None),
+            )
+            .unwrap();
+            assert!(open_and_identify_scan_candidate_at(
+                SnapshotSource::ClaudeCode,
+                candidate,
+                &mut census,
+                crate::snapshots::CandidateWindow {
+                    census_unix_seconds: Some(now),
+                    backfill_window_days: 30,
+                    retention: crate::snapshots::DiscoveryRetention::unverified(&resumed.files),
+                    growth: Some(&resumed.v2().growth_retention),
+                },
+            )
+            .is_some());
+        }
+    }
+
+    /// [money] f2 progress restart terminal excludes debt until native settlement.
+    #[test]
+    fn f2_progress_restart_terminal_excludes_debt_until_native_settlement() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        assert!(revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root)
+        ));
+        // A progress checkpoint can advance working bytes before settlement.
+        index.files.get_mut(&fixture.key).unwrap().size_bytes = 11;
+        let mut index = restart(&index);
+        index.traversal.as_mut().unwrap().pending_candidates.clear();
+        let window = 40 * 86400;
+        assert_eq!(index.retire_claude_transcript_records_for_test(window).0, 0);
+        assert_eq!(index.claude_request_census.hash_total_for_test(), 1);
+        let state = index.files[&fixture.key].clone();
+        index
+            .files
+            .get_mut(&fixture.key)
+            .unwrap()
+            .set_unverified_deadline(window + 10);
+        settle_growth(&mut index, &fixture.key);
+        assert!(
+            index.files[&fixture.key].has_unverified_source(),
+            "growth settlement does not erase audit debt"
+        );
+        index.files.insert(fixture.key.clone(), state);
+        index.traversal.as_mut().unwrap().reconciliation_after = Some(fixture.key.clone());
+        // Native settlement's existing residue bookkeeping removes that key.
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .residue
+            .index_keys
+            .remove(&fixture.key);
+        assert_eq!(index.retire_claude_transcript_records_for_test(window).0, 1);
+        assert_eq!(index.claude_request_census.hash_total_for_test(), 0);
+    }
+
+    /// [money] f2 admission pressure keeps retained hashes and defers new record.
+    #[test]
+    fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
+        for prechecked in [true, false] {
+            let fixture = Fixture::new();
+            let mut index = fixture.index();
+            fixture.grow();
+            if prechecked {
+                revalidate_growth(
+                    &mut index,
+                    &fixture.key,
+                    std::slice::from_ref(&fixture.root),
+                );
+            }
+            let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                (0..cap as u64).collect(),
+            )
+            .with_modified_for_test(Some(1));
+            index
+                .claude_request_census
+                .insert_for_test(&fixture.key, record);
+            let mut index = restart(&index);
+            let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"b".repeat(64),
+                40 * 86400,
+                ClaudeRequestCensusShape::Exact,
+                vec![u64::MAX],
+            );
+            let outcome =
+                index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
+            assert_ne!(
+                outcome,
+                super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+            );
+            assert_eq!(
+                index
+                    .claude_request_census
+                    .record_for_test(&fixture.key)
+                    .unwrap()
+                    .request_hashes_for_test()
+                    .len(),
+                cap
+            );
+            // Occupancy release also excludes this key, even above 90%.
+            assert_eq!(
+                index
+                    .retire_claude_transcript_records_for_test(40 * 86400)
+                    .0,
+                0
+            );
+            assert_eq!(
+                index.claude_request_census.totals_for_test(),
+                index.claude_request_census.recounted_for_test()
+            );
+        }
+    }
+
+    /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
+    #[test]
+    fn retained_same_key_rollback_restores_exact_custody_inside_tombstone_reserve() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        let whole = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+            - 1024 * 1024;
+        let padding = "x".repeat(3900);
+        let mut n = 0;
+        while index.claude_request_census.serialized_total_for_test() <= whole + 16384 {
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"b".repeat(64),
+                40 * 86400,
+                ClaudeRequestCensusShape::OverBudget,
+                vec![],
+            )
+            .with_modified_for_test(Some(40 * 86400));
+            assert_ne!(
+                index
+                    .claude_request_census
+                    .insert_for_test(&format!("reserve-{n:05}-{padding}"), record,),
+                super::super::claude_request_census::ClaudeRequestCensusInsert::Refused
+            );
+            n += 1;
+        }
+        let before = index
+            .claude_request_census
+            .get(&fixture.key)
+            .unwrap()
+            .clone();
+        let hashes = before.request_hashes_for_test().as_ptr();
+        let bytes = serde_json::to_vec(&before).unwrap();
+        let totals = index.claude_request_census.totals_for_test();
+        assert!(totals.1 > whole);
+        assert!(
+            totals.1
+                < super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+        );
+        let outcome = index.insert_transcript_record_for_test(
+            &fixture.key,
+            before.clone().with_request_hashes_for_test(vec![7, 8]),
+            40 * 86400,
+        );
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        let restored = index.claude_request_census.get(&fixture.key).unwrap();
+        assert_eq!(
+            serde_json::to_vec(restored).unwrap(),
+            bytes,
+            "exact old record"
+        );
+        assert_eq!(
+            restored.request_hashes_for_test().as_ptr(),
+            hashes,
+            "same shared hash buffer"
+        );
+        assert_eq!(index.claude_request_census.totals_for_test(), totals);
+        assert_eq!(index.claude_request_census.recounted_for_test(), totals);
+    }
+
+    /// [off=main] f3 off preserves v1 age and bytes.
+    #[test]
+    fn f3_off_preserves_v1_age_and_bytes() {
+        let fixture = Fixture::new();
+        let mut index = fixture.legacy_index();
+        fixture.grow();
+        let before = serde_json::to_vec(&index).unwrap();
+        assert!(!growth_active(&index));
+        let candidate = identified(&fixture, &index);
+        assert!(growth_read_admitted_at(
+            &mut index,
+            &candidate,
+            crate::transcript_acquisition::ReadMode::Full(
+                crate::transcript_acquisition::FullReason::StateMissing
+            ),
+            100,
+        ));
+        assert!(!revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root)
+        ));
+        assert_eq!(serde_json::to_vec(&index).unwrap(), before);
+        assert!(!serde_json::from_slice::<serde_json::Value>(&before)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("growth_retention"));
+        assert_eq!(serde_json::to_vec(&restart(&index)).unwrap(), before);
+        let mut census = ScanCensus::default();
+        let now = unix_seconds(SystemTime::now()).unwrap() + 40 * 86400;
+        // Main's #876 retains an indexed grown file across the window
+        // (DiscoveryRetention::owes_stamped / codex_fragment::grown); OFF
+        // selects it exactly as main does, without any v2 growth custody.
+        assert!(candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            fixture.pending(),
+            &mut census,
+            Some(now),
+            30,
+            // v2 growth follows the index (production derivation).
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+        )
+        .is_some());
+        assert!(reconcile_missing_index_entries_with_limit(&mut index, 1));
+        assert!(!index.files.contains_key(&fixture.key));
+    }
+
+    /// [money] f9 uncertainty alarms on fourth consecutive saved pass without dropping.
+    #[test]
+    fn f9_uncertainty_alarms_on_fourth_consecutive_saved_pass_without_dropping() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        let missing_root = fixture.root.join("not-configured");
+        for pass in 1..=4 {
+            index.generation = pass;
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                assert!(revalidate_growth(
+                    &mut index,
+                    &fixture.key,
+                    std::slice::from_ref(&missing_root)
+                ));
+                // Repeat in the same pass must not spend another uncertainty.
+                assert!(revalidate_growth(
+                    &mut index,
+                    &fixture.key,
+                    std::slice::from_ref(&missing_root)
+                ));
+            });
+            assert_eq!(
+                rows.iter()
+                    .any(|row| row["stage"] == "v2_growth_uncertain_alarm"),
+                pass == 4
+            );
+            assert!(index.files.contains_key(&fixture.key));
+            index = restart(&index);
+        }
+        assert_eq!(
+            index.v2().growth_retention[&fixture.key].uncertain_passes,
+            4
+        );
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        assert_eq!(
+            index.v2().growth_retention[&fixture.key].uncertain_passes,
+            0
+        );
+    }
+    /// [regress] N5: retirement revalidation persisted a growth row for every
+    /// unchanged aged candidate and rewrote debt rows every generation.
+    #[test]
+    fn retirement_revalidation_persists_no_check_only_rows() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            1
+        );
+        assert!(index.files.contains_key(&fixture.key));
+        assert!(!index.v2().growth_retention.contains_key(&fixture.key));
+        // A debt row records its checked status once, not every generation.
+        fixture.grow();
+        let roots = std::slice::from_ref(&fixture.root);
+        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        let checked = index.v2().growth_retention[&fixture.key].checked_generation;
+        assert!(checked.is_some());
+        index.generation += 1;
+        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        assert_eq!(
+            index.v2().growth_retention[&fixture.key].checked_generation,
+            checked
+        );
+    }
+
+    /// [money] f3 identity causes are not reclassified as retained growth.
+    #[test]
+    fn f3_identity_causes_are_not_reclassified_as_retained_growth() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            fixture.pending(),
+            &mut census,
+            None,
+            30,
+            // v2 growth follows the index (production derivation).
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+        )
+        .unwrap();
+        let (candidate, _) = open_and_identify_scan_candidate_at(
+            SnapshotSource::ClaudeCode,
+            candidate,
+            &mut census,
+            crate::snapshots::CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 30,
+                retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
+                growth: Some(&index.v2().growth_retention),
+            },
+        )
+        .unwrap();
+        for cause in [
+            FullReason::Replaced,
+            FullReason::Shrunk,
+            FullReason::HeadChanged,
+            FullReason::BoundaryChanged,
+            FullReason::SameSizeEdit,
+        ] {
+            assert!(growth_read_admitted(
+                &mut index,
+                &candidate,
+                ReadMode::Full(cause)
+            ));
+        }
+        assert!(growth_read_admitted(&mut index, &candidate, ReadMode::Tail));
+        assert!(
+            !growth_read_admitted(
+                &mut restart(&index),
+                &candidate,
+                ReadMode::Full(FullReason::StateMissing)
+            ),
+            "no restart allowance without a durable Full claim"
+        );
+    }
+
+    /// [money] f2 growth subset restores debt for unsettled file only.
+    #[test]
+    fn f2_growth_subset_restores_debt_for_unsettled_file_only() {
+        let fixture = Fixture::new();
+        let mut previous = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut previous,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        let mut working = previous.clone();
+        settle_growth(&mut working, &fixture.key);
+        let mut subset = restart(&working);
+        subset.v2_mut().growth_retention = growth_subset(&working, &previous, &BTreeSet::new());
+        assert!(restart(&subset).v2().growth_retention[&fixture.key]
+            .predecessor_size
+            .is_some());
+        assert!(
+            growth_subset(&working, &previous, &BTreeSet::from([fixture.key.clone()]))
+                .values()
+                .all(|state| state.predecessor_size.is_none())
+        );
+    }
+    fn identified(fixture: &Fixture, index: &ScanIndex) -> CandidateFile {
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            fixture.pending(),
+            &mut census,
+            None,
+            30,
+            // v2 growth follows the index (production derivation).
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+        )
+        .unwrap();
+        open_and_identify_scan_candidate_at(
+            SnapshotSource::ClaudeCode,
+            candidate,
+            &mut census,
+            crate::snapshots::CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 30,
+                retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
+                growth: Some(&index.v2().growth_retention),
+            },
+        )
+        .unwrap()
+        .0
+    }
+
+    /// [money] f3 growth full claim survives restart failure and subset save.
+    #[test]
+    fn f3_growth_full_claim_survives_restart_failure_and_subset_save() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        for reason in [
+            FullReason::StateMissing,
+            FullReason::InvalidCheckpoint,
+            FullReason::UnsupportedIdentity,
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.storage_path();
+            let mut initial = fixture.index();
+            fixture.grow();
+            revalidate_growth(
+                &mut initial,
+                &fixture.key,
+                std::slice::from_ref(&fixture.root),
+            );
+            fixture.persist(&initial);
+            let previous = ScanIndex::load(&path).unwrap();
+            let mut unrelated = ScanIndex::load(&path).unwrap();
+            let mut working = previous.clone();
+            let candidate = identified(&fixture, &working);
+            // The working page's progress/output is not committable yet.
+            working.files.get_mut(&fixture.key).unwrap().size_bytes = 999;
+            working
+                .files
+                .get_mut(&fixture.key)
+                .unwrap()
+                .last_snapshot_fingerprint = Some("d".repeat(64));
+            let now = 100_000;
+            assert!(growth_read_admitted_at(
+                &mut working,
+                &candidate,
+                ReadMode::Full(reason),
+                now
+            ));
+            // Simulate acquisition failure after admission. There is no refund:
+            // a restart before any outcome save must still see the claim.
+            fs::remove_file(&fixture.path).unwrap();
+            assert!(open_candidate_beneath_root(&candidate).is_err());
+            let mut resumed = ScanIndex::load(&path).unwrap();
+            assert_eq!(resumed.files[&fixture.key].size_bytes, 4);
+            assert_eq!(
+                resumed.v2().growth_retention[&fixture.key].last_growth_full_unix,
+                Some(now)
+            );
+            assert!(!growth_read_admitted_at(
+                &mut resumed,
+                &candidate,
+                ReadMode::Full(reason),
+                now + GROWTH_FULL_INTERVAL - 1
+            ));
+            assert!(!growth_read_admitted_at(
+                &mut resumed,
+                &candidate,
+                ReadMode::Full(reason),
+                now - 1
+            ));
+            assert!(
+                unrelated.save(&path).is_err(),
+                "independent stale loads still fail CAS"
+            );
+            // Subset publication restores the old file, never the spent claim.
+            let mut subset =
+                working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(subset.files[&fixture.key].size_bytes, 4);
+            subset.save(&path).unwrap();
+            assert!(
+                working.save(&path).is_err(),
+                "ordinary publication ends the old claim-only lineage"
+            );
+            let mut resumed = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                resumed.v2().growth_retention[&fixture.key].last_growth_full_unix,
+                Some(now)
+            );
+            assert!(!growth_read_admitted_at(
+                &mut resumed,
+                &candidate,
+                ReadMode::Full(reason),
+                now + 1
+            ));
+            assert!(growth_read_admitted_at(
+                &mut resumed,
+                &candidate,
+                ReadMode::Full(reason),
+                now + GROWTH_FULL_INTERVAL
+            ));
+            assert!(!growth_read_admitted_at(
+                &mut resumed,
+                &candidate,
+                ReadMode::Full(reason),
+                now + GROWTH_FULL_INTERVAL
+            ));
+            // Even a settled key keeps its clock if it grows again soon.
+            settle_growth(&mut resumed, &fixture.key);
+            assert_eq!(
+                resumed.v2().growth_retention[&fixture.key].last_growth_full_unix,
+                Some(now + GROWTH_FULL_INTERVAL)
+            );
+        }
+    }
+
+    /// [money] f3 growth full without durable index never reads.
+    #[test]
+    fn f3_growth_full_without_durable_index_never_reads() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        let candidate = identified(&fixture, &index);
+        // A graph without a load-lineage receipt cannot authorize acquisition.
+        index.v2_mut().growth_claim_context = None;
+        assert!(!growth_read_admitted_at(
+            &mut index,
+            &candidate,
+            ReadMode::Full(FullReason::StateMissing),
+            100
+        ));
+        assert_eq!(
+            index.v2().growth_retention[&fixture.key].last_growth_full_unix,
+            None
+        );
+    }
+
+    /// [money] f3 recent claim outlives removal until interval expires.
+    #[test]
+    fn f3_recent_claim_outlives_removal_until_interval_expires() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        index.v2_mut().growth_retention.insert(
+            fixture.key.clone(),
+            GrowthRetention {
+                last_growth_full_unix: Some(100),
+                ..Default::default()
+            },
+        );
+        index.files.clear();
+        prune_growth_retention(&mut index, 100 + GROWTH_FULL_INTERVAL - 1);
+        assert_eq!(
+            restart(&index).v2().growth_retention[&fixture.key].last_growth_full_unix,
+            Some(100)
+        );
+        prune_growth_retention(&mut index, 100 + GROWTH_FULL_INTERVAL);
+        assert!(index.v2().growth_retention.is_empty());
+    }
+    /// [money] f3 malformed growth claim stays held across codec round trips.
+    #[test]
+    fn f3_malformed_growth_claim_stays_held_across_codec_round_trips() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let fixture = Fixture::new();
+        let initial = fixture.index();
+        let candidate = identified(&fixture, &initial);
+        for bad in [
+            serde_json::json!({"last_growth_full_unix": "bad"}),
+            serde_json::json!({"last_growth_full_unix": "x".repeat(4097)}),
+        ] {
+            let mut seeded = initial.clone();
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            let charge = bytes.len() as u64 + 256;
+            seeded
+                .decode_holds
+                .v2_insert("growth_retention", fixture.key.clone(), bytes, None, charge)
+                .unwrap();
+            let mut decoded = restart_lenient(&seeded);
+            assert!(decoded
+                .decode_holds
+                .contains("growth_retention", &fixture.key));
+            assert!(!growth_read_admitted_at(
+                &mut decoded,
+                &candidate,
+                ReadMode::Full(FullReason::StateMissing),
+                100
+            ));
+            let raw = decoded
+                .decode_holds
+                .v2_entries()
+                .find(|(field, key, ..)| *field == "growth_retention" && *key == fixture.key)
+                .unwrap()
+                .2;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(raw).unwrap(),
+                bad
+            );
+            let decoded = restart_lenient(&decoded);
+            assert!(decoded
+                .decode_holds
+                .contains("growth_retention", &fixture.key));
+        }
+    }
+
+    /// [money] f3 failed claim save never authorizes full or spends memory only.
+    #[test]
+    fn f3_failed_claim_save_never_authorizes_full_or_spends_memory_only() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let fixture = Fixture::new();
+        let path = fixture.storage_path();
+        let mut index = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        fixture.persist(&index);
+        let mut stale = ScanIndex::load(&path).unwrap();
+        let candidate = identified(&fixture, &stale);
+        let mut newer = ScanIndex::load(&path).unwrap();
+        newer.save(&path).unwrap();
+        assert!(!growth_read_admitted_at(
+            &mut stale,
+            &candidate,
+            ReadMode::Full(FullReason::StateMissing),
+            100
+        ));
+        assert_eq!(
+            stale.v2().growth_retention[&fixture.key].last_growth_full_unix,
+            None
+        );
+        assert_eq!(
+            ScanIndex::load(&path).unwrap().v2().growth_retention[&fixture.key]
+                .last_growth_full_unix,
+            None
+        );
+    }
+    /// [money] f3 claim receipt rejects same generation checkpoint replacement.
+    #[test]
+    fn f3_claim_receipt_rejects_same_generation_checkpoint_replacement() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let fixture = Fixture::new();
+        let path = fixture.storage_path();
+        let mut initial = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut initial,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        fixture.persist(&initial);
+        let mut working = ScanIndex::load(&path).unwrap();
+        let candidate = identified(&fixture, &working);
+        assert!(growth_read_admitted_at(
+            &mut working,
+            &candidate,
+            ReadMode::Full(FullReason::StateMissing),
+            100
+        ));
+        let db_path = path.with_file_name(format!(
+            "{}.v2.sqlite",
+            path.file_name().unwrap().to_str().unwrap()
+        ));
+        let bytes = fs::read(&db_path).unwrap();
+        let replacement = fixture.root.join("replacement.sqlite");
+        fs::write(&replacement, &bytes).unwrap();
+        fs::rename(&replacement, &db_path).unwrap();
+        assert!(
+            working.save(&path).is_err(),
+            "same generation alone is not exact claim publication custody"
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), bytes);
+    }
 }

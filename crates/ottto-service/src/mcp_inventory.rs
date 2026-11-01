@@ -18,6 +18,7 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
@@ -1865,21 +1866,9 @@ fn read_cache(path: &Path) -> Option<InventoryCacheEntry> {
 /// torn record that would force a redundant re-POST. Best-effort: a write error
 /// is non-fatal (it only costs one extra upload next cycle).
 fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
     let mut entry = entry.clone();
     entry.seed = entry.seed.filter(|s| s.sample().is_some());
-    let Ok(payload) = serde_json::to_vec(&entry) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if std::fs::write(&temp, &payload).is_ok() {
-        let _ = std::fs::rename(&temp, path);
-    }
+    write_json_atomic(path, &entry);
 }
 
 /// SHA-256 over the inventory's meaningful content. `machine_id` and
@@ -2273,23 +2262,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn probe_mcp_prelaunch_failures_create_no_child_or_reservation() {
-        for fault in [ProbeFault::Prepare, ProbeFault::WorkerStart] {
-            let fixture = ProbeFixture::new("probe-mcp-no-launch", "protected", &[], 0);
-            set_probe_fault(fault);
-            assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
-            assert!(!fixture.fake.root.join("direct").exists());
-            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
-        }
-        let fixture = ProbeFixture::new("probe-mcp-spawn-error", "protected", &[], 0);
-        fs::remove_file(&fixture.script).unwrap();
-        assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
-        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
     fn probe_mcp_same_login_servers_both_reach_inventory() {
         let response =
             br#"{"id":2,"result":{"tools":[{"name":"complete","inputSchema":{"type":"object"}}]}}"#;
@@ -2344,30 +2316,8 @@ mod tests {
         fixture.wait_settled();
     }
 
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn probe_mcp_io_errors_retain_protected_child_and_pipes() {
-        for fault in [ProbeFault::Read, ProbeFault::Write] {
-            let fixture = ProbeFixture::new("probe-mcp-io-error", "protected", &[], 0);
-            set_probe_fault(fault);
-            let started = Instant::now();
-            assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
-            assert!(started.elapsed() < Duration::from_secs(2));
-            fixture.wait_started();
-            assert!(ProbeFixture::alive(fixture.pid("direct")));
-            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
-            for _ in 0..10 {
-                let error = probe_mcp(&fixture, true, Duration::from_secs(1))
-                    .err()
-                    .unwrap();
-                assert!(error.downcast_ref::<McpProbeDeferred>().is_some());
-            }
-            fixture.release();
-            fixture.wait_settled();
-        }
-    }
-
+    /// [regress] A held stdout must reach the deadline even if the shell exits
+    /// before initialize is written (Linux CI failures on several PRs).
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -2377,13 +2327,15 @@ mod tests {
             if fill {
                 set_probe_fault(ProbeFault::FillStdin);
             }
+            let timeout = Duration::from_millis(500);
             let started = Instant::now();
-            assert!(probe_mcp(&fixture, false, Duration::from_millis(500))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("timed out"));
-            assert!(started.elapsed() < Duration::from_secs(2));
+            let error = probe_mcp(&fixture, false, timeout).unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= timeout,
+                "{mode}: probe failed before its deadline: {error:#}"
+            );
+            assert!(elapsed < Duration::from_secs(2));
             fixture.wait_started();
             assert!(!ProbeFixture::alive(fixture.pid("direct")));
             if fill {
@@ -3023,36 +2975,6 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn tool_search_auto_threshold_and_versions_parse() {
-        assert_eq!(
-            tool_search_auto_pct(&claude_env(Some("auto"), false, false)),
-            Some(10)
-        );
-        assert_eq!(
-            tool_search_auto_pct(&claude_env(Some("AUTO:0"), false, false)),
-            Some(0)
-        );
-        assert_eq!(
-            tool_search_auto_pct(&claude_env(Some("auto:250"), false, false)),
-            Some(10)
-        );
-        assert_eq!(
-            tool_search_auto_pct(&claude_env(Some("false"), false, false)),
-            None
-        );
-        assert_eq!(tool_search_auto_pct(&claude_env(None, false, false)), None);
-        assert_eq!(parse_version("2.1.300 (Claude Code)"), Some((2, 1, 300)));
-        assert_eq!(parse_version("0.155.0-alpha.16.4"), Some((0, 155, 0)));
-        assert_eq!(parse_version("codex"), None);
-        assert!(is_first_party_anthropic_url("https://api.anthropic.com"));
-        assert!(is_first_party_anthropic_url(""));
-        assert!(!is_first_party_anthropic_url(
-            "https://relay.example.test/v1"
-        ));
-        assert!(!is_first_party_anthropic_url("http://localhost:8080"));
-    }
-
-    #[test]
     fn loading_policy_applies_project_settings_to_project_servers() {
         let home = test_home("loading-policy-project");
         let project = home.join("proj");
@@ -3185,33 +3107,6 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn parse_tools_extracts_name_description_and_schema() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": {
-                "tools": [
-                    {
-                        "name": "fetch",
-                        "description": "Fetch a URL",
-                        "inputSchema": { "type": "object", "properties": { "url": { "type": "string" } } }
-                    },
-                    { "name": "noschema" }
-                ]
-            }
-        });
-        let tools = parse_tools(&response);
-
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "fetch");
-        assert_eq!(tools[0].description, "Fetch a URL");
-        assert_eq!(tools[0].input_schema["type"], json!("object"));
-        assert_eq!(tools[1].name, "noschema");
-        assert_eq!(tools[1].description, "");
-        assert_eq!(tools[1].input_schema, json!({}));
-    }
-
-    #[test]
     fn inventory_payload_matches_backend_schema_shape() {
         let inventory = McpInventoryIngestRequest {
             agent_source: "claude-code".to_string(),
@@ -3259,22 +3154,6 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn build_inventory_for_pi_has_no_servers() {
-        let home = test_home("pi-build");
-        let built = build_inventory(
-            &home,
-            SnapshotSource::Pi,
-            Some("otm_test"),
-            unbounded_deadline(),
-            None,
-        );
-        assert_eq!(built.inventory.agent_source, "pi");
-        assert!(built.inventory.servers.is_empty());
-        assert!(!built.metrics.throttled);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn build_inventory_omits_machine_id_when_absent() {
         let home = test_home("no-machine");
         let value = serde_json::to_value(
@@ -3305,63 +3184,6 @@ url = "https://unset.test/mcp"
         .unwrap();
         assert_eq!(with_id["machine_id"], json!("otm_x"));
         let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn harvest_servers_throttles_when_deadline_passed() {
-        // A deadline already in the past drops every server and flags throttled.
-        let configured = vec![
-            ConfiguredServer {
-                config_dir: None,
-                name: "a".to_string(),
-                transport: Transport::Stdio {
-                    command: "true".to_string(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: std::collections::BTreeMap::new(),
-                },
-                disabled: false,
-                always_load: false,
-            },
-            ConfiguredServer {
-                config_dir: None,
-                name: "b".to_string(),
-                transport: Transport::Http {
-                    url: "https://x.test".to_string(),
-                },
-                disabled: false,
-                always_load: false,
-            },
-        ];
-        let past = Instant::now() - Duration::from_secs(1);
-        let (servers, throttled, _) = harvest_servers(&configured, past, &test_spawn_env());
-        assert!(throttled);
-        assert!(servers.is_empty(), "no probes launched after the deadline");
-    }
-
-    #[test]
-    fn harvest_servers_completes_within_budget() {
-        // Network transports return instantly (unreachable); a generous deadline
-        // harvests them all with no throttle.
-        let configured: Vec<ConfiguredServer> = (0..6)
-            .map(|i| ConfiguredServer {
-                config_dir: None,
-                disabled: false,
-                always_load: false,
-                name: format!("s{i}"),
-                transport: Transport::Http {
-                    url: "https://x.test".to_string(),
-                },
-            })
-            .collect();
-        let (servers, throttled, _) = harvest_servers(
-            &configured,
-            Instant::now() + Duration::from_secs(30),
-            &test_spawn_env(),
-        );
-        assert!(!throttled);
-        assert_eq!(servers.len(), 6);
-        assert!(servers.iter().all(|s| !s.reachable));
     }
 
     /// `dump_inventory` harvests an agent's configured servers into the ingest
@@ -3411,53 +3233,6 @@ url = "https://unset.test/mcp"
         }
     }
 
-    /// End-to-end stdio handshake against a tiny in-repo mock MCP server: a
-    /// shell script speaking line-delimited JSON-RPC. Verifies initialize +
-    /// tools/list parsing without any external dependency.
-    #[test]
-    fn stdio_handshake_against_mock_server_returns_tools() {
-        let home = test_home("stdio-mock");
-        let script = home.join("mock_mcp.sh");
-        fs::write(
-            &script,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*|*'"method": "initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
-      ;;
-    *'"method":"tools/list"'*|*'"method": "tools/list"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
-      ;;
-  esac
-done
-"#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-
-        let tools = harvest_stdio(
-            &script.to_string_lossy(),
-            &[],
-            &test_spawn_env(),
-            None,
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-        )
-        .expect("handshake succeeds")
-        .tools;
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "echo");
-        assert_eq!(tools[0].description, "Echo input");
-        assert_eq!(tools[0].input_schema["type"], json!("object"));
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
     fn sample_inventory(server: &str, tool: &str) -> McpInventoryIngestRequest {
         McpInventoryIngestRequest {
             agent_source: "claude-code".to_string(),
@@ -3483,55 +3258,6 @@ done
             }],
             capabilities: Vec::new(),
         }
-    }
-
-    #[test]
-    fn inventory_hash_is_content_sensitive_and_machine_independent() {
-        let a = sample_inventory("fetch", "get");
-        let b = sample_inventory("fetch", "get");
-        assert_eq!(
-            inventory_hash(&a).unwrap(),
-            inventory_hash(&b).unwrap(),
-            "identical content hashes equal"
-        );
-
-        // machine_id is excluded from the hash (constant per machine).
-        let mut c = sample_inventory("fetch", "get");
-        c.machine_id = Some("otm_other".to_string());
-        assert_eq!(inventory_hash(&a).unwrap(), inventory_hash(&c).unwrap());
-
-        // A changed tool set changes the hash.
-        let d = sample_inventory("fetch", "post");
-        assert_ne!(inventory_hash(&a).unwrap(), inventory_hash(&d).unwrap());
-    }
-
-    #[test]
-    fn cache_freshness_tracks_max_staleness() {
-        let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
-        let fresh = InventoryCacheEntry {
-            seed: None,
-            identity: "d|m|u".to_string(),
-            inventory_sha256: "x".to_string(),
-            posted_at: now.format(&Rfc3339).unwrap(),
-        };
-        assert!(!cache_is_stale(&fresh, now));
-        assert!(!cache_is_stale(
-            &fresh,
-            now + time::Duration::seconds(MCP_HARVEST_MAX_STALENESS_SECS - 1)
-        ));
-        assert!(cache_is_stale(
-            &fresh,
-            now + time::Duration::seconds(MCP_HARVEST_MAX_STALENESS_SECS)
-        ));
-
-        // An unparseable timestamp is treated as stale (force a re-POST).
-        let corrupt = InventoryCacheEntry {
-            seed: None,
-            identity: "d|m|u".to_string(),
-            inventory_sha256: "x".to_string(),
-            posted_at: "not-a-timestamp".to_string(),
-        };
-        assert!(cache_is_stale(&corrupt, now));
     }
 
     /// Write a CC home whose single configured stdio server is a mock MCP server

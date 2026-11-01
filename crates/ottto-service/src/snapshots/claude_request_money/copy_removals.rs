@@ -2,9 +2,10 @@
 //! file, the request hashes it once removed as copies on an earlier holder's
 //! CURRENT census proof, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
-//! restoring the prefix. A holder no longer indexed proves nothing: its group
-//! is ignored, and dropped at the file's next store. Local state (class L):
-//! never uploaded, never a wire field.
+//! restoring the prefix. A holder no longer indexed cannot disprove anything:
+//! its group stands, counted (`copy_removal_holder_absent_kept`, Lead B F5);
+//! only an indexed holder whose census lacks a hash reverts it. Local state
+//! (class L): never uploaded, never a wire field.
 //!
 //! Bounded by `MAX_BYTES` of charged state: 40 bytes per file, 32 per holder
 //! group and 8 per hash (about 520k hashes when dense; the encoded index text
@@ -60,6 +61,12 @@ impl CopyRemovals {
     pub(crate) fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+    /// Only an empty undamaged store is omitted from the index: an absent
+    /// field then reads back as exactly that (Lead B F4). Switch off keeps
+    /// the released bytes: an empty store is never written.
+    pub(crate) fn is_unwritten(&self) -> bool {
+        self.is_empty() && (!self.metadata_lost || !super::e2::resumed_prefix_enabled())
+    }
 
     /// The charged bytes held now (at most `MAX_BYTES`).
     #[cfg(test)]
@@ -67,7 +74,8 @@ impl CopyRemovals {
         self.bytes
     }
 
-    /// Absent or damaged metadata is uncertainty, never fresh ownership.
+    /// Damaged metadata is uncertainty, never fresh ownership; it is written
+    /// back even when empty. An absent field is an empty store (Lead B F4).
     pub(crate) fn missing() -> Self {
         Self {
             metadata_lost: true,
@@ -195,6 +203,61 @@ impl CopyRemovals {
             let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
             self.files.insert(at, (file, attempts, groups));
             self.bytes += bytes;
+        }
+    }
+
+    /// A proven physical move preserves removed-copy proofs and retry age.
+    /// Combining two existing entries cannot exceed their already admitted charge.
+    pub(in crate::snapshots) fn rekey(&mut self, from: LocationKey, to: LocationKey) {
+        if from == to {
+            return;
+        }
+        if let Ok(i) = self.files.binary_search_by_key(&from, |f| f.0) {
+            let (_, attempts, groups) = self.files.remove(i);
+            self.bytes -= charge(&groups).max(FILE_BYTES);
+            let mut merged = self
+                .get(to)
+                .iter()
+                .map(|(holder, hashes)| (*holder, hashes.iter().copied().collect::<BTreeSet<_>>()))
+                .collect::<BTreeMap<_, _>>();
+            for (holder, hashes) in &groups {
+                merged
+                    .entry(*holder)
+                    .or_default()
+                    .extend(hashes.iter().copied());
+            }
+            let attempts = self
+                .files
+                .binary_search_by_key(&to, |f| f.0)
+                .map_or(attempts, |j| attempts.max(self.files[j].1));
+            self.replace(
+                to,
+                attempts,
+                merged
+                    .into_iter()
+                    .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
+                    .collect(),
+            );
+        }
+        // The moved file may also be another copy's holder. Preserve that
+        // proof's indexed owner instead of letting retain_files orphan it.
+        for (_, _, groups) in &mut self.files {
+            if groups.binary_search_by_key(&from, |g| g.0).is_ok() {
+                let before = charge(groups);
+                let mut merged = groups
+                    .iter()
+                    .map(|(holder, hashes)| {
+                        (*holder, hashes.iter().copied().collect::<BTreeSet<_>>())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let hashes = merged.remove(&from).expect("known holder");
+                merged.entry(to).or_default().extend(hashes);
+                *groups = merged
+                    .into_iter()
+                    .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
+                    .collect();
+                self.bytes -= before - charge(groups);
+            }
         }
     }
 

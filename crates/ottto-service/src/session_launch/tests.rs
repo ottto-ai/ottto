@@ -750,3 +750,66 @@ fn codex_system_configuration_is_presence_refused() {
     fs::remove_file(path).unwrap();
     assert!(preflight::codex(&binding, &cwd, &system).is_ok());
 }
+
+#[test]
+fn claude_remote_settings_are_validated_not_presence_refused() {
+    let scratch = crate::test_scratch::ScratchDir::new("claude-remote-settings");
+    let home = scratch.as_ref().join("home");
+    let cwd = scratch.as_ref().join("project");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    let binding = fixture_binding(&home);
+    let path = home.join(".claude/remote-settings.json");
+    // Team and Enterprise logins cache organization settings in this file.
+    fs::write(&path, r#"{"channelsEnabled":false}"#).unwrap();
+    assert!(preflight::evaluate(&binding, &cwd).is_ok());
+    fs::write(&path, "{}").unwrap();
+    assert!(preflight::evaluate(&binding, &cwd).is_ok());
+    fs::write(&path, r#"{"forceLoginMethod":"console"}"#).unwrap();
+    let error = preflight::evaluate(&binding, &cwd).unwrap_err();
+    assert_eq!(error.reason, Reason::ForcedLoginMethod);
+    assert_eq!(
+        error.setting_layer,
+        Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
+    );
+}
+
+#[test]
+fn codex_app_preferences_are_read_for_managed_keys_only() {
+    let scratch = crate::test_scratch::ScratchDir::new("codex-user-preferences");
+    let home = scratch.as_ref().join("home");
+    let cwd = scratch.as_ref().join("project");
+    let system = scratch.as_ref().join("system-codex");
+    let preferences = home.join("Library/Preferences");
+    for path in [&preferences, &cwd, &system] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut binding = fixture_binding(&home);
+    binding.provider = Provider::Codex;
+    binding.claude_slot = None;
+    binding.root = home.join(".codex");
+    let path = preferences.join("com.openai.codex.plist");
+    // The Codex desktop app writes ordinary preferences to this domain.
+    let mut app = plist::Dictionary::new();
+    app.insert("SUHasLaunchedBefore".into(), plist::Value::Boolean(true));
+    plist::Value::Dictionary(app.clone())
+        .to_file_binary(&path)
+        .unwrap();
+    assert!(preflight::codex(&binding, &cwd, &system).is_ok());
+    for key in ["config_toml_base64", "requirements_toml_base64"] {
+        let mut managed = app.clone();
+        managed.insert(key.into(), plist::Value::String("synthetic".into()));
+        plist::Value::Dictionary(managed)
+            .to_file_xml(&path)
+            .unwrap();
+        let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+        assert_eq!(error.reason, Reason::ConfigUnsupported, "{key}");
+        assert_eq!(
+            error.setting_layer,
+            Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
+        );
+    }
+    fs::write(&path, "not a plist").unwrap();
+    let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+    assert_eq!(error.reason, Reason::SettingsMalformed);
+}

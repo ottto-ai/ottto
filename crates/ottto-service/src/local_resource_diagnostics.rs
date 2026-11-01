@@ -1,10 +1,103 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
-use serde::{ser::SerializeMap, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
+/// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
+/// test-only `observe` seam.
+macro_rules! lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [] $($field: $event),+);
+    };
+    (@core [$($hook:path)?] $($field:ident: $event:ident),+) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
+        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event { $($event),+ }
+        const COUNT: usize = [$(stringify!($field)),+].len();
+        // Fixed static instrumentation only: no owner/cache graph fields,
+        // allocations, additional locks, identifiers or retained history.
+        static TOTALS: [::std::sync::atomic::AtomicU64; COUNT] =
+            [const { ::std::sync::atomic::AtomicU64::new(0) }; COUNT];
+        impl Counts {
+            fn from_array(values: [u64; COUNT]) -> Self {
+                Self { $($field: values[Event::$event as usize]),+ }
+            }
+            fn totals() -> Self {
+                use ::std::sync::atomic::Ordering::Relaxed;
+                Self::from_array(::std::array::from_fn(|i| TOTALS[i].load(Relaxed)))
+            }
+            #[cfg(test)]
+            pub(super) fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
+        }
+        pub(crate) fn add(event: Event, amount: u64) {
+            use ::std::sync::atomic::Ordering::Relaxed;
+            $($hook(event, amount);)?
+            let _ = TOTALS[event as usize].fetch_update(Relaxed, Relaxed, |n| {
+                Some(n.saturating_add(amount))
+            });
+            #[cfg(test)]
+            TEST_EVENTS.with(|events| {
+                if let Some(mut values) = events.get() {
+                    values[event as usize] = values[event as usize].saturating_add(amount);
+                    events.set(Some(values));
+                }
+            });
+        }
+        pub(crate) fn record(event: Event) {
+            add(event, 1);
+        }
+        #[cfg(test)]
+        thread_local! {
+            static TEST_EVENTS: std::cell::Cell<Option<[u64; COUNT]>> = const { std::cell::Cell::new(None) };
+        }
+        /// Isolates assertions from concurrent fixtures without resetting or
+        /// changing the production process totals. No production observer or callback.
+        #[cfg(test)]
+        pub(crate) fn observe<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+            struct Reset(Option<[u64; COUNT]>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    TEST_EVENTS.with(|events| events.set(self.0));
+                }
+            }
+            let reset = Reset(TEST_EVENTS.with(|events| events.replace(Some([0; COUNT]))));
+            let value = f();
+            let counts = TEST_EVENTS.with(|events| Counts::from_array(events.get().unwrap()));
+            drop(reset);
+            (value, counts)
+        }
+    };
+}
+/// `lifetime_counters!` plus `Sparse` and `Counts::{add, merge, is_empty}`;
+/// each `add` first feeds `claude_reread::cache_event` (cache_lifecycle).
+macro_rules! sparse_lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [super::claude_reread::cache_event] $($field: $event),+);
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl ::serde::Serialize for Sparse {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use ::serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
+        impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
+        }
+    };
+}
 
 pub(crate) mod cache_lifecycle;
 pub(crate) mod claude_absence;
@@ -16,10 +109,10 @@ mod footprint;
 pub(crate) mod rearm_cause;
 
 #[cfg(not(test))]
-static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = const { [const { AtomicU64::new(0) }; 8] };
 }
 
 /// Append-only reason labels, cumulative per process (not distinct sessions).
@@ -27,17 +120,20 @@ thread_local! {
 pub(crate) fn claude_identity_over_cap(
     reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
     item_bytes: usize,
+    components: Option<&ClaudeIdentityOverCapBytes>,
 ) {
     use crate::snapshots::claude_request_identity::OverCap;
-    const LABELS: [&str; 6] = [
+    const LABELS: [&str; 8] = [
         "evidence_entries",
         "authority_keys",
         "parts_per_row",
         "parts_per_item",
         "rows",
         "bytes",
+        "near_cap",
+        "identity_over_cap_held",
     ];
-    let record = |counters: &[AtomicU64; 6]| {
+    let record = |counters: &[AtomicU64; 8]| {
         for reason in reasons {
             let index = match reason {
                 OverCap::EvidenceEntries => 0,
@@ -46,13 +142,18 @@ pub(crate) fn claude_identity_over_cap(
                 OverCap::PartsPerItem => 3,
                 OverCap::Rows => 4,
                 OverCap::Bytes => 5,
+                OverCap::NearCap => 6,
+                OverCap::IdentityHeld => 7,
             };
             let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
         #[derive(Serialize)]
-        struct Counts {
+        struct Counts<'a> {
             claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
             claude_request_identity_last_over_cap_item_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_request_identity_last_over_cap_components:
+                Option<&'a ClaudeIdentityOverCapBytes>,
         }
         traversal_point(
             "claude_request_identity_over_cap",
@@ -61,8 +162,12 @@ pub(crate) fn claude_identity_over_cap(
                 claude_request_identity_over_cap: LABELS
                     .into_iter()
                     .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .filter(|(label, count)| {
+                        !matches!(*label, "near_cap" | "identity_over_cap_held") || *count != 0
+                    })
                     .collect(),
                 claude_request_identity_last_over_cap_item_bytes: item_bytes,
+                claude_request_identity_last_over_cap_components: components,
             },
         );
     };
@@ -70,6 +175,21 @@ pub(crate) fn claude_identity_over_cap(
     CLAUDE_IDENTITY_OVER_CAP.with(record);
     #[cfg(not(test))]
     record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
+/// Wire bytes of the last over-cap tagged body by component, measured before
+/// its display leaves are shed; `after_shed` is what the tag selector then
+/// sees. Counts and an 8-hex entity digest only.
+#[derive(Serialize)]
+pub(crate) struct ClaudeIdentityOverCapBytes {
+    pub(crate) entity: String,
+    pub(crate) item: usize,
+    pub(crate) context_curve: usize,
+    pub(crate) cache_observations: usize,
+    pub(crate) identity: usize,
+    pub(crate) usage_buckets: usize,
+    pub(crate) rest: usize,
+    pub(crate) after_shed: usize,
 }
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
@@ -169,7 +289,7 @@ struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_hits: u64,
 }
-fn is_zero(value: &u64) -> bool {
+pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 #[cfg(not(test))]
@@ -219,6 +339,57 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub boundary_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_signature_clear_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_trace_row_limit_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_ref_refusals: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub inventory_hold_keys_discarded: u64,
+}
+impl CapCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    pub(crate) fn drain(&mut self, source: &str) -> Self {
+        for (event, total) in [
+            &mut self.boundary_overflow_events,
+            &mut self.bootstrap_overflow_events,
+            &mut self.parent_signature_clear_events,
+            &mut self.price_trace_row_limit_hits,
+            &mut self.parent_ref_refusals,
+            &mut self.inventory_hold_keys_discarded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *total = total.saturating_add(source_count(source, CAP_EVENT_START + event, |n| {
+                n.swap(0, Relaxed)
+            }));
+        }
+        if !self.is_empty() {
+            traversal_point("scan_cap_events", source, self);
+        }
+        *self
+    }
+    pub(crate) fn record(source: &str, event: usize, amount: u64) {
+        source_count(source, CAP_EVENT_START + event, |slot| {
+            slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
@@ -234,14 +405,22 @@ pub(crate) struct LineDeliveryCounts {
 pub(crate) enum UnselectedReason {
     Age,
     Size,
+    /// The subset of size skips whose key holds a withheld-account revision.
+    WithheldOversized,
+    /// F4 kept custody because another same-member path prevents absence proof.
+    WithheldAbsenceAmbiguous = 18,
 }
-/// Claude, Codex, Pi x (age, size, serial fallback causes), drained by that
-/// source's page line. Diagnostics only; never carried in a scan/frame graph.
+const CAP_EVENT_START: usize = 19;
+const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
+const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
+/// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
-static SOURCE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
 #[cfg(test)]
 thread_local! {
-    static SOURCE_COUNTS: [AtomicU64; 12] = const { [const { AtomicU64::new(0) }; 12] };
+    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -250,11 +429,11 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     };
     #[cfg(test)]
     {
-        SOURCE_COUNTS.with(|slots| f(&slots[4 * slot + reason]))
+        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&SOURCE_COUNTS[4 * slot + reason])
+        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
@@ -263,20 +442,99 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
 pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
-    source_count(source, 2 + usize::from(layout_supported), |slot| {
+    source_count(source, 16 + usize::from(layout_supported), |slot| {
         slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
             .unwrap_or_else(|n| n)
     });
 }
 
-// Same public seam as E3/#876. Its merged withheld carrier can keep this
-// signature; this branch emits the count on the existing diagnostics carrier.
+/// A vanished file's index entry was retired while its parsed body was not
+/// ACKed; nothing holds or resends that body. `usage` is the resident
+/// reduction's `(requests, tokens)`; `None` (no copy in RAM, or Claude
+/// responses not yet folded) counts in `totals_unknown_files`, so
+/// `requests`/`tokens` are at least. Counted after
+/// the retirement; never a gate.
+pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u64)>) {
+    let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
+    for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
+        source_count(source, UNACKED_LOST_START + slot, |n| {
+            n.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+const UNACKED_LOST: [(&str, usize); 4] = [
+    ("files", UNACKED_LOST_START),
+    ("requests", UNACKED_LOST_START + 1),
+    ("tokens", UNACKED_LOST_START + 2),
+    ("totals_unknown_files", UNACKED_LOST_START + 3),
+];
+
+/// E3: Claude withheld-account hold events, in the slots after the reasons.
+#[derive(Clone, Copy)]
+pub(crate) enum WithheldEvent {
+    /// A held key's file was proved absent and its hold released.
+    ReleasedDeleted = 3,
+    /// A held key re-parsed: first time in this process, after an account
+    /// evidence change, or after its transcript stamp changed.
+    ReparseStart,
+    ReparseEvidence,
+    ReparseGrowth,
+    /// A parse resolved the account and released the hold.
+    ReleasedResolved,
+    /// A withheld key past the hold cap left unrecorded, and its withheld tokens.
+    UnrecordedEvents,
+    UnrecordedTokens,
+    ReleasedDeletedTokens = 11,
+    BirthClampAccepted = 15,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
+    source_count("claude_code", event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
+    slots
+        .iter()
+        .map(|&(key, slot)| (key, source_count(source, slot, |n| n.swap(0, Relaxed))))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
 pub(crate) fn audit_retired_absent(source: &str) {
-    traversal_point(
-        "audit_retired_absent",
-        source,
-        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
-    );
+    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One aged gate retained a grown indexed file (not a unique-file count).
+pub(crate) fn discovery_retained_grown(source: &str) {
+    source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
+pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
+    source_count("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    source_count("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
+}
+/// Post-save fate and current estimated age of this page's observed growth.
+pub(crate) fn discovery_growth_fate(
+    source: &str,
+    counts: &crate::snapshots::discovery_growth::Counts,
+) {
+    traversal_point("discovery_growth_fate", source, counts);
+}
+const WITHHELD_RELEASED: [(&str, usize); 3] =
+    [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
+const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
+const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
+#[cfg(test)]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn take_withheld() -> [BTreeMap<&'static str, u64>; 3] {
+        let claude = "claude_code";
+        [
+            drain(claude, &WITHHELD_RELEASED),
+            drain(claude, &WITHHELD_REPARSE),
+            drain(claude, &WITHHELD_UNRECORDED),
+        ]
+    }
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -477,13 +735,13 @@ fn process_sample() -> Option<ProcessSample> {
 
 #[derive(Debug)]
 pub(crate) struct Probe {
+    withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
-    #[cfg(feature = "replay-harness")]
-    index_reuse_skips: std::cell::Cell<u64>,
+    pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -491,6 +749,16 @@ impl Drop for Probe {
     }
 }
 impl Probe {
+    pub(crate) fn set_withheld_memo(&mut self, memo: crate::snapshots::withheld_account::Memo) {
+        self.withheld_memo = Some(memo);
+    }
+    pub(crate) fn with_withheld_memo(
+        mut self,
+        memo: crate::snapshots::withheld_account::Memo,
+    ) -> Self {
+        self.set_withheld_memo(memo);
+        self
+    }
     pub(crate) fn rearm_full_selected(
         &self,
         key: &str,
@@ -506,18 +774,32 @@ impl Probe {
     ) {
         rearm_cause::completed(self.started, key, mode, bytes);
     }
+    pub(crate) fn full_parse_reason(
+        &self,
+        mode: crate::transcript_acquisition::ReadMode,
+        reason: Option<crate::snapshots::CandidateParseReason>,
+        count: u64,
+        native_bytes: u64,
+    ) {
+        if let (crate::transcript_acquisition::ReadMode::Full(_), Some(reason)) = (mode, reason) {
+            rearm_cause::record_parse_reason(self.started, reason, count, native_bytes);
+        }
+    }
+    pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
+        rearm_cause::full_by_parse_reason(self.started)
+    }
     pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
         rearm_cause::page(self.started)
     }
     pub(crate) fn start() -> Self {
         Self {
+            withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: std::cell::Cell::new(0),
+            discovery_growth: Default::default(),
         }
     }
     fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
@@ -525,11 +807,6 @@ impl Probe {
         observation.footprint =
             footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
         observation
-    }
-    #[cfg(feature = "replay-harness")]
-    pub(crate) fn index_reuse_skip(&self) {
-        self.index_reuse_skips
-            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -552,8 +829,6 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -569,30 +844,69 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            audit_retired_absent: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            discovery_retained: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_reparse: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_birth_clamp_accepted: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(flatten)]
+            withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
-            line_delivery_unselected: [("age", 0), ("size", 1)]
-                .into_iter()
-                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
-            source_rotation_serial_fallback: [("unsupported_layout", 2), ("bound_refused", 3)]
-                .into_iter()
-                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
+            line_delivery_unselected: drain(
+                source,
+                &[
+                    ("age", 0),
+                    ("size", 1),
+                    ("withheld_oversized", 2),
+                    ("withheld_absence_ambiguous", 18),
+                ],
+            ),
+            audit_retired_absent: drain(source, &[("events", 12)]),
+            discovery_retained: drain(source, &[("grown", 10)]),
+            codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
+            withheld_hold_released: drain(source, &WITHHELD_RELEASED),
+            withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
+            withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
+            withheld_memo: claude
+                .then(|| self.withheld_memo.as_ref().and_then(|memo| memo.census()))
+                .flatten(),
+            withheld_held: claude
+                .then(|| {
+                    self.withheld_memo
+                        .as_ref()
+                        .and_then(|memo| memo.held_gauge())
+                })
+                .flatten(),
+            source_rotation_serial_fallback: drain(
+                source,
+                &[("unsupported_layout", 16), ("bound_refused", 17)],
+            ),
+            unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
-                Default::default()
+                self.page_events.with_current().retained_cache_only()
             },
             collection: counts,
             pending,
@@ -666,7 +980,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for Probe {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(
             &self.full_causes.restore_outcome.miss,
             c,
-        )
+        )?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)
     }
 }
 
@@ -703,10 +1018,17 @@ impl Observation {
 
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
-pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+pub(crate) fn source_prepare<T>(
+    source: &str,
+    inner: impl FnOnce() -> T,
+    v2_active: impl FnOnce(&T) -> bool,
+) -> T {
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
+    if source == "claude_code" && v2_active(&result) {
+        crate::snapshots::state_v2_prepare_observed();
+    }
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -722,11 +1044,20 @@ pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
+    v2_active: bool,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
+    let v2_active = source == "claude_code" && v2_active;
+    let v2_window = v2_active
+        .then(crate::snapshots::state_v2_finish_window)
+        .flatten();
     let result = inner();
+    drop(v2_window);
+    if v2_active {
+        crate::snapshots::state_v2_post_pass_observed();
+    }
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -1017,6 +1348,11 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
+/// State-v2 backend observations use the existing local-only #799 sink.
+/// Callers supply counts, lengths and bounded states, never storage keys.
+pub(crate) fn claude_state_v2(counts: &impl Serialize) {
+    traversal_point("claude_state_v2", "claude_code", counts);
+}
 /// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
@@ -1164,12 +1500,7 @@ impl NativeDecision {
         );
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; NativeDecision);
 
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
@@ -1397,12 +1728,7 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
 
 /// Existing audit point, using already computed final/previous fingerprints.
 /// Additive aliases retain their meaning; neither comparison is an audit-policy
@@ -1447,6 +1773,8 @@ pub(crate) fn sampled_audit_comparison(
 pub(crate) struct PageEvents {
     #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
     pub(crate) full_cause: rearm_cause::Counts,
+    #[serde(skip_serializing_if = "claude_reread::FullByParseReason::is_empty")]
+    pub(crate) full_by_parse_reason: claude_reread::FullByParseReason,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
     pub(crate) audits_started: usize,
@@ -1558,7 +1886,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
-        #[cfg(any(test, feature = "replay-harness"))]
+        #[cfg(test)]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1578,11 +1906,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {
@@ -1871,6 +2199,7 @@ mod tests {
             },
             page_events: PageEvents {
                 full_cause: Default::default(),
+                full_by_parse_reason: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,
@@ -2101,9 +2430,11 @@ mod tests {
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
-                source_prepare(source, || {
-                    source_finish(source, || Ok::<_, anyhow::Error>(17))
-                })
+                source_prepare(
+                    source,
+                    || source_finish(source, false, || Ok::<_, anyhow::Error>(17)),
+                    |_| false,
+                )
             });
             assert_eq!(result.unwrap(), 17);
             assert_eq!(records.len(), 2);
@@ -2146,7 +2477,7 @@ mod tests {
         let value = Box::new(17);
         let original = std::ptr::from_ref(value.as_ref());
         let (result, records) = capture(|| {
-            source_finish("claude_code", || {
+            source_finish("claude_code", false, || {
                 let mut upload = UploadCall::start("claude_code");
                 upload.serialized(20);
                 upload.attempt(20, false);
@@ -2185,7 +2516,7 @@ mod tests {
         let error =
             anyhow::Error::new(OriginalError(identity.clone())).context("synthetic context");
         let original_chain: Vec<_> = error.chain().map(ToString::to_string).collect();
-        let (result, records) = capture(|| source_finish::<()>("codex", || Err(error)));
+        let (result, records) = capture(|| source_finish::<()>("codex", false, || Err(error)));
         let returned = result.unwrap_err();
         assert_eq!(
             returned
@@ -2208,7 +2539,7 @@ mod tests {
         let original = payload.clone();
         let (result, records) = capture(|| {
             std::panic::catch_unwind(|| {
-                source_finish::<()>("pi", || std::panic::panic_any(payload))
+                source_finish::<()>("pi", false, || std::panic::panic_any(payload))
             })
         });
         let panic = result.unwrap_err();
@@ -2217,6 +2548,53 @@ mod tests {
             &original
         ));
         assert!(records.is_empty());
+    }
+
+    /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.
+    #[test]
+    fn full_parse_reasons_are_sparse_page_local_counts_and_completed_bytes() {
+        use crate::snapshots::CandidateParseReason::{Rearmed, TranscriptChanged};
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            let full = ReadMode::Full(FullReason::StateMissing);
+            for (mode, reason, bytes) in [
+                (full, Some(Rearmed), 123),
+                (full, Some(TranscriptChanged), 456),
+                (ReadMode::Tail, Some(Rearmed), 999),
+                (ReadMode::Unchanged, Some(Rearmed), 999),
+                (full, None, 999),
+            ] {
+                probe.full_parse_reason(mode, reason, 1, 0);
+                probe.full_parse_reason(mode, reason, 0, bytes);
+            }
+            // A selected Full that has not completed contributes no bytes.
+            probe.full_parse_reason(full, Some(Rearmed), 1, 0);
+            for probe in [probe, Probe::start()] {
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                probe.collection(
+                    "claude_code",
+                    CollectionCounts {
+                        scanned_files: 6,
+                        semantic_noops: 0,
+                        sampled_acquisition: Some(reads),
+                        full_causes: Default::default(),
+                    },
+                );
+            }
+        });
+        assert_eq!(rows[0]["stage"], "native_collection_page");
+        assert_eq!(
+            rows[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+            serde_json::json!({
+                "rearmed": {"count": 2, "completed_native_bytes": 123},
+                "transcript_changed": {"count": 1, "completed_native_bytes": 456},
+            })
+        );
+        assert!(rows[1]["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_by_parse_reason")
+            .is_none());
     }
 
     #[test]
@@ -2236,6 +2614,12 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
+            // Another source's page: its retained-cache events and nothing else.
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
             probe.collection(
                 "codex",
                 CollectionCounts {
@@ -2258,9 +2642,10 @@ mod tests {
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
-        assert!(rows[1]["counts"]
-            .get("retained_cache_page_events")
-            .is_none());
+        assert_eq!(
+            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
         assert_eq!(rows[2]["stage"], "native_comparison_decision");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
@@ -2526,7 +2911,7 @@ mod tests {
             let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
                 for _ in 0..ITERATIONS {
                     if stage == "source_finish" {
-                        source_finish("claude_code", || Ok(())).unwrap();
+                        source_finish("claude_code", false, || Ok(())).unwrap();
                     } else {
                         Probe::start().collection(
                             "claude_code",
@@ -2619,7 +3004,7 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
-            source_finish("secret/path/provider", || Ok(())).unwrap();
+            source_finish("secret/path/provider", false, || Ok(())).unwrap();
             let mut upload = UploadCall::start("secret/path/provider");
             upload.serialized(1000);
             upload.attempt(100, true);
@@ -2678,6 +3063,7 @@ mod continuation_tests {
             "groups_completed",
             "no_remaining",
             "over_bound",
+            "not_mintable",
         ];
         let (_, rows) = super::capture(|| {
             for outcome in outcomes {
@@ -2828,7 +3214,8 @@ pub(crate) fn scan_index_repair_required(
     source: &str,
     cause: crate::snapshots::scan_index_health::RepairCause,
 ) {
-    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
+        [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
     let count = TOTALS[cause as usize]
         .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
@@ -2842,4 +3229,76 @@ pub(crate) fn scan_index_repair_required(
             },
         }),
     );
+}
+
+/// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
+/// can contribute. Peaks are 50-ms observations, not hard memory bounds.
+pub(crate) struct StateV2Probe {
+    footprint: Option<footprint::Stage>,
+    cpu: Option<ProcessSample>,
+}
+impl StateV2Probe {
+    pub(crate) fn begin() -> Self {
+        Self {
+            footprint: footprint::Stage::begin(),
+            cpu: process_sample(),
+        }
+    }
+    pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
+        self.footprint
+            .as_ref()
+            .map(|s| s.finish().memory())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn finish(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let (steady, peak) = self
+            .footprint
+            .as_ref()
+            .map(|s| {
+                let (end, peak) = s.finish().memory();
+                (end.rss_bytes, peak.rss_bytes)
+            })
+            .unwrap_or_default();
+        (
+            self.cpu
+                .zip(process_sample())
+                .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+            steady,
+            peak,
+        )
+    }
+}
+
+/// V2 growth counters use the existing local #799 row. No keys or paths.
+pub(crate) fn v2_growth_retained(bytes: u64) {
+    claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
+}
+pub(crate) fn v2_growth_revalidate(uncertain: bool) {
+    claude_state_v2(
+        &serde_json::json!({"v2_growth_revalidate": {"stats": 1, "uncertain": u64::from(uncertain)}}),
+    );
+}
+pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
+    traversal_point(
+        "v2_growth_uncertain_alarm",
+        "claude_code",
+        &serde_json::json!({"consecutive_passes": passes}),
+    );
+}
+pub(crate) fn census_retire_skipped_grown() {
+    claude_state_v2(&serde_json::json!({"census_retire_skipped_grown": 1}));
+}
+
+/// Current process memory, not lifetime ru_maxrss. Unavailable is never zero.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct StateV2Memory {
+    pub(crate) rss_bytes: Option<u64>,
+    pub(crate) phys_footprint_bytes: Option<u64>,
+}
+pub(crate) fn state_v2_memory() -> StateV2Memory {
+    footprint::current()
+}
+pub(crate) fn state_v2_cpu_us() -> Option<u64> {
+    process_sample().map(|p| p.cpu_us)
 }

@@ -1,0 +1,73 @@
+name: Rust setup
+description: Pinned Rust toolchain, compiler receipt and optional cargo cache for the Rust CI jobs.
+
+inputs:
+  components:
+    description: Space-separated rustup components to install
+    default: ""
+  linux-test-env:
+    description: '"true" on Linux test jobs: system packages and a private, symlinked TMPDIR like macOS'
+    default: "false"
+  cache-key:
+    description: Swatinem/rust-cache shared-key; empty skips the cache
+    default: ""
+  cache-save:
+    description: rust-cache save-if
+    default: "false"
+  cache-bin:
+    description: rust-cache cache-bin
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # rusqlite links the system SQLite; command-environment tests probe zsh.
+    - name: Install system packages
+      if: inputs.linux-test-env == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
+
+    # Credential-path checks reject group/world-writable ancestors such as
+    # /tmp (1777). macOS hands each user a private TMPDIR; mirror that.
+    # macOS TMPDIR also sits under a symlink (/var -> /private/var), and
+    # code that refuses symlinked ancestors fails only there; mirror it too.
+    - name: Private temp directory
+      if: inputs.linux-test-env == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        install -d -m 0700 "$RUNNER_TEMP/private/var/tmp"
+        ln -s private/var "$RUNNER_TEMP/var"
+        echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
+
+    # The one place CI pins Rust. Layout-sensitive tests run only on compilers
+    # validated in crates/ottto-service/src/heap_layout_bound.rs.
+    - name: Install pinned Rust toolchain
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -eo pipefail
+        toolchain=1.95.0
+        echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+        set --
+        for component in $COMPONENTS; do set -- "$@" --component "$component"; done
+        rustup toolchain install "$toolchain" --profile minimal "$@"
+
+    - name: Compiler receipt
+      shell: bash
+      run: rustc -Vv && cargo -V
+
+    - name: Rust cache
+      if: inputs.cache-key != ''
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        workspaces: |
+          . -> target
+          crates -> target
+        save-if: ${{ inputs.cache-save }}
+        cache-bin: ${{ inputs.cache-bin }}

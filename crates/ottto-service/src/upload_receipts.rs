@@ -1114,6 +1114,7 @@ mod tests {
 
     fn response(raw_id: &str) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 1,
             session_ids: Vec::new(),
@@ -1140,7 +1141,6 @@ mod tests {
 
     fn proof_request(source: &str, cache: bool) -> SnapshotBatchRequest {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
         if !cache {
             item.cache_observations = None;
             item.cache_observations_state = None;

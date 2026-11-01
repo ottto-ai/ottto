@@ -67,9 +67,11 @@
 //! `read_state`, then `load_or_create_control_token`), so the pass adds no
 //! new kind of startup hang.
 
+use crate::locked_state_dir::FileLock;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::ffi::{CStr, CString, OsStr};
+use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -893,17 +895,6 @@ fn list_dir(dir: &OwnedFd, cap: usize, out_of_time: &mut dyn FnMut() -> bool) ->
     }
 }
 
-/// An exclusive flock on an existing checkpoint lock file, released on drop.
-struct HeldLock(OwnedFd);
-
-impl Drop for HeldLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
 enum LockFailure {
     Skip(SkipReason),
     Error,
@@ -1334,7 +1325,7 @@ impl Sweep<'_> {
         dir: RawFd,
         name: &CStr,
         expected: &Identity,
-    ) -> std::result::Result<HeldLock, LockFailure> {
+    ) -> std::result::Result<FileLock, LockFailure> {
         let fd = match open_at(
             dir,
             name,
@@ -1358,15 +1349,13 @@ impl Sweep<'_> {
             Ok(_) => return Err(LockFailure::Skip(SkipReason::Changed)),
             Err(_) => return Err(LockFailure::Error),
         }
-        if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        FileLock::try_exclusive(File::from(fd)).map_err(|error| {
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 LockFailure::Skip(SkipReason::Locked)
             } else {
                 LockFailure::Error
-            });
-        }
-        Ok(HeldLock(fd))
+            }
+        })
     }
 
     /// The newest of every timestamp, including one recorded in the name,

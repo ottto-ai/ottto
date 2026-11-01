@@ -24,8 +24,12 @@ impl E2ScanFixture {
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
     /// fixtures retain their historical capture-off scope and bytes.
     pub(crate) fn capturing_identity() -> Self {
+        Self::with_identity_capture(true)
+    }
+
+    pub(crate) fn with_identity_capture(capture_claude_identity: bool) -> Self {
         Self {
-            capture_claude_identity: true,
+            capture_claude_identity,
             ..Self::default()
         }
     }
@@ -82,9 +86,6 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_scan(roots, support, index, limit, sampled, births, hints);
-        }
         self.observed.lock().unwrap().clear();
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
@@ -97,56 +98,7 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
-            true,
             self.capture_claude_identity,
-        );
-        if sampled {
-            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
-            scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
-        }
-        // The same synthetic root births reach the page's staged twin probes,
-        // which read metadata before the file is opened for parse.
-        let staged = births
-            .iter()
-            .filter(|(path, _)| {
-                claude_index_path_member_ref(path)
-                    .is_some_and(|member| member.subagent_stem.is_none())
-            })
-            .filter_map(|(path, birth)| Some((local_index_key(path), u64::try_from(*birth).ok()?)))
-            .collect();
-        claude_history_upgrade::with_staged_births_for_test(staged, || self.drive(scan, births))
-    }
-
-    #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
-    pub(crate) fn terminal_off_on_scan(
-        &self,
-        roots: &[PathBuf],
-        support: &Path,
-        index: ScanIndex,
-        limit: usize,
-        sampled: bool,
-        births: &BTreeMap<PathBuf, i128>,
-        hints: &[PathBuf],
-    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-        self.observed.lock().unwrap().clear();
-        let relist = hints.is_empty() && index.scan_traversal_exhausted_for_test();
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
-            SnapshotSource::ClaudeCode,
-            roots,
-            index,
-            "2026-08-02T08:00:00Z",
-            183,
-            limit,
-            false,
-            Some(support),
-            hints,
-            // These fixtures explicitly request re-lists at a frozen clock.
-            // Model the production metadata-rediscovery event; a retained
-            // traversal cannot infer a new walk from an identical timestamp.
-            // This changes discovery only, never terminal/proof authority.
-            relist,
-            true,
-            CLAUDE_IDENTITY_CAPTURE,
         );
         if sampled {
             let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
@@ -185,7 +137,6 @@ impl E2ScanFixture {
             Some(support),
             &[],
             false,
-            true,
         );
         if sampled {
             let (scope, _) = durable_binding(source);
@@ -240,13 +191,6 @@ impl E2ScanFixture {
     }
 }
 
-pub(crate) fn without_money_folds(scan: &mut SourceScanResult) {
-    // Publication reference: the legacy caller has no E2 fold carrier.
-    for item in &mut scan.snapshots {
-        item.claude_money = None;
-    }
-}
-
 pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_money_birth_store).unwrap()
 }
@@ -281,7 +225,80 @@ pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) 
     index.upload_context_fingerprint = Some(context.into());
 }
 
-/// Read the actual runtime context for the exact-ACK fixture bridge.
-pub(crate) fn active_upload_context(index: &ScanIndex) -> Option<&str> {
-    index.active_upload_context_fingerprint.as_deref()
+/// Install the real exclusion input used by ordinary-money fixture families.
+/// An empty slice adopts request-owned money on the next normal source pass.
+pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
+    use sha2::Digest;
+    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines = sessions
+        .iter()
+        .map(|session| format!("{:x}\n", sha2::Sha256::digest(session.as_bytes())))
+        .collect::<String>();
+    fs::write(path, lines).unwrap();
+}
+
+/// A real fail-closed exclusion-list result, scoped to this fixture index.
+pub(crate) fn ordinary_index(mut index: ScanIndex) -> ScanIndex {
+    index.claude_reemission_exclusions = claude_reemission_exclusions::ReemissionExclusions::parse(
+        b"malformed synthetic exclusion input",
+    );
+    index
+}
+
+/// Ordinary-money parser fixture through the existing native parser and real
+/// paused-adoption input. No alternate resolver or money builder.
+pub(crate) fn parse_ordinary(
+    path: &Path,
+    at: &str,
+    fingerprint: String,
+) -> Result<Vec<SnapshotItem>> {
+    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default(), true)
+}
+
+pub(super) fn parse_ordinary_with_metadata(
+    path: &Path,
+    at: &str,
+    fingerprint: String,
+    metadata: &ClaudeTitleMetadata,
+    artifacts: bool,
+) -> Result<Vec<SnapshotItem>> {
+    let mut file = File::open(path)?;
+    let opened = opened_object_identity(SnapshotSource::ClaudeCode, &mut file)?;
+    let mut parser = OwnedJsonlParser::new(
+        file,
+        path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        artifacts,
+    )?;
+    while !parser.step()? {}
+    let index = ordinary_index(ScanIndex::default());
+    parser
+        .finish_with_repository_identity(
+            &opened,
+            path,
+            at,
+            fingerprint,
+            None,
+            Some(metadata),
+            None,
+            None,
+            Some(claude_request_money::e2::ReadContext {
+                index: &index,
+                path,
+                twins: &std::cell::OnceCell::new(),
+            }),
+        )
+        .map(|parsed| parsed.snapshots)
+}
+
+/// Persist a real malformed-list input to exercise fail-closed ordinary money.
+pub(crate) fn pause_adoption(support: &Path) {
+    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }
