@@ -220,14 +220,19 @@ fn account_window_unsafe_boundaries_are_untouched() {
             .previous_windows
             .resident_mut()[2]
             .census_window_end = boundary.into();
-        // Cold arm: a cold archive is never walked; the run the walk would
-        // collapse is counted as refused and nothing changes.
-        for mut index in [index.clone(), cold(index)] {
+        // Cold arm: a cold archive is never walked and nothing changes; the
+        // run the walk would collapse stays visible as `uncollapsed`.
+        for (cold_arm, mut index) in [(false, index.clone()), (true, cold(index))] {
             let before = index.claude_account_family_pending.clone();
             index.collapse_account_pending_windows();
             assert_eq!(index.claude_account_family_pending, before);
             assert_eq!(index.claude_account_window_retention.windows_collapsed, 0);
-            assert_eq!(index.claude_account_window_retention.roots_refused, 1);
+            let refused = u64::from(!cold_arm);
+            assert_eq!(index.claude_account_window_retention.roots_refused, refused);
+            let uncollapsed = index.claude_account_family_pending[&root]
+                .previous_windows
+                .uncollapsed();
+            assert_eq!(uncollapsed != 0, cold_arm);
         }
     }
     fs::remove_dir_all(dir).unwrap();
