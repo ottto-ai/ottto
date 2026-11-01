@@ -1432,7 +1432,7 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
         grown.result.snapshots[0].source_file_fingerprint.as_deref(),
         Some(entry.source_file_fingerprint.as_str())
     );
-    grown.index.files.insert(moved_key, entry);
+    grown.index.files.insert_shared(moved_key, entry);
     grown
         .index
         .claude_request_census_mut_for_test()
@@ -1491,7 +1491,7 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
         .invalidate_keeping_birth_for_test(&grown.base.key);
     let moved = local_index_key(&grown.base.path.with_file_name("physical-other.jsonl"));
     let entry = grown.index.files.remove(&grown.base.key).unwrap();
-    grown.index.files.insert(moved.clone(), entry);
+    grown.index.files.insert_shared(moved.clone(), entry);
     let path = grown.base.fixture.root.join("prefix-index.json");
     grown.index.save(&path).unwrap();
     let mut loaded =

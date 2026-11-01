@@ -2600,7 +2600,7 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
         key: &str,
-        files: &BTreeMap<String, ScanIndexEntry>,
+        files: &SharedMap<String, ScanIndexEntry>,
         length: u64,
     ) -> bool {
         files

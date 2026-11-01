@@ -2068,7 +2068,14 @@ whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
 `account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history.
+account-window pressure without capping owed history; `account_windows_retained`
+also reports `uncollapsed`, the interior windows of equal-evidence runs left in a
+store-only archive (boundaries unchecked). A complete v2 load keeps archived account
+windows in the store, so the retained-pending byte diagnostic is unavailable while
+any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
+`cold_row_unknown`) when a stored archived row no longer matches its baseline, and
+with `state_v2_cold_lineage_miss` (count `cold_lineage_miss`) when a graph's archive
+view predates a commit it shares no rollover with; both hold and remove nothing.
 These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows

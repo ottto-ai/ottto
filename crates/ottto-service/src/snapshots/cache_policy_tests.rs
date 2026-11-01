@@ -1494,55 +1494,32 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
     );
 }
 
-/// [regress] A long-lived daemon's cache full of small idle residents locked
-/// out every later Full: its copy budget beside a full cache is zero, only a
-/// Tail or Unchanged read could release, so a growing file read Full on every
-/// page. A Full singleton now releases at completion: only residents ranked
-/// strictly below its plan's mtime leave, and a later page takes the copy as a
-/// Tail. With residents of equal or newer rank nothing leaves, the copy is
-/// refused and the next page is Full again. Small residents keep `|P*|` above
-/// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
-/// Full has no X_out (ruling 5), so nothing proves its output fits and it
-/// evicts nothing, even beside strictly older residents. Its equal and newer
-/// rows are dropped: strictly-older ranking already keeps those residents for
-/// every source, and the Claude rows pin that.
+/// [regress] Same-size Full re-reads must not churn a full cache of idle
+/// residents: no eviction, copy refused, next page Full. A grown Full with
+/// X_out may release strictly older residents to admit its copy, then Tail
+/// on the next page. Equal/newer residents stay. Codex has no X_out for a
+/// Full, so it releases nothing even after growth.
 #[test]
-fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
+fn cache_policy_full_singleton_releases_only_after_growth() {
     if unexecuted("full_singleton_release") {
         return;
     }
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
-    let ranks = [
-        (now - OLD_SECONDS, true),
-        (file_modified, false),
-        (newer_modified, false),
-    ];
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        // Codex: the strictly-older row alone, the only rank a release reaches.
-        let rows = if source == SnapshotSource::Codex {
-            &ranks[..1]
-        } else {
-            &ranks[..]
-        };
-        for &(idle_modified, older) in rows {
-            let releases = older && source == SnapshotSource::ClaudeCode;
-            let label = format!("{source:?} idle_modified={idle_modified}");
-            let cache = Arc::new(sampled_scan::SharedCache::default());
-            let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
-            idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
-            idle.set_modified(idle_modified);
-            // The fill stops at the first resident that brings the cache to
-            // 9/10 of the state budget, the count a walk after every insert
-            // finds. The residents are identical, so all but the last few go
-            // in as one batch sized from the first one's measured charge and
-            // checked by one walk; the last few are walked one by one.
-            let target = POLICY_STATE_BYTES / 10 * 9;
-            let mut residents_inserted = 0;
-            observe(|| {
-                let mut insert_idle = |count: usize| {
-                    for _ in 0..count {
+        for grew in [false, true] {
+            for idle_modified in [now - OLD_SECONDS, file_modified, newer_modified] {
+                let releases =
+                    grew && idle_modified < file_modified && source == SnapshotSource::ClaudeCode;
+                let label = format!("{source:?} grew={grew} idle_modified={idle_modified}");
+                let cache = Arc::new(sampled_scan::SharedCache::default());
+                let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
+                idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
+                idle.set_modified(idle_modified);
+                let mut residents_inserted = 0;
+                observe(|| {
+                    while optional_resident(&cache) < POLICY_STATE_BYTES / 10 * 9 {
                         let retained = retained_reduction(&idle);
                         assert!(
                             cache.retained().expect("retained cache lock").insert(
@@ -1553,100 +1530,112 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
                         );
                         residents_inserted += 1;
                     }
-                };
-                let empty = optional_resident(&cache);
-                insert_idle(1);
-                let mut resident = optional_resident(&cache);
-                let charge = (resident - empty).max(1);
-                let batch = (target.saturating_sub(resident) / charge).saturating_sub(2);
-                if batch > 0 {
-                    insert_idle(batch);
-                    resident = optional_resident(&cache);
+                });
+                for (key, modified) in [
+                    ("cache-policy-equal", file_modified),
+                    ("cache-policy-newer", newer_modified),
+                ] {
+                    let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
+                    entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
+                    entry.set_modified(modified);
+                    let retained = retained_reduction(&entry);
                     assert!(
-                        resident < target,
-                        "precondition: {label} the batched fill stays below 9/10"
+                        cache
+                            .retained()
+                            .expect("retained cache lock")
+                            .insert(key.to_string(), retained),
+                        "precondition: {label} {key} is admitted"
                     );
                 }
-                while resident < target {
-                    insert_idle(1);
-                    resident = optional_resident(&cache);
-                }
-            });
-            for (key, modified) in [
-                ("cache-policy-equal", file_modified),
-                ("cache-policy-newer", newer_modified),
-            ] {
-                let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
-                entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
-                entry.set_modified(modified);
-                let retained = retained_reduction(&entry);
-                assert!(
-                    cache
-                        .retained()
-                        .expect("retained cache lock")
-                        .insert(key.to_string(), retained),
-                    "precondition: {label} {key} is admitted"
+                let before = residents(&cache);
+                assert_eq!(
+                    before.len(),
+                    residents_inserted + 2,
+                    "precondition: {label} the fill evicts nothing"
                 );
-            }
-            let before = residents(&cache);
-            assert_eq!(
-                before.len(),
-                residents_inserted + 2,
-                "precondition: {label} the fill evicts nothing"
-            );
 
-            let grown = ScanFixture::new(source);
-            grown.append(&usage(source, 100, 0, MODEL));
-            // A zero copy budget: its line buffer alone exceeds the room left.
-            append_padding(&grown);
-            grown.append(&usage(source, 141, 1, MODEL));
-            grown.set_modified(file_modified);
-            let (full, counts) =
-                observe(|| observed_scan(&grown, source, ScanIndex::default(), &cache));
-            assert_eq!(full.modes, (1, 0, 0), "precondition: {label} a Full");
-            let after = residents(&cache);
-            let left: Vec<_> = before
-                .iter()
-                .filter(|(key, _, _)| !after.iter().any(|(resident, _, _)| resident == key))
-                .map(|(key, rank, _)| (key.clone(), *rank))
-                .collect();
-            let admitted = cache.retained_checkpoint(&grown.key()).is_some();
-            eprintln!(
+                let grown = ScanFixture::new(source);
+                grown.append(&usage(source, 100, 0, MODEL));
+                // A zero copy budget: its line buffer alone exceeds the room left.
+                append_padding(&grown);
+                grown.append(&usage(source, 141, 1, MODEL));
+                grown.set_modified(file_modified);
+                // A completed prior read supplies the real pre-read index size.
+                // Its cache is separate: this pass must miss and select Full.
+                let previous_cache = Arc::new(sampled_scan::SharedCache::default());
+                let mut index =
+                    observed_scan(&grown, source, ScanIndex::default(), &previous_cache).index;
+                drop(previous_cache);
+                let entry = index
+                    .files
+                    .get_mut(&grown.key())
+                    .expect("previous read indexed");
+                let previous_size = entry.size_bytes;
+                assert_eq!(
+                    previous_size,
+                    fs::metadata(&grown.path).unwrap().len(),
+                    "precondition: {label} the previous read recorded the file size"
+                );
+                // Re-arm the same-size arm too, without changing the stored size.
+                entry.source_file_fingerprint.clear();
+                if grew {
+                    grown.append(&usage(source, 160, 2, MODEL));
+                    grown.set_modified(file_modified);
+                }
+                assert_eq!(
+                    fs::metadata(&grown.path).unwrap().len() > previous_size,
+                    grew,
+                    "precondition: {label} growth against the last read"
+                );
+                let (full, counts) = observe(|| observed_scan(&grown, source, index, &cache));
+                assert_eq!(full.modes, (1, 0, 0), "precondition: {label} a Full");
+                assert_eq!(
+                    full.state_missing(),
+                    1,
+                    "precondition: {label} no cached state"
+                );
+                let after = residents(&cache);
+                let left: Vec<_> = before
+                    .iter()
+                    .filter(|(key, _, _)| !after.iter().any(|(resident, _, _)| resident == key))
+                    .map(|(key, rank, _)| (key.clone(), *rank))
+                    .collect();
+                let admitted = cache.retained_checkpoint(&grown.key()).is_some();
+                eprintln!(
                 "CACHE_POLICY test=full_singleton_release {label} residents={residents_inserted} left={} admitted={admitted} produced={} finalization_refused={}",
                 left.len(),
                 counts.retention_produced,
                 counts.retention_finalization_bound_refused,
             );
-            assert_eq!(
-                counts.copy_refusal_admission_evicted as usize,
-                left.len(),
-                "{label}: by the release only"
-            );
-            assert_eq!(wipe_clears(&counts), 0, "{label}: nothing wiped");
-            for (key, rank) in &left {
-                assert!(
-                    *rank < (i64::try_from(file_modified).unwrap(), 0),
-                    "{label}: {key} was not strictly older"
+                assert_eq!(
+                    counts.copy_refusal_admission_evicted as usize,
+                    left.len(),
+                    "{label}: by the release only"
                 );
-            }
-            if releases {
-                assert!(!left.is_empty(), "{label}: older residents leave");
-            } else {
-                assert!(left.is_empty(), "{label}: every resident stays");
-                assert!(!admitted, "{label}: the copy is refused");
-            }
+                assert_eq!(wipe_clears(&counts), 0, "{label}: nothing wiped");
+                for (key, rank) in &left {
+                    assert!(
+                        *rank < (i64::try_from(file_modified).unwrap(), 0),
+                        "{label}: {key} was not strictly older"
+                    );
+                }
+                if releases {
+                    assert!(!left.is_empty(), "{label}: older residents leave");
+                    assert!(admitted, "{label}: X_out proves the copy is admitted");
+                } else {
+                    assert!(left.is_empty(), "{label}: every resident stays");
+                    assert!(!admitted, "{label}: the copy is refused");
+                }
 
-            grown.append(&usage(source, 182, 2, MODEL));
-            grown.set_modified(file_modified + 1);
-            let next = observed_scan(&grown, source, full.index, &cache);
-            if admitted {
-                assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is a Tail");
-            } else {
-                assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
-                assert_eq!(next.state_missing(), 1, "{label}");
-            }
-            if releases {
-                assert!(admitted, "{label}: X_out proves the copy is admitted");
+                grown.append(&usage(source, 182, 3, MODEL));
+                grown.set_modified(file_modified + 1);
+                let next = observed_scan(&grown, source, full.index, &cache);
+                if releases {
+                    assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is Tail");
+                } else {
+                    assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
+                    assert_eq!(next.state_missing(), 1, "{label}");
+                }
             }
         }
     }

@@ -27,6 +27,11 @@ impl Counter {
         if self.visits > 4096 {
             return None;
         }
+        self.charge(bytes)
+    }
+    /// Charge a fixed header that rides on the next visit of its own value,
+    /// so wrapping a value adds bytes but no traversal work.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Option<()> {
         self.bytes = self.bytes.checked_add(bytes)?;
         (self.bytes <= self.limit).then_some(())
     }
@@ -378,6 +383,25 @@ impl<A: HeapLayoutBound, B: HeapLayoutBound, D: HeapLayoutBound> HeapLayoutBound
         self.0.completed_heap_bound(c)?;
         self.1.completed_heap_bound(c)?;
         self.2.completed_heap_bound(c)
+    }
+}
+impl<A: HeapLayoutBound, B: HeapLayoutBound, D: HeapLayoutBound, E: HeapLayoutBound> HeapLayoutBound
+    for (A, B, D, E)
+{
+    fn stable_heap(&self) -> bool {
+        self.0.stable_heap() && self.1.stable_heap() && self.2.stable_heap() && self.3.stable_heap()
+    }
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.0.heap_bound(c)?;
+        self.1.heap_bound(c)?;
+        self.2.heap_bound(c)?;
+        self.3.heap_bound(c)
+    }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.0.completed_heap_bound(c)?;
+        self.1.completed_heap_bound(c)?;
+        self.2.completed_heap_bound(c)?;
+        self.3.completed_heap_bound(c)
     }
 }
 // `inline` fields own no heap: they need INLINE_ONLY and add no visit (as in

@@ -244,7 +244,7 @@ impl ScanIndex {
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
 pub(super) fn path_requires_verification(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
     files
@@ -258,7 +258,7 @@ pub(super) fn path_requires_verification(
 /// Discovery grants no ACK, census proof or independent read permission.
 pub(super) fn path_requires_recovery(
     source: SnapshotSource,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
     length: u64,
 ) -> bool {
@@ -271,18 +271,23 @@ pub(super) fn path_requires_recovery(
             }))
 }
 
-pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    for entry in index
-        .files
-        .values_mut()
-        .filter(|entry| entry.has_unverified_source())
-    {
-        if entry
+fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
+    entry.has_unverified_source()
+        && entry
             .scan_identity_version
             .as_ref()
             .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
-        {
-            entry.set_unverified_deadline(0);
+}
+
+/// Runs every Claude and Codex scan, so an index with nothing to normalize
+/// stays shared with the committed baseline.
+pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
+    if !index.files.values().any(marker_storage_oversized) {
+        return;
+    }
+    for (_, entry) in index.files.slots_mut() {
+        if marker_storage_oversized(entry) {
+            entry.make_mut().set_unverified_deadline(0);
         }
     }
 }
@@ -1470,7 +1475,7 @@ mod provenance_tests {
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
@@ -1588,6 +1593,32 @@ impl AbsenceParent {
             let _ = (self, other);
             false
         }
+    }
+}
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {

@@ -91,11 +91,19 @@ class GroupTests(unittest.TestCase):
     def test_selects_by_function_name_and_rejects_clashes(self):
         lib = ['a::tests::one', 'a::tests::two', 'b::tests::one']
         others = ['tests::cli_case']
-        self.assertEqual(runner.serial_group(lib, {'one'}, lib + others), ['a::tests::one', 'b::tests::one'])
+        self.assertEqual(runner.serial_group(lib, {'one'}), ['a::tests::one', 'b::tests::one'])
+        runner.require_unique(['a::tests::one'], lib + others)
         with self.assertRaises(runner.SetupError):
-            runner.serial_group(lib, {'one'}, lib + others + ['a::tests::one'])
+            runner.require_unique(['a::tests::one'], lib + others + ['a::tests::one'])
         with self.assertRaises(runner.SetupError):
-            runner.serial_group(lib, {'missing'}, lib)
+            runner.serial_group(lib, {'missing'})
+
+    def test_shards_cover_every_name_once(self):
+        names = [f't{i}' for i in range(10)]
+        shares = [runner.shard_of(names, (i, 3)) for i in (1, 2, 3)]
+        self.assertEqual(sorted(sum(shares, [])), sorted(names))
+        self.assertEqual(shares[0], ['t0', 't3', 't6', 't9'])
+        self.assertEqual(runner.shard_of(names, (1, 1)), names)
 
 
 class SummaryTests(unittest.TestCase):

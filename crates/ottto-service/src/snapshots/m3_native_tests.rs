@@ -148,7 +148,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
         .unwrap()
         .as_secs();
     let key = local_index_key(&path);
-    let discover = |files: &BTreeMap<String, ScanIndexEntry>| {
+    let discover = |files: &SharedMap<String, ScanIndexEntry>| {
         let mut index = ScanIndex {
             files: files.clone(),
             ..ScanIndex::default()
@@ -169,12 +169,15 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
         .is_some()
     };
     // Control: an unindexed old file and an idle accepted one age out.
-    assert!(!discover(&BTreeMap::new()));
-    assert!(!discover(&BTreeMap::from([(key.clone(), entry("fp", 64))])));
+    assert!(!discover(&SharedMap::default()));
+    assert!(!discover(&SharedMap::from([(
+        key.clone(),
+        entry("fp", 64)
+    )])));
     // Held: the committed entry keeps its pre-hold accepted extent (the
     // held completion recorded nothing), so the read bytes past it keep
     // the key a candidate regardless of age, every pass and after restart.
-    assert!(discover(&BTreeMap::from([(key.clone(), entry("fp", 16))])));
+    assert!(discover(&SharedMap::from([(key.clone(), entry("fp", 16))])));
     // Its audit marker alone also keeps it, at the accepted length.
     let mut marked = committed(&key);
     marked.files.get_mut(&key).unwrap().size_bytes = 64;
