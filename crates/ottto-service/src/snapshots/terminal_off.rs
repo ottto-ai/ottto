@@ -251,11 +251,11 @@ impl TerminalOffStaleClears {
     }
 }
 process_memo!(fn with_terminal_off_stale_clears,
-static TERMINAL_OFF_STALE_CLEARS: TerminalOffStaleClears = TerminalOffStaleClears {
-    keys: BTreeSet::new(),
-    order: VecDeque::new(),
-    evictions: 0,
-});
+    static TERMINAL_OFF_STALE_CLEARS: TerminalOffStaleClears = TerminalOffStaleClears {
+        keys: BTreeSet::new(),
+        order: VecDeque::new(),
+        evictions: 0,
+    });
 fn terminal_off_stale_clear_key(
     index: &ScanIndex,
     context: &str,
@@ -266,10 +266,7 @@ fn terminal_off_stale_clear_key(
     for value in [
         "terminal-off-stale-clear:v1",
         context,
-        index
-            .upload_context_fingerprint
-            .as_deref()
-            .unwrap_or("none"),
+        index.upload_context_fingerprint.as_deref().unwrap_or("none"),
         index
             .active_upload_context_fingerprint
             .as_deref()
@@ -476,11 +473,11 @@ impl TerminalOffEmptyContexts {
     }
 }
 process_memo!(fn with_terminal_off_empty_contexts,
-static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts = TerminalOffEmptyContexts {
-    keys: BTreeSet::new(),
-    order: VecDeque::new(),
-    evictions: 0,
-});
+    static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts = TerminalOffEmptyContexts {
+        keys: BTreeSet::new(),
+        order: VecDeque::new(),
+        evictions: 0,
+    });
 #[cfg(test)]
 thread_local! {
     static TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
