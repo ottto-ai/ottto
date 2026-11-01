@@ -41,8 +41,8 @@ fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     (home, root, index, paths)
 }
 
-fn activate_mode(index: &mut ScanIndex, base: &str, enabled: bool, wire: bool) {
-    let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.into(), enabled);
+fn activate_mode(index: &mut ScanIndex, base: &str, wire: bool) {
+    let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.into(), true);
     let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, mode);
     index.set_copy_prefix_base_upload_context(Some(base.into()));
@@ -93,8 +93,8 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
         .map(|(key, entry)| (key.clone(), entry.upload_context_receipt.clone()))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(receipts.len(), 6);
-    for (local, wire) in [(true, false), (true, true), (false, false)] {
-        activate_mode(&mut index, "ctx-1", local, wire);
+    for wire in [false, true] {
+        activate_mode(&mut index, "ctx-1", wire);
         let (next, scan, opened) = walk(&root, index, &[]);
         index = next;
         assert!(opened.is_empty(), "mode change opened unaffected bodies");
@@ -114,7 +114,7 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
     }
     // The exemption is only for mode variants of the SAME base, never a
     // destination, privacy-policy or attribution-context change.
-    activate_mode(&mut index, "different-policy", true, false);
+    activate_mode(&mut index, "different-policy", false);
     assert!(index
         .files
         .keys()
@@ -127,7 +127,7 @@ fn mode_context_reads_only_requested_set_and_matches_estimate() {
     let (home, root, mut index, paths) = setup("copy-prefix-context-scoped");
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     let (index, scan, opened) = walk(&root, index, &pending);
     assert_eq!(opened, pending, "only affected files open, earlier first");
@@ -169,7 +169,7 @@ fn configured_root_symlink_uses_the_same_resolved_scope_as_discovery() {
     std::os::unix::fs::symlink(&root, &configured).unwrap();
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&configured)).unwrap();
     let (_, scan, opened) = walk(&configured, index, &pending);
     assert_eq!(opened, pending);
@@ -189,7 +189,7 @@ fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
     let (home, root, mut index, _) = setup("copy-prefix-combined-budget");
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     assert_eq!(pending.len(), 3);
     with_body_witness_adoption_page_budget(1, || {
@@ -218,7 +218,7 @@ fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
     let (home, root, mut index, _) = setup("copy-prefix-existing-replay");
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let roots = vec![root.clone()];
     let pending = prepare(&mut index, &support, &roots).unwrap();
     ensure_bounded_traversal(
@@ -257,7 +257,7 @@ fn scoped_mode_budget_preserves_independent_source_refresh() {
     let (home, root, mut index, _) = setup("copy-prefix-independent-source");
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     let key = local_index_key(&pending[0]);
     // A different source witness models changed account/telemetry sidecars;
@@ -275,7 +275,7 @@ fn scoped_mode_budget_preserves_independent_source_refresh() {
     assert_eq!(scan.scanned_file_count, 1);
     assert_ne!(after.files[&key].source_file_fingerprint, stale);
     let mut changed_policy = after;
-    activate_mode(&mut changed_policy, "new-policy", true, false);
+    activate_mode(&mut changed_policy, "new-policy", false);
     assert!(
         !changed_policy.copy_prefix_base_context_proven(&key),
         "real base changes are not mode-only debt"
@@ -539,7 +539,7 @@ fn one_listed_twin_estimates_and_reads_the_complete_native_family() {
         counts,
         run(&home.join("scope.json"), &support, true).unwrap()
     );
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     assert_eq!(pending.iter().cloned().collect::<BTreeSet<_>>(), expected);
     let (_, scan, opened) = walk(&root, index, &pending);
@@ -645,7 +645,7 @@ fn twin_closure_native_reader_keeps_the_existing_byte_budget() {
     let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     with_body_witness_adoption_byte_budget(1, || {
         let counts = run(&home.join("scope.json"), &home.join("absent-budget"), false).unwrap();

@@ -62,7 +62,7 @@ impl CopyRemovals {
         self.files.is_empty()
     }
     /// Only an empty undamaged store is omitted from the index: an absent
-    /// field then reads back as exactly that (Lead B F4).
+    /// field then reads back as exactly that.
     pub(crate) fn is_unwritten(&self) -> bool {
         self.is_empty() && !self.metadata_lost
     }

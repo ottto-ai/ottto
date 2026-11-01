@@ -6657,11 +6657,11 @@ fn prepare_sync_source_inner(
         cache_observations_enabled,
     );
     let base_upload_context = upload_context.clone();
-    let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode;
-    let copy_unproven_enabled = resumed_prefix_enabled
-        && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
+    let claude = source == SnapshotSource::ClaudeCode;
+    let copy_unproven_enabled =
+        claude && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
     // Context adoption invalidates stale pending pages on capability downgrade.
-    let upload_context = resumed_prefix_upload_context(upload_context, resumed_prefix_enabled);
+    let upload_context = resumed_prefix_upload_context(upload_context, claude);
     let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
@@ -6748,8 +6748,7 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
-    index
-        .set_copy_prefix_base_upload_context(resumed_prefix_enabled.then_some(base_upload_context));
+    index.set_copy_prefix_base_upload_context(claude.then_some(base_upload_context));
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.

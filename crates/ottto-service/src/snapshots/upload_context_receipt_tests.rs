@@ -419,8 +419,8 @@ fn acknowledged_unaffected_receipt_survives_resumed_prefix_mode_changes() {
     assert!(receipt.is_some(), "real uploader ACK granted the receipt");
     let base = "d".repeat(64);
     f.index.copy_prefix_base_upload_context = Some(base.clone());
-    for (enabled, wire) in [(true, false), (true, true), (false, false)] {
-        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), enabled);
+    for wire in [false, true] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
         let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
         f.index.activate_file_upload_context(f.source, mode);
         let (scan, bytes) = f.walk(true);
@@ -445,8 +445,8 @@ fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
     assert_eq!(receipt.context_fingerprint, old_on);
     f.index = serde_json::from_value(serde_json::to_value(&f.index).unwrap()).unwrap();
     f.index.copy_prefix_base_upload_context = Some(base.clone());
-    for (enabled, wire) in [(true, false), (true, true), (false, false)] {
-        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), enabled);
+    for wire in [false, true] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
         let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
         f.index.activate_file_upload_context(f.source, mode);
         let (scan, bytes) = f.walk(true);

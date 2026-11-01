@@ -180,8 +180,7 @@ and closure remain bounded by the existing 10,000-file scan limit and the 4 MiB
 local request envelope. Estimate creates no support directory and changes no
 state or upload.
 
-After the change is merged and installed, money sign-off and a same-cohort
-PLAN are prerequisites for the authorized operator to replace `--estimate`
+After the change is installed, an authorized operator may replace `--estimate`
 with `--apply`. Apply publishes one private create-new request under
 `snapshots/claude-copy-prefix-reread.json`; it does not restart the service,
 read transcript bodies or upload. Existing intent is never overwritten. Only
@@ -260,9 +259,8 @@ expiry of unrecorded removals can preserve the original overcount. These
 residuals are counted and disclosed; unknown usage is never silently zeroed.
 Removed and unproven dollars include only priced telemetry and are partial.
 The separate wire capability is OFF without the exact advertised token.
-Money-owner sign-off, an installed merged build and a same-cohort PLAN still
-precede any authorized application of a re-read request. Implementation and review do not perform
-those runtime actions.
+Applying a re-read request stays an authorized operator action on an
+installed build; implementation and review do not perform it.
 
 The request binds that window. Runtime validation uses the SAME effective
 window and scan clock as ordinary candidate selection, before any re-owe. A
