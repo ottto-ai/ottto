@@ -4495,6 +4495,7 @@ pub(crate) fn quarantine_context_only_changed(
     normalized.same_retry_contract(active)
 }
 
+#[cfg(test)]
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8823,6 +8824,7 @@ fn claude_transcript_effort(value: &Value) -> Option<String> {
 /// Reasoning effort comes only from each assistant transcript record. Local
 /// OTLP evidence may stamp an exactly covered session or proven account family,
 /// but it must never supply or split reasoning-effort tiers.
+#[cfg(test)]
 pub fn apply_claude_effort_evidence(
     snapshots: &mut [SnapshotItem],
     evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
@@ -9081,6 +9083,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
 /// This mutates usage, cost, and context-posture fields only. Provider graph
 /// facts remain the transcript/filesystem truth and are never inferred from
 /// telemetry spans.
+#[cfg(test)]
 pub fn apply_claude_reported_usage_with_index(
     snapshots: &mut [SnapshotItem],
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -21826,6 +21829,7 @@ pub fn scan_source_roots_with_artifacts(
 /// Dark-mode attribution-aware scan. It reuses the normal changed-file path;
 /// the context only adds in-memory HMAC facts to sessions already selected for
 /// parsing and never changes the filesystem polling cadence.
+#[cfg(test)]
 pub fn scan_source_roots_with_attribution(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -21850,6 +21854,7 @@ pub fn scan_source_roots_with_attribution(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn scan_source_roots_with_attribution_and_hints(
     source: SnapshotSource,
@@ -21910,6 +21915,7 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
 
 /// Compatibility entry retained for focused account-attribution and effort
 /// sidecar tests that do not exercise watcher hints.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn scan_source_roots_with_attribution_and_claude_effort(
     source: SnapshotSource,
@@ -34582,6 +34588,7 @@ fn codex_state_only_snapshot(
     item
 }
 
+#[cfg(test)]
 pub fn parse_codex_jsonl_file(
     path: &Path,
     collected_at: &str,
@@ -34596,6 +34603,7 @@ pub fn parse_codex_jsonl_file(
     )
 }
 
+#[cfg(test)]
 fn parse_codex_jsonl_file_with_title_metadata(
     path: &Path,
     collected_at: &str,
@@ -34613,6 +34621,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
     )
 }
 
+#[cfg(test)]
 fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
     path: &Path,
     collected_at: &str,
@@ -34632,6 +34641,7 @@ fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
     .map(|parsed| parsed.snapshots)
 }
 
+#[cfg(test)]
 fn parse_codex_jsonl_file_with_diagnostics(
     path: &Path,
     collected_at: &str,
@@ -34656,6 +34666,7 @@ fn parse_codex_jsonl_file_with_diagnostics(
     )
 }
 
+#[cfg(test)]
 pub fn parse_claude_code_jsonl_file(
     path: &Path,
     collected_at: &str,
@@ -34667,6 +34678,7 @@ pub fn parse_claude_code_jsonl_file(
 /// As ``parse_claude_code_jsonl_file`` but with the artifact-scrape policy
 /// threaded in. The production scan path passes ``false`` when the org has
 /// session artifacts disabled so the per-line VCS scrape is skipped entirely.
+#[cfg(test)]
 fn parse_claude_code_jsonl_file_with_artifacts(
     path: &Path,
     collected_at: &str,
@@ -34685,6 +34697,7 @@ fn parse_claude_code_jsonl_file_with_artifacts(
 /// Full production form with the desktop-store title metadata threaded in; the
 /// scan path loads the store once per cycle and shares it across every session
 /// file.
+#[cfg(test)]
 fn parse_claude_code_jsonl_file_with_title_metadata(
     path: &Path,
     collected_at: &str,
@@ -34702,6 +34715,7 @@ fn parse_claude_code_jsonl_file_with_title_metadata(
     )
 }
 
+#[cfg(test)]
 fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
     path: &Path,
     collected_at: &str,
@@ -34721,6 +34735,7 @@ fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
     .map(|parsed| parsed.snapshots)
 }
 
+#[cfg(test)]
 fn parse_claude_code_jsonl_file_with_diagnostics(
     path: &Path,
     collected_at: &str,
@@ -34743,6 +34758,7 @@ fn parse_claude_code_jsonl_file_with_diagnostics(
     )
 }
 
+#[cfg(test)]
 pub fn parse_pi_jsonl_file(
     path: &Path,
     collected_at: &str,
@@ -34751,6 +34767,7 @@ pub fn parse_pi_jsonl_file(
     parse_pi_jsonl_file_with_attribution(path, collected_at, source_file_fingerprint, None)
 }
 
+#[cfg(test)]
 fn parse_pi_jsonl_file_with_attribution(
     path: &Path,
     collected_at: &str,
@@ -34766,6 +34783,7 @@ fn parse_pi_jsonl_file_with_attribution(
     .map(|parsed| parsed.snapshots)
 }
 
+#[cfg(test)]
 fn parse_pi_jsonl_file_with_diagnostics(
     path: &Path,
     collected_at: &str,
@@ -34787,11 +34805,13 @@ fn parse_pi_jsonl_file_with_diagnostics(
     )
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ParsedSnapshotFile {
     snapshots: Vec<SnapshotItem>,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn parse_jsonl_file(
     path: &Path,
@@ -49527,7 +49547,8 @@ impl ScanIndex {
 
     /// `source` only names the source kind in containment lines and alarms.
     fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
-        let (mut index, origin) = Self::load_inner(path, source)?;
+        let (mut index, origin) =
+            Self::load_inner_with_probe(path, source, None, SystemTime::now(), None)?;
         index.settle_claude_index_load(path, ScanIndexLoadOrigin::from(&origin));
         if sampled_audit::growth_active(&index) {
             sampled_audit::bind_growth_claims(&mut index, path);
@@ -49555,10 +49576,12 @@ impl ScanIndex {
 
     /// `load` before the U1a-2a proof incarnation (row 35): each accepted
     /// return says what it found.
+    #[cfg(test)]
     fn load_inner(path: &Path, source: Option<SnapshotSource>) -> Result<(Self, LoadOrigin)> {
         Self::load_inner_at(path, source, SystemTime::now())
     }
 
+    #[cfg(test)]
     fn load_inner_at(
         path: &Path,
         source: Option<SnapshotSource>,
@@ -49569,6 +49592,7 @@ impl ScanIndex {
 
     /// Only a load that names its support directory can spend an armed user
     /// Repair override and see the source-wide override stamp.
+    #[cfg(test)]
     fn load_inner_with_support(
         path: &Path,
         source: Option<SnapshotSource>,
@@ -51284,6 +51308,7 @@ impl ScanIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn committable_subset(
         &self,
         previous: &ScanIndex,
