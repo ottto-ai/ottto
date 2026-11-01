@@ -30,8 +30,6 @@ pub(super) fn populate(
     presence: BTreeMap<String, bool>,
 ) -> sqlite::Sqlite {
     let mut db = sqlite::Sqlite::create_import(path).unwrap();
-    db.path_extractor(kinds::private_paths);
-    db.reference_extractor(kinds::references);
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-money-custody".into(),
@@ -52,10 +50,7 @@ pub(super) fn populate(
     // Journal OFF deliberately invalidates aborted imports. Fault/rollback
     // tests must operate on a completed import reopened in live WAL mode.
     db.finish_import().unwrap();
-    let mut db = sqlite::Sqlite::open(path, &identity).unwrap();
-    db.path_extractor(kinds::private_paths);
-    db.reference_extractor(kinds::references);
-    db
+    sqlite::Sqlite::open(path, &identity).unwrap()
 }
 
 pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
@@ -130,8 +125,6 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         fence_generation: index.generation + 1,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
-    db.path_extractor(kinds::private_paths);
-    db.reference_extractor(kinds::references);
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();

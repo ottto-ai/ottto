@@ -34,8 +34,6 @@ impl Scratch {
         ));
         fs::create_dir(&dir).unwrap();
         let mut db = sqlite::Sqlite::create_import(&dir.join("index.v2.sqlite.import")).unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         db.control(
             "identity",
             &Identity {
@@ -52,7 +50,7 @@ impl Scratch {
     fn live_store() -> (Self, sqlite::Sqlite) {
         let (scratch, db) = Self::store();
         db.finish_import().unwrap();
-        let mut db = sqlite::Sqlite::open(
+        let db = sqlite::Sqlite::open(
             &scratch.0.join("index.v2.sqlite.import"),
             &Identity {
                 format: FORMAT,
@@ -62,8 +60,6 @@ impl Scratch {
             },
         )
         .unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         (scratch, db)
     }
 }

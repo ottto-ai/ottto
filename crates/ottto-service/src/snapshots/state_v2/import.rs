@@ -907,8 +907,6 @@ mod application_cases {
         fn store(&self) -> sqlite::Sqlite {
             let mut db =
                 sqlite::Sqlite::create_import(&self.dir.join("proof.v2.sqlite.import")).unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control(
                 "identity",
                 &Identity {
@@ -952,8 +950,6 @@ mod application_cases {
             let mut db =
                 sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
                     .unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &generation).unwrap();
             let verified = import_graph(&mut db, &index, Some(&original)).unwrap();
@@ -1038,8 +1034,6 @@ mod application_cases {
             let mut db =
                 sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
                     .unwrap();
-            db.path_extractor(kinds::private_paths);
-            db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &0_u64).unwrap();
             let result = import_graph(&mut db, &index, Some(&original));
@@ -1118,8 +1112,6 @@ mod application_cases {
         };
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &identity).unwrap();
         db.control("generation", &9_u64).unwrap();
         import_graph(&mut db, &index, Some(&original)).unwrap();
