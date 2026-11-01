@@ -307,7 +307,7 @@ pub(super) struct Sqlite {
     last_collection_check: Option<(SystemTime, Instant)>,
     recovery_attempts_left: u8,
     paths: PathExtractor,
-    references: Option<ReferenceExtractor>,
+    references: ReferenceExtractor,
     // Keep DB identity separate from ownership: Darwin flock conflicts with
     // SQLite's fcntl locks on the same inode. Both fds outlive the connection.
     owner: File,
@@ -542,7 +542,7 @@ impl Sqlite {
             last_collection_check: None,
             recovery_attempts_left: 0,
             paths: kinds::private_paths,
-            references: Some(kinds::references),
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -741,7 +741,7 @@ impl Sqlite {
             last_collection_check: None,
             recovery_attempts_left: 0,
             paths: kinds::private_paths,
-            references: Some(kinds::references),
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -1145,7 +1145,7 @@ impl Sqlite {
     }
     #[cfg(test)]
     pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
-        self.references = Some(refs);
+        self.references = refs;
     }
 }
 impl Sqlite {

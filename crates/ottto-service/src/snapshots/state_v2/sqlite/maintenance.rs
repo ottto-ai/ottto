@@ -562,35 +562,32 @@ impl Sqlite {
         }
 
         if window == Some(true) {
-            if let Some(extract) = self.references {
-                let last = self.read_control::<u64>("reference_check_success")?;
-                let attempt = self.read_control::<u64>("reference_check_attempt")?;
-                if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
-                    && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
-                {
-                    self.control("reference_check_attempt", &now)?;
-                    self.conn()?.execute_batch("BEGIN")?;
-                    let result =
-                        limited(self.conn()?, size_budget(self.logical_bytes()?, 10), || {
-                            references::verify_counts(self.conn()?, extract)
-                        });
-                    self.conn()?.execute_batch("ROLLBACK")?;
-                    match result {
-                        Ok(()) => self.control("reference_check_success", &now)?,
-                        Err(error)
-                            if error.downcast_ref::<super::super::Hold>()
-                                == Some(&super::super::Hold::ReferenceDrift) =>
-                        {
-                            self.stats.reference_drift =
-                                self.stats.reference_drift.saturating_add(1);
-                            super::super::telemetry::event("reference_drift", &1);
-                            self.control("reference_drift", &1_u64)?;
-                            return Err(error);
-                        }
-                        Err(_) => {
-                            self.stats.reference_check_failed =
-                                self.stats.reference_check_failed.saturating_add(1);
-                        }
+            let extract = self.references;
+            let last = self.read_control::<u64>("reference_check_success")?;
+            let attempt = self.read_control::<u64>("reference_check_attempt")?;
+            if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
+                && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
+            {
+                self.control("reference_check_attempt", &now)?;
+                self.conn()?.execute_batch("BEGIN")?;
+                let result = limited(self.conn()?, size_budget(self.logical_bytes()?, 10), || {
+                    references::verify_counts(self.conn()?, extract)
+                });
+                self.conn()?.execute_batch("ROLLBACK")?;
+                match result {
+                    Ok(()) => self.control("reference_check_success", &now)?,
+                    Err(error)
+                        if error.downcast_ref::<super::super::Hold>()
+                            == Some(&super::super::Hold::ReferenceDrift) =>
+                    {
+                        self.stats.reference_drift = self.stats.reference_drift.saturating_add(1);
+                        super::super::telemetry::event("reference_drift", &1);
+                        self.control("reference_drift", &1_u64)?;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        self.stats.reference_check_failed =
+                            self.stats.reference_check_failed.saturating_add(1);
                     }
                 }
             }
