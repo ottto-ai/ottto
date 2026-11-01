@@ -435,7 +435,7 @@ fn claude_case(name: &str) {
         }
         let disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
-        let mut mode = (0, 1, 0);
+        let mode: (usize, usize, usize);
         match name {
             "quiet_sidecar_growth" => {
                 c.evidence(&[api("r1", 10, 100), api("late-side", 5, 50)], &[]);
