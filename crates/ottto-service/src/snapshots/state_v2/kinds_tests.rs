@@ -423,7 +423,8 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
     const EXTENDED: &str = "synthetic-family2";
     const UNREQUESTED: &str = "synthetic-unrequested";
     const MISSING: &str = "synthetic-missing";
-    let (_scratch, mut db) = Scratch::store();
+    // Published, so a rolled-back damage transaction leaves the store usable.
+    let (_scratch, mut db) = Scratch::live_store();
     let mut index = fixture();
     let family = index.claude_account_family_pending[WITH_WINDOWS].clone();
     assert!(!family.previous_windows.is_empty());
