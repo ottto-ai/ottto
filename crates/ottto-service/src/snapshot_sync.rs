@@ -1388,27 +1388,6 @@ fn attach_head_conflict_answers(
     attached
 }
 
-/// Answer framing must not turn an otherwise retryable conflict into a local
-/// oversized-body poison verdict. Keep the stale-base offer and recovery debt.
-fn hold_oversized_head_conflict_answers(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-) -> usize {
-    let mut held = 0;
-    for item in snapshots {
-        if item.cache_conflict_answer.is_some()
-            && crate::snapshots::snapshot_item_wire_size(source, item, policy)
-                > crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
-        {
-            item.cache_conflict_answer = None;
-            head_conflict::note("wire_capacity_hold");
-            held += 1;
-        }
-    }
-    held
-}
-
 fn effective_snapshot_upload_body_witness(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -1521,10 +1500,6 @@ struct PendingCacheHeadFile {
 /// existing rescan handshake instead of conflicting on it forever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HeadConflictChallenge {
-    /// Optional for older #905 checkpoints. Only a complete census may retire
-    /// this metadata when its refused entity is superseded or vanishes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    snapshot_fingerprint: Option<String>,
     challenge: String,
     stale_revision_v2_hash: String,
     /// Answers the server refused again. Counted and logged; never terminal,
@@ -1605,11 +1580,7 @@ struct SnapshotUploadProgress {
     pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
     /// Head-CAS conflict challenges keyed like `accepted_cache_heads`. Any
     /// accepted or unchanged ACK for the session clears its entry.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "head_conflict::deserialize"
-    )]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     head_conflict_challenges: BTreeMap<String, HeadConflictChallenge>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
@@ -2481,14 +2452,11 @@ impl SnapshotUploadProgress {
     fn record_head_conflict_challenge(
         &mut self,
         session_id: &str,
-        snapshot_fingerprint: &str,
         challenge: &str,
         rescan: &crate::snapshot_client::SnapshotConflictRescan,
         now: u64,
     ) -> Option<u32> {
-        if !is_snapshot_fingerprint(snapshot_fingerprint)
-            || !is_snapshot_fingerprint(challenge)
-            || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
+        if !is_snapshot_fingerprint(challenge) || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
         {
             return None;
         }
@@ -2517,7 +2485,6 @@ impl SnapshotUploadProgress {
         self.head_conflict_challenges.insert(
             key,
             HeadConflictChallenge {
-                snapshot_fingerprint: Some(snapshot_fingerprint.to_string()),
                 challenge: challenge.to_string(),
                 stale_revision_v2_hash: rescan.revision_v2_hash.clone(),
                 answer_attempts,
@@ -3142,24 +3109,6 @@ impl SnapshotUploadProgress {
                     .keys()
                     .all(|entity| pending.settled_entities.contains(entity)))
         });
-    }
-
-    /// Retire optional recovery state only after the successful index save.
-    /// An incomplete/opaque census cannot prove a held entity vanished. This
-    /// never retires quarantine, accepted proof or owed usage.
-    fn retire_head_conflict_challenges(
-        &mut self,
-        current_entities: &BTreeSet<String>,
-        census_complete: bool,
-    ) {
-        if census_complete {
-            self.head_conflict_challenges.retain(|_, record| {
-                record
-                    .snapshot_fingerprint
-                    .as_ref()
-                    .map_or(true, |fingerprint| current_entities.contains(fingerprint))
-            });
-        }
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
@@ -8088,10 +8037,6 @@ fn finish_sync_source(
     // by the authoritative current index before any early upload error can
     // preserve them forever.
     let current_fingerprints = index.current_snapshot_fingerprints();
-    // Capture absence authority before upload settlement selects a smaller
-    // committable index. Held/unacknowledged bodies are still in this census.
-    let head_conflict_census_complete =
-        scan_result.census_complete && !index.upload_progress_ack_incidence_unknown();
     if upload_progress.retain_current_quarantines_with_diagnostics(
         &current_fingerprints,
         scan_result.local_codex_diagnostics.as_mut(),
@@ -8412,13 +8357,10 @@ fn finish_sync_source(
         upload_progress.save(&upload_progress_path)?;
     }
     // After bootstrap set each base, so an answer never borrows a fresh head.
-    let mut head_conflict_answers = attach_head_conflict_answers(
+    let head_conflict_answers = attach_head_conflict_answers(
         &mut scan_result.snapshots,
         &upload_progress,
         current_unix_seconds(),
-    );
-    head_conflict_answers = head_conflict_answers.saturating_sub(
-        hold_oversized_head_conflict_answers(source, &mut scan_result.snapshots, upload_policy),
     );
     if head_conflict_answers > 0 {
         eprintln!(
@@ -9207,8 +9149,6 @@ fn finish_sync_source(
     upload_progress
         .permanent_rejections
         .retain(|fingerprint, _| current_entities.contains(fingerprint));
-    upload_progress
-        .retire_head_conflict_challenges(&current_fingerprints, head_conflict_census_complete);
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
@@ -11073,7 +11013,6 @@ where
             };
             if let Some(attempts) = progress.record_head_conflict_challenge(
                 &entity.source_session_id,
-                &entity.snapshot_fingerprint,
                 challenge,
                 rescan,
                 now,
@@ -17853,73 +17792,6 @@ mod tests {
             SnapshotUploadProgress::new(namespace, test_quarantine_witness())
         );
         assert!(!path.exists());
-        assert_eq!(
-            std::fs::read_dir(&root)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
-                .count(),
-            1
-        );
-        // A malformed OPTIONAL challenge field must never quarantine known
-        // ACKs, refusals or identity proof. Only recovery metadata is dropped.
-        let mut known = test_upload_progress();
-        known.record_body(&"b".repeat(64), &"c".repeat(64));
-        known.quarantine_permanent_body(&"d".repeat(64), &"e".repeat(64), "body_exceeds_max_bytes");
-        let expected = serde_json::to_value(&known).unwrap();
-        for optional in [
-            serde_json::json!(null),
-            serde_json::json!(true),
-            serde_json::json!(42),
-            serde_json::json!(1.5),
-            serde_json::json!("broken"),
-            serde_json::json!([1, 2]),
-            serde_json::json!({"bad-key": {"challenge":"bad"}}),
-            serde_json::json!({"a".repeat(64): {"challenge":"f".repeat(64),
-                "stale_revision_v2_hash":"0".repeat(64), "answer_attempts":"broken"}}),
-            serde_json::json!({"a".repeat(64): {"challenge":"bad",
-                "stale_revision_v2_hash":"0".repeat(64)}}),
-        ] {
-            let mut raw = expected.clone();
-            raw["head_conflict_challenges"] = optional;
-            std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-            head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
-            let restored = SnapshotUploadProgress::load(
-                &path,
-                &known.destination_namespace_hash,
-                test_quarantine_witness(),
-            )
-            .unwrap();
-            assert!(
-                path.exists(),
-                "optional metadata cannot quarantine progress"
-            );
-            assert!(restored.head_conflict_challenges.is_empty());
-            assert_eq!(serde_json::to_value(&restored).unwrap(), expected);
-            head_conflict::REFUSALS
-                .with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
-        }
-        // Even deeply malformed optional content is isolated from the outer
-        // progress decoder. Syntactically truncated whole JSON is still corrupt.
-        let deep = "[".repeat(256) + "0" + &"]".repeat(256);
-        let mut raw = serde_json::to_string(&expected).unwrap();
-        raw.pop();
-        raw.push_str(",\"head_conflict_challenges\":{\"");
-        raw.push_str(&"a".repeat(64));
-        raw.push_str("\":{\"challenge\":");
-        raw.push_str(&deep);
-        raw.push_str("}}}");
-        std::fs::write(&path, raw).unwrap();
-        head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
-        let restored = SnapshotUploadProgress::load(
-            &path,
-            &known.destination_namespace_hash,
-            test_quarantine_witness(),
-        )
-        .unwrap();
-        assert!(path.exists());
-        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
-        head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
         assert_eq!(
             std::fs::read_dir(&root)
                 .unwrap()
@@ -24796,7 +24668,7 @@ mod head_conflict_answer_tests;
 mod head_conflict_released_progress_fixture;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
-crate::heap_layout_bound::fields!(HeadConflictChallenge; snapshot_fingerprint, challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
+crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
