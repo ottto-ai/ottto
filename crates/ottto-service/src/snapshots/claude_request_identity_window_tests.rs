@@ -140,6 +140,71 @@ fn sticky_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
     item.model_usage = vec![row];
     (item, contributions)
 }
+/// Hourly buckets of four priced, tagged model rows with varied amounts: the
+/// shape of a long real session, about 1.8 KB per bucket.
+fn long_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
+    let (mut item, _) = sticky_session(hours);
+    let template = item.model_usage[0].clone();
+    let models = [
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "claude-opus-4-1",
+    ];
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let mut proof = Vec::new();
+    for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+        let key = (hour / 24) % 4;
+        let mut rows = Vec::with_capacity(models.len());
+        for model in models {
+            let mut row = template.clone();
+            row.model = model.into();
+            row.input_tokens = next(50_000);
+            row.output_tokens = next(20_000);
+            row.cache_read_tokens = next(2_000_000);
+            row.cache_creation_5m_tokens = next(100_000);
+            row.request_count = 1 + next(40);
+            for slot in [
+                &mut row.cost_usd,
+                &mut row.input_cost_usd,
+                &mut row.output_cost_usd,
+                &mut row.cache_read_cost_usd,
+                &mut row.cache_creation_cost_usd,
+            ] {
+                *slot = Some(usd_picos_string(u128::from(next(5_000_000)) * 1_000_000));
+            }
+            proof.push(Contribution {
+                bucket_start: bucket.bucket_start.clone(),
+                row_key: row_key_from_model_usage(&row),
+                usage: holder_usage(&row, None),
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(format!("{key:064x}")),
+                    org: Some(format!("{:064x}", key + 32)),
+                    basis: identity::TELEMETRY,
+                    account_source: None,
+                }),
+            });
+            rows.push(row);
+        }
+        bucket.model_usage = rows;
+    }
+    item.model_usage = models
+        .map(|model| {
+            let mut row = template.clone();
+            row.model = model.into();
+            row
+        })
+        .to_vec();
+    sticky_receiver_totals(&mut item);
+    (item, proof)
+}
+
 fn sticky_tagged(row: &SnapshotModelUsage) -> bool {
     row.evidence_ref.is_some()
         || row
@@ -2627,6 +2692,45 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
                 .as_u64()
                 .is_some_and(|n| n > 0)
     }));
+
+    // A real-shaped whole body near the 8 MiB limit is sent whole, every tag and
+    // total intact, inside the request cap and encoded for the raised receiver.
+    let item_cap = 8 * 1024 * 1024;
+    let apply_long = |hours: usize| {
+        let (mut item, proof) = long_session(hours);
+        let money = sticky_money(&item);
+        let result = identity::apply_with_reserved_bytes_for_test(
+            &mut item,
+            &proof,
+            &identity::AcceptedBuckets::for_test(),
+            0,
+            Some(item_cap as u64),
+        )
+        .unwrap();
+        (item, money, result)
+    };
+    let per_hour = identity::item_bytes(&apply_long(200).0) / 200;
+    let (long, long_money, result) = apply_long(((item_cap - 64 * 1024) / per_hour).min(4_400));
+    assert_eq!(result, Tagged::Sent { refusals: 0 });
+    assert_eq!(sticky_money(&long), long_money);
+    assert!(long
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .all(sticky_tagged));
+    let long_bytes = identity::item_bytes(&long);
+    assert!(long_bytes > 3_145_728 && long_bytes <= item_cap);
+    let mut request = valid_v6_batch_request();
+    request.snapshots = vec![long];
+    validate_snapshot_batch_request_with_item_limit(&request, item_cap).unwrap();
+    let wire = serde_json::to_vec(&request).unwrap();
+    let encoded = crate::snapshot_client::retention_gzip_probe(&wire, item_cap).unwrap();
+    assert!(crate::snapshot_client::retention_gzip_probe(&wire, 2_097_152).is_none());
+    eprintln!(
+        "whole-body gzip decoded_bytes={} encoded_bytes={}",
+        wire.len(),
+        encoded.len()
+    );
 }
 
 /// [money] Previously stripped buckets are new accepted tags on the next ACK,
@@ -2851,7 +2955,8 @@ fn advertised_cap_absent_or_invalid_is_byte_identical_to_main() {
         (655_360, 655_360),
         (1_048_576, 1_048_576),
         (3_145_728, 3_145_728),
-        (u64::MAX, 3_145_728),
+        (8_388_608, 8_388_608),
+        (u64::MAX, 8_388_608),
     ] {
         assert_eq!(identity::effective_item_cap(Some(advertised)), expected);
     }

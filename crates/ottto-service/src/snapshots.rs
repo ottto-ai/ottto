@@ -611,7 +611,8 @@ pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revisio
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
-pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Receiver request cap: one largest advertised item plus the batch envelope.
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
 const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";

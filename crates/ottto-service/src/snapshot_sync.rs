@@ -8373,7 +8373,12 @@ fn finish_sync_source(
                 let token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let response = client.upload_batch(&token, &request, enforce_head_cas)?;
+                let response = client.upload_batch_with_item_cap(
+                    &token,
+                    &request,
+                    enforce_head_cas,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
                 Ok(response)
             },
@@ -8501,8 +8506,12 @@ fn finish_sync_source(
                 let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let mut response =
-                    client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+                let mut response = client.upload_batch_with_item_cap(
+                    &upload_relay_token,
+                    &request,
+                    reconcile_class,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
                 response.bind_conflict_rescans(&request);
                 let request_fingerprints = request
