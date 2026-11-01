@@ -148,7 +148,7 @@ fn plain_trailing_pi_body_counts_and_round_trips() {
     assert_eq!(again.into_bytes(), bytes);
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] The Pi section bytes are pinned for a one-key ledger without a fork.
 #[test]
 fn pi_section_bytes_are_pinned() {
     let keys = BTreeMap::from([(
@@ -174,8 +174,7 @@ fn pi_section_bytes_are_pinned() {
     assert!(body(&reduction(keys)).unwrap().ends_with(&golden));
 }
 
-/// [format] Pi fork accounting and durable body contract.
-/// The ledger charges the decode allowance before it allocates, and a
+/// [format] The ledger charges the decode allowance before it allocates, and a
 /// refused charge leaves nothing allocated.
 #[test]
 fn ledger_decode_funds_the_tree_before_any_allocation() {
@@ -230,7 +229,8 @@ fn ledger_decode_funds_the_tree_before_any_allocation() {
     assert_eq!(stats.allocations, 0, "unfunded H string: {stats:?}");
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] A ledger at the key cap round-trips; one more key refuses to encode
+/// and is corrupt on decode.
 #[test]
 fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     let mut keys = (0..PI_LEDGER_MAX_KEYS)
@@ -266,8 +266,7 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     assert_eq!(calls, 0);
 }
 
-/// [format] Pi fork accounting and durable body contract.
-/// Only the ledger may leave the shared body, only inside one Pi body's
+/// [format] Only the ledger may leave the shared body, only inside one Pi body's
 /// scope, and only from a Pi accumulator.
 #[test]
 fn moved_ledger_allowance_is_scoped_to_one_pi_body() {
@@ -342,8 +341,7 @@ fn corrupt_or_truncated_trailing_fields_are_refused() {
     refused(&[&bytes[..at], &e.into_bytes()].concat());
 }
 
-/// [format] Pi fork accounting and durable body contract.
-/// Every ledger key and digest is 64-char lower hex.
+/// [format] Every ledger key and digest is 64-char lower hex.
 #[test]
 fn ledger_h_values_must_be_lower_hex_digests() {
     for invalid in [
@@ -370,7 +368,8 @@ fn ledger_h_values_must_be_lower_hex_digests() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] The Pi row's tag, slot, format and allowlist pin are fixed, and it
+/// round-trips a populated body byte for byte.
 #[test]
 fn pi_registered_body_rows_preserve_populated_body_bytes() {
     use crate::durable_tail_store::DurableSource;
@@ -416,7 +415,8 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] The Pi row's bounded decode charges the active lease and refuses
+/// once the lease is spent.
 #[cfg(unix)]
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -466,7 +466,8 @@ fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
-/// [regress] Pi fork accounting and durable body contract.
+/// [regress] Fork usage of every entry kind stamped before the header is skipped
+/// and counted; usage at or after the header counts.
 #[test]
 fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
     use crate::local_resource_diagnostics::cache_lifecycle;
@@ -514,7 +515,8 @@ fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
     }
 }
 
-/// [regress] Pi fork accounting and durable body contract.
+/// [regress] A copy is judged by its envelope time, by the provider time only
+/// when the envelope has none; an invalid or missing time counts.
 #[test]
 fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
     let header = fork_header(Some(PARENT_CANARY), FORK_TIME);
@@ -559,7 +561,8 @@ fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] A fork persists only its parent flag and local header time, never
+/// the parent, and its decode funds the box.
 #[test]
 fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
     let mut original = reduction(ledger());
@@ -591,7 +594,8 @@ fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
     assert!(cloned.fork.as_ref().unwrap().parent_ref.is_none());
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] A Claude or Codex accumulator carrying fork state refuses to encode
+/// instead of dropping it.
 #[test]
 fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
     use crate::durable_tail_codec::DurableEmpty;
@@ -612,7 +616,8 @@ fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] Decoding a fork charges its box, and the heap bound counts the box
+/// and the parent's capacity.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native heap layout")]
 fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
@@ -662,7 +667,8 @@ fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [behaviour] The parent is looked up once per Full read, counted when unknown,
+/// and never kept for a later Tail.
 #[test]
 fn fork_parent_membership_is_full_read_only_and_never_retained() {
     use crate::local_resource_diagnostics::cache_lifecycle;
@@ -696,7 +702,7 @@ fn fork_parent_membership_is_full_read_only_and_never_retained() {
     }
 }
 
-/// [format] Pi fork accounting and durable body contract.
+/// [format] A header time without a parent is corrupt in both verify and decode.
 #[test]
 fn fork_section_semantics_agree_between_verify_and_decode() {
     let reduction = reduction(BTreeMap::new());
@@ -709,7 +715,8 @@ fn fork_section_semantics_agree_between_verify_and_decode() {
     assert!(take_body(&mut Dec::new(&bad)).is_err());
 }
 
-/// [regress] Pi fork accounting and durable body contract.
+/// [regress] A skipped copied usage entry still sets the model that later owned
+/// summaries bill under.
 #[test]
 fn copied_top_level_usage_keeps_the_model_for_owned_summaries() {
     let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);

@@ -405,9 +405,8 @@ impl<F: FnMut()> Drop for Reset<F> {
     }
 }
 
-// Two consecutive quiet restarts read no transcript bytes, emit
-// nothing and rewrite no record.
-/// [format] Pi native accounting and restore contract.
+/// [money] Two consecutive quiet restarts read no transcript bytes, emit
+/// nothing and rewrite no record.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -460,7 +459,8 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
 // index. `restored_behind_accepted.published` counts exactly this offer. An
 // equal-or-larger extent POSTs normally and leaves it at 0. The RAM-resident
 // cut is the in-process control below.
-/// [format] Pi native accounting and restore contract.
+/// [money] A restored Tail behind the accepted extent publishes the smaller
+/// body, equal to cold Full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -542,9 +542,9 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     whole_body(&cold, &restored);
 }
 
-/// [format] Pi native accounting and restore contract.
-/// An unchanged survivor below the accepted extent still finalizes its older
-/// body. Count the offer and the downward accepted/index transition explicitly.
+/// [money] An unchanged survivor below the accepted extent still finalizes its
+/// older body. Count the offer and the downward accepted/index transition
+/// explicitly.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -602,7 +602,8 @@ fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
 // accepted extent with the same head, its entry still in RAM, is classified
 // Shrunk by the certificate/ReadPlan and takes one A2 Full
 // `real_edit.<check>` outside the restore seam.
-/// [format] Pi native accounting and restore contract.
+/// [money] A RAM-resident cut below the accepted extent reads one real-edit
+/// Full equal to cold Full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -665,7 +666,8 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
 // survivor. "ram" resumes the owed RAM completion past new growth; "restart"
 // lost it, so the survivor restores and its Tail reads the held growth too.
 // Neither arm reads Full, and a later quiet restart POSTs nothing.
-/// [format] Pi native accounting and restore contract.
+/// [format] A failed receipt write holds with the survivor kept, then one Tail
+/// equal to cold Full replaces it.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -753,7 +755,8 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
 // record and Tails, so no second Full follows. Neither later stage refuses a
 // certificate: that count belongs to the rewrite alone. The shrink arm's Full
 // ends below accepted, but it is not a restored Tail.
-/// [format] Pi native accounting and restore contract.
+/// [money] A same-inode version rewrite reads one Full equal to cold Full after
+/// a restart, then restores and Tails.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -848,7 +851,8 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
 // format-3 record untouched. On re-upgrade that record's valid prefix
 // restores and the Tail catches up past the accepted extent; its own receipt
 // then restores again after the next restart.
-/// [format] Pi native accounting and restore contract.
+/// [format] After a downgrade reads Full without the store, the re-upgraded
+/// binary restores the kept record and Tails.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -919,7 +923,8 @@ fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
 // Pi beside a Claude row in one state directory and one process owner.
 // A held Pi record leaves the Claude sibling equal to its cold Full, and each
 // source's save/GC leaves the other's record; then both restore together.
-/// [format] Pi native accounting and restore contract.
+/// [money] Pi and Claude in one state directory each stay equal to their cold
+/// Full through a hold, save/GC and a joint restore.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1106,7 +1111,8 @@ fn assert_store_private(f: &PiDriver, mode: Mode) {
 // re-receipted record. The selector is validated at capture by the known-key
 // table: an unknown key is dropped identically in cold Full and restore + Tail
 // while a known key publishes.
-/// [format] Pi native accounting and restore contract.
+/// [format] No privacy canary reaches a Pi record, the store's counters or the
+/// diagnostics, and the selector is validated at capture.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1172,10 +1178,10 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     }
 }
 
-/// [format] Pi native accounting and restore contract.
-/// restore→Tail on a body with a header cwd and a first prompt: one Tail and
-/// the whole body equal to a cold Full, first-prompt title and money included.
-/// The record stores only its H fence; bounded replay rebuilds the prompt.
+/// [money] restore→Tail on a body with a header cwd and a first prompt: one
+/// Tail and the whole body equal to a cold Full, first-prompt title and money
+/// included. The record stores only its H fence; bounded replay rebuilds the
+/// prompt.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1207,9 +1213,8 @@ fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
     whole_body(&cold, &restored);
 }
 
-/// [format] Pi native accounting and restore contract.
-/// A first prompt beyond the head bound cannot create a durable content proof.
-/// The next growing restart therefore takes a counted native Full.
+/// [format] A first prompt beyond the head bound cannot create a durable content
+/// proof. The next growing restart therefore takes a counted native Full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1268,9 +1273,9 @@ fn pi_prompt_beyond_head_bound_uses_counted_growth_full() {
     whole_body(&cold, &grown);
 }
 
-/// [format] Pi native accounting and restore contract.
-/// Rewrite only unsampled head bytes, with unchanged length, then append.
-/// Certificate samples still match; the first-prompt H fence denies the record.
+/// [format] A same-length rewrite of unsampled head bytes, then an append,
+/// keeps the certificate samples, but the first-prompt H fence denies the
+/// record.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1341,7 +1346,8 @@ fn fork_copy_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
-/// [regress] Pi native accounting and restore contract.
+/// [money] A fork's Tail, restart and eviction routes equal cold Full at each
+/// cut, and no fork upload or record carries a canary.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1415,7 +1421,8 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
     }
 }
 
-/// [regress] Pi native accounting and restore contract.
+/// [regress] A fork of an unknown parent counts its skipped copies without
+/// uploading the parent, and its lower corrected money publishes.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),

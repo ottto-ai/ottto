@@ -1547,7 +1547,8 @@ fn pi_ledger_splits(
     proof.finish(&c, &disk);
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A plain Pi session split at every line boundary emits cold Full's
+/// money from the RAM Tail and the disk restore.
 #[test]
 fn pi() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1569,7 +1570,8 @@ fn pi() {
     assert_eq!(scan.snapshots[0].input_tokens, 20);
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A tool call, its result and the next turn split across pages emit
+/// cold Full's money on every route.
 #[test]
 fn pi_tool_turn() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1595,7 +1597,8 @@ fn pi_tool_turn() {
     );
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] Compaction and branch-summary usage counts once, in its own hour and
+/// model row, on every route.
 #[test]
 fn pi_summary_usage() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1640,7 +1643,8 @@ fn pi_summary_usage() {
     }
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] Standalone usage entries of a known and an unknown kind count under
+/// their provider on every route.
 #[test]
 fn pi_usage_entry_kinds() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1665,7 +1669,8 @@ fn pi_usage_entry_kinds() {
     assert_eq!((row.request_count, row.input_tokens), (2, 40));
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] The usage dedup ledger keeps counts, pairs and conflicts across every
+/// restore seal.
 #[test]
 fn pi_ledger_seal_boundaries() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1728,7 +1733,8 @@ fn pi_ledger_seal_boundaries() {
     );
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A message_end whose usage diverges from its message drops that usage
+/// on every route, before or after a pair.
 #[test]
 fn pi_divergent_pair_quarantine() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1796,7 +1802,8 @@ fn pi_no_response_id() {
     pi_usage_case("pi_no_response_id");
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A selector recorded before the seal applies to the usage after it on
+/// every route.
 #[test]
 fn pi_selector_across_seal() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1834,7 +1841,8 @@ fn pi_selector_across_seal() {
     );
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] Hour buckets, late times, invalid cost or time and overflowing usage
+/// resolve as in cold Full on every route.
 #[test]
 fn pi_time_and_invalid_evidence() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -2067,7 +2075,8 @@ fn pi_version_rewrite_after_tail() {
     pi_lifecycle_case("pi_version_rewrite_after_tail");
 }
 
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A restart between pages restores the previous page's record and
+/// emits cold Full's money.
 #[test]
 fn pi_restart_between_pages() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -2098,7 +2107,8 @@ fn pi_downgrade_then_reupgrade() {
 }
 
 #[cfg(unix)]
-/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
+/// [money] A mode-only change reads nothing, an mtime-only change reads Full,
+/// and later growth restores and Tails, each equal to cold Full.
 #[test]
 fn pi_acquisition_metadata_changes() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

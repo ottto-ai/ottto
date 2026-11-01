@@ -11365,7 +11365,8 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
 #[path = "durable_tail_pi_bound_tests.rs"]
 mod pi_bound;
 
-/// [format] Pi native accounting and restore contract.
+/// [format] A Claude or Codex live encode carrying fork state is refused,
+/// counted and writes no record.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {

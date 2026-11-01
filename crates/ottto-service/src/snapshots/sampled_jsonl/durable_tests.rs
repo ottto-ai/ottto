@@ -1169,8 +1169,8 @@ fn pi_lines(first_prompt: bool) -> Vec<String> {
     lines
 }
 
-/// [format] Pi native accounting and restore contract.
-/// A physical first prompt after 1 MiB cannot obtain a bounded durable proof.
+/// [format] A physical first prompt after 1 MiB cannot obtain a bounded durable
+/// proof.
 #[test]
 fn pi_first_prompt_beyond_head_bound_refuses_persistence() {
     let scratch = Scratch::new("pi-head-bound");
@@ -1322,11 +1322,10 @@ fn pi_restored_tail(path: &Path, grow: &[String]) -> OwnedJsonlParser {
     continued
 }
 
-/// [format] Pi native accounting and restore contract.
-/// restore→Tail equals a cold Full: money and every uploaded field, byte-equal,
-/// including the first-prompt and title fields, with no re-assignment from the
-/// Tail's prompt. With and without a header `cwd`, rederived from its marked
-/// header row.
+/// [money] restore→Tail equals a cold Full: money and every uploaded field,
+/// byte-equal, including the first-prompt and title fields, with no
+/// re-assignment from the Tail's prompt. With and without a header `cwd`,
+/// rederived from its marked header row.
 #[test]
 fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
     for cwd in [false, true] {
@@ -1347,9 +1346,8 @@ fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
     }
 }
 
-/// [format] Pi native accounting and restore contract.
-/// The title stays last-wins across a restore: a later title replaces the
-/// first-prompt title, and the first-prompt grouping facts stay.
+/// [money] The title stays last-wins across a restore: a later title replaces
+/// the first-prompt title, and the first-prompt grouping facts stay.
 #[test]
 fn pi_tail_title_follows_its_update_and_the_first_prompt_fields_stay() {
     let scratch = Scratch::new("pi-marked-title");
@@ -2953,8 +2951,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
 /// The label text the shape keeps for `SnapshotAccumulator.seen_pi_usage_keys`.
 const PI_LEDGER_LABEL: &str = "BTreeMap<String, PiUsageDedupState>";
 
-/// [format] Pi native accounting and restore contract.
-/// The recorded label, the shape line it prints, and the real types
+/// [format] The recorded label, the shape line it prints, and the real types
 /// behind it. Fails if the label changes or the ledger's type drifts.
 #[test]
 fn pi_only_e_label_is_recorded_and_names_the_real_ledger_type() {
@@ -3025,8 +3022,8 @@ fn twin_bytes<T: Durable>(value: &T) -> Result<Vec<u8>, Refuse> {
     Ok(e.into_bytes())
 }
 
-/// [format] Pi native accounting and restore contract.
-/// The two synthetic arms have the same shape, bytes, decode and refusal.
+/// [format] A labelled and an unlabelled synthetic `E` arm have the same shape,
+/// bytes, decode and refusal.
 #[test]
 fn labelled_e_arm_is_wire_identical_to_the_unlabelled_arm() {
     use labelled_e_twins::{labelled, unlabelled};
@@ -3091,9 +3088,10 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
     }
 }
 
-/// [format] Pi native accounting and restore contract.
-/// The codec/Tail rule runs on Linux too; the transition matrix additionally
-/// checks native disk receipts, eviction and the shared money oracle on macOS.
+/// [money] A Pi fork restored and Tailed at every physical line cut equals cold
+/// Full. The codec/Tail rule runs on Linux too; the transition matrix
+/// additionally checks native disk receipts, eviction and the shared money
+/// oracle on macOS.
 #[test]
 fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
     let source = SnapshotSource::Pi;
@@ -3162,7 +3160,8 @@ fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
     }
 }
 
-/// [format] Pi native accounting and restore contract.
+/// [behaviour] A fork whose usage is all copied is complete, publishes a zero
+/// revision and restores for a Tail.
 #[test]
 fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
     let scratch = Scratch::new("pi-fork-only-copies");
