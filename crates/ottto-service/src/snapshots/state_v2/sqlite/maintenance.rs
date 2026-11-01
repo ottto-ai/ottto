@@ -93,6 +93,63 @@ struct CommitLatency {
     #[serde(skip)]
     cursor: usize,
 }
+
+#[derive(Default, Serialize)]
+struct StoreGrowth {
+    page_count: Option<u64>,
+    freelist_count: Option<u64>,
+    page_size: Option<u64>,
+    kinds: BTreeMap<String, KindGrowth>,
+    shared_value_bytes: Option<u64>,
+    chunk_bytes: Option<u64>,
+    partial: bool,
+}
+#[derive(Serialize)]
+struct KindGrowth {
+    rows: u64,
+    key_bytes: u64,
+    value_bytes: u64,
+}
+impl StoreGrowth {
+    fn pages(&mut self, conn: &Connection) -> Result<()> {
+        self.page_count = Some(conn.query_row("PRAGMA page_count", [], |r| r.get(0))?);
+        self.freelist_count = Some(conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?);
+        self.page_size = Some(conn.query_row("PRAGMA page_size", [], |r| r.get(0))?);
+        Ok(())
+    }
+    fn rows(&mut self, conn: &Connection, started: Instant, budget: Duration) -> Result<()> {
+        ensure!(started.elapsed() < budget, "state_v2_work_budget");
+        let mut stmt = conn.prepare_cached(
+            "SELECT kind,count(*),sum(length(key_bytes)),sum(value_bytes) FROM records GROUP BY kind",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            // Never pass through an unregistered, possibly private label.
+            let kind = RecordKind::parse(&row.get::<_, String>(0)?)?;
+            self.kinds.insert(
+                kind.name().into(),
+                KindGrowth {
+                    rows: row.get(1)?,
+                    key_bytes: row.get(2)?,
+                    value_bytes: row.get(3)?,
+                },
+            );
+            ensure!(started.elapsed() < budget, "state_v2_work_budget");
+        }
+        self.shared_value_bytes = Some(conn.query_row(
+            "SELECT coalesce(sum(value_bytes),0) FROM shared_values",
+            [],
+            |r| r.get(0),
+        )?);
+        ensure!(started.elapsed() < budget, "state_v2_work_budget");
+        self.chunk_bytes = Some(conn.query_row(
+            "SELECT coalesce(sum(length(chunk)),0) FROM value_chunks",
+            [],
+            |r| r.get(0),
+        )?);
+        Ok(())
+    }
+}
 impl MaintenanceStats {
     pub(super) fn commit(&mut self, outcome: &DurableCommitOutcome, latency: Option<Duration>) {
         let slot = match outcome {
@@ -569,12 +626,38 @@ impl Sqlite {
                     && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
                 {
                     self.control("reference_check_attempt", &now)?;
+                    let gauge_due = self
+                        .read_control::<u64>("growth_gauge_attempt")?
+                        .map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
+                    let mut growth = if gauge_due {
+                        // Persist admission before sampling, including partial or failed work.
+                        self.control("growth_gauge_attempt", &now)?;
+                        Some(StoreGrowth {
+                            partial: true,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    };
                     self.conn()?.execute_batch("BEGIN")?;
-                    let result =
-                        limited(self.conn()?, size_budget(self.logical_bytes()?, 10), || {
-                            references::verify_counts(self.conn()?, extract)
-                        });
+                    let budget = size_budget(self.logical_bytes()?, 10);
+                    let started = Instant::now();
+                    let result = limited(self.conn()?, budget, || {
+                        if let Some(growth) = &mut growth {
+                            let _ = growth.pages(self.conn()?);
+                        }
+                        // Reference verification retains priority; sampling shares its VM budget.
+                        let result = references::verify_counts(self.conn()?, extract);
+                        if let Some(growth) = &mut growth {
+                            let complete = growth.rows(self.conn()?, started, budget).is_ok();
+                            growth.partial = !complete || growth.page_size.is_none();
+                        }
+                        result
+                    });
                     self.conn()?.execute_batch("ROLLBACK")?;
+                    if let Some(growth) = growth {
+                        super::super::telemetry::event("store_growth", &growth);
+                    }
                     match result {
                         Ok(()) => self.control("reference_check_success", &now)?,
                         Err(error)

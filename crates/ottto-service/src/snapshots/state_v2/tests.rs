@@ -997,6 +997,93 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
 
+/// [behaviour] idle maintenance emits counts once per persisted daily window.
+#[test]
+fn store_growth_gauge_is_daily_and_counts_only() {
+    fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
+        if matches!(&h.key, RowKey::Record { kind, .. } if kind.name() == "raw_hold.files") {
+            emit(&RowKey::RequestSet(1))?;
+        }
+        Ok(())
+    }
+    fn sample(db: &mut sqlite::Sqlite) -> Vec<serde_json::Value> {
+        let (_, records) =
+            crate::local_resource_diagnostics::capture(|| db.maintenance(true).unwrap());
+        records
+            .into_iter()
+            .filter_map(|r| r["counts"]["latest"].get("store_growth").cloned())
+            .collect()
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.reference_extractor(refs);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(
+        &mut tx,
+        &test_record("synthetic-private-key".into()),
+        b"synthetic-private-value",
+    );
+    put(&mut tx, &traversal("other-key".into()), &[b'x'; 600]);
+    tx.put(RowInput {
+        key: &RowKey::RequestSet(1),
+        fixed: &Fixed::RequestSet {
+            commitment: [5; 32],
+            refs: 1,
+        },
+        value_version: 1,
+        value: &[b'y'; 700],
+    })
+    .unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // Ordinary save/maintenance paths cannot start the daily sample.
+    let (_, records) =
+        crate::local_resource_diagnostics::capture(|| db.maintenance(false).unwrap());
+    assert!(!records.iter().any(|r| r["counts"].get("latest").is_some()));
+    let gauges = sample(&mut db);
+    assert_eq!(gauges.len(), 1);
+    let gauge = &gauges[0];
+    assert!(gauge["page_count"].as_u64().unwrap() > 0);
+    assert!(gauge["freelist_count"].as_u64().unwrap() <= gauge["page_count"].as_u64().unwrap());
+    assert!(gauge["page_size"].as_u64().unwrap().is_power_of_two());
+    assert_eq!(
+        gauge["kinds"]["raw_hold.files"],
+        serde_json::json!({
+            "rows": 1, "key_bytes": 21, "value_bytes": 23
+        })
+    );
+    assert_eq!(
+        gauge["kinds"]["scan_state.traversal"],
+        serde_json::json!({
+            "rows": 1, "key_bytes": 9, "value_bytes": 600
+        })
+    );
+    assert_eq!(gauge["shared_value_bytes"], 700);
+    assert_eq!(gauge["chunk_bytes"], 1300);
+    assert_eq!(gauge["partial"], false);
+    assert!(!gauge.to_string().contains("synthetic-private"));
+    assert!(sample(&mut db).is_empty());
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.reference_extractor(refs);
+    // An hourly retry may run, but cannot emit another daily sample after restart.
+    db.control("reference_check_success", &0_u64).unwrap();
+    db.control("reference_check_attempt", &0_u64).unwrap();
+    assert!(sample(&mut db).is_empty());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for name in [
+        "reference_check_success",
+        "reference_check_attempt",
+        "growth_gauge_attempt",
+    ] {
+        db.control(name, &(now - 86401)).unwrap();
+    }
+    assert_eq!(sample(&mut db).len(), 1);
+    assert!(sample(&mut db).is_empty());
+}
+
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
