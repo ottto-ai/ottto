@@ -10649,6 +10649,9 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 counts.identity_contract_latch.cleared +=
                     u64::from(index.claude_request_identity_contract_changed)
             });
+            if index.claude_request_identity_contract_changed {
+                evidence_owed::mark_unproven_at_latch_clear(index, census_window_end);
+            }
             index.claude_request_identity_contract_changed = false;
         }
         let mut unchanged_proof_roots = if unchanged_proof_gate && !proven.is_empty() {

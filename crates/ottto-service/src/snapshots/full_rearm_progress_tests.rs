@@ -503,6 +503,7 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
         },
     );
     let mut quarantined = older.clone();
+    let mut spent = older.clone();
     older.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
     let disposition = rearm.fold(&mut older, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
     // Main's clear, never owed: an older reader still sees the read, and the
@@ -536,6 +537,33 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     let pending = &quarantined.claude_usage_family_pending[OTHER_ROOT];
     assert!(pending.contract_unproven && !pending.invalid);
     assert_eq!(pending.census_window_end, "2026-08-01T07:10:00Z");
+
+    // Main's latch clear has routes without its identity-contract re-arm (a
+    // completion whose fence opens, the identity upgrade; here a spent
+    // cutover). Older-window pending kept across any of them is marked
+    // `contract_unproven`: it re-stamps only through its own stamp, so this
+    // unstamped one is read.
+    spent.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
+    rearm.fold(&mut spent, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    assert!(!spent.claude_request_identity_contract_changed, "main's clear");
+    let pending = &spent.claude_usage_family_pending[OTHER_ROOT];
+    assert!(pending.contract_unproven && pending.identity_contract.is_none());
+    evidence_owed::clear(spent.files.get_mut(&other_key).unwrap());
+    let mut candidate = test_candidate(PathBuf::from(&other_key));
+    candidate.source_file_fingerprint = spent.files[&other_key].source_file_fingerprint.clone();
+    let (mut decision, mut reason) = (CandidateDecision::Skip, None);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    evidence_owed::resolve(
+        &mut spent,
+        &mut evidence_owed::Page::default(),
+        &candidate,
+        WINDOW,
+        &mut decision,
+        &mut reason,
+    );
+    let owed = scope.finish().contract.evidence_owed;
+    assert_eq!((owed.refused_contract_unproven, owed.read), (1, 1));
+    assert_eq!(decision, CandidateDecision::Parse);
 }
 
 /// [regress] The first complete census's full re-arm clears every family

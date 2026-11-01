@@ -748,6 +748,23 @@ pub(super) fn latch_clearable(
     Some(exempt)
 }
 
+/// Main's latch clear, by any route (its identity-contract re-arm, a
+/// completion whose fence opens, the identity upgrade, a spent cutover): kept
+/// pending from another window, or not stamped with the contract this cycle
+/// runs under, is marked `contract_unproven`, so it re-stamps only through its
+/// own stamp, never through the cleared latch.
+pub(super) fn mark_unproven_at_latch_clear(index: &mut ScanIndex, census_window_end: &str) {
+    if !enabled() {
+        return;
+    }
+    let current = EvidenceContract::current(index);
+    for pending in index.claude_usage_family_pending.values_mut() {
+        if pending.census_window_end != census_window_end || pending.identity_contract != current {
+            pending.contract_unproven = true;
+        }
+    }
+}
+
 /// The admission drop: an unfinished admission still owes
 /// due paths its existing selector has not offered.
 pub(super) fn due_unoffered(
