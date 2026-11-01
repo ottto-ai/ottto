@@ -687,12 +687,25 @@ fn cold_row(name: &str) {
             !crate::snapshots::state_v2_usage_head_only(&pages[1].index, ROOT),
             "the cold page loads its stored family"
         );
+        // Account placement is per usage row and identity part; request
+        // evidence carries only the organization.
         let accounts = pages[0]
             .scan
             .snapshots
             .iter()
-            .flat_map(|item| &item.request_evidence)
-            .filter_map(|evidence| evidence.provider_workspace_hash.as_ref())
+            .flat_map(|item| {
+                item.model_usage
+                    .iter()
+                    .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+            })
+            .flat_map(|row| {
+                row.account_identifier_hash.iter().chain(
+                    row.identity_parts
+                        .iter()
+                        .flatten()
+                        .filter_map(|part| part.account_identifier_hash.as_ref()),
+                )
+            })
             .collect::<std::collections::BTreeSet<_>>();
         assert!(accounts.len() >= 2, "positive control: two accounts placed");
         let [resident, cold] = pages.each_ref().map(routed);
