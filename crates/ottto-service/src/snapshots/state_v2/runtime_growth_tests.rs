@@ -151,7 +151,8 @@ impl Fixture {
         .unwrap();
         let _lock = crate::snapshots::CheckpointLock::acquire(&self.path).unwrap();
         assert_eq!(
-            sampled_audit::publish_growth_claim_receipt(index, &self.path).is_ok(),
+            sampled_audit::publish_growth_claim_receipt(index, &self.path, index.generation)
+                .is_ok(),
             confirmed
         );
     }
@@ -351,7 +352,7 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     ));
     {
         let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
-        sampled_audit::publish_growth_claim_receipt(&claim, &f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path, claim.generation).unwrap();
     }
     assert_eq!(
         sampled_audit::own_growth_claim_generation(&old, &f.path),
@@ -407,100 +408,58 @@ fn admit_without_hydrate(
         .is_some();
     (admitted, untouched)
 }
-fn renamed(
-    rows: &BTreeMap<String, sampled_audit::GrowthRetention>,
-    key: &str,
-) -> BTreeMap<String, sampled_audit::GrowthRetention> {
-    rows.iter()
-        .map(|(name, state)| {
-            let name = if name == key {
-                "claimed"
-            } else {
-                name.as_str()
-            };
-            (name.to_owned(), state.clone())
-        })
-        .collect()
-}
 fn durable(index: &ScanIndex) -> ScanIndex {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     let mut guard = runtime.session.lock().unwrap();
     super::super::money_test_support::hydrate_resident(&mut guard.as_mut().unwrap().db)
 }
 
-/// [money] The one-transaction claim commits the hydrate path's growth rows
-/// (claim, merge and pruning) at its generation, publishes the same receipt,
-/// keeps the next save's lineage, and decodes no committed graph.
+/// [money] One transaction commits exactly the expected growth rows at G+1
+/// (the claim, the save's merge and pruning), publishes the lineage receipt,
+/// paces the next Full, keeps the next save's lineage, and decodes no graph.
 #[test]
-fn row_claim_matches_hydrated_claim_without_a_hydrate() {
+fn row_claim_commits_expected_rows_without_a_hydrate() {
     let now = crate::snapshots::sampled_scan::now_seconds();
-    let claims = || {
-        BTreeMap::from([
-            (
-                "/synthetic/expired.jsonl".into(),
-                debt(Some(now - INTERVAL - 1)),
-            ),
-            ("/synthetic/recent.jsonl".into(), debt(Some(now - 1))),
-        ])
-    };
-    // The shipped hydrate path is the oracle.
-    let hydrated = Fixture::with_claims(claims());
-    let mut oracle = hydrated.load();
-    let context = oracle.v2().growth_claim_context.clone().unwrap();
-    assert!(
-        sampled_audit::claim_growth_hydrated(&mut oracle, &context, &hydrated.key, now).unwrap()
-    );
-
-    let f = Fixture::with_claims(claims());
+    let (expired, recent) = ("/synthetic/expired.jsonl", "/synthetic/recent.jsonl");
+    let f = Fixture::with_claims(BTreeMap::from([
+        (expired.into(), debt(Some(now - INTERVAL - 1))),
+        (recent.into(), debt(Some(now - 1))),
+    ]));
     let mut index = f.load();
     let candidate = f.candidate(&index);
     let (claimed, untouched) = admit_without_hydrate(&mut index, &candidate, now);
     assert!(claimed);
     assert!(untouched, "no committed graph was hydrated");
     with_state(&f.path, |state| {
-        assert!(state.save_digests.is_none(), "as after a claim-only save");
+        assert!(
+            state.save_digests.is_none(),
+            "the next save reads its baseline"
+        );
         Ok(())
     })
     .unwrap();
     assert_eq!(
         sampled_audit::own_growth_claim_generation(&index, &f.path),
-        sampled_audit::own_growth_claim_generation(&oracle, &hydrated.path)
-    );
-    assert_eq!(
-        sampled_audit::own_growth_claim_generation(&index, &f.path),
         Some(2)
     );
-    assert_eq!(
-        renamed(&index.v2().growth_retention, &f.key),
-        renamed(&oracle.v2().growth_retention, &hydrated.key),
-        "the working page merges the same committed claim"
-    );
-    let (row, expected) = (durable(&index), durable(&oracle));
-    assert_eq!(row.generation, expected.generation);
-    assert_eq!(
-        renamed(&row.v2().growth_retention, &f.key),
-        renamed(&expected.v2().growth_retention, &hydrated.key)
-    );
-    assert!(!row
-        .v2()
-        .growth_retention
-        .contains_key("/synthetic/expired.jsonl"));
-    assert_eq!(
-        serde_json::to_value(&row.v2().growth_retention[&f.key]).unwrap()["last_growth_full_unix"],
-        now
-    );
+    // Durable: the claim at `now`; the expired orphan pruned; recent kept.
+    let expected = BTreeMap::from([
+        (f.key.clone(), debt(Some(now))),
+        (recent.to_owned(), debt(Some(now - 1))),
+    ]);
+    let committed = durable(&index);
+    assert_eq!(committed.generation, 2);
+    assert_eq!(committed.v2().growth_retention, expected);
+    // The working page merges the claim and keeps its own rows.
+    let mut working = expected.clone();
+    working.insert(expired.to_owned(), debt(Some(now - INTERVAL - 1)));
+    assert_eq!(index.v2().growth_retention, working);
 
-    // The pacing gate now refuses a second Full, on both routes.
     assert!(!admit_without_hydrate(&mut index, &candidate, now + INTERVAL - 1).0);
-    // The working page's next ordinary save extends the claim lineage.
     index.save(&f.path).unwrap();
-    oracle.save(&hydrated.path).unwrap();
-    let (row, expected) = (durable(&index), durable(&oracle));
-    assert_eq!((row.generation, expected.generation), (3, 3));
-    assert_eq!(
-        renamed(&row.v2().growth_retention, &f.key),
-        renamed(&expected.v2().growth_retention, &hydrated.key)
-    );
+    let committed = durable(&index);
+    assert_eq!(committed.generation, 3);
+    assert_eq!(committed.v2().growth_retention, expected);
 }
 
 /// [money] A stale generation is refused before any write: selection keeps

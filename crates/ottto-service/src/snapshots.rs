@@ -50020,6 +50020,8 @@ impl ScanIndex {
         }
         self.save_internal(path, read_limit, false, Some(owner))
     }
+    /// Test-only since growth claims commit their rows directly.
+    #[cfg(test)]
     fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
         self.save_internal(path, None, true, None)
     }

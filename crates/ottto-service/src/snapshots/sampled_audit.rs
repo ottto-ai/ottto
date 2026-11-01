@@ -2265,13 +2265,13 @@ fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Called by save while the checkpoint lock still protects this publication.
-/// A same-generation replacement must not become a claim-lineage CAS bypass.
-pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Result<()> {
-    publish_growth_receipt_at(index, path, index.generation)
-}
-/// The lineage's own claim commit at `generation`, under the same lock.
-fn publish_growth_receipt_at(index: &ScanIndex, path: &Path, generation: u64) -> Result<()> {
+/// Called after the claim's commit at `generation`, still under the checkpoint
+/// lock. A same-generation replacement must not become a claim-lineage CAS bypass.
+pub(super) fn publish_growth_claim_receipt(
+    index: &ScanIndex,
+    path: &Path,
+    generation: u64,
+) -> Result<()> {
     let context = index
         .v2()
         .growth_claim_context
@@ -2313,6 +2313,8 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
 }
 
+/// The claim is one store transaction CAS'd on this lineage's G; no
+/// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
     if index
         .v2()
@@ -2328,23 +2330,6 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .growth_claim_context
         .clone()
         .context("growth Full needs a committed scan index")?;
-    if let Some(admitted) = claim_growth_row(index, &context, key, now)? {
-        return Ok(admitted);
-    }
-    claim_growth_hydrated(index, &context, key, now)
-}
-
-/// v2 route: the claim is one store transaction CAS'd on this lineage's G,
-/// with the same decisions as the hydrate path and no committed graph decode.
-fn claim_growth_row(
-    index: &mut ScanIndex,
-    context: &GrowthClaimContext,
-    key: &str,
-    now: u64,
-) -> Result<Option<bool>> {
-    if index.v2().persistence_v2.is_none() {
-        return Ok(None);
-    }
     let _lock = CheckpointLock::acquire(&context.path)?;
     authenticate_growth_generation(index, &context.path)?;
     let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
@@ -2377,73 +2362,14 @@ fn claim_growth_row(
             ));
             true
         };
-    let Some((admitted, committed)) =
-        state_v2::claim_growth_locked(&context.path, index, expected, key, decide)?
-    else {
-        return Ok(None);
-    };
+    let (admitted, committed) =
+        state_v2::claim_growth_locked(&context.path, index, expected, key, decide)?;
     if admitted {
         let generation = expected.checked_add(1).context("growth claim generation")?;
-        publish_growth_receipt_at(index, &context.path, generation)?;
+        publish_growth_claim_receipt(index, &context.path, generation)?;
     }
     merge_growth_claims(&mut index.v2_mut().growth_retention, &committed);
-    Ok(Some(admitted))
-}
-
-/// v1 or no v2 route: claim through one committed load and a claim-only save.
-pub(super) fn claim_growth_hydrated(
-    index: &mut ScanIndex,
-    context: &Arc<GrowthClaimContext>,
-    key: &str,
-    now: u64,
-) -> Result<bool> {
-    let recent = |state: &GrowthRetention| growth_claim_recent(state, now);
-    // Decode the committed index, not the working page: persisting a claim
-    // must never publish unaccepted bodies, progress or census changes.
-    authenticate_growth_generation(index, &context.path)?;
-    let mut committed = ScanIndex::load(&context.path)?;
-    anyhow::ensure!(
-        growth_owner_matches(&committed, context),
-        "growth claim owner changed"
-    );
-    authenticate_growth_generation(index, &context.path)?;
-    let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
-    anyhow::ensure!(
-        committed.generation == expected,
-        "growth claim needs index reload"
-    );
-    committed.require_persistence_available()?;
-    if committed.v2().growth_retention.get(key).is_some_and(recent)
-        || committed.decode_holds.contains("growth_retention", key)
-    {
-        merge_growth_claims(
-            &mut index.v2_mut().growth_retention,
-            &committed.v2().growth_retention,
-        );
-        return Ok(false);
-    }
-    let mut claim = index
-        .v2()
-        .growth_retention
-        .get(key)
-        .cloned()
-        .unwrap_or_default();
-    claim.last_growth_full_unix = Some(now);
-    committed
-        .v2_mut()
-        .growth_retention
-        .insert(key.to_owned(), claim);
-    // Existing save owns lock, full CAS, atomic publication and fsync. If it
-    // fails (including ambiguous publication), no acquisition is authorized.
-    committed.v2_mut().growth_claim_context = Some(context.clone());
-    committed.save_growth_claim(&context.path)?;
-    let _lock = CheckpointLock::acquire(&context.path)?;
-    publish_growth_claim_receipt(&committed, &context.path)?;
-    merge_growth_claims(
-        &mut index.v2_mut().growth_retention,
-        &committed.v2().growth_retention,
-    );
-    Ok(true)
+    Ok(admitted)
 }
 
 /// Identity has already been checked by open_and_identify and ReadPlan.
