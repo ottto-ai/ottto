@@ -4604,8 +4604,10 @@ pub struct ScanIndexEntry {
     /// owes this file's request evidence to the current census window. Only
     /// census-window debt is kept this way; a read the file really needs
     /// clears the fingerprint as main does. Never set while the switch is OFF.
-    /// Downgrade from ON state means a fresh walk; an older binary drops the
-    /// bit (a state-v2 store refuses it instead, see `identity_contract`).
+    /// An older v1 binary drops the bit and treats such entries as observed;
+    /// must-read debt stays visible to it as an empty fingerprint. After a
+    /// downgrade from ON, start a fresh walk. A state-v2 store refuses the
+    /// bit instead (see `identity_contract`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
 }
