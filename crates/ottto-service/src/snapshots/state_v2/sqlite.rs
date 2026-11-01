@@ -449,6 +449,15 @@ pub(in crate::snapshots) fn sqlite_uri(path: &Path, query: &str) -> Result<Strin
     uri.push_str(query);
     Ok(uri)
 }
+// Required store work waits for lock availability. Maintenance temporarily
+// installs its own bounded wait so an external reader can defer a checkpoint.
+fn wait_for_busy(retries: i32) -> bool {
+    if retries == 10 {
+        super::telemetry::event("sqlite_busy_slow_alarm", &true);
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    true
+}
 fn settings(conn: &Connection, import: bool) -> Result<()> {
     // SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
     // OS installation. Refuse an accidental older link before using the store.
@@ -465,7 +474,7 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
         &serde_json::json!({"version":engine.0,"source_id":engine.1,"bundled":true}),
     );
     conn.set_prepared_statement_cache_capacity(32);
-    conn.busy_timeout(BUSY)?;
+    conn.busy_handler(Some(wait_for_busy))?;
     conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;")?;
     for (name, expected) in [
         ("synchronous", 2_i64),
@@ -645,7 +654,7 @@ impl Sqlite {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        probe.busy_timeout(BUSY)?;
+        probe.busy_handler(Some(wait_for_busy))?;
         if migrations::revision(&probe)? > migrations::REVISION {
             super::telemetry::event("newer_schema_refused", &1);
             bail!(super::Hold::NewerSchema);
@@ -688,6 +697,7 @@ impl Sqlite {
             before.dev() == after.dev() && before.ino() == after.ino(),
             "state_v2_object_changed"
         );
+        conn.busy_handler(Some(wait_for_busy))?;
         migrations::supported(&conn)?;
         settings(&conn, false)?;
         migrations::run(&conn)?;
@@ -883,13 +893,16 @@ impl Sqlite {
             }
         };
         let tuple = self.conn().and_then(|conn| {
-            Ok(conn.query_row(command, [], |r| {
+            conn.busy_timeout(BUSY)?;
+            let result = conn.query_row(command, [], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                 ))
-            })?)
+            });
+            conn.busy_handler(Some(wait_for_busy))?;
+            Ok(result?)
         });
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
@@ -1717,42 +1730,28 @@ fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
     );
     Ok(())
 }
-unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
-    // Callback is installed only for quick_check and removed before the stack
-    // deadline is dropped. No panic crosses the C boundary.
-    let deadline = unsafe { &*(raw.cast::<Instant>()) };
-    (Instant::now() >= *deadline) as std::ffi::c_int
-}
 fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
-    let mut deadline = Instant::now()
-        .checked_add(budget)
-        .context("state_v2_work_budget")?;
+    #[cfg(test)]
+    let budget = open_check_tests::budget(budget);
     super::telemetry::event("quick_check", &1);
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            conn.handle(),
-            1000,
-            Some(progress),
-            (&mut deadline as *mut Instant).cast(),
-        );
-    }
+    // An interrupted check starts over on every open. Finish the finite scan;
+    // the former deadline is an alarm threshold, never an ingestion gate.
+    let started = Instant::now();
     let result = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0));
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
-    }
-    let checked = result.map_err(|error| {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
-            anyhow::Error::from(super::Hold::IntegrityRetry)
-        } else {
-            error.into()
-        }
-    })?;
+    let elapsed = started.elapsed();
+    super::telemetry::event("quick_check_ms", &elapsed.as_millis());
+    super::telemetry::event("quick_check_slow_alarm", &(elapsed > budget));
+    let checked = result?;
     ensure!(
         checked == "ok",
         "state_v2_integrity_requires_explicit_repair"
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sqlite/open_check_tests.rs"]
+mod open_check_tests;
 
 #[cfg(test)]
 #[path = "sqlite/fixtures.rs"]
@@ -1776,7 +1775,7 @@ impl Sqlite {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(BUSY)?;
+        conn.busy_handler(Some(wait_for_busy))?;
         conn.execute_batch("BEGIN")?;
         migrations::check_current(&conn)?;
         migrations::writer_supported(&conn)?;

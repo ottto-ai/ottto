@@ -1655,9 +1655,9 @@ fn key_admission_rejects_invalid_keys_before_sqlite_reads() {
     assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
 }
 
-/// [format] overdue external reader is a breach and recovery precedes collection.
+/// [format] overdue external reader alarms and defers erasure without holding collection.
 #[test]
-fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
+fn overdue_external_reader_alarms_and_defers_erasure_without_holding_collection() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("private".into());
@@ -1669,10 +1669,14 @@ fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
     put(&mut tx, &key, b"replacement");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     age_erasure(&mut db, 25 * 3600);
-    assert!(db.before_collection().is_err());
+    db.before_collection().unwrap();
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_breaches"], 1);
-    assert_eq!(stats["erasure_resume_refusals"], 1);
+    assert_eq!(stats["erasure_resume_refusals"], 0);
+    assert_eq!(
+        telemetry::take_thread_event_for_test("erasure_busy_deferred_alarm"),
+        Some(serde_json::json!(true))
+    );
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     drop(reader);
     // Recovery does not wait for the failed attempt's one-hour backoff.

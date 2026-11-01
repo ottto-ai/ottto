@@ -79,6 +79,9 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
+| `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without a deadline; a slow scan never holds collection. |
+| `sqlite_busy_slow_alarm`, `vacuum_slow_alarm` | Required SQLite lock waits beyond 100 ms and VACUUM beyond its former work allowance alarm while work continues. |
+| `maintenance_lock_deferred_alarm`, `erasure_busy_deferred_alarm`, `wal_debt_alarm` | Maintenance lock contention or excess checkpoint debt defers maintenance with an alarm while collection continues. Erasure obligations remain pending until verified completion. |
 | `db_unavailable_cause` | Latest v2 storage-hold cause: `at` = outermost static `state_v2_*` code, `cause` = innermost static code, `io_<ErrorKind>` or `sqlite_<extended code>`. Never messages, paths, keys or values. |
 | `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
 | `ack_receipt_inventory` | Companion count/bytes/bounded inventory during maintenance; does not certify a recovery set or authorize GC. |
@@ -110,10 +113,14 @@ excuse delay: acquisition yields to maintenance by the forced pause, normally
 at 20 hours, after idle attempts from 12 hours. Another process's lock that
 prevents timely purge is a breach. A due pause reserves the next checkpoint-lock
 turn ahead of this process's new normal work and waits up to two seconds for
-an existing owner; own-lock refusal remains a failure and an overdue breach.
-Overdue recovery and recovery from a failed idle purge run before preparation
-continues or acquisition resumes; retry/cadence cooldowns cannot defer them.
-Failure keeps debt and pauses collection. Prior committed data remains committed.
+an existing owner. A lock timeout defers maintenance with an alarm, retaining
+any overdue breach and erasure debt while collection continues.
+Overdue recovery and recovery from a failed idle purge attempt run before
+preparation continues or acquisition resumes; retry/cadence cooldowns cannot
+defer them. VACUUM completes without a work deadline. An external reader that
+prevents TRUNCATE keeps erasure debt pending and raises an alarm without holding
+collection. Other recovery failures, including insufficient disk space, retain
+their existing collection refusal. Prior committed data remains committed.
 
 Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,
 `erasure_overdue`, `erasure_breaches`, `maintenance_pauses`,
