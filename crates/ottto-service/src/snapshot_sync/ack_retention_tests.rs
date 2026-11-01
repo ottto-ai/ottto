@@ -909,7 +909,9 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
 }
 
 #[test]
-fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_failures() {
+fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures() {
+    // Size is not a bound: capacity follows the entity count.
+    const ENTITIES: usize = 50;
     for failure in ["crash", "progress_cas", "index_cas"] {
         let scratch = crate::test_scratch::ScratchDir::new("ack-retirement-crash");
         let index_path = scratch.join("index.json");
@@ -917,7 +919,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
         let mut progress = test_upload_progress();
         let namespace = progress.destination_namespace_hash.clone();
         let mut committed = ScanIndex::default();
-        for entity in 0..5000 {
+        for entity in 0..ENTITIES {
             let fp = format!("{entity:064x}");
             committed
                 .codex_state_only_snapshot_fingerprints
@@ -930,7 +932,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
         committed.save(&index_path).unwrap();
         progress.save(&progress_path).unwrap();
         progress.configure_ack_capacity(&committed);
-        assert_eq!(progress.ack_capacity, 5000 + 4096);
+        assert_eq!(progress.ack_capacity, ENTITIES + 4096);
         let mut selected = committed.clone();
         selected.codex_state_only_snapshot_fingerprints.clear();
         progress
@@ -947,7 +949,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
                 .unwrap()
                 .bodies
                 .len(),
-            5000
+            ENTITIES
         );
         drop((committed, selected, progress)); // crash before any progress cleanup
 
@@ -956,9 +958,10 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
             SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
                 .unwrap();
         progress.configure_ack_capacity(&saved);
-        assert_eq!(progress.accepted_fingerprints.len(), 5001);
+        assert_eq!(progress.accepted_fingerprints.len(), ENTITIES + 1);
         assert_eq!(progress.ack_capacity, 4096);
-        assert!(progress.admit_ack_batch(1).is_err());
+        // Handed-off ACKs no longer grant slots: one past the 4096 headroom stops.
+        assert!(progress.admit_ack_batch(4096 - ENTITIES).is_err());
         if failure == "progress_cas" {
             let mut concurrent = progress.clone();
             concurrent.save(&progress_path).unwrap();
@@ -967,7 +970,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
                 .is_err());
             assert_eq!(
                 progress.accepted_fingerprints.len(),
-                5001,
+                ENTITIES + 1,
                 "failed cleanup restores memory"
             );
             assert_eq!(
@@ -975,7 +978,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
                     .unwrap()
                     .accepted_fingerprints
                     .len(),
-                5001
+                ENTITIES + 1
             );
             assert!(ScanIndex::load(&index_path)
                 .unwrap()
