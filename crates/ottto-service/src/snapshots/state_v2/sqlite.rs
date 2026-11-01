@@ -541,8 +541,8 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: Some(kinds::references),
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -740,8 +740,8 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: Some(kinds::references),
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -851,9 +851,8 @@ impl Sqlite {
     }
 }
 
-impl Store for Sqlite {
-    type Txn<'a> = Txn<'a>;
-    fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
+impl Sqlite {
+    pub(super) fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
             telemetry::row_cap_reset();
             self.save_failure = None;
@@ -884,7 +883,7 @@ impl Store for Sqlite {
             dirty_rows: 0,
         })
     }
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
+    pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         if mode == CheckpointMode::Purge && self.vacuum().is_err() {
             self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
@@ -1016,14 +1015,7 @@ fn scan_record_range(
         values.push(SqlValue::Integer(i64::try_from(*position)?));
         filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
     }
-    values.push(SqlValue::Integer(limit as i64));
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
-        projection(Table::Records),
-        values.len()
-    ))?;
-    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    record_headers(conn, &filter, values, "key_bytes,position", limit)
 }
 fn scan_record_key(
     conn: &Connection,
@@ -1042,15 +1034,25 @@ fn scan_record_key(
         values.push(SqlValue::Integer(i64::try_from(position)?));
         filter.push_str(" AND position>?3");
     }
+    record_headers(conn, &filter, values, "position", limit)
+}
+fn record_headers(
+    conn: &Connection,
+    filter: &str,
+    mut values: Vec<SqlValue>,
+    order: &str,
+    limit: usize,
+) -> Result<Vec<Header>> {
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
+        "SELECT {} FROM records WHERE {filter} ORDER BY {order} LIMIT ?{}",
         projection(Table::Records),
         values.len()
     ))?;
     let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
     ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
     if let RowKey::Meta(name) = &h.key {
@@ -1122,18 +1124,11 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
 /// The semantic encoder owns path classification, including paths inside raw
 /// holds and packed maps AND the primary key. Only actual PL strings are
 /// emitted, through a bounded sink before allocation. No table field knowledge
-/// belongs here. Missing extractors refuse mutations, never infer privacy.
+/// belongs here. The default extractors use the semantic encoder.
 pub(super) type PathExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
 pub(super) type ReferenceExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()>;
-fn missing_path_extractor(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    bail!("state_v2_private_path_extractor_required")
-}
 struct StoredValue<'a> {
     conn: &'a Connection,
     header: &'a Header,
@@ -1144,9 +1139,11 @@ impl Value for StoredValue<'_> {
     }
 }
 impl Sqlite {
+    #[cfg(test)]
     pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
         self.paths = paths;
     }
+    #[cfg(test)]
     pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
         self.references = Some(refs);
     }

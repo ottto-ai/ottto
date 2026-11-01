@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped Mapper writes,
+//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;

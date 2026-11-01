@@ -2,7 +2,7 @@
 //! store; any other load stays v1 before publication. Custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure, Context};
-use import::{Mapper, Pace, Pause};
+use import::{Pace, Pause};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -322,7 +322,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = Mapper.hydrate_context(&mut session.db)?;
+                        let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         // Digest the exact persisted image: a save then also
                         // persists whatever normalization changes.
@@ -346,15 +346,12 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
             let (deadline, work) = purge_policy();
             let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
                 .map_err(Hold::storage)?;
-            db.path_extractor(Mapper::private_paths);
-            db.reference_extractor(Mapper::references);
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
-            let (mut index, mut cx) = Mapper
-                .hydrate_context(&mut db)
-                .context("state_v2_open_hydrate")?;
+            let (mut index, mut cx) =
+                import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
@@ -393,7 +390,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                 telemetry::event("import_restart_attempt", &1);
             }
             // Inventory precedes v1 recovery/decoding and never creates artifacts.
-            match Mapper.inventory_context(path) {
+            match import::inventory_context(path) {
                 Ok(original) => {
                     state.inventory_ready = true;
                     state.original = original;
@@ -487,7 +484,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            let generation = Mapper.import_generation(index)?;
+            let generation = import::import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
@@ -500,11 +497,9 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             telemetry::baseline(path);
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
-            db.path_extractor(Mapper::private_paths);
-            db.reference_extractor(Mapper::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
-            let cx = Mapper.import_graph(&mut db, index, state.original.as_ref())?;
+            let cx = import::import_graph(&mut db, index, state.original.as_ref())?;
             original.unchanged()?;
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
@@ -529,12 +524,10 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         let (deadline, work) = purge_policy();
         let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
             .map_err(Hold::storage)?;
-        db.path_extractor(Mapper::private_paths);
-        db.reference_extractor(Mapper::references);
         db.audit_headers()?;
         let stamp = db.stamp()?;
         ensure!(
-            stamp.0 == Mapper.import_generation(index)?,
+            stamp.0 == import::import_generation(index)?,
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
@@ -615,7 +608,7 @@ fn save_with_custody(
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let (previous, mut cx) = Mapper.hydrate_context(&mut session.db)?;
+                let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
                 session.cx = cx;
@@ -634,7 +627,7 @@ fn save_with_custody(
                     path,
                     owner,
                 )?;
-                let digests = Mapper.save(
+                let digests = import::save(
                     &mut session.db,
                     &identity,
                     previous,

@@ -302,14 +302,6 @@ pub(super) trait Transaction {
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
-pub(super) trait Store {
-    type Txn<'a>: Transaction
-    where
-        Self: 'a;
-    fn begin(&mut self, mode: TxnMode) -> Result<Self::Txn<'_>>;
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult;
-}
-
 const KEY_BYTES: usize = 4096;
 const HEADER_BYTES: usize = 512;
 const CONTROL_BYTES: u64 = 16 * 1024;

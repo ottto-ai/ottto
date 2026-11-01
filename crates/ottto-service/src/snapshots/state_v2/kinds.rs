@@ -81,8 +81,8 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 /// Decode all four groups from one snapshot into an unpublished graph. Account
 /// skeletons precede census-owned request membership; no partial graph escapes.
 #[cfg(test)]
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+pub(super) fn hydrate(
+    store: &mut sqlite::Sqlite,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;

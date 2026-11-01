@@ -143,7 +143,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
             &fixture(),
             BTreeMap::new(),
         );
-        assert!(import::Mapper.hydrate_context(&mut db).is_ok());
+        assert!(import::hydrate_context(&mut db).is_ok());
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let mut rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 64)
@@ -155,7 +155,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         assert!(tx.delete(&h.key).unwrap());
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         assert!(
-            import::Mapper.hydrate_context(&mut db).is_err(),
+            import::hydrate_context(&mut db).is_err(),
             "missing {kind} must not look like empty custody"
         );
     }
@@ -201,7 +201,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
             drop(tx);
         }
         let counts = assert_refs(&mut db);
-        let restored = import::Mapper.hydrate_context(&mut db).unwrap().0;
+        let restored = import::hydrate_context(&mut db).unwrap().0;
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
             serde_json::to_vec(if commit { &next } else { &prev }).unwrap()
@@ -247,7 +247,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
     let path = scratch.join("claude_code-scan-index.json");
     std::fs::write(&path, br#"{"schema_version":2,"files":{}}"#).unwrap();
     assert!(
-        import::Mapper.inventory_context(&path).is_ok(),
+        import::inventory_context(&path).is_ok(),
         "valid original must reach inventory"
     );
     // #915 has no mapper on this main: every prospective representation is
@@ -290,7 +290,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         let bytes = serde_json::to_vec(&raw).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(
-            import::Mapper.inventory_context(&path).map(|_| ()),
+            import::inventory_context(&path).map(|_| ()),
             expected,
             "{case} {field}"
         );
@@ -319,7 +319,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    assert!(import::Mapper.hydrate_context(&mut db).is_err());
+    assert!(import::hydrate_context(&mut db).is_err());
 }
 
 /// [money] money large memberships segment and preserve exact shared domains.
@@ -347,7 +347,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         &index,
         BTreeMap::new(),
     );
-    let restored = import::Mapper.hydrate_context(&mut db).unwrap().0;
+    let restored = import::hydrate_context(&mut db).unwrap().0;
     let mut expected = index;
     expected.generation = 1;
     assert_eq!(
@@ -378,7 +378,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         drop(tx);
     }
     assert_eq!(
-        serde_json::to_vec(&import::Mapper.hydrate_context(&mut db).unwrap().0).unwrap(),
+        serde_json::to_vec(&import::hydrate_context(&mut db).unwrap().0).unwrap(),
         serde_json::to_vec(&expected).unwrap()
     );
 }

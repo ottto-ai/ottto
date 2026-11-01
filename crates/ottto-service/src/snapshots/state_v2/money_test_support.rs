@@ -30,8 +30,8 @@ pub(super) fn populate(
     presence: BTreeMap<String, bool>,
 ) -> sqlite::Sqlite {
     let mut db = sqlite::Sqlite::create_import(path).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-money-custody".into(),
@@ -53,8 +53,8 @@ pub(super) fn populate(
     // tests must operate on a completed import reopened in live WAL mode.
     db.finish_import().unwrap();
     let mut db = sqlite::Sqlite::open(path, &identity).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
     db
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
     let mut db = populate(path, index, BTreeMap::new());
-    import::Mapper.hydrate_context(&mut db).unwrap().0
+    import::hydrate_context(&mut db).unwrap().0
 }
 
 /// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt
@@ -130,8 +130,8 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         fence_generation: index.generation + 1,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
-    db.path_extractor(import::Mapper::private_paths);
-    db.reference_extractor(import::Mapper::references);
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();
