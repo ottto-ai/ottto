@@ -620,7 +620,7 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
             next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
         }
         // Claim-only skips window retirement, so a clean family stays clean.
-        let saved = import::ClaudeMapper
+        let saved = import::Mapper
             .save(&mut db, &identity, committed, &mut next, &mut cx, true)
             .err()
             .map(|error| error.to_string());
