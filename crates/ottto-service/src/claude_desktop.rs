@@ -1,5 +1,5 @@
 //! Shared, bounded discovery of Desktop app profiles. Only the existing
-//! config and session metadata readers consume these roots.
+//! session metadata reader consumes these roots.
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,8 @@ pub(crate) struct Discovery {
     pub(crate) error: bool,
 }
 
-pub(crate) fn support_roots(home: &Path) -> Vec<PathBuf> {
+#[cfg(test)]
+fn support_roots(home: &Path) -> Vec<PathBuf> {
     discover_support_roots(home).roots
 }
 

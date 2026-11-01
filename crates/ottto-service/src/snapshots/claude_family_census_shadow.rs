@@ -956,10 +956,7 @@ impl<'a> View<'a> {
             .iter()
             .zip(&names)
             .map(|(key, member)| {
-                let entry = index
-                    .files
-                    .get(*key)
-                    .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
+                let entry = index.files.get(*key).filter(|entry| !entry.rearmed())?;
                 let finalized = proven?
                     .member_requests
                     .get(member)?

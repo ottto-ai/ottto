@@ -330,7 +330,16 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         &serde_json::to_vec(&index.schema_version)?,
     )?;
     macro_rules! save {
-        (claude_desktop_store_inventory, $($t:tt)*) => {};
+        (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
+            // Like the v1 serializer: only versioned cursor fences persist.
+            let inventory = &index.claude_desktop_store_inventory;
+            let inventory = if super::super::claude_desktop_store_inventory_is_legacy(inventory) {
+                &None
+            } else {
+                inventory
+            };
+            write_field(inventory, "claude_desktop_store_inventory", $kind, rows, cx)?;
+        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             write_field(&index.$f, stringify!($f), $kind, rows, cx)?;
         };
