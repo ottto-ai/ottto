@@ -377,6 +377,12 @@ fn reset_start_identity_samples() {
     START_IDENTITY_SAMPLES.with(|counts| *counts.borrow_mut() = StartIdentitySamples::default());
 }
 fn note_start_identity_sample(source: SnapshotSource, file: &File, samples: &OpenedContentSamples) {
+    #[cfg(test)]
+    START_IDENTITY_SAMPLE_FOR_TEST.with(|v| {
+        let (f, b) = v.get();
+        let bytes = (samples.head.len() + samples.tail.as_ref().map_or(0, Vec::len)) as u64;
+        v.set((f + 1, b + bytes));
+    });
     if source != SnapshotSource::ClaudeCode || !claude_terminal_off() {
         return;
     }
@@ -390,11 +396,6 @@ fn note_start_identity_sample(source: SnapshotSource, file: &File, samples: &Ope
                 counts.files.insert((device, inode));
             }
         }
-    });
-    #[cfg(test)]
-    START_IDENTITY_SAMPLE_FOR_TEST.with(|v| {
-        let (f, b) = v.get();
-        v.set((f + 1, b + bytes));
     });
 }
 

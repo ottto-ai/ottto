@@ -194,13 +194,16 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     let mut parser = sampled_scan::new_source_parser(
         file,
         &candidate,
-        SnapshotSource::Codex,
-        &metadata,
-        None,
-        None,
-        false,
-        false,
         &ScanIndex::default(),
+        sampled_scan::ParserOptions {
+            source: SnapshotSource::Codex,
+            metadata: &metadata,
+            traces: None,
+            parents: None,
+            artifacts: false,
+            identity_capture: false,
+            cache: None,
+        },
     )
     .unwrap();
     while !parser.step().unwrap() {}

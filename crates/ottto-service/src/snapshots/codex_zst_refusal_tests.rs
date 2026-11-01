@@ -64,6 +64,8 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
     }
 }
 
+/// [behaviour] Unfunded reader families refuse archives; the plain header
+/// inventory excludes them without poisoning ordinary join completeness.
 #[test]
 fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     let root = crate::test_scratch::private_dir("codex-zst-closure");
@@ -109,11 +111,14 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    assert_refused(CodexZstCause::HeaderUnfunded, || {
-        while !inventory.step(&CodexTitleMetadata::default()) {}
-        assert!(inventory.headers.is_empty());
-        assert!(inventory.refused.contains_key(&local_index_key(&path)));
-    });
+    // The plain join inventory no longer owns archive refusal. Its bounded
+    // archive share performs admission separately, without a plain parser.
+    let before = ACTIVITY.with(std::cell::Cell::get);
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    assert!(inventory.headers.is_empty());
+    assert!(inventory.complete);
+    assert!(inventory.refused.is_empty());
+    assert_eq!(ACTIVITY.with(std::cell::Cell::get), before);
     let paths = BTreeSet::from([local_index_key(&path)]);
     let roots = [root.clone()];
     let census = CodexParentCensus::new(&roots, &paths);

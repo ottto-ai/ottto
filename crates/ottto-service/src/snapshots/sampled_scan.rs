@@ -15,6 +15,7 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
+pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
 pub(super) mod durable_tail;
 #[cfg(all(unix, test))]
@@ -2138,20 +2139,64 @@ fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     today || in_file_fork
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct ParserOptions<'a> {
+    pub(super) source: SnapshotSource,
+    pub(super) metadata: &'a CodexTitleMetadata,
+    pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
+    pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    pub(super) artifacts: bool,
+    pub(super) identity_capture: bool,
+    pub(super) cache: Option<&'a Arc<SharedCache>>,
+}
+
 pub(super) fn new_source_parser(
     file: File,
     candidate: &CandidateFile,
-    source: SnapshotSource,
-    metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
-    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
-    identity_capture: bool,
     index: &ScanIndex,
+    options: ParserOptions<'_>,
 ) -> Result<OwnedJsonlParser> {
-    let mut parser = OwnedJsonlParser::new(
-        file,
+    let ParserOptions {
+        source,
+        metadata,
+        traces,
+        parents,
+        artifacts,
+        identity_capture,
+        cache,
+    } = options;
+    let input = if source == SnapshotSource::Codex
+        && is_compressed_codex_rollout(Some(&candidate.path), None)
+    {
+        let key = local_index_key(&candidate.path);
+        anyhow::ensure!(
+            index.archives.get(&key).is_some_and(|a| a.ready_full()),
+            "archive reservation unavailable"
+        );
+        let input = cache
+            .map(|c| OpenedInput::funded(file, c))
+            .transpose()?
+            .flatten()
+            .ok_or(codex_compressed_input::ArchiveAdmissionYield)?;
+        let attempts = index
+            .archives
+            .get(&key)
+            .and_then(|a| a.work.as_ref())
+            .map_or(0, |w| w.attempts);
+        crate::local_resource_diagnostics::traversal_point(
+            if attempts > 1 {
+                "codex_zst_first_read_retry"
+            } else {
+                "codex_zst_first_read"
+            },
+            "codex",
+            &serde_json::json!({"full_attempts":1}),
+        );
+        input
+    } else {
+        OpenedInput::plain(file)
+    };
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
         &candidate.path,
         source,
         match source {

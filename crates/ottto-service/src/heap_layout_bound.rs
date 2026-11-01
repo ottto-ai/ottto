@@ -398,21 +398,21 @@ pub(crate) use fields;
 // Destructuring is exhaustive; a field moved into the inline group must
 // prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
 macro_rules! split_fields {
-    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
+    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*] $(; shared: [$($shared:ident),*])?) => {
         impl crate::heap_layout_bound::HeapLayoutBound for $t {
             fn stable_heap(&self) -> bool {
-                let Self { $($inline,)* $($heap,)* } = self;
+                let Self { $($inline,)* $($heap,)* $($($shared: _,)*)? } = self;
                 true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
                     $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
             }
             fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
+                let Self { $($inline,)* $($heap,)* $($($shared: _,)*)? } = self;
                 $(crate::heap_layout_bound::require_inline($inline)?;)*
                 $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
                 Some(())
             }
             fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
+                let Self { $($inline,)* $($heap,)* $($($shared: _,)*)? } = self;
                 $(crate::heap_layout_bound::require_inline($inline)?;)*
                 $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
                 Some(())
