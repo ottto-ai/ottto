@@ -44,6 +44,7 @@ mod kinds_misc;
 mod mapper;
 mod sqlite;
 use kinds::KindCx;
+pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
 /// inline graph. An absent attachment borrows this immutable empty value.

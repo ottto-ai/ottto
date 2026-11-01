@@ -1,4 +1,5 @@
 //! Bounded, local-only folder history. These paths never enter status uploads.
+use crate::snapshots::codex_sqlite_read::CodexSqliteRead;
 use hmac::{Hmac, Mac};
 use ottto_core::{
     generate_control_token, session_launch::launch_user, FileClaudeConfigSlotSettingsStore,
@@ -375,7 +376,7 @@ fn codex_folders(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let connection = Connection::open_with_flags(
+    let connection = CodexSqliteRead::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
@@ -397,6 +398,14 @@ fn codex_folders(
             (&deadline as *const Instant).cast_mut().cast(),
         );
     }
+    // A snapshot the database moved past fails as a database error before
+    // any schema error its moved pages may show.
+    connection
+        .read(|connection| Ok(codex_folder_rows(connection)))
+        .map_err(|_| "codex_database")?
+}
+
+fn codex_folder_rows(connection: &Connection) -> Result<Vec<(String, Option<i64>)>, &'static str> {
     let mut columns = connection
         .prepare("PRAGMA table_info(threads)")
         .map_err(|_| "codex_schema")?;
