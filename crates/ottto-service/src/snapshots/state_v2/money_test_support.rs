@@ -150,6 +150,21 @@ pub(crate) fn resident(index: &ScanIndex) -> ScanIndex {
     runtime::materialized(index)
 }
 
+/// Whether a cold graph holds `root`'s stored value, loaded this pass.
+pub(crate) fn usage_loaded(index: &ScanIndex, root: &str) -> bool {
+    index
+        .claude_usage_family_pending
+        .cold()
+        .is_some_and(|cold| cold.loaded().contains_key(root))
+}
+
+/// Whether `root` is a stored family this cold graph never loaded: a head
+/// with no value, whose evidence a page could only have refused.
+pub(crate) fn usage_head_only(index: &ScanIndex, root: &str) -> bool {
+    index.claude_usage_family_pending.cold().is_some()
+        && index.claude_usage_family_pending.family(root).is_err()
+}
+
 /// Families of a cold usage-pending graph; None while resident.
 pub(crate) fn cold_usage_families(index: &ScanIndex) -> Option<usize> {
     let usage = &index.claude_usage_family_pending;
@@ -281,4 +296,6 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
     ScanIndex::load(path).unwrap()
 }
 
-pub(in super::super) use runtime::erase_published;
+pub(in super::super) use runtime::{
+    delete_usage_row_in_session, erase_published, usage_unknown_count,
+};

@@ -675,6 +675,12 @@ fn cold_row(name: &str) {
             page.enrich(&c);
             page.finish();
         }
+        // The cold page read ROOT's stored value: it is loaded (or removed
+        // by a decision that loaded it), never left as an unread head.
+        assert!(
+            !crate::snapshots::state_v2_usage_head_only(&pages[1].index, ROOT),
+            "the cold page loads its stored family"
+        );
         let accounts = pages[0]
             .scan
             .snapshots

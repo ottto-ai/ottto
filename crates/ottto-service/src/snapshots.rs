@@ -85962,7 +85962,8 @@ pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtr
 pub(crate) use state_v2::money_test_support::{
     cold_usage_families as state_v2_cold_usage_families,
     has_cold_archive as state_v2_has_cold_archive,
-    roll_account_families as state_v2_roll_account_families, ColdSession as StateV2ColdSession,
+    roll_account_families as state_v2_roll_account_families,
+    usage_head_only as state_v2_usage_head_only, ColdSession as StateV2ColdSession,
     ColdStore as StateV2ColdStore,
 };
 
