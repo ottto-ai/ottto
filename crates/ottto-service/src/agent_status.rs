@@ -181,6 +181,8 @@ struct CodexAuthCredentials {
     access_token: Option<String>,
     id_token: Option<String>,
     account_id: Option<String>,
+    /// Codex's own record of its last token refresh (`last_refresh`).
+    last_refresh: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15497,10 +15499,15 @@ fn read_codex_auth_credentials_at(
     if access_token.is_none() && id_token.is_none() {
         return Ok(None);
     }
+    let last_refresh = json
+        .get("last_refresh")
+        .and_then(Value::as_str)
+        .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok());
     Ok(Some(CodexAuthCredentials {
         access_token,
         id_token,
         account_id,
+        last_refresh,
     }))
 }
 
@@ -15911,7 +15918,8 @@ fn collect_codex_app_server_usage_for_home(
 }
 
 /// One log line per failed app-server probe: wall-clock time, the session
-/// stage, the error kind, a digest of the Codex home and the elapsed time.
+/// stage, the error kind, the JSON-RPC error code, a digest of the Codex home
+/// and the elapsed time.
 /// Built from the fixed producer text only; no path, account or provider text.
 fn codex_probe_failure_log_line(
     message: &str,
@@ -15920,12 +15928,17 @@ fn codex_probe_failure_log_line(
     now: u64,
 ) -> String {
     let (stage, kind) = codex_probe_failure_stage_and_kind(message);
+    // The JSON-RPC error code from `codex_app_server_rpc_failure`, digits only.
+    let code = message
+        .split_once("RPC failed with code ")
+        .and_then(|(_, rest)| rest.trim_end_matches('.').parse::<i64>().ok())
+        .map_or_else(|| "none".to_string(), |code| code.to_string());
     let mut digest = Sha256::new();
     digest.update(b"ottto:codex-home-log:v1\0");
     digest.update(codex_home.as_os_str().as_encoded_bytes());
     let home = format!("{:x}", digest.finalize());
     format!(
-        "codex usage probe failed: at={} stage={stage} kind={kind} home={} elapsed_ms={}",
+        "codex usage probe failed: at={} stage={stage} kind={kind} code={code} home={} elapsed_ms={}",
         rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
         &home[..12],
         elapsed.as_millis()
@@ -16339,10 +16352,20 @@ fn run_codex_app_server_rate_limits_for_home(
         }
     });
     let initialized = serde_json::json!({"method": "initialized"});
+    // The default home's login belongs to the person's Codex app, and a forced
+    // refresh would rotate it under the app: never force one there. An account
+    // home forces at most one a day; an unknown last refresh counts as due so
+    // its login is still kept alive.
+    let refresh_token = home_trust == CodexHomeTrust::Managed
+        && read_codex_auth_credentials_at(codex_home, home_trust)
+            .ok()
+            .flatten()
+            .and_then(|credentials| credentials.last_refresh)
+            .is_none_or(|last| OffsetDateTime::now_utc() - last >= TimeDuration::days(1));
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": true}
+        "params": {"refreshToken": refresh_token}
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it (design R7).
@@ -23823,7 +23846,9 @@ for line in sys.stdin:
 
     /// [behaviour] The probe starts Codex with its home-writing startup
     /// installers off, shares CODEX_HOME as the SQLite home, drops provider
-    /// keys and keeps stdin open until the asynchronous answer arrives.
+    /// keys and keeps stdin open until the asynchronous answer arrives. It
+    /// never forces a token refresh in the default home, and forces one in an
+    /// account home only when that login's last refresh is over a day old.
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
@@ -23833,7 +23858,8 @@ for line in sys.stdin:
         let helper = dir.join("fake_codex.py");
         std::fs::write(
             &helper,
-            r#"import os
+            r#"import json
+import os
 import sys
 
 if sys.argv[1:] != [
@@ -23845,17 +23871,18 @@ if os.environ.get("CODEX_SQLITE_HOME") != os.environ.get("CODEX_HOME"):
 if "OPENAI_API_KEY" in os.environ:
     sys.exit(3)
 
-account_refreshed = False
+account_read = False
 for line in sys.stdin:
     if '"id":1' in line:
         print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
     if '"id":"ottto_account"' in line:
-        if '"refreshToken":true' not in line:
-            sys.exit(4)
-        account_refreshed = True
+        account_read = True
+        refresh = json.loads(line)["params"]["refreshToken"]
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh.log"), "a") as log:
+            log.write(json.dumps(refresh) + "\n")
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     if "account/rateLimits/read" in line:
-        if not account_refreshed:
+        if not account_read:
             sys.exit(5)
         print('{"id":"ottto_rate_limits","result":{"rateLimitResetCredits":{"availableCount":2},"rateLimitsByLimitId":{},"rateLimits":{}}}', flush=True)
 "#,
@@ -23890,6 +23917,38 @@ for line in sys.stdin:
                 .pointer("/rateLimitResetCredits/availableCount")
                 .and_then(Value::as_u64),
             Some(2)
+        );
+
+        let now = OffsetDateTime::now_utc();
+        for (label, last_refresh) in [
+            ("fresh", now - TimeDuration::hours(1)),
+            ("stale", now - TimeDuration::hours(25)),
+        ] {
+            let slot = crate::test_scratch::ScratchDir::canonical("codex-slot-refresh");
+            let auth = slot.join("auth.json");
+            std::fs::write(
+                &auth,
+                serde_json::json!({
+                    "tokens": {"access_token": "synthetic-access"},
+                    "last_refresh": last_refresh.format(&Rfc3339).expect("timestamp"),
+                })
+                .to_string(),
+            )
+            .expect("slot auth fixture");
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+                .expect("slot auth mode");
+            call_codex_app_server_rate_limits_for_home(
+                &slot,
+                CodexHomeTrust::Managed,
+                &|_, _, _| false,
+            )
+            .expect(label);
+        }
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(
+            refreshes.lines().collect::<Vec<_>>(),
+            ["false", "false", "true"],
+            "default home, fresh account home, stale account home"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -24088,6 +24147,13 @@ for line in sys.stdin:
             assert_eq!(message, expected, "{mode}");
             assert_no_provider_text(&message);
         }
+        let quota_error = run_codex_probe_failure_fake("quota_error")
+            .err()
+            .expect("quota");
+        assert!(
+            codex_probe_failure_log_line(&quota_error, Path::new("/h"), Duration::ZERO, 0)
+                .contains(" kind=rpc_error code=-32603 ")
+        );
     }
 
     /// A request made with a Codex token is logged under the same user hash
@@ -25435,6 +25501,7 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace-a".to_string()),
+            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
@@ -25502,6 +25569,7 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace-b".to_string()),
+            last_refresh: None,
         };
         assert!(validated_codex_identity(
             &correlated,
@@ -25585,6 +25653,7 @@ for line in sys.stdin:
                 organizations,
             )),
             account_id: Some("synthetic-workspace".to_string()),
+            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}
@@ -25657,6 +25726,7 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace".to_string()),
+            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
@@ -25739,6 +25809,7 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace".to_string()),
+            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
