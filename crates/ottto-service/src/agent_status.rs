@@ -25002,6 +25002,34 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_failed_codex_probe_is_a_retrying_read_not_a_connection_needing_attention() {
+        let default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "default_user",
+            "default_workspace",
+            5,
+        );
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-failed-probe",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::Degraded);
+        assert_eq!(
+            codex_source_health_codes(&health),
+            vec!["codex_usage_read_retrying"]
+        );
+    }
+
+    #[test]
     fn a_real_connection_problem_still_needs_attention_beside_a_failed_default_probe() {
         let mut default = codex_failed_probe_candidate(
             "/tmp/codex-health-test-default-probe-and-login",
