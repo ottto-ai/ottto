@@ -97,6 +97,13 @@ fn settle(
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
+    // The service finish: each exact ACK earns its file receipt.
+    let acks = crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots);
+    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+        &mut settled,
+        &scan.snapshots,
+        &acks,
+    );
     let path = home.join("scan-index.json");
     settled.save(&path).unwrap();
     ScanIndex::load(&path).unwrap()
@@ -388,6 +395,14 @@ fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
         index.record_accepted_snapshot_fingerprints(&accepted);
+        // The service finish: each exact ACK earns its file receipt.
+        let acks =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&result.snapshots);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            index,
+            &result.snapshots,
+            &acks,
+        );
         result
     };
     let mut index = ScanIndex::default();
@@ -783,6 +798,14 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
             .snapshots
             .iter()
             .all(|item| !item.source_session_id.starts_with(&family)));
+        // The uploader exact-ACKs the emitted bodies: each earns its receipt.
+        let acks =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&result.snapshots);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &result.snapshots,
+            &acks,
+        );
     }
     assert_eq!(
         scanned,

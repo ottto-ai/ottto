@@ -437,6 +437,19 @@ impl PipelineFixture {
         }
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        // The service finish: each exact ACK of this page's sent bodies earns
+        // its file receipt under the active context. Refused or unsent bodies
+        // are not accepted, so their files stay owed.
+        let acks: BTreeMap<String, String> =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
+                .into_iter()
+                .filter(|(entity, _)| progress.accepted_fingerprints.contains(entity))
+                .collect();
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &acks,
+        );
         let fully_settled = settle_upload_corrections_after_selection(
             &mut index,
             &scan,

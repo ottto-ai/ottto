@@ -3911,13 +3911,15 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let revision =
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     let activate = |index: &mut ScanIndex, revision| {
-        index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
+        if reason == CandidateParseReason::UploadContext {
+            // Production activation: the context, then its quarantine witness.
+            // The file holds no receipt under this context: its own debt.
+            index.activate_file_upload_context(SnapshotSource::ClaudeCode, "retry-context".into());
+        } else {
+            index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
+        }
         index.activate_effective_upload_body_witness_revision(revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
-        if reason == CandidateParseReason::UploadContext {
-            // The file holds no receipt under this context: its own debt.
-            index.activate_upload_context("retry-context".into());
-        }
     };
     let memo = withheld_account::Memo::default();
     let page = |mut index: ScanIndex, revision| {

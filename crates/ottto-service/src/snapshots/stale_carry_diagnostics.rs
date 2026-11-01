@@ -113,7 +113,7 @@ mod tests {
         assert!(encoded.len() < 640);
         assert!(std::mem::size_of::<Counts>() <= 88);
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 11);
+        assert_eq!(value.as_object().unwrap().len(), 10);
         assert!(value
             .as_object()
             .unwrap()

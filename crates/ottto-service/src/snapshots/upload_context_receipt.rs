@@ -11,6 +11,12 @@ pub(crate) struct Receipt {
     pub body_witness: String,
 }
 
+/// Replay epoch of every receipt and local empty proof. It is fixed: the
+/// context-curve replay that once advanced it is retired (an index that never
+/// negotiated curve upload held 0). A historical replay clears receipts
+/// instead of advancing it.
+pub(crate) const RECEIPT_REPLAY_EPOCH: u64 = crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH;
+
 /// One entity's exact stored-body ACK, copied from the upload ledger so it
 /// outlives ACK retirement. It proves only that body under that context, in
 /// the set's destination and replay generation; anything else means owed. It
@@ -260,8 +266,7 @@ impl ScanIndex {
                 .as_ref()
                 .is_some_and(|receipt| {
                     self.same_copy_prefix_base(&receipt.context_fingerprint)
-                        && receipt.replay_generation
-                            == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
+                        && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
                         && receipt.source_witness == entry.source_file_fingerprint
                         && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
                 })
@@ -289,7 +294,7 @@ impl ScanIndex {
     /// source bytes. A nonempty file also needs its exact final body set.
     fn receipt_proves(&self, key: &str, entry: &ScanIndexEntry, receipt: &Receipt) -> bool {
         self.proof_context_matches(key, &receipt.context_fingerprint)
-            && receipt.replay_generation == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
+            && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
             && receipt.source_witness == entry.source_file_fingerprint
     }
 
@@ -436,7 +441,7 @@ impl ScanIndex {
                         .then(|| mode_context.clone()),
                     receipt: Receipt {
                         context_fingerprint: context_fingerprint.clone(),
-                        replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+                        replay_generation: RECEIPT_REPLAY_EPOCH,
                         source_witness: entry.source_file_fingerprint.clone(),
                         body_witness,
                     },
@@ -477,8 +482,7 @@ impl ScanIndex {
             if self.active_upload_context_fingerprint.as_ref() != Some(mode_context)
                 || self.file_expected_context(&candidate.key)
                     != Some(&candidate.receipt.context_fingerprint)
-                || crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
-                    != candidate.receipt.replay_generation
+                || RECEIPT_REPLAY_EPOCH != candidate.receipt.replay_generation
                 || self.historical_replay_generation != candidate.historical_replay_generation
                 || self.decode_holds_file(&candidate.key)
                 || self
@@ -574,7 +578,7 @@ impl ScanIndex {
         }
         entry.upload_context_receipt = Some(Receipt {
             context_fingerprint: context,
-            replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+            replay_generation: RECEIPT_REPLAY_EPOCH,
             source_witness: entry.source_file_fingerprint.clone(),
             body_witness: String::new(),
         });

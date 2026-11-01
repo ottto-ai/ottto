@@ -203,7 +203,7 @@ impl Fixture {
                             self.index.active_upload_context_fingerprint.as_ref()
                                 == Some(&receipt.context_fingerprint)
                                 && receipt.replay_generation
-                                    == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
+                                    == upload_context_receipt::RECEIPT_REPLAY_EPOCH
                                 && receipt.source_witness == entry.source_file_fingerprint
                                 && entry.last_upload_body_witness.as_ref()
                                     == Some(&receipt.body_witness)
@@ -1005,6 +1005,8 @@ fn upload_context_policy_suppressed_file_rearms_on_context_change() {
     let entry = f.index.files.get_mut(&key).unwrap();
     entry.last_snapshot_fingerprint = None;
     entry.last_upload_body_witness = None;
+    // As the scan's record does for a suppressed file: its local empty proof.
+    f.index.note_empty_file_upload_context(&key);
     assert!(!f.index.file_upload_context_requires_adoption(&key));
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));

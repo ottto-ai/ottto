@@ -225,11 +225,39 @@ pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str)
     for entry in index.files.values_mut() {
         entry.upload_context_receipt = Some(super::upload_context_receipt::Receipt {
             context_fingerprint: context.into(),
-            replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+            replay_generation: super::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
             source_witness: entry.source_file_fingerprint.clone(),
             body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
         });
     }
+}
+
+/// Each sent item's exact ACK (entity -> upload body witness), as the
+/// synthetic responders answer a fully accepted page.
+pub(crate) fn exact_acks_for_test(items: &[SnapshotItem]) -> BTreeMap<String, String> {
+    items
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect()
+}
+
+/// The production finish of per-file upload-context proof for one page:
+/// the page's final `items` become receipt candidates under the index's
+/// active context, and only exact `acks` earn receipts (`snapshot_sync`
+/// finish and partial checkpoint run the same two calls). Call it after the
+/// page's settlement, where the service does.
+pub(crate) fn accept_upload_context_acks_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) {
+    let candidates = index.file_upload_context_ack_candidates(items);
+    index.accept_file_upload_context_acks(&candidates, acks);
 }
 
 /// Install the real exclusion input used by ordinary-money fixture families.

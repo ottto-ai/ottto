@@ -849,6 +849,13 @@ impl RearmFixture {
                 fully_settled = false;
             }
         }
+        // As the service finish, after every selected-state restoration:
+        // this page's exact ACKs earn their file receipts.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         let census_complete = scan.census_complete;
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");

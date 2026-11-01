@@ -13831,11 +13831,18 @@ mod tests {
             .unwrap()
         };
         let mut index = ScanIndex::default();
-        index.activate_upload_context("cache-on".into());
+        let mut progress = test_upload_progress();
+        // As the source pass: one context and quarantine witness bind the
+        // index and the ledger, so the quarantined file's backoff holds.
+        activate_source_upload_context(
+            SnapshotSource::Codex,
+            format!("{:x}", Sha256::digest(b"cache-on")),
+            &mut index,
+            &mut progress,
+        );
         let mut first = scan(&mut index);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
         let mut item = first.snapshots.remove(0);
-        let mut progress = test_upload_progress();
         progress
             .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
             .unwrap();
@@ -14279,9 +14286,12 @@ mod tests {
                 )
             },
         );
-        assert!(
-            on.snapshots.is_empty(),
-            "actual effective ordinary-body equality removes candidate"
+        // The new context owes even an equal ordinary body once: finalization
+        // keeps it for its exact ACK under that context, not as a no-op.
+        assert_eq!(
+            on.snapshots.len(),
+            1,
+            "the context change owes the unchanged accepted body once"
         );
         let groups = cache_head_file_groups(&index);
         for identity in &identities {
@@ -14311,10 +14321,9 @@ mod tests {
         .unwrap();
         assert_eq!(progress.pending_cache_heads.len(), 1);
         assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 0);
-        assert!(
-            scan(&mut loaded).snapshots.is_empty(),
-            "missing authority remains explicitly pending"
-        );
+        // Missing authority remains explicitly pending; the file stays owed
+        // under the new context until its exact ACK.
+        assert_eq!(loaded.upload_context_owed_file_count(), 1);
         // Existing exact ordinary CAS transport supplies the actual prerequisite;
         // the marker itself neither schedules this probe nor invents head authority.
         bootstrap_cache_heads(
@@ -14370,6 +14379,11 @@ mod tests {
             "ACK alone never retires index obligation"
         );
         loaded.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut loaded,
+            &enriched.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         loaded.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
             &loaded,
@@ -14603,6 +14617,12 @@ mod tests {
             .accepted_cache_states
             .contains_key(&cache_session_key(&local_item.source_session_id)));
         assert_eq!(on.snapshots[0].snapshot_fingerprint, semantic);
+        // The service finish: the exact ACK earns the file's receipt.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &on.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         assert!(
             scan(&mut index).snapshots.is_empty(),
             "next unchanged source is settled"
@@ -14623,10 +14643,22 @@ mod tests {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },
         );
-        assert!(
-            repeated.snapshots.is_empty(),
-            "actual finalizer also suppresses equal effective body after current-state preparation"
+        // A new context owes even an equal effective body once: finalization
+        // keeps it; its exact ACK earns the receipt and the file is quiet.
+        assert_eq!(
+            repeated.snapshots.len(),
+            1,
+            "owed once under the new context"
         );
+        for item in &mut repeated.snapshots {
+            prepare_snapshot_cache_for_upload(item, &progress, true, false, &legacy);
+        }
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &repeated.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&repeated.snapshots),
+        );
+        assert!(scan(&mut index).snapshots.is_empty(), "then quiet");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -23401,9 +23433,24 @@ mod tests {
             baseline.prepare_historical_replay("boundary-pending-replay".into());
             baseline.save(&index_path).unwrap();
             let mut working = baseline.clone();
+            let mut progress = test_upload_progress();
+            progress.destination_namespace_hash =
+                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+            progress.prepare_historical_replay("boundary-pending-replay");
+            // As the source pass: bind the context on index and ledger first.
+            activate_source_upload_context(
+                SnapshotSource::Codex,
+                Self::context(),
+                &mut working,
+                &mut progress,
+            );
             let mut items = Self::prepare(&root, &mut working, None).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
+            // The page's receipt candidates, taken after preparation and before
+            // upload as the source pass does; each checkpoint accepts them.
+            progress.context_receipt_candidates =
+                working.file_upload_context_ack_candidates(&items);
             let keys = items
                 .iter()
                 .map(|item| {
@@ -23416,10 +23463,6 @@ mod tests {
                         .clone()
                 })
                 .collect();
-            let mut progress = test_upload_progress();
-            progress.destination_namespace_hash =
-                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-            progress.prepare_historical_replay("boundary-pending-replay");
             let mut f = Self {
                 root,
                 index_path,
@@ -23437,6 +23480,10 @@ mod tests {
             assert!(f.baseline.files.contains_key(&f.keys[2]));
             f
         }
+        /// The fixture's upload context, fingerprint-shaped as the ledger requires.
+        fn context() -> String {
+            format!("{:x}", Sha256::digest(b"boundary-current-policy"))
+        }
         /// `cache` keeps the scanned cache evidence and finalizes with the source
         /// pass's effective (projected) body witness; `None` strips it.
         fn prepare(
@@ -23444,7 +23491,7 @@ mod tests {
             index: &mut ScanIndex,
             cache: Option<&SnapshotUploadProgress>,
         ) -> SourceScanResult {
-            index.activate_upload_context("boundary-current-policy".into());
+            index.activate_upload_context(Self::context());
             index.activate_effective_upload_body_witness_revision(1);
             let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
@@ -23562,11 +23609,19 @@ mod tests {
             .unwrap();
             self.progress
                 .prepare_historical_replay("boundary-pending-replay");
+            activate_source_upload_context(
+                SnapshotSource::Codex,
+                Self::context(),
+                &mut self.working,
+                &mut self.progress,
+            );
             let cache = keep_cache.then_some(&self.progress);
             let mut scan = Self::prepare(&self.root, &mut self.working, cache);
             self.items = std::mem::take(&mut scan.snapshots);
             self.items
                 .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+            self.progress.context_receipt_candidates =
+                self.working.file_upload_context_ack_candidates(&self.items);
             scan
         }
         fn stable_context(index: &ScanIndex) {

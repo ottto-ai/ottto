@@ -71285,6 +71285,12 @@ mod tests {
                 .map(|item| item.snapshot_fingerprint.clone())
                 .collect(),
         );
+        // The same exact ACKs earn each file its receipt, as the service finish does.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &baseline.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&baseline.snapshots),
+        );
         index.save(&home.join("scan-index.json")).unwrap();
         let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
         loaded.activate_upload_context("already-admitted-context".into());
@@ -71374,6 +71380,11 @@ mod tests {
             .collect();
         let mut settled =
             retry_index.committable_subset(&retry_previous, &accepted, &BTreeMap::new());
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut settled,
+            &retry.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&retry.snapshots),
+        );
         settled.save(&home.join("scan-index.json")).unwrap();
         let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
         assert_eq!(loaded.active_effective_upload_body_witness_revision, 0);
@@ -71453,6 +71464,11 @@ mod tests {
                 .map(|item| item.snapshot_fingerprint.clone())
                 .collect();
             let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+            crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+                &mut settled,
+                &scan.snapshots,
+                &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
+            );
             settled.save(&home.join("scan-index.json")).unwrap();
             index = ScanIndex::load(&home.join("scan-index.json")).unwrap();
             index.activate_upload_context("already-admitted-context".into());
@@ -71553,6 +71569,12 @@ mod tests {
                 .map(|item| item.snapshot_fingerprint.clone())
                 .collect(),
         );
+        // The same exact ACKs earn each file its receipt, as the service finish does.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &baseline.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&baseline.snapshots),
+        );
         index.save(&home.join("scan-index.json")).unwrap();
         let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
         loaded.activate_upload_context("already-admitted-context".into());
@@ -71614,6 +71636,11 @@ mod tests {
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
         let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut settled,
+            &adopted.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&adopted.snapshots),
+        );
         settled.save(&home.join("scan-index.json")).unwrap();
         let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
         loaded.activate_upload_context("already-admitted-context".into());
