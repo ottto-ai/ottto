@@ -44,7 +44,7 @@ thread_local! {
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 
 /// A loaded graph with its cold archives read back from the session store.
-fn materialized(index: &ScanIndex) -> ScanIndex {
+pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
     let mut view = index.clone();
     with_session_db(index, |db| {
         let mut tx = db.begin(TxnMode::Read).unwrap();

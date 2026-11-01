@@ -1282,7 +1282,7 @@ pub(in super::super) fn settle_usage(
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::erase_published;
+pub(in super::super) use tests::{erase_published, materialized};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]
