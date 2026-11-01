@@ -88,4 +88,6 @@ Bounded reconciliation owns marker deletion. A persisted deferred-population ala
 count suppresses repeated alarms after reload; its additive positional slot follows
 archives and leaves historical slots unchanged. This count grants no read or ACK.
 The Claude-only typed store excludes both archive fields and refuses archive
-state on save, preserving its existing rows and field-presence metadata.
+state on save. Original object/positional inventory and normalized import
+verification also exclude their presence keys, preserving existing Claude rows
+and the full field-presence value through conversion.
