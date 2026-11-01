@@ -30608,7 +30608,7 @@ impl OwnedSourceScan {
                     .zip(file_sampling.as_ref())
                     .filter(|(_, active)| {
                         restart_restore::enabled()
-                            && matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+                            && crate::durable_tail_store::DurableSource::from_snapshot(source).is_some()
                             // No new acquisition is written for an ordinary
                             // Unchanged read. Receipt-owed retries retain their
                             // exact native owner; quiet debt changes settle only
@@ -30619,8 +30619,7 @@ impl OwnedSourceScan {
                             && side_origin.is_none()
                             && aliases.is_empty()
                             && applied_receipts.values().all(Option::is_none)
-                            && (source != SnapshotSource::Codex
-                                || sampled_scan::compatible_reduction(&parser.accumulator))
+                            && sampled_scan::compatible_reduction(&parser.accumulator)
                     })
                     .and_then(|(context, active)| {
                         let held =
@@ -34049,6 +34048,10 @@ impl OwnedSourceScan {
                 }
                 pending!();
             }
+            // Declared before the parser so every early exit drops its graph
+            // before releasing any restore transfer credit.
+            #[cfg(unix)]
+            let mut active_restore_lease = None;
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,
                 &candidate,
@@ -34475,9 +34478,8 @@ impl OwnedSourceScan {
                             context_curve_enabled,
                             index,
                         );
-                        // M1: on a RAM miss, a durable record may restore
-                        // the copy (charged to the RAM cache, then taken as
-                        // a retained copy); resource refusal keeps it Pending.
+                        // A verified cold graph moves directly into the active
+                        // acquisition, with process transfer and state-room funding.
                         // #814's E2 held-new flag is RAM-only in M1: a miss
                         // carries it false, and a restore needs the
                         // committed index entry, so it never widens reuse.
@@ -34500,15 +34502,84 @@ impl OwnedSourceScan {
                                         &context.namespace,
                                     );
                                 interpretation.accepted = restore_floor;
-                                let restore = context.cache.durable_restore(
-                                    source,
-                                    &key,
-                                    &candidate.path,
-                                    &scope,
-                                    parser.reader.reader.get_mut(),
-                                    index,
-                                    &interpretation,
-                                );
+                                let restore = if restart_restore::enabled() {
+                                    // Measure the same native active owner before the graph lands.
+                                    // Only small selection metadata is copied; the parser moves.
+                                    let mut incoming = OwnedActiveFile {
+                                        comparison_target,
+                                        sampling: Some(sampled_scan::Active {
+                                            no_record: false,
+                                            restored_behind_accepted: false,
+                                            key: key.clone(),
+                                            scope: scope.clone(),
+                                            mode: crate::transcript_acquisition::ReadMode::Full(
+                                                crate::transcript_acquisition::FullReason::StateMissing,
+                                            ),
+                                            audit_due: recovered_audit_due,
+                                            retained_hint: None,
+                                            retained_finalization_charge: 0,
+                                            retained_usage: None,
+                                            reinsertion: Default::default(),
+                                        }),
+                                        recovered_audit_due,
+                                        candidate: candidate.clone(),
+                                        decision,
+                                        parse_reason: parse_reason.filter(|_| source == SnapshotSource::ClaudeCode),
+                                        previous_snapshot_fingerprint: previous_snapshot_fingerprint.clone(),
+                                        previous_upload_body_witness: previous_upload_body_witness.clone(),
+                                        projection_adoption_required,
+                                        source_file_fingerprint: source_file_fingerprint.clone(),
+                                        parser,
+                                        aliases: Vec::new(),
+                                        applied_receipts: BTreeMap::new(),
+                                        cursor: None,
+                                        charged_bytes: 0,
+                                        hold_offset: None,
+                                        group: None,
+                                        side_origin: None,
+                                    };
+                                    let (_, step) = sampled_scan::copy_budget_step(
+                                        Some(context),
+                                        Some(&mut incoming),
+                                        false,
+                                    );
+                                    // A duplicate descriptor avoids borrowing the active owner
+                                    // across restore's positional proof reads. The ordinary plan
+                                    // still positions the parser before native input starts.
+                                    let restore =
+                                        match incoming.parser.reader.reader.get_ref().try_clone() {
+                                            Ok(mut held) => context.cache.durable_restore_reserved(
+                                                source,
+                                                &key,
+                                                &candidate.path,
+                                                &scope,
+                                                &mut held,
+                                                index,
+                                                &interpretation,
+                                                |bytes| {
+                                                    sampled_scan::reserve_active_restore(
+                                                        context, &incoming, step, bytes,
+                                                    )
+                                                },
+                                            ),
+                                            Err(_) => {
+                                                sampled_scan::durable_tail::RestoreOutcome::Pending
+                                            }
+                                        };
+                                    parser = incoming.parser;
+                                    restore
+                                } else {
+                                    context.cache.durable_restore_reserved(
+                                        source,
+                                        &key,
+                                        &candidate.path,
+                                        &scope,
+                                        parser.reader.reader.get_mut(),
+                                        index,
+                                        &interpretation,
+                                        |_| false, // OFF returns before reading or reserving.
+                                    )
+                                };
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(
@@ -34697,8 +34768,21 @@ impl OwnedSourceScan {
                                 .retained_entry_rejected_by_eligibility
                                 .saturating_add(1);
                         }
-                        // Both refusals, eligibility and the cap's Full, hand the
-                        // original back with its receipt debt and funding.
+                        // A cold graph need not fit retained RAM. The cap has
+                        // already granted a Full, so discard this optional copy
+                        // under its lease and take that Full without re-admission.
+                        #[cfg(unix)]
+                        if cap_full && restored_durable {
+                            drop(retained.take());
+                            if let Some(lease) = preparation_lease.take() {
+                                lease.release();
+                            }
+                            restored_durable = false;
+                            retained_offset = None;
+                            returned_refusal = Some("audit_cap");
+                        }
+                        // Other eligibility refusals return the original with
+                        // its receipt debt and funding.
                         if !allow_sample {
                             if let Some(taken) = retained.take() {
                                 if restart_restore::enabled()
@@ -34904,7 +34988,9 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         #[cfg(unix)]
-                        if let Some(lease) = preparation_lease.take() {
+                        if restored_durable {
+                            active_restore_lease = preparation_lease.take();
+                        } else if let Some(lease) = preparation_lease.take() {
                             lease.release();
                         }
                         // H1c: the plan uses absolute offsets; the reader's
@@ -35135,6 +35221,12 @@ impl OwnedSourceScan {
                 group: None,
                 side_origin,
             });
+            // The graph now belongs to OwnedActiveFile and its ordinary state
+            // walk. Transfer credit is released only after that handoff.
+            #[cfg(unix)]
+            if let Some(lease) = active_restore_lease.take() {
+                lease.release();
+            }
             if let Some(context) = sampling
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)

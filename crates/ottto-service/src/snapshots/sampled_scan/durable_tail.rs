@@ -6,9 +6,9 @@
 //!   context, scope with format, allowlist, identity contract and counting
 //!   view), its certificate must admit on the held FD, its body must decode
 //!   and any unfunded content re-derivation holds before input. A record
-//!   without content obligations is then charged through
-//!   the ordinary cache admission and taken like any retained copy, so the
-//!   existing `prepare_acquisition` decides Unchanged, Tail or Full. Any
+//!   with verified content moves directly into a funded active acquisition,
+//!   without retained-cache admission. The existing `prepare_acquisition`
+//!   decides Unchanged, Tail or Full. Any
 //!   resource refusal is Pending with no reusable guardless RAM entry; on
 //!   a file grown past its committed end, any but a busy lease is a Miss
 //!   (ordinary counted Full), so no hold drops growth. Restore advances no
@@ -2865,13 +2865,13 @@ impl SharedCache {
         }
     }
 
-    /// Restores `key` from the durable store into the RAM cache and takes it,
+    /// Restores `key` by move into a funded active acquisition,
     /// or a typed pending/integrity/missing outcome. `held` is
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    pub(crate) fn durable_restore(
+    pub(crate) fn durable_restore_reserved(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
@@ -2880,6 +2880,7 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
+        reserve: impl FnOnce(usize) -> bool,
     ) -> RestoreOutcome {
         if !restart_restore::enabled() {
             let Some(source) = durable_source(snapshot_source) else {
@@ -3024,38 +3025,58 @@ impl SharedCache {
         );
         // The common guard held U/T14 before acquisition; this sees class changes since.
         let outcome = match result {
-            Ok(Ok(completed)) => {
-                // Admission and take share one retained lock and this paid owner.
-                match self.insert_with_custody(key.to_string(), completed, 0, false, true, true) {
-                    Ok(Some(taken)) => {
-                        if let Some(mut stores) = self.durable() {
-                            stores.counters.restored += 1;
-                            #[cfg(test)]
-                            super::transition_fixture::reach(
-                                super::transition_fixture::CrashPoint::Restore,
-                            );
-                            stores.counters.durable_restore_after_selection_clear += u64::from(
-                                snapshot_source == SnapshotSource::ClaudeCode
-                                    && index
-                                        .files
-                                        .get(key)
-                                        .is_some_and(|e| e.source_file_fingerprint.is_empty()),
-                            );
-                        }
-                        RestoreOutcome::Restored(Box::new(taken), lease)
-                    }
-                    refused => {
-                        drop(refused); // Original graph/temporary custody before its credit.
-                        lease.release();
-                        self.restore_resource_pending(
-                            snapshot_source,
-                            "cache_transit",
-                            key,
-                            held,
-                            index,
-                        )
-                    }
+            Ok(Ok(mut completed)) => {
+                #[cfg(test)]
+                super::test_hooks::fire(super::test_hooks::Point::BeforeActiveRestore);
+                // restore_known has dropped its input/decode/rederive temporaries.
+                // Both the process lease and the active state budget must fit
+                // before transferring ownership; retained-entry bounds do not apply.
+                let bytes =
+                    crate::heap_layout_bound::completed_bound(&completed, super::state_bytes());
+                if !bytes.is_some_and(|bytes| lease.charge(bytes as u64).is_ok() && reserve(bytes))
+                {
+                    drop(completed); // Drop the graph before its transfer credit.
+                    lease.release();
+                    return self.restore_resource_pending(
+                        snapshot_source,
+                        "active_restore_no_room",
+                        key,
+                        held,
+                        index,
+                    );
                 }
+                let rank = crate::transcript_cache::admission_rank(
+                    completed.checkpoint.modified_hint(),
+                    crate::transcript_cache::admission_now(),
+                );
+                let taken = Taken {
+                    retained: crate::transcript_cache::Retained {
+                        checkpoint: completed.checkpoint,
+                        state: completed
+                            .reduction
+                            .take()
+                            .expect("verified restored reduction"),
+                    },
+                    durable: completed.durable,
+                    modified_hint: rank,
+                    finalization_charge: 0,
+                    e2_held_new_file: false,
+                };
+                if let Some(mut stores) = self.durable() {
+                    stores.counters.restored += 1;
+                    #[cfg(test)]
+                    super::transition_fixture::reach(
+                        super::transition_fixture::CrashPoint::Restore,
+                    );
+                    stores.counters.durable_restore_after_selection_clear += u64::from(
+                        snapshot_source == SnapshotSource::ClaudeCode
+                            && index
+                                .files
+                                .get(key)
+                                .is_some_and(|e| e.source_file_fingerprint.is_empty()),
+                    );
+                }
+                RestoreOutcome::Restored(Box::new(taken), lease)
             }
             Ok(Err(phase)) => {
                 lease.release();
@@ -3107,6 +3128,32 @@ impl SharedCache {
             }
         }
         outcome
+    }
+
+    /// Raw restore fixtures own their transfer outside an active scan. Native
+    /// scanner fixtures use the production reservation callback instead.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn durable_restore(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        index: &ScanIndex,
+        interpretation: &Interpretation<'_>,
+    ) -> RestoreOutcome {
+        self.durable_restore_reserved(
+            source,
+            key,
+            path,
+            scope,
+            held,
+            index,
+            interpretation,
+            |_| true,
+        )
     }
 
     /// Count only a completed Full after an entry_changed refusal; any
@@ -5927,7 +5974,7 @@ impl MissClass {
                 "resource_full.",
                 phase,
                 "decode",
-                "cache_transit",
+                "active_restore_no_room",
                 "stores_unavailable",
                 "input",
                 "cache_key",

@@ -1767,7 +1767,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             ("old_append", 0),
             ("old_append_50h", 0),
             ("due_quiet_50h", 0),
-            ("restore_miss_debt", 0),
+            ("nonresident_debt", 0),
             ("cleared_selection_debt", 0),
             ("due_append", 0),
             ("due_quiet", 0),
@@ -1778,9 +1778,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             ("real_edit", 0),
         ] {
             let quiet = arm.starts_with("due_quiet");
-            let missing = matches!(arm, "restore_miss_debt" | "cleared_selection_debt");
+            let missing = matches!(arm, "nonresident_debt" | "cleared_selection_debt");
             let full = arm == "real_edit"
-                || arm == "restore_miss_debt"
                 || (arm == "cleared_selection_debt" && source == SnapshotSource::Codex);
             let owes = arm.starts_with("due_") || arm == "real_edit" || missing || pending > 0;
             sampled_scan::set_test_now(Some(START));
@@ -1895,9 +1894,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 true, // Match OwnedSourceScan::new outside a sync cycle.
             );
             assert!(second.take(&key).is_none(), "restore must start cold");
-            if arm == "restore_miss_debt" {
-                // The real record passes binding/certificate/decode but RAM
-                // admission refuses it: exercise DT's budget-refused Miss.
+            if arm == "nonresident_debt" {
+                // Retained capacity cannot gate a verified active restore.
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
             }
             let cold_quiet = quiet;
@@ -1972,9 +1970,9 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             assert_eq!(counts.restored, u64::from(!full), "{source:?}/{arm}");
             if arm == "real_edit" {
                 assert_eq!(counts.certificate_refused.get("same_size_edit"), Some(&1));
-            } else if arm == "restore_miss_debt" {
+            } else if arm == "nonresident_debt" {
                 assert_eq!(counts.budget_refused, 0);
-                assert_eq!(counts.resource_full.get("cache_transit"), Some(&1));
+                assert!(counts.resource_full.is_empty());
                 assert!(counts.ineligible.is_empty());
                 assert!(counts.certificate_refused.is_empty());
             } else if arm == "cleared_selection_debt" {
@@ -1993,7 +1991,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             } else if !full {
                 2 // restore + prepare (Tail), or restore + quiet validation
             } else {
-                usize::from(arm == "restore_miss_debt")
+                0 // The independently proved edit refuses before restore samples.
             };
             assert_eq!(sample_reads.len(), 2 * pairs, "{source:?}/{arm}");
             for pair in sample_reads.chunks_exact(2) {

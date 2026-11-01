@@ -1088,6 +1088,27 @@ fn admit_tail_copy(context: &Context, active: &OwnedActiveFile, step: StepMeasur
     }
 }
 
+/// Make room for a verified graph before it enters the active file. Only
+/// strictly older residents yield, and an unfundable move evicts nothing.
+#[cfg(unix)]
+pub(super) fn reserve_active_restore(
+    context: &Context,
+    active: &OwnedActiveFile,
+    step: StepMeasure,
+    bytes: usize,
+) -> bool {
+    #[cfg(test)]
+    let step = test_hooks::active_restore_step(context, step, bytes);
+    context_overhead(context)
+        .zip(step.used)
+        .and_then(|(overhead, used)| overhead.checked_add(used)?.checked_add(bytes))
+        .is_some_and(|pinned| {
+            context
+                .cache
+                .release_older_to_fit(pinned, tail_rank(&active.candidate))
+        })
+}
+
 /// The tailed file's eviction rank as its re-admission records it: its
 /// modification time, clipped to now (`TranscriptCache` clips at admission).
 fn tail_rank(candidate: &CandidateFile) -> (i64, i64) {
@@ -1993,6 +2014,8 @@ pub(super) mod test_hooks {
         BeforeRetireWitness,
         /// A bounded restore is decoded, immediately before identity sampling.
         BeforeRestoredIdentity,
+        /// Verification finished; before either active restore budget is used.
+        BeforeActiveRestore,
         /// The first opened-object identity sample has actually been read.
         AfterIdentityHead,
         /// Content replay succeeded, before its final accepted-floor check.
@@ -2069,6 +2092,29 @@ pub(super) mod test_hooks {
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         static X_OUT: std::cell::Cell<Option<super::XOut>> = const { std::cell::Cell::new(None) };
+        static ACTIVE_RESTORE_ROOM: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Scale the room beside a restore without allocating a large fixture graph.
+    pub(in crate::snapshots) fn active_restore_room(room: Option<usize>) {
+        ACTIVE_RESTORE_ROOM.with(|slot| slot.set(room));
+    }
+    pub(super) fn active_restore_step(
+        context: &super::Context,
+        step: super::StepMeasure,
+        bytes: usize,
+    ) -> super::StepMeasure {
+        let Some(room) = ACTIVE_RESTORE_ROOM.with(|slot| slot.get()) else {
+            return step;
+        };
+        super::StepMeasure {
+            used: super::state_bytes()
+                .checked_sub(context.cache.cursor_resident_for_main())
+                .and_then(|n| n.checked_sub(room))
+                .and_then(|n| n.checked_sub(super::context_overhead(context)?))
+                .and_then(|n| n.checked_sub(bytes)),
+            ..step
+        }
     }
 
     /// Run `hook` each time this thread reaches `point`, until `clear`.
@@ -2086,6 +2132,7 @@ pub(super) mod test_hooks {
         FINISH_ERRORS.with(|errors| errors.borrow_mut().clear());
         INS_EXTRA.with(|term| term.set(None));
         X_OUT.with(|x_out| x_out.set(None));
+        ACTIVE_RESTORE_ROOM.with(|room| room.set(None));
     }
 
     pub(in crate::snapshots) fn fire(point: Point) {
