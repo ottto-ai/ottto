@@ -1,7 +1,7 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
-    ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
-    UnreadableCauses, LINEAGE_SAMPLES,
+    ParentUnresolvableCauses, RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs,
+    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -107,6 +107,7 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
+pub(crate) mod codex_sqlite_read;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
 mod compaction_events;
@@ -40704,25 +40705,25 @@ impl CodexTitleMetadata {
             let state_path = codex_dir.join("state_5.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
             let state_conflicts_before = metadata.identity_conflicts.len();
-            let mut retries = 0;
+            let mut open = SidecarOpenCounts::default();
             let title_census = load_codex_sqlite_titles(
                 &state_path,
-                &mut retries,
+                &mut open,
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
             metadata.local_diagnostics.state_titles.observe_root(
                 &title_census,
-                retries,
+                open,
                 metadata.identity_conflicts.len() != state_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
             let thread_conflicts_before = metadata.identity_conflicts.len();
             let mut root_sidecar = codex_root_copies::RootSidecar::default();
-            let mut retries = 0;
+            let mut open = SidecarOpenCounts::default();
             let state_census = load_codex_sqlite_state_threads(
                 &state_path,
-                &mut retries,
+                &mut open,
                 &mut root_sidecar.threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
@@ -40730,15 +40731,15 @@ impl CodexTitleMetadata {
             codex_root_copies::merge_threads(&mut metadata, &codex_dir, &root_sidecar.threads);
             metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
-                retries,
+                open,
                 metadata.identity_conflicts.len() != thread_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
             let spawn_conflicts_before = metadata.identity_conflicts.len();
-            let mut retries = 0;
+            let mut open = SidecarOpenCounts::default();
             let spawn_census = load_codex_sqlite_spawn_edges(
                 &state_path,
-                &mut retries,
+                &mut open,
                 &mut metadata.state_created_threads,
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
@@ -40747,7 +40748,7 @@ impl CodexTitleMetadata {
             );
             metadata.local_diagnostics.spawn_edges.observe_root(
                 &spawn_census,
-                retries,
+                open,
                 metadata.identity_conflicts.len() != spawn_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -40773,17 +40774,17 @@ impl CodexTitleMetadata {
             let history_path = codex_dir.join("thread_history_1.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
             let history_conflicts_before = metadata.identity_conflicts.len();
-            let mut retries = 0;
+            let mut open = SidecarOpenCounts::default();
             let history_census = load_codex_rollout_extents(
                 &history_path,
-                &mut retries,
+                &mut open,
                 &mut root_sidecar.extents,
                 &mut metadata.identity_conflicts,
             );
             codex_root_copies::merge_extents(&mut metadata, &root_sidecar.extents);
             metadata.local_diagnostics.rollout_extents.observe_root(
                 &history_census,
-                retries,
+                open,
                 metadata.identity_conflicts.len() != history_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -40808,7 +40809,7 @@ impl CodexTitleMetadata {
             );
             metadata.local_diagnostics.session_index.observe_root(
                 &index_census,
-                0,
+                SidecarOpenCounts::default(),
                 metadata.identity_conflicts.len() != index_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -41054,12 +41055,9 @@ fn load_codex_logs2_priority_turns(
     if !path.exists() {
         return true;
     }
-    // URI `mode=ro` so a WAL database with a concurrent writer is safe to read.
-    let uri = format!("file:{}?mode=ro", path.to_string_lossy());
-    let Ok(connection) = Connection::open_with_flags(
-        uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    ) else {
+    let Ok(connection) =
+        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
         return false;
     };
     let _ = connection.busy_timeout(std::time::Duration::from_millis(
@@ -41083,19 +41081,22 @@ fn load_codex_logs2_priority_turns(
     };
     let mut complete = true;
     let mut read = 0_u64;
+    let mut turns = Vec::new();
     for body in rows {
         let Ok(body) = body else {
             complete = false;
             continue;
         };
         read += 1;
-        if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
-            priority_turns.insert(turn_id);
-        }
+        turns.extend(codex_logs2_priority_turn_from_body(&body));
     }
     if read == CODEX_LOGS2_MAX_ROWS as u64 {
         CapCounts::record("codex", 3, 1);
     }
+    if connection.verify().is_err() {
+        return false;
+    }
+    priority_turns.extend(turns);
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
 
@@ -41197,7 +41198,7 @@ fn load_codex_session_index_titles(
 
 fn load_codex_sqlite_titles(
     path: &Path,
-    retries: &mut u32,
+    open: &mut SidecarOpenCounts,
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -41205,23 +41206,23 @@ fn load_codex_sqlite_titles(
         return Ok(());
     }
     let connection =
-        open_codex_sidecar_database(path, retries).context("open Codex title database")?;
-    let mut statement = connection
-        .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare Codex title census")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    let mut loaded = Vec::new();
-    for row in rows {
-        loaded.push(
-            row.context(crate::codex_scan_diagnostics::LoaderStage::Row)
-                .context("read Codex title census row")?,
-        );
-    }
+        open_codex_sidecar_database(path, open).context("open Codex title database")?;
+    let loaded = connection.read(|connection| {
+        let mut statement = connection
+            .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+            .context("prepare Codex title census")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
+        let loaded = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
+            .context("read Codex title census row")?;
+        Ok(loaded)
+    })?;
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
         let id =
@@ -41237,7 +41238,7 @@ fn load_codex_sqlite_titles(
 
 fn load_codex_sqlite_state_threads(
     path: &Path,
-    retries: &mut u32,
+    open: &mut SidecarOpenCounts,
     state_threads: &mut BTreeMap<String, CodexStateThread>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
@@ -41246,59 +41247,63 @@ fn load_codex_sqlite_state_threads(
         return Ok(());
     }
     let connection =
-        open_codex_sidecar_database(path, retries).context("open Codex state database")?;
-    let columns = sqlite_table_columns(&connection, "threads")?;
-    if !columns.contains("id") || !columns.contains("tokens_used") {
-        return Err(anyhow::Error::new(IncompleteShape)
-            .context("Codex state database is missing required thread census columns"));
-    }
+        open_codex_sidecar_database(path, open).context("open Codex state database")?;
+    let rows = connection.read(|connection| {
+        let columns = sqlite_table_columns(connection, "threads")?;
+        if !columns.contains("id") || !columns.contains("tokens_used") {
+            return Err(anyhow::Error::new(IncompleteShape)
+                .context("Codex state database is missing required thread census columns"));
+        }
 
-    let sql = format!(
-        "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
-        sqlite_select_expr(&columns, "title", "NULL"),
-        sqlite_select_expr(&columns, "tokens_used", "0"),
-        sqlite_select_expr(&columns, "archived", "0"),
-        sqlite_select_expr(&columns, "created_at", "NULL"),
-        sqlite_select_expr(&columns, "updated_at", "NULL"),
-        sqlite_select_expr(&columns, "created_at_ms", "NULL"),
-        sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
-        sqlite_select_expr(&columns, "model", "NULL"),
-        sqlite_select_expr(&columns, "rollout_path", "NULL"),
-    );
-    let mut statement = connection
-        .prepare(sql.as_str())
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare Codex state thread census")?;
-    let rows = statement
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let title: Option<String> = row.get(1)?;
-            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-            let archived = row.get::<_, i64>(3)? != 0;
-            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-            let model: Option<String> = row.get(8)?;
-            let rollout_path: Option<String> = row.get(9)?;
-            Ok((
-                id,
-                CodexStateThread {
-                    title,
-                    tokens_used,
-                    archived,
-                    created_at,
-                    updated_at,
-                    model,
-                    rollout_path,
-                },
-            ))
-        })
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    let mut loaded = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    for row in rows {
-        let (raw_id, thread) = row
+        let sql = format!(
+            "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
+            sqlite_select_expr(&columns, "title", "NULL"),
+            sqlite_select_expr(&columns, "tokens_used", "0"),
+            sqlite_select_expr(&columns, "archived", "0"),
+            sqlite_select_expr(&columns, "created_at", "NULL"),
+            sqlite_select_expr(&columns, "updated_at", "NULL"),
+            sqlite_select_expr(&columns, "created_at_ms", "NULL"),
+            sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
+            sqlite_select_expr(&columns, "model", "NULL"),
+            sqlite_select_expr(&columns, "rollout_path", "NULL"),
+        );
+        let mut statement = connection
+            .prepare(sql.as_str())
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+            .context("prepare Codex state thread census")?;
+        let rows = statement
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let title: Option<String> = row.get(1)?;
+                let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
+                let archived = row.get::<_, i64>(3)? != 0;
+                let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
+                let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
+                let model: Option<String> = row.get(8)?;
+                let rollout_path: Option<String> = row.get(9)?;
+                Ok((
+                    id,
+                    CodexStateThread {
+                        title,
+                        tokens_used,
+                        archived,
+                        created_at,
+                        updated_at,
+                        model,
+                        rollout_path,
+                    },
+                ))
+            })
+            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .context(crate::codex_scan_diagnostics::LoaderStage::Row)
             .context("read Codex state thread census row")?;
+        Ok(rows)
+    })?;
+    let mut loaded = BTreeMap::new();
+    let mut raw_ids_by_key = BTreeMap::new();
+    for (raw_id, thread) in rows {
         let conflicts_before = identity_conflicts.len();
         let id =
             record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
@@ -41366,7 +41371,7 @@ fn saturating_count_u32(count: usize) -> u32 {
 
 fn load_codex_rollout_extents(
     path: &Path,
-    retries: &mut u32,
+    open: &mut SidecarOpenCounts,
     rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -41374,39 +41379,46 @@ fn load_codex_rollout_extents(
         return Ok(());
     }
     let connection =
-        open_codex_sidecar_database(path, retries).context("open Codex thread-history database")?;
-    let columns = sqlite_table_columns(&connection, "thread_history_projection_state")?;
-    if columns.is_empty() {
-        return Ok(());
-    }
-    if !columns.contains("thread_id")
-        || !columns.contains("next_rollout_byte_offset")
-        || !columns.contains("next_rollout_ordinal")
-    {
-        return Err(anyhow::Error::new(IncompleteShape)
-            .context("Codex thread-history database has an incomplete projection schema"));
-    }
-    let mut statement = connection
-        .prepare(
-            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
-             FROM thread_history_projection_state",
-        )
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare Codex rollout-extent census")?;
-    let rows = statement
-        .query_map([], |row| {
-            let thread_id: String = row.get(0)?;
-            let next_byte_offset: i64 = row.get(1)?;
-            let next_ordinal: i64 = row.get(2)?;
-            Ok((thread_id, next_byte_offset, next_ordinal))
-        })
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    let mut loaded = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    for row in rows {
-        let (raw_thread_id, next_byte_offset, next_ordinal) = row
+        open_codex_sidecar_database(path, open).context("open Codex thread-history database")?;
+    let Some(rows) = connection.read(|connection| {
+        let columns = sqlite_table_columns(connection, "thread_history_projection_state")?;
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        if !columns.contains("thread_id")
+            || !columns.contains("next_rollout_byte_offset")
+            || !columns.contains("next_rollout_ordinal")
+        {
+            return Err(anyhow::Error::new(IncompleteShape)
+                .context("Codex thread-history database has an incomplete projection schema"));
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
+                 FROM thread_history_projection_state",
+            )
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+            .context("prepare Codex rollout-extent census")?;
+        let rows = statement
+            .query_map([], |row| {
+                let thread_id: String = row.get(0)?;
+                let next_byte_offset: i64 = row.get(1)?;
+                let next_ordinal: i64 = row.get(2)?;
+                Ok((thread_id, next_byte_offset, next_ordinal))
+            })
+            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .context(crate::codex_scan_diagnostics::LoaderStage::Row)
             .context("read Codex rollout-extent census row")?;
+        Ok(Some(rows))
+    })?
+    else {
+        return Ok(());
+    };
+    let mut loaded = BTreeMap::new();
+    let mut raw_ids_by_key = BTreeMap::new();
+    for (raw_thread_id, next_byte_offset, next_ordinal) in rows {
         let thread_id = record_codex_identity_key(
             &mut raw_ids_by_key,
             identity_conflicts,
@@ -41452,7 +41464,7 @@ fn load_codex_rollout_extents(
 /// no parent, so it can never remove a parent recorded elsewhere.
 fn load_codex_sqlite_spawn_edges(
     path: &Path,
-    retries: &mut u32,
+    open: &mut SidecarOpenCounts,
     state_created_threads: &mut BTreeSet<String>,
     spawn_parents: &mut BTreeMap<String, String>,
     spawn_parent_conflicts: &mut BTreeSet<String>,
@@ -41463,38 +41475,42 @@ fn load_codex_sqlite_spawn_edges(
         return Ok(());
     }
     let connection =
-        open_codex_sidecar_database(path, retries).context("open Codex spawn-edge database")?;
+        open_codex_sidecar_database(path, open).context("open Codex spawn-edge database")?;
 
     // Newer Codex Desktop builds can create a child task without populating
     // `thread_spawn_edges`. The equivalent provider-native relationship lives
     // in the child row. Only the exact machine-owned source kind and wrapper
     // are eligible: ordinary user prompt text must never manufacture lineage.
-    let thread_columns = sqlite_table_columns(&connection, "threads")?;
-    for required in ["id", "thread_source", "first_user_message"] {
-        if !thread_columns.contains(required) {
-            return Err(anyhow::Error::new(IncompleteShape).context(format!(
-                "Codex state database is missing required created-thread census column {required}"
-            )));
+    let rows = connection.read(|connection| {
+        let thread_columns = sqlite_table_columns(connection, "threads")?;
+        for required in ["id", "thread_source", "first_user_message"] {
+            if !thread_columns.contains(required) {
+                return Err(anyhow::Error::new(IncompleteShape).context(format!(
+                    "Codex state database is missing required created-thread census column {required}"
+                )));
+            }
         }
-    }
-    let mut statement = connection
-        .prepare(
-            "SELECT id, first_user_message FROM threads \
-             WHERE thread_source = 'agent_created_thread'",
-        )
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare Codex created-thread census")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    let mut raw_created_ids_by_key = BTreeMap::new();
-    let mut created_in_database = Vec::new();
-    for row in rows {
-        let (raw_child, first_user_message) = row
+        let mut statement = connection
+            .prepare(
+                "SELECT id, first_user_message FROM threads \
+                 WHERE thread_source = 'agent_created_thread'",
+            )
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+            .context("prepare Codex created-thread census")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .context(crate::codex_scan_diagnostics::LoaderStage::Row)
             .context("read Codex created-thread census row")?;
+        Ok(rows)
+    })?;
+    let mut raw_created_ids_by_key = BTreeMap::new();
+    let mut created_in_database = Vec::new();
+    for (raw_child, first_user_message) in rows {
         let child = record_codex_identity_key(
             &mut raw_created_ids_by_key,
             identity_conflicts,
@@ -41523,28 +41539,31 @@ fn load_codex_sqlite_spawn_edges(
         }
     }
 
-    let columns = sqlite_table_columns(&connection, "thread_spawn_edges")?;
-    if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
+    let Some(loaded) = connection.read(|connection| {
+        let columns = sqlite_table_columns(connection, "thread_spawn_edges")?;
+        if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+            .context("prepare Codex spawn-edge census")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
+        let loaded = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
+            .context("read Codex spawn-edge census row")?;
+        Ok(Some(loaded))
+    })?
+    else {
         // Without the edge table, a missing edge is not evidence of no parent.
         parentless_ineligible.extend(created_in_database);
         return Ok(());
-    }
-    let mut statement = connection
-        .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare Codex spawn-edge census")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    let mut loaded = Vec::new();
-    for row in rows {
-        loaded.push(
-            row.context(crate::codex_scan_diagnostics::LoaderStage::Row)
-                .context("read Codex spawn-edge census row")?,
-        );
-    }
+    };
     let mut raw_parent_ids_by_key = BTreeMap::new();
     let mut raw_child_ids_by_key = BTreeMap::new();
     for (raw_parent, raw_child) in loaded {
@@ -41655,27 +41674,33 @@ fn record_codex_identity_key(
 
 /// Bounded retries of a transient sidecar open: on Ron's M4 (2026-10-31)
 /// `~/.codex/state_5.sqlite` failed SQLITE_CANTOPEN at its first prepare on 11
-/// of 175 Codex pages while Codex itself kept it open. BUSY is not retried:
-/// rusqlite's connection busy timeout already waits for it.
+/// of 175 Codex pages while Codex itself kept it open. BUSY at the open's
+/// schema probe, which never waits, is retried too: it usually means Codex
+/// is closing the database, and the retry re-checks whether it is now idle.
+/// So does CANTOPEN when Codex removed the `-wal` after that check.
 const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
 const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Open a Codex sidecar database read-only and read its schema, which opens
 /// the WAL and its index for the connection's later statements. A transient
-/// CANTOPEN is retried; `retries` counts the extra attempts.
-fn open_codex_sidecar_database(path: &Path, retries: &mut u32) -> Result<Connection> {
-    retry_transient_sqlite(retries, || {
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .context(crate::codex_scan_diagnostics::LoaderStage::Open)?;
-        connection
-            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)?;
-        Ok(connection)
-    })
+/// CANTOPEN or BUSY is retried; `open` counts the extra attempts and an idle
+/// WAL database read as a snapshot, whose rows the caller reads through
+/// `CodexSqliteRead::read`.
+fn open_codex_sidecar_database(
+    path: &Path,
+    open: &mut SidecarOpenCounts,
+) -> Result<codex_sqlite_read::CodexSqliteRead> {
+    let connection = retry_transient_sqlite(&mut open.retries, || {
+        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    })?;
+    if connection.is_snapshot() {
+        open.snapshots = open.snapshots.saturating_add(1);
+    }
+    Ok(connection)
 }
 
-/// Run `attempt` until it succeeds, fails other than SQLITE_CANTOPEN, or has
-/// been retried `CODEX_SIDECAR_OPEN_RETRIES` times.
+/// Run `attempt` until it succeeds, fails other than SQLITE_CANTOPEN or
+/// SQLITE_BUSY, or has been retried `CODEX_SIDECAR_OPEN_RETRIES` times.
 fn retry_transient_sqlite<T>(
     retries: &mut u32,
     mut attempt: impl FnMut() -> Result<T>,
@@ -41688,7 +41713,10 @@ fn retry_transient_sqlite<T>(
                     && matches!(
                         error.downcast_ref::<rusqlite::Error>(),
                         Some(rusqlite::Error::SqliteFailure(failure, _))
-                            if failure.code == rusqlite::ErrorCode::CannotOpen
+                            if matches!(
+                                failure.code,
+                                rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::DatabaseBusy
+                            )
                     ) =>
             {
                 retried += 1;
@@ -76932,7 +76960,11 @@ mod tests {
             Ok(())
         });
         let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
-        evidence.observe_root(&result, retries, false, "codex root");
+        let open = SidecarOpenCounts {
+            retries,
+            snapshots: 0,
+        };
+        evidence.observe_root(&result, open, false, "codex root");
         assert_eq!((evidence.completed_roots, evidence.failed_roots), (1, 0));
         assert_eq!(evidence.transient_retries, 1);
         assert_eq!(evidence.completed_after_retry, 1);
@@ -76952,7 +76984,9 @@ mod tests {
 
     /// [behaviour] E2 B3: a state database that keeps failing SQLITE_CANTOPEN
     /// still fails each state loader's root after the bounded retries, with
-    /// main's stage, native code and created-thread ambiguity.
+    /// main's stage, native code and created-thread ambiguity. An unreadable
+    /// file models a persistent failure; the observed persistent CANTOPEN, an
+    /// idle WAL database without its `-wal`, now reads as a snapshot (below).
     #[cfg(unix)]
     #[test]
     fn codex_state_loaders_keep_failing_root_after_bounded_cantopen_retries() {
@@ -76990,6 +77024,282 @@ mod tests {
         }
         assert!(metadata.state_census_incomplete);
         assert!(!metadata.created_thread_census_failed_homes.is_empty());
+    }
+
+    /// An idle WAL-mode thread-history database: one extent row, written
+    /// and cleanly closed, so SQLite removed its `-wal` and `-shm`.
+    fn codex_idle_wal_history(codex_dir: &Path, thread_id: &str) -> PathBuf {
+        let path = codex_dir.join("thread_history_1.sqlite");
+        let connection = Connection::open(&path).expect("open history fixture");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;\
+                 CREATE TABLE thread_history_projection_state (\
+                    thread_id TEXT NOT NULL, next_rollout_byte_offset INTEGER NOT NULL,\
+                    next_rollout_ordinal INTEGER NOT NULL\
+                 );",
+            )
+            .expect("create history fixture schema");
+        connection
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES (?1, 120, 3)",
+                [thread_id],
+            )
+            .expect("seed history fixture extent");
+        drop(connection);
+        path
+    }
+
+    fn sqlite_wal_and_shm_exist(path: &Path) -> [bool; 2] {
+        ["-wal", "-shm"].map(|suffix| state_v2::sidecar(path, suffix).exists())
+    }
+
+    fn rollout_ordinal(path: &Path) -> (Result<Option<u64>>, SidecarOpenCounts) {
+        let mut open = SidecarOpenCounts::default();
+        let mut extents = BTreeMap::new();
+        let result =
+            load_codex_rollout_extents(path, &mut open, &mut extents, &mut BTreeSet::new());
+        let ordinal = result.map(|()| extents.into_values().next().map(|e| e.next_ordinal));
+        (ordinal, open)
+    }
+
+    /// [regress] An idle WAL-mode Codex database (no `-wal`) in a home the
+    /// daemon may not write failed every read-only open at its first
+    /// statement, so its root never completed. It now reads as a verified
+    /// snapshot of the main file and creates no `-wal` or `-shm`.
+    #[cfg(unix)]
+    #[test]
+    fn codex_idle_wal_sidecar_reads_as_snapshot_without_writing_beside_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir("codex-idle-wal-snapshot");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create history fixture root");
+        let thread_id = "01a04e21-49cf-7460-9fd7-f7dbfd2f05e4";
+        let history_path = codex_idle_wal_history(&codex_dir, thread_id);
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+        fs::set_permissions(&codex_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        let created = sqlite_wal_and_shm_exist(&history_path);
+        fs::set_permissions(&codex_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let evidence = metadata.local_diagnostics.rollout_extents;
+        assert_eq!((evidence.completed_roots, evidence.failed_roots), (1, 0));
+        assert_eq!(evidence.snapshot_fallbacks, 1);
+        assert_eq!(evidence.transient_retries, 0);
+        assert_eq!(
+            metadata.rollout_extents.get(thread_id),
+            Some(&CodexRolloutExtent {
+                next_byte_offset: 120,
+                next_ordinal: 3,
+            })
+        );
+        assert!(!metadata.sidecar_census_incomplete);
+        assert_eq!(created, [false, false]);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// [behaviour] Routing by name. A database with a second hard link is
+    /// refused for good (not retried), and a link added after a snapshot was
+    /// taken fails that snapshot's rows as busy. An idle database reached
+    /// through a symlink is read as a snapshot of its target. A database with
+    /// a `-wal` takes the plain open: with no connection attached, its frames
+    /// are read through a private index, also through a symlink, and an
+    /// existing `-shm` keeps its bytes; a `-wal` without its `-shm` fails
+    /// closed (CANTOPEN, retried) with no file created. SQLite keeps one
+    /// `-shm` mapping per file per process, so a `-shm` that this process's
+    /// writer opened read-write is refused rather than marked, and the live
+    /// reads use copies made while that writer was attached.
+    #[cfg(unix)]
+    #[test]
+    fn codex_sidecar_plain_open_reads_live_wal_without_writing_beside_it() {
+        let home = temp_dir("codex-live-wal-plain-open");
+        let codex_dir = home.join(".codex");
+        let [indexed, bare] = ["indexed", "bare"].map(|name| home.join(name));
+        for dir in [&codex_dir, &indexed, &bare] {
+            fs::create_dir_all(dir).expect("create history fixture root");
+        }
+        let history_path =
+            codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
+        let alias_path = codex_dir.join("alias.sqlite");
+        std::os::unix::fs::symlink(&history_path, &alias_path).expect("link history fixture");
+        let (ordinal, open) = rollout_ordinal(&alias_path);
+        assert_eq!(
+            ordinal.expect("read idle database through symlink"),
+            Some(3)
+        );
+        assert_eq!(open.snapshots, 1);
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+
+        let other_name = codex_dir.join("other.sqlite");
+        fs::hard_link(&history_path, &other_name).expect("hard-link history fixture");
+        let (ordinal, open) = rollout_ordinal(&history_path);
+        let linked = ordinal.expect_err("second hard link refused");
+        assert!(linked
+            .downcast_ref::<crate::codex_scan_diagnostics::LinkedDatabase>()
+            .is_some());
+        assert_eq!((open.retries, open.snapshots), (0, 0));
+        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
+        evidence.observe_root(&Err(linked), open, false, "codex root");
+        assert_eq!(
+            evidence.reason,
+            crate::codex_scan_diagnostics::LoaderReason::LinkedDatabase
+        );
+        assert_eq!(evidence.transient_retries, 0);
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+        fs::remove_file(&other_name).expect("unlink second name");
+
+        let snapshot = codex_sqlite_read::CodexSqliteRead::open(
+            &history_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open idle snapshot");
+        assert!(snapshot.is_snapshot());
+        fs::hard_link(&history_path, &other_name).expect("hard-link after the snapshot");
+        let other_writer = Connection::open(&other_name).expect("open writer by other name");
+        other_writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;\
+                 UPDATE thread_history_projection_state SET next_rollout_ordinal = 9;",
+            )
+            .expect("write beside the other name");
+        let stale = snapshot.read(|connection| {
+            Ok(connection.query_row(
+                "SELECT next_rollout_ordinal FROM thread_history_projection_state",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        });
+        assert!(matches!(
+            stale.expect_err("old snapshot row").downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        drop(snapshot);
+        drop(other_writer);
+        fs::remove_file(&other_name).expect("unlink other name");
+
+        let writer = Connection::open(&history_path).expect("open history writer");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;\
+                 UPDATE thread_history_projection_state SET next_rollout_ordinal = 4;",
+            )
+            .expect("write an uncheckpointed frame");
+        let (ordinal, open) = rollout_ordinal(&history_path);
+        assert!(ordinal.is_err(), "writable -shm mapping refused");
+        assert_eq!(open.snapshots, 0);
+        let copies = [(&indexed, true), (&bare, false)].map(|(dir, with_shm)| {
+            let copy = dir.join("thread_history_1.sqlite");
+            fs::copy(&history_path, &copy).expect("copy main file");
+            let suffixes: &[&str] = if with_shm {
+                &["-wal", "-shm"]
+            } else {
+                &["-wal"]
+            };
+            let bytes = suffixes
+                .iter()
+                .map(|suffix| {
+                    let bytes = fs::read(state_v2::sidecar(&history_path, suffix))
+                        .expect("read live sidecar");
+                    let sidecar = state_v2::sidecar(&copy, suffix);
+                    fs::write(&sidecar, &bytes).expect("copy sidecar");
+                    // The guard refuses a sidecar whose mode differs from
+                    // the main file's.
+                    let main = fs::metadata(&copy).expect("stat main copy");
+                    fs::set_permissions(&sidecar, main.permissions()).expect("match sidecar mode");
+                    (*suffix, bytes)
+                })
+                .collect::<Vec<_>>();
+            (copy, bytes)
+        });
+        drop(writer);
+
+        let [(indexed_path, indexed_bytes), (bare_path, bare_bytes)] = copies;
+        let indexed_alias = home.join("indexed-alias.sqlite");
+        std::os::unix::fs::symlink(&indexed_path, &indexed_alias).expect("link live copy");
+        for path in [&indexed_path, &indexed_alias] {
+            let (ordinal, open) = rollout_ordinal(path);
+            assert_eq!(ordinal.expect("read copied WAL with -shm"), Some(4));
+            assert_eq!(open.snapshots, 0);
+        }
+        assert_eq!(sqlite_wal_and_shm_exist(&indexed_alias), [false, false]);
+        let (ordinal, open) = rollout_ordinal(&bare_path);
+        assert!(matches!(
+            ordinal.expect_err("-wal without -shm").downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::CannotOpen
+        ));
+        assert!(open.retries > 0);
+        assert_eq!(open.snapshots, 0);
+        assert_eq!(sqlite_wal_and_shm_exist(&bare_path), [true, false]);
+        for (path, bytes) in [(&indexed_path, &indexed_bytes), (&bare_path, &bare_bytes)] {
+            for (suffix, before) in bytes {
+                let after = fs::read(state_v2::sidecar(path, suffix)).expect("reread sidecar");
+                assert_eq!(&after, before, "{suffix} changed");
+            }
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// [behaviour] A snapshot is used only while the database stays idle: a
+    /// writer that is still open (its `-wal` back), or one that grew the main
+    /// file and closed (`-wal` gone again), fails the read as busy, whatever
+    /// the read itself returned.
+    #[cfg(unix)]
+    #[test]
+    fn codex_sidecar_snapshot_fails_busy_once_the_database_moves() {
+        let home = temp_dir("codex-idle-wal-snapshot-moves");
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).expect("create history fixture root");
+        let history_path =
+            codex_idle_wal_history(&codex_dir, "01a04e23-49cf-7460-9fd7-f7dbfd2f05e4");
+        let is_busy = |error: anyhow::Error| {
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.code == rusqlite::ErrorCode::DatabaseBusy
+            )
+        };
+        let open_snapshot = || {
+            let snapshot = codex_sqlite_read::CodexSqliteRead::open(
+                &history_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("open idle snapshot");
+            assert!(snapshot.is_snapshot());
+            snapshot
+        };
+
+        let snapshot = open_snapshot();
+        let writer = Connection::open(&history_path).expect("open history writer");
+        writer
+            .execute_batch("UPDATE thread_history_projection_state SET next_rollout_ordinal = 5;")
+            .expect("write past the snapshot");
+        assert!(is_busy(
+            snapshot.read(|_| Ok(())).expect_err("-wal is back")
+        ));
+        drop(writer);
+        drop(snapshot);
+
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+        let snapshot = open_snapshot();
+        let len = fs::metadata(&history_path).expect("stat history").len();
+        Connection::open(&history_path)
+            .expect("open growing writer")
+            .execute_batch(
+                "CREATE TABLE filler (body BLOB);\
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)\
+                 INSERT INTO filler SELECT randomblob(4096) FROM n;",
+            )
+            .expect("grow the main file");
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+        assert!(fs::metadata(&history_path).expect("restat history").len() > len);
+        let moved = snapshot
+            .read(|_| -> Result<()> { Err(anyhow::Error::new(IncompleteShape)) })
+            .expect_err("main file grew");
+        assert!(is_busy(moved));
+        let _ = fs::remove_dir_all(home);
     }
 
     /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census

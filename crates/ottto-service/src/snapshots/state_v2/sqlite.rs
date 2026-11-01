@@ -427,12 +427,12 @@ pub(super) fn private_parent(path: &Path) -> Result<()> {
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(in crate::snapshots) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
 }
-fn sqlite_uri(path: &Path) -> Result<String> {
+pub(in crate::snapshots) fn sqlite_uri(path: &Path, query: &str) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     ensure!(path.is_absolute(), "state_v2_absolute_path_required");
     let mut uri = String::from("file:");
@@ -444,7 +444,8 @@ fn sqlite_uri(path: &Path) -> Result<String> {
             write!(uri, "%{byte:02X}")?;
         }
     }
-    uri.push_str("?mode=ro&immutable=1");
+    uri.push('?');
+    uri.push_str(query);
     Ok(uri)
 }
 fn settings(conn: &Connection, import: bool) -> Result<()> {
@@ -650,7 +651,7 @@ impl Sqlite {
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
-            sqlite_uri(path)?,
+            sqlite_uri(path, "mode=ro&immutable=1")?,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1736,10 +1737,7 @@ impl Sqlite {
         let before = fs::symlink_metadata(path)?;
         // Identity probes use immutable mode on the frozen base pages. ACK
         // settlement must instead see the live WAL's committed generation.
-        let uri = sqlite_uri(path)?;
-        let uri = uri
-            .strip_suffix("&immutable=1")
-            .context("state_v2_ack_live_uri")?;
+        let uri = sqlite_uri(path, "mode=ro")?;
         let conn = Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY
