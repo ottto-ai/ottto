@@ -568,11 +568,21 @@ fn e2_pipeline_owed_restamp_equals_a_full_of_the_same_bytes() {
     let (restamped, _, failed) = e2_page(roots, &support, &mut owed);
     let counts = scope.finish().contract.evidence_owed;
     assert!(!failed);
-    assert!(restamped.is_empty(), "a re-stamp reads nothing");
+    let emitted = restamped
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        (counts.restamped, counts.restamped_from_record, counts.read),
-        (2, 1, 0)
+        (
+            counts.restamped,
+            counts.restamped_from_record,
+            counts.read,
+            counts.selected_by_other_reason
+        ),
+        (2, 1, 0, 0),
+        "{counts:?} emitted={emitted:?}"
     );
+    assert!(emitted.is_empty(), "a re-stamp reads nothing");
     assert!(family.iter().all(|key| !owed.files[key].evidence_owed));
 
     let (reread, _, failed) = e2_page(roots, &support, &mut full);
