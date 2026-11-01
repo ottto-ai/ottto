@@ -1138,14 +1138,20 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
 /// Store-only rows of one kind, read on the graph's own session in one short
 /// read transaction. `Some`: those families' rows by key (a missing row is no
 /// callback). `None`: the whole kind, complete by its manifest count. Each
-/// value comes with its row digest as stored. A graph whose generation is not
-/// the session's committed one, or a store changed elsewhere, holds.
+/// value comes with its row digest as stored. A graph not at the generation
+/// its save would commit over (its own, or its confirmed growth claim's),
+/// or a store changed elsewhere, holds.
 pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
     index: &ScanIndex,
     kind: &str,
     roots: Option<&std::collections::BTreeSet<String>>,
     f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
 ) -> Result<()> {
+    // The save path's rule: a claim-only growth save in this pass moved the
+    // store past the working graph. Authenticate before the session lock.
+    let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
+    let generation = super::super::sampled_audit::own_growth_claim_generation(index, &path)
+        .unwrap_or(index.generation);
     let runtime = index
         .v2()
         .persistence_v2
@@ -1159,7 +1165,7 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
     );
     let stamp = session.db.stamp()?;
     ensure!(
-        stamp == session.stamp && index.generation == stamp.0,
+        stamp == session.stamp && generation == stamp.0,
         Hold::DbUnavailable
     );
     let mut tx = session.db.begin(TxnMode::Read)?;
