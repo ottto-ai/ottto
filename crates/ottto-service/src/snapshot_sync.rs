@@ -599,31 +599,15 @@ fn note_claude_history_cutoff_for_cycle(
     );
 }
 
-/// The historical replays one cycle arms (StateMissing H1, N2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReplayArming {
-    /// The source's bootstrap for this destination is pending.
-    backfill_pending: bool,
-}
-
-impl ReplayArming {
-    /// One decision for production and the history pipeline tests. An
-    /// unreadable backfill state arms no Claude replay (its history is
-    /// unknown, and a replay would drop the index's entries); Codex and Pi
-    /// replays are not affected.
-    fn decide(
-        source: SnapshotSource,
-        backfill_state: &crate::backfill::BackfillState,
-        destination_namespace: &str,
-    ) -> Self {
-        Self {
-            backfill_pending: pending_backfill_sources_for_destination(
-                backfill_state,
-                destination_namespace,
-            )
-            .contains(&source),
-        }
-    }
+/// Whether the source's bootstrap for this destination is pending, which arms
+/// its historical replay (StateMissing H1, N2).
+fn backfill_replay_pending(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+) -> bool {
+    pending_backfill_sources_for_destination(backfill_state, destination_namespace)
+        .contains(&source)
 }
 
 /// Claude only: the unreadable backfill state suppresses replays until a
@@ -2988,7 +2972,7 @@ impl SnapshotUploadProgress {
                 .retain(|session, _| self.accepted_cache_heads.contains_key(session));
         }
         let mut selected = 0;
-        for (index_key, entry) in &mut index.files {
+        for (index_key, entry) in index.files.slots_mut() {
             let Some(pending) = self
                 .pending_cache_heads
                 .get(&cache_head_index_key(index_key))
@@ -3006,6 +2990,7 @@ impl SnapshotUploadProgress {
             {
                 // Existing candidate_decision treats a nonempty file without a
                 // final group as Parse. Entity membership/ACK state stays intact.
+                let entry = entry.make_mut();
                 entry.last_snapshot_fingerprint = None;
                 entry.last_upload_body_witness = None;
                 selected += 1;
@@ -3563,6 +3548,46 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_refusals(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        fallback,
+        cause,
+        audit_release,
+        body_drains,
+        None,
+    )
+}
+
+/// `isolated_refusals`: the upload sent every batch and only these items were
+/// refused (`IsolatedItemRefusals`). Every other entity then settles as on a
+/// clean page; without it only this pass's ACKs settle.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_refusals(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
+    audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    isolated_refusals: Option<&BTreeSet<String>>,
+) -> Result<ScanIndex> {
     let progress_owner =
         SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
@@ -3644,11 +3669,12 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset_with_local_holds(
+    let mut committable = index.committable_subset_with_refusals(
         committed_index,
         &accepted,
         &quarantined,
         locally_held,
+        isolated_refusals,
     );
     if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);
@@ -5910,7 +5936,8 @@ struct SourcePreparation {
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
     cache_observations_enabled: bool,
-    scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
+    /// `None` only on a continuation page's preparation, which never finishes.
+    scan_agent_status_collection: Option<std::sync::Arc<AgentStatusCollection>>,
     attribution_context: Option<SessionAttributionContext>,
     upload_policy: SnapshotUploadPolicy,
     upload_destination_namespace: String,
@@ -5921,7 +5948,6 @@ struct SourcePreparation {
     committed_index: ScanIndex,
     backfill_state: crate::backfill::BackfillState,
     backfill_pending: bool,
-    replay_generation: String,
     legacy_reconciliation_pending: BTreeSet<String>,
     active_legacy_reconciliation: BTreeSet<String>,
     scan: Option<crate::snapshots::OwnedSourceScan>,
@@ -6471,8 +6497,8 @@ fn cycle_upload_context(
     }
 }
 
-/// Bind persisted retry pages to the local money mode. OFF is the released
-/// context; an operator's next launch in another mode cannot replay old bodies.
+/// Bind persisted retry pages to the Claude copy-prefix money mode; pages
+/// persisted under the earlier context cannot replay old bodies.
 pub(crate) fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
     if enabled {
         format!(
@@ -6848,13 +6874,11 @@ fn prepare_sync_source_inner(
         cache_observations_enabled,
     );
     let base_upload_context = upload_context.clone();
-    let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_request_money::e2::resumed_prefix_enabled();
-    let copy_unproven_enabled = resumed_prefix_enabled
-        && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
+    let claude = source == SnapshotSource::ClaudeCode;
+    let copy_unproven_enabled =
+        claude && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
     // Context adoption invalidates stale pending pages on capability downgrade.
-    // OFF preserves the exact released context and body bytes.
-    let upload_context = resumed_prefix_upload_context(upload_context, resumed_prefix_enabled);
+    let upload_context = resumed_prefix_upload_context(upload_context, claude);
     let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
@@ -6941,10 +6965,7 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
-    index.set_copy_prefix_base_upload_context(
-        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
-        resumed_prefix_enabled,
-    );
+    index.set_copy_prefix_base_upload_context(claude.then_some(base_upload_context));
     index.note_upload_context_inputs(
         source,
         crate::snapshots::UploadContextInputs::new(
@@ -6952,7 +6973,7 @@ fn prepare_sync_source_inner(
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
             copy_unproven_enabled,
-            resumed_prefix_enabled,
+            claude,
         ),
     );
     let backfill_state = load_backfill_state(support_dir);
@@ -6975,10 +6996,9 @@ fn prepare_sync_source_inner(
     let replay_generation = cycle_replay_generation(source, &upload_destination_namespace);
     // An unreadable backfill state arms no Claude replay and no replay-wide
     // scan window (StateMissing H1, N2).
-    let ReplayArming { backfill_pending } =
-        ReplayArming::decide(source, &backfill_state, &upload_destination_namespace);
-    let historical_replay_pending = backfill_pending;
-    if !historical_replay_pending
+    let backfill_pending =
+        backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
+    if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
         // Persist the one-shot policy adoption before progress or scan can
@@ -6988,7 +7008,7 @@ fn prepare_sync_source_inner(
     let admission_reoffer_pending =
         index.snapshot_admission_reoffer_pending_for_scan(source, receipt_window_days);
     let mut legacy_reconciliation_pending = BTreeSet::new();
-    if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
+    if !backfill_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
             source,
             LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
@@ -7021,7 +7041,7 @@ fn prepare_sync_source_inner(
         &mut upload_progress,
         &index,
         &replay_generation,
-        historical_replay_pending,
+        backfill_pending,
         Some(&reoffer_scope),
     ) {
         // Claim the new generation before the potentially long historical
@@ -7047,7 +7067,7 @@ fn prepare_sync_source_inner(
     // scan is built.
     let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
         &mut index,
-        historical_replay_pending,
+        backfill_pending,
         replay_generation.clone(),
         source,
         &daemon.transcript_cache,
@@ -7099,7 +7119,7 @@ fn prepare_sync_source_inner(
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     // A replay re-reads everything and neither re-offers nor defers.
-    index.activate_reason_reoffer_cooldowns(if historical_replay_pending {
+    index.activate_reason_reoffer_cooldowns(if backfill_pending {
         BTreeMap::new()
     } else {
         upload_progress.reason_reoffer_cooldowns(reoffer_now)
@@ -7199,7 +7219,7 @@ fn prepare_sync_source_inner(
         activity_hint,
         receipt_window_days,
         cache_observations_enabled,
-        scan_agent_status_collection,
+        scan_agent_status_collection: Some(scan_agent_status_collection),
         attribution_context,
         upload_policy,
         upload_destination_namespace,
@@ -7210,7 +7230,6 @@ fn prepare_sync_source_inner(
         committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: Some(scan),
@@ -7232,7 +7251,8 @@ struct ContinuationInputs {
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
     cache_observations_enabled: bool,
-    scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
+    /// The one status input a continuation page reads: its finish never runs.
+    codex_scan_homes: Vec<PathBuf>,
     attribution_context: Option<SessionAttributionContext>,
     upload_policy: SnapshotUploadPolicy,
     upload_destination_namespace: String,
@@ -7245,7 +7265,7 @@ struct ContinuationInputs {
 
 crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, cache_observations_enabled,
-    scan_agent_status_collection, attribution_context, upload_policy,
+    codex_scan_homes, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
 
 impl ContinuationInputs {
@@ -7300,9 +7320,11 @@ fn take_continuation_inputs(
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
         cache_observations_enabled: preparation.cache_observations_enabled,
-        scan_agent_status_collection: std::sync::Arc::clone(
-            &preparation.scan_agent_status_collection,
-        ),
+        codex_scan_homes: preparation
+            .scan_agent_status_collection
+            .as_ref()
+            .map(|collection| collection.codex_scan_homes.clone())
+            .unwrap_or_default(),
         attribution_context: preparation.attribution_context.take(),
         upload_policy: preparation.upload_policy,
         upload_destination_namespace: preparation.upload_destination_namespace.clone(),
@@ -7483,12 +7505,11 @@ fn prepare_continuation_source(
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
-    let arming = ReplayArming::decide(
+    if backfill_replay_pending(
         source,
         &backfill_state,
         &inputs.upload_destination_namespace,
-    );
-    if arming.backfill_pending {
+    ) {
         return Ok(Err(ContinuationRefusal::HistoricalReplay));
     }
     if index.snapshot_admission_reoffer_pending() {
@@ -7552,11 +7573,7 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
-    let roots = crate::snapshot_roots::scan_roots(
-        source,
-        home,
-        &inputs.scan_agent_status_collection.codex_scan_homes,
-    )?;
+    let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
@@ -7595,7 +7612,7 @@ fn prepare_continuation_source(
         activity_hint: inputs.activity_hint.clone(),
         receipt_window_days: inputs.receipt_window_days,
         cache_observations_enabled: inputs.cache_observations_enabled,
-        scan_agent_status_collection: std::sync::Arc::clone(&inputs.scan_agent_status_collection),
+        scan_agent_status_collection: None,
         attribution_context: inputs.attribution_context.take(),
         upload_policy: inputs.upload_policy,
         upload_destination_namespace: inputs.upload_destination_namespace.clone(),
@@ -7606,7 +7623,6 @@ fn prepare_continuation_source(
         committed_index,
         backfill_state,
         backfill_pending: false,
-        replay_generation,
         legacy_reconciliation_pending: BTreeSet::new(),
         active_legacy_reconciliation: BTreeSet::new(),
         scan: Some(scan),
@@ -7737,11 +7753,12 @@ fn finish_sync_source(
         mut committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation: _,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let scan_agent_status_collection =
+        scan_agent_status_collection.context("a continuation preparation reached its finish")?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
         activity_hint.max_snapshot_item_bytes,
     );
@@ -7989,12 +8006,7 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
-    crate::snapshots::apply_upload_policy_with_item_limit(
-        source,
-        &mut scan_result.snapshots,
-        upload_policy,
-        identity_item_cap,
-    );
+    crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -8029,12 +8041,7 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            crate::snapshots::apply_upload_policy_with_item_limit(
-                source,
-                snapshots,
-                upload_policy,
-                identity_item_cap,
-            );
+            crate::snapshots::apply_upload_policy(source, snapshots, upload_policy);
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -8395,7 +8402,12 @@ fn finish_sync_source(
                 let token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let response = client.upload_batch(&token, &request, enforce_head_cas)?;
+                let response = client.upload_batch_with_item_cap(
+                    &token,
+                    &request,
+                    enforce_head_cas,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
                 Ok(response)
             },
@@ -8520,8 +8532,12 @@ fn finish_sync_source(
                 let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let mut response =
-                    client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+                let mut response = client.upload_batch_with_item_cap(
+                    &upload_relay_token,
+                    &request,
+                    reconcile_class,
+                    identity_item_cap,
+                )?;
                 response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
                 response.bind_conflict_rescans(&request);
                 let request_fingerprints = request
@@ -8725,7 +8741,7 @@ fn finish_sync_source(
                         source.api_slug(),
                         safe_error(&error)
                     );
-                    committed_index.clone()
+                    committed_index
                 }
             };
             if retry.enabled()
@@ -8815,7 +8831,14 @@ fn finish_sync_source(
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
                 let side_mark = codex_side_save_mark(daemon, source, &index_path);
-                match checkpoint_partial_snapshot_index_with_audit_release(
+                // Refused items alone stay owed; an admission-limited page
+                // omitted bodies, so it keeps the ACK-only subset as a
+                // Completed one would.
+                let isolated_refusals = error
+                    .downcast_ref::<IsolatedItemRefusals>()
+                    .filter(|_| ack_admission_limited.is_none())
+                    .map(|refusals| &refusals.fingerprints);
+                match checkpoint_partial_snapshot_index_with_refusals(
                     &index,
                     &committed_index,
                     &upload_progress,
@@ -8840,6 +8863,7 @@ fn finish_sync_source(
                         backfill_window_days: receipt_window_days,
                     }),
                     std::mem::take(&mut claude_proof_body_drains),
+                    isolated_refusals,
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -9319,7 +9343,10 @@ fn finish_sync_source(
             scan_result.codex_counting_v2.as_deref(),
         );
         if !resolved_permanent_rejections {
-            return Err(snapshot_entity_deferred(count));
+            return Err(snapshot_entity_deferred(
+                count,
+                upload_progress.context_resend.deferred.len(),
+            ));
         }
         // Permanent refusals still finish transport successfully and remain
         // disclosed as errors. Only an otherwise earned, clean selected save
@@ -10606,6 +10633,23 @@ impl std::fmt::Display for SnapshotBatchPreflightRejected {
 
 impl std::error::Error for SnapshotBatchPreflightRejected {}
 
+/// The upload sent every batch and backend validation refused only these
+/// items, each alone; every other item settled as on a clean page.
+#[derive(Debug)]
+struct IsolatedItemRefusals {
+    fingerprints: BTreeSet<String>,
+}
+
+impl std::fmt::Display for IsolatedItemRefusals {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} refused snapshot item(s) isolated from settled siblings",
+            self.fingerprints.len()
+        )
+    }
+}
+
 #[derive(Debug)]
 struct SnapshotLocalStateRejected {
     operation: &'static str,
@@ -10674,6 +10718,8 @@ fn require_normal_write_ack_for_legacy_reconciliation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityDeferred {
     count: usize,
+    conflicted: usize,
+    context_budget: usize,
 }
 
 impl std::fmt::Display for SnapshotEntityDeferred {
@@ -10688,8 +10734,12 @@ impl std::fmt::Display for SnapshotEntityDeferred {
 
 impl std::error::Error for SnapshotEntityDeferred {}
 
-fn snapshot_entity_deferred(count: usize) -> anyhow::Error {
-    anyhow::Error::new(SnapshotEntityDeferred { count })
+fn snapshot_entity_deferred(count: usize, context_budget: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityDeferred {
+        count,
+        conflicted: count.saturating_sub(context_budget),
+        context_budget,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11544,6 +11594,7 @@ where
         }
     }
     let mut deferred_validation_error = None;
+    let mut isolated_refusals = BTreeSet::new();
     let mut batches = VecDeque::new();
     // Request-owned literal bodies travel with their Claude family (early-t7
     // Q1). A family that fits one batch is packed whole; a larger one is cut
@@ -11800,10 +11851,11 @@ where
             Err(error) if is_item_specific_validation_failure(&error) => {
                 // Preserve the first poison-item diagnostic, but continue so
                 // every valid sibling is accepted and checkpointed exactly
-                // once. The caller still reports the cycle as failed and does
-                // not commit the final scan index.
+                // once. The caller still reports the cycle as failed; only
+                // the refused items stay owed in its checkpoint.
                 for index in &indices {
                     record_poison_loss_once(poison_scope, fingerprint(&items[*index]));
+                    isolated_refusals.insert(fingerprint(&items[*index]).to_string());
                 }
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
@@ -11888,7 +11940,9 @@ where
         })
         .count();
     if let Some(error) = deferred_validation_error {
-        Err(error)
+        Err(error.context(IsolatedItemRefusals {
+            fingerprints: isolated_refusals,
+        }))
     } else if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
@@ -13123,8 +13177,8 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
-    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
-        return "local snapshot upload deferred by unsettled entities".to_string();
+    if let Some(deferred) = error.downcast_ref::<SnapshotEntityDeferred>() {
+        return format!("local snapshot upload deferred by unsettled entities: count={} conflicted={} context_budget={}", deferred.count, deferred.conflicted, deferred.context_budget);
     }
     if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
         return "local health upload held after setup-run refresh failed".to_string();
@@ -16557,7 +16611,7 @@ mod tests {
             .accepted_fingerprints
             .contains(&items[SNAPSHOT_BATCH_LIMIT]));
 
-        let deferred = snapshot_entity_deferred(1);
+        let deferred = snapshot_entity_deferred(1, 0);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
@@ -16566,7 +16620,7 @@ mod tests {
         );
         assert_eq!(
             safe_error(&deferred),
-            "local snapshot upload deferred by unsettled entities"
+            "local snapshot upload deferred by unsettled entities: count=1 conflicted=1 context_budget=0"
         );
 
         // Model the next authoritative scan replacing the oversized canonical
@@ -16647,12 +16701,12 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_deferred(3);
+        let deferred = snapshot_entity_deferred(3, 2);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
-                .map(|error| error.count),
-            Some(3)
+                .map(|error| (error.count, error.conflicted, error.context_budget)),
+            Some((3, 1, 2))
         );
     }
 
@@ -17623,6 +17677,13 @@ mod tests {
         .expect_err("poison snapshot keeps the cycle failed");
 
         assert!(is_item_specific_validation_failure(&error));
+        assert_eq!(
+            error
+                .downcast_ref::<IsolatedItemRefusals>()
+                .map(|refusals| &refusals.fingerprints),
+            Some(&BTreeSet::from([items[19].clone()])),
+            "the checkpoint keeps only the refused item owed"
+        );
         assert_eq!(accepted, 24);
         assert_eq!(progress.accepted_fingerprints.len(), 24);
         assert!(progress.quarantined_fingerprints.is_empty());
@@ -17696,6 +17757,10 @@ mod tests {
         );
         assert!(is_item_specific_validation_failure(&error));
         assert!(error.downcast_ref::<BatchRejected>().is_some());
+        assert!(
+            error.downcast_ref::<IsolatedItemRefusals>().is_none(),
+            "a pass stopped early settles only its ACKs"
+        );
         assert_eq!(accepted, 0);
         assert!(
             attempts
@@ -22256,7 +22321,7 @@ mod tests {
             "replay-only.jsonl".to_string(),
             BTreeSet::from([replay_only.clone()]),
         );
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = crate::snapshots::SharedMap::from([
             (inside, Some("2026-08-29T00:00:00Z".to_string())),
             (replay_only, Some("2026-04-01T00:00:00Z".to_string())),
         ]);
@@ -22388,7 +22453,7 @@ mod tests {
             "replay-only.jsonl".to_string(),
             BTreeSet::from([replay_only.clone()]),
         );
-        index.snapshot_activity_at = BTreeMap::from([
+        index.snapshot_activity_at = crate::snapshots::SharedMap::from([
             (inside, Some("2026-08-29T00:00:00Z".to_string())),
             (replay_only, Some("2025-08-29T00:00:00Z".to_string())),
         ]);
@@ -24758,7 +24823,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 

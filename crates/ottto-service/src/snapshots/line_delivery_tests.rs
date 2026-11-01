@@ -934,7 +934,7 @@ fn unselected_page(source: &str) -> Value {
 }
 
 /// A file with an accepted sampled generation keeps verification rescue.
-fn rescue(files: &mut BTreeMap<String, ScanIndexEntry>, path: &Path) {
+fn rescue(files: &mut SharedMap<String, ScanIndexEntry>, path: &Path) {
     let mut entry = super::tests::manifest_index_entry(None);
     entry.set_unverified_deadline(0);
     files.insert(local_index_key(path), entry);
@@ -1227,7 +1227,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 census_at,
                 7,
                 crate::snapshots::DiscoveryRetention {
-                    files: &BTreeMap::new(),
+                    files: &SharedMap::default(),
                     account_holds: holds,
                     memo: None,
                     growth: None,
@@ -1311,9 +1311,9 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
         assert_eq!(
             index.traversal.as_ref().unwrap().observed_index_keys,
-            ["big", "grown", "held"]
-                .map(|name| local_index_key(&path(name)))
-                .into()
+            std::collections::BTreeSet::from(
+                ["big", "grown", "held"].map(|name| local_index_key(&path(name)))
+            )
         );
         let counts = discovery_page(source.api_slug());
         assert_eq!(counts["discovery_retained"], json!({"grown": 3}));

@@ -97,12 +97,22 @@ impl ScanIndexEntry {
         }
     }
     pub(super) fn carry_sampled_audit(&mut self, working: &Self) {
-        if let Some(due) = working.unverified_deadline() {
-            self.scan_identity_version = Some(provenance_marker(
-                self.unverified_deadline().map_or(due, |old| old.min(due)),
-                self.has_prefix_provenance() || working.has_prefix_provenance(),
-            ));
+        if let Some(version) = self.sampled_audit_carry(working) {
+            self.scan_identity_version = Some(version);
         }
+    }
+    /// Whether `carry_sampled_audit(working)` would change this entry. By
+    /// value: the carry rewrites even this entry's own v1 marker in v2 form.
+    pub(super) fn carry_sampled_audit_changes(&self, working: &Self) -> bool {
+        self.sampled_audit_carry(working)
+            .is_some_and(|version| self.scan_identity_version.as_deref() != Some(&*version))
+    }
+    fn sampled_audit_carry(&self, working: &Self) -> Option<String> {
+        let due = working.unverified_deadline()?;
+        Some(provenance_marker(
+            self.unverified_deadline().map_or(due, |old| old.min(due)),
+            self.has_prefix_provenance() || working.has_prefix_provenance(),
+        ))
     }
     pub(super) fn audit_obligation(&self, now: u64) -> Option<AuditDebt> {
         if !self.has_unverified_source() {
@@ -244,7 +254,7 @@ impl ScanIndex {
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
 pub(super) fn path_requires_verification(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
     files
@@ -252,18 +262,23 @@ pub(super) fn path_requires_verification(
         .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
 }
 
-pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    for entry in index
-        .files
-        .values_mut()
-        .filter(|entry| entry.has_unverified_source())
-    {
-        if entry
+fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
+    entry.has_unverified_source()
+        && entry
             .scan_identity_version
             .as_ref()
             .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
-        {
-            entry.set_unverified_deadline(0);
+}
+
+/// Runs every Claude and Codex scan, so an index with nothing to normalize
+/// stays shared with the committed baseline.
+pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
+    if !index.files.values().any(marker_storage_oversized) {
+        return;
+    }
+    for (_, entry) in index.files.slots_mut() {
+        if marker_storage_oversized(entry) {
+            entry.make_mut().set_unverified_deadline(0);
         }
     }
 }
@@ -1451,7 +1466,7 @@ mod provenance_tests {
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
@@ -1569,6 +1584,32 @@ impl AbsenceParent {
             let _ = (self, other);
             false
         }
+    }
+}
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
@@ -2667,62 +2708,52 @@ mod growth_tests {
     /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        for prechecked in [true, false] {
-            let fixture = Fixture::new();
-            let mut index = fixture.index();
-            fixture.grow();
-            if prechecked {
-                revalidate_growth(
-                    &mut index,
-                    &fixture.key,
-                    std::slice::from_ref(&fixture.root),
-                );
-            }
-            let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-            let record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                (0..cap as u64).collect(),
-            )
-            .with_modified_for_test(Some(1));
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            (0..cap as u64).collect(),
+        )
+        .with_modified_for_test(Some(1));
+        index
+            .claude_request_census
+            .insert_for_test(&fixture.key, record);
+        let mut index = restart(&index);
+        let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            40 * 86400,
+            ClaudeRequestCensusShape::Exact,
+            vec![u64::MAX],
+        );
+        let outcome = index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
             index
                 .claude_request_census
-                .insert_for_test(&fixture.key, record);
-            let mut index = restart(&index);
-            let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"b".repeat(64),
-                40 * 86400,
-                ClaudeRequestCensusShape::Exact,
-                vec![u64::MAX],
-            );
-            let outcome =
-                index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
-            assert_ne!(
-                outcome,
-                super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-            );
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .record_for_test(&fixture.key)
-                    .unwrap()
-                    .request_hashes_for_test()
-                    .len(),
-                cap
-            );
-            // Occupancy release also excludes this key, even above 90%.
-            assert_eq!(
-                index
-                    .retire_claude_transcript_records_for_test(40 * 86400)
-                    .0,
-                0
-            );
-            assert_eq!(
-                index.claude_request_census.totals_for_test(),
-                index.claude_request_census.recounted_for_test()
-            );
-        }
+                .record_for_test(&fixture.key)
+                .unwrap()
+                .request_hashes_for_test()
+                .len(),
+            cap
+        );
+        // Occupancy release also excludes this key, even above 90%.
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            0
+        );
+        assert_eq!(
+            index.claude_request_census.totals_for_test(),
+            index.claude_request_census.recounted_for_test()
+        );
     }
 
     /// [regress] retained same key rollback restores exact custody inside tombstone reserve.

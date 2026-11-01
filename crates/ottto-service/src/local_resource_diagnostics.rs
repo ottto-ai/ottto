@@ -3063,6 +3063,7 @@ mod continuation_tests {
             "groups_completed",
             "no_remaining",
             "over_bound",
+            "not_mintable",
         ];
         let (_, rows) = super::capture(|| {
             for outcome in outcomes {
