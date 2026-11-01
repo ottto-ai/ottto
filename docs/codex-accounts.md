@@ -137,8 +137,8 @@ restriction.
 Each collection pass probes the default and durable homes independently using
 the installed Codex binary with exact per-slot `CODEX_HOME` and
 `CODEX_SQLITE_HOME` values, a cleared environment, and no ambient provider API
-keys. Durable homes never use Ottto's legacy OAuth
-HTTP fallback. Collection uses the documented local Codex App Server
+keys. Every home, default and durable, reads quota only from the local Codex
+App Server; there is no HTTP fallback. Collection uses the documented
 `account/rateLimits/read` method and treats its `rateLimits` field as the
 effective subscription snapshot. `rateLimitsByLimitId` is retained only as a
 compatibility fallback when no usable effective snapshot is present, because
