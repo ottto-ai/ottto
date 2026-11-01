@@ -241,6 +241,16 @@
     },
     {
       "kind": "tiered",
+      "model": "gpt-6-1-terra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-rosalind",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
       "model": "claude-haiku-5-5",
       "tokens": 100000
     },
