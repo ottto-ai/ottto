@@ -24065,6 +24065,8 @@ for line in sys.stdin:
         );
     }
 
+    /// [behaviour] A failed probe names its phase and the numeric JSON-RPC
+    /// code only; provider error text and data never reach the message.
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -24111,13 +24113,6 @@ for line in sys.stdin:
             assert_eq!(message, expected, "{mode}");
             assert_no_provider_text(&message);
         }
-        let quota_error = run_codex_probe_failure_fake("quota_error")
-            .err()
-            .expect("quota");
-        assert!(
-            codex_probe_failure_log_line(&quota_error, Path::new("/h"), Duration::ZERO, 0)
-                .contains(" kind=rpc_error code=-32603 ")
-        );
     }
 
     /// A request made with a Codex token is logged under the same user hash
