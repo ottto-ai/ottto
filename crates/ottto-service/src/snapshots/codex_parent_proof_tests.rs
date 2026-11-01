@@ -865,6 +865,9 @@ fn drop_retires_a_keys_side_and_proof_items_and_its_ledger_generation() {
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
+            context_inputs: None,
+            listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         }),
         ..ScanIndex::default()
     };

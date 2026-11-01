@@ -1004,7 +1004,7 @@ fn e_content_refuses_and_approved_mid_file_skills_persist() {
     );
 }
 
-/// [format] SOURCE P2-5: request-shape and blob keys (client content hashes of
+/// [format] Request-shape and blob keys (client content hashes of
 /// instruction text) are stored only as their domain-separated SHA-256 (`H`),
 /// never raw, whatever the key holds. The fixture seals with the request-1
 /// window still holding both, keyed by the secret, so a raw key would show as
@@ -1932,7 +1932,7 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
         .write_all(b"{}\n")
         .unwrap();
     let mut due = parser(&path, source);
-    // Since #870, audit debt alone never forces a Full on a checkpoint; an
+    // Audit debt alone never forces a Full on a checkpoint; an
     // independently owed Full (here a scope change) must not touch the gate.
     let mode = due
         .prepare_acquisition_with_reuse_gate(
@@ -1974,7 +1974,7 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     );
 }
 
-// M3 G1 (r6 native): the one native finish body and its PRE-finalization
+// The one native finish body and its PRE-finalization
 // seam. The seam is what `finish_with_repository_identity_prepared` stages
 // from; these controls pin where it runs and what it sees, without a store.
 
@@ -2258,8 +2258,8 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     );
 }
 
-/// Pi is not registered by this slice. Exercise the same decoded production
-/// content interface without granting Pi store/write authority (E5 owns that).
+/// Pi is not registered in the durable source table. Exercise the decoded
+/// production content interface without granting Pi store/write authority.
 /// [money] bounded pi prompt workspace tail matches cold body in two cycles.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
@@ -2546,7 +2546,7 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
 }
 
 /// Pi remains unregistered here. This is the production codec/acquisition/
-/// native-finish/finalizer interface E5 will route after registration, with
+/// native-finish/finalizer interface without store registration, with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
 /// [money] codex pi restored tail race below accepted publishes complete native body.
 #[test]
@@ -2719,7 +2719,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
 }
 
 /// [money] A certified PRE body cannot replace its predecessor after native
-/// finish reports loss. E5's Pi seal-boundaries fixture supplies the real
+/// finish reports loss. The Pi seal-boundaries fixture supplies the real
 /// cross-shape conflict; this unit seam covers the source-independent decision.
 #[test]
 fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {

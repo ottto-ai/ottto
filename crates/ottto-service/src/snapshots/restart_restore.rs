@@ -2,7 +2,7 @@
 use std::path::Path;
 
 const NAME: &str = "restart_restore_enabled";
-// #876 + F4 must flip this marker only when held grown files remain discoverable.
+// Enable this dependency only when held grown files remain discoverable.
 // The sentinel alone can never bypass this release dependency.
 const DISCOVERY_DEPENDENCY_READY: bool = false;
 

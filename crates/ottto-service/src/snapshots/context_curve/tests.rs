@@ -1,55 +1,60 @@
 use super::*;
 
-fn candidates(count: u64) -> Vec<ContextCurveCandidatePoint> {
-    (1..=count)
-        .map(|ordinal| ContextCurveCandidatePoint {
-            observed_at: Some(format!("2026-09-22T12:00:{:02}Z", ordinal % 60)),
-            effective_input_tokens: ordinal * 100,
-            model: Some("synthetic-model".to_string()),
-            context_window_tokens: Some(200_000),
+/// The complete, boundary-free curve the retired builder emitted for `count`
+/// owned requests with rising input tokens.
+fn complete_curve(parser_revision: &str, count: u64) -> SnapshotContextCurve {
+    let points = (1..=count)
+        .map(|ordinal| {
+            let mut retention_flags = 0;
+            if [1, 2, 5, 10, 20].contains(&ordinal) {
+                retention_flags |= CONTEXT_CURVE_RETENTION_ANCHOR;
+            }
+            if ordinal == count {
+                retention_flags |= CONTEXT_CURVE_RETENTION_PEAK;
+            }
+            if ordinal + 10 > count {
+                retention_flags |= CONTEXT_CURVE_RETENTION_TAIL;
+            }
+            if retention_flags == 0 {
+                retention_flags = CONTEXT_CURVE_RETENTION_FILL;
+            }
+            SnapshotContextCurvePoint {
+                owned_request_ordinal: ordinal,
+                observed_at: format!("2026-09-22T12:00:{:02}Z", ordinal % 60),
+                effective_input_tokens: ordinal * 100,
+                model_window_index: 0,
+                segment_ordinal: 0,
+                retention_flags,
+                compaction_before_request_boundary_index: None,
+                compaction_after_request_boundary_index: None,
+            }
         })
-        .collect()
-}
-
-#[test]
-fn construction_is_deterministic_and_valid() {
-    let candidates = candidates(6);
-    let boundaries = [ContextCurveCandidateBoundary {
-        observed_at: Some("2026-09-22T12:00:03Z".to_string()),
-        point_count_before: 3,
-    }];
-    let build = || {
-        build_context_curve(
-            "synthetic_parser:v1",
-            "synthetic_owner:v1",
-            "synthetic_model:v1",
-            &candidates,
-            &boundaries,
-            "parser_unsupported",
-        )
-    };
-
-    let first = build();
-    let second = build();
-    assert_eq!(first, second);
-    assert_eq!(
-        serde_json::to_vec(&first).unwrap(),
-        serde_json::to_vec(&second).unwrap()
-    );
-    assert_eq!(first.coverage, "complete");
-    validate_context_curve(0, &first).unwrap();
+        .collect::<Vec<_>>();
+    SnapshotContextCurve {
+        contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+        parser_revision: parser_revision.to_string(),
+        ownership_revision: "synthetic_owner:v1".to_string(),
+        sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
+        coverage: "complete".to_string(),
+        total_owned_request_count: count,
+        retained_point_count: points.len() as u64,
+        total_compaction_boundary_count: 0,
+        retained_boundary_count: 0,
+        points,
+        boundaries: Vec::new(),
+        model_windows: vec![SnapshotContextCurveModelWindow {
+            model_window_index: 0,
+            model: "synthetic-model".to_string(),
+            context_window_tokens: Some(200_000),
+            evidence_kind: "provider_reported_window".to_string(),
+            evidence_revision: "synthetic_model:v1".to_string(),
+        }],
+    }
 }
 
 #[test]
 fn validation_rejects_unsafe_revision_evidence() {
-    let curve = build_context_curve(
-        "unsafe revision",
-        "synthetic_owner:v1",
-        "synthetic_model:v1",
-        &candidates(2),
-        &[],
-        "parser_unsupported",
-    );
+    let curve = complete_curve("unsafe revision", 2);
 
     assert!(validate_context_curve(0, &curve)
         .unwrap_err()
@@ -58,14 +63,8 @@ fn validation_rejects_unsafe_revision_evidence() {
 
 #[test]
 fn wire_budget_pruning_removes_only_fill_points() {
-    let mut curve = build_context_curve(
-        "synthetic_parser:v1",
-        "synthetic_owner:v1",
-        "synthetic_model:v1",
-        &candidates(40),
-        &[],
-        "parser_unsupported",
-    );
+    let mut curve = complete_curve("synthetic_parser:v1", 40);
+    validate_context_curve(0, &curve).unwrap();
     let retained_before = curve.retained_point_count;
 
     assert!(prune_one_context_curve_fill_point(&mut curve));

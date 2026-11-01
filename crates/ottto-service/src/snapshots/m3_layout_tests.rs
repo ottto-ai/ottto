@@ -1,4 +1,4 @@
-//! SOURCE Addendum 3: unsupported known layout, selected reads and post-read
+//! Unsupported known layout, selected reads and post-read
 //! retirement. Unknown/newer records remain protected, including across GC.
 use super::*;
 use crate::durable_tail_store::{self as store, DurableSource};
@@ -75,7 +75,6 @@ impl Fixture {
             Some(&self.root),
             &[],
             false,
-            true,
         );
         if let Some(cache) = cache {
             scan = scan.with_sampled_acquisition(cache, self.namespace.clone());
@@ -107,7 +106,7 @@ impl Fixture {
     }
     fn seed_record_with_debt(&self, index: &ScanIndex, debt: Option<u64>) -> PathBuf {
         // Actual native stream creates v3. This is a current fixture artifact,
-        // never labelled the hash-pinned old writer used by #882.
+        // never labelled the hash-pinned old writer used by the crash fixture.
         let mut disk = store::DurableTailStore::new(
             store::store_dir_for_index(&self.index_path()),
             DurableSource::ClaudeCode,
@@ -312,7 +311,7 @@ fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     });
 }
 
-/// A real lossy selection may retire unsupported A only after #865 has an
+/// A real lossy selection may retire unsupported A only after audit has an
 /// equal-or-earlier persisted carrier. GC counts successful unlink, not intent.
 /// [money] unsupported layout lossy read carries debt through failed gc and restart.
 #[test]
@@ -373,7 +372,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             );
 
             // Without a persisted carrier, even an actual lossy read is not
-            // authority to delete the only remaining evidence of #865 debt.
+            // authority to delete the only remaining evidence of audit debt.
             let mut missing_carrier = read.index.clone();
             missing_carrier
                 .files

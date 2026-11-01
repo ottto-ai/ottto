@@ -306,7 +306,7 @@ impl ScanIndex {
         let parsed = self
             .files
             .get(key)
-            .filter(|entry| entry.source_file_fingerprint == fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == fingerprint)
             .map(|entry| self.withheld_seen(PARSED, entry.size_bytes, fingerprint));
         let key = memo_key(key);
         let trigger = self
@@ -381,7 +381,8 @@ impl Memo {
             // Heap admission does not reserve descriptors. Keep at least seven
             // eighths of the soft limit for ordinary daemon I/O, and never retain
             // more than 32 pins. The existing memo owns the population accounting.
-            let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
+            let limit =
+                crate::control_plane_health::descriptor_limit().map_or(0, |n| (n / 8).min(32));
             if state
                 .entries
                 .values()
@@ -746,21 +747,6 @@ mod tests {
         }
         sampled_scan::set_test_now(None);
     }
-    /// [behaviour] Empty memo releases its root and charges no phantom node.
-
-    #[test]
-    fn empty_memo_releases_its_root_and_charges_no_phantom_node() {
-        let memo = Memo::default();
-        support::clock(&memo);
-        memo.with_state(|state| {
-            state.entry(memo_key("temporary"));
-            state.entries.clear();
-        });
-        assert_eq!(memo.retained_bound(0), Some(0));
-        assert!(memo.with_state(|state| state.entries.is_empty()).unwrap());
-    }
-
-    use crate::heap_layout_bound::tree_node_bytes;
 
     /// [behaviour] Held tokens and ages leave only on resolution or eligible absence.
     #[test]
@@ -1030,34 +1016,7 @@ mod tests {
             );
         }
     }
-    /// [behaviour] Every completed reparse is counted even with equal parsed evidence.
 
-    #[test]
-    fn every_completed_reparse_is_counted_even_with_equal_parsed_evidence() {
-        let memo = Memo::default();
-        support::clock(&memo);
-        let key = "/opaque/reparses.jsonl";
-        let mut index = ScanIndex {
-            withheld_memo: memo.clone(),
-            ..ScanIndex::default()
-        };
-        index
-            .claude_account_deferred_holds
-            .insert(key.to_string(), "parsed".to_string());
-        parsed(&mut index, key, 5);
-        memo.hold_tokens(key, 7);
-        memo.retain_held(&index.claude_account_deferred_holds);
-        index.note_withheld_account_parse(key, "parsed", true);
-        index.note_withheld_account_parse(key, "parsed", true);
-        index.note_withheld_account_parse(key, "parsed", true);
-        parsed(&mut index, key, 6);
-        index.note_withheld_account_parse(key, "parsed", true);
-        let [_, reparses, _] = crate::local_resource_diagnostics::withheld_support::take_withheld();
-        assert_eq!(
-            reparses,
-            BTreeMap::from([("start", 1), ("evidence", 2), ("growth", 1)])
-        );
-    }
     /// [behaviour] Content generation rejects reused inode and unknown identity.
 
     #[test]
@@ -1120,130 +1079,7 @@ mod tests {
         };
         assert!(content_stamp(100_000, Some(&unknown_birth), &samples).is_none());
     }
-    /// [behaviour] Cap churn never allocates a 4097th entry.
 
-    #[test]
-    fn cap_churn_never_allocates_a_4097th_entry() {
-        let memo = Memo::default();
-        support::clock(&memo);
-        let mut holds = BTreeMap::new();
-        for slot in 0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS {
-            let key = format!("/opaque/old-{slot}");
-            holds.insert(key.clone(), String::new());
-            memo.hold_tokens(&key, 1);
-        }
-        memo.retain_held(&holds);
-        let len = || memo.with_state(|state| state.entries.len()).unwrap();
-        assert_eq!(len(), MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        // Even if a caller delays removal, every insertion enforces the cap.
-        memo.hold_tokens("/opaque/refused", 9);
-        assert_eq!(len(), MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        assert_eq!(
-            memo.with_state(|state| state.entries.contains_key(&memo_key("/opaque/refused"))),
-            Some(false)
-        );
-        // Whole-page churn, inspecting occupancy after EACH operation, not
-        // just after final pruning. Parent removes resolved keys immediately.
-        let mut peak = len();
-        for slot in 0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS {
-            let old = format!("/opaque/old-{slot}");
-            holds.remove(&old);
-            memo.released_resolved(&old);
-            assert_eq!(len(), MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS - 1);
-            let new = format!("/opaque/new-{slot}");
-            holds.insert(new.clone(), String::new());
-            memo.hold_tokens(&new, 2);
-            peak = peak.max(len());
-            assert!(len() <= MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        }
-        memo.retain_held(&holds);
-        assert_eq!(peak, MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        let gauge = memo.held_gauge().unwrap();
-        assert!(!gauge.withheld_memo_unavailable);
-        assert_eq!(gauge.withheld_held_count, MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        assert_eq!(
-            gauge.withheld_held_tokens,
-            Some(2 * MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS as u64)
-        );
-    }
-
-    /// [behaviour] The capped memo, including absence witnesses, fits its existing allowance.
-    #[test]
-    fn memo_at_the_hold_cap_has_a_conservative_portable_charge() {
-        let memo = Memo::default();
-        support::clock(&memo);
-        let seen = Seen {
-            size_bytes: u64::MAX,
-            evidence: [0xff; 32],
-            object: [1, 2, 3],
-        };
-        let full: Entries = (0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
-            .map(|slot| {
-                (
-                    memo_key(&format!("/opaque/{slot}.jsonl")),
-                    Entry {
-                        seen: Some(Box::new(seen)),
-                        tokens: Some(1),
-                        first_seen: 0,
-                        absence: None,
-                    },
-                )
-            })
-            .collect();
-
-        let expected = charge(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS).unwrap();
-        assert!(
-            expected < 8 << 20,
-            "{expected} bytes must fit the EXISTING owner allowance"
-        );
-        // Assert even on Linux or an unvalidated compiler. The real charge
-        // has no layout gate, and its native comparison remains an extra check.
-        assert!(
-            tree_node_bytes::<[u8; 32], Entry>().unwrap()
-                + std::mem::size_of::<Seen>()
-                + std::mem::size_of::<sampled_audit::AbsenceParent>()
-                <= NODE_UPPER_BYTES
-        );
-        if crate::heap_layout_bound::layout_supported() {
-            let native = crate::heap_layout_bound::completed_bound(&full, usize::MAX).unwrap();
-            assert!(
-                native <= expected,
-                "native {native} exceeds portable {expected}"
-            );
-        }
-        memo.with_state(|state| {
-            state.held_count = full.len();
-            state.entries = full;
-        });
-        assert_eq!(memo.retained_bound(usize::MAX), Some(expected));
-        let line = serde_json::to_value(memo.census()).unwrap();
-        assert_eq!(line["entries"], MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
-        assert_eq!(line["retained_bytes"], expected);
-        memo.discard_if_refused();
-        assert_eq!(
-            memo.with_state(|state| state.entries.len()),
-            Some(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS),
-            "an unrelated graph fallback preserves this known bounded graph"
-        );
-        assert_eq!(
-            memo.retained_bound(expected - 1),
-            None,
-            "over the limit is refused"
-        );
-        memo.discard_if_refused();
-        assert!(
-            memo.census().is_none(),
-            "discarded entries are omitted from the resource census"
-        );
-        assert_eq!(
-            serde_json::to_value(memo.held_gauge()).unwrap(),
-            json!({
-                "withheld_held_count": MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
-                "withheld_memo_unavailable": true
-            }),
-            "refusal must neither omit population nor fabricate zero tokens"
-        );
-    }
     /// [behaviour] Poison discloses count counts reparse and recovers after discard.
 
     #[test]

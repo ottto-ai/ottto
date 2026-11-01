@@ -357,7 +357,6 @@ fn failed_write_case(fail: bool) {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         let mode = parser

@@ -560,15 +560,21 @@ pub(crate) struct HistoryPage {
     twin_index: std::cell::OnceCell<ClaudeTwinGroups>,
     /// E2: this page cleared the birth table's page probes.
     birth_page_begun: bool,
+    /// Selection deferrals on this page, retained only for the hold diagnostic.
+    pub(super) queued_family_deferred_paths: BTreeSet<super::claude_money_birth_store::LocationKey>,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun, queued_family_deferred_paths);
 
 impl HistoryPage {
     /// A page whose twin groups candidate selection already built.
-    pub(super) fn with_twin_groups(twin_index: std::cell::OnceCell<ClaudeTwinGroups>) -> Self {
+    pub(super) fn with_twin_groups(
+        twin_index: std::cell::OnceCell<ClaudeTwinGroups>,
+        queued_family_deferred_paths: BTreeSet<super::claude_money_birth_store::LocationKey>,
+    ) -> Self {
         Self {
             twin_index,
+            queued_family_deferred_paths,
             ..Self::default()
         }
     }

@@ -127,7 +127,7 @@ fn revision(index: &ScanIndex) -> [u8; 32] {
     ] {
         update_length_prefixed(&mut h, value.as_bytes());
     }
-    h.update(index.context_curve_replay_epoch.to_be_bytes());
+    h.update(crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH.to_be_bytes());
     h.update(
         index
             .active_effective_upload_body_witness_revision
@@ -161,7 +161,7 @@ fn cause(index: &ScanIndex, key: &str, now: u64) -> Option<&'static str> {
 
     let cause = if contract_retry {
         "activity_or_quarantine_retry"
-    } else if entry.source_file_fingerprint.is_empty() {
+    } else if entry.rearmed() {
         "cleared_fingerprint"
     } else if !entry.has_unverified_source()
         && entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)

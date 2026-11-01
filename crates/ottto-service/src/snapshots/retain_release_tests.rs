@@ -812,7 +812,7 @@ fn r0_tail_past_the_visit_limit_is_granted_without_release() {
 /// T-R0d: every borrowed-state conjunct keeps a Tail off shape F, so its
 /// step-start refusal keeps `ClearOtherActive`, and its completion never
 /// reaches `tail_completion_budget` (the only source of `Deferred`, called
-/// only behind `borrows_only_retained_reduction`). Aliases and receipts are
+/// only behind `releases_at_completion`). Aliases and receipts are
 /// in the guard matrix; the cursor and group conjuncts are in
 /// `codex_cursor_tests` and `group_job_tests`.
 #[test]
@@ -1122,6 +1122,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             cache_observations: _, // K (None on Claude)
             cache_observations_state: _, // K (None at into_items)
             cache_base_head_etag: _, // K (None at into_items)
+            cache_conflict_answer: _, // K (None at into_items)
             cache_requests: _, // R
             cache_requests_complete: _, // I
             avg_duration_ms: _, // I

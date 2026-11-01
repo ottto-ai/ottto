@@ -1,4 +1,4 @@
-//! M3 r7 resources: prepaid key-map layout, P1-1 restore-pending authority,
+//! Resource controls: prepaid key-map layout, restore-pending authority,
 //! freed authorityless custody, debt outside custody, index-sized pass maps,
 //! the P2 restored head budget and the Codex refused stale record. Every row
 //! drives the real `Stores` owner; nothing here is a production entry point.
@@ -83,7 +83,6 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
             Some(&scratch),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
         fixture::scan(scan, 1000).1.snapshots

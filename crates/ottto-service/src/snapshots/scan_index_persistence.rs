@@ -98,18 +98,18 @@ impl Slot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Object {
-    slot: Slot,
+pub(super) struct Object {
+    pub(super) slot: Slot,
     #[serde(default)]
-    generation: u64,
-    bytes: u64,
-    digest: String,
+    pub(super) generation: u64,
+    pub(super) bytes: u64,
+    pub(super) digest: String,
 }
 impl Object {
     fn same_payload(&self, other: &Self) -> bool {
         self.slot == other.slot && self.bytes == other.bytes && self.digest == other.digest
     }
-    fn filename(&self) -> String {
+    pub(super) fn filename(&self) -> String {
         format!("{}-{}.json", self.slot.label(), self.digest)
     }
 }
@@ -118,19 +118,87 @@ impl Object {
 /// supported readers: it MUST yield `scan index refused: schema_version`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
-    schema_version: u16,
+pub(super) struct Manifest {
+    pub(super) schema_version: u16,
     // The pinned old header visitor requires this field BEFORE its schema
     // check. It is always empty and is NEVER the logical index's files map.
-    files: BTreeMap<String, serde_json::Value>,
-    storage_format: u16,
-    logical_schema_version: u16,
-    generation: u64,
-    binding: Binding,
-    padding_bytes: u64,
+    pub(super) files: BTreeMap<String, serde_json::Value>,
+    pub(super) storage_format: u16,
+    pub(super) logical_schema_version: u16,
+    pub(super) generation: u64,
+    pub(super) binding: Binding,
+    pub(super) padding_bytes: u64,
     #[serde(default)]
-    maps: Vec<MapManifest>,
-    objects: Vec<Object>,
+    pub(super) maps: Vec<MapManifest>,
+    pub(super) objects: Vec<Object>,
+}
+
+impl Manifest {
+    pub(super) fn validate(&self, binding: &Binding) -> Result<()> {
+        ensure!(
+            self.schema_version == OUTER_SCHEMA
+                && self.storage_format == STORAGE_FORMAT
+                && self.logical_schema_version == LOGICAL_SCHEMA,
+            "scan_index_representation_refused"
+        );
+        ensure!(self.files.is_empty(), "scan_index_compatibility_fence");
+        ensure!(self.binding == *binding, "scan_index_binding");
+        ensure!(
+            !self.objects.is_empty() && self.objects.len() <= MAX_OBJECTS,
+            "scan_index_descriptor_count"
+        );
+        ensure!(
+            self.objects[0].slot == Slot::Metadata,
+            "scan_index_metadata_missing"
+        );
+        ensure!(
+            self.objects.windows(2).all(|p| p[0].slot < p[1].slot),
+            "scan_index_duplicate_or_unordered_slot"
+        );
+        let mut total = 0u64;
+        ensure!(self.maps.len() <= 3, "scan_index_map_count");
+        for object in &self.objects {
+            if matches!(object.slot, Slot::Metadata) {
+                ensure!(
+                    valid_digest(&object.digest) && object.bytes >= 2,
+                    "scan_index_metadata_descriptor"
+                );
+            }
+            total = total
+                .checked_add(object.bytes)
+                .context("scan_index_length_overflow")?;
+        }
+        ensure!(self.padding_bytes <= total, "scan_index_padding_size");
+        ensure!(
+            total
+                .checked_add(self.padding_bytes)
+                .is_some_and(|n| n <= i64::MAX as u64 - MAX_ROOT_BYTES as u64),
+            "scan_index_length_overflow"
+        );
+        Ok(())
+    }
+}
+
+/// Read-only integrity check shared by normal v1 loading and v2 inventory.
+pub(super) fn validate_object_digest(
+    input: &mut impl Read,
+    binding: &Binding,
+    object: &Object,
+) -> Result<()> {
+    let mut hash = HashWriter::new(io::sink(), binding, object.slot)?;
+    let mut scratch = [0; BUFFER_BYTES];
+    loop {
+        let n = input.read(&mut scratch)?;
+        if n == 0 {
+            break;
+        }
+        hash.write_all(&scratch[..n])?;
+    }
+    ensure!(
+        hash.finish(object.slot).same_payload(object),
+        "scan_index_object_integrity"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,10 +435,10 @@ pub(crate) struct ReadStats {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct MapManifest {
-    field: Field,
-    generation: u64,
-    buckets: Vec<u8>,
+pub(super) struct MapManifest {
+    pub(super) field: Field,
+    pub(super) generation: u64,
+    pub(super) buckets: Vec<u8>,
 }
 
 /// Existing checkpoint flock is a caller precondition. Directory handles and
@@ -883,47 +951,7 @@ impl LockedStore {
         Ok((Some(file), root))
     }
     fn validate_manifest(&self, manifest: &Manifest) -> Result<()> {
-        ensure!(
-            manifest.schema_version == OUTER_SCHEMA
-                && manifest.storage_format == STORAGE_FORMAT
-                && manifest.logical_schema_version == LOGICAL_SCHEMA,
-            "scan_index_representation_refused"
-        );
-        ensure!(manifest.files.is_empty(), "scan_index_compatibility_fence");
-        ensure!(manifest.binding == self.binding, "scan_index_binding");
-        ensure!(
-            !manifest.objects.is_empty() && manifest.objects.len() <= MAX_OBJECTS,
-            "scan_index_descriptor_count"
-        );
-        ensure!(
-            manifest.objects[0].slot == Slot::Metadata,
-            "scan_index_metadata_missing"
-        );
-        ensure!(
-            manifest.objects.windows(2).all(|p| p[0].slot < p[1].slot),
-            "scan_index_duplicate_or_unordered_slot"
-        );
-        let mut total = 0u64;
-        ensure!(manifest.maps.len() <= 3, "scan_index_map_count");
-        for object in &manifest.objects {
-            if matches!(object.slot, Slot::Metadata) {
-                ensure!(
-                    valid_digest(&object.digest) && object.bytes >= 2,
-                    "scan_index_metadata_descriptor"
-                );
-            }
-            total = total
-                .checked_add(object.bytes)
-                .context("scan_index_length_overflow")?;
-        }
-        ensure!(manifest.padding_bytes <= total, "scan_index_padding_size");
-        ensure!(
-            total
-                .checked_add(manifest.padding_bytes)
-                .is_some_and(|n| n <= i64::MAX as u64 - MAX_ROOT_BYTES as u64),
-            "scan_index_length_overflow"
-        );
-        Ok(())
+        manifest.validate(&self.binding)
     }
     fn validate_object(&self, dir: &File, object: &Object) -> Result<Stamp> {
         let mut file = open_at(dir, &cstring(object.filename().as_bytes())?, libc::O_RDONLY)?;
@@ -936,19 +964,7 @@ impl LockedStore {
         ensure!(boundary == [b'}'], "scan_index_fragment_boundary");
         file.seek(SeekFrom::Start(0))?;
         ensure!(before.bytes == object.bytes, "scan_index_object_length");
-        let mut hash = HashWriter::new(io::sink(), &self.binding, object.slot)?;
-        let mut scratch = [0; BUFFER_BYTES];
-        loop {
-            let n = file.read(&mut scratch)?;
-            if n == 0 {
-                break;
-            }
-            hash.write_all(&scratch[..n])?;
-        }
-        ensure!(
-            hash.finish(object.slot).same_payload(object),
-            "scan_index_object_integrity"
-        );
+        validate_object_digest(&mut file, &self.binding, object)?;
         file.seek(SeekFrom::Start(0))?;
         let mut decoder = serde_json::Deserializer::from_reader(BufReader::with_capacity(
             BUFFER_BYTES,

@@ -1,7 +1,7 @@
-//! M3 r7 D3 matrix through the production scan, the write-ahead facade and
+//! Write-fault matrix through the production scan, the write-ahead facade and
 //! the real store: the Claude per-key hold after a write + cleanup double
 //! fault, the narrow cleanup-proved-absent degraded publish, the ENOSPC
-//! store pause without per-pass retries, #865 debt and membership kept while
+//! store pause without per-pass retries, audit debt and membership kept while
 //! held, the content-change exit, the Codex strict rebind across a real index
 //! save, load and restart, and SIGKILL at the native order points in a real
 //! subprocess. Faults use the store's existing test hooks; no receipt,
@@ -122,7 +122,6 @@ fn scan_with_window(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(cache, namespace.clone());
     let (mut index, mut scan, _, _) = fixture::scan(scan, 10_000);
@@ -394,7 +393,7 @@ fn assert_cold_body(rig: &Rig, pass: &Pass) {
     );
 }
 
-/// [regress] r25: due lossy-shrink recovery verifies once and retains the accepted floor.
+/// [regress] Due lossy-shrink recovery verifies once and retains the accepted floor.
 #[test]
 fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -433,7 +432,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
     });
 }
 
-/// [regress] r25: due lossy-shrink recovery verifies once and retains the accepted floor.
+/// [regress] Due lossy-shrink recovery verifies once and retains the accepted floor.
 #[test]
 fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -604,7 +603,7 @@ fn count_unlinks(record: PathBuf) -> Rc<Cell<u64>> {
     calls
 }
 
-/// (a) + Addendum: a Claude write + cleanup double fault holds only that key
+/// A Claude write + cleanup double fault holds only that key
 /// (no body, accepted facts and the stale A untouched) while another Claude
 /// key publishes; growth stays held and is counted; the key's next
 /// successful write releases it with a Tail catch-up equal to a cold Full.
@@ -844,7 +843,7 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
     assert_eq!(rig.pass().published(SESSION_A), 0, "published exactly once");
 }
 
-/// (e) + (f): nothing is dropped while held. The #865 marker survives (it may
+/// Nothing is dropped while held. The audit marker survives (it may
 /// only be re-armed earlier, never postponed or cleared), the entry, upload
 /// membership and record stay, the key stays discoverable, and no $0 body
 /// is ever emitted for it.
@@ -926,7 +925,7 @@ impl Change {
     }
 }
 
-/// Addendum: a genuine content change of a held key releases it even while
+/// A genuine content change of a held key releases it even while
 /// its writes keep failing; the surviving stale A can never bind the changed
 /// file afterwards, including after a restart.
 /// [money] m3 d3 content change releases a held key while writes still fail.
@@ -978,11 +977,11 @@ fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
     }
 }
 
-/// (c) + SOURCE conditions 1, 3 and 5 at the index boundary: the Codex D3
+/// At the index boundary, the Codex strict-rebind
 /// disposition's own index mutation (`codex_strict_rebind`) settled by a
-/// real save and load keeps key, #865 debt, membership and accepted facts,
+/// real save and load keeps key, audit debt, membership and accepted facts,
 /// deletes nothing, and after restart refuses A with exactly one counted
-/// Full; the next restart restores the replacement. (d), the 0.1.201 refusal,
+/// Full; the next restart restores the replacement. The 0.1.201 refusal
 /// is the file:line proof on `codex_strict_rebind`.
 /// [money] m3 d3 codex strict rebind survives save and load and refuses a with one full.
 #[test]
@@ -1070,17 +1069,17 @@ fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrderPoint {
-    /// E5: the native finish staged a private temp; no store decision yet.
+    /// The native finish staged a private temp; no store decision yet.
     Staged,
     /// Registered pending, temp complete, canonical rename not yet done.
     BeforeRename,
-    /// E12: renamed and receipted, before any publication effect or save.
+    /// Renamed and receipted, before any publication effect or save.
     Receipted,
 }
 impl OrderPoint {
     const ALL: [Self; 3] = [Self::Staged, Self::BeforeRename, Self::Receipted];
     fn name(self) -> &'static str {
-        // Shared #882 classification is exact; FileSynced is explicitly N/A
+        // Shared crash classification is exact; FileSynced is explicitly N/A
         // for all native-M3 rows (plain-flush engine: no fsync boundary).
         use sampled_scan::transition_fixture::CrashPoint;
         assert_eq!(
@@ -1512,7 +1511,7 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
     assert!(!pass.disabled());
 }
 
-/// SOURCE singleton condition 2: the production owner changes from one plain
+/// The production scan changes from one plain
 /// file to a grouped pair; old native bytes cannot enter the joined reduction.
 /// [money] m3 codex singleton to group refuses native restore and retires record.
 #[test]

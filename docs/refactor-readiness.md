@@ -1,5 +1,7 @@
 # Refactor readiness and review coverage
 
+> Dated review. Current daemon design and rules, including "one version" (retire dormant paths rather than keep them), are in [crates/ottto-service/ARCHITECTURE.md](../crates/ottto-service/ARCHITECTURE.md).
+
 Review date: 2026-10-06. Inventory revision:
 `35ef92cb5aa0dd5376c77f877717ec460c73fdcc`.
 

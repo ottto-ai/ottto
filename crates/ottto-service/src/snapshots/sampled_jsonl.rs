@@ -691,7 +691,7 @@ impl OwnedJsonlParser {
         charge
     }
 
-    /// P1-RETAIN R0, shape F with a feasible release: every non-budget gate
+    /// P1-RETAIN R0, a completion with a feasible release: every non-budget gate
     /// first, then the commit, the checkpoint-charged admission at
     /// `budget_after` (within the insert's entry limit), the stamp gate, and
     /// only then the release. Any refusal before `execute` evicts nothing.

@@ -449,13 +449,15 @@ pub(crate) use split_fields;
 // Types proved to own no heap: one walker visit, no bytes, INLINE_ONLY.
 // The literal is STABLE_HEAP, kept per type. `T { a, b }` keeps an
 // exhaustive field guard: a new field is a compile error until accounted for.
+// `T: A | B` is the enum form: a new variant is likewise a compile error.
 macro_rules! no_heap {
-    ($stable:literal; $($t:ty $({ $($f:ident),* $(,)? })?),+ $(,)?) => { $(
+    ($stable:literal; $($t:ty $({ $($f:ident),* $(,)? })? $(: $($v:ident)|+)?),+ $(,)?) => { $(
         impl crate::heap_layout_bound::HeapLayoutBound for $t {
             const INLINE_ONLY: bool = true;
             const STABLE_HEAP: bool = $stable;
             fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
                 $(let Self { $($f: _,)* } = self;)?
+                $(let ($(Self::$v)|+) = self;)?
                 c.add(0)
             }
         }

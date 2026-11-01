@@ -1,4 +1,4 @@
-//! E1's transport/mapping controls. E5 owns the eight native Pi capture cases.
+//! Native publication transport and mapping controls.
 use super::*;
 use sampled_scan::durable_tail::{
     Degraded, DegradedCause, FinishAcquisition, HeldCause, NotPersisted, Unprepared,
@@ -73,7 +73,7 @@ fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     let write = |outcome| write_disposition(&cache, &mut acquisition(), source, outcome, None).0;
     let cause = Unprepared::NotPersisted(NotPersisted::Codec);
     // The receipt policy is a typed value here; real candidate/receipt binding
-    // stays in the existing facade fixtures and E5's native outcome tests.
+    // stays in the existing facade fixtures and native outcome tests.
     let publishing = [
         NativePublication::Receipted,
         unprepared(UnpreparedDisposition::PublishWithoutRecord { cause }),
@@ -138,7 +138,6 @@ fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
             None,
             &[],
             false,
-            true,
             false,
         );
         NativePublication::carry(

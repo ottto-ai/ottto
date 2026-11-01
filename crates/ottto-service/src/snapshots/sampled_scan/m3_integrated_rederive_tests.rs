@@ -200,7 +200,6 @@ impl ColdReplay {
             None,
             &[],
             false,
-            true,
             false,
         )
         .with_sampled_acquisition(cache, self.namespace.clone());

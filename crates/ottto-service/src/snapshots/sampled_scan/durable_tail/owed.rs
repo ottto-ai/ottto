@@ -255,7 +255,7 @@ impl Stores {
         }
         self.release_idle_debt(&digest);
     }
-    /// SOURCE condition 3: a disabled store leaves no orphan OwedMark.
+    /// A disabled store leaves no orphan OwedMark.
     pub(super) fn clear_source_owed(&mut self, source: DurableSource) {
         for debt in self.key_debt.values_mut() {
             if matches!(debt.owed, OwedMark::Owed(s) | OwedMark::Hold(s) if s == source) {

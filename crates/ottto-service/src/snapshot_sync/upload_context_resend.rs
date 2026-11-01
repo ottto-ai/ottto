@@ -1,4 +1,5 @@
-//! Context-bound transport resume. Durable stamps never mint file receipts.
+//! Context-bound transport resume. A file receipt needs every body exact-ACKed
+//! in this context: this pass, or an earlier one by its durable stamp.
 use super::*;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize)]
@@ -23,10 +24,8 @@ pub(super) struct Cycle {
     // Shared by every uploader invocation in this source pass. Ordinary
     // bodies reserve first, even when they exceed this allowance; only
     // stamp-only catch-up is capped by the existing packing byte target.
+    // A file's catch-up tail past it stays owed (Lead B Q1, 2026-10-31).
     remaining_bytes: usize,
-    alone_allowance: usize,
-    alone_allowance_used: bool,
-    catchup_admitted: bool,
     ordinary_pending: BTreeSet<String>,
     pub deferred: BTreeSet<String>,
     pub bootstrap_blocks_catchup: bool,
@@ -61,29 +60,12 @@ impl Cycle {
     }
     pub(super) fn reserve_ordinary_bytes(&mut self, bytes: usize) {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
-        // Selection admits at most one oversized logical unit. Its complete
-        // ACK set must fit this pass; each POST retains the normal size cap.
-        if self.alone_allowance > 0 {
-            // Selection can reserve an oversized file before final projection
-            // reveals ordinary revisions. That is no longer an alone pass.
-            // Never refill the allowance on a later uploader/bootstrap call.
-            if !self.alone_allowance_used
-                && !self.catchup_admitted
-                && bytes == 0
-                && self.ordinary_pending.is_empty()
-            {
-                self.remaining_bytes = self.remaining_bytes.max(self.alone_allowance);
-            }
-            self.alone_allowance_used = true;
-            self.alone_allowance = 0;
-        }
     }
     pub(super) fn admit_catchup_bytes(&mut self, bytes: usize) -> bool {
         if bytes > self.remaining_bytes {
             return false;
         }
         self.remaining_bytes -= bytes;
-        self.catchup_admitted = true;
         true
     }
     #[cfg(test)]
@@ -156,13 +138,33 @@ impl Cycle {
     }
 }
 impl SnapshotUploadProgress {
+    /// Lead B Q1 (2026-10-31): one file's context ACKs may split across
+    /// passes. An earlier pass's ACK counts only by its durable stamp of the
+    /// same mode context and exact body; an unstamped ACK stays unknown.
+    pub(super) fn split_context_receipt_candidates(
+        &self,
+    ) -> Vec<crate::snapshots::UploadContextReceiptCandidate> {
+        self.context_receipt_candidates
+            .iter()
+            .cloned()
+            .map(|candidate| {
+                candidate.with_split_evidence(
+                    |entity, body, context| {
+                        self.accepted_body_contexts.get(entity).map(String::as_str) == Some(context)
+                            && self.accepted_body_witnesses.get(entity).map(String::as_str)
+                                == Some(body)
+                    },
+                    &self.context_resend.deferred,
+                )
+            })
+            .collect()
+    }
     pub(super) fn prepare_context_receipt_candidates(
         &mut self,
         index: &ScanIndex,
         previous: &ScanIndex,
         items: &[SnapshotItem],
     ) {
-        self.context_resend.alone_allowance = index.context_read_counts.wire_allowance;
         self.context_resend.counts.files = index.context_read_counts.files;
         self.context_resend.counts.local_bytes = index.context_read_counts.local_bytes;
         self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
@@ -211,7 +213,7 @@ impl SnapshotUploadProgress {
     }
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed);
-crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, alone_allowance, alone_allowance_used, catchup_admitted, ordinary_pending, deferred, bootstrap_blocks_catchup);
+crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]
 thread_local! { static LAST_COUNTS: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
