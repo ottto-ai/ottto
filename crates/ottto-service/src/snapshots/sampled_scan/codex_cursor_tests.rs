@@ -962,7 +962,6 @@ fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> Owned
         None,
         &[],
         false,
-        true,
     )
 }
 
@@ -1723,7 +1722,6 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
             Some(&support),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         // No active file: the release takes its conservative full path.
@@ -1808,7 +1806,6 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
             Some(&support),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         claude.sidecar_census_complete = false;
@@ -2185,9 +2182,10 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
     });
 }
 
-/// E2 (R2-B1): a resume whose evidence is unavailable is tried at most once
-/// per page and ends after `UNAVAILABLE_RESUMES` such pages, freeing the
-/// slot. The trigger is R1-M1's: an untrusted census plus a changed scope.
+/// [regress] E2 (R2-B1): a resume whose evidence is unavailable is tried at
+/// most once per page and ends after `UNAVAILABLE_RESUMES` such pages,
+/// freeing the slot. The trigger: an untrusted census plus reduction
+/// dependencies that cannot be computed (the existing refusal hook).
 /// Before E2 the deferred job was resumed again on the next step of the
 /// same scan object, forever; every page here must finish within a bound.
 #[test]
@@ -2199,9 +2197,16 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     let fixture = ScanRoot::new(40);
     let path = fixture.file(SESSION);
     let cache = Arc::new(SharedCache::default());
+    struct ResetDependencies;
+    impl Drop for ResetDependencies {
+        fn drop(&mut self) {
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+        }
+    }
+    let _reset = ResetDependencies;
     let flipped = |scan: &mut OwnedSourceScan| {
         scan.sidecar_census_complete = false;
-        scan.context_curve_enabled = !scan.context_curve_enabled;
+        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(true));
     };
     with_test_limits(2048, 1024, 64, || {
         let (mut index, _, _) = page_steps(
@@ -3045,7 +3050,6 @@ fn hinted_page_limited(
         None,
         hints,
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     loop {
@@ -3268,7 +3272,6 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         None,
         &[fixture.file(SESSION_B)],
         false,
-        true,
     );
     assert_eq!(scan.identified_candidates.len(), 2);
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
@@ -3416,7 +3419,6 @@ fn published_scan(
         None,
         hints,
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     loop {
@@ -4086,7 +4088,6 @@ fn accumulator_heap_bound_at_measured_event_counts() {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         // The pause charge is the completed walk (N3); it must exist.
@@ -4320,6 +4321,8 @@ const SPAWN_PARENT: &str = "01a0c0de-5e24-7f10-8a93-a0c1968d8a3a";
 /// thread (Σ last = 200 input over 3 requests); `fork` adds a
 /// `forked_from_id` (copied-history evidence that keeps it held).
 struct CreatedThreadHome {
+    // These lineage controls count Legacy: their owning header predates this epoch.
+    _cutover: codex_counting_version::TestCutover,
     fixture: ScanRoot,
     path: PathBuf,
     body: Vec<Vec<u8>>,
@@ -4398,6 +4401,7 @@ impl CreatedThreadHome {
         let path = fixture.root.join(format!("rollout-{CREATED}.jsonl"));
         fs::write(&path, body[..written].concat()).unwrap();
         let home = Self {
+            _cutover: codex_counting_version::TestCutover::set(base_ms + 1),
             fixture,
             path,
             body,
@@ -6896,7 +6900,11 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
     assert_ne!(reference, digest(&context, &codex, 1), "upload context");
     let flags: [fn(&mut CodexTitleMetadata); 3] = [
-        |codex| codex.created_thread_census_unscoped_incomplete = true,
+        |codex| {
+            codex
+                .created_thread_census_failed_homes
+                .insert(PathBuf::from("/failed-home"));
+        },
         |codex| codex.state_census_unscoped_incomplete = true,
         |codex| codex.sidecar_census_unscoped_incomplete = true,
     ];
@@ -8133,6 +8141,10 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
         let (next, scan) = home.generation(index, &cache, n);
         assert!(session_usage(&scan, CHILD).is_empty());
         assert!(!next.codex_parent_ownership_refs.contains(PARENT));
+        // [behaviour] A refused global parent-ref request is locally visible.
+        if n == 0 {
+            assert!(scan.cap_counts.parent_ref_refusals > 0);
+        }
         assert_eq!(restarts_in_scope(&scan), Some(0), "generation {n}");
         assert_eq!(
             parent_causes(&scan),
@@ -10507,7 +10519,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 }
 
 /// One continuation page of the paused job whose member index keys are
-/// `members`, over `root` (`days`, `curve` as the ordinary pages used),
+/// `members`, over `root` (`days` as the ordinary pages used),
 /// standing for `ordinary` of the ordinary cadence (§6).
 #[allow(clippy::too_many_arguments)]
 fn continuation_page_in(
@@ -10517,7 +10529,6 @@ fn continuation_page_in(
     namespace: &str,
     collected_at: &str,
     days: u64,
-    curve: bool,
     ordinary: Option<std::time::Duration>,
     tweak: impl Fn(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
@@ -10528,7 +10539,6 @@ fn continuation_page_in(
         days,
         10,
         false,
-        curve,
         ordinary,
         carried(root),
     );
@@ -10552,7 +10562,6 @@ fn continuation_page(
         "cursor-fixture",
         NOW,
         BACKFILL_WINDOW_DAYS,
-        true,
         None,
         tweak,
     )
@@ -10703,7 +10712,6 @@ fn continuation_prepares_no_group_attempt() {
                 None,
                 &[],
                 false,
-                false,
             )
             .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into())),
         )
@@ -10768,7 +10776,6 @@ fn continuation_prepares_no_group_attempt() {
                     "group-fixture",
                     AT,
                     7,
-                    false,
                     None,
                     |_| {},
                 )
@@ -10982,7 +10989,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11206,7 +11212,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         None,
         &[],
         false,
-        false,
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("ns".into()));
     let context = scan.sampling.as_ref().unwrap();
@@ -11332,7 +11337,6 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 BACKFILL_WINDOW_DAYS,
                 10,
                 false,
-                true,
                 Some(secs(600)),
                 carried(&fixture.root),
             )
@@ -11419,7 +11423,6 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |scan| scan.codex_page.set_continuation_deadline(t0 + secs(5)),
             )
@@ -11440,7 +11443,6 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11491,7 +11493,6 @@ fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             )
@@ -11909,7 +11910,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                     "cursor-fixture",
                     NOW,
                     BACKFILL_WINDOW_DAYS,
-                    true,
                     Some(secs(600)),
                     |_| {},
                 );
@@ -12030,7 +12030,6 @@ fn eof_park_state_bound_keeps_prior_body_and_discloses_without_rereading() {
                 "cursor-fixture",
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                true,
                 Some(secs(600)),
                 |_| {},
             );
@@ -12620,6 +12619,10 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
                 break;
             }
             if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
+                // Retain the real Legacy ACK before the entry leaves the index.
+                assert!(codex_counting_version::tombstone_before_retire(
+                    &mut index, &key
+                ));
                 // The per-pass index loads without the parked file's entry.
                 index.files.remove(&key);
                 cleared = true;

@@ -115,33 +115,15 @@ impl std::fmt::Display for SnapshotAckRejected {
 
 impl std::error::Error for SnapshotAckRejected {}
 
-/// Whether snapshot batch bodies are gzip-encoded.
-///
-/// Default OFF, deliberately. Response compression is universal, but nothing
-/// decompresses a *request* body unless a route opts in, and the batch route does
-/// not yet — the OTLP route is the only one in the estate with a request
-/// decompression path. Shipping this enabled would 4xx every upload from an
-/// upgraded daemon against today's server.
-///
-/// So the encoder ships now (the release train is the long pole) behind
-/// `OTTTO_SNAPSHOT_UPLOAD_GZIP=1`, and the default flips in the release AFTER the
-/// batch route decompresses. The refusal fallback below means a premature flip
-/// degrades to identity encoding instead of stopping sync.
-static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(false);
-static SNAPSHOT_UPLOAD_GZIP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Gzip is enabled until the backend refuses an encoded snapshot batch.
+/// Size budgets and encoding failures still fall back to identity per request.
+static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn snapshot_upload_gzip_enabled() -> bool {
-    if !SNAPSHOT_UPLOAD_GZIP_INITIALIZED.swap(true, Ordering::Relaxed) {
-        let enabled = std::env::var("OTTTO_SNAPSHOT_UPLOAD_GZIP")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        SNAPSHOT_UPLOAD_GZIP.store(enabled, Ordering::Relaxed);
-    }
     SNAPSHOT_UPLOAD_GZIP.load(Ordering::Relaxed)
 }
 
 fn disable_snapshot_upload_gzip() {
-    SNAPSHOT_UPLOAD_GZIP_INITIALIZED.store(true, Ordering::Relaxed);
     if SNAPSHOT_UPLOAD_GZIP.swap(false, Ordering::Relaxed) {
         eprintln!(
             "ottto-service: snapshot upload gzip disabled for this process — the backend refused \
@@ -559,6 +541,11 @@ impl UploadFailureDiagnostics {
         self.status_family
     }
 
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
+    }
+
     /// Whether a snapshot page exceeded the client or gateway read deadline.
     ///
     /// Keep this endpoint-scoped: a relay-token timeout happened before the
@@ -680,11 +667,6 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
-    /// Durable accepted-log capability for content-free request-index curves.
-    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
-    /// emits curves that the server cannot durably acknowledge.
-    #[serde(default)]
-    pub session_context_curve_contract: Option<String>,
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
@@ -696,6 +678,14 @@ pub struct ActivityHintResponse {
     /// the field off, so older servers never receive it.
     #[serde(default)]
     pub session_request_identity_retained_contract: Option<String>,
+    /// Server capability for `request_evidence.account_source` (carried
+    /// accounts as placement, never proof). Missing/null/unknown keeps it off,
+    /// so older servers never receive the field.
+    #[serde(default)]
+    pub session_request_account_source_contract: Option<String>,
+    /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
+    #[serde(skip)]
+    pub max_snapshot_item_bytes: Option<u64>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -710,6 +700,9 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
+    /// Exact backend admission for non-terminal census progress/block status.
+    #[serde(default)]
+    pub census_status_contract: Option<String>,
     /// Retired per-account cohort token for contract-5 request identity rows.
     /// Contract 5 is always on for Claude Code, so this daemon decodes the
     /// field for compatibility and never reads it; the server keeps sending
@@ -724,6 +717,7 @@ pub struct ActivityHintResponse {
 pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
     let mut hint = ActivityHintResponse::deserialize(&value)
         .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.max_snapshot_item_bytes = value.get("max_snapshot_item_bytes").and_then(Value::as_u64);
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
@@ -1275,6 +1269,22 @@ pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
 /// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
 pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
 
+/// Activity-hint admission; unknown or absent tokens preserve legacy bytes.
+pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
+
+/// Content-free first failed census gate, in the shared receipt builder's order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusBlockCause {
+    UnreadableEvents,
+    DisappearedFiles,
+    CarryAdmission,
+    StateLoader,
+    TransportReservation,
+    OwnershipIncomplete,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
@@ -1371,6 +1381,11 @@ pub struct SnapshotStatusRequest {
     pub last_census_residue_archived_rollout_count: u64,
     #[serde(default)]
     pub last_census_residue_blocked_session_count: u64,
+    /// Census-member queue plus carry replay, only under census_status:v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_pending_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_block_cause: Option<CensusBlockCause>,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
@@ -1453,6 +1468,8 @@ impl SnapshotStatusRequest {
             last_census_residue_index_key_count,
             last_census_residue_archived_rollout_count,
             last_census_residue_blocked_session_count,
+            last_census_pending_file_count,
+            last_census_block_cause,
             consecutive_failures,
             next_retry_at,
             // Build identity, unrelated to any scan.
@@ -1487,6 +1504,12 @@ impl SnapshotStatusRequest {
         }
         if last_error_message.is_some() {
             return Some("last_error_message");
+        }
+        if last_census_pending_file_count.is_some() {
+            return Some("last_census_pending_file_count");
+        }
+        if last_census_block_cause.is_some() {
+            return Some("last_census_block_cause");
         }
         if next_retry_at.is_some() {
             return Some("next_retry_at");
@@ -3902,6 +3925,43 @@ mod tests {
         assert_eq!(parse_retry_after("later", now), None);
     }
 
+    /// [behaviour] A fresh default client sends eligible batches as gzip.
+    #[test]
+    fn default_snapshot_client_sends_gzip() {
+        // Refusals in other tests must not change this process-default proof.
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            let body =
+                r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response.validate_entity_ack(&request).unwrap();
+        let captured = server.join().unwrap();
+        let headers = captured.split_once("\r\n\r\n").unwrap().0;
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
     #[test]
     fn snapshot_gzip_respects_decoded_and_compressed_budgets() {
         for size in [128 * 1024, 640 * 1024, 1024 * 1024] {
@@ -4003,6 +4063,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.123".to_string()),
@@ -4185,6 +4247,14 @@ mod tests {
                 Box::new(|r| r.last_terminal_over_line_cap_count = 1),
             ),
             (
+                "last_census_pending_file_count",
+                Box::new(|r| r.last_census_pending_file_count = Some(0)),
+            ),
+            (
+                "last_census_block_cause",
+                Box::new(|r| r.last_census_block_cause = Some(CensusBlockCause::Other)),
+            ),
+            (
                 "last_census_residue_settled",
                 Box::new(|r| r.last_census_residue_settled = true),
             ),
@@ -4297,6 +4367,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
@@ -4369,6 +4441,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.120".to_string()),
@@ -5050,7 +5124,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

@@ -11,6 +11,9 @@ fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         false,
     )
     .unwrap();
+    // The parser no longer builds curves; a retained body-tracking curve keeps
+    // a changed body's witness distinct.
+    crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, true);
     index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut scan.snapshots, &[]);
     apply_upload_policy(
         SnapshotSource::Codex,

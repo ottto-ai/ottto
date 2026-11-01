@@ -3597,7 +3597,10 @@ pub(in crate::snapshots) fn group_memo_digest(
         receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
-        if codex.created_thread_census_unscoped_incomplete {
+        if members
+            .iter()
+            .any(|member| codex.created_thread_census_incomplete_for(&member.path))
+        {
             "created_incomplete".to_owned()
         } else {
             "created_complete".to_owned()
@@ -5872,7 +5875,6 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) codex: &'a CodexTitleMetadata,
     pub(in crate::snapshots) claude: &'a ClaudeTitleMetadata,
     pub(in crate::snapshots) support: Option<&'a Path>,
-    pub(in crate::snapshots) context_curve_enabled: bool,
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) parents:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
@@ -5930,14 +5932,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.support,
         )
         .map(|dependency| {
-            sampling.file_scope(
-                context.source,
-                &job.candidate,
-                &dependency,
-                true,
-                context.context_curve_enabled,
-                index,
-            )
+            sampling.file_scope(context.source, &job.candidate, &dependency, true, index)
         })
     });
     // A group's counting view is built over every member (R1-M2).
@@ -6802,7 +6797,7 @@ pub(in crate::snapshots) fn memo_digest(
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
         &conflicted_identities(codex, &candidate.path),
-        if codex.created_thread_census_unscoped_incomplete {
+        if codex.created_thread_census_incomplete_for(&candidate.path) {
             "created_incomplete"
         } else {
             "created_complete"

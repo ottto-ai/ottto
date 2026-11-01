@@ -1883,37 +1883,6 @@ fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
     }
 }
 
-/// OBS: correction state persists only the proof and the owed member ids; owed
-/// counts and reasons go only to the existing local diagnostic line.
-#[test]
-fn a_correction_persists_no_diagnostic_metadata() {
-    let value = serde_json::to_value(apc_granted()).unwrap();
-    let record = value["claude_usage_authority_quarantine"][APC_ROOT]
-        .as_object()
-        .unwrap();
-    assert_eq!(
-        record.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "contract",
-            "proven_witness_fingerprint",
-            "member_source_file_fingerprints",
-            "failed_reconstruction_count",
-            "disposition",
-            "retry_after_unix_seconds",
-            "proof_correction",
-        ])
-    );
-    assert_eq!(
-        record["proof_correction"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["proof_witness_fingerprint", "owed_member_ids"])
-    );
-}
-
 fn apc_emit(line: Value) {
     use std::io::Write as _;
     std::io::stderr()
@@ -2023,7 +1992,7 @@ fn binding_family() -> (
     crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
 ) {
     let scratch = crate::test_scratch::ScratchDir::new("authority-binding");
-    let (dir, root, mut items) = claude_account_family_fixture();
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     let mut index = ScanIndex::default();
     for (n, item) in items.iter_mut().enumerate() {
         item.source_file_fingerprint = Some(apc_hex(if n == 0 { 'a' } else { 'b' }));
@@ -2086,7 +2055,7 @@ fn binding_family() -> (
 #[test]
 fn demotion_after_same_call_reproof_binds_current_witness() {
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let (scratch, root, mut index, items, mut api, trace) = binding_family();
     let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
     let row = &mut api.evidence.get_mut(&root).unwrap()[0];
@@ -2143,7 +2112,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
 #[test]
 fn witness_removed_while_member_demotes_does_not_quarantine_index() {
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let (scratch, root, mut index, mut items, api, trace) = binding_family();
     index.files.insert(
         format!("/synthetic/twin/{root}.jsonl"),

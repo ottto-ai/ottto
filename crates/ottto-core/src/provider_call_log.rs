@@ -66,8 +66,6 @@ impl Provider {
 pub enum CallKind {
     /// `GET api.anthropic.com/api/oauth/usage` (Claude quota).
     ClaudeOauthUsage,
-    /// `GET chatgpt.com/backend-api/wham/usage` (legacy Codex quota).
-    CodexWhamUsage,
     /// `GET chatgpt.com/.../daily-workspace-usage-counts` (Codex daily totals).
     CodexDailyWorkspaceUsage,
     /// One `codex app-server` quota read: a token refresh and a rate-limits
@@ -96,7 +94,6 @@ impl CallKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ClaudeOauthUsage => "claude_oauth_usage",
-            Self::CodexWhamUsage => "codex_wham_usage",
             Self::CodexDailyWorkspaceUsage => "codex_daily_workspace_usage",
             Self::CodexAppServerQuota => "codex_app_server_quota",
             Self::CodexCloudList => "codex_cloud_list",

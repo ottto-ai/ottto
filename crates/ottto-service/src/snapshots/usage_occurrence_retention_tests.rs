@@ -55,7 +55,6 @@ fn parsed_items(rows: &[Value]) -> Vec<SnapshotItem> {
         None,
         true,
         None,
-        true,
     )
     .unwrap();
     fs::remove_dir_all(&dir).unwrap();

@@ -196,29 +196,8 @@ fn inherited_start(item: &SnapshotItem) -> Option<SnapshotSessionStart> {
 
 /// Serialized top-level keys whose values differ between two bodies.
 fn differing_keys(left: &SnapshotItem, right: &SnapshotItem) -> BTreeSet<String> {
-    if left.context_curve != right.context_curve {
-        // The E-on/control comparison may change only the unavailable reason,
-        // never introduce curve evidence alongside the admitted scalars.
-        assert_eq!(
-            left.claude_file_birth_verdict(),
-            Some(ClaudeFileBirthVerdict::Admitted)
-        );
-        for (item, coverage) in [
-            (left, "scalars_file_birth_only"),
-            (right, "ownership_unresolved"),
-        ] {
-            assert_eq!(
-                item.context_curve,
-                Some(unavailable_context_curve(
-                    CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                    CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                    coverage,
-                    0,
-                    0,
-                ))
-            );
-        }
-    }
+    // The daemon builds no curve on either side of the comparison.
+    assert!(left.context_curve.is_none() && right.context_curve.is_none());
     let left = serde_json::to_value(left).expect("serialize body");
     let right = serde_json::to_value(right).expect("serialize body");
     let (left, right) = (
@@ -1320,66 +1299,6 @@ fn api_row_without_trace_row_counts_as_owned() {
 }
 
 #[test]
-fn telemetry_proven_session_keeps_todays_numbers() {
-    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let dir = temp_dir("claude-file-birth-parity");
-    let now = OffsetDateTime::now_utc();
-    let (path, parsed) = root_session(
-        &dir,
-        ROOT,
-        &[
-            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
-            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
-            boundary(ROOT, &stamp(now, -28), 310, 50),
-            assistant(ROOT, "req_a3", &stamp(now, -27), 200),
-        ],
-    );
-    let evidence = reports(
-        &[
-            (ROOT, "req_a1", 1, 100),
-            (ROOT, "req_a2", 2, 300),
-            (ROOT, "req_a3", 3, 200),
-        ],
-        true,
-    );
-    let run = |fence_closed: bool| {
-        let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], fence_closed);
-        let disposition = fold(&mut items, &evidence, &mut index, true);
-        (disposition.posture_admission(ROOT), items.remove(0))
-    };
-
-    let (strict_admission, strict) = run(false);
-    let (birth_admission, birth) = run(true);
-
-    assert_eq!(strict_admission, Some("strict"));
-    assert_eq!(birth_admission, Some("file_birth_rule"));
-    assert_eq!(posture(&strict), (Some(100), Some(300), Some(200), Some(1)));
-    assert_eq!(posture(&birth), posture(&strict));
-    assert_eq!(birth.compaction_timestamps, strict.compaction_timestamps);
-    assert_eq!(
-        birth.compaction_total_pre_tokens,
-        strict.compaction_total_pre_tokens
-    );
-    assert_eq!(birth.session_start, strict.session_start);
-    // Both writers build sizes and points through one helper: same values.
-    assert_eq!(
-        strict.compaction_events,
-        vec![SnapshotCompactionEvent {
-            at: stamp(now, -28),
-            before: Some(300),
-            after: Some(200),
-            trigger: Some("auto".to_string()),
-        }]
-    );
-    assert_eq!(birth.compaction_events, strict.compaction_events);
-    assert!(!strict.local_context_points.is_empty());
-    assert_eq!(birth.local_context_points, strict.local_context_points);
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
 fn id_less_responses_share_the_one_scalar_source() {
     let dir = temp_dir("claude-file-birth-id-less");
     let now = OffsetDateTime::now_utc();
@@ -1443,7 +1362,7 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -1498,7 +1417,8 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     .unwrap();
     let claude = SnapshotSource::ClaudeCode;
     let run = |rule_on: bool, fence_closed: bool| {
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = scan_source_roots_with_test_limit(
             claude,
             std::slice::from_ref(&dir),
@@ -1670,7 +1590,6 @@ fn native_read(
         None,
         None,
         false,
-        true,
     )
     .expect("parser");
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
@@ -2460,10 +2379,9 @@ fn points_work_refusal_preserves_every_other_snapshot_field() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Advertised curves must distinguish E's admitted scalars from copied or
-/// unresolved posture, while the curve itself remains strictly unavailable.
+/// E's admitted scalars reach the batch wire; the daemon advertises no curve.
 #[test]
-fn file_birth_only_curve_coverage_keeps_admitted_scalars_on_batch_wire() {
+fn file_birth_only_admitted_scalars_reach_batch_wire_without_a_curve() {
     let dir = temp_dir("claude-file-birth-curve-coverage");
     let now = OffsetDateTime::now_utc();
     let lines = [
@@ -2475,112 +2393,67 @@ fn file_birth_only_curve_coverage_keeps_admitted_scalars_on_batch_wire() {
     let (path, parsed) = root_session(&dir, ROOT, &lines);
     // finish() has no E verdict and must keep the conservative default.
     assert_eq!(parsed.claude_file_birth_verdict(), None);
+    assert!(parsed.context_curve.is_none());
+    let mut item = parsed.clone();
+    item.claude_context_curve_request_index_complete = true;
+    let mut items = vec![item];
+    let mut index = indexed(&[&path], true);
+    fold(&mut items, &no_reports(), &mut index, false);
+    let item = &items[0];
     assert_eq!(
-        parsed.context_curve.as_ref().unwrap().coverage,
-        "ownership_unresolved"
+        item.claude_file_birth_verdict(),
+        Some(ClaudeFileBirthVerdict::Admitted)
     );
-    for (advertised, index_complete, expected) in [
-        (true, true, Some("scalars_file_birth_only")),
-        (true, false, Some("parser_unsupported")),
-        (false, true, None),
-    ] {
-        let mut item = parsed.clone();
-        if !advertised {
-            item.context_curve = None;
-        }
-        item.claude_context_curve_request_index_complete = index_complete;
-        let mut items = vec![item];
-        let mut index = indexed(&[&path], true);
-        let disposition = fold(&mut items, &no_reports(), &mut index, false);
-        let item = &items[0];
-        assert_eq!(
-            item.claude_file_birth_verdict(),
-            Some(ClaudeFileBirthVerdict::Admitted)
-        );
-        assert_eq!(posture(item), (Some(100), Some(300), Some(200), Some(1)));
-        assert_eq!(
-            item.session_start, parsed.session_start,
-            "fresh opening keeps full split"
-        );
-        assert_eq!(item.first_own_request_at, Some(stamp(now, -30)));
-        assert_eq!(
-            item.context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            expected
-        );
-        assert_eq!(
-            disposition
-                .context_file_birth
-                .curve_scalars_file_birth_only_session_count,
-            usize::from(expected == Some("scalars_file_birth_only"))
-        );
-        assert_eq!(
-            disposition
-                .context_file_birth
-                .curve_ownership_unresolved_session_count,
-            0
-        );
-        if let Some(curve) = &item.context_curve {
-            assert_eq!(
-                *curve,
-                unavailable_context_curve(
-                    CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                    CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                    expected.unwrap(),
-                    0,
-                    0
-                )
-            );
-            validate_context_curve(0, curve).expect("new unavailable coverage is valid locally");
-        }
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "claude_code".to_string(),
-            machine_id: "machine".to_string(),
-            collector_version: None,
-            snapshots: items.clone(),
-            upload_policy: SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
-        let wire = serde_json::to_value(&request).expect("serialize real batch wire");
-        let body = &wire["snapshots"][0];
-        assert_eq!(body["first_turn_context_tokens"], 100);
-        assert_eq!(body["peak_context_fill_tokens"], 300);
-        assert_eq!(body["last_turn_context_tokens"], 200);
-        assert_eq!(body["compaction_count"], 1);
-        assert_eq!(body["compaction_timestamps"], json!([stamp(now, -28)]));
-        assert_eq!(body["compaction_events"][0]["before"], 300);
-        assert_eq!(body["compaction_events"][0]["after"], 200);
-        assert_eq!(body["compaction_total_pre_tokens"], 310);
-        assert_eq!(body["compaction_total_post_tokens"], 50);
-        assert_eq!(body["compaction_total_cumulative_dropped_tokens"], 3);
-        assert_eq!(body["compaction_total_duration_ms"], 9);
-        assert_eq!(body["first_own_request_at"], stamp(now, -30));
-        assert_eq!(
-            body["session_start"],
-            serde_json::to_value(&parsed.session_start).unwrap()
-        );
-        assert!(body.get("claude_file_birth_verdict").is_none());
-        assert!(body.get("claude_file_birth").is_none());
-        assert_eq!(body.get("context_curve").is_some(), advertised);
-        if advertised {
-            assert_eq!(body["context_curve"]["coverage"], expected.unwrap());
-        }
-        let mut previous_coverage = item.clone();
-        previous_coverage.context_curve = parsed.context_curve.clone();
-        assert_eq!(
-            snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, item),
-            snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &previous_coverage),
-            "coverage and the local verdict cannot move protected semantic roots"
-        );
-        assert_eq!(
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, item),
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, &previous_coverage)
-        );
-        let mut cleared = item.clone();
-        clear_claude_context_posture(&mut cleared);
-        assert_eq!(cleared.claude_file_birth_verdict(), None);
-    }
+    assert_eq!(posture(item), (Some(100), Some(300), Some(200), Some(1)));
+    assert_eq!(
+        item.session_start, parsed.session_start,
+        "fresh opening keeps full split"
+    );
+    assert_eq!(item.first_own_request_at, Some(stamp(now, -30)));
+    assert!(item.context_curve.is_none());
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".to_string(),
+        machine_id: "machine".to_string(),
+        collector_version: None,
+        snapshots: items.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let wire = serde_json::to_value(&request).expect("serialize real batch wire");
+    let body = &wire["snapshots"][0];
+    assert_eq!(body["first_turn_context_tokens"], 100);
+    assert_eq!(body["peak_context_fill_tokens"], 300);
+    assert_eq!(body["last_turn_context_tokens"], 200);
+    assert_eq!(body["compaction_count"], 1);
+    assert_eq!(body["compaction_timestamps"], json!([stamp(now, -28)]));
+    assert_eq!(body["compaction_events"][0]["before"], 300);
+    assert_eq!(body["compaction_events"][0]["after"], 200);
+    assert_eq!(body["compaction_total_pre_tokens"], 310);
+    assert_eq!(body["compaction_total_post_tokens"], 50);
+    assert_eq!(body["compaction_total_cumulative_dropped_tokens"], 3);
+    assert_eq!(body["compaction_total_duration_ms"], 9);
+    assert_eq!(body["first_own_request_at"], stamp(now, -30));
+    assert_eq!(
+        body["session_start"],
+        serde_json::to_value(&parsed.session_start).unwrap()
+    );
+    assert!(body.get("claude_file_birth_verdict").is_none());
+    assert!(body.get("claude_file_birth").is_none());
+    assert!(body.get("context_curve").is_none());
+    let mut previous_coverage = item.clone();
+    previous_coverage.context_curve = parsed.context_curve.clone();
+    assert_eq!(
+        snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, item),
+        snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &previous_coverage),
+        "coverage and the local verdict cannot move protected semantic roots"
+    );
+    assert_eq!(
+        snapshot_fingerprint(SnapshotSource::ClaudeCode, item),
+        snapshot_fingerprint(SnapshotSource::ClaudeCode, &previous_coverage)
+    );
+    let mut cleared = item.clone();
+    clear_claude_context_posture(&mut cleared);
+    assert_eq!(cleared.claude_file_birth_verdict(), None);
     let _ = fs::remove_dir_all(dir);
 }

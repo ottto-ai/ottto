@@ -63,13 +63,7 @@ impl ClaudeWriterRun {
         self.0 != 0 && self.0 != 255
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeWriterRun {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeWriterRun);
 
 /// Money only: the writer certificate of the lines at or after a cutoff that
 /// finalize decides (the EFFECTIVE money birth, earlier than the physical
@@ -112,13 +106,7 @@ impl ClaudeOwnWriters {
         self.latest >= cutoff && self.others.iter().any(|other| *other < cutoff)
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOwnWriters {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeOwnWriters);
 
 /// Open-descriptor metadata, also used by the page's one metadata probe per twin.
 /// A zero inode means unavailable; no timestamp or file identity is invented.
@@ -163,13 +151,7 @@ impl ClaudeOpenedBirth {
         }
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOpenedBirth {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeOpenedBirth);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ClaudeBirthScope {
@@ -193,13 +175,7 @@ crate::durable_tail_codec::durable_enum!(ClaudeBirthScope {
     3 => Root(N x0: i128),
 });
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeBirthScope {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeBirthScope);
 
 /// Per-file birth evidence and the own-only context tally the parser keeps
 /// beside today's values. Inline only: no heap, so neither the parser budget
@@ -243,31 +219,13 @@ crate::durable_tail_codec::durable_struct!(ClaudeFileBirth {
     N all_response_writers: ClaudeWriterRun,
     I opened: ClaudeOpenedBirth,
 });
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirth {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        // This Copy witness owns no heap. Keep exhaustive coverage so a new
-        // field cannot silently enter native frame/cache accounting.
-        let Self {
-            scope: _,
-            path_key_hash: _,
-            tagged_in_opening: _,
-            tagged_responses: _,
-            own_responses: _,
-            untimed_records: _,
-            first_own_sequence: _,
-            own_first_context: _,
-            own_peak_context: _,
-            own_last_context: _,
-            tagged_before_first_own: _,
-            writer: _,
-            all_response_writers: _,
-            opened: _,
-        } = self;
-        c.add(0)
-    }
-}
+// This Copy witness owns no heap. Keep exhaustive coverage so a new
+// field cannot silently enter native frame/cache accounting.
+crate::heap_layout_bound::no_heap!(true; ClaudeFileBirth {
+    scope, path_key_hash, tagged_in_opening, tagged_responses, own_responses, untimed_records,
+    first_own_sequence, own_first_context, own_peak_context, own_last_context,
+    tagged_before_first_own, writer, all_response_writers, opened,
+});
 
 /// A reported birth at or before the floor is no evidence (F5).
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
@@ -599,13 +557,7 @@ pub(crate) enum ClaudeFileBirthVerdict {
     EvidenceBound,
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirthVerdict {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeFileBirthVerdict);
 
 impl SnapshotItem {
     /// Local design E decision for this fold, independent of strict ownership.
@@ -1036,10 +988,6 @@ enum ContextBasisOutcome {
 pub struct ClaudeContextFileBirthCounts {
     #[serde(flatten)]
     pub total: ClaudeContextBasisCounts,
-    /// Final advertised curve coverage after the ownership fold. Local only;
-    /// these bodies may still be held by the existing upload quarantine.
-    pub curve_scalars_file_birth_only_session_count: usize,
-    pub curve_ownership_unresolved_session_count: usize,
     pub by_claude_code_version: BTreeMap<String, ClaudeContextBasisCounts>,
     /// Sessions the family demotion quarantine held back this fold (R7): the
     /// hold is unchanged, so their scalars wait with the rest of the body.

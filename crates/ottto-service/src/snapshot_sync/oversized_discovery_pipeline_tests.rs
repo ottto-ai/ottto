@@ -50,6 +50,21 @@ fn oversized_clock(now: u64) -> String {
         .unwrap()
 }
 
+/// The 30 min re-listing pass stamps only its own clock and count; an
+/// unchanged generation's traversal is otherwise byte-identical.
+fn without_listing_clock(traversal: &serde_json::Value) -> serde_json::Value {
+    let mut traversal = traversal.clone();
+    traversal
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_started_unix_seconds");
+    traversal["counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_generations");
+    traversal
+}
+
 fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
     let (page, rows) = crate::local_resource_diagnostics::capture(|| {
         fixture.page(&oversized_clock(now), RearmUpload::Accept)
@@ -63,6 +78,8 @@ fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
     page
 }
 
+/// [behaviour] An unchanged oversized file keeps its loss disclosed with no
+/// clock restart; a re-listing pass changes only its own clock and count.
 #[test]
 #[serial(source_manifests)]
 fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
@@ -82,7 +99,10 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         );
         assert_eq!(page.scan.scanned_file_count, 0);
         let current = c1a_saved(&fixture);
-        assert_eq!(current["traversal"], saved["traversal"]);
+        assert_eq!(
+            without_listing_clock(&current["traversal"]),
+            without_listing_clock(&saved["traversal"])
+        );
         assert_eq!(c1a_latch(&fixture), latch);
     }
     // The only new durable content consists of hashes plus a sighting count.
@@ -205,7 +225,10 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
     for offset in [0, 60, 3600] {
         let page = oversized_tick(&fixture, oversized_deadline(&before) + offset);
         assert!(!page.scan.census_complete);
-        assert_eq!(c1a_saved(&fixture)["traversal"], before["traversal"]);
+        assert_eq!(
+            without_listing_clock(&c1a_saved(&fixture)["traversal"]),
+            without_listing_clock(&before["traversal"])
+        );
         assert_eq!(page.scan.scanned_file_count, 0);
     }
     std::fs::set_permissions(&path, original_permissions).unwrap();
@@ -410,12 +433,15 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
-    // Legacy demotion hold; E2 literals bypass it. Gate-on local holds and the
-    // same six-hour floor: oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy demotion hold; E2 literals bypass it, so only the listed held
+    // family reaches it (real list, loaded by every page after an unlisted
+    // baseline). Gate-on local holds and the same six-hour floor:
+    // oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("oversized-blocking-hold-floor");
     fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     let oversized = fixture.root.join(format!("{OVERSIZED_SESSION}.jsonl"));
     std::fs::File::create(&oversized)
@@ -461,6 +487,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     let (seed, starts) = walk(at);
     assert_eq!(starts.len(), 1);
     assert_eq!(seed.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+    assert_listed_fold_absent(&seed, PIPELINE_HELD_SESSION);
     let held = seed
         .iter()
         .flat_map(|page| page.held.iter())
@@ -505,6 +532,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
         assert_eq!(starts.len(), 1, "exactly one re-walk at the floor");
         assert_eq!(starts[0]["counts"]["reason"], "terminal_unhealthy_retry");
         assert_eq!(retry.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+        assert_listed_fold_absent(&retry, PIPELINE_HELD_SESSION);
         assert!(
             retry.iter().any(|page| page.held.contains(&held)),
             "the same demoted body is offered to real hold classification again"
@@ -524,6 +552,9 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     }
 }
 
+/// [behaviour] With no hint, a new file beside an oversized one is found by
+/// the re-listing pass inside the recovery floor, uploaded and ACKed without a
+/// restart; the floor still re-walks exactly once.
 #[test]
 #[serial(source_manifests)]
 fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor() {
@@ -549,13 +580,14 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
     .unwrap();
     // Every fixture page independently reloads the exhausted checkpoint: no
     // process-local state or watcher input can discover this file for it.
-    let quiet = oversized_tick(&fixture, floor - 1);
-    assert!(!quiet.parsed.contains(NEW_SESSION));
-    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
-    assert_eq!(starts.len(), 1);
-    assert!(retry.iter().any(|page| page.parsed.contains(NEW_SESSION)));
+    // The re-listing pass finds it inside the floor, with no traversal
+    // restart (oversized_tick asserts none).
+    let quiet = (0..C1B_MAX_PAGES as u64)
+        .map(|number| oversized_tick(&fixture, floor - 600 + number))
+        .collect::<Vec<_>>();
+    assert!(quiet.iter().any(|page| page.parsed.contains(NEW_SESSION)));
     assert!(
-        retry
+        quiet
             .iter()
             .any(|page| page.scan.snapshots.iter().any(|item| {
                 item.source_session_id == NEW_SESSION
@@ -564,11 +596,19 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
             })),
         "no-hint discovery reaches the real uploader and durable ACK"
     );
+    assert!(quiet.iter().all(|page| !page.scan.census_complete));
+    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
     assert!(!retry.last().unwrap().scan.census_complete);
     assert_eq!(retry.last().unwrap().scan.oversized_file_count, 1);
     assert!(fixture.hinted_paths.is_empty());
 }
 
+/// [regress] Two oversized files retry only changed content and keep an exact
+/// loss count. A third file that turns up oversized only to a re-listing pass
+/// records no debt, so its later shrink cannot cancel another file's loss: the
+/// count and the incomplete census survive save/reload. Before the fix the
+/// pass recorded the debt but restored its count away.
 #[test]
 #[serial(source_manifests)]
 fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
@@ -640,6 +680,47 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     assert!(page.parsed.contains(OVERSIZED_SESSION));
     assert_eq!(page.scan.scanned_file_count, 1);
     assert!(!page.scan.census_complete);
+
+    // Every tick reloads the saved index, so each check below is post-reload.
+    const LATE: &str = "e7000000-0000-4000-8000-000000000007";
+    let late = fixture.root.join(format!("{LATE}.jsonl"));
+    std::fs::File::create(&late)
+        .unwrap()
+        .set_len(OVERSIZED_BYTES)
+        .unwrap();
+    let interval = crate::snapshots::LISTING_INTERVAL_SECONDS;
+    let listed_at = after["traversal"]["listing_started_unix_seconds"]
+        .as_u64()
+        .unwrap()
+        + interval
+        + 60;
+    let page = oversized_tick(&fixture, listed_at);
+    let listed = c1a_saved(&fixture);
+    assert!(listed["traversal"]["counts"]["listing_generations"].as_u64() >= Some(1));
+    assert_eq!(
+        listed["traversal"]["oversized_discovery"],
+        after["traversal"]["oversized_discovery"],
+        "a re-listing pass records no oversized debt"
+    );
+    assert_eq!(listed["traversal"]["counts"]["oversized_file_count"], 1);
+    assert_eq!(page.scan.oversized_file_count, 1);
+    assert!(!page.scan.census_complete);
+    std::fs::write(&late, rearm_transcript_line(LATE, None, "req_late_shrunk", 0)).unwrap();
+    let page = oversized_tick(
+        &fixture,
+        oversized_deadline(&listed).max(listed_at + interval + 60),
+    );
+    let reloaded = c1a_saved(&fixture);
+    assert_eq!(
+        reloaded["traversal"]["counts"]["oversized_file_count"], 1,
+        "the remaining file's loss stays counted"
+    );
+    assert_eq!(
+        reloaded["traversal"]["oversized_discovery"],
+        after["traversal"]["oversized_discovery"]
+    );
+    assert_eq!(page.scan.oversized_file_count, 1);
+    assert!(!page.scan.census_complete);
 }
 
 /// E2 holds stay progress-blocking beside an oversized file and are offered
@@ -650,9 +731,10 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
     if !c1a_layout_supported("oversized-e2-hold-floor") {
         return;
     }
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     let _manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("oversized-e2-hold-floor");
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
     fixture.owned_base_preparation = true;
     fixture.local_holds.insert(REARM_ROOT.to_owned());
     let oversized = oversized_create(&fixture);
@@ -731,10 +813,13 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
 #[serial(source_manifests)]
 fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("terminal-off-real-hold-renewal");
     fixture.baseline();
+    // Real demotion classification needs ordinary money: list only the held
+    // family after the unlisted baseline; every page loads the list.
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     let cycle = PipelineCycle {
         replay_generation: "terminal-off-held-replay",
@@ -777,6 +862,7 @@ fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
         1,
         "real hold classified once then parked across three pages"
     );
+    assert_listed_fold_absent(&seed, PIPELINE_HELD_SESSION);
     assert!(
         held_reads(&seed_reads) <= 1,
         "the seed's three-page hold reads the held transcript at most once: {seed_reads:?}"

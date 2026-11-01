@@ -369,8 +369,7 @@ impl Uploader {
         index: &mut ScanIndex,
     ) {
         self.activate(source, context, index);
-        let replay_generation =
-            cycle_replay_generation(source, true, index, "context-real-uploader");
+        let replay_generation = cycle_replay_generation(source, "context-real-uploader");
         let now = reason_reoffer::now_unix_seconds();
         // Import durable refusals through the same prepare path as the service,
         // before scanning: an empty disposable ledger must not erase a hold.
@@ -415,8 +414,7 @@ impl Uploader {
             return self.terminal_off_on_prepare_for_scan(source, context, index);
         }
         self.activate(source, context, index);
-        let replay_generation =
-            cycle_replay_generation(source, true, index, "context-real-uploader");
+        let replay_generation = cycle_replay_generation(source, "context-real-uploader");
         let now = reason_reoffer::now_unix_seconds();
         // Import durable refusals through the same prepare path as the service,
         // before scanning: an empty disposable ledger must not erase a hold.
@@ -564,7 +562,7 @@ impl Uploader {
         )?;
         settle_index_after_upload(index, previous, &self.progress);
         let counts = index.accept_file_upload_context_acks(
-            &self.progress.context_receipt_candidates,
+            &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
         );
         Ok((counts.files, counts.bytes))
@@ -703,7 +701,7 @@ impl Uploader {
         )?;
         settle_index_after_upload(index, previous, &self.progress);
         let counts = index.accept_file_upload_context_acks(
-            &self.progress.context_receipt_candidates,
+            &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
         );
         Ok((counts.files, counts.bytes))

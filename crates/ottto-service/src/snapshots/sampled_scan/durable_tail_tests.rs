@@ -122,7 +122,8 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
         "effective_upload_body_witness_revision":3
     }))
     .unwrap();
-    let mut index = ScanIndex::default();
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     index.files.insert(key.into(), entry);
     index.activate_effective_upload_body_witness_revision(3);
     index.adopt_effective_upload_body_witness_revision_monotonically();
@@ -143,7 +144,7 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
     };
     let prior = binding(&index);
     assert!(!index.effective_upload_body_witness_revision_requires_adoption(key));
-    for arm in ["revision", "rule", "applied", "marks", "gate"] {
+    for arm in ["revision", "rule", "applied", "marks"] {
         let mut changed = index.clone();
         match arm {
             "revision" => changed.activate_effective_upload_body_witness_revision(2),
@@ -158,14 +159,9 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
             "marks" => changed
                 .claude_money_birth_store
                 .set_money_marks(key, claude_request_money::e2::money_mark::ESTIMATED),
-            "gate" => {}
             _ => unreachable!(),
         }
-        let after = if arm == "gate" {
-            claude_request_money::e2::with_disabled(|| binding(&changed))
-        } else {
-            binding(&changed)
-        };
+        let after = binding(&changed);
         assert_ne!(prior, after, "{arm}");
         assert_eq!(prior.key, after.key, "{arm}");
         assert_eq!(prior.context, after.context, "{arm}");
@@ -202,7 +198,6 @@ fn native_record_of(
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     parser
@@ -238,7 +233,6 @@ pub(super) fn native_fixture(path: &Path) {
 /// invalidates the existing record on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -968,7 +962,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache.clone(), namespace);
                 if bypass == "sampling_none" || bypass == "compressed" {
@@ -1256,7 +1249,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache, namespace.clone());
                 for _ in 0..10_000 {
@@ -1523,7 +1515,6 @@ pub(super) fn known_corrupt_scan(
         None,
         &[],
         false,
-        true,
         capture,
     )
     .with_sampled_acquisition(cache.clone(), namespace.clone());
@@ -2171,7 +2162,6 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
@@ -2384,7 +2374,7 @@ fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
         crate::snapshot_sync::effective_upload_body_witness_revision(source),
         index.active_effective_upload_body_witness_revision,
         index.claude_money_birth_store.money_rule_version(),
-        claude_request_money::e2::enabled(),
+        true,
     );
     assert_eq!(
         base, prior_formula,
@@ -2819,7 +2809,7 @@ fn scope_for(
         } else {
             0
         },
-        source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == DurableSource::ClaudeCode,
     )
 }
 
@@ -3483,7 +3473,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
