@@ -671,7 +671,7 @@ fn streamed_evidence_equals_whole_corpus() {
         // Path twins.
         twins(false);
         // A page copy with no own rows (the foreign-owner branch).
-        e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns();
+        e2_pipeline_resumed_prefix_counts_removed_partial_dollars_and_own_turns();
         e2_pipeline_legacy_fork_prefix_is_removed_exactly_once();
     });
     assert!(
