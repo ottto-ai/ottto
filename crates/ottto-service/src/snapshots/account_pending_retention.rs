@@ -315,64 +315,64 @@ impl ClaudeAccountFamilyPending {
             }
         }
     }
+}
 
-    fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
-        let ArchivedWindows::Resident(windows) = &mut self.previous_windows else {
+fn apply_checked_plan(
+    windows: &mut Vec<ClaudeAccountFamilyPendingWindow>,
+    retained: Vec<usize>,
+) -> Option<usize> {
+    if HistorySummary::from_windows(&*windows)
+        != HistorySummary::from_windows(retained.iter().map(|&i| &windows[i]))
+    {
+        return None;
+    }
+    let removed = windows.len() - retained.len();
+    if removed != 0 {
+        let mut retained = retained.into_iter().peekable();
+        let mut position = 0;
+        windows.retain(|_| {
+            let keep = retained.peek() == Some(&position);
+            if keep {
+                retained.next();
+            }
+            position += 1;
+            keep
+        });
+    }
+    Some(removed)
+}
+
+/// Validate before proposing any removal. Unsafe histories stay byte-for-byte
+/// equivalent in RAM; in particular no malformed boundary disappears.
+fn collapse_plan(
+    windows: &[ClaudeAccountFamilyPendingWindow],
+    current_end: &str,
+) -> Option<Vec<usize>> {
+    let current = rfc3339_unix_seconds(current_end)?;
+    let mut previous = None;
+    for window in windows {
+        let time = rfc3339_unix_seconds(&window.census_window_end)?;
+        if time >= current || previous.is_some_and(|previous| time <= previous) {
             return None;
-        };
-        if HistorySummary::from_windows(&*windows)
-            != HistorySummary::from_windows(retained.iter().map(|&i| &windows[i]))
+        }
+        previous = Some(time);
+    }
+    let mut retained = Vec::new();
+    let mut read = 0;
+    while read < windows.len() {
+        let start = read;
+        read += 1;
+        while read < windows.len()
+            && windows[start].strict_evidence() == windows[read].strict_evidence()
         {
-            return None;
-        }
-        let removed = windows.len() - retained.len();
-        if removed != 0 {
-            let mut retained = retained.into_iter().peekable();
-            let mut position = 0;
-            windows.retain(|_| {
-                let keep = retained.peek() == Some(&position);
-                if keep {
-                    retained.next();
-                }
-                position += 1;
-                keep
-            });
-        }
-        Some(removed)
-    }
-
-    /// Validate before proposing any removal. Unsafe histories stay byte-for-
-    /// byte equivalent in RAM; in particular no malformed boundary disappears.
-    fn collapse_plan(&self) -> Option<Vec<usize>> {
-        let ArchivedWindows::Resident(windows) = &self.previous_windows else {
-            return None;
-        };
-        let current = rfc3339_unix_seconds(&self.census_window_end)?;
-        let mut previous = None;
-        for window in windows {
-            let time = rfc3339_unix_seconds(&window.census_window_end)?;
-            if time >= current || previous.is_some_and(|previous| time <= previous) {
-                return None;
-            }
-            previous = Some(time);
-        }
-        let mut retained = Vec::new();
-        let mut read = 0;
-        while read < windows.len() {
-            let start = read;
             read += 1;
-            while read < windows.len()
-                && windows[start].strict_evidence() == windows[read].strict_evidence()
-            {
-                read += 1;
-            }
-            retained.push(start);
-            if read - start > 1 {
-                retained.push(read - 1);
-            }
         }
-        Some(retained)
+        retained.push(start);
+        if read - start > 1 {
+            retained.push(read - 1);
+        }
     }
+    Some(retained)
 }
 
 /// First equal predecessor creates the second endpoint. Later equal pushes
@@ -504,31 +504,27 @@ impl ScanIndex {
             // A cold archive is not loaded: v2 replays the endpoint rule at
             // save. Runs the walk would have collapsed show as `uncollapsed`
             // in the save's retained-windows event.
-            let ArchivedWindows::Resident(windows) = &pending.previous_windows else {
+            let ArchivedWindows::Resident(windows) = &mut pending.previous_windows else {
                 continue;
             };
-            let empty = windows.is_empty();
             let before = window_bytes(windows);
             counts.window_bytes_before = counts.window_bytes_before.saturating_add(before);
             let mut after = before;
-            let plan = if opaque_holds && !empty {
+            let plan = if opaque_holds && !windows.is_empty() {
                 None
             } else {
-                pending.collapse_plan()
+                collapse_plan(windows, &pending.current.census_window_end)
             };
             match plan {
                 None => counts.roots_refused = counts.roots_refused.saturating_add(1),
                 Some(retained) => {
                     // Check proposed summaries before deleting anything. A
                     // mismatch leaves this root unchanged, without a backup.
-                    match pending.apply_checked_plan(retained) {
+                    match apply_checked_plan(windows, retained) {
                         None => counts.roots_refused = counts.roots_refused.saturating_add(1),
                         Some(0) => {}
                         Some(removed) => {
-                            after = match &pending.previous_windows {
-                                ArchivedWindows::Resident(windows) => window_bytes(windows),
-                                ArchivedWindows::Cold(_) => before,
-                            };
+                            after = window_bytes(windows);
                             counts.roots_collapsed = counts.roots_collapsed.saturating_add(1);
                             counts.windows_collapsed =
                                 counts.windows_collapsed.saturating_add(removed as u64);
@@ -573,8 +569,11 @@ mod tests {
         };
         let before = serde_json::to_vec(&pending).unwrap();
         // A deliberately defective plan drops the last historical endpoint.
-        assert_eq!(pending.apply_checked_plan(vec![0]), None);
+        let plan = |pending: &mut ClaudeAccountFamilyPending, retained| {
+            apply_checked_plan(pending.previous_windows.resident_mut(), retained)
+        };
+        assert_eq!(plan(&mut pending, vec![0]), None);
         assert_eq!(serde_json::to_vec(&pending).unwrap(), before);
-        assert_eq!(pending.apply_checked_plan(vec![0, 2]), Some(1));
+        assert_eq!(plan(&mut pending, vec![0, 2]), Some(1));
     }
 }
