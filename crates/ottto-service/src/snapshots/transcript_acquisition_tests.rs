@@ -4423,11 +4423,14 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
             restart.durable_counters(source).unwrap().1.records_written,
             1
         );
+        let successor = store::tests::found(disk.read(&digest));
+        assert_eq!(successor.format, store::FORMAT_V3);
         assert_eq!(
-            fs::read(&record_path).unwrap()[311],
-            1,
+            successor.envelope_audit_debt,
+            repaired.files[&key].unverified_deadline(),
             "new Tail debt survives restart"
         );
+        assert!(successor.envelope_audit_debt.is_some());
         drop(restart);
         fixture.file.append(&usage(source, 190, 3, "fixture-model"));
         let (_, _, modes) = production_scan(

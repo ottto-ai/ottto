@@ -1287,6 +1287,27 @@ impl TransitionDriver for Codex24b {
         } else {
             self.disk.owner(source)
         };
+        if mode != Mode::ColdFull
+            && self
+                .disk
+                .record_bytes()
+                .values()
+                .any(|bytes| u16::from_le_bytes(bytes[8..10].try_into().unwrap()) == 1)
+        {
+            let ds = crate::durable_tail_store::DurableSource::Codex;
+            let mut store = crate::durable_tail_store::DurableTailStore::new(
+                crate::durable_tail_store::store_dir_for_index(&self.disk.index),
+                ds,
+            );
+            assert_eq!(
+                store.missing_cause(&crate::durable_tail_store::key_digest(
+                    ds,
+                    &fixture::local_key(&self.c.root.join("rollout.jsonl"))
+                )),
+                Some("repin"),
+                "restart must still contain the exact retired writer before scan"
+            );
+        }
         scanner.versions = Some(feed.clone());
         let ((mut index, scan, modes), consumed) =
             fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
@@ -1398,10 +1419,11 @@ fn codex_24b_old_writer_row() {
         .durable_counters(source)
         .unwrap()
         .0;
-    // The public counter projection zeros this Claude-only scalar for Codex.
-    // The per-source recovery Full and its repin cause carry this admission.
+    // The public projection zeros this Claude-only scalar for Codex. Repin
+    // owns its named cause, not Q11's retail-exhaustion recovery counter.
+    // The mode above and dedicated cause below both require exactly one Full.
     assert_eq!(counters.upgrade_missing_full, 0);
-    assert_eq!(counters.retail_full[0], 1);
+    assert_eq!(counters.retail_full, [0; 3]);
     assert_eq!(counters.resource_full.get("repin"), Some(&1));
     driver.save_gc(Mode::DiskRestore);
     assert!(driver

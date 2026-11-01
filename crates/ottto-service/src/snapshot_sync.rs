@@ -22988,7 +22988,11 @@ mod tests {
                     &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
                     &mut |body| {
                         posts += 1;
-                        same_source_fixture_ack(body)
+                        let mut ack = same_source_fixture_ack(body)?;
+                        for entity in &mut ack.accepted_entities {
+                            entity.head_etag = Some("e".repeat(64));
+                        }
+                        Ok(ack)
                     },
                     &mut |_| Ok(()),
                 )

@@ -4196,20 +4196,23 @@ impl SharedCache {
             .certificate
             .check_metadata(held)
             .map_err(Failure::Certificate)?;
+        let length = held
+            .metadata()
+            .map_err(|_| Failure::Certificate(CertificateRefusal::ReadError))?
+            .len();
         let committed = v3
             .and_then(|v| {
                 v.index
                     .files
                     .get(path.to_string_lossy().as_ref())
+                    .filter(|e| !e.has_unverified_source() || length >= e.size_bytes)
                     .map(|e| e.size_bytes)
             })
+            // A lossy extent is not an accepted prefix. Growth beyond the
+            // certificate must reach the checked behind-accepted hold, even
+            // when it remains shorter than that lossy extent.
             .unwrap_or(record.record.certificate.length);
-        let quiet = held
-            .metadata()
-            .map_err(|_| Failure::Certificate(CertificateRefusal::ReadError))?
-            .len()
-            <= committed
-            && v3.is_some();
+        let quiet = length <= committed && v3.is_some();
         // Every metadata-quiet scoped restore defers before decode or samples.
         if quiet {
             if let Some(mut stores) = self.durable() {
