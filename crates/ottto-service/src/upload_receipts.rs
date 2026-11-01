@@ -1142,7 +1142,6 @@ mod tests {
 
     fn proof_request(source: &str, cache: bool) -> SnapshotBatchRequest {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
         if !cache {
             item.cache_observations = None;
             item.cache_observations_state = None;

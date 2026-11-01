@@ -399,12 +399,12 @@ impl RearmFixture {
             activity_hint: hint,
             receipt_window_days: 183,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: Vec::new(),
                 codex_home_bindings: Vec::new(),
-            }),
+            })),
             attribution_context: None,
             upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: REARM_DESTINATION.to_owned(),
@@ -415,7 +415,6 @@ impl RearmFixture {
             committed_index: index,
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "replay-generation-rearm".to_owned(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),

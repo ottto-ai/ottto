@@ -8,7 +8,7 @@ use super::*;
 use crate::adaptive_collector::CadenceConfig;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// An ordinary Codex scan of an empty root: no cursor, no ticket.
 fn empty_scan() -> SourceScanResult {
@@ -857,7 +857,7 @@ fn ticket_with_inputs(
     world: &World,
 ) -> (
     ContinuationTicket,
-    Arc<crate::agent_status::AgentStatusCollection>,
+    Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
 ) {
     let (inputs, sentinel) = super::super::tests::continuation_inputs_for_test(true);
     assert!(inputs.holds_attribution());
@@ -880,7 +880,7 @@ fn ticket_with_inputs(
 /// `Zeroizing` storage) on every end that clears the ticket: expiry, an
 /// authority or destination change, a ticket that is not ready, an ordinary
 /// failure or prepare, a replacement, a rotation discard, and a worker
-/// panic. The drop sentinel is the inputs' status collection.
+/// panic. The drop sentinel is the inputs' prelude feed.
 #[test]
 fn a_held_context_is_dropped_on_every_clear() {
     type Clear = fn(&World);
@@ -1132,13 +1132,12 @@ fn native_platform_qos_restores_on_a_spawned_thread_and_power_has_valid_range() 
     .unwrap();
 }
 
-#[test]
-#[cfg(target_os = "macos")]
-fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
-    let mut preparation = super::super::tests::continuation_preparation_for_test();
-    let root = preparation.index_path.parent().unwrap().join("sessions");
-    std::fs::create_dir_all(&root).unwrap();
-    let session = "019fa111-2222-7333-8444-555555555555";
+const MINT_SESSION: &str = "019fa111-2222-7333-8444-555555555555";
+
+/// A real ordinary page that leaves one rollout's job paused and accelerated.
+/// Run under `with_test_limits_for_test`.
+fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanResult {
+    let session = MINT_SESSION;
     let mut body = format!(
         "{}\n",
         serde_json::json!({"type":"session_meta", "timestamp":"2026-10-24T00:00:00Z", "payload":{"id":session}})
@@ -1151,35 +1150,45 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
         body,
     )
     .unwrap();
+    let mut owned = crate::snapshots::OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root.to_path_buf()),
+        ScanIndex::default(),
+        "2026-10-24T12:00:00Z",
+        30,
+        10,
+        false,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(
+        Arc::clone(cache),
+        crate::transcript_acquisition::Scope("mint-fixture".into()),
+    );
+    let scan = loop {
+        match owned.step(None) {
+            crate::snapshots::OwnedSourceScanStep::Pending(next) => owned = next,
+            crate::snapshots::OwnedSourceScanStep::Complete { scan, .. } => break scan,
+        }
+    };
+    assert!(scan.snapshots.is_empty());
+    assert!(
+        scan.continuation_ticket().is_some(),
+        "real paused accelerated scan"
+    );
+    scan
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
+    let mut preparation = super::super::tests::continuation_preparation_for_test();
+    let root = preparation.index_path.parent().unwrap().join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
     let cache = Arc::new(SharedCache::default());
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
-        let mut owned = crate::snapshots::OwnedSourceScan::new(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            ScanIndex::default(),
-            "2026-10-24T12:00:00Z",
-            30,
-            10,
-            false,
-            None,
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(
-            Arc::clone(&cache),
-            crate::transcript_acquisition::Scope("mint-fixture".into()),
-        );
-        let mut scan = loop {
-            match owned.step(None) {
-                crate::snapshots::OwnedSourceScanStep::Pending(next) => owned = next,
-                crate::snapshots::OwnedSourceScanStep::Complete { scan, .. } => break scan,
-            }
-        };
-        assert!(scan.snapshots.is_empty());
-        assert!(
-            scan.continuation_ticket().is_some(),
-            "real paused accelerated scan"
-        );
+        let mut scan = paused_accelerated_scan(&root, &cache);
         static LATCH: AtomicBool = AtomicBool::new(false);
         let mut port = CodexContinuation {
             cache: &cache,
@@ -1227,5 +1236,109 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["counts"]["continuation_mint"]["minted"], 1);
+    });
+}
+
+/// [regress] Every real mint was `over_bound`: the page's inputs exceeded the
+/// ticket's walk. Realistic inputs (a status collection over the walk alone,
+/// 2,500 lineage rows, scan homes, schedules) mint through the production
+/// finish and `with_inputs`, under the walk with room to spare.
+#[test]
+fn realistic_inputs_mint_through_the_tickets_walk_with_headroom() {
+    use crate::heap_layout_bound::{bound, layout_supported, Counter, HeapLayoutBound as _};
+    if !layout_supported() {
+        return;
+    }
+    let mut preparation = super::super::tests::continuation_realistic_preparation_for_test();
+    let status = Arc::clone(preparation.scan_agent_status_collection.as_ref().unwrap());
+    assert!(
+        bound(&status, 8 << 20).is_none(),
+        "the whole status collection exceeds the ticket's walk"
+    );
+    let root = preparation.index_path.parent().unwrap().join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let state = rusqlite::Connection::open(root.parent().unwrap().join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "CREATE TABLE threads (\
+                id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                rollout_path TEXT\
+            );\
+            CREATE TABLE thread_spawn_edges (\
+                parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+    let rollout = root.join(format!("rollout-2026-10-24T00-00-00-{MINT_SESSION}.jsonl"));
+    state
+        .execute(
+            "INSERT INTO threads VALUES (?1, 'Thread', 1, 'user', 'Summarize', ?2, ?3)",
+            rusqlite::params![
+                MINT_SESSION,
+                1_792_800_000_000_i64,
+                rollout.to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    for n in 0..2_500 {
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("019fb000-0000-7000-8000-{n:012}"),
+                    format!("019fc000-0000-7000-8000-{n:012}")
+                ],
+            )
+            .unwrap();
+    }
+    drop(state);
+    let cache = Arc::new(SharedCache::default());
+    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+        let mut scan = paused_accelerated_scan(&root, &cache);
+        static LATCH: AtomicBool = AtomicBool::new(false);
+        let port = CodexContinuation {
+            cache: &cache,
+            home: &root,
+            support_dir: &root,
+            worker_qos: MacPlatformSignals::background,
+            latch: &LATCH,
+        };
+        let world = World::new();
+        let ticket = ordinary_ticket(
+            &port,
+            &scan,
+            &preparation.upload_destination_namespace,
+            Some(AUTHORITY),
+            Some((world.now.get(), world.now.get() + LIFETIME)),
+        )
+        .unwrap();
+        let (ticket, records) = crate::local_resource_diagnostics::capture(|| {
+            super::super::continuation_finish_inputs(
+                &mut preparation,
+                &mut scan,
+                Some(8 * 1024 * 1024),
+                &Arc::default(),
+                Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+            )(ticket)
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["counts"]["continuation_mint"]["minted"], 1);
+        let ticket = ticket.expect("realistic inputs mint");
+        match &ticket.cursor.0 {
+            CursorParts::Codex(page) => {
+                let inputs = page.inputs.as_ref().unwrap();
+                assert_eq!(inputs.codex_scan_homes, status.codex_scan_homes);
+                assert!(inputs.holds_attribution());
+                let mut walk = Counter::new(8 << 20);
+                page.heap_bound(&mut walk).expect("within the walk");
+                assert!(
+                    walk.visits_for_test() < 3072,
+                    "headroom under the 4096-visit walk: {}",
+                    walk.visits_for_test()
+                );
+            }
+            _ => panic!("a production Codex ticket"),
+        }
     });
 }

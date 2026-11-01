@@ -23223,14 +23223,7 @@ for line in sys.stdin:
         // An identity hash is 64 lowercase hex.
         let strong_hash = |key: &str| -> Result<Option<String>, String> {
             match text(collection, key) {
-                Some(hash)
-                    if hash.len() == 64
-                        && hash
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-                {
-                    Ok(Some(hash))
-                }
+                Some(hash) if crate::hex::is_sha256_lower(&hash) => Ok(Some(hash)),
                 Some(_) => Err(format!("{key} is not a strong hash")),
                 None => Ok(None),
             }

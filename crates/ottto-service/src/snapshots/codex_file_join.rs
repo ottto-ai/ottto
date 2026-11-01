@@ -412,6 +412,15 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
+    /// What a continuation page reads: the headers `keep` names, in path
+    /// order, and completeness. The directory census goes too: only an
+    /// ordinary page's coverage and membership checks read it.
+    pub(super) fn keep_job_share(&mut self, keep: impl Fn(&HeaderWitness) -> bool) {
+        self.headers.retain(keep);
+        self.headers.shrink_to_fit();
+        self.pending.shrink_to_fit();
+        self.directories = DirectoryCensus::default();
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
@@ -721,12 +730,6 @@ crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, sn
 const RECEIPT_VERSION: u16 = 1;
 const MAX_APPLIED_TIERS: usize = 512;
 pub(super) const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,10 +834,10 @@ impl TierReplay {
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
                 || receipt.scope != scope
                 || receipt.records == 0
-                || !is_sha256_hex(&receipt.prefix_digest)
+                || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
                 || receipt.tiers.len() > MAX_APPLIED_TIERS
                 || receipt.tiers.iter().any(|(key, source)| {
-                    !is_sha256_hex(key)
+                    !crate::hex::is_sha256_lower(key)
                         || source.is_empty()
                         || source.len() > 64
                         || !source
@@ -3748,7 +3751,9 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
-                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

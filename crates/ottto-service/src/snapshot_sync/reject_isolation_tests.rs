@@ -459,3 +459,117 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
     );
     crate::client_report::reset_for_test();
 }
+
+/// [regress] A page ending in one indexed refusal must settle its other
+/// files, including a re-read file whose unchanged entity was not resent
+/// (its committed witness was cleared). An ACK-only checkpoint returned that
+/// file to the cleared witness, so it was read again next pass.
+#[test]
+fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
+    let entry = |fingerprint: &str, source: &str| -> crate::snapshots::ScanIndexEntry {
+        serde_json::from_value(json!({"size_bytes": 1, "modified_unix_seconds": 2,
+            "source_file_fingerprint": source, "last_snapshot_fingerprint": fingerprint}))
+        .unwrap()
+    };
+    let [unchanged, sibling, refused, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
+    let mut committed = ScanIndex::default();
+    for (key, fingerprint, source) in [("reread", &unchanged, ""), ("refused", &old, "source")] {
+        committed
+            .files
+            .insert(key.into(), entry(fingerprint, source));
+        committed
+            .file_snapshot_fingerprints
+            .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
+        committed.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
+    }
+    let mut scanned = committed.clone();
+    for (key, fingerprint) in [
+        ("reread", &unchanged),
+        ("sibling", &sibling),
+        ("refused", &refused),
+    ] {
+        scanned
+            .files
+            .insert(key.into(), entry(fingerprint, "source"));
+        scanned
+            .file_snapshot_fingerprints
+            .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
+    }
+
+    // The unchanged entity is a semantic no-op: only the sibling and the
+    // refused revision are offered, and the backend locates the refusal.
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    let result = upload_resumable_batches(
+        &[sibling.clone(), refused.clone()],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        String::as_str,
+        |batch| match batch.iter().position(|item| item == &refused) {
+            Some(index) => Err(anyhow::Error::new(BatchRejected::from_response(
+                422,
+                json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
+                    .to_string()
+                    .as_bytes(),
+                batch.len(),
+            ))),
+            None => Ok(accepted_batch(batch.len())),
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(accepted, 1);
+    assert!(progress.quarantined_fingerprints.contains_key(&refused));
+
+    let ack_only = scanned.committable_subset_with_local_holds(
+        &committed,
+        &progress.accepted_fingerprints,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    );
+    assert!(
+        ack_only.files["reread"].source_file_fingerprint.is_empty(),
+        "control: an ACK-only subset keeps the cleared witness"
+    );
+
+    let no_holds = LocalHoldSettlement {
+        held_entity_count: 0,
+        retry_pending_family_count: 0,
+        held_fingerprints: BTreeSet::new(),
+        account_deferred_fingerprints: BTreeSet::new(),
+        progress_blocking: false,
+        held_family_roots: None,
+    };
+    let settlement =
+        settle_checkpointed_upload(scanned.clone(), &committed, &progress, &no_holds, false);
+    assert!(
+        !settlement.fully_settled,
+        "the refused item keeps a follow-up owed"
+    );
+    let mut settled = settlement.index;
+    settle_index_after_upload(&mut settled, &committed, &progress);
+    for key in ["reread", "sibling"] {
+        assert_eq!(
+            serde_json::to_value(&settled.files[key]).unwrap(),
+            serde_json::to_value(&scanned.files[key]).unwrap(),
+            "{key} settles as scanned, so the next pass does not read it again"
+        );
+    }
+    assert!(settled
+        .accepted_snapshot_fingerprints_for_test()
+        .contains(&sibling));
+    assert!(
+        !settled
+            .accepted_snapshot_fingerprints_for_test()
+            .contains(&refused),
+        "the refused revision gets no credit"
+    );
+    assert!(
+        settled
+            .quarantined_snapshot_fingerprints
+            .contains_key(&refused),
+        "its quarantine owes the retry"
+    );
+}
