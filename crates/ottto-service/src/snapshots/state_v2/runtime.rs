@@ -1,5 +1,5 @@
-//! Locked runtime routing. Conversion stays paused until publication integration
-//! is complete. OFF remains v1 before publication; custody evidence always wins.
+//! Locked runtime routing. A load that names its support dir converts v1 to the
+//! store; any other load stays v1 before publication. Custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure, Context};
 use import::{Mapper, Pace, Pause};
@@ -215,21 +215,11 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
     f(&mut state)
 }
 
-pub(super) fn enabled(support: Option<&Path>) -> bool {
-    let Some(support) = support else {
-        return false;
-    };
-    std::env::var("OTTTO_CLAUDE_STATE_V2")
-        .ok()
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        || support.join("snapshots/claude_state_v2").is_file()
-}
-fn route_needed(path: &Path, switched: bool, custody: bool) -> Result<bool> {
-    Ok(switched
-        || states()
-            .lock()
-            .map_err(|_| Hold::DbUnavailable)?
-            .contains_key(path)
+fn route_needed(path: &Path, custody: bool) -> Result<bool> {
+    Ok(states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .contains_key(path)
         || custody)
 }
 /// Probe custody without admitting a v1 path to the route registry or decoding
@@ -291,16 +281,17 @@ pub(in super::super) fn load_locked(
     if binding(path).is_none() {
         return Ok((None, false));
     }
-    let switched = enabled(support);
-    let index = load_with_custody(path, switched, custody)?;
-    let sample_v1 = switched && index.is_none();
+    // Without a support dir (unit tests, tools) only an existing route loads.
+    let importable = support.is_some();
+    let index = load_with_custody(path, importable, custody)?;
+    let sample_v1 = importable && index.is_none();
     Ok((index, sample_v1))
 }
-fn load_with_custody(path: &Path, switched: bool, custody: bool) -> Result<Option<ScanIndex>> {
+fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
         return Ok(None);
     };
-    if !route_needed(path, switched, custody)? {
+    if !importable && !route_needed(path, custody)? {
         return Ok(None);
     }
     let mut load_started = None;
@@ -309,15 +300,12 @@ fn load_with_custody(path: &Path, switched: bool, custody: bool) -> Result<Optio
         state.original = None;
         state.save_digests = None;
         let pair = fence::reconcile(path, &binding, state.latched)?;
-        state.pass_written_start = (switched || pair.is_some())
+        state.pass_written_start = (importable || pair.is_some())
             .then(telemetry::process_written_bytes)
             .flatten();
         if let Some((identity, db_path)) = pair {
             load_started = Some(Instant::now());
             state.latched = true;
-            if !switched {
-                telemetry::event("switch_off_ignored", &1);
-            }
             telemetry::baseline(path);
             if let Some(runtime) = state.current.clone() {
                 let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
@@ -388,7 +376,7 @@ fn load_with_custody(path: &Path, switched: bool, custody: bool) -> Result<Optio
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }
-        if !switched {
+        if !importable {
             return Ok(None);
         }
         let now = Instant::now();
@@ -591,7 +579,7 @@ fn save_with_custody(
         ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
         return Ok(false);
     };
-    if index.v2().persistence_v2.is_none() && !route_needed(path, false, custody)? {
+    if index.v2().persistence_v2.is_none() && !route_needed(path, custody)? {
         return Ok(false);
     }
     // This accessor authenticates the owner/session; call before route/session locks.
@@ -713,7 +701,7 @@ fn save_with_custody(
     result
 }
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
-    if binding(path).is_none() || !route_needed(path, false, published(path)?)? {
+    if binding(path).is_none() || !route_needed(path, published(path)?)? {
         return Ok(());
     }
     // A containment guard never promotes a DB. This also covers a parent/root
@@ -918,7 +906,7 @@ pub(super) fn purge_policy() -> (Duration, Duration) {
 pub(in super::super) struct BaselineRelease(Option<PathBuf>);
 impl BaselineRelease {
     pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
-        // v2 OFF has no runtime: hold nothing, so drop is a no-op.
+        // A v1 graph has no runtime: hold nothing, so drop is a no-op.
         Self(index.v2().persistence_v2.as_ref().map(|_| path.to_owned()))
     }
 }

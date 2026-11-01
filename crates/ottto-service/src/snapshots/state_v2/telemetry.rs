@@ -121,8 +121,7 @@ impl Stage {
         }
     }
     pub(in super::super) fn v1(path: &Path, sample_v1: bool) -> Option<Self> {
-        // OFF has no probe/thread/allocation side effects. Only opted-in Claude
-        // paths have route state before the mapper pauses the conversion.
+        // A load that cannot import has no probe/thread/allocation side effects.
         if !sample_v1 {
             return None;
         }
@@ -507,7 +506,7 @@ mod ops_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [off=main] OFF Claude passes preserve even stale active v2 telemetry state.
+    /// [behaviour] Claude passes with no route preserve even stale active v2 telemetry state.
     #[test]
     fn off_claude_passes_do_not_touch_v2_telemetry() {
         let root = crate::test_scratch::private_dir("off-v2-pass");
