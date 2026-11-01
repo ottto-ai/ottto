@@ -962,9 +962,11 @@ mod tests {
             "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],
             "not_found_sites":([[u64::MAX, u64::MAX]; 5]),
             "vanished_audit_debt_dropped":u64::MAX,
-            "vanished_request_census_removed":u64::MAX,"overflowed":true})
+            "vanished_request_census_removed":u64::MAX,
+            "parent_missing_removals":u64::MAX,"vanished_pin_refusals":u64::MAX,
+            "overflowed":true})
         );
-        assert_eq!(totals.as_object().unwrap().len(), 7);
+        assert_eq!(totals.as_object().unwrap().len(), 9);
         assert_eq!(row["observation"]["wall_elapsed_us"], 0);
         for field in [
             "shared_process_cpu_delta_us",

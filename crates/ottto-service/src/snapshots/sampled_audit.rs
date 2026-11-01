@@ -1649,6 +1649,32 @@ impl AbsenceParent {
         }
     }
 }
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
+    }
+}
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;

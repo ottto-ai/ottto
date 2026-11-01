@@ -153,6 +153,7 @@ pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
+use disappearance_diagnostics::enabled as vanished_directory_removal;
 pub(crate) mod evidence_owed;
 #[cfg(test)]
 mod launch_demand_tests;
@@ -44570,11 +44571,27 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                disappearance_diagnostics::not_found(
-                    &mut traversal.counts.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Site::WalkDirectory,
-                );
+                // A queued directory gone below its live parent, in a strictly
+                // later walk too, is a removal; its files settle one by one
+                // through the missing-parent rule.
+                if vanished_directory_removal()
+                    && matches!(
+                        claude_absence_is_removal(source, &directory.path),
+                        Parent::Live
+                    )
+                    && claude_vanished_confirmed(&index.withheld_memo, &traversal, &directory.path)
+                {
+                    disappearance_diagnostics::not_found_removal(
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut traversal.counts.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                }
                 continue;
             }
             Err(_) => {
@@ -44870,6 +44887,38 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
     }
 }
 
+/// Default OFF: a member below a deleted directory settles as a removal
+/// once a strictly later walk proves the same absence beneath the same pinned
+/// ancestor of a live configured root with no symlink, on its device, >=600 s
+/// on, even while discovery is still pending (deleted directories are found
+/// then). Every other case, including the first NotFound, stays loss as on main.
+fn claude_missing_parent_is_removal(index: &ScanIndex, parent: Parent, path: &Path) -> bool {
+    if !matches!(parent, Parent::Missing) || !vanished_directory_removal() {
+        return false;
+    }
+    let Some(walk) = index.traversal.as_ref() else {
+        return false;
+    };
+    if !claude_vanished_confirmed(&index.withheld_memo, walk, path) {
+        return false;
+    }
+    disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
+    true
+}
+
+/// Later-walk confirmation for a vanished member or queued directory.
+fn claude_vanished_confirmed(
+    memo: &withheld_account::Memo,
+    walk: &ScanTraversalCheckpoint,
+    path: &Path,
+) -> bool {
+    let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
+        return false;
+    };
+    let ancestor = sampled_audit::absence_parent_on_root_device(path, &walk.scan_roots);
+    memo.vanished_absence_eligible(&local_index_key(path), ancestor, walk_window)
+}
+
 /// Mutable candidate-boundary owner plus the same bounded member view used by
 /// discovery. Built once per selection batch; no filesystem work or move authority.
 struct CandidateDiscovery<'a> {
@@ -44938,7 +44987,10 @@ fn candidate_from_traversal_path_at(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                if claude_absence_is_removal(source, &pending.path).is_removal(&pending.path) {
+                let parent = claude_absence_is_removal(source, &pending.path);
+                if parent.is_removal(&pending.path)
+                    || claude_missing_parent_is_removal(discovery.index, parent, &pending.path)
+                {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);
@@ -45416,7 +45468,7 @@ impl<'a> DiscoveryRetention<'a> {
         stamp: Option<codex_fragment::Stamp>,
     ) {
         let key = local_index_key(path);
-        if self.account_holds.contains_key(&key) {
+        if self.account_holds.contains_key(&key) || vanished_directory_removal() {
             // This gate already has physical presence; invalidate an earlier
             // absence even if the file disappears again before page completion.
             if let Some(memo) = self.memo {
