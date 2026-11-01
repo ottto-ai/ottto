@@ -4542,7 +4542,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
-            "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+            "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
         ]
     );

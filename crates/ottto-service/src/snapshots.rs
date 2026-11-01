@@ -74367,7 +74367,7 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// [regress] A2: the session reader skipped configured Claude-ALT profiles.
+    /// [regress] The session reader skipped configured sibling Desktop profiles.
     #[test]
     fn claude_desktop_all_profiles_reuses_discovery_and_defers_incomplete_inventory() {
         let home = crate::test_scratch::ScratchDir::new("desktop-all-profiles-discovery");
