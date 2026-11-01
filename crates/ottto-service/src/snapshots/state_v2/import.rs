@@ -121,7 +121,10 @@ impl Mapper for ClaudeMapper {
         // A COMMIT advanced control.generation; the proof must compare the
         // normalized G graph against that one deliberate G+1 control change.
         let mut tx = store.begin(TxnMode::Read)?;
-        verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+        let cx = verify_normalized_at(&mut tx, index, original, identity.binding, generation);
+        // The read-back re-encodes the same rows; one gauge covers the import.
+        telemetry::row_cap_save();
+        cx
     }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;

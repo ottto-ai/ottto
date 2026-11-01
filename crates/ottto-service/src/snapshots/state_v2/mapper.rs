@@ -233,6 +233,7 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
+    telemetry::row_cap(kind, json.len() as u64, value_cap(key));
     ensure!(
         json.len() as u64 <= value_cap(key),
         "state_v2_value_admission"
