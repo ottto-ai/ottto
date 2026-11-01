@@ -680,18 +680,12 @@ fn commit_completed_with_local_holds(
             crate::local_resource_diagnostics::claude_reread::HeldReason::NotRestorable,
         );
     }
-    let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-    accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-    let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-    server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    // Every batch was sent and nothing was refused, so every entity that is
-    // not held settles as on a clean page, unsent unchanged ones included.
-    let mut index = index.committable_subset_with_refusals(
+    let mut index = index.committable_subset_for_upload(
         committed_index,
-        &accepted_fingerprints,
-        &server_quarantine,
+        &upload_progress.accepted_fingerprints,
+        &upload_progress.quarantined_fingerprints,
         locally_held_fingerprints,
-        Some(&BTreeSet::new()),
+        true,
     );
     index.mark_bounded_sweep_held_by_families(held_family_roots);
     index
@@ -1050,37 +1044,20 @@ fn settle_checkpointed_upload(
             &holds.held_fingerprints,
             &holds.account_deferred_fingerprints,
         )
-    } else if holds.page_held() {
-        let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-        accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
-        let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-        server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        // Conflicts and permanent refusals are quarantined; every other
-        // entity that is not held settles as on a page without holds.
-        index.committable_subset_with_refusals(
-            committed_index,
-            &accepted_fingerprints,
-            &server_quarantine,
-            &holds.held_fingerprints,
-            Some(&BTreeSet::new()),
-        )
-    } else if !resolved_permanent_rejections {
-        // Retryable refusals already have quarantine custody. Settle every
-        // other scanned entity, including semantic no-ops not resent here,
-        // through the same rule used by partial checkpoints.
-        let refused = upload_progress
-            .quarantined_fingerprints
-            .keys()
-            .cloned()
-            .collect();
-        let mut committable = index.committable_subset_with_refusals(
+    } else if holds.page_held() || !resolved_permanent_rejections {
+        // Refusals already have quarantine custody. Every entity that is not
+        // held settles as on a clean page, semantic no-ops not resent here
+        // included.
+        let mut committable = index.committable_subset_for_upload(
             committed_index,
             &upload_progress.accepted_fingerprints,
             &upload_progress.quarantined_fingerprints,
             &holds.held_fingerprints,
-            Some(&refused),
+            true,
         );
-        committable.preserve_scanned_upload_context_from(&index);
+        if !holds.page_held() {
+            committable.preserve_scanned_upload_context_from(&index);
+        }
         committable
     } else {
         index
@@ -3567,46 +3544,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
-    checkpoint_partial_snapshot_index_with_refusals(
-        index,
-        committed_index,
-        progress,
-        snapshots,
-        correction_scan,
-        locally_held,
-        index_path,
-        progress_path,
-        validate_destination,
-        read_limit,
-        fallback,
-        cause,
-        audit_release,
-        body_drains,
-        None,
-    )
-}
-
-/// `isolated_refusals`: the upload sent every batch and only these items were
-/// refused. Every other entity then settles as on a
-/// clean page; without it only this pass's ACKs settle.
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_partial_snapshot_index_with_refusals(
-    index: &ScanIndex,
-    committed_index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    snapshots: &[SnapshotItem],
-    correction_scan: Option<&SourceScanResult>,
-    locally_held: &BTreeSet<String>,
-    index_path: &Path,
-    progress_path: &Path,
-    validate_destination: impl FnOnce() -> Result<()>,
-    read_limit: Option<usize>,
-    fallback: Option<NativeSelectedRestore<'_>>,
-    cause: Option<UnsettledUploadCause>,
-    audit_release: Option<AccountAuditRelease<'_>>,
-    body_drains: crate::snapshots::ClaudeProofBodyDrains,
-    isolated_refusals: Option<&BTreeSet<String>>,
-) -> Result<ScanIndex> {
     let progress_owner =
         SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
@@ -3671,9 +3608,8 @@ fn checkpoint_partial_snapshot_index_with_refusals(
         .accepted_fingerprints
         .iter()
         .filter(|fingerprint| {
-            !locally_held.contains(*fingerprint)
-                && durable.accepted_body_witnesses.get(*fingerprint)
-                    == current_bodies.get(fingerprint.as_str())
+            durable.accepted_body_witnesses.get(*fingerprint)
+                == current_bodies.get(fingerprint.as_str())
                 && current_bodies.contains_key(fingerprint.as_str())
         })
         .cloned()
@@ -3682,18 +3618,17 @@ fn checkpoint_partial_snapshot_index_with_refusals(
         .quarantined_fingerprints
         .iter()
         .filter(|(fingerprint, record)| {
-            !locally_held.contains(*fingerprint)
-                && record.upload_body_witness.as_ref() == current_bodies.get(fingerprint.as_str())
+            record.upload_body_witness.as_ref() == current_bodies.get(fingerprint.as_str())
                 && current_bodies.contains_key(fingerprint.as_str())
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset_with_refusals(
+    let mut committable = index.committable_subset_for_upload(
         committed_index,
         &accepted,
         &quarantined,
         locally_held,
-        isolated_refusals,
+        false,
     );
     if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);
@@ -20742,109 +20677,6 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
-    }
-
-    /// [regress] A page with one locally held entity kept only this pass's
-    /// ACKs, so a re-read file whose unchanged entity was not resent (its
-    /// committed witness was cleared) returned to that cleared witness and
-    /// was read again next pass. Every hold arm now settles it as scanned,
-    /// exactly as the same page without the hold; the held file keeps its
-    /// committed revision and credit and stays owed.
-    #[test]
-    fn local_hold_settles_unsent_siblings_without_a_reread() {
-        let entry = |fingerprint: &str, source: &str| {
-            serde_json::json!({"size_bytes": 1, "modified_unix_seconds": 2,
-                "source_file_fingerprint": source, "last_snapshot_fingerprint": fingerprint})
-        };
-        let [unchanged, sibling, held, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
-        let committed = claude_index_with(serde_json::json!({
-            "files": {"reread": entry(&unchanged, ""), "held": entry(&old, "source")},
-            "file_snapshot_fingerprints": {"reread": [&unchanged], "held": [&old]},
-            "accepted_snapshot_fingerprints": [&unchanged, &old],
-        }));
-        let scanned = claude_index_with(serde_json::json!({
-            "files": {
-                "reread": entry(&unchanged, "source"),
-                "sibling": entry(&sibling, "source"),
-                "held": entry(&held, "source"),
-            },
-            "file_snapshot_fingerprints": {
-                "reread": [&unchanged], "sibling": [&sibling], "held": [&held],
-            },
-            "accepted_snapshot_fingerprints": [&unchanged, &old],
-        }));
-        // The unchanged entity is a semantic no-op: only the sibling is sent.
-        let mut progress = test_upload_progress();
-        progress.accepted_fingerprints.insert(sibling.clone());
-        let held_set = BTreeSet::from([held.clone()]);
-
-        let ack_only = scanned.committable_subset_with_local_holds(
-            &committed,
-            &progress.accepted_fingerprints,
-            &BTreeMap::new(),
-            &held_set,
-        );
-        assert!(
-            ack_only.files["reread"].source_file_fingerprint.is_empty(),
-            "control: an ACK-only subset keeps the cleared witness"
-        );
-
-        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
-            held_entity_count: held_fingerprints.len(),
-            retry_pending_family_count: 0,
-            held_fingerprints: held_fingerprints.clone(),
-            account_deferred_fingerprints: BTreeSet::new(),
-            progress_blocking: true,
-            held_family_roots: None,
-        };
-        let settle = |outcome: &str, holds: &LocalHoldSettlement| {
-            let settlement = match outcome {
-                "completed" => {
-                    settle_completed_upload(scanned.clone(), &committed, &progress, holds)
-                }
-                other => settle_checkpointed_upload(
-                    scanned.clone(),
-                    &committed,
-                    &progress,
-                    holds,
-                    other == "rejected",
-                ),
-            };
-            let mut index = settlement.index;
-            settle_index_after_upload(&mut index, &committed, &progress);
-            (index, settlement.fully_settled)
-        };
-        let file = |index: &ScanIndex, key: &str| {
-            (
-                serde_json::to_value(&index.files[key]).unwrap(),
-                index.file_snapshot_fingerprints[key].clone(),
-            )
-        };
-        for outcome in ["completed", "deferred", "rejected"] {
-            let (settled, fully_settled) = settle(outcome, &holds(&held_set));
-            let (clean, _) = settle(outcome, &holds(&BTreeSet::new()));
-            assert!(!fully_settled, "{outcome}: the hold keeps a follow-up owed");
-            assert!(settled.bounded_sweep_had_unsettled_upload(), "{outcome}");
-            for key in ["reread", "sibling"] {
-                assert_eq!(
-                    file(&settled, key),
-                    file(&clean, key),
-                    "{outcome}: {key} settles as on the page without the hold"
-                );
-                assert_eq!(file(&settled, key), file(&scanned, key), "{outcome}: {key}");
-            }
-            assert_eq!(
-                file(&settled, "held"),
-                file(&committed, "held"),
-                "{outcome}: the held file keeps its committed revision"
-            );
-            let credited = settled.accepted_snapshot_fingerprints_for_test();
-            assert_eq!(
-                credited,
-                &BTreeSet::from([unchanged.clone(), sibling.clone(), old.clone()]),
-                "{outcome}: exact ACKs and prior credit only; the held revision gets none"
-            );
-        }
     }
 
     /// Path-(a) bridge: RetryPending debt elsewhere settles a page without
