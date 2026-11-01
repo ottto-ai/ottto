@@ -7416,7 +7416,10 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
     };
     let mut seed = ScanIndex::default();
     for key in [&held_key, &hash_key, &retired_key] {
-        seed.files.insert(key.clone(), ScanIndexEntry::default());
+        seed.files.insert(
+            key.clone(),
+            crate::snapshots::tests::manifest_index_entry(None),
+        );
     }
     seed.files.get_mut(&hash_key).unwrap().codex_counting_owner =
         Some(codex_protected_owner(SESSION).into_boxed_str());
