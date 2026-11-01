@@ -1230,15 +1230,25 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
     }
     fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
         let roots = family_hold_roots(&self.holds.0);
+        // Only held roots are serialized. A cold usage map is refused only
+        // when a held root names one of its stored families; otherwise it
+        // contributes nothing, exactly as its resident entries would not.
+        if index.claude_usage_family_pending.cold().is_some()
+            && roots
+                .iter()
+                .any(|root| index.claude_usage_family_pending.contains_key(root))
+        {
+            return Err(Error::Refused("usage pending cold"));
+        }
         let mut input = HydrateInput(Vec::new());
         self.family_spans.clear();
         macro_rules! field {
             ($field:ident) => {{
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
+                let empty = BTreeMap::new();
                 let view = FamilyView {
-                    typed: Records::records(&index.$field)
-                        .ok_or(Error::Refused("usage pending cold"))?,
+                    typed: Records::records(&index.$field).unwrap_or(&empty),
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
