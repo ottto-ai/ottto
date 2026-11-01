@@ -7,7 +7,7 @@ use super::super::*;
 fn recovery_nonce_defaults_previous_layouts_and_persists_on_upgrade() {
     let home = crate::test_scratch::canonical_private_dir("copy-prefix-nonce-layout");
     for previous_layout in [1_u32, 2] {
-        let path = home.join(format!("layout-{previous_layout}.sqlite"));
+        let path = home.join(format!("layout-{previous_layout}.v2.sqlite.import"));
         let mut db = money_test_support::populate(&path, &ScanIndex::default(), BTreeMap::new());
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
         let nonce_key = mapper::key("setting.copy_prefix_last_accepted_nonce", "", 0).unwrap();

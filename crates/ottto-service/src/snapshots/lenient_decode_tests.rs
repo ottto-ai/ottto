@@ -1573,6 +1573,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "resume_upper_bound_path"
             | "resume_census_window_end"
             | "historical_replay_generation"
+            | "copy_prefix_last_accepted_nonce"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
@@ -1620,7 +1621,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 6..],
+        &fields[fields.len() - 7..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
@@ -1628,6 +1629,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             "claude_desktop_store_inventory",
             "claude_copy_removals",
             "upload_context_proof",
+            "copy_prefix_last_accepted_nonce",
         ]
     );
     for earlier_e2 in [false, true] {
@@ -1640,6 +1642,10 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             .as_object_mut()
             .unwrap()
             .remove("upload_context_proof");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("copy_prefix_last_accepted_nonce");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -1650,7 +1656,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 4]
+                fields[..fields.len() - 5]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -1735,10 +1741,14 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 fn desktop_inventory_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
-    let tombstone_slot = fields.len() - 3;
+    let tombstone_slot = fields.len() - 4;
     assert_eq!(fields[tombstone_slot], DESKTOP_INVENTORY);
     assert_eq!(fields[tombstone_slot + 1], "claude_copy_removals");
     assert_eq!(fields[tombstone_slot + 2], "upload_context_proof");
+    assert_eq!(
+        fields[tombstone_slot + 3],
+        "copy_prefix_last_accepted_nonce"
+    );
     let slot = |name: &&str| current[*name].clone();
     let shorter: Vec<Value> = fields[..tombstone_slot].iter().map(slot).collect();
     let mut legacy = current.clone();
@@ -1750,10 +1760,15 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("upload_context_proof");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     let mut full = shorter.clone();
     full.push(serde_json::json!("a".repeat(64)));
     full.push(current["claude_copy_removals"].clone());
     full.push(current["upload_context_proof"].clone());
+    full.push(current["copy_prefix_last_accepted_nonce"].clone());
     for (slots, expected) in [(shorter, &legacy), (full, &current)] {
         let bytes = serde_json::to_vec(&Value::Array(slots)).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
@@ -1776,7 +1791,8 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[86], DESKTOP_INVENTORY);
     assert_eq!(fields[87], "claude_copy_removals");
     assert_eq!(fields[88], "upload_context_proof");
-    assert_eq!(fields.len(), 89);
+    assert_eq!(fields[89], "copy_prefix_last_accepted_nonce");
+    assert_eq!(fields.len(), 90);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1805,10 +1821,15 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("upload_context_proof");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields[fields.len() - 2], "claude_copy_removals");
-    assert_eq!(fields.last(), Some(&"upload_context_proof"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 2]), (&current, fields)] {
+    assert_eq!(fields[fields.len() - 3], "claude_copy_removals");
+    assert_eq!(fields[fields.len() - 2], "upload_context_proof");
+    assert_eq!(fields.last(), Some(&"copy_prefix_last_accepted_nonce"));
+    for (expected, slots) in [(&legacy, &fields[..fields.len() - 3]), (&current, fields)] {
         let bytes = serde_json::to_vec(&Value::Array(
             slots.iter().map(|name| expected[*name].clone()).collect(),
         ))
@@ -4454,6 +4475,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
             "upload_context_proof",
+            "copy_prefix_last_accepted_nonce",
         ]
     );
 }

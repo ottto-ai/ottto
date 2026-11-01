@@ -207,7 +207,6 @@ impl ProofChain {
         );
         let acks = fixture::exact_acks_for_test(&scan.snapshots);
         fixture::accept_upload_context_acks_for_test(index, &scan.snapshots, &acks);
-        index.save(&self.home.join("scan-index.json")).unwrap();
     }
 
     fn retire(&self, index: &mut ScanIndex, slots: &[usize]) {
@@ -236,6 +235,7 @@ impl ProofChain {
             self.enrich(&mut index, &mut scan);
         }
         self.accept(&mut index, &mut scan);
+        index.save(&self.home.join("scan-index.json")).unwrap();
         let items = scan.snapshots;
         assert!(items.iter().map(|item| item.request_count).sum::<u64>() > 7);
         (index, items)
@@ -305,6 +305,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
             (1, Some(2))
         );
         chain.accept(&mut index, &mut recovered);
+        index.save(&chain.home.join("scan-index.json")).unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
         assert!(chain.prepare(&mut index).is_empty());
         assert!(index.copy_prefix_recovery_scope.is_empty());
@@ -400,7 +401,10 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
         index.save(&chain.home.join("scan-index.json")).unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
         assert!(index.copy_prefix_recovery_scope.is_empty());
-        index = state_v2::money_test_support::roundtrip(&index, &chain.home.join("nonce.sqlite"));
+        index = state_v2::money_test_support::roundtrip(
+            &index,
+            &chain.home.join("nonce.v2.sqlite.import"),
+        );
         assert!(index.copy_prefix_recovery_scope.is_empty());
         assert_eq!(
             chain.prepare(&mut index).len(),
