@@ -168,7 +168,7 @@ impl NativeCorrection {
                     claude_usage_family_witness_fingerprint(witness) == self.proof
                 })
             && index.files.get(key).is_some_and(|entry| {
-                entry.source_file_fingerprint == self.revision
+                entry.observed_fingerprint() == self.revision
                     && entry.scan_identity_version.as_deref()
                         == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                     && entry.last_snapshot_fingerprint.as_ref() == Some(&self.selected_fingerprint)
@@ -400,12 +400,19 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
-        let counts = accumulate_claude_usage_family_pending_with_credit(
+        let counts = super::super::evidence_owed::stamped(
+            index,
             &scan.snapshots,
-            &mut index.claude_usage_family_pending,
             &scan.census_window_end,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            Some(&mut budget),
+            |index| {
+                accumulate_claude_usage_family_pending_with_credit(
+                    &scan.snapshots,
+                    &mut index.claude_usage_family_pending,
+                    &scan.census_window_end,
+                    MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                    Some(&mut budget),
+                )
+            },
         )?;
         Ok(Some(ClaudeNativeObservations {
             counts,
@@ -560,7 +567,7 @@ impl Completion {
                     && previous
                         .files
                         .get(&pending.index_key)
-                        .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                        .is_some_and(ScanIndexEntry::rearmed)
             }) else {
                 continue;
             };

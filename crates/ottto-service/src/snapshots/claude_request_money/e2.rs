@@ -2229,7 +2229,7 @@ fn scan_evidence(
     let settled = index
         .files
         .get(key)
-        .filter(|entry| record.proves_current(&entry.source_file_fingerprint));
+        .filter(|entry| record.proves_current(entry.observed_fingerprint()));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
     if let Some(metadata) = &metadata {
         let now = metadata
