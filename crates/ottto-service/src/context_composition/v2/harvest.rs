@@ -440,7 +440,7 @@ pub fn run_context_composition_worker() -> Result<()> {
 
 /// Background work: let the system run it on efficiency cores and behind
 /// interactive work.
-pub(super) fn set_utility_qos() {
+pub(crate) fn set_utility_qos() {
     #[cfg(target_os = "macos")]
     {
         extern "C" {
@@ -453,7 +453,7 @@ pub(super) fn set_utility_qos() {
 }
 
 /// CPU time of the calling thread, in microseconds.
-pub(super) fn thread_cpu_micros() -> Option<u64> {
+pub(crate) fn thread_cpu_micros() -> Option<u64> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut spec = libc::timespec {

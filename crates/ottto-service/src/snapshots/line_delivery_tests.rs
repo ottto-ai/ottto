@@ -1227,6 +1227,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 census_at,
                 7,
                 crate::snapshots::DiscoveryRetention {
+                    archives: &BTreeMap::new(),
                     files: &BTreeMap::new(),
                     account_holds: holds,
                     memo: None,
@@ -3871,6 +3872,7 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
         None,
         BACKFILL_WINDOW_DAYS,
         DiscoveryRetention {
+            archives: &BTreeMap::new(),
             files: &index.files,
             account_holds: &index.claude_account_deferred_holds,
             memo: Some(&index.withheld_memo),

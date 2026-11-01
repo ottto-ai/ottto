@@ -179,6 +179,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
             };
             for (source, root) in &roots {
                 let paths = paths_from_events(
+                    *source,
                     events
                         .iter()
                         .flat_map(|event| event.paths.iter())
