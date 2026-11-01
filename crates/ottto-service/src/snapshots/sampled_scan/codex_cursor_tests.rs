@@ -7388,7 +7388,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
     assert!(prior.accepted.contains_key(SESSION));
     fs::remove_file(fixture.file(SESSION)).unwrap();
     let held_key = local_index_key(&fixture.file(SESSION));
-    let hash_key = local_index_key(&fixture.root.join("owner-known-by-index.jsonl"));
     let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
     let last = fixture.root.join("last-page.jsonl");
     fs::write(&last, b"").unwrap();
@@ -7407,20 +7406,18 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         )
     };
     let mut seed = ScanIndex::default();
-    for key in [&held_key, &hash_key, &retired_key] {
+    for key in [&held_key, &retired_key] {
         seed.files.insert(
             key.clone(),
             crate::snapshots::tests::manifest_index_entry(None),
         );
     }
-    seed.files.get_mut(&hash_key).unwrap().codex_counting_owner =
-        Some(codex_protected_owner(SESSION).into_boxed_str());
     let healthy_thread = CodexStateThread {
         tokens_used: 10,
         ..Default::default()
     };
 
-    // Independent cold control: observed held entries cannot be retired, and
+    // Independent cold control: the observed held entry cannot be retired, and
     // only the healthy state thread exists. No residue guard is needed here.
     let mut cold = new_scan(seed.clone());
     cold.codex_join_prepared = true;
@@ -7429,7 +7426,7 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         .as_mut()
         .unwrap()
         .observed_index_keys
-        .extend([held_key.clone(), hash_key.clone()]);
+        .insert(held_key.clone());
     cold.codex_title_metadata
         .state_threads
         .insert(SESSION_B.into(), healthy_thread.clone());
@@ -7443,9 +7440,7 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         // No per-file block or accepted file body may mask the restored block.
         first.census.ownership_incomplete_file_count = 1;
         first.census.causes.add(ownership::GROUP, 1);
-        first
-            .residue_index_keys
-            .extend([held_key.clone(), hash_key.clone()]);
+        first.residue_index_keys.insert(held_key.clone());
         first.residue_blocked_session_ids.insert(SESSION.into());
         first
             .codex_state_only_blocked_session_ids
@@ -7496,21 +7491,16 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
                 .insert(id.into(), healthy_thread.clone());
         }
         if removal_hint {
-            final_page.census.removed_index_keys.extend([
-                held_key.clone(),
-                hash_key.clone(),
-                retired_key.clone(),
-            ]);
+            final_page
+                .census
+                .removed_index_keys
+                .extend([held_key.clone(), retired_key.clone()]);
         }
         let (index, result) = finish(final_page);
         assert!(result.census_complete);
         assert!(
             index.files.contains_key(&held_key),
             "filename owner is retained"
-        );
-        assert!(
-            index.files.contains_key(&hash_key),
-            "counting owner is retained"
         );
         assert!(
             !index.files.contains_key(&retired_key),

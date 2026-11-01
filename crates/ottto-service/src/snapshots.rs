@@ -24923,6 +24923,7 @@ fn validate_codex_parent_ownership_ledgers(
 /// that owner go (`accept_codex_block`); any other key still blocking it, and
 /// every other owner, stay. A missing traversal skips the release: it is
 /// never read as an empty census.
+/// Owners in the traversal's residue set keep their provenance and claims.
 fn release_departed_join_owners(
     index: &mut ScanIndex,
     cache: &sampled_scan::SharedCache,
@@ -52102,13 +52103,9 @@ impl ScanIndex {
             return false;
         };
         let owners = &traversal.residue.blocked_session_ids;
-        self.files
-            .get(key)
-            .and_then(|entry| entry.codex_counting_owner.as_deref())
-            .is_some_and(|owner| owners.iter().any(|id| codex_protected_owner(id) == owner))
-            || codex_session_id_candidates_from_path(Path::new(key))
-                .iter()
-                .any(|owner| owners.contains(owner))
+        codex_session_id_candidates_from_path(Path::new(key))
+            .iter()
+            .any(|owner| owners.contains(owner))
     }
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
