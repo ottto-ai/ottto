@@ -32770,6 +32770,15 @@ impl OwnedSourceScan {
                     index.archive_transition(&candidate.path, ArchiveTransition::Quiet);
                     pending!();
                 }
+                // Identity samples are archive reads too: only the funded,
+                // durably admitted Full may reach the generic opener.
+                if sampling.is_none() || !index.archives.get(&key).is_some_and(|a| a.ready_full()) {
+                    index.archive_transition(
+                        &candidate.path,
+                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
+                    );
+                    pending!();
+                }
             }
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
@@ -79454,7 +79463,8 @@ mod tests {
 
     /// [regress] Unfunded archive inventory finishes within a bounded number
     /// of steps even with power allowed, preserving the plain fork child's
-    /// exact body and complete parent census through paged restart.
+    /// exact body and complete parent census through paged restart. Fresh
+    /// unfunded censuses sample zero archive bytes, even with a saved header.
     #[test]
     fn codex_parent_prefix_ledger_survives_paged_scan_and_index_restart() {
         let root = temp_dir("codex-parent-ledger-paged");
@@ -79590,6 +79600,83 @@ mod tests {
             }
             if with_archive {
                 assert!(index.archive_owed_count() > 0);
+            }
+        }
+        // Isolate physical archive samples from the plain parent/child reads.
+        let archive_root = root.join("unfunded");
+        fs::create_dir(&archive_root).unwrap();
+        let archive = archive_root.join("unfunded.jsonl.zst");
+        let header = json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"unfunded-session","thread_source":"user"}}).to_string() + "\n";
+        let mut bytes = zstd::stream::encode_all(header.as_bytes(), 1).unwrap();
+        bytes.resize(8192, 0); // Both physical identity sample windows exist.
+        fs::write(&archive, bytes).unwrap();
+        let samples = || START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+        let before = samples();
+        opened_object_identity_and_stat_retained(
+            SnapshotSource::Codex,
+            &mut File::open(&archive).unwrap(),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            samples().1 - before.1,
+            8192,
+            "physical-read seam observes head and tail"
+        );
+        let checkpoint = root.join("unfunded-index.json");
+        for validated in [false, true] {
+            let key = local_index_key(&archive);
+            let mut index = ScanIndex::default();
+            if validated {
+                let mut evidence = codex_compressed_input::ArchiveEvidence::from_metadata(
+                    fs::metadata(&archive).unwrap(),
+                )
+                .unwrap();
+                let h =
+                    codex_compressed_input::ValidatedHeader::from_bytes(header.as_bytes()).unwrap();
+                evidence.owner = Some(h.owner.clone());
+                evidence.work.as_mut().unwrap().header = Some(Box::new(h));
+                index.archives.insert(key.clone(), evidence);
+            }
+            for pass in 0..3 {
+                index.save(&checkpoint).unwrap();
+                index = ScanIndex::load(&checkpoint).unwrap();
+                index.traversal = None; // A fresh ordinary census, not a paced re-list.
+                let before = samples();
+                let mut state = OwnedSourceScan::new(
+                    SnapshotSource::Codex,
+                    std::slice::from_ref(&archive_root),
+                    index,
+                    &format!("2026-08-02T10:{pass:02}:00Z"),
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    true,
+                    None,
+                    &[],
+                    false,
+                );
+                let mut completed = None;
+                for _ in 0..256 {
+                    state.index.archive_pass.power = true;
+                    state.index.archive_pass.cpu = 0;
+                    match state.step(None) {
+                        OwnedSourceScanStep::Pending(next) => state = next,
+                        OwnedSourceScanStep::Complete { index: next, .. } => {
+                            completed = Some(next);
+                            break;
+                        }
+                    }
+                }
+                index = completed.expect("unfunded archive census completes");
+                assert_eq!(samples(), before, "no physical head/tail archive reads");
+                assert!(index.archive_owed_count() > 0);
+                assert!(!index.archive_pass.dirty);
+                assert!(index.archives.contains_key(&key));
+                if validated {
+                    assert!(index.archives[&key].header().is_some());
+                }
             }
         }
         let _ = fs::remove_dir_all(root);
