@@ -466,27 +466,7 @@ fn claude_case(name: &str) {
         return;
     }
     with_e2(|| {
-        let mut c = corpus(name);
-        if name == "side_owner_directory_unlisted" {
-            let hidden = c
-                .root
-                .join("unlisted")
-                .join(ROOT)
-                .join("subagents/agent-unlisted.jsonl");
-            std::fs::create_dir_all(hidden.parent().unwrap()).unwrap();
-            std::fs::write(&hidden, line(ROOT, "hidden-owner", AT, 20)).unwrap();
-            input_clock(&hidden);
-            // A real owner file exists, but its directory is outside this
-            // page's listed root. Trace ownership must not invent its body.
-            c.root = c.root.join("listed");
-            std::fs::create_dir_all(&c.root).unwrap();
-        }
-        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
-        if name == "side_owner" {
-            let agent = c.agent(0, &line(ROOT, "agent", AT, 20));
-            input_clock(&agent);
-        }
-        input_clock(&path);
+        let (c, path) = claude_corpus(name);
         if name == "failed_then_healthy_telemetry" {
             // A distinct finalized baseline keeps the failed estimate from
             // being suppressed as an unchanged body before real upload.
@@ -494,40 +474,10 @@ fn claude_case(name: &str) {
         }
         let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
-        let mut mode = (0, 1, 0);
-        match name {
-            "progressive_response" => append(&path, &line(ROOT, "r1", AT, 30)),
-            "duplicate_request_ids" => append(
-                &path,
-                &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 20)),
-            ),
-            "resolver_conflict" => append(
-                &path,
-                &line(ROOT, "r1", AT, 10).replace("claude-haiku-4-5", "claude-sonnet-4-5"),
-            ),
+        let mode = match name {
             "quiet_sidecar_growth" => {
                 c.evidence(&[api("r1", 10, 100), api("late-side", 5, 50)], &[]);
-                mode = (0, 0, 1);
-            }
-            "side_owner" => {
-                c.evidence(
-                    &[
-                        api("r1", 10, 100),
-                        api("agent", 20, 200),
-                        api("side", 5, 50),
-                    ],
-                    &[trace("side", "000")],
-                );
-                mode = (0, 0, 2);
-            }
-            "side_without_owner" | "side_owner_directory_unlisted" => {
-                let traces = if name == "side_owner_directory_unlisted" {
-                    vec![trace("side", "unlisted")]
-                } else {
-                    vec![]
-                };
-                c.evidence(&[api("r1", 10, 100), api("side", 5, 50)], &traces);
-                mode = (0, 0, 1);
+                (0, 0, 1)
             }
             "failed_then_healthy_telemetry" => {
                 // Incomplete telemetry on a live session publishes a token-only
@@ -686,8 +636,8 @@ fn claude_case(name: &str) {
                 receipt(name, &[failed_wire, healthy_wire]);
                 return;
             }
-            _ => unreachable!(),
-        }
+            _ => claude_change(&c, &path, name),
+        };
         if mode.1 > 0 {
             input_clock(&path);
         }
@@ -696,6 +646,71 @@ fn claude_case(name: &str) {
             &[compare_claude(&c, &scanner, &mut disk, prior, mode)],
         );
     });
+}
+
+/// A row's corpus before its warm page: the root transcript (returned) and
+/// any owner file the row needs. Shared with the state-v2 cold rows.
+pub(super) fn claude_corpus(name: &str) -> (Corpus, PathBuf) {
+    let mut c = corpus(name);
+    if name == "side_owner_directory_unlisted" {
+        let hidden = c
+            .root
+            .join("unlisted")
+            .join(ROOT)
+            .join("subagents/agent-unlisted.jsonl");
+        std::fs::create_dir_all(hidden.parent().unwrap()).unwrap();
+        std::fs::write(&hidden, line(ROOT, "hidden-owner", AT, 20)).unwrap();
+        input_clock(&hidden);
+        // A real owner file exists, but its directory is outside this
+        // page's listed root. Trace ownership must not invent its body.
+        c.root = c.root.join("listed");
+        std::fs::create_dir_all(&c.root).unwrap();
+    }
+    let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+    if name == "side_owner" {
+        let agent = c.agent(0, &line(ROOT, "agent", AT, 20));
+        input_clock(&agent);
+    }
+    input_clock(&path);
+    (c, path)
+}
+
+/// The row's change after its warm page; returns the retained acquisition
+/// mode it exercises. Shared with the state-v2 cold rows.
+pub(super) fn claude_change(c: &Corpus, path: &Path, name: &str) -> (usize, usize, usize) {
+    match name {
+        "progressive_response" => append(path, &line(ROOT, "r1", AT, 30)),
+        "duplicate_request_ids" => append(
+            path,
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 20)),
+        ),
+        "resolver_conflict" => append(
+            path,
+            &line(ROOT, "r1", AT, 10).replace("claude-haiku-4-5", "claude-sonnet-4-5"),
+        ),
+        "side_owner" => {
+            c.evidence(
+                &[
+                    api("r1", 10, 100),
+                    api("agent", 20, 200),
+                    api("side", 5, 50),
+                ],
+                &[trace("side", "000")],
+            );
+            return (0, 0, 2);
+        }
+        "side_without_owner" | "side_owner_directory_unlisted" => {
+            let traces = if name == "side_owner_directory_unlisted" {
+                vec![trace("side", "unlisted")]
+            } else {
+                vec![]
+            };
+            c.evidence(&[api("r1", 10, 100), api("side", 5, 50)], &traces);
+            return (0, 0, 1);
+        }
+        _ => unreachable!(),
+    }
+    (0, 1, 0)
 }
 
 macro_rules! claude_tests {
