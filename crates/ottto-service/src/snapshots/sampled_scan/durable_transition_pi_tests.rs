@@ -1603,16 +1603,13 @@ fn pi_real_1_4_0_sessions_across_restarts() {
         let restart = disk.owner(source);
         let before = durable_restores(&restart.cache, source).1;
         assert_eq!(before, 0, "fresh process cache");
-        let ([tail, full, mut restored], scan) = pi_pages_checked(
+        let ([tail, full, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
             priors,
-            (0, 1, 0),
-            (0, 1, 0),
-            before + 1,
-            None,
+            PiPageExpect::modes((0, 1, 0), (0, 1, 0), before + 1),
         );
         assert_eq!(durable_restores(&restart.cache, source).1, before + 1);
         assert_eq!(totals(&scan.snapshots), (requests, input, output));
@@ -1639,16 +1636,13 @@ fn pi_real_1_4_0_sessions_across_restarts() {
     std::fs::write(&path, FORK).unwrap();
     input_clock(&path);
     let restart = disk.owner(source);
-    let ([_, _, mut restored], scan) = pi_pages_checked(
+    let ([_, _, mut restored], scan) = pi_pages(
         &mut proof,
         &c,
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
-        None,
+        PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
     );
     // New fork response: input=556, output=2; cost=0.000139 + 0.000003 = 0.000142.
     assert_eq!(totals(&scan.snapshots), (1, 556, 2));
