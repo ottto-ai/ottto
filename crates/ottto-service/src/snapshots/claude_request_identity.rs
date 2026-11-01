@@ -1608,6 +1608,22 @@ fn defer_retained_rows(
     deferred
 }
 
+/// Marking a previously accepted carry preserves its placement. A carried
+/// slot ACKed without proof remains None; a legacy proved slot compares the
+/// unmarked pair. The shared comparison also governs copy invalidation.
+fn share_placement(
+    accepted: &accepted::AcceptedSession,
+    prior: &BTreeSet<Option<[u8; 32]>>,
+    key: &AuthorityKey,
+) -> Option<[u8; 32]> {
+    let hash = accepted.authority_hash(key);
+    if key.account_source.is_some() && prior.contains(&None) && !prior.contains(&Some(hash)) {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
 /// The frozen share set of a row whose current tagged shares differ from it.
 fn changed_shares(
     accepted: &accepted::AcceptedSession,
@@ -1621,22 +1637,14 @@ fn changed_shares(
     if prior.is_empty() {
         return None;
     }
-    // Marking a previously accepted carry preserves its placement. A carried
-    // slot ACKed without proof remains None; a legacy proved slot compares the
-    // unmarked pair. The shared comparison also governs copy invalidation.
-    let placement = |key: &AuthorityKey| {
-        let hash = accepted.authority_hash(key);
-        if key.account_source.is_some() && prior.contains(&None) && !prior.contains(&Some(hash)) {
-            None
-        } else {
-            Some(hash)
-        }
-    };
     let current = group
         .by_key
         .iter()
         .filter(|(_, amount)| amount.counts != [0; 8])
-        .map(|(key, _)| key.as_ref().and_then(placement))
+        .map(|(key, _)| {
+            key.as_ref()
+                .and_then(|key| share_placement(accepted, &prior, key))
+        })
         .collect::<BTreeSet<_>>();
     // Resolving an untagged share to the same surviving tagged set is
     // new proof, not a retag. Missing prior tagged keys still count changed.
@@ -1738,7 +1746,7 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
-                let key = key.filter(|key| prior.contains(&placement(key)));
+                let key = key.filter(|key| prior.contains(&share_placement(accepted, &prior, key)));
                 // Never reconstruct missing proof from the ledger.
                 kept.entry(key)
                     .or_default()
