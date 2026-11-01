@@ -631,7 +631,7 @@ impl SideLedger {
 /// One SHA-256 per file key, so it runs with the ledger lock released
 /// (C14 is single-threaded under `SNAPSHOT_SYNC_LOCK`).
 pub(in crate::snapshots) fn index_parent_keys(
-    files: &BTreeMap<String, crate::snapshots::ScanIndexEntry>,
+    files: &crate::snapshots::SharedMap<String, crate::snapshots::ScanIndexEntry>,
     wanted: &BTreeSet<u128>,
 ) -> BTreeMap<u128, String> {
     files

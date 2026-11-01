@@ -219,23 +219,30 @@ fn e2_malformed_literal_is_isolated_and_siblings_settle() {
 }
 
 #[test]
-fn e2_literal_batch_validation_error_splits_instead_of_stalling() {
-    // A whole-batch 422 naming the snapshots list: the existing splitter
-    // isolates the bad body; healthy families and plain bodies settle.
+fn e2_literal_batch_validation_error_holds_entity_and_settles_siblings() {
+    // Validated entity-local locations hold the bad body durably;
+    // healthy family members and plain bodies still settle on their own ACKs.
     let mut items = family("root-e", 4, 0);
     items.push(plain_item(7));
     let poison = items[2].fingerprint.clone();
     let mut progress = test_upload_progress();
     let (result, _) = upload_families(&items, &mut progress, |batch| {
-        if batch.iter().any(|item| item.fingerprint == poison) {
-            return Err(anyhow::Error::new(BatchRejected {
-                status: 422,
-                body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0]}]}"#.into()),
-            }));
+        if let Some(index) = batch.iter().position(|item| item.fingerprint == poison) {
+            return Err(anyhow::Error::new(BatchRejected::from_response(
+                422,
+                serde_json::json!({"errors":[{"loc":["body","snapshots",index]}]})
+                    .to_string()
+                    .as_bytes(),
+                batch.len(),
+            )));
         }
         Ok(accepted_batch(batch.len()))
     });
-    assert!(result.is_err(), "the poison body is reported, not hidden");
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert!(progress.quarantined_fingerprints.contains_key(&poison));
     for item in &items {
         assert_eq!(
             progress.accepted_fingerprints.contains(&item.fingerprint),

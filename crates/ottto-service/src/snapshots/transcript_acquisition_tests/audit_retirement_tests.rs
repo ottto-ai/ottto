@@ -1991,7 +1991,8 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        let done = reconcile_missing_index_entries_with_side(&mut index, 10, None, source, None);
+        let done =
+            reconcile_missing_index_entries_with_side(&mut index, 10, None, None, source, None);
         crate::local_resource_diagnostics::Probe::start().collection(
             source.api_slug(),
             crate::local_resource_diagnostics::CollectionCounts {
@@ -2067,6 +2068,7 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
         assert!(reconcile_missing_index_entries_with_side(
             &mut index,
             10,
+            None,
             None,
             SnapshotSource::Codex,
             None

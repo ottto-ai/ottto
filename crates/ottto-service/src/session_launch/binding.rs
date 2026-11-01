@@ -1,4 +1,5 @@
 use super::{block, Block, Reason};
+use crate::hex::is_sha256_lower;
 use ottto_core::{
     session_launch::LaunchUser, ClaudeConfigDirSlot, CodexHomeTrust,
     FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore,
@@ -20,13 +21,6 @@ pub(super) struct Binding {
     pub user: LaunchUser,
 }
 
-pub(super) fn strong_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 pub(super) fn resolve(
     provider: Provider,
     slot_id: &str,
@@ -34,7 +28,7 @@ pub(super) fn resolve(
     organization: &str,
     user: LaunchUser,
 ) -> Result<Binding, Block> {
-    if !strong_hash(account) || (!organization.is_empty() && !strong_hash(organization)) {
+    if !is_sha256_lower(account) || (!organization.is_empty() && !is_sha256_lower(organization)) {
         return Err(block(Reason::AccountMismatch));
     }
     let (root, claude_slot) = match provider {

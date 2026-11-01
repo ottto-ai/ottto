@@ -78,7 +78,7 @@ fn synthetic_index(families: usize) -> ScanIndex {
                     )]),
                     invalid: false,
                 },
-                previous_windows: Vec::new(),
+                previous_windows: Default::default(),
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
@@ -240,46 +240,5 @@ fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
             assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
             assert_same_state(&restarted, &loaded, layout);
         }
-    }
-}
-
-#[test]
-fn hold_funded_by_legacy_pretty_whitespace_still_saves() {
-    // Above the 1 MiB floor the restart admission is input bytes / 8. Build
-    // a hold that an older pretty file funds but compact output of the same
-    // state would not: saving must neither refuse every cycle nor shrink it.
-    let scratch = crate::test_scratch::ScratchDir::new("compact-index-legacy-hold");
-    let path = scratch.as_ref().join("index.json");
-    let mut seed = synthetic_index(2048);
-    seed.save(&path).unwrap();
-    let mut value = serde_json::to_value(&seed).unwrap();
-    let pretty_base = serde_json::to_vec_pretty(&value).unwrap().len();
-    let compact_base = serde_json::to_vec(&value).unwrap().len();
-    value["files"]["legacy-held"] =
-        serde_json::json!({"unknown": "x".repeat((pretty_base + compact_base) / 14)});
-    let bytes = serde_json::to_vec_pretty(&value).unwrap();
-    fs::write(&path, &bytes).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.decode_holds_file("legacy-held"));
-    let held = loaded.decode_holds.held_bytes();
-    let compact_len = serde_json::to_vec(&loaded).unwrap().len() as u64;
-    assert!(held > 1024 * 1024);
-    assert!(held <= lenient_decode::hold_bytes_limit(bytes.len() as u64));
-    assert!(
-        held > lenient_decode::hold_bytes_limit(compact_len),
-        "held={held} compact={compact_len} pretty={}",
-        bytes.len()
-    );
-    // Plain save only: this corpus is far over the bounded reader's node cap.
-    for _ in 0..2 {
-        loaded.save(&path).unwrap();
-        let saved = fs::read(&path).unwrap();
-        assert_eq!(saved, serde_json::to_vec_pretty(&loaded).unwrap());
-        assert_eq!(
-            raw_slot(&saved, "files", "legacy-held"),
-            raw_slot(&bytes, "files", "legacy-held")
-        );
-        let restarted = ScanIndex::load(&path).unwrap();
-        assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
     }
 }

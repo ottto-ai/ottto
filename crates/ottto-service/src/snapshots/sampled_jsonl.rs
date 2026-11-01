@@ -102,6 +102,14 @@ impl CachedJsonlReduction {
             ),
         )
     }
+    /// The copy's accepted `(requests, tokens)` when it belongs to `source`;
+    /// `None` while Claude responses wait for their fold at finish.
+    pub(super) fn accepted_usage(&self, source: SnapshotSource) -> Option<(u64, u64)> {
+        let accumulator = &self.accumulator;
+        let totals = &accumulator.accepted_usage_totals;
+        (accumulator.source == source && accumulator.claude_responses.is_empty())
+            .then(|| (totals.request_count, totals.total_tokens()))
+    }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {

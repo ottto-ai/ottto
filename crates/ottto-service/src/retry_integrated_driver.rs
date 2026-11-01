@@ -117,8 +117,22 @@ fn integrated_ack(
         .iter()
         .map(|item| {
             let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
-            // As the backend's entity ACK does, the digest travels only with
-            // a witness version.
+            if version.is_none() {
+                // Ordinary fixtures have no witness domain, as on the backend.
+                let retained_version = crate::snapshots::snapshot_upload_body_witness_version(item);
+                assert!(
+                    matches!(
+                        retained_version,
+                        None | Some(
+                            crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
+                                | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
+                        )
+                    ),
+                    "unexpected retained ordinary fixture witness: {retained_version:?}"
+                );
+            }
+            // Additive evidence uses the production public ACK version; the
+            // digest travels only with that version.
             Ok(serde_json::json!({
                 "source_session_id":item.source_session_id,
                 "snapshot_fingerprint":item.snapshot_fingerprint,
@@ -204,7 +218,10 @@ fn integrated_send(
                         .map_err(|e| anyhow!("preflight: {e}"))?;
                     let body = serde_json::to_vec(&request)?;
                     assert!(body.len() <= SNAPSHOT_BATCH_MAX_BYTES);
-                    let encoded = crate::snapshot_client::retention_gzip_probe(&body);
+                    let encoded = crate::snapshot_client::retention_gzip_probe(
+                        &body,
+                        crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+                    );
                     integrated_post(slot, now + 2_000, current, "main", trace)?;
                     match script {
                         IntegratedScript::FallbackShed => {

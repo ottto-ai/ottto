@@ -1,5 +1,6 @@
 //! Opportunistic, process-local Desktop request activity. No acquisition or
 //! persistence: the existing request fold publishes only validated event clocks.
+use crate::hex::is_sha256_lower;
 use ottto_protocol::{AgentStatusSnapshot, SourceKind};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -24,12 +25,7 @@ impl RecentActivity {
         at: OffsetDateTime,
         now: OffsetDateTime,
     ) {
-        let hash = |s: &str| {
-            s.len() == 64
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        if !hash(account) || !hash(org) || !recent(at, now) {
+        if !is_sha256_lower(account) || !is_sha256_lower(org) || !recent(at, now) {
             return;
         }
         self.0.retain(|_, at| recent(*at, now));

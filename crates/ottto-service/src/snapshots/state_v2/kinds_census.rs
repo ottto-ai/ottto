@@ -75,10 +75,13 @@ pub(super) fn hydrate_txn(
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
-            let h = tx
-                .get(&mapper::key($kind, "", 0)?)?
-                .context("state_v2_census_missing")?;
-            index.$f = mapper::read(tx, &h, Some(&mut cx.digests))?;
+            index.$f = mapper::field_read(
+                tx,
+                $kind,
+                mapper::Members::Field,
+                Some(&mut cx.digests),
+                || ScanIndex::default().$f,
+            )?;
         };
         ($($t:tt)*) => {};
     }
@@ -126,22 +129,12 @@ pub(super) fn hydrate_cas_families(
 ) -> Result<()> {
     let members: BTreeMap<String, usize> =
         mapper::read_map(tx, "family.requests", Some(roots), None)?;
-    for (root, count) in members {
+    for root in roots {
+        let pending = index.claude_usage_family_pending.get(root);
         ensure!(
-            index
-                .claude_usage_family_pending
-                .get(&root)
-                .is_some_and(|p| p.member_request_id_hashes.len() == count),
+            members.get(root).copied() == pending.map(|p| p.member_request_id_hashes.len()),
             "state_v2_census_membership"
         );
-    }
-    for root in roots {
-        if index.claude_usage_family_pending.contains_key(root) {
-            ensure!(
-                tx.get(&mapper::key("family.requests", root, 1)?)?.is_some(),
-                "state_v2_census_membership"
-            );
-        }
     }
     Ok(())
 }

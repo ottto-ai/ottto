@@ -671,7 +671,6 @@ pub(crate) enum LoaderReason {
     SqliteOpenOrQuery,
     SqliteRowDecode,
     IncompleteShape,
-    LinkedDatabase,
     OtherFailure,
 }
 
@@ -764,8 +763,6 @@ impl LoaderEvidence {
             }
         } else if error.downcast_ref::<IncompleteShape>().is_some() {
             LoaderReason::IncompleteShape
-        } else if error.downcast_ref::<LinkedDatabase>().is_some() {
-            LoaderReason::LinkedDatabase
         } else {
             LoaderReason::OtherFailure
         };
@@ -855,16 +852,6 @@ impl std::fmt::Display for IncompleteShape {
     }
 }
 impl std::error::Error for IncompleteShape {}
-
-/// A Codex database with another hard link: refused, not retried.
-#[derive(Debug)]
-pub(crate) struct LinkedDatabase;
-impl std::fmt::Display for LinkedDatabase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Codex database has another hard link")
-    }
-}
-impl std::error::Error for LinkedDatabase {}
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CensusGates {
@@ -1049,7 +1036,7 @@ crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, st
 crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::unit_enum!(false;
     LoaderReason: Complete | Io | SqliteBusy | SqliteOpenOrQuery | SqliteRowDecode
-        | IncompleteShape | LinkedDatabase | OtherFailure;
+        | IncompleteShape | OtherFailure;
     LoaderStage: Open | Prepare | Query | Row;
     FileReason: NotParsedThisCycle | Complete | ParentPending | OwnershipIncomplete
         | RecognizedUsageDropped | ReadOrLineLoss;

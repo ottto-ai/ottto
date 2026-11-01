@@ -1022,14 +1022,37 @@ mod application_cases {
     }
 
     /// [format] real-data traversal admission: 3 MiB imports byte-equal in chunks;
-    /// over-cap JSON refuses before publication, on expansion and on fenced save.
+    /// over-cap JSON refuses at row admission, on expansion and on fenced save.
     #[test]
     fn large_traversal_import_roundtrips_and_above_cap_refuses() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/scan_index/real-shaped-v1.json"
         ))
         .unwrap();
-        for target in [3 * 1024 * 1024, 16 * 1024 * 1024 + 1] {
+        // Above the cap, admission refuses the row itself: no 16 MiB import.
+        {
+            let key = mapper::key("scan_state.traversal", "", 0).unwrap();
+            let over = "x".repeat(16 * 1024 * 1024 - 1);
+            let c = Corpus::new();
+            let mut db =
+                sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
+                    .unwrap();
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            let error = mapper::put(&mut tx, &key, &over).unwrap_err();
+            assert!(error.to_string().contains("state_v2_value_admission"));
+            let json = serde_json::to_vec(&over).unwrap();
+            assert!(json.len() as u64 > value_cap(&key));
+            let compressed = codec::encode(&json).unwrap();
+            assert!(compressed.len() < 1024 * 1024);
+            assert_eq!(
+                codec::expand(&compressed, value_cap(&key))
+                    .unwrap_err()
+                    .to_string(),
+                "state_v2_value_admission"
+            );
+        }
+        {
+            let target = 3 * 1024 * 1024;
             let c = Corpus::new();
             let mut index = ScanIndex {
                 traversal: serde_json::from_value(fixture["logical"]["traversal"].clone()).unwrap(),
@@ -1074,22 +1097,6 @@ mod application_cases {
             db.control("generation", &0_u64).unwrap();
             let result = Mapper.import_graph(&mut db, &index, Some(&original));
             let key = mapper::key("scan_state.traversal", "", 0).unwrap();
-            if target > 16 * 1024 * 1024 {
-                let error = result.err().unwrap();
-                assert!(error.to_string().contains("state_v2_value_admission"));
-                let compressed = codec::encode(&expected).unwrap();
-                assert!(compressed.len() < 1024 * 1024);
-                assert_eq!(
-                    codec::expand(&compressed, value_cap(&key))
-                        .unwrap_err()
-                        .to_string(),
-                    "state_v2_value_admission"
-                );
-                assert_eq!(fs::read(&c.path).unwrap(), original_bytes);
-                assert_eq!(fs::read(&progress_path).unwrap(), progress);
-                assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
-                continue;
-            }
             result.unwrap();
             let mut tx = db.begin(TxnMode::Read).unwrap();
             let header = tx.get(&key).unwrap().unwrap();

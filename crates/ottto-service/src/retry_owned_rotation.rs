@@ -198,12 +198,12 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             activity_hint: hint,
             receipt_window_days: 30,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
                 codex_home_bindings: vec![],
-            }),
+            })),
             attribution_context: None,
             upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: "offline-native".into(),
@@ -214,7 +214,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "owned".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),

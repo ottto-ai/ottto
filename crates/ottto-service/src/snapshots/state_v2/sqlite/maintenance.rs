@@ -10,6 +10,9 @@ pub(in super::super) struct PurgePolicy {
     pub(super) space: fn(&Path) -> Option<u64>,
     /// Hard charged-work ceiling for one save.
     pub(super) save_ceiling: u64,
+    /// Memory for one transaction's old-row string sets; past it, erasure is
+    /// required without a diff.
+    pub(super) path_diff_budget: usize,
 }
 impl Default for PurgePolicy {
     fn default() -> Self {
@@ -18,6 +21,7 @@ impl Default for PurgePolicy {
             work: Duration::from_secs(2),
             space: free_space,
             save_ceiling: SAVE_CEILING_BYTES,
+            path_diff_budget: PATH_DIFF_BUDGET_BYTES,
         }
     }
 }

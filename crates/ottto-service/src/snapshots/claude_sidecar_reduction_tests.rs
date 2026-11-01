@@ -262,12 +262,8 @@ fn validate_exact_ack(request: &SnapshotBatchRequest) {
             let public_version = snapshot_upload_body_witness_version(item).and_then(|v| {
                 if matches!(v, 9 | 10) { return None; }
                 Some(match v {
-                11 => 5,
-                12 => 6,
                 15 => 13,
                 16 => 14,
-                19 => 17,
-                20 => 18,
                 23 => {
                     if item.cache_observations.is_some() {
                         13

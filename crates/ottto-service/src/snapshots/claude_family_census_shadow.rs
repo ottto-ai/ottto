@@ -144,6 +144,14 @@ impl FamilyRef {
             root: member.root.to_owned(),
         })
     }
+
+    pub(super) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub(super) fn root(&self) -> &str {
+        &self.root
+    }
 }
 
 /// The families one page's selection touched, deduplicated and bounded.

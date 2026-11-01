@@ -70,7 +70,8 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
         Ok(next)
     })();
     if let Err(error) = &result {
-        tx.store.record_save_error(error);
+        let dirty_bytes = tx.dirty_bytes;
+        tx.store.record_save_error(error, dirty_bytes);
     }
     tx.failed |= result.is_err();
     result

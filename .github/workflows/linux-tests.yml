@@ -75,12 +75,19 @@ jobs:
       - name: Connector format
         run: cargo fmt --manifest-path crates/Cargo.toml --all --check
 
-  rust-linux:
-    name: Rust tests (Linux)
-    needs: dispatch-once
-    if: ${{ !cancelled() && !github.event.pull_request.draft && needs.dispatch-once.outputs.state != 'success' && needs.dispatch-once.outputs.state != 'pending' }}
+  rust-linux-shard:
+    # Three shares of the ottto-service lib tests (scripts/ci_runtime_tests.py
+    # --shard), each on its own runner with main's warm cache; share 1 also
+    # runs clippy, every other test target and the connector tests.
     # Heap-layout tests run here too: the lib step took 15-27 min in trial
     # runs against 7-12 before.
+    name: Rust tests (Linux) shard ${{ matrix.shard }}/3
+    needs: dispatch-once
+    if: ${{ !cancelled() && !github.event.pull_request.draft && needs.dispatch-once.outputs.state != 'success' && needs.dispatch-once.outputs.state != 'pending' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
@@ -91,21 +98,23 @@ jobs:
         with:
           persist-credentials: false
 
-      # Cache: only main saves. A save per PR merge ref (~331 MB each) filled
-      # the 10 GB repo cache and evicted the macOS main cache. PRs restore
-      # main's entry.
+      # Cache: only main saves, from share 1. A save per PR merge ref (~331 MB
+      # each) filled the 10 GB repo cache and evicted the macOS main cache.
+      # PRs restore main's entry.
       - name: Rust setup
         uses: ./.github/actions/rust-setup
         with:
           components: clippy
           linux-test-env: "true"
           cache-key: linux-tests
-          cache-save: ${{ github.ref == 'refs/heads/main' }}
+          cache-save: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
       - name: Runtime clippy
+        if: matrix.shard == 1
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Connector clippy
+        if: matrix.shard == 1
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       # Build every test binary first, then let main save the cache even if a
@@ -119,7 +128,9 @@ jobs:
         run: |
           build_status=0
           cargo test --workspace --locked --no-run || build_status=$?
-          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          if [ "${{ matrix.shard }}" = 1 ]; then
+            cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          fi
           if [ "$build_status" -eq 0 ]; then
             echo "CACHE_ON_FAILURE=true" >> "$GITHUB_ENV"
           fi
@@ -128,8 +139,24 @@ jobs:
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
         # Same split as the macOS job (scripts/ci_runtime_tests.py).
-        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast
+        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast --shard ${{ matrix.shard }}/3
 
       # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests
+        if: matrix.shard == 1
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
+
+  rust-linux:
+    # The single required name (merge guard, mac_batch.py, linux_check_state.sh).
+    name: Rust tests (Linux)
+    needs: [dispatch-once, rust-linux-shard]
+    if: ${{ !cancelled() && !github.event.pull_request.draft && needs.dispatch-once.outputs.state != 'success' && needs.dispatch-once.outputs.state != 'pending' }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every shard passed
+        env:
+          SHARDS: ${{ needs.rust-linux-shard.result }}
+        run: |
+          echo "shards: $SHARDS"
+          test "$SHARDS" = success

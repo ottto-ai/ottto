@@ -97,12 +97,22 @@ impl ScanIndexEntry {
         }
     }
     pub(super) fn carry_sampled_audit(&mut self, working: &Self) {
-        if let Some(due) = working.unverified_deadline() {
-            self.scan_identity_version = Some(provenance_marker(
-                self.unverified_deadline().map_or(due, |old| old.min(due)),
-                self.has_prefix_provenance() || working.has_prefix_provenance(),
-            ));
+        if let Some(version) = self.sampled_audit_carry(working) {
+            self.scan_identity_version = Some(version);
         }
+    }
+    /// Whether `carry_sampled_audit(working)` would change this entry. By
+    /// value: the carry rewrites even this entry's own v1 marker in v2 form.
+    pub(super) fn carry_sampled_audit_changes(&self, working: &Self) -> bool {
+        self.sampled_audit_carry(working)
+            .is_some_and(|version| self.scan_identity_version.as_deref() != Some(&*version))
+    }
+    fn sampled_audit_carry(&self, working: &Self) -> Option<String> {
+        let due = working.unverified_deadline()?;
+        Some(provenance_marker(
+            self.unverified_deadline().map_or(due, |old| old.min(due)),
+            self.has_prefix_provenance() || working.has_prefix_provenance(),
+        ))
     }
     pub(super) fn audit_obligation(&self, now: u64) -> Option<AuditDebt> {
         if !self.has_unverified_source() {
@@ -244,7 +254,7 @@ impl ScanIndex {
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
 pub(super) fn path_requires_verification(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
     files
@@ -258,7 +268,7 @@ pub(super) fn path_requires_verification(
 /// Discovery grants no ACK, census proof or independent read permission.
 pub(super) fn path_requires_recovery(
     source: SnapshotSource,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
     length: u64,
 ) -> bool {
@@ -271,18 +281,23 @@ pub(super) fn path_requires_recovery(
             }))
 }
 
-pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    for entry in index
-        .files
-        .values_mut()
-        .filter(|entry| entry.has_unverified_source())
-    {
-        if entry
+fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
+    entry.has_unverified_source()
+        && entry
             .scan_identity_version
             .as_ref()
             .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
-        {
-            entry.set_unverified_deadline(0);
+}
+
+/// Runs every Claude and Codex scan, so an index with nothing to normalize
+/// stays shared with the committed baseline.
+pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
+    if !index.files.values().any(marker_storage_oversized) {
+        return;
+    }
+    for (_, entry) in index.files.slots_mut() {
+        if marker_storage_oversized(entry) {
+            entry.make_mut().set_unverified_deadline(0);
         }
     }
 }
@@ -1470,7 +1485,7 @@ mod provenance_tests {
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
@@ -1588,6 +1603,32 @@ impl AbsenceParent {
             let _ = (self, other);
             false
         }
+    }
+}
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
@@ -2155,15 +2196,27 @@ pub(super) const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
 pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
     let files = &index.files;
     let Some(v2) = index.v2.as_mut() else { return };
-    let before = v2.growth_retention.len();
-    v2.growth_retention.retain(|key, state| {
-        files.contains_key(key)
+    let reclaimed = reclaim_growth(&mut v2.growth_retention, |key| files.contains_key(key), now);
+    if growth_active(index) {
+        note_growth_reclaimed(reclaimed);
+    }
+}
+fn reclaim_growth(
+    retention: &mut BTreeMap<String, GrowthRetention>,
+    has_file: impl Fn(&str) -> bool,
+    now: u64,
+) -> usize {
+    let before = retention.len();
+    retention.retain(|key, state| {
+        has_file(key)
             || state
                 .last_growth_full_unix
                 .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
     });
-    let reclaimed = before - v2.growth_retention.len();
-    if reclaimed > 0 && growth_active(index) {
+    before - retention.len()
+}
+fn note_growth_reclaimed(reclaimed: usize) {
+    if reclaimed > 0 {
         crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
             "growth_claim_reclaimed": reclaimed
         }));
@@ -2241,9 +2294,13 @@ fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Called by save while the checkpoint lock still protects this publication.
-/// A same-generation replacement must not become a claim-lineage CAS bypass.
-pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Result<()> {
+/// Called after the claim's commit at `generation`, still under the checkpoint
+/// lock. A same-generation replacement must not become a claim-lineage CAS bypass.
+pub(super) fn publish_growth_claim_receipt(
+    index: &ScanIndex,
+    path: &Path,
+    generation: u64,
+) -> Result<()> {
     let context = index
         .v2()
         .growth_claim_context
@@ -2255,15 +2312,12 @@ pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Re
         "growth claim owner changed"
     );
     let stamp = state_v2::confirmed_growth_stamp(index, path)?;
-    anyhow::ensure!(
-        stamp.0 == index.generation,
-        "growth claim publication changed"
-    );
+    anyhow::ensure!(stamp.0 == generation, "growth claim publication changed");
     *context
         .receipt
         .lock()
         .map_err(|_| anyhow::anyhow!("growth claim receipt unavailable"))? =
-        Some((index.generation, stamp));
+        Some((generation, stamp));
     Ok(())
 }
 
@@ -2282,13 +2336,20 @@ pub(super) fn merge_growth_claims(
     }
 }
 
+fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
+    state
+        .last_growth_full_unix
+        .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+}
+
+/// The claim is one store transaction CAS'd on this lineage's G; no
+/// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
-    let recent = |state: &GrowthRetention| {
-        state
-            .last_growth_full_unix
-            .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
-    };
-    if index.v2().growth_retention.get(key).is_some_and(recent)
+    if index
+        .v2()
+        .growth_retention
+        .get(key)
+        .is_some_and(|state| growth_claim_recent(state, now))
         || index.decode_holds.contains("growth_retention", key)
     {
         return Ok(false);
@@ -2298,30 +2359,12 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .growth_claim_context
         .clone()
         .context("growth Full needs a committed scan index")?;
-    // Decode the committed index, not the working page: persisting a claim
-    // must never publish unaccepted bodies, progress or census changes.
-    authenticate_growth_generation(index, &context.path)?;
-    let mut committed = ScanIndex::load(&context.path)?;
-    anyhow::ensure!(
-        growth_owner_matches(&committed, &context),
-        "growth claim owner changed"
-    );
+    let _lock = CheckpointLock::acquire(&context.path)?;
     authenticate_growth_generation(index, &context.path)?;
     let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
-    anyhow::ensure!(
-        committed.generation == expected,
-        "growth claim needs index reload"
-    );
-    committed.require_persistence_available()?;
-    if committed.v2().growth_retention.get(key).is_some_and(recent)
-        || committed.decode_holds.contains("growth_retention", key)
-    {
-        merge_growth_claims(
-            &mut index.v2_mut().growth_retention,
-            &committed.v2().growth_retention,
-        );
-        return Ok(false);
-    }
+    // The committed graph shares this lineage's normalization; only claim
+    // rows differ, so its availability is this graph's.
+    index.require_persistence_available()?;
     let mut claim = index
         .v2()
         .growth_retention
@@ -2329,21 +2372,33 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .cloned()
         .unwrap_or_default();
     claim.last_growth_full_unix = Some(now);
-    committed
-        .v2_mut()
-        .growth_retention
-        .insert(key.to_owned(), claim);
-    // Existing save owns lock, full CAS, atomic publication and fsync. If it
-    // fails (including ambiguous publication), no acquisition is authorized.
-    committed.v2_mut().growth_claim_context = Some(context.clone());
-    committed.save_growth_claim(&context.path)?;
-    let _lock = CheckpointLock::acquire(&context.path)?;
-    publish_growth_claim_receipt(&committed, &context.path)?;
-    merge_growth_claims(
-        &mut index.v2_mut().growth_retention,
-        &committed.v2().growth_retention,
-    );
-    Ok(true)
+    let decide =
+        |rows: &mut BTreeMap<String, GrowthRetention>, held: bool, files: &BTreeSet<String>| {
+            if held
+                || rows
+                    .get(key)
+                    .is_some_and(|state| growth_claim_recent(state, now))
+            {
+                return false;
+            }
+            // The save's merge keeps the larger claim; this one is not recent,
+            // so the committed claim is older. The save's pruning then applies.
+            rows.insert(key.to_owned(), claim);
+            note_growth_reclaimed(reclaim_growth(
+                rows,
+                |name| files.contains(name),
+                sampled_scan::now_seconds(),
+            ));
+            true
+        };
+    let (admitted, committed) =
+        state_v2::claim_growth_locked(&context.path, index, expected, key, decide)?;
+    if admitted {
+        let generation = expected.checked_add(1).context("growth claim generation")?;
+        publish_growth_claim_receipt(index, &context.path, generation)?;
+    }
+    merge_growth_claims(&mut index.v2_mut().growth_retention, &committed);
+    Ok(admitted)
 }
 
 /// Identity has already been checked by open_and_identify and ReadPlan.
@@ -2686,62 +2741,52 @@ mod growth_tests {
     /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        for prechecked in [true, false] {
-            let fixture = Fixture::new();
-            let mut index = fixture.index();
-            fixture.grow();
-            if prechecked {
-                revalidate_growth(
-                    &mut index,
-                    &fixture.key,
-                    std::slice::from_ref(&fixture.root),
-                );
-            }
-            let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-            let record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                (0..cap as u64).collect(),
-            )
-            .with_modified_for_test(Some(1));
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            (0..cap as u64).collect(),
+        )
+        .with_modified_for_test(Some(1));
+        index
+            .claude_request_census
+            .insert_for_test(&fixture.key, record);
+        let mut index = restart(&index);
+        let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            40 * 86400,
+            ClaudeRequestCensusShape::Exact,
+            vec![u64::MAX],
+        );
+        let outcome = index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
             index
                 .claude_request_census
-                .insert_for_test(&fixture.key, record);
-            let mut index = restart(&index);
-            let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"b".repeat(64),
-                40 * 86400,
-                ClaudeRequestCensusShape::Exact,
-                vec![u64::MAX],
-            );
-            let outcome =
-                index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
-            assert_ne!(
-                outcome,
-                super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-            );
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .record_for_test(&fixture.key)
-                    .unwrap()
-                    .request_hashes_for_test()
-                    .len(),
-                cap
-            );
-            // Occupancy release also excludes this key, even above 90%.
-            assert_eq!(
-                index
-                    .retire_claude_transcript_records_for_test(40 * 86400)
-                    .0,
-                0
-            );
-            assert_eq!(
-                index.claude_request_census.totals_for_test(),
-                index.claude_request_census.recounted_for_test()
-            );
-        }
+                .record_for_test(&fixture.key)
+                .unwrap()
+                .request_hashes_for_test()
+                .len(),
+            cap
+        );
+        // Occupancy release also excludes this key, even above 90%.
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            0
+        );
+        assert_eq!(
+            index.claude_request_census.totals_for_test(),
+            index.claude_request_census.recounted_for_test()
+        );
     }
 
     /// [regress] retained same key rollback restores exact custody inside tombstone reserve.

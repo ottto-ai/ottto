@@ -325,6 +325,9 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
+Claude Code's local-evidence stage adds three such footprint records (empty
+counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
@@ -2113,14 +2116,27 @@ the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
 (>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records a
-whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
-`state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+whole-save refusal above 256 MiB, with `save_ceiling_cause`; at page size one,
+`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
+string diff passed its 32 MiB memory budget: the save commits and requires
+erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
 `account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history.
+account-window pressure without capping owed history; `account_windows_retained`
+also reports `uncollapsed`, the windows older than their equal-evidence run's
+newest left in a store-only archive (boundaries unchecked), and `replaced` and
+`pushed`, the store-only archive rollovers this save wrote that replaced their
+run's newest window or were appended (resident archives, kept only with raw
+holds or before a complete v2 load, are not counted). A complete v2 load keeps archived account
+windows in the store, so the retained-pending byte diagnostic is unavailable while
+any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
+`cold_row_unknown`) when a stored archived row no longer matches its baseline, and
+with `state_v2_cold_lineage_miss` (count `cold_lineage_miss`) when a graph's archive
+view predates a commit it shares no rollover with; both hold and remove nothing.
 These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows
@@ -2135,8 +2151,8 @@ A bucket row enters the local proved-row ledger only when a stored-body entity
 ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
 only while the capability is on, and only when that ACK declares a body witness
 version and its digest equals the local body witness of a body that has a
-public witness version (context curve, session account evidence or cache
-observations), so the ACK validator also checked the exact version. The
+public witness version (session account evidence or cache observations), so
+the ACK validator also checked the exact version. The
 ledger keeps truncated keyed digests of the row key and of that proof
 (authorities plus the eight counts and five costs); later positive proof
 replaces it. Per revision, a proved row whose current proof equals the ACKed
