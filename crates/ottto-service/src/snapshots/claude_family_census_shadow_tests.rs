@@ -132,7 +132,7 @@ fn pending(members: &[String], window: &str, seed: usize) -> ClaudeAccountFamily
             member_requests,
             invalid: false,
         },
-        previous_windows: Vec::new(),
+        previous_windows: Default::default(),
         confirmed_absent_members: BTreeSet::new(),
     }
 }
