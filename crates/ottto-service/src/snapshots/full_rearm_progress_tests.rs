@@ -175,7 +175,8 @@ impl Rearm {
         self.terminal(index, items)
     }
 
-    /// Re-read every re-armed file, recording its current revision.
+    /// Re-read every re-armed (cleared or owed) file, recording its current
+    /// revision.
     fn reread(
         &self,
         index: &mut ScanIndex,
@@ -185,10 +186,11 @@ impl Rearm {
         let mut rearmed_bytes = 0;
         for (key, source) in &self.sources {
             let entry = index.files.get_mut(key).expect("an indexed member");
-            if entry.source_file_fingerprint.is_empty() {
+            if entry.rearmed() {
                 rearmed_files += 1;
                 rearmed_bytes += entry.size_bytes;
                 entry.source_file_fingerprint = source.clone();
+                entry.evidence_owed = false;
             }
         }
         Terminal {
@@ -458,6 +460,133 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     let skipped = rearm.terminal(&mut index, &rearm.items);
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
+}
+
+/// [regress] A complete census under the recorded cycle contract with no
+/// older-window evidence left clears the identity-contract latch before its
+/// contract re-arm (no re-read, counted). Older valid evidence of an indexed
+/// family still blocks the clear and takes main's re-arm (main's clear, never
+/// owed). Older evidence of a family
+/// held in authority quarantine no longer blocks the clear: it is kept, not
+/// invalidated, and its family is marked `contract_unproven` (counted).
+#[test]
+fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
+    let _on = evidence_owed::EvidenceOwedForTest::on();
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut older = index.clone();
+
+    index.claude_request_identity_contract_changed = true;
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let settled = rearm.terminal(&mut index, &rearm.items);
+    assert_eq!(settled.rearmed_files, 0, "{settled:?}");
+    assert!(!index.claude_request_identity_contract_changed);
+    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
+
+    // An indexed family this census does not fold keeps older valid evidence.
+    rearm.add_other_family(&mut older);
+    older.claude_request_identity_contract_changed = true;
+    older.claude_usage_family_pending.insert(
+        OTHER_ROOT.to_string(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-08-01T07:10:00Z".to_string(),
+            member_request_id_hashes: BTreeMap::from([(
+                OTHER_ROOT.to_string(),
+                BTreeSet::from(["a".repeat(64)]),
+            )]),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+            idless_revision: None,
+            identity_contract: None,
+            contract_unproven: false,
+        },
+    );
+    let mut quarantined = older.clone();
+    let mut spent = older.clone();
+    older.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+    let disposition = rearm.fold(&mut older, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    // Main's clear, never owed: an older reader still sees the read, and the
+    // older-window pending cannot re-stamp an unread file.
+    assert!(older.files.values().all(|entry| !entry.evidence_owed));
+    let latched = rearm.reread(&mut older, &disposition);
+    assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
+
+    // A quarantine binds the member's real (sha256-shaped) revision.
+    let revision = "1".repeat(64);
+    let other_key = rearm.other_key();
+    rearm.sources.insert(other_key.clone(), revision.clone());
+    quarantined
+        .files
+        .get_mut(&other_key)
+        .unwrap()
+        .source_file_fingerprint = revision.clone();
+    quarantined.insert_unproven_terminal_claude_authority_for_test(OTHER_ROOT, &revision);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    rearm.terminal(&mut quarantined, &rearm.items);
+    let latch = scope.finish().contract.identity_contract_latch;
+    assert!(!quarantined.claude_request_identity_contract_changed);
+    assert_eq!(
+        (
+            latch.cleared,
+            latch.cleared_with_quarantine_exempt,
+            latch.quarantine_exempt_families
+        ),
+        (1, 1, 1)
+    );
+    let pending = &quarantined.claude_usage_family_pending[OTHER_ROOT];
+    assert!(pending.contract_unproven && !pending.invalid);
+    assert_eq!(pending.census_window_end, "2026-08-01T07:10:00Z");
+
+    // Main's latch clear has routes without its identity-contract re-arm (a
+    // completion whose fence opens, the identity upgrade; here a spent
+    // cutover). Older-window pending kept across any of them is marked
+    // `contract_unproven`: it re-stamps only through its own stamp, so this
+    // unstamped one is read.
+    spent.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
+    rearm.fold(&mut spent, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    assert!(!spent.claude_request_identity_contract_changed, "main's clear");
+    let pending = &spent.claude_usage_family_pending[OTHER_ROOT];
+    assert!(pending.contract_unproven && pending.identity_contract.is_none());
+    evidence_owed::clear(spent.files.get_mut(&other_key).unwrap());
+    let mut candidate = test_candidate(PathBuf::from(&other_key));
+    candidate.source_file_fingerprint = spent.files[&other_key].source_file_fingerprint.clone();
+    let (mut decision, mut reason) = (CandidateDecision::Skip, None);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    evidence_owed::resolve(
+        &mut spent,
+        &mut evidence_owed::Page::default(),
+        &candidate,
+        WINDOW,
+        &mut decision,
+        &mut reason,
+    );
+    let owed = scope.finish().contract.evidence_owed;
+    assert_eq!((owed.refused_contract_unproven, owed.read), (1, 1));
+    assert_eq!(decision, CandidateDecision::Parse);
+}
+
+/// [regress] The first complete census's full re-arm clears every family
+/// file, again on a 1-24 h backoff while the fence stays closed. OFF the fold
+/// clears exactly as main; ON it owes the same files, keeping
+/// their fingerprints, so the owed resolver (re-stamp, restore, paced Full)
+/// decides each one at the next walk.
+#[test]
+fn evidence_owed_first_census_fold_owes_instead_of_clearing() {
+    for on in [false, true] {
+        let _on = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let rearm = Rearm::new();
+        let mut index = rearm.index();
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let first = rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(first.duplicate_census.full_rearm, "on={on}");
+        for key in rearm.sources.keys() {
+            let entry = &index.files[key];
+            assert!(entry.rearmed(), "on={on} {key}");
+            assert_eq!(entry.evidence_owed, on, "{key}");
+            assert_eq!(entry.source_file_fingerprint.is_empty(), !on, "{key}");
+        }
+    }
 }
 
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so

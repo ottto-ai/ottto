@@ -147,7 +147,7 @@ impl ScanIndex {
 
     pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
         let Some(entry) = self.files.get_mut(key).filter(|entry| {
-            entry.source_file_fingerprint == fingerprint
+            entry.observed_fingerprint() == fingerprint
                 && entry.has_unverified_source()
                 && !entry.has_prefix_provenance()
         }) else {
@@ -172,7 +172,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -194,7 +194,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -218,7 +218,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
+            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
         else {
             return false;
         };
@@ -250,9 +250,9 @@ pub(super) fn path_requires_verification(
     files: &BTreeMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files.get(&local_index_key(path)).is_some_and(|entry| {
-        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
-    })
+    files
+        .get(&local_index_key(path))
+        .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
 }
 
 /// Retain the existing partial growth safeguard and shorter/future floors
@@ -917,7 +917,7 @@ impl SourceScanResult {
                     && index
                         .files
                         .get(key)
-                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
+                        .is_some_and(|entry| entry.observed_fingerprint() == fingerprint)
                     && index.stage_sampled_audit(key, fingerprint, debt)
                 {
                     reserved += 1;

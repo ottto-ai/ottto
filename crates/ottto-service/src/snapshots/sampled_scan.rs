@@ -2094,8 +2094,11 @@ pub(super) mod test_hooks {
     }
 
     type Hook = Box<dyn FnMut()>;
+    type SelectionHook =
+        Box<dyn FnOnce(&mut super::super::ScanIndex, Option<super::super::CandidateParseReason>)>;
     thread_local! {
         static HOOKS: RefCell<Vec<(Point, Hook)>> = RefCell::new(Vec::new());
+        static AFTER_SELECTION: RefCell<Option<SelectionHook>> = const { RefCell::new(None) };
         static PROBE: RefCell<Probe> = RefCell::new(Probe::default());
         static DECISIONS: RefCell<Vec<Decision>> = const { RefCell::new(Vec::new()) };
         static BUCKETS: RefCell<Vec<super::sampled_jsonl::Bucket>> = const { RefCell::new(Vec::new()) };
@@ -2110,9 +2113,38 @@ pub(super) mod test_hooks {
         HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
     }
 
+    /// Change test inputs after selection, before acquisition; restore nested hooks on unwind.
+    /// Its only caller is a native-layout restore test, which is macOS-only.
+    #[cfg(target_os = "macos")]
+    pub(in crate::snapshots) fn with_after_selection<T>(
+        hook: impl FnOnce(&mut super::super::ScanIndex, Option<super::super::CandidateParseReason>)
+            + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<SelectionHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                AFTER_SELECTION.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(AFTER_SELECTION.with(|slot| slot.replace(Some(Box::new(hook)))));
+        run()
+    }
+
+    pub(in crate::snapshots) fn after_selection(
+        index: &mut super::super::ScanIndex,
+        reason: Option<super::super::CandidateParseReason>,
+    ) {
+        let hook = AFTER_SELECTION.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(index, reason);
+        }
+    }
+
     /// Drop every hook and recorded value on this thread.
     pub(in crate::snapshots) fn clear() {
         HOOKS.with(|hooks| hooks.borrow_mut().clear());
+        AFTER_SELECTION.with(|slot| slot.borrow_mut().take());
         PROBE.with(|probe| *probe.borrow_mut() = Probe::default());
         DECISIONS.with(|decisions| decisions.borrow_mut().clear());
         BUCKETS.with(|buckets| buckets.borrow_mut().clear());

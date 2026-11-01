@@ -2659,15 +2659,16 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.durable_held, [0; 9]);
-            // The read-only privacy retry counts its own refusal even after
-            // ordinary restore disabled the store. It cannot hold native work.
+            // Both read-only privacy checks count their refusal after ordinary
+            // restore disables the store: consent erasure and verification of
+            // a live key in an unknown inventory. Neither can hold native work.
             let mut privacy_refusals = [0; 9];
             let reason = if fault == "body" {
                 store::Refusal::Corrupt
             } else {
                 store::Refusal::Undecodable
             };
-            privacy_refusals[reason as usize] = 1;
+            privacy_refusals[reason as usize] = 2;
             assert_eq!(stats.format_hold, privacy_refusals, "{source:?}/{fault}");
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
@@ -4853,6 +4854,203 @@ fn a1a_scan_at(
         .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
         fixture::scan_modes(scan, 100_000)
     })
+}
+
+/// [money] An owed unchanged file restores current evidence; a stale contract
+/// cannot supply a stamp or replace the cold Full's totals and placement.
+#[test]
+#[cfg(target_os = "macos")]
+fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
+    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let _owed = EvidenceOwedForTest::on();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    const SESSION: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let source = SnapshotSource::ClaudeCode;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ContractChange {
+        Unchanged,
+        Placeholder,
+        BodyWitness,
+    }
+    for change in [
+        ContractChange::Unchanged,
+        ContractChange::Placeholder,
+        ContractChange::BodyWitness,
+    ] {
+        let mut disk = fixture::NativeColdStore::with_scope(
+            source,
+            "owed-rearmed-restore",
+            Scope("e2-pipeline".into()),
+        );
+        let path = disk.path(SESSION);
+        let key = disk.key(SESSION);
+        std::fs::write(&path, a1a_row("first", 100)).unwrap();
+        let read = |disk: &fixture::NativeColdStore,
+                    index: ScanIndex,
+                    cache: Arc<SharedCache>,
+                    change: ContractChange| {
+            claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                let owned = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&disk.sessions),
+                    index,
+                    "2026-08-02T08:00:00Z",
+                    183,
+                    100,
+                    false,
+                    Some(&disk.root),
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache, disk.namespace.clone());
+                let key = disk.key(SESSION);
+                let (mut index, mut scan, modes) =
+                    crate::snapshots::sampled_scan::test_hooks::with_after_selection(
+                        move |index, reason| {
+                            if change != ContractChange::Unchanged {
+                                assert_eq!(reason, Some(CandidateParseReason::Rearmed));
+                                assert!(index.files[&key].evidence_owed);
+                            }
+                            match change {
+                                ContractChange::Unchanged => {}
+                                ContractChange::Placeholder => {
+                                    index.claude_request_identity_contract = Some(
+                                        CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL
+                                            .into(),
+                                    );
+                                    // Make the audit due after owed selection, so the resolver
+                                    // owns the read and the stale-binding fallback may read Full.
+                                    index
+                                        .files
+                                        .get_mut(&key)
+                                        .unwrap()
+                                        .set_unverified_deadline(1);
+                                }
+                                ContractChange::BodyWitness => {
+                                    index.active_effective_upload_body_witness_revision += 1;
+                                }
+                            }
+                        },
+                        || fixture::scan_modes(owned, 100_000),
+                    );
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                    &disk.root, &mut scan, &mut index,
+                );
+                (index, scan, modes)
+            })
+        };
+        let mut seed = ScanIndex {
+            claude_request_identity_contract: Some(
+                claude_request_identity::cycle_contract(true).into(),
+            ),
+            ..Default::default()
+        };
+        // Exercise a real change between two admitted body-witness revisions.
+        seed.activate_effective_upload_body_witness_revision(
+            effective_revision(source) - u64::from(change == ContractChange::BodyWitness),
+        );
+        disk.cache
+            .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
+        let (mut index, mut initial, modes) =
+            read(&disk, seed, disk.cache.clone(), ContractChange::Unchanged);
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(initial.snapshots.len(), 1);
+        assert_eq!(initial.snapshots[0].input_tokens, 100);
+        let stamped = EvidenceContract::current(&index);
+        assert!(stamped.is_some());
+        assert_eq!(
+            index.claude_usage_family_pending[SESSION].identity_contract,
+            stamped
+        );
+        finalize_scan_after_policy(source, &mut initial, &mut index);
+        assert!(!index.files[&key].evidence_owed);
+        assert!(!index.files[&key].observed_fingerprint().is_empty());
+        index.record_accepted_snapshot_fingerprints(
+            &initial
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&disk.index_path).unwrap();
+        assert_native_write_before_save(&disk.cache, disk.writer, source, &index, &key);
+        let mut prior = index;
+        // Lose the pending occurrences so only the record can restore their evidence.
+        // Keep the physical file and its revision unchanged across the re-arm.
+        prior.claude_usage_family_pending.clear();
+        prior.traversal = None;
+        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
+        assert!(prior.files[&key].observed_fingerprint().is_empty());
+        prior.save(&disk.index_path).unwrap();
+        disk.restart();
+        assert!(disk.cache.retained_checkpoint(&key).is_none());
+        assert!(disk.index.claude_usage_family_pending.is_empty());
+        let prior = disk.index.clone();
+        disk.cache
+            .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
+        let (cold_index, cold, cold_modes) = read(
+            &disk,
+            prior.clone(),
+            Arc::new(SharedCache::default()),
+            change,
+        );
+        assert_eq!(cold_modes, (1, 0, 0));
+        let ((index, restored, modes), events) = crate::local_resource_diagnostics::capture(|| {
+            read(&disk, prior, disk.cache.clone(), change)
+        });
+        let owed_count = |name: &str| {
+            events
+                .iter()
+                .filter(|event| event["stage"] == "native_collection_page")
+                .filter_map(|event| event["counts"]["evidence_owed"][name].as_u64())
+                .sum::<u64>()
+        };
+        assert_eq!(owed_count("read"), 1);
+        assert_eq!(owed_count("restamped"), 0);
+        assert_eq!(owed_count("restamped_from_record"), 0);
+        assert_eq!(owed_count("selected_by_other_reason"), 0);
+        money_oracle::assert_equivalent(
+            &scan_money(source, &cold_index, &cold),
+            &scan_money(source, &index, &restored),
+        );
+        let current = EvidenceContract::current(&index);
+        assert_eq!(
+            index.claude_usage_family_pending[SESSION].identity_contract,
+            current
+        );
+        assert!(!index.files[&key].evidence_owed);
+        assert!(!index.files[&key].observed_fingerprint().is_empty());
+        let counts = disk.cache.durable_counters(source).unwrap().0;
+        match change {
+            ContractChange::Unchanged => {
+                assert_eq!(counts.restored, 1);
+                assert_eq!(modes, (0, 0, 1));
+                assert!(current.is_some());
+                assert_eq!(current, stamped);
+            }
+            ContractChange::Placeholder => {
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
+                assert_eq!(current, None, "a stale record never supplies its old stamp");
+            }
+            ContractChange::BodyWitness => {
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
+                assert!(current.is_some());
+                assert_ne!(current, stamped);
+            }
+        }
+    }
 }
 
 /// [money] a1a frozen floor holds before certificate even after working entry clear.
@@ -7347,7 +7545,19 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     );
     index.save(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-    let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+    let (reduction, checkpoint) = {
+        // Configure the same active counting view as the production singleton read.
+        let mut parser =
+            fixture::parser(source, &path, File::open(&path).unwrap(), apply_codex_line);
+        codex_counting_version::configure_group_once(
+            &mut parser.accumulator,
+            codex_counting_version::AckEvidence::None,
+        );
+        parser
+            .prepare_acquisition(None, &scope, None, 1_800_000_000)
+            .unwrap();
+        fixture::finish_record(&mut parser, &scope, 1_800_000_000)
+    };
     assert!(reduction.supports_frozen_charge());
     let incoming = Retained {
         checkpoint,
@@ -7502,6 +7712,10 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 false,
             )
             .unwrap();
+            codex_counting_version::configure_group_once(
+                &mut parser.accumulator,
+                codex_counting_version::AckEvidence::None,
+            );
             assert_eq!(
                 parser
                     .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_001)
@@ -7828,7 +8042,7 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                             key: digest,
                             context: store::context_digest(&owner.namespace.0, None),
                             scope: [2; 32],
-                            entry: [3; 32],
+                            entry: [0; 32],
                         },
                         certificate(&path, &owner.namespace),
                         body.clone(),
