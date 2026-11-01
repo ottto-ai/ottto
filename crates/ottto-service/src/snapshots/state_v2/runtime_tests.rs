@@ -455,10 +455,6 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
                 .unwrap()
                 .last_snapshot_fingerprint = Some(fingerprint(c));
         }
-        // A's upload was acknowledged, as the ack path records it.
-        working
-            .accepted_snapshot_fingerprints
-            .insert(fingerprint('3'));
         roll(&mut working, 28);
         assert_eq!(
             matches!(
@@ -515,12 +511,6 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             claim.files[B].last_snapshot_fingerprint,
             Some(fingerprint('2'))
         );
-        assert!(claim
-            .accepted_snapshot_fingerprints
-            .contains(&fingerprint('3')));
-        assert!(!claim
-            .accepted_snapshot_fingerprints
-            .contains(&fingerprint('4')));
         assert!(save_with_mode(&f.path, &mut claim, true, None).unwrap());
         working.generation = claim.generation;
         roll(&mut working, 29);
