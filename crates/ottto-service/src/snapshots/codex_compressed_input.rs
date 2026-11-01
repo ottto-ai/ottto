@@ -245,6 +245,16 @@ impl ArchiveEvidence {
     }
     pub(super) fn transition(&mut self, change: ArchiveTransition) {
         use ArchiveTransition::*;
+        // A transient skip cannot erase paid header pacing or a named hold.
+        if matches!(change, Transient(_))
+            && (matches!(self.disposition, ArchiveDisposition::Held { cause, .. } if cause != CodexZstCause::AdmissionRefused)
+                || self.work.as_ref().is_some_and(|w| {
+                    w.reservation == ArchiveReservation::None
+                        && super::sampled_scan::now_seconds() < w.header_retry_after
+                }))
+        {
+            return;
+        }
         let correction = matches!(change, Correctness(CodexZstCause::CorrectionUnapplied));
         let settled = matches!(
             self.disposition,
@@ -1674,6 +1684,8 @@ pub(in crate::snapshots) mod tests {
 
     /// [money] Standalone native ownership reads once. Every claimant, parent,
     /// damaged header and unresolved root is owed without a Full decode.
+    /// Paid damaged-header attempts retain their cause and deadline across
+    /// funded/unfunded passes and restart without physical re-reads.
     #[test]
     fn native_archive_fence_is_conservative_and_quiet_between_saved_retries() {
         let _lock = DECODER_TEST_LOCK
@@ -1768,6 +1780,74 @@ pub(in crate::snapshots) mod tests {
                     result.archive_owed_count > 0,
                     "archive debt stays disclosed"
                 );
+                if case == "damaged" {
+                    let physical_header_bytes = |rows: &[Value]| -> u64 {
+                        rows.iter()
+                            .filter(|r| r["stage"] == "codex_zst_inventory")
+                            .map(|r| r["counts"]["physical_bytes"].as_u64().unwrap())
+                            .sum()
+                    };
+                    assert_eq!(physical_header_bytes(&logs), b"invalid zstd".len() as u64);
+                    let work = index.archives[&key].work.as_ref().unwrap();
+                    let deadline = work.header_retry_after;
+                    let attempts = work.header_attempts;
+                    assert!(deadline > sampled_scan::now_seconds());
+                    assert!(attempts > 0);
+                    assert!(
+                        !work.decoded,
+                        "the failed frame consumed only physical bytes"
+                    );
+                    let mut held = index.clone();
+                    for funded in [true, true, false, true] {
+                        held.save(&checkpoint.0).unwrap();
+                        held = ScanIndex::load(&checkpoint.0).unwrap();
+                        let mut retry = selector_scan(
+                            &f,
+                            held,
+                            Arc::new(sampled_scan::SharedCache::default()),
+                            retry_candidates.clone(),
+                            true,
+                        );
+                        if !funded {
+                            retry.sampling = None;
+                        }
+                        let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+                        let ((next, scan), quiet) =
+                            crate::local_resource_diagnostics::capture(|| {
+                                finish_selector(retry, &checkpoint.0)
+                            });
+                        held = next;
+                        let work = held.archives[&key].work.as_ref().unwrap();
+                        assert_eq!(
+                            held.archives[&key].owed_cause(),
+                            Some(CodexZstCause::HeaderInvalid)
+                        );
+                        assert_eq!(work.header_retry_after, deadline);
+                        assert_eq!(work.header_attempts, attempts);
+                        assert_eq!(physical_header_bytes(&quiet), 0);
+                        assert_eq!(
+                            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+                            samples
+                        );
+                        assert_eq!(full_decodes(&quiet), 0);
+                        assert!(scan.archive_owed_count > 0);
+                        assert_eq!(scan.unreadable_path_count, 0);
+                    }
+                    held.save(&checkpoint.0).unwrap();
+                    let reloaded = ScanIndex::load(&checkpoint.0).unwrap();
+                    assert_eq!(
+                        reloaded.archives[&key].owed_cause(),
+                        Some(CodexZstCause::HeaderInvalid)
+                    );
+                    assert_eq!(
+                        reloaded.archives[&key]
+                            .work
+                            .as_ref()
+                            .unwrap()
+                            .header_retry_after,
+                        deadline
+                    );
+                }
                 let mut retry = selector_scan(
                     &f,
                     saved(&index),
