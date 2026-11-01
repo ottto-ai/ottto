@@ -158,13 +158,19 @@ fn long_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
         state ^= state << 17;
         state % bound
     };
+    let mut top = models.map(|model| {
+        let mut row = template.clone();
+        row.model = model.into();
+        row.input_tokens = 0;
+        row.request_count = 0;
+        row
+    });
     let mut proof = Vec::new();
     for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
         let key = (hour / 24) % 4;
         let mut rows = Vec::with_capacity(models.len());
-        for model in models {
-            let mut row = template.clone();
-            row.model = model.into();
+        for total in &mut top {
+            let mut row = total.clone();
             row.input_tokens = next(50_000);
             row.output_tokens = next(20_000);
             row.cache_read_tokens = next(2_000_000);
@@ -179,6 +185,11 @@ fn long_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
             ] {
                 *slot = Some(usd_picos_string(u128::from(next(5_000_000)) * 1_000_000));
             }
+            total.input_tokens += row.input_tokens;
+            total.output_tokens += row.output_tokens;
+            total.cache_read_tokens += row.cache_read_tokens;
+            total.cache_creation_5m_tokens += row.cache_creation_5m_tokens;
+            total.request_count += row.request_count;
             proof.push(Contribution {
                 bucket_start: bucket.bucket_start.clone(),
                 row_key: row_key_from_model_usage(&row),
@@ -194,13 +205,7 @@ fn long_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
         }
         bucket.model_usage = rows;
     }
-    item.model_usage = models
-        .map(|model| {
-            let mut row = template.clone();
-            row.model = model.into();
-            row
-        })
-        .to_vec();
+    item.model_usage = top.to_vec();
     sticky_receiver_totals(&mut item);
     (item, proof)
 }

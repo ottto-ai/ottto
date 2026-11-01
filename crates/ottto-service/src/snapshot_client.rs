@@ -2164,6 +2164,7 @@ impl SnapshotApiClient {
             .and_then(decode_activity_hint)
     }
 
+    #[cfg(test)]
     pub fn upload_batch(
         &self,
         relay_token: &str,
