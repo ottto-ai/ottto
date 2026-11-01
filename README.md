@@ -799,12 +799,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - display-safe agent status snapshots attached to `SourceHealth` for Codex,
   Claude Code, and Pi, including account, subscription, model, context,
   quota-window, credit-balance, capability-gap, and diagnostic fields where each
-  local CLI exposes safe metadata. Codex OAuth usage collection is an explicit
-  setup-gated collector because it reads the local Codex credential only inside
-  `ottto-service` to call an undocumented ChatGPT usage endpoint, converts the
-  returned primary and secondary windows into session/weekly quota windows with
-  `started_at` and `resets_at`, and converts provider credits into display-safe
-  balances without serializing access tokens. `SourceHealth` and
+  local CLI exposes safe metadata. Codex quota collection asks the local Codex
+  app-server inside `ottto-service`, converts the returned primary and secondary
+  windows into session/weekly quota windows with `started_at` and `resets_at`,
+  and converts provider credits into display-safe balances without serializing
+  access tokens. `SourceHealth` and
   `AgentStatusSnapshot` also carry
   `plan_observations` with last-seen, current marker, evidence method, optional
   session id, and normalized billing/model attribution so the backend can keep

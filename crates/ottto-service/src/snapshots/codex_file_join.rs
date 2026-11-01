@@ -2204,7 +2204,13 @@ pub(super) mod tests {
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
-        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let (legacy_index, legacy) = {
+            // The fixture's October 1 headers predate the frozen cutover.
+            let _cutover = codex_counting_version::TestCutover::set(
+                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+            );
+            scan(&root, ScanIndex::default(), 2)
+        };
         let _cutover = codex_counting_version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
@@ -2222,9 +2228,16 @@ pub(super) mod tests {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
             assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        assert!(
-            legacy.codex_counting_v2.is_none(),
-            "an inactive scan reports no receipts, not a zero block"
+        let legacy_receipts = legacy
+            .codex_counting_v2
+            .as_deref()
+            .expect("a pre-cutover Legacy scan still reports bookkeeping");
+        assert_eq!(legacy_receipts.v2_sessions, 0);
+        assert_eq!(legacy_receipts.native_counted, 0);
+        assert_eq!(legacy_receipts.tombstone_count, 0);
+        assert_eq!(
+            legacy_receipts.tombstone_cap,
+            codex_counting_version::MAX_COUNTING_TOMBSTONES as u64
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
@@ -2304,7 +2317,7 @@ pub(super) mod tests {
         traces.priority_turns.insert(turn.into());
         let job = replay_group(
             inventory.groups().into_values().next().unwrap(),
-            Some(Arc::new(traces.clone())),
+            Some(Arc::new(traces)),
             &ScanIndex::default(),
         )
         .unwrap();

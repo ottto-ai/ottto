@@ -3831,6 +3831,7 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
+    cap_counts: crate::local_resource_diagnostics::CapCounts,
     local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
     backfill_file_limit: u64,
@@ -3964,6 +3965,7 @@ impl SyncCounts {
             scanned_session_count: scan_result.scanned_session_count as u64,
             semantic_noop_count: scan_result.semantic_noop_count as u64,
             census_complete: scan_result.census_complete,
+            cap_counts: scan_result.cap_counts,
             local_codex_diagnostics: scan_result.local_codex_diagnostics,
             symlink_rejected_count: scan_result.symlink_rejected_count as u64,
             unreadable_path_count: scan_result.unreadable_path_count as u64,
@@ -11937,7 +11939,7 @@ fn terminal_status_journal_path(
 
 #[cfg(test)]
 fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
-    save_terminal_status_journal_with_diagnostics(path, request, None, None)
+    save_terminal_status_journal_with_diagnostics(path, request, None, None, Default::default())
 }
 
 fn save_terminal_status_journal_with_diagnostics(
@@ -11945,11 +11947,14 @@ fn save_terminal_status_journal_with_diagnostics(
     request: &SnapshotStatusRequest,
     diagnostic: Option<&CodexScanDiagnostics>,
     codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
+    cap_counts: crate::local_resource_diagnostics::CapCounts,
 ) -> Result<()> {
     #[derive(Serialize)]
     struct LocalJournal<'a> {
         #[serde(flatten)]
         receipt: &'a SnapshotStatusRequest,
+        #[serde(skip_serializing_if = "crate::local_resource_diagnostics::CapCounts::is_empty")]
+        local_cap_counts: crate::local_resource_diagnostics::CapCounts,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_codex_diagnostics: Option<&'a CodexScanDiagnostics>,
         /// Borrowed from the scan result; absent when no configured counting
@@ -11964,6 +11969,7 @@ fn save_terminal_status_journal_with_diagnostics(
             .is_ok_and(|bytes| bytes.len() <= MAX_LOCAL_DIAGNOSTIC_BYTES)
     });
     let journal = LocalJournal {
+        local_cap_counts: cap_counts,
         receipt: request,
         local_codex_diagnostics: diagnostic,
         local_codex_counting_v2: codex_counting_v2,
@@ -12046,6 +12052,7 @@ fn report_status_with_fresh_relay_token(
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
     let diagnostic = status.counts.local_codex_diagnostics;
+    let cap_counts = status.counts.cap_counts;
     let request = collector_status_request(
         &destination_namespace,
         status,
@@ -12066,6 +12073,7 @@ fn report_status_with_fresh_relay_token(
         &request,
         diagnostic.as_ref(),
         codex_counting_v2,
+        cap_counts,
     ) {
         eprintln!(
             "local snapshot terminal status journal write failed for {}: {}",
@@ -20774,7 +20782,12 @@ mod tests {
             ..Default::default()
         };
         for generation in [1, 2] {
+            let cap_counts = crate::local_resource_diagnostics::CapCounts {
+                boundary_overflow_events: u64::from(generation == 1),
+                ..Default::default()
+            };
             let counts = SyncCounts {
+                cap_counts,
                 local_codex_diagnostics: Some(CodexScanDiagnostics {
                     version: 1,
                     generation,
@@ -20802,6 +20815,12 @@ mod tests {
             let journal: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
+            assert_eq!(
+                journal.get("local_cap_counts"),
+                (generation == 1)
+                    .then(|| serde_json::to_value(cap_counts).unwrap())
+                    .as_ref()
+            );
             if generation == 1 {
                 assert_eq!(
                     journal["local_codex_counting_v2"],
@@ -21920,7 +21939,37 @@ mod tests {
                 Err(_) => break,
             }
         }
-        String::from_utf8_lossy(&request).to_string()
+        decoded_http_request(&request)
+    }
+
+    // Mock receivers inspect decoded JSON just as the backend does. Keep the
+    // raw bounded_native_read fixture for tests asserting encoded wire bytes.
+    fn decoded_http_request(request: &[u8]) -> String {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return String::from_utf8_lossy(request).into_owned();
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        if !headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip"))
+        {
+            return String::from_utf8_lossy(request).into_owned();
+        }
+        let mut body = String::new();
+        flate2::read::GzDecoder::new(&request[header_end + 4..])
+            .read_to_string(&mut body)
+            .expect("decode gzip fixture request");
+        let headers = headers
+            .lines()
+            .filter(|line| {
+                !line.split_once(':').is_some_and(|(name, _)| {
+                    name.eq_ignore_ascii_case("Content-Length")
+                        || name.eq_ignore_ascii_case("Content-Encoding")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        format!("{headers}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
     }
 
     fn http_request_complete(request: &[u8]) -> bool {
