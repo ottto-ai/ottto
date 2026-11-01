@@ -86,12 +86,18 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Shared<T> {
         (**self).stable_heap()
     }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.0.heap_bound(c)
+        // The shared allocation's header, then the value's own walk: one visit.
+        c.charge(
+            size_of::<T>()
+                .checked_add(align_of::<T>())?
+                .checked_add(2 * size_of::<usize>())?,
+        )?;
+        (**self).heap_bound(c)
     }
     // Unlike a plain `Arc`, a large collection in here keeps its per-element
     // completion counters: this owner is the only one the walk ever charges.
     fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(
+        c.charge(
             size_of::<T>()
                 .checked_add(align_of::<T>())?
                 .checked_add(2 * size_of::<usize>())?,
