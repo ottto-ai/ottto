@@ -109,3 +109,10 @@ text, paths or raw identifiers; types holding local-only text don't derive `Debu
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
 Erasure (consent off, retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+
+Claude's optional slot-owner fallback requires the exact receiver hint, a qualified approved
+account and organization, and the transcript's own stable recorded login on proven client versions.
+Emails are compared only in memory. The scan index retains a boolean decision bound to the approved
+pair and exact cache checkpoint; the durable reduction format stays unchanged. Missing prior proof
+stays unknown on Tail, and qualification alone never selects a historical re-read. Children get no
+inherited slot ownership.

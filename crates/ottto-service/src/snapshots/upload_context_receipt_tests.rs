@@ -853,7 +853,7 @@ fn upload_context_receipt_current_round_trip_and_size() {
     let decoded: ScanIndexEntry = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded.upload_context_receipt, entry.upload_context_receipt);
     assert_eq!(std::mem::size_of::<upload_context_receipt::Receipt>(), 80);
-    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
+    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 568);
 }
 
 #[test]

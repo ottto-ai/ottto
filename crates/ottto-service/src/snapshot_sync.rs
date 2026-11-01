@@ -2524,9 +2524,13 @@ impl SnapshotUploadProgress {
         }
         if let Some((entity, local_witness)) = stored {
             // Mirrors `snapshot_ack_body_witness_version`'s public domains.
-            let versioned_body = ["session_account_evidence", "cache_observations"]
-                .iter()
-                .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
+            let versioned_body = [
+                "session_slot_owner",
+                "session_account_evidence",
+                "cache_observations",
+            ]
+            .iter()
+            .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
             let witnessed = self.accepted_identity_buckets.retained_enabled()
                 && versioned_body
                 && entity.body_witness_version.is_some()
@@ -5108,6 +5112,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        session_slot_owner: item.session_slot_owner.clone(),
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -6928,6 +6933,9 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
+    index.session_slot_owner_enabled = source == SnapshotSource::ClaudeCode
+        && activity_hint.session_slot_owner_contract.as_deref()
+            == Some(crate::snapshots::session_slot_owner::CONTRACT);
     index.set_copy_prefix_base_upload_context(
         (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
         resumed_prefix_enabled,
@@ -10300,6 +10308,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
+    // A sidecar can arrive after native parsing. Never let an unknown load
+    // or any own telemetry travel beside the optional slot fallback.
+    for item in &mut scan_result.snapshots {
+        if item.session_slot_owner.is_some()
+            && (identity_unhealthy_roots.contains(&item.source_session_id)
+                || api_report
+                    .evidence
+                    .get(&item.source_session_id)
+                    .is_some_and(|rows| !rows.is_empty())
+                || trace_report
+                    .evidence
+                    .get(&item.source_session_id)
+                    .is_some_and(|rows| !rows.is_empty())
+                || !crate::claude_local_otel::claude_sidecars_absent(
+                    support_dir,
+                    &item.source_session_id,
+                ))
+        {
+            item.session_slot_owner = None;
+        }
+    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -13340,6 +13369,7 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,

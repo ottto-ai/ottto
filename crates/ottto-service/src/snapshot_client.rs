@@ -686,6 +686,9 @@ pub struct ActivityHintResponse {
     /// so older servers never receive the field.
     #[serde(default)]
     pub session_request_account_source_contract: Option<String>,
+    /// Exact capability for qualified session-level slot ownership.
+    #[serde(default)]
+    pub session_slot_owner_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
     #[serde(skip)]
     pub max_snapshot_item_bytes: Option<u64>,
@@ -857,6 +860,9 @@ fn default_occurrence_count() -> u64 {
 pub(crate) fn snapshot_ack_body_witness_version(
     item: &crate::snapshots::SnapshotItem,
 ) -> Result<Option<u64>> {
+    if item.session_slot_owner.is_some() {
+        return Ok(snapshot_upload_body_witness_version(item));
+    }
     if item.session_account_evidence.is_none() && item.cache_observations.is_none() {
         return Ok(None);
     }
@@ -968,6 +974,7 @@ impl SnapshotBatchResponse {
                 }
                 if request.snapshots.iter().any(|item| {
                     crate::snapshots::claude_request_money::is_request_owned_literal(item)
+                        || item.session_slot_owner.is_some()
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()
                 }) {
@@ -5205,7 +5212,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, session_slot_owner_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

@@ -199,6 +199,22 @@ struct PersistedClaudeConfigSlotV1 {
     /// written by an earlier build of this change; read as `observed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approved_from: Option<ClaudeSlotApprovalSource>,
+    /// Verified approval time, in Unix seconds. Legacy and observed approvals
+    /// have no time; migration never manufactures one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "decode_owner_since"
+    )]
+    owner_since: Option<u64>,
+}
+
+// A malformed optional timestamp cannot prevent registration discovery.
+fn decode_owner_since<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64().filter(|value| *value > 0))
 }
 
 impl PersistedClaudeConfigSlotV1 {
@@ -210,6 +226,7 @@ impl PersistedClaudeConfigSlotV1 {
             approved_account_identifier_hash: None,
             approved_organization_identifier_hash: None,
             approved_from: None,
+            owner_since: None,
         }
     }
 
@@ -230,6 +247,30 @@ impl PersistedClaudeConfigSlotV1 {
     }
 
     fn approve(&mut self, binding: &ClaudeSlotAccountBinding, source: ClaudeSlotApprovalSource) {
+        let owner_since = (source != ClaudeSlotApprovalSource::Observed)
+            .then(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|time| time.as_secs())
+            })
+            .flatten();
+        self.record_approval(binding, source, owner_since);
+    }
+
+    fn record_approval(
+        &mut self,
+        binding: &ClaudeSlotAccountBinding,
+        source: ClaudeSlotApprovalSource,
+        owner_since: Option<u64>,
+    ) {
+        let source =
+            if self.approved_binding().is_some() && source == ClaudeSlotApprovalSource::Setup {
+                ClaudeSlotApprovalSource::Reconnect
+            } else {
+                source
+            };
+        self.owner_since = owner_since;
         self.approved_account_identifier_hash = Some(binding.account_identifier_hash.clone());
         self.approved_organization_identifier_hash =
             Some(binding.organization_identifier_hash.clone());
@@ -1301,10 +1342,25 @@ impl FileClaudeConfigSlotSettingsStore {
         else {
             return Ok(None);
         };
-        slot.approve(&binding, source);
+        // Recovering an old binding is not a new verified approval.
+        slot.record_approval(&binding, source, None);
         validate_persisted(&persisted)?;
         self.write_persisted(&persisted)?;
         Ok(Some(binding))
+    }
+
+    /// Verified approval time for an exact registered slot, in Unix seconds.
+    /// Historical and first-use approvals have no time.
+    pub fn slot_owner_since(
+        &self,
+        slot_id: &str,
+    ) -> Result<Option<u64>, ClaudeConfigSlotSettingsError> {
+        Ok(self
+            .load_persisted()?
+            .registered_slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id && slot.approved_binding().is_some())
+            .and_then(|slot| slot.owner_since))
     }
 
     /// Every registered slot's persisted approval with its provenance.
@@ -1579,19 +1635,23 @@ impl FileClaudeConfigSlotSettingsStore {
             let was_terminal_reconnect = operation.kind
                 == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
                 && operation_allows_reconnect_successor(operation);
+            let was_completed = completed_operation_binding(operation).is_some();
             mutation(operation)?;
             (
                 !was_terminal_reconnect
                     && operation.kind == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
                     && operation_allows_reconnect_successor(operation),
-                completed_operation_binding(operation).map(|binding| {
-                    (
-                        operation.slot_id.clone(),
-                        operation.config_dir.clone(),
-                        binding,
-                        ClaudeSlotApprovalSource::of_operation(operation.kind),
-                    )
-                }),
+                (!was_completed)
+                    .then(|| completed_operation_binding(operation))
+                    .flatten()
+                    .map(|binding| {
+                        (
+                            operation.slot_id.clone(),
+                            operation.config_dir.clone(),
+                            binding,
+                            ClaudeSlotApprovalSource::of_operation(operation.kind),
+                        )
+                    }),
             )
         };
         if let Some((slot_id, config_dir, binding, source)) = approved {

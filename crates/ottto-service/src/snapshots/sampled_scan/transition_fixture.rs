@@ -735,6 +735,7 @@ pub(crate) mod money_oracle {
         entries.sort_by_key(Value::to_string);
         json!({
             "session_account_evidence": snapshot.get("session_account_evidence"),
+            "session_slot_owner": snapshot.get("session_slot_owner"),
             "request_evidence": entries,
             "request_identity_refusals": snapshot.get("request_identity_refusals"),
             "model_usage": rows(&snapshot["model_usage"]),

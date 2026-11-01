@@ -2959,6 +2959,16 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Whole-file organization agreement, independent of request placement.
+    pub(super) fn all_orgs_equal(&self, approved: &str) -> bool {
+        !self.overflowed
+            && !self.entries.is_empty()
+            && self
+                .entries
+                .iter()
+                .all(|marker| marker.org.as_deref() == Some(approved))
+    }
+
     /// Binds the registered-folder key once the item's path is known.
     pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
         if self.context_position.is_some() {

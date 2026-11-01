@@ -190,6 +190,9 @@ impl OwnedJsonlParser {
             now,
         )?;
         let mode = plan.mode();
+        if let Some(proof) = self.slot_owner_proof.as_deref_mut() {
+            proof.restore(mode, old.as_ref().map(|old| &old.checkpoint));
+        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }

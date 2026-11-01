@@ -17428,6 +17428,26 @@ pub(crate) fn session_launch_claude_identity(
     ))
 }
 
+/// Local-only login text, qualified by BOTH hashes of an actual saved approval.
+/// Never accepts the pending operation's expected binding.
+pub(crate) fn approved_claude_slot_email(
+    config_dir: &Path,
+    binding: &ottto_core::ClaudeSlotAccountBinding,
+) -> Option<String> {
+    let slot = ClaudeConfigDirSlot::registered(config_dir.to_str()?).ok()?;
+    let identity = read_claude_cli_oauth_account(&slot.identity_path(config_dir))?;
+    let account = billing_identity_hash("anthropic", "account", identity.account_uuid.as_deref()?)?;
+    let org = billing_identity_hash(
+        "anthropic",
+        "organization",
+        identity.organization_uuid.as_deref()?,
+    )?;
+    if account != binding.account_identifier_hash || org != binding.organization_identifier_hash {
+        return None;
+    }
+    extract_single_email(identity.email_address.as_deref()?)
+}
+
 /// Match Codex's explicit-mode precedence. ChatGPT login can retain an
 /// exchanged API key; explicit API/unknown modes cannot inherit stale OAuth.
 pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTrust) -> bool {
@@ -19096,21 +19116,32 @@ fn command_diagnostic(code: &str, message: &str, output: &CommandOutput) -> Agen
     )
 }
 
-fn extract_email(text: &str) -> Option<String> {
+fn email_tokens(text: &str) -> impl Iterator<Item = &str> {
     text.split_whitespace()
         .map(|token| {
             token.trim_matches(|c: char| {
                 c == '<' || c == '>' || c == ',' || c == ';' || c == ':' || c == '"' || c == '\''
             })
         })
-        .find(|token| {
+        .filter(|token| {
             let parts: Vec<&str> = token.split('@').collect();
             parts.len() == 2
                 && !parts[0].is_empty()
                 && parts[1].contains('.')
                 && !token.contains('/')
         })
-        .map(ToString::to_string)
+}
+
+fn extract_email(text: &str) -> Option<String> {
+    email_tokens(text).next().map(ToString::to_string)
+}
+
+/// The recorded-login proof rejects missing or multiple addresses, including
+/// repeated addresses. The extracted address stays transient.
+pub(crate) fn extract_single_email(text: &str) -> Option<String> {
+    let mut emails = email_tokens(text);
+    let email = emails.next()?.trim_end_matches('.');
+    emails.next().is_none().then(|| email.to_ascii_lowercase())
 }
 
 fn extract_plan_type(text: &str, candidates: &[&str]) -> Option<String> {

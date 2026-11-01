@@ -154,6 +154,7 @@ mod claude_response_records;
 mod claude_thinking_tokens_tests;
 mod codex_usage_occurrence;
 mod context_curve;
+pub(crate) mod session_slot_owner;
 mod session_start;
 pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
@@ -1718,8 +1719,23 @@ pub struct SessionAccountEvidence {
     pub source_created_at: Option<String>,
 }
 
+/// Qualified owner of this transcript's registered slot. Session fallback
+/// only: receivers must prefer request evidence and native creator evidence.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionSlotOwner {
+    pub provider: &'static str,
+    pub account_identifier_hash: String,
+    pub provider_workspace_hash: String,
+    pub identity_hash_scheme: &'static str,
+    pub basis: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_since: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_slot_owner: Option<SessionSlotOwner>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_account_evidence: Option<SessionAccountEvidence>,
     pub source_session_id: String,
@@ -4110,6 +4126,9 @@ pub struct ScanIndex {
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,
+    /// Exact activity-hint capability, refreshed for each sync cycle.
+    #[serde(skip)]
+    pub(crate) session_slot_owner_enabled: bool,
     /// Runtime base delivery context; local copy-mode retry isolation is
     /// source-wide, while reacquisition is restricted to requested files.
     #[serde(skip)]
@@ -4325,6 +4344,7 @@ impl Default for ScanIndex {
             claude_copy_removals: Default::default(),
             upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
+            session_slot_owner_enabled: false,
             copy_prefix_base_upload_context: None,
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
@@ -4553,6 +4573,13 @@ fn scan_index_schema_version() -> u16 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIndexEntry {
+    /// Certified local recorded-login decision; old writers drop it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    pub(crate) session_slot_owner_proof: Option<Box<session_slot_owner::SavedProof>>,
     /// RAM-only custody of a certified, already-observed Codex EOF fragment.
     /// Never serialized; missing evidence fails open to the existing read path.
     #[serde(skip)]
@@ -4658,7 +4685,7 @@ pub struct ScanIndexEntry {
 // Verify the EXISTING native entry-layout contract during compile-only checks.
 // No budget, whitelist or substitute bound is changed.
 #[cfg(all(test, target_os = "macos", target_pointer_width = "64"))]
-const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 560);
+const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 568);
 
 impl ScanIndexEntry {
     /// Re-armed: the fingerprint was cleared (main) or kept with its evidence
@@ -15294,6 +15321,19 @@ pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSIO
 /// preserves previous versions and digests. Semantic identity remains owned
 /// exclusively by the component/content hashes.
 pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Option<u64> {
+    if item.session_slot_owner.is_some() {
+        // SnapshotBatchRequest always declares its semantic envelope.
+        return Some(
+            27 + u64::from(
+                item.usage_accounting_contract.as_deref()
+                    == Some("session_exclusive_reported_usage:v1"),
+            ),
+        );
+    }
+    retained_body_witness_version(item)
+}
+
+fn retained_body_witness_version(item: &SnapshotItem) -> Option<u64> {
     let exclusive =
         item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
     if item.session_account_evidence.is_some() {
@@ -15317,6 +15357,18 @@ pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Optio
 }
 
 fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Value {
+    if let Some(owner) = &item.session_slot_owner {
+        let retained = retained_body_witness_version(item)
+            .map(|_| body_witness_digest(&retained_body_witness_payload(item)));
+        return json!({
+            "session_slot_owner": owner,
+            "retained_body_witness": retained,
+        });
+    }
+    retained_body_witness_payload(item)
+}
+
+fn retained_body_witness_payload(item: &SnapshotItem) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     if let Some(evidence) = &item.session_account_evidence {
         payload.insert("session_account_evidence".to_string(), json!(evidence));
@@ -15364,8 +15416,11 @@ fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Valu
 /// bytes match the backend accepted-log/body-witness contract exactly. Local
 /// progress keys it by fingerprint separately.
 pub(crate) fn snapshot_upload_body_witness(item: &SnapshotItem) -> String {
-    let payload = snapshot_upload_body_witness_payload(item);
-    let canonical = crate::canonical_json::canonicalize(&payload)
+    body_witness_digest(&snapshot_upload_body_witness_payload(item))
+}
+
+fn body_witness_digest(payload: &Value) -> String {
+    let canonical = crate::canonical_json::canonicalize(payload)
         .expect("snapshot additive body witness canonicalizes");
     format!("{:x}", Sha256::digest(canonical))
 }
@@ -16592,6 +16647,11 @@ struct CodexRolloutExtent {
 /// file stats): rewriting one store file can select only its matching session.
 #[derive(Debug, Clone, Default)]
 struct ClaudeTitleMetadata {
+    /// Every observed Desktop store session, including identity-less records.
+    desktop_sessions: BTreeSet<String>,
+    /// Qualified local approvals, scoped to this scan; email stays in RAM.
+    slot_owners:
+        BTreeMap<crate::claude_status_coverage::HomeKey, session_slot_owner::ApprovedOwner>,
     titles: BTreeMap<String, ClaudeTitleCandidate>,
     account_identifier_hashes: BTreeMap<String, BTreeSet<String>>,
     original_identity_evidence: BTreeMap<String, BTreeSet<ClaudeDesktopIdentityEvidence>>,
@@ -17084,6 +17144,9 @@ impl ClaudeTitleMetadata {
 
     fn from_durable_index_with_metadata(index: &ScanIndex, mut metadata: Self) -> Self {
         for entry in index.claude_desktop_title_files.values() {
+            metadata
+                .desktop_sessions
+                .insert(entry.cli_session_id.clone());
             if let Some(original_identity) = &entry.original_identity {
                 metadata
                     .original_identity_evidence
@@ -21209,6 +21272,7 @@ impl SnapshotAccumulator {
             claude_account_withheld_reason: None,
             claude_account_display: None,
             session_account_evidence,
+            session_slot_owner: None,
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
             status: "final".to_string(),
@@ -26144,6 +26208,8 @@ pub(crate) struct OwnedSourceScan {
     codex_versions: Option<Arc<codex_version::CodexVersionFeed>>,
 }
 struct OwnedActiveFile {
+    /// Ordinary revision before the optional slot-owner sidecar extension.
+    slot_owner_base_fingerprint: String,
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
     // Survives paging and missing preparation; only source verification retires it.
@@ -26764,6 +26830,9 @@ impl OwnedSourceScan {
         } else {
             ClaudeTitleMetadata::default()
         };
+        if index.session_slot_owner_enabled {
+            claude_title_metadata.slot_owners = session_slot_owner::approved_owners();
+        }
         if source == SnapshotSource::ClaudeCode
             && !claude_identity_census_was_complete
             && !claude_title_metadata.original_identity_census_incomplete
@@ -29585,16 +29654,17 @@ impl OwnedSourceScan {
                     Some((digest, live, stamp, sidecar))
                 });
                 let OwnedActiveFile {
+                    slot_owner_base_fingerprint,
                     comparison_target,
                     sampling: file_sampling,
                     recovered_audit_due,
-                    candidate,
+                    mut candidate,
                     decision,
                     parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
-                    source_file_fingerprint,
+                    mut source_file_fingerprint,
                     parser,
                     aliases,
                     mut applied_receipts,
@@ -30088,6 +30158,10 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                let mut slot_owner_proof = parser
+                    .slot_owner_proof
+                    .as_deref()
+                    .and_then(|proof| proof.finish(&parser));
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -30147,6 +30221,54 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                if !parsed_file.complete()
+                    || !parsed_file.report.complete()
+                    || parsed_file.dropped_usage_record_count > 0
+                    || !parsed_file.snapshots.iter().any(|item| {
+                        candidate.path.file_stem().and_then(|s| s.to_str())
+                            == Some(item.source_session_id.as_str())
+                    })
+                {
+                    slot_owner_proof = None;
+                }
+                if let Some(proof) = slot_owner_proof.as_deref_mut() {
+                    session_slot_owner::seal(
+                        proof,
+                        completed_acquisition.as_ref(),
+                        &parsed_file.snapshots,
+                    );
+                }
+                let slot_owner = session_slot_owner::owner_for(
+                    &candidate.path,
+                    slot_owner_proof.as_deref(),
+                    &claude_title_metadata,
+                    index,
+                    claude_effort_support_dir_ref,
+                    history_upgrade.twin_groups(),
+                    true,
+                );
+                let finalized_fingerprint = session_slot_owner::fingerprint(
+                    &slot_owner_base_fingerprint,
+                    slot_owner.as_ref(),
+                );
+                let owner_revision_changed = source_file_fingerprint != finalized_fingerprint;
+                if owner_revision_changed {
+                    source_file_fingerprint = finalized_fingerprint;
+                    candidate
+                        .source_file_fingerprint
+                        .clone_from(&source_file_fingerprint);
+                }
+                for item in &mut parsed_file.snapshots {
+                    // The path's proof belongs only to this file's own entity.
+                    if candidate.path.file_stem().and_then(|s| s.to_str())
+                        == Some(item.source_session_id.as_str())
+                    {
+                        item.session_slot_owner = slot_owner.clone();
+                    }
+                    if owner_revision_changed {
+                        item.source_file_fingerprint = Some(source_file_fingerprint.clone());
+                    }
+                }
                 // U1a-2a (row 29) side exit, before any main write of the
                 // completion: P's record or request only, from the first
                 // matching outcome row; then the read's end line.
@@ -31185,6 +31307,7 @@ impl OwnedSourceScan {
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
                     if let Some(entry) = index.files.get_mut(&index_key) {
+                        entry.session_slot_owner_proof = slot_owner_proof;
                         entry.codex_counting_v2 = codex_counting_v2;
                         entry.codex_counting_owner =
                             counting_owner.clone().map(String::into_boxed_str);
@@ -32602,6 +32725,37 @@ impl OwnedSourceScan {
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
+            let slot_owner_base_fingerprint = candidate.source_file_fingerprint.clone();
+            let slot_owner = session_slot_owner::owner_for(
+                &candidate.path,
+                index
+                    .files
+                    .get(&rescue_key)
+                    .and_then(|entry| entry.session_slot_owner_proof.as_deref()),
+                &claude_title_metadata,
+                index,
+                claude_effort_support_dir_ref,
+                history_upgrade.twin_groups(),
+                false,
+            );
+            let selected_fingerprint =
+                session_slot_owner::fingerprint(&slot_owner_base_fingerprint, slot_owner.as_ref());
+            // An incomplete census cannot retract an unchanged prior offer.
+            // A newly qualified saved proof alone never selects historical
+            // bytes; it may add the field on the next ordinary read.
+            let old_revision = index
+                .files
+                .get(&rescue_key)
+                .map(|entry| entry.source_file_fingerprint.as_str());
+            if old_revision == Some(selected_fingerprint.as_str())
+                || (old_revision != Some(slot_owner_base_fingerprint.as_str())
+                    && index
+                        .traversal
+                        .as_ref()
+                        .is_some_and(codex_frozen_census_valid))
+            {
+                candidate.source_file_fingerprint = selected_fingerprint;
+            }
             if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
                 claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
             }
@@ -33392,6 +33546,12 @@ impl OwnedSourceScan {
                     pending!();
                 }
             };
+            session_slot_owner::Proof::configure(
+                &mut parser,
+                &candidate.path,
+                &claude_title_metadata,
+                index,
+            );
             // U1a-2a (D6(a)): this child's proof, P-fenced before its parse.
             // A side read is P's, never a proof consumer.
             if source == SnapshotSource::Codex && side_origin.is_none() {
@@ -33855,6 +34015,7 @@ impl OwnedSourceScan {
                 pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
+                slot_owner_base_fingerprint,
                 comparison_target,
                 sampling: file_sampling,
                 recovered_audit_due,
@@ -34472,6 +34633,7 @@ fn codex_state_only_snapshot(
         resolver_conflict_count: None,
         copy_unproven_counts: None,
         claude_money: None,
+        session_slot_owner: None,
         session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -34911,6 +35073,7 @@ type ParserReader = BoundedJsonlReader<OpenedInput>;
 type LineSink<'a> = &'a mut dyn FnMut(&Value);
 
 struct OwnedJsonlParser {
+    slot_owner_proof: Option<Box<session_slot_owner::Proof>>,
     #[cfg(test)]
     source_read_probe: Option<PathBuf>,
     reader: BoundedJsonlReader<OpenedInput>,
@@ -34995,6 +35158,7 @@ impl OwnedJsonlParser {
         }
 
         Ok(Self {
+            slot_owner_proof: None,
             #[cfg(test)]
             source_read_probe: Some(path.to_owned()),
             reader: BoundedJsonlReader::new(
@@ -35130,8 +35294,12 @@ impl OwnedJsonlParser {
         let positive_recognized_usage_count = &mut self.positive_recognized_usage_count;
         let positive_usage_evidence = &mut self.positive_usage_evidence;
         let apply_line = self.apply_line;
+        let slot_owner_proof = &mut self.slot_owner_proof;
         let mut sink = |value: &Value| {
             observe(value);
+            if let Some(proof) = slot_owner_proof.as_deref_mut() {
+                proof.note_line(value);
+            }
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.observe(value);
             }
@@ -35180,8 +35348,15 @@ impl OwnedJsonlParser {
     /// finished field holds them, and `retention_bound` leaves them out the
     /// same way.
     fn finish_output_bound(&mut self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
+        let owner_heap = self
+            .slot_owner_proof
+            .as_deref()
+            .map_or(0, |proof| proof.output_heap_bound());
         let inputs = self.take_live_reduction_inputs();
-        let bound = self.accumulator.finish_output_bound(input, limit);
+        let bound = limit
+            .checked_sub(owner_heap)
+            .and_then(|room| self.accumulator.finish_output_bound(input, room))
+            .and_then(|bound| bound.checked_add(owner_heap));
         self.restore_live_reduction_inputs(inputs);
         bound
     }
@@ -51740,6 +51915,7 @@ impl ScanIndex {
             claude_copy_removals: self.claude_copy_removals.clone(),
             upload_context_proof: self.upload_context_proof.clone(),
             copy_unproven_enabled: self.copy_unproven_enabled,
+            session_slot_owner_enabled: self.session_slot_owner_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
@@ -52852,6 +53028,10 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                session_slot_owner_proof: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.session_slot_owner_proof.clone()),
                 codex_fragment: None,
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
@@ -52919,6 +53099,7 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
@@ -54205,6 +54386,75 @@ mod tests {
     }
     use super::*;
     use base64::Engine as _;
+
+    /// [format] Composite slot-owner witnesses match fixed receiver vectors,
+    /// including a retained witness and the timestamp's original wire spelling.
+    #[test]
+    fn session_slot_owner_body_witness_receiver_parity() {
+        for (basis, retained, expected) in [
+            (
+                "recorded_login:v1",
+                false,
+                "c9be084155b22a6ee10a5e88293b2802ae7255b30f058e36f17f2efb5df28c6d",
+            ),
+            (
+                "recorded_login:v1",
+                true,
+                "18a8987ca7550562fc304b7c308cb056c6153937b3e8b00c67bf023e7e6f7dc0",
+            ),
+            (
+                "owner_since",
+                false,
+                "75ebf4ead2a70d47aca701fd7492e01fa7abc4ccf964ab565e15124f6a4c1f96",
+            ),
+            (
+                "owner_since",
+                true,
+                "be0a631a38bcaf9ba864f9f08e97918b19ea599efc9c4835f2df42238a6402d3",
+            ),
+        ] {
+            let mut item = sample_session_artifact_item();
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            item.context_curve = None;
+            item.tool_usage = None;
+            item.tool_usage_truncated = false;
+            item.session_account_evidence = retained.then(|| SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: Some("c".repeat(64)),
+                provider_workspace_hash: Some("d".repeat(64)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("complete"),
+                source_created_at: Some("2026-11-02T07:00:00Z".into()),
+            });
+            item.session_slot_owner = Some(SessionSlotOwner {
+                provider: "anthropic",
+                account_identifier_hash: "a".repeat(64),
+                provider_workspace_hash: "b".repeat(64),
+                identity_hash_scheme: "provider-sha256:v1",
+                basis,
+                owner_since: (basis == "owner_since")
+                    .then(|| "2026-11-02T10:20:30.000+02:00".into()),
+            });
+            for exclusive in [false, true] {
+                item.usage_accounting_contract =
+                    exclusive.then(|| "session_exclusive_reported_usage:v1".into());
+                let version = Some(27 + u64::from(exclusive));
+                assert_eq!(snapshot_upload_body_witness_version(&item), version);
+                assert_eq!(
+                    crate::snapshot_client::snapshot_ack_body_witness_version(&item).unwrap(),
+                    version,
+                );
+                assert_eq!(snapshot_upload_body_witness(&item), expected);
+            }
+            let wire = serde_json::to_value(&item).unwrap();
+            assert_eq!(
+                wire["session_slot_owner"].get("owner_since").is_some(),
+                basis == "owner_since",
+            );
+        }
+    }
 
     fn temp_file(name: &str) -> PathBuf {
         let unique = crate::test_scratch::unique_name(&format!("ottto-{name}"));
@@ -55601,6 +55851,7 @@ mod tests {
             files: SharedMap::from([(
                 "content-free-key".to_string(),
                 ScanIndexEntry {
+                    session_slot_owner_proof: None,
                     codex_fragment: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_700_000_000,
@@ -56535,6 +56786,7 @@ mod tests {
             files: SharedMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    session_slot_owner_proof: None,
                     codex_fragment: None,
                     size_bytes: candidate.size_bytes,
                     modified_unix_seconds: candidate.modified_unix_seconds,
@@ -57004,6 +57256,7 @@ mod tests {
             files: SharedMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    session_slot_owner_proof: None,
                     codex_fragment: None,
                     size_bytes: metadata.len(),
                     modified_unix_seconds,
@@ -61857,6 +62110,7 @@ mod tests {
         let v6_key =
             source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
         let legacy_entry = ScanIndexEntry {
+            session_slot_owner_proof: None,
             codex_fragment: None,
             size_bytes,
             modified_unix_seconds,
@@ -62331,6 +62585,7 @@ mod tests {
             resolver_conflict_count: None,
             copy_unproven_counts: None,
             claude_money: None,
+            session_slot_owner: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
@@ -79026,6 +79281,7 @@ mod tests {
         index.files.insert(
             local_index_key(&parent_path),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: metadata.len(),
                 modified_unix_seconds,
@@ -80093,6 +80349,7 @@ mod tests {
             resolver_conflict_count: None,
             copy_unproven_counts: None,
             claude_money: None,
+            session_slot_owner: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
@@ -80486,6 +80743,7 @@ mod tests {
                 .display()
                 .to_string(),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
@@ -80578,6 +80836,7 @@ mod tests {
                 .display()
                 .to_string(),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 source_file_fingerprint: "file-b".to_string(),
                 ..index.files.values().next().unwrap().clone()
@@ -81810,6 +82069,7 @@ mod tests {
                 resolver_conflict_count: None,
                 copy_unproven_counts: None,
                 claude_money: None,
+                session_slot_owner: None,
                 session_account_evidence: None,
                 claude_usage_request_ids: BTreeSet::new(),
                 claude_usage_occurrences: BTreeMap::new(),
@@ -82269,6 +82529,7 @@ mod tests {
 
     pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
         ScanIndexEntry {
+            session_slot_owner_proof: None,
             codex_fragment: None,
             size_bytes: 1,
             modified_unix_seconds: 2,
@@ -82329,6 +82590,7 @@ mod tests {
         scanned.files.insert(
             "unchanged.jsonl".to_string(),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: 42,
                 ..manifest_index_entry(Some("aa"))
@@ -83207,6 +83469,7 @@ mod tests {
         index.files.insert(
             "old-file-modified-now.jsonl".to_string(),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: u64::MAX,
@@ -84091,7 +84354,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; desktop_sessions, slot_owners, titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
@@ -84125,8 +84388,8 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedActiveFile; slot_owner_base_fingerprint, comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; slot_owner_proof, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
@@ -84145,7 +84408,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
+crate::heap_layout_bound::fields!(ScanIndexEntry; session_slot_owner_proof, codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, context_inputs);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted);
@@ -84222,6 +84485,7 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 // Measurement only (#665, X_out family U3): the identity the release proof peeks.
 crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);
+crate::heap_layout_bound::fields!(SessionSlotOwner; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, basis, owner_since);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
     N provider: &'static str,
@@ -84392,7 +84656,7 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
+crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_slot_owner, session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);

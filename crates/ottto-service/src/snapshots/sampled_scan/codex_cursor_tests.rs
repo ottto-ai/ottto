@@ -6894,6 +6894,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
+                session_slot_owner_proof: None,
                 codex_fragment: None,
                 size_bytes: 8,
                 modified_unix_seconds: 0,

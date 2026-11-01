@@ -1097,6 +1097,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
     };
     let _item = |item: SnapshotItem| {
         let SnapshotItem {
+            session_slot_owner: _,                          // U (qualified slot owner)
             session_account_evidence: _,                    // U (title metadata)
             source_session_id: _,                           // D
             snapshot_fingerprint: _,                        // K (empty)

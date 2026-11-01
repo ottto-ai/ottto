@@ -735,6 +735,7 @@ mod tests {
             resolver_conflict_count: None,
             copy_unproven_counts: None,
             claude_money: None,
+            session_slot_owner: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
             claude_usage_occurrences: std::collections::BTreeMap::new(),

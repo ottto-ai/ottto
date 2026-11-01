@@ -1076,6 +1076,7 @@ mod tests {
 
     fn file_entry() -> crate::snapshots::ScanIndexEntry {
         crate::snapshots::ScanIndexEntry {
+            session_slot_owner_proof: None,
             codex_fragment: None,
             size_bytes: 42,
             modified_unix_seconds: 1_700_000_000,

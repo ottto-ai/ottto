@@ -1,4 +1,6 @@
-//! Transcript roots are registration metadata, never account evidence.
+//! Transcript roots identify registrations, not their historical owners.
+//! Slot-owner evidence additionally requires a qualified approved login and
+//! proof from the transcript itself; it is never inherited by child sessions.
 use crate::snapshots::SnapshotSource;
 use anyhow::{Context, Result};
 use ottto_core::{FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore};

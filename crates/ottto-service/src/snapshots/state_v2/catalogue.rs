@@ -138,6 +138,7 @@ macro_rules! scan_index_fields {
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
+            session_slot_owner_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
         }
     };
