@@ -15288,13 +15288,11 @@ pub(crate) fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) 
 
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION: u64 = 9;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION: u64 = 10;
-pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION: u64 = 11;
-pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 12;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION: u64 = 23;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 24;
 
 /// Backend-compatible, hash-neutral witness version for additive snapshot-body
-/// evidence. Creator-bearing bodies use v23/v24, retaining curve/tool fields.
+/// evidence. Creator-bearing bodies use v23/v24, retaining tool fields.
 /// Public ACKs select v7/v8 for creator-only and v13/v14 when cache is declared. Missing creator evidence
 /// preserves previous versions and digests. Semantic identity remains owned
 /// exclusively by the component/content hashes.
@@ -15309,19 +15307,7 @@ pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Optio
         });
     }
     if item.cache_observations.is_some() {
-        return Some(match (item.context_curve.is_some(), exclusive) {
-            (false, false) => 15,
-            (false, true) => 16,
-            (true, false) => 19,
-            (true, true) => 20,
-        });
-    }
-    if item.context_curve.is_some() {
-        return Some(if exclusive {
-            SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-        } else {
-            SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-        });
+        return Some(if exclusive { 16 } else { 15 });
     }
     if item.tool_usage.is_some() || item.tool_usage_truncated {
         return Some(if exclusive {
@@ -15346,11 +15332,8 @@ fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Valu
             }),
         );
     }
-    if let Some(context_curve) = &item.context_curve {
-        payload.insert("context_curve".to_string(), json!(context_curve));
-    }
-    // Curve-free legacy tool witnesses include both defaults whenever either
-    // tool leaf is declared. Creator/cache/curve domains retain wire presence.
+    // Legacy tool witnesses include both defaults whenever either tool leaf
+    // is declared. Creator/cache domains retain wire presence.
     if payload.is_empty() && (item.tool_usage.is_some() || item.tool_usage_truncated) {
         payload.insert(
             "tool_usage".into(),
@@ -53996,25 +53979,6 @@ pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> Snapsho
         .expect("curve fixture decodes")
 }
 
-/// Test-only vehicle for the retained curve-bearing body path: attaches the
-/// stored Codex cache golden curve. Curves are hash-neutral, so only the body
-/// witness sees it. With `tracks_body` every point takes the item's input
-/// tokens, as the retired builder's curve followed the body.
-#[cfg(test)]
-pub(crate) fn attach_retained_context_curve(items: &mut [SnapshotItem], tracks_body: bool) {
-    let curve =
-        context_curve_golden_fixture("cache_observation_codex_v1.json", "/snapshot/context_curve");
-    for item in items {
-        let mut curve = curve.clone();
-        if tracks_body {
-            for point in &mut curve.points {
-                point.effective_input_tokens = item.input_tokens.max(1);
-            }
-        }
-        item.context_curve = Some(curve);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     mod claude_file_cap_tests {
@@ -70846,29 +70810,6 @@ mod tests {
         // truth and must still round-trip byte-for-byte.
         let codex = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         let claude = context_curve_golden_fixture("context-curve-v1-golden.json", "/claude_code");
-        let witness = |curve: SnapshotContextCurve,
-                       tool_usage: Option<Vec<SnapshotToolUsage>>,
-                       tool_usage_truncated: bool| {
-            let mut item = sample_session_artifact_item();
-            item.context_curve = Some(curve);
-            item.tool_usage = tool_usage;
-            item.tool_usage_truncated = tool_usage_truncated;
-            json!({
-                "version": snapshot_upload_body_witness_version(&item),
-                "digest": snapshot_upload_body_witness(&item),
-            })
-        };
-        let body_witnesses = json!({
-            "codex_curve_only_v11": witness(codex.clone(), None, false),
-            "claude_curve_only_v11": witness(claude.clone(), None, false),
-            "curve_with_empty_tool_usage_v11": witness(codex.clone(), Some(Vec::new()), false),
-            "curve_with_truncated_only_v11": witness(codex.clone(), None, true),
-            "curve_with_both_tool_fields_v11": witness(
-                codex.clone(),
-                Some(vec![SnapshotToolUsage { name: "Read".to_string(), count: 2 }]),
-                true,
-            ),
-        });
         let fixture = json!({
             "fixture_version": "local_context_curve_wire:v1",
             "codex": codex,
@@ -70917,7 +70858,6 @@ mod tests {
                 "claude_ownership": "claude_owned_request_start_proof:v2",
                 "claude_model_window_evidence": "claude_transcript_model:v1",
             },
-            "body_witnesses": body_witnesses,
         });
         let canonical_manifest =
             crate::canonical_json::canonicalize(&manifest).expect("curve manifest canonicalizes");
@@ -70963,150 +70903,7 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_requires_exact_durable_entity_ack_proof() {
-        let curve = single_request_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            "2026-08-20T12:00:00.003Z",
-            42,
-            "gpt-5.5",
-            Some(258_400),
-        );
-        let mut item = sample_session_artifact_item();
-        item.context_curve = Some(curve);
-        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "claude_code".to_string(),
-            machine_id: "machine".to_string(),
-            collector_version: None,
-            snapshots: vec![item.clone()],
-            upload_policy: SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
-        let response = |version: Option<u64>, digest: Option<String>| {
-            crate::snapshot_client::SnapshotBatchResponse {
-                conflict_rescans: Default::default(),
-                accepted: 1,
-                sessions_reconciled: 0,
-                session_ids: Vec::new(),
-                disabled: false,
-                disabled_reason: None,
-                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
-                accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                    source_session_id: item.source_session_id.clone(),
-                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                    occurrence_count: 1,
-                    body_witness_version: version,
-                    body_witness_digest: digest,
-                    head_etag: None,
-                    head_challenge: None,
-                    unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
-                }],
-                unchanged_entities: Vec::new(),
-                rejected_entities: Vec::new(),
-                conflict_entities: Vec::new(),
-            }
-        };
-        let legacy = crate::snapshot_client::SnapshotBatchResponse {
-            conflict_rescans: Default::default(),
-            accepted: 1,
-            sessions_reconciled: 0,
-            session_ids: Vec::new(),
-            disabled: false,
-            disabled_reason: None,
-            entity_ack_contract: None,
-            accepted_entities: Vec::new(),
-            unchanged_entities: Vec::new(),
-            rejected_entities: Vec::new(),
-            conflict_entities: Vec::new(),
-        };
-        legacy
-            .validate_entity_ack(&request)
-            .expect_err("legacy/routing-off ACK cannot settle curve evidence");
-        response(None, None)
-            .validate_entity_ack(&request)
-            .expect_err("generic entity ACK cannot settle curve evidence");
-        response(Some(5), Some("0".repeat(64)))
-            .validate_entity_ack(&request)
-            .expect_err("mismatched durable proof cannot settle curve evidence");
-        response(
-            Some(SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION),
-            Some(snapshot_upload_body_witness(&item)),
-        )
-        .validate_entity_ack(&request)
-        .expect_err("internal envelope proof cannot replace the public ACK version");
-        response(
-            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-            Some("0".repeat(64)),
-        )
-        .validate_entity_ack(&request)
-        .expect_err("mismatched durable proof cannot settle curve evidence");
-        response(
-            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
-            Some(snapshot_upload_body_witness(&item)),
-        )
-        .validate_entity_ack(&request)
-        .expect("exact released accepted-log proof settles curve evidence");
-
-        let mut exclusive_item = item.clone();
-        exclusive_item.usage_accounting_contract =
-            Some("session_exclusive_reported_usage:v1".to_string());
-        exclusive_item.snapshot_fingerprint =
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, &exclusive_item);
-        let exclusive_request = SnapshotBatchRequest {
-            snapshots: vec![exclusive_item.clone()],
-            ..request
-        };
-        let exclusive_response = |version| crate::snapshot_client::SnapshotBatchResponse {
-            conflict_rescans: Default::default(),
-            accepted: 1,
-            sessions_reconciled: 0,
-            session_ids: Vec::new(),
-            disabled: false,
-            disabled_reason: None,
-            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
-            accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                source_session_id: exclusive_item.source_session_id.clone(),
-                snapshot_fingerprint: exclusive_item.snapshot_fingerprint.clone(),
-                occurrence_count: 1,
-                body_witness_version: Some(version),
-                body_witness_digest: Some(snapshot_upload_body_witness(&exclusive_item)),
-                head_etag: None,
-                head_challenge: None,
-                unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
-            }],
-            unchanged_entities: Vec::new(),
-            rejected_entities: Vec::new(),
-            conflict_entities: Vec::new(),
-        };
-        exclusive_response(SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION)
-            .validate_entity_ack(&exclusive_request)
-            .expect_err("internal v12 alias cannot replace released v6 ACK proof");
-        exclusive_response(6)
-            .validate_entity_ack(&exclusive_request)
-            .expect("released v6 accepted-log proof settles internal v12 curve evidence");
-    }
-
-    #[test]
     fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
-        let curve = single_request_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            "2026-08-30T12:00:00Z",
-            42,
-            "claude-opus-4-8",
-            None,
-        );
-        let mut nonexclusive = sample_session_artifact_item();
-        nonexclusive.context_curve = Some(curve.clone());
-        let mut exclusive = nonexclusive.clone();
-        exclusive.usage_accounting_contract =
-            Some("session_exclusive_reported_usage:v1".to_string());
         // Evidence-bearing legacy bodies reserve v21/v22. Envelope evidence
         // uses v23/v24, so public normalization must be an explicit mapping.
         let mappings = [
@@ -71114,12 +70911,8 @@ mod tests {
             (8, 2),
             (9, 3),
             (10, 4),
-            (11, 5),
-            (12, 6),
             (15, 13),
             (16, 14),
-            (19, 17),
-            (20, 18),
             (23, 7),
             (24, 8),
         ]
@@ -71132,7 +70925,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let header = codex_creator_header();
-        let creator_case = |exclusive: bool, with_curve: bool| {
+        let creator_case = |exclusive: bool| {
             // Exercise the actual original-session parser and its model/hourly
             // usage fold rather than a metadata-only item with positive totals.
             let mut item = codex_creator_item(
@@ -71144,14 +70937,6 @@ mod tests {
             if !exclusive {
                 item.usage_accounting_contract = None;
             }
-            // The parser no longer builds curves; the curve case carries its
-            // stored golden curve.
-            item.context_curve = with_curve.then(|| {
-                context_curve_golden_fixture(
-                    "body-witness-ack-normalization-v1.json",
-                    "/session_account_cases/exclusive_with_curve/wire/snapshots/0/context_curve",
-                )
-            });
             assert_eq!(
                 (item.input_tokens, item.output_tokens, item.request_count),
                 (100, 5, 1)
@@ -71229,24 +71014,11 @@ mod tests {
                 "legacy_content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
             },
             "session_account_cases": {
-                "nonexclusive": creator_case(false, false),
-                "exclusive": creator_case(true, false),
-                "exclusive_with_curve": creator_case(true, true),
+                "nonexclusive": creator_case(false),
+                "exclusive": creator_case(true),
             },
             "mappings": mappings,
             "declared_cache_session_account_ack_mappings": {"23": 13, "24": 14},
-            "curve_cases": {
-                "nonexclusive": {
-                    "internal_version": snapshot_upload_body_witness_version(&nonexclusive),
-                    "released_ack_version": 5,
-                    "digest": snapshot_upload_body_witness(&nonexclusive),
-                },
-                "exclusive": {
-                    "internal_version": snapshot_upload_body_witness_version(&exclusive),
-                    "released_ack_version": 6,
-                    "digest": snapshot_upload_body_witness(&exclusive),
-                },
-            },
         });
         let mut canonical = crate::canonical_json::canonicalize(&fixture)
             .expect("ACK normalization fixture canonicalizes");
@@ -71418,155 +71190,141 @@ mod tests {
         assert!(parsed.session_account_evidence.is_some());
         assert!(parsed.cache_observations.is_some());
         assert!(parsed.context_curve.is_none());
-        // The parser no longer builds curves; curve cases carry a retained one.
-        let retained_curve = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
         let mut cases = Vec::new();
         for capability in ["creator", "cache", "combined", "legacy"] {
             for exclusive in [false, true] {
-                for curve in [false, true] {
-                    for tools in [
-                        "omitted",
-                        "empty_default_only",
-                        "nonempty",
-                        "truncated_only",
-                    ] {
-                        let mut item = parsed.clone();
-                        if capability == "cache" || capability == "legacy" {
-                            item.session_account_evidence = None;
-                        }
-                        if capability == "creator" || capability == "legacy" {
-                            item.cache_observations = None;
-                            item.cache_observations_state = None;
-                        }
-                        if !exclusive {
-                            item.usage_accounting_contract = None;
-                        }
-                        item.context_curve = curve.then(|| retained_curve.clone());
-                        item.tool_usage = match tools {
-                            "empty_default_only" => Some(vec![]),
-                            "nonempty" => Some(vec![SnapshotToolUsage {
-                                name: "Read".into(),
-                                count: 2,
-                            }]),
-                            _ => None,
-                        };
-                        item.tool_usage_truncated = tools == "truncated_only";
-                        let mut request = valid_v6_batch_request();
-                        request.source = "codex".into();
-                        request.snapshots = vec![item];
-                        apply_upload_policy(
-                            SnapshotSource::Codex,
-                            &mut request.snapshots,
-                            request.upload_policy,
-                        );
-                        request.snapshots[0].snapshot_fingerprint =
-                            snapshot_fingerprint(SnapshotSource::Codex, &request.snapshots[0]);
-                        let item = &request.snapshots[0];
-                        // These are exact normal HTTP body bytes, not reconstructed
-                        // canonical JSON or a mutation of the serialized leaves.
-                        let wire_bytes = serde_json::to_vec(&request).unwrap();
-                        let wire: Value = serde_json::from_slice(&wire_bytes).unwrap();
-                        let projection = snapshot_upload_body_witness_payload(item);
-                        let internal = snapshot_upload_body_witness_version(item);
-                        let public = internal.map(|version| match version {
-                            9 => 3,
-                            10 => 4,
-                            11 => 5,
-                            12 => 6,
-                            15 => 13,
-                            16 => 14,
-                            19 => 17,
-                            20 => 18,
-                            23 => {
-                                if item.cache_observations.is_some() {
-                                    13
-                                } else {
-                                    7
-                                }
-                            }
-                            24 => {
-                                if item.cache_observations.is_some() {
-                                    14
-                                } else {
-                                    8
-                                }
-                            }
-                            _ => panic!("unexpected paired domain"),
-                        });
-                        let digest = internal.map(|_| snapshot_upload_body_witness(item));
-                        for field in [
-                            "context_curve",
-                            "tool_usage",
-                            "tool_usage_truncated",
-                            "session_account_evidence",
-                        ] {
-                            if let Some(declared) = wire["snapshots"][0].get(field) {
-                                assert_eq!(projection.get(field), Some(declared));
-                            } else if capability != "legacy" || curve || tools == "omitted" {
-                                assert!(projection.get(field).is_none());
-                            }
-                        }
-                        let response = |version, proof, unchanged| {
-                            let reference = crate::snapshot_client::SnapshotEntityRef {
-                                source_session_id: item.source_session_id.clone(),
-                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                occurrence_count: 1,
-                                body_witness_version: version,
-                                body_witness_digest: proof,
-                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
-                                head_challenge: None,
-                                unchanged_basis: None,
-                                retained_proof_missing: Vec::new(),
-                            };
-                            crate::snapshot_client::SnapshotBatchResponse {
-                                conflict_rescans: Default::default(),
-                                accepted: 1,
-                                sessions_reconciled: 0,
-                                session_ids: vec![],
-                                disabled: false,
-                                disabled_reason: None,
-                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
-                                accepted_entities: if unchanged {
-                                    vec![]
-                                } else {
-                                    vec![reference.clone()]
-                                },
-                                unchanged_entities: if unchanged {
-                                    vec![reference]
-                                } else {
-                                    vec![]
-                                },
-                                rejected_entities: vec![],
-                                conflict_entities: vec![],
-                            }
-                        };
-                        for unchanged in [false, true] {
-                            response(public, digest.clone(), unchanged)
-                                .validate_entity_ack(&request)
-                                .unwrap();
-                            if capability != "legacy" || curve {
-                                assert!(response(public, Some("0".repeat(64)), unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                                assert!(response(None, None, unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                                assert!(response(Some(99), digest.clone(), unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                            }
-                        }
-                        cases.push(json!({"admission":"first_admission","capability":capability,"exclusive":exclusive,"curve":curve,"tools":tools,
-                            "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
-                            "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
-                            "internal_version":internal,"released_ack_version":public,"digest":digest,
-                            "body_projection":projection,"cache_observations_state":item.cache_observations_state}));
+                for tools in [
+                    "omitted",
+                    "empty_default_only",
+                    "nonempty",
+                    "truncated_only",
+                ] {
+                    let mut item = parsed.clone();
+                    if capability == "cache" || capability == "legacy" {
+                        item.session_account_evidence = None;
                     }
+                    if capability == "creator" || capability == "legacy" {
+                        item.cache_observations = None;
+                        item.cache_observations_state = None;
+                    }
+                    if !exclusive {
+                        item.usage_accounting_contract = None;
+                    }
+                    item.tool_usage = match tools {
+                        "empty_default_only" => Some(vec![]),
+                        "nonempty" => Some(vec![SnapshotToolUsage {
+                            name: "Read".into(),
+                            count: 2,
+                        }]),
+                        _ => None,
+                    };
+                    item.tool_usage_truncated = tools == "truncated_only";
+                    let mut request = valid_v6_batch_request();
+                    request.source = "codex".into();
+                    request.snapshots = vec![item];
+                    apply_upload_policy(
+                        SnapshotSource::Codex,
+                        &mut request.snapshots,
+                        request.upload_policy,
+                    );
+                    request.snapshots[0].snapshot_fingerprint =
+                        snapshot_fingerprint(SnapshotSource::Codex, &request.snapshots[0]);
+                    let item = &request.snapshots[0];
+                    // These are exact normal HTTP body bytes, not reconstructed
+                    // canonical JSON or a mutation of the serialized leaves.
+                    let wire_bytes = serde_json::to_vec(&request).unwrap();
+                    let wire: Value = serde_json::from_slice(&wire_bytes).unwrap();
+                    let projection = snapshot_upload_body_witness_payload(item);
+                    let internal = snapshot_upload_body_witness_version(item);
+                    let public = internal.map(|version| match version {
+                        9 => 3,
+                        10 => 4,
+                        15 => 13,
+                        16 => 14,
+                        23 => {
+                            if item.cache_observations.is_some() {
+                                13
+                            } else {
+                                7
+                            }
+                        }
+                        24 => {
+                            if item.cache_observations.is_some() {
+                                14
+                            } else {
+                                8
+                            }
+                        }
+                        _ => panic!("unexpected paired domain"),
+                    });
+                    let digest = internal.map(|_| snapshot_upload_body_witness(item));
+                    for field in [
+                        "tool_usage",
+                        "tool_usage_truncated",
+                        "session_account_evidence",
+                    ] {
+                        if let Some(declared) = wire["snapshots"][0].get(field) {
+                            assert_eq!(projection.get(field), Some(declared));
+                        } else if capability != "legacy" || tools == "omitted" {
+                            assert!(projection.get(field).is_none());
+                        }
+                    }
+                    let response = |version, proof, unchanged| {
+                        let reference = crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version: version,
+                            body_witness_digest: proof,
+                            head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                            head_challenge: None,
+                            unchanged_basis: None,
+                            retained_proof_missing: Vec::new(),
+                        };
+                        crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
+                            accepted: 1,
+                            sessions_reconciled: 0,
+                            session_ids: vec![],
+                            disabled: false,
+                            disabled_reason: None,
+                            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                            accepted_entities: if unchanged {
+                                vec![]
+                            } else {
+                                vec![reference.clone()]
+                            },
+                            unchanged_entities: if unchanged { vec![reference] } else { vec![] },
+                            rejected_entities: vec![],
+                            conflict_entities: vec![],
+                        }
+                    };
+                    for unchanged in [false, true] {
+                        response(public, digest.clone(), unchanged)
+                            .validate_entity_ack(&request)
+                            .unwrap();
+                        if capability != "legacy" {
+                            assert!(response(public, Some("0".repeat(64)), unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                            assert!(response(None, None, unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                            assert!(response(Some(99), digest.clone(), unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                        }
+                    }
+                    cases.push(json!({"admission":"first_admission","capability":capability,"exclusive":exclusive,"tools":tools,
+                        "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
+                        "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
+                        "internal_version":internal,"released_ack_version":public,"digest":digest,
+                        "body_projection":projection,"cache_observations_state":item.cache_observations_state}));
                 }
             }
         }
-        assert_eq!(cases.len(), 64);
+        assert_eq!(cases.len(), 32);
     }
 
     fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, ScanIndex) {
@@ -71982,7 +71740,7 @@ mod tests {
             format!("{base}{}", "{}\n".repeat(revision)),
         )
         .expect("write forced-parse fixture");
-        let mut result = scan_source_roots_with_limit(
+        let result = scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
             index,
@@ -71993,24 +71751,20 @@ mod tests {
         )
         .expect("scan forced-parse fixture");
         assert_eq!(result.snapshots.len(), 1);
-        result.snapshots[0].context_curve = Some(unavailable_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "ownership_unresolved",
-            0,
-            0,
-        ));
+        assert!(!result.snapshots[0].tool_usage_truncated);
         result
     }
 
-    fn curve_omitted_body_witness(item: &SnapshotItem) -> String {
+    /// A delivery-only projection: it declares a witnessed leaf the raw body
+    /// omits, so the effective witness differs from the raw one.
+    fn projected_body_witness(item: &SnapshotItem) -> String {
         assert_eq!(
             item.snapshot_fingerprint,
             snapshot_fingerprint(SnapshotSource::ClaudeCode, item),
             "effective witness runs after semantic fingerprint recomputation"
         );
         let mut effective = item.clone();
-        effective.context_curve = None;
+        effective.tool_usage_truncated = true;
         snapshot_upload_body_witness(&effective)
     }
 
@@ -72027,7 +71781,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
-            curve_omitted_body_witness,
+            projected_body_witness,
         );
         assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
         let semantic_state = index.file_snapshot_fingerprints.clone();
@@ -72045,7 +71799,7 @@ mod tests {
                 &mut index,
                 |item| {
                     if omitted {
-                        curve_omitted_body_witness(item)
+                        projected_body_witness(item)
                     } else {
                         assert_eq!(item.snapshot_fingerprint, raw.snapshot_fingerprint);
                         snapshot_upload_body_witness(item)
@@ -72072,11 +71826,11 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
-            curve_omitted_body_witness,
+            projected_body_witness,
         );
         let item = &first.snapshots[0];
         let raw_witness = snapshot_upload_body_witness(item);
-        let effective_witness = curve_omitted_body_witness(item);
+        let effective_witness = projected_body_witness(item);
         assert_ne!(raw_witness, effective_witness);
         let scan = body_witness_finalizer_scan(&root, &mut index, 2);
         for (witness, expected_count) in [(effective_witness, 0), (raw_witness, 1)] {
@@ -72095,84 +71849,13 @@ mod tests {
                 &mut retry_index,
                 |item| {
                     calls.set(calls.get() + 1);
-                    curve_omitted_body_witness(item)
+                    projected_body_witness(item)
                 },
             );
             assert_eq!(calls.get(), 2, "file fold and quarantine share the witness");
             assert_eq!(retry.snapshots.len(), expected_count);
             assert_eq!(retry.semantic_noop_count, 1 - expected_count);
         }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn context_curve_body_witness_uploads_absent_present_corrections_once() {
-        let root = temp_dir("context-curve-body-witness");
-        let path = root.join("curve-session.jsonl");
-        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
-        let curve = |tokens| {
-            single_request_context_curve(
-                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                "claude_owned_request_start_proof:v1",
-                "claude_transcript_model:v1",
-                "2026-08-20T12:00:01Z",
-                tokens,
-                "claude-opus-4-8",
-                None,
-            )
-        };
-        let curve_a = curve(100);
-        let curve_b = curve(125);
-        let mut index = ScanIndex::default();
-        let mut revision = 0_usize;
-        let mut run = |curve: Option<SnapshotContextCurve>| {
-            revision += 1;
-            fs::write(&path, format!("{base}{}", "{}\n".repeat(revision)))
-                .expect("write forced-parse fixture");
-            let mut result = scan_source_roots_with_limit(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-08-20T12:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("scan forced-parse fixture");
-            assert_eq!(result.snapshots.len(), 1);
-            result.snapshots[0].context_curve = curve;
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-            (
-                result.snapshots.len(),
-                result.semantic_noop_count,
-                index
-                    .files
-                    .get(&local_index_key(&path))
-                    .and_then(|entry| entry.last_upload_body_witness.clone())
-                    .expect("body witness persisted"),
-            )
-        };
-
-        let (baseline_count, _, baseline_witness) = run(None);
-        assert_eq!(baseline_count, 1);
-        let (present_count, _, curve_a_witness) = run(Some(curve_a.clone()));
-        assert_eq!(present_count, 1, "absent -> present uploads once");
-        assert_ne!(baseline_witness, curve_a_witness);
-        let (identical_count, identical_noops, identical_witness) = run(Some(curve_a.clone()));
-        assert_eq!((identical_count, identical_noops), (0, 1));
-        assert_eq!(curve_a_witness, identical_witness);
-        let (corrected_count, _, curve_b_witness) = run(Some(curve_b));
-        assert_eq!(corrected_count, 1, "curve A -> B uploads");
-        assert_ne!(curve_a_witness, curve_b_witness);
-        let (restored_count, _, restored_witness) = run(Some(curve_a));
-        assert_eq!(restored_count, 1, "curve B -> A uploads");
-        assert_eq!(restored_witness, curve_a_witness);
-        let (rollback_count, _, rollback_witness) = run(None);
-        assert_eq!(rollback_count, 1, "rollback omission uploads once");
-        assert_eq!(rollback_witness, baseline_witness);
-        let (settled_count, settled_noops, _) = run(None);
-        assert_eq!((settled_count, settled_noops), (0, 1));
-
         let _ = fs::remove_dir_all(root);
     }
 
@@ -72772,182 +72455,167 @@ mod tests {
         let mut declared_cases = Vec::new();
         for disposition in ["complete", "missing", "conflict"] {
             for cache in [false, true] {
-                for curve in [false, true] {
-                    let mut item = complete.clone();
-                    if disposition == "missing" {
-                        item = claude_original_carrier_fixture(
-                            &claude_original_carrier_missing_metadata(),
-                            "",
-                        );
-                    } else if disposition == "conflict" {
-                        let mut metadata = claude_original_carrier_metadata();
-                        let mut other = metadata.original_identity_evidence["native-session"]
-                            .first()
-                            .unwrap()
-                            .clone();
-                        other.provider_workspace_hash = Some("c".repeat(64));
-                        metadata
-                            .original_identity_evidence
-                            .get_mut("native-session")
-                            .unwrap()
-                            .insert(other);
-                        item = claude_original_carrier_fixture(&metadata, "");
+                let mut item = complete.clone();
+                if disposition == "missing" {
+                    item = claude_original_carrier_fixture(
+                        &claude_original_carrier_missing_metadata(),
+                        "",
+                    );
+                } else if disposition == "conflict" {
+                    let mut metadata = claude_original_carrier_metadata();
+                    let mut other = metadata.original_identity_evidence["native-session"]
+                        .first()
+                        .unwrap()
+                        .clone();
+                    other.provider_workspace_hash = Some("c".repeat(64));
+                    metadata
+                        .original_identity_evidence
+                        .get_mut("native-session")
+                        .unwrap()
+                        .insert(other);
+                    item = claude_original_carrier_fixture(&metadata, "");
+                }
+                prepare_cache_observations(&mut item, None);
+                if !cache {
+                    item.cache_observations = None;
+                    item.cache_observations_state = None;
+                }
+                let source_item = item;
+                for tools in [
+                    "omitted",
+                    "empty_default_only",
+                    "nonempty",
+                    "truncated_only",
+                ] {
+                    let mut item = source_item.clone();
+                    match tools {
+                        "omitted" | "truncated_only" => item.tool_usage = None,
+                        "empty_default_only" => item.tool_usage = Some(vec![]),
+                        _ => {}
                     }
-                    prepare_cache_observations(&mut item, None);
-                    if !cache {
-                        item.cache_observations = None;
-                        item.cache_observations_state = None;
-                    }
-                    // The parser no longer builds curves; curve cases carry the
-                    // stored golden curve.
-                    item.context_curve = curve.then(|| {
-                        context_curve_golden_fixture(
-                            "claude-original-source-corpus-v1.json",
-                            "/cases/1/wire/snapshots/0/context_curve",
+                    item.tool_usage_truncated = tools == "truncated_only";
+                    let mut request = valid_v6_batch_request();
+                    request.source = "claude_code".into();
+                    request.snapshots = vec![item];
+                    apply_upload_policy(
+                        SnapshotSource::ClaudeCode,
+                        &mut request.snapshots,
+                        request.upload_policy,
+                    );
+                    request.snapshots[0].snapshot_fingerprint =
+                        snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
+                    let item = &request.snapshots[0];
+                    assert_eq!(
+                        item.session_account_evidence
+                            .as_ref()
+                            .unwrap()
+                            .identity_disposition,
+                        Some(disposition)
+                    );
+                    assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
+                    assert_eq!(item.cache_observations.is_some(), cache);
+                    assert_eq!(
+                        item.session_account_evidence,
+                        source_item.session_account_evidence
+                    );
+                    assert_eq!(
+                        (item.input_tokens, item.output_tokens, item.request_count),
+                        (
+                            source_item.input_tokens,
+                            source_item.output_tokens,
+                            source_item.request_count
                         )
-                    });
-                    let source_item = item;
-                    for tools in [
-                        "omitted",
-                        "empty_default_only",
-                        "nonempty",
-                        "truncated_only",
+                    );
+                    assert_eq!(item.model_usage, source_item.model_usage);
+                    assert_eq!(item.usage_buckets, source_item.usage_buckets);
+                    let bytes = serde_json::to_vec(&request).unwrap();
+                    let wire: Value = serde_json::from_slice(&bytes).unwrap();
+                    let projection = snapshot_upload_body_witness_payload(item);
+                    for field in [
+                        "session_account_evidence",
+                        "tool_usage",
+                        "tool_usage_truncated",
                     ] {
-                        let mut item = source_item.clone();
-                        match tools {
-                            "omitted" | "truncated_only" => item.tool_usage = None,
-                            "empty_default_only" => item.tool_usage = Some(vec![]),
-                            _ => {}
-                        }
-                        item.tool_usage_truncated = tools == "truncated_only";
-                        let mut request = valid_v6_batch_request();
-                        request.source = "claude_code".into();
-                        request.snapshots = vec![item];
-                        apply_upload_policy(
-                            SnapshotSource::ClaudeCode,
-                            &mut request.snapshots,
-                            request.upload_policy,
-                        );
-                        request.snapshots[0].snapshot_fingerprint =
-                            snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
-                        let item = &request.snapshots[0];
                         assert_eq!(
-                            item.session_account_evidence
-                                .as_ref()
-                                .unwrap()
-                                .identity_disposition,
-                            Some(disposition)
+                            projection.get(field),
+                            wire["snapshots"][0].get(field),
+                            "original Claude declared presence: {field}/{tools}"
                         );
-                        assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
-                        assert_eq!(item.cache_observations.is_some(), cache);
-                        assert_eq!(
-                            item.session_account_evidence,
-                            source_item.session_account_evidence
-                        );
-                        assert_eq!(
-                            (item.input_tokens, item.output_tokens, item.request_count),
-                            (
-                                source_item.input_tokens,
-                                source_item.output_tokens,
-                                source_item.request_count
-                            )
-                        );
-                        assert_eq!(item.model_usage, source_item.model_usage);
-                        assert_eq!(item.usage_buckets, source_item.usage_buckets);
-                        let bytes = serde_json::to_vec(&request).unwrap();
-                        let wire: Value = serde_json::from_slice(&bytes).unwrap();
-                        let projection = snapshot_upload_body_witness_payload(item);
-                        for field in [
-                            "session_account_evidence",
-                            "context_curve",
-                            "tool_usage",
-                            "tool_usage_truncated",
-                        ] {
-                            assert_eq!(
-                                projection.get(field),
-                                wire["snapshots"][0].get(field),
-                                "original Claude declared presence: {field}/{tools}"
-                            );
-                        }
-                        assert_eq!(
-                            wire["snapshots"][0].get("tool_usage_truncated"),
-                            (tools == "truncated_only").then_some(&Value::Bool(true))
-                        );
-                        let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
-                        let digest = snapshot_upload_body_witness(item);
-                        assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
-                        let public = if cache { 13 } else { 7 };
-                        let response = |version, proof, unchanged| {
-                            let reference = crate::snapshot_client::SnapshotEntityRef {
-                                source_session_id: item.source_session_id.clone(),
-                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                occurrence_count: 1,
-                                body_witness_version: version,
-                                body_witness_digest: proof,
-                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
-                                head_challenge: None,
-                                unchanged_basis: None,
-                                retained_proof_missing: Vec::new(),
-                            };
-                            crate::snapshot_client::SnapshotBatchResponse {
-                                conflict_rescans: Default::default(),
-                                accepted: 1,
-                                sessions_reconciled: 0,
-                                session_ids: vec![],
-                                disabled: false,
-                                disabled_reason: None,
-                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
-                                accepted_entities: if unchanged {
-                                    vec![]
-                                } else {
-                                    vec![reference.clone()]
-                                },
-                                unchanged_entities: if unchanged {
-                                    vec![reference]
-                                } else {
-                                    vec![]
-                                },
-                                rejected_entities: vec![],
-                                conflict_entities: vec![],
-                            }
-                        };
-                        for unchanged in [false, true] {
-                            response(Some(public), Some(digest.clone()), unchanged)
-                                .validate_entity_ack(&request)
-                                .unwrap();
-                            for (version, proof) in [
-                                (Some(public), Some("0".repeat(64))),
-                                (None, None),
-                                (Some(23), Some(digest.clone())),
-                                (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
-                            ] {
-                                assert!(response(version, proof, unchanged)
-                                    .validate_entity_ack(&request)
-                                    .is_err());
-                            }
-                        }
-                        let case = json!({"disposition":disposition,"cache":cache,"curve":curve,
-                        "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
-                        "wire":wire,
-                        "wire_body_utf8":String::from_utf8(bytes).unwrap(),
-                        "internal_version":snapshot_upload_body_witness_version(item),
-                        "released_ack_version":public,
-                        "digest":digest,
-                        "body_projection":projection,
-                        "cache_observations_state":item.cache_observations_state});
-                        if tools == "nonempty" {
-                            cases.push(case.clone());
-                        }
-                        let mut declared_case = case;
-                        declared_case["tools"] = json!(tools);
-                        declared_case["body_projection_canonical_utf8"] =
-                            json!(String::from_utf8(canonical).unwrap());
-                        declared_cases.push(declared_case);
                     }
+                    assert_eq!(
+                        wire["snapshots"][0].get("tool_usage_truncated"),
+                        (tools == "truncated_only").then_some(&Value::Bool(true))
+                    );
+                    let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
+                    let digest = snapshot_upload_body_witness(item);
+                    assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
+                    let public = if cache { 13 } else { 7 };
+                    let response = |version, proof, unchanged| {
+                        let reference = crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version: version,
+                            body_witness_digest: proof,
+                            head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                            head_challenge: None,
+                            unchanged_basis: None,
+                            retained_proof_missing: Vec::new(),
+                        };
+                        crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
+                            accepted: 1,
+                            sessions_reconciled: 0,
+                            session_ids: vec![],
+                            disabled: false,
+                            disabled_reason: None,
+                            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                            accepted_entities: if unchanged {
+                                vec![]
+                            } else {
+                                vec![reference.clone()]
+                            },
+                            unchanged_entities: if unchanged { vec![reference] } else { vec![] },
+                            rejected_entities: vec![],
+                            conflict_entities: vec![],
+                        }
+                    };
+                    for unchanged in [false, true] {
+                        response(Some(public), Some(digest.clone()), unchanged)
+                            .validate_entity_ack(&request)
+                            .unwrap();
+                        for (version, proof) in [
+                            (Some(public), Some("0".repeat(64))),
+                            (None, None),
+                            (Some(23), Some(digest.clone())),
+                            (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
+                        ] {
+                            assert!(response(version, proof, unchanged)
+                                .validate_entity_ack(&request)
+                                .is_err());
+                        }
+                    }
+                    let case = json!({"disposition":disposition,"cache":cache,
+                    "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
+                    "wire":wire,
+                    "wire_body_utf8":String::from_utf8(bytes).unwrap(),
+                    "internal_version":snapshot_upload_body_witness_version(item),
+                    "released_ack_version":public,
+                    "digest":digest,
+                    "body_projection":projection,
+                    "cache_observations_state":item.cache_observations_state});
+                    if tools == "nonempty" {
+                        cases.push(case.clone());
+                    }
+                    let mut declared_case = case;
+                    declared_case["tools"] = json!(tools);
+                    declared_case["body_projection_canonical_utf8"] =
+                        json!(String::from_utf8(canonical).unwrap());
+                    declared_cases.push(declared_case);
                 }
             }
         }
-        assert_eq!(cases.len(), 12);
+        assert_eq!(cases.len(), 6);
         let bytes = serde_json::to_vec_pretty(
             &json!({"contract_version":"claude_original_wire_corpus:v1", "cases":cases}),
         )
@@ -72962,7 +72630,7 @@ mod tests {
         if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_CORPUS_OUT") {
             fs::write(output, &bytes).unwrap();
         }
-        assert_eq!(declared_cases.len(), 48);
+        assert_eq!(declared_cases.len(), 24);
         if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_DECLARED_CORPUS_OUT") {
             fs::write(output, serde_json::to_vec_pretty(
                 &json!({"contract_version":"claude_original_declared_wire_corpus:v1", "cases":declared_cases})
@@ -83757,8 +83425,6 @@ pub(crate) mod cache_adapter_tests {
                 None,
             )
             .remove(0);
-        // The parser no longer builds curves; restore the stored golden curve.
-        super::attach_retained_context_curve(std::slice::from_mut(&mut item), false);
         prepare_cache_observations(&mut item, None);
         item
     }
@@ -83919,7 +83585,7 @@ pub(crate) mod cache_adapter_tests {
             item.cache_observations.as_ref().unwrap().operations.len(),
             1
         );
-        assert_eq!(snapshot_upload_body_witness_version(&item), Some(20));
+        assert_eq!(snapshot_upload_body_witness_version(&item), Some(16));
         let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::Codex,&item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(&item),"body_witness_digest":snapshot_upload_body_witness(&item)});
         let golden: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/cache_observation_codex_v1.json"
@@ -83943,8 +83609,8 @@ pub(crate) mod cache_adapter_tests {
                 "codex",
                 "OTTTO_CACHE_FIXTURE_OUT",
                 SnapshotSource::Codex,
-                20,
-                18,
+                16,
+                14,
             ),
             (
                 "claude",
@@ -83992,7 +83658,7 @@ pub(crate) mod cache_adapter_tests {
             "duration_policy":"nonnegative_whole_seconds_floor",
             "head_cas_contract":SNAPSHOT_HEAD_CAS_CONTRACT,
             "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
-            "normalized_public_body_witness_map":{"15":13,"16":14,"19":17,"20":18},
+            "normalized_public_body_witness_map":{"15":13,"16":14},
             "fixtures":fixtures,
         });
         if let Some(output) = output {
