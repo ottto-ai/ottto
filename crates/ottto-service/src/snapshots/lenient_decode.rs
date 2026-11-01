@@ -406,6 +406,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(
+            claude_desktop_store_inventory,
+            claude_desktop_store_inventory_is_legacy
+        );
+        field!(
             claude_copy_removals,
             claude_request_money::copy_removals::CopyRemovals::is_unwritten
         );
@@ -500,7 +504,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
-    "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+    "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
 ];
 

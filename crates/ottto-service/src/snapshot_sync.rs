@@ -7907,7 +7907,7 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
-        // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
+        // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
         if upload_progress
@@ -10562,7 +10562,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Request identity is not the session owner: admit only this scan's
     // exact contract-5 bodies, never rewriting a retained owner.
     // Nor is an unhealthy read's cleared account: admit this scan's exact
-    // Unknown bodies so a bound session uploads them (Lead B Addendum 4).
+    // Unknown bodies so a bound session uploads them.
     for item in &scan_result.snapshots {
         disposition.mixed_uploads.admit_request_identity(item);
         disposition.mixed_uploads.admit_unhealthy_unknown(item);
@@ -14879,7 +14879,7 @@ mod tests {
         assert!(progress.accepted_cache_heads.is_empty());
     }
 
-    /// R9 (SOURCE Amendment 2, option (i)): an `unchanged` ACK whose
+    /// An `unchanged` ACK whose
     /// `unchanged_basis` says the server did not store the body never marks
     /// it emitted. The exact body is held, so it is offered once per change;
     /// a plain `unchanged` ACK still settles as stored. Both server bases.
@@ -20341,7 +20341,7 @@ mod tests {
         assert_eq!(lossy["last_dropped_usage_record_count"], 1_105);
 
         // [money] Loss is never a settled zero-dollar result, and an accepted
-        // healthy sibling cannot hide the dropped record (Lead B rule 1).
+        // healthy sibling cannot hide the dropped record.
         for healthy_sibling in [false, true] {
             let mut counts = SyncCounts::for_policy(30);
             counts.discovered_file_count = 1;
@@ -21172,7 +21172,7 @@ mod tests {
         assert!(!deferred.fully_settled);
     }
 
-    /// SOURCE 2026-10-27 (option A), conditions (2) and (3): a `Completed`
+    /// A `Completed`
     /// page's blocking holds scope the sweep marker to their own families for
     /// the terminal unchanged-proof skip only. The flag and its cause names
     /// are exactly as before. Scopes accumulate across the sweep's pages and
