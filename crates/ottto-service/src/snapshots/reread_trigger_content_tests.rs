@@ -678,7 +678,6 @@ fn reused_inode_with_an_unequal_birth_is_read() {
 
 /// An unavailable birth, stored (older entries, file systems without birth)
 /// or live, never adopts a stored ctime: the normal path reads.
-/// [behaviour] Missing birth evidence preserves the normal reread decision.
 #[test]
 fn unavailable_birth_never_adopts_a_stored_ctime() {
     for (source, name, body) in sources() {

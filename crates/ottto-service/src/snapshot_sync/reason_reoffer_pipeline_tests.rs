@@ -1490,7 +1490,6 @@ fn refused_then_conflicted_holding(
 /// same restart restores it instead of re-reading the transcript. Either way
 /// the due day offers the same exact body once.
 #[cfg(unix)]
-/// [format] Durable writes retain single-writer custody through the state-directory lock.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -1692,7 +1691,6 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 /// arm's re-offer outcome equals the cold arm's. A restore never suppresses
 /// or postpones a due re-offer.
 #[cfg(unix)]
-/// [behaviour] Durable restore preserves the existing cooldown reoffer decision.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]

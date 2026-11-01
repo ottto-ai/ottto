@@ -1462,7 +1462,6 @@ fn unchanged_group_releases_persisted_blocked_owner() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// [behaviour] Legacy tee state remains included in the group memory charge.
 #[test]
 fn group_with_legacy_tee_is_byte_charged() {
     if !crate::heap_layout_bound::layout_supported() {
