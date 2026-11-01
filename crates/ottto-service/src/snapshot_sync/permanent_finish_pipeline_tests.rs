@@ -259,7 +259,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         .expect("real due native preparation");
         assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
         "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
         assert_eq!(scan.census_complete, !unclean);
         let selected_losses = [
@@ -540,7 +540,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         })
         .unwrap()
         .expect("real due native preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         assert!(scan.census_complete);
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
@@ -868,7 +868,7 @@ impl AckFinishHome {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame);
         assert!(scan.census_complete, "{cycle}: the real scan is clean");
         assert_eq!(
             scan.snapshots.len(),

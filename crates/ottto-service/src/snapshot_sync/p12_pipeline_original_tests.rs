@@ -344,7 +344,7 @@ impl RearmFixture {
         if self.serial_active_frame {
             collect_unparkable_preparation_with_rotation(frame)
         } else {
-            collect_native_preparation_with_rotation(frame, true)
+            collect_native_preparation_with_rotation(frame)
         }
     }
 
@@ -1669,7 +1669,7 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
     let target_hook =
         crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
-    let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame, true).unwrap();
+    let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame).unwrap();
     assert_eq!(
         target_hook.hits(),
         0,
