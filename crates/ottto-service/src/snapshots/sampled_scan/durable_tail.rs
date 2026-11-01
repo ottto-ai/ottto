@@ -408,7 +408,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted,repin]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
-             gc_records_deleted={} rec_orphans_erased={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
+             gc_records_deleted={} rec_orphans_erased={} private_label_inventory_overflow={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              off_v1_invalidated={} off_v1_invalidate_failed={} records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
@@ -457,6 +457,7 @@ impl Counters {
             store.store_write_skipped,
             store.gc_records_deleted,
             store.rec_orphans_erased,
+            store.private_label_inventory_overflow,
             store.gc_records_read,
             store.gc_bytes_read,
             self.gc_keep_peak,

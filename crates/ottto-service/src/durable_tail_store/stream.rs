@@ -624,11 +624,12 @@ impl DurableTailStore {
                 return Err(io::Error::other("invalid native header"));
             }
             let encoded_len = size + header.body_len + TRAILER_BYTES;
-            if self.stream_records >= MAX_BATCH
-                || self
-                    .stream_bytes
-                    .checked_add(encoded_len)
-                    .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
+            // Completed native receipts release custody synchronously; only
+            // encoded bytes pace cumulative throughput within this pass.
+            if self
+                .stream_bytes
+                .checked_add(encoded_len)
+                .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
             {
                 self.counters.records_deferred += 1;
                 self.counters.budget_refused += 1;
@@ -1146,6 +1147,77 @@ mod tests {
         assert!(store.durable.len() <= MAX_RECORDS);
         assert_eq!(store.counters.mutation_unproved, 0);
         assert!(store.disabled().is_none());
+    }
+
+    /// Byte exhaustion needs store-private accounting to exercise exact encoded
+    /// boundaries without constructing multi-megabyte retained reductions.
+    #[test]
+    fn native_byte_budget_is_exact_and_shared_with_post_save() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for properties in crate::snapshots::durable_sources::SOURCES {
+            let source = properties.source;
+            let scratch = Scratch::new();
+            let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+            let mut store = DurableTailStore::new(
+                store_dir_for_index(&scratch.root.join("index.json")),
+                source,
+            );
+            for n in 0..=MAX_BATCH {
+                let (mut header, body) = header(&scratch, source, 1);
+                header.binding.key = key_digest(source, &format!("native-{n}"));
+                commit(&mut store, writer, header, &body);
+                assert!(!store.has_pending(), "settled custody is reusable");
+            }
+            assert_eq!(store.counters.records_written, MAX_BATCH as u64 + 1);
+            assert_eq!(store.counters.budget_refused, 0);
+
+            let (mut next, body) = header(&scratch, source, 1);
+            next.binding.key = key_digest(source, "post-save");
+            let record = PendingRecord {
+                binding: next.binding.clone(),
+                certificate: next.certificate.clone(),
+                body: body.clone(),
+                allowlist: next.allowlist,
+                acquisition: Some(next.acquisition),
+            };
+            let encoded_len = header_len(next.format, source, &next.allowlist).unwrap()
+                + body.len()
+                + TRAILER_BYTES;
+            // Native throughput above 32 cannot starve a post-save batch;
+            // exact encoded bytes, including envelope/trailer, still bound it.
+            store.stream_bytes = WRITE_PASS_BYTES - encoded_len;
+            let mut overflow = record.clone();
+            overflow.binding.key = key_digest(source, "post-save-overflow");
+            let receipt = store
+                .write_after_save(writer, next.generation, 0, vec![record, overflow.clone()])
+                .unwrap();
+            assert_eq!(
+                (receipt.written, receipt.deferred, receipt.budget_refused),
+                (1, 1, 0),
+                "deferred keys cannot block audit retirement of written siblings"
+            );
+            assert_eq!(receipt.bytes_written, encoded_len as u64);
+            assert_eq!(receipt.deferred_keys, vec![overflow.binding.key]);
+            assert_eq!(store.counters.budget_refused, 1);
+            assert!(!store.has_pending());
+
+            store.begin_pass();
+            store.stream_bytes = WRITE_PASS_BYTES - encoded_len;
+            next.binding.key = key_digest(source, "native-exact-boundary");
+            commit(&mut store, writer, next, &body);
+            assert_eq!(store.stream_bytes, WRITE_PASS_BYTES);
+            let (mut next, _) = header(&scratch, source, 1);
+            next.binding.key = key_digest(source, "native-overflow");
+            let failure = store.prepare_stream(writer, next).err().unwrap();
+            assert_eq!(failure.stage, "stream_budget");
+            assert_eq!(store.counters.budget_refused, 2);
+            assert_eq!(store.counters.records_deferred, 2);
+            assert!(!store.has_pending());
+            assert!(!store.record_path(&failure.attempt.key).exists());
+            assert!(store.disabled().is_none());
+        }
     }
 
     /// [format] newly staged codex record is refused by both released decoders.
