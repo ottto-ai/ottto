@@ -61,6 +61,7 @@ impl E2ScanFixture {
             false,
             &scope,
             capture,
+            true,
         );
     }
 
@@ -123,9 +124,12 @@ impl E2ScanFixture {
         source: SnapshotSource,
         roots: &[PathBuf],
         support: &Path,
-        index: ScanIndex,
+        mut index: ScanIndex,
         sampled: bool,
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        );
         let mut scan = OwnedSourceScan::new(
             source,
             roots,

@@ -766,6 +766,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     index_key: &local_index_key(&off_page),
                     source_file_fingerprint: &"a".repeat(64),
                     census_window_end: "2026-08-02T09:00:00Z",
+                    held_index_keys: &Default::default(),
                     complete: true,
                     lossy: false,
                     source_verified: true,

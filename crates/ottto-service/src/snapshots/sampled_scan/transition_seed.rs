@@ -1,291 +1,37 @@
-//! Genuine v1 records from main's pinned 53d05a43 writer, before R2 (#865).
-//! Read the production post-save artifact unchanged: never rewrite its version,
-//! binding, allowlist, body or trailer. Source pins below fail on codec drift;
-//! a future writer must supply archived bytes rather than relabel its output.
-//!
-//! Serializer regions are extracted by the single companion Python standard-
-//! library tool used for both baseline generation and candidate verification.
-//! Only tests launch it; production has no subprocess or dependency change.
-//! It balances Rust tokens, preserves literals, removes comments/whitespace,
-//! discovers durable macros/trait impls and follows local helpers/constants.
-//! Trait paths accept qualified prefixes and optional :: before generic args;
-//! raw identifiers stay distinct from keywords. Unsupported trait paths fail.
-//! Literal macro_rules impls are scanned; generated trait names/token assembly
-//! still require owner review (no macro expansion or name resolution here).
-//! Explicit roots cover body encoding, allowlist labels, session-start content
-//! hashes, source slugs, native body publication/store framing/verification,
-//! and owned-container inherent dispatch plus Deref/Default/From. See the tool docstring for
-//! limits and owner-reviewed rebaseline procedure. Runtime tree walking sees
-//! new non-catalog files; cfg(test)-only code is excluded. The adjacent JSON
-//! inventory enumerates helper references, pinned providers and exceptions;
-//! adding a reference requires an explicit inventory review.
-//! Python 3 and the source checkout are mandatory test prerequisites: missing
-//! python3, walk/parse failure or malformed extractor output panics, never skips.
-//! There is no environment opt-out, and the pin never changes PATH or other
-//! process-global environment variables.
+//! Historical transition seeds come only from the checked 53d05a43 archive.
+//! M3 retires this pin: these bytes exercise rebuild dispatch, never current
+//! encoding disguised as v1. Only the scratch-path key and checksum move.
+use super::super::transition_fixture::load_v1_goldens;
 use super::*;
-use sha2::{Digest, Sha256};
 
 pub(crate) fn seed_pinned_v1(
     cache: &SharedCache,
     source: SnapshotSource,
     key: &str,
-    index: &ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
     assert_eq!(pin, "53d05a43");
-    assert_pinned_body_writer();
-    let checkpoint = cache
-        .retained_checkpoint(key)
-        .expect("populated native reduction");
     let ds = durable_source(source).unwrap();
+    let case_id = match source {
+        SnapshotSource::ClaudeCode => "claude-three-request",
+        SnapshotSource::Codex => "codex-v2-24b",
+        SnapshotSource::Pi => unreachable!("no historical Pi record"),
+    };
+    let golden = load_v1_goldens()
+        .unwrap()
+        .into_iter()
+        .find(|golden| golden.case_id == case_id)
+        .unwrap();
+    let digest = store::key_digest(ds, key);
+    let bytes = golden.relocated_record(digest);
     let mut stores = cache.durable().unwrap();
     let slot = stores.slot(ds).as_mut().unwrap();
-    let interpretation =
-        Interpretation::of(source, key, index, slot.identity_capture, &slot.namespace);
-    let expected = expected(
-        ds,
-        source,
-        key,
-        checkpoint.scope(),
-        index,
-        &interpretation,
-        None,
-    )
-    .unwrap();
-    let record = match slot.store.read(&expected.binding.key) {
-        ReadOutcome::Found(record) => record,
-        other => panic!("pinned writer did not produce a readable record: {other:?}"),
-    };
-    assert_eq!(record.format, 1);
-    assert_eq!(record.record.allowlist, codec::allowlist_digest(source));
-    assert_eq!(record.record.binding, expected.binding);
-    assert_eq!(record.index_generation, index.generation);
-    let name = expected
-        .binding
-        .key
+    let name = digest
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let bytes = std::fs::read(slot.store.dir().join(format!("{name}.rec"))).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 1);
-    assert_eq!(bytes, pinned_bytes(&record.record, record.index_generation));
-    bytes
-}
-
-// Pin serializer, body-publication/store-framing regions and qualified helpers.
-// Discovery walks EVERY src/**/*.rs; non-catalog serializer regions must be empty.
-// Hashes are generated with the SAME extractor using --baseline 53d05a43;
-// unrelated source edits are ignored, and new serializer definitions refuse.
-struct SourcePin {
-    path: &'static str,
-    sha256: &'static str,
-}
-const PINNED_SOURCES: &[SourcePin] = &[
-    SourcePin {
-        path: "snapshots/sampled_scan/durable_tail.rs",
-        sha256: "cfe897560385b43fed8a1e6d60429dce92e365b991d6b058955039295da5c705",
-    },
-    SourcePin {
-        path: "durable_tail_store.rs",
-        sha256: "1a20538d2cd8cdafb44e6cdc093313cf877ff54cda37f6f79a4168339d4e6fb9",
-    },
-    SourcePin {
-        path: "codex_scan_diagnostics.rs",
-        sha256: "2f1433a7f722a6fed7b0883b6873cc0b9c7b54aed43953ada7b504a8a3a4be34",
-    },
-    SourcePin {
-        path: "codex_prelude_footprint.rs",
-        sha256: "2459e58e5f2bb58ecf30ac8e27a7bb04e42fb059fe7b1164ab5640958c1a47ef",
-    },
-    SourcePin {
-        path: "durable_tail_codec.rs",
-        sha256: "dc56bac8c7a9e478df9df2eff82f83f409429a43750bfb1599c14a0190c4f9a6",
-    },
-    SourcePin {
-        path: "snapshots/cache_observations.rs",
-        sha256: "8e6149a1d900c8b08fcef32c98dffb2d2068ab693b19c40ac142ba33d1daf0f9",
-    },
-    SourcePin {
-        path: "snapshots/claude_context_file_birth.rs",
-        sha256: "860991b52bf5bb2cf8cbfe97cfd0cc718bea4c04b48fe6e5730371f4cf46d588",
-    },
-    SourcePin {
-        path: "snapshots/claude_request_identity.rs",
-        sha256: "1e69a00b4ebee5293c50a5821bd762593d57fcc40a2972194313ef8ce1c0e08c",
-    },
-    SourcePin {
-        path: "snapshots/claude_response_records.rs",
-        sha256: "64f73ce9b4efea512629c05a5dc7a1c5becafd869b2d97a585f55672e170d80d",
-    },
-    SourcePin {
-        path: "snapshots/codex_counting_version.rs",
-        sha256: "958f27ce4b7bf9c91290ae7335b51176f0c70f61840fcb797cc6ccec8388dc18",
-    },
-    SourcePin {
-        path: "snapshots/codex_usage_occurrence.rs",
-        sha256: "3a136aa935ea75df886802f9ead0f92c2710a68ef5f6260b7485e138d91148a3",
-    },
-    SourcePin {
-        path: "snapshots/compaction_events.rs",
-        sha256: "022e30453631e93a71583b9e8cb451620e88685122fb27bfd9e94f5ac29f05ce",
-    },
-    SourcePin {
-        path: "snapshots/context_curve.rs",
-        sha256: "33b96640a27df9c4509a5668ccc1f34a0d4451dcfa2da5b862e2ecdcdaed6392",
-    },
-    SourcePin {
-        path: "snapshots/local_context_points.rs",
-        sha256: "32ed5c1287c1bb742c10d1920aaaa9e4ac779602deff0c1b1f7519b64a6ea700",
-    },
-    SourcePin {
-        path: "snapshots/sampled_jsonl/durable.rs",
-        sha256: "6e83200e5b58c08c228ef1bfad1151b229343bbbb1eef255d1ce4f35477c4f65",
-    },
-    SourcePin {
-        path: "snapshots/sampled_jsonl.rs",
-        sha256: "d33615424a83737c6f6a38508957ef673421dea4c9e7e645ea7920ce673888d6",
-    },
-    SourcePin {
-        path: "snapshots/session_start.rs",
-        sha256: "2a5639944e4ba77464af196159ceebd26aa471b711240ccf866dd5e07a0afad3",
-    },
-    SourcePin {
-        path: "snapshots.rs",
-        sha256: "df4fa458a11f4e45199884e69baeebeeb83c9a67f410ba9eac50334d384815b8",
-    },
-    SourcePin {
-        path: "owned_heap.rs",
-        sha256: "397dd734a76404232b6165da638c9b5ccc53ff73c2e2def4d5cb83fe9253b488",
-    },
-];
-
-#[derive(serde::Deserialize)]
-struct Extraction {
-    hashes: BTreeMap<String, String>,
-    references: BTreeSet<String>,
-}
-
-fn extract_with_python() -> Extraction {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("python3")
-        .args([
-            "-c",
-            include_str!("transition_serializer_regions.py"),
-            "--source-root",
-        ])
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("serializer extractor requires python3: {error}"));
-    // Walking the checkout, rather than embedding a fixed file catalog, notices
-    // future source files. CI and native fixture runs have the source tree.
-    // Python drains the (empty) override request before emitting hashes.
-    let mut input = child.stdin.take().unwrap();
-    input
-        .write_all(b"{}")
-        .expect("python3 serializer extractor request could not be written");
-    drop(input);
-    let output = child
-        .wait_with_output()
-        .expect("python3 serializer extractor process must complete");
-    assert!(
-        output.status.success(),
-        "python3 serializer extraction failed (walk/parse): {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout)
-        .expect("python3 serializer extractor returned invalid JSON")
-}
-
-fn verify_extraction(extraction: Extraction) -> Result<(), &'static str> {
-    let hashes = extraction.hashes;
-    for pin in PINNED_SOURCES {
-        if hashes.get(pin.path).map(String::as_str) != Some(pin.sha256) {
-            return Err(pin.path);
-        }
-    }
-    if hashes.len() != PINNED_SOURCES.len() {
-        return Err("serializer regions outside baseline catalog");
-    }
-    let inventory: BTreeMap<String, String> =
-        serde_json::from_str(include_str!("transition_serializer_helpers.json")).unwrap();
-    assert!(inventory
-        .values()
-        .all(|status| status.starts_with("pinned: ") || status.starts_with("exception: ")));
-    if extraction.references != inventory.into_keys().collect::<BTreeSet<_>>() {
-        return Err("serializer helper reference inventory changed; owner review required");
-    }
-    Ok(())
-}
-
-fn assert_pinned_body_writer() {
-    static VERIFIED: std::sync::OnceLock<Result<(), &'static str>> = std::sync::OnceLock::new();
-    VERIFIED
-        .get_or_init(|| verify_extraction(extract_with_python()))
-        .expect("pinned MAIN 53d05a43 writer changed; provide genuine archived writer bytes");
-}
-
-#[test]
-fn pinned_v1_serializer_regions_match_main() {
-    // Portable positive control: provenance must also run without native layout.
-    assert_pinned_body_writer();
-    // The sole cryptographic dependency exception has the standardized SHA-256
-    // contract; this independent vector checks its concrete implementation.
-    assert_eq!(
-        format!("{:x}", Sha256::digest(b"abc")),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-}
-
-fn pinned_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
-    let binding = &record.binding;
-    let certificate = &record.certificate;
-    out.extend_from_slice(b"ottto-dt");
-    out.extend_from_slice(&1_u16.to_le_bytes());
-    out.extend_from_slice(&record.allowlist);
-    out.push(match binding.source {
-        DurableSource::ClaudeCode => 1,
-        DurableSource::Codex => 2,
-    });
-    for part in [
-        &binding.key,
-        &binding.context,
-        &binding.scope,
-        &binding.entry,
-    ] {
-        out.extend_from_slice(part);
-    }
-    out.extend_from_slice(&generation.to_le_bytes());
-    for value in [certificate.device, certificate.inode, certificate.length] {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out.extend_from_slice(&certificate.modified.0.to_le_bytes());
-    out.extend_from_slice(&certificate.modified.1.to_le_bytes());
-    out.extend_from_slice(&certificate.birth_nanos.to_le_bytes());
-    out.extend_from_slice(&certificate.sealed_offset.to_le_bytes());
-    out.extend_from_slice(&certificate.sample_len.to_le_bytes());
-    out.extend_from_slice(&certificate.head_sha256);
-    out.extend_from_slice(&certificate.boundary_sha256);
-    out.extend_from_slice(&certificate.verified_unix_seconds.to_le_bytes());
-    out.push(u8::from(certificate.audit_debt_unix_seconds.is_some()));
-    out.extend_from_slice(
-        &certificate
-            .audit_debt_unix_seconds
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
-}
-
-fn pinned_bytes(record: &PendingRecord, generation: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    pinned_header(&mut bytes, record, generation);
-    bytes.extend_from_slice(&record.body);
-    let trailer = Sha256::digest(&bytes);
-    bytes.extend_from_slice(&trailer);
+    std::fs::write(slot.store.dir().join(format!("{name}.rec")), &bytes).unwrap();
+    assert_eq!(slot.store.missing_cause(&digest), Some("repin"));
+    assert_eq!(slot.store.read(&digest), ReadOutcome::Missing);
     bytes
 }
