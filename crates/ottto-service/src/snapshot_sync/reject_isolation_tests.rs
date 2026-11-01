@@ -57,7 +57,7 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
 /// [regress] An indexed validation hold preserves money and lets exact-ACK siblings settle.
 #[test]
 #[serial(client_report)]
-fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
+fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
     use crate::snapshots::sampled_scan::transition_fixture::{
         self as oracle,
         money_oracle::{assert_equivalent, assert_held},
@@ -293,10 +293,13 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                             .iter()
                             .position(|item| item.snapshot_fingerprint == fp)
                         {
-                            if retrying {
-                                assert_eq!(batch.len(), 1, "due retries are singleton requests");
-                            }
                             if reject {
+                                if retrying {
+                                    assert!(
+                                        batch.iter().any(|item| item.source_session_id == "synthetic-fresh"),
+                                        "the repeat indexed rejection shares an ordinary batch with fresh work"
+                                    );
+                                }
                                 if !retrying && batch.len() > 1 {
                                     assert!(index > 0, "post-packing nonzero request index");
                                 }
@@ -311,7 +314,6 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                                     batch.len(),
                                 )));
                             }
-                            assert_eq!(batch.len(), 1, "due retries are singleton requests");
                         }
                         let response = ack(&batch)?;
                         response.validate_entity_ack(&wire(&batch))?;
@@ -362,8 +364,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                 .accepted_identity_buckets
                 .bind_test_key(Some([0x42; 32]));
             let mut cold_backend = BTreeMap::new();
-            // The comparison independently accepts every cold Full body. It
-            // does not apply the due-retry-only assertion in the retry backend.
+            // The comparison independently accepts every cold Full body.
             let mut count = 0;
             upload_resumable_batches_with_body_witness(
                 &items,
@@ -409,6 +410,16 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                 assert_eq!(accepted, 1);
                 assert_eq!(emitted.len(), 1);
                 assert_eq!(emitted[0].source_session_id, "synthetic-fresh");
+                assert_eq!(
+                    progress
+                        .accepted_body_witnesses
+                        .get(&emitted[0].snapshot_fingerprint),
+                    Some(&snapshot_upload_body_witness(&emitted[0])),
+                    "the fresh sibling has its exact ACK"
+                );
+                assert_eq!(progress.quarantined_fingerprints.len(), 1);
+                assert!(!progress.accepted_fingerprints.contains(&fp));
+                assert!(!progress.accepted_body_witnesses.contains_key(&fp));
                 let record = &progress.quarantined_fingerprints[&fp];
                 assert_eq!(
                     record.disposition,
@@ -425,6 +436,11 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                 assert_eq!(accepted, 1);
             });
             assert!(progress.quarantined_fingerprints.is_empty());
+            assert_eq!(
+                progress.accepted_body_witnesses.get(&fp),
+                Some(&snapshot_upload_body_witness(&poison)),
+                "eventual acceptance clears the hold with an exact ACK"
+            );
             let mut count = 0;
             upload_resumable_batches_with_body_witness(
                 &items,
@@ -460,12 +476,17 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
     crate::client_report::reset_for_test();
 }
 
-/// [regress] A page ending in one indexed refusal must settle its other
-/// files, including a re-read file whose unchanged entity was not resent
-/// (its committed witness was cleared). An ACK-only checkpoint returned that
-/// file to the cleared witness, so it was read again next pass.
-#[test]
-fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
+/// A scanned semantic-no-op sibling, an ACKed sibling, and one indexed
+/// refusal with durable quarantine custody, for sibling-settlement regressions.
+pub(in crate::snapshot_sync) struct IndexedRefusalFixture {
+    pub committed: ScanIndex,
+    pub scanned: ScanIndex,
+    pub progress: SnapshotUploadProgress,
+    pub sibling: String,
+    pub refused: String,
+}
+
+pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixture {
     let entry = |fingerprint: &str, source: &str| -> crate::snapshots::ScanIndexEntry {
         serde_json::from_value(json!({"size_bytes": 1, "modified_unix_seconds": 2,
             "source_file_fingerprint": source, "last_snapshot_fingerprint": fingerprint}))
@@ -528,6 +549,29 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
     assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
     assert_eq!(accepted, 1);
     assert!(progress.quarantined_fingerprints.contains_key(&refused));
+
+    IndexedRefusalFixture {
+        committed,
+        scanned,
+        progress,
+        sibling,
+        refused,
+    }
+}
+
+/// [regress] A page ending in one indexed refusal must settle its other
+/// files, including a re-read file whose unchanged entity was not resent
+/// (its committed witness was cleared). An ACK-only checkpoint returned that
+/// file to the cleared witness, so it was read again next pass.
+#[test]
+fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
+    let IndexedRefusalFixture {
+        committed,
+        scanned,
+        progress,
+        sibling,
+        refused,
+    } = indexed_refusal_fixture();
 
     let ack_only = scanned.committable_subset_with_local_holds(
         &committed,

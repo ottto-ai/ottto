@@ -2925,7 +2925,7 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     }
 }
 
-mod reject_isolation_tests {
+pub(in crate::snapshot_sync) mod reject_isolation_tests {
     include!("reject_isolation_tests.rs");
 }
 

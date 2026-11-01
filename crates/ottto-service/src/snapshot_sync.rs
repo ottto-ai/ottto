@@ -11482,14 +11482,6 @@ where
             body_length.saturating_add(1),
             batch_class(&items[index]),
         );
-        if progress
-            .active_quarantine_retries
-            .contains(fingerprint(&items[index]))
-        {
-            order.push(item);
-            unit_ends.push(order.len());
-            continue;
-        }
         match literal_family(&items[index]) {
             Some(root) => literal_families.entry(root).or_default().push(item),
             None => {
@@ -11596,14 +11588,9 @@ where
         let unit_bytes = unit
             .iter()
             .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
-        let singleton_retry = unit.len() == 1
-            && progress
-                .active_quarantine_retries
-                .contains(fingerprint(&items[unit[0].0]));
         let unit_class = (unit[0].2, catchup);
         if !batch.is_empty()
-            && (singleton_retry
-                || batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
+            && (batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
                 || batch_bytes.saturating_add(unit_bytes) > SNAPSHOT_BATCH_MAX_BYTES
                 || current_batch_class != Some(unit_class))
         {
@@ -11613,10 +11600,6 @@ where
         current_batch_class = Some(unit_class);
         batch.extend(unit.iter().map(|(index, _, _)| *index));
         batch_bytes = batch_bytes.saturating_add(unit_bytes);
-        if singleton_retry {
-            batches.push_back((std::mem::take(&mut batch), false));
-            batch_bytes = 2;
-        }
     }
     if !batch.is_empty() {
         batches.push_back((batch, false));
