@@ -190,7 +190,10 @@ impl<S: HeapLayoutBound> HeapLayoutBound for TranscriptCache<S> {
             count_limit,
         } = self;
         entries.heap_bound(c)?;
-        custody.heap_bound(c)?;
+        // The ON-only custody map adds no visit while absent (`fields!` optional).
+        if custody.is_some() {
+            custody.heap_bound(c)?;
+        }
         clock.heap_bound(c)?;
         byte_limit.heap_bound(c)?;
         entry_limit.heap_bound(c)?;

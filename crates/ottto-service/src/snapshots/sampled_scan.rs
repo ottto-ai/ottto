@@ -648,8 +648,8 @@ pub(super) struct Active {
     pub(super) retained_usage: Option<u64>,
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
-crate::heap_layout_bound::fields!(Active; no_record, restored_behind_accepted, key, scope, mode, audit_due, retained_hint,
-    retained_finalization_charge, retained_usage, reinsertion);
+crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
+    retained_finalization_charge, retained_usage, reinsertion; inline no_record, restored_behind_accepted);
 
 impl Context {
     #[inline(never)]
