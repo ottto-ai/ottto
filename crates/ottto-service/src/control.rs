@@ -27927,20 +27927,36 @@ X-API-Key = "otel_redacted"
     #[serial]
     #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
+        use crate::otlp_relay::tests::with_bind_plan;
+
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
-        let port = ports[1];
         write_startup_relay_settings(
             &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(port),
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
         );
-        let _busy_preferred = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let default_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(default_listener.local_addr().unwrap().port(), ports[0]);
-        // Keep default occupied too; the first fallback is the preferred busy
-        // port, so the next candidate must be selected.
-        let fallback_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(fallback_listener.local_addr().unwrap().port(), ports[2]);
+        // Plan the candidate binds: any real candidate number can be held by a
+        // parallel test's ephemeral port, so the free one is a held listener.
+        let busy = || -> std::io::Result<std::net::TcpListener> {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        };
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let default_listener = with_bind_plan([(ports[1], busy()), (ports[0], Ok(held))], || {
+            crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+        });
+        assert_eq!(default_listener.local_addr().unwrap(), addr);
+        // Default busy too: the preferred port is not retried as a fallback,
+        // so the next candidate is selected.
+        let fallback_listener = with_bind_plan(
+            [
+                (ports[1], busy()),
+                (ports[0], busy()),
+                (ports[2], Ok(default_listener)),
+            ],
+            || crate::otlp_relay::bind_startup_local_relay_listener().unwrap(),
+        );
+        assert_eq!(fallback_listener.local_addr().unwrap(), addr);
         fs::remove_dir_all(root).unwrap();
     }
 
