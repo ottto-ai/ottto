@@ -165,7 +165,7 @@ pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
 pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
-pub(crate) const MAX_ITEM_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
 pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
@@ -508,7 +508,7 @@ pub(crate) struct Grouping {
     accepted_rows_vanished: u64,
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
-    /// X-B1 (Lead B 2026-10-31): bucket rows sent with `copy_invalidated`,
+    /// Bucket rows sent with `copy_invalidated`,
     /// by bucket start. Empty unless the copy-prefix switch is on and the
     /// receiver advertised option (ii) retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
@@ -1380,7 +1380,7 @@ const MARKER_BYTES: usize = r#","identity_retained":true"#.len();
 /// Bytes one `copy_invalidated` member adds to a compact wire row.
 const COPY_INVALIDATED_BYTES: usize = r#","copy_invalidated":true"#.len();
 
-/// X-B1 (Lead B 2026-10-31): bucket rows F5 tombstoned, this pass or earlier
+/// Bucket rows the copy-derived check tombstoned, this pass or earlier
 /// and still tombstoned, flagged so a retaining receiver never re-applies
 /// their retained proof. One bool per bucket row, so bounded by the rows the
 /// item carries; flags are reserved before measurement like markers. The
@@ -1601,7 +1601,7 @@ fn fresh_row_value(
     ))
 }
 
-/// SOURCE option (ii), per bucket row, against the witnessed proved ledger:
+/// Option (ii) retention, per bucket row, against the witnessed proved ledger:
 /// - today's proof equals the ACKed proof in a closed hour: marker;
 /// - today's transcript no longer proves the row (none, refused): marker;
 /// - different proof: fresh tags, counted `accepted_share_changed`;
@@ -1748,7 +1748,7 @@ pub(crate) struct CopyInvalidation {
     row: RowKey,
 }
 
-/// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
+/// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
 /// markers lent to that very row's requests (ones the copy-prefix switch
 /// re-derived without them) is copy-derived: it is treated as never accepted
@@ -1793,7 +1793,7 @@ fn copy_derived_rows(
         else {
             continue;
         };
-        // Lead B Addendum 4: without per-ACK provenance, a freeze holding any
+        // Without per-ACK provenance, a freeze holding any
         // share copied markers did not lend may be a corrected body's, and
         // evidence this pass could not read may still prove the latest
         // proof. Both keep #909's protection, counted.
@@ -3057,10 +3057,10 @@ pub(crate) struct RequestAccounts {
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
     /// This page could not read the family's strict sidecar evidence; no
-    /// account may fill its shares (SOURCE: unhealthy root is all-Unknown).
+    /// account may fill its shares (an unhealthy root is all-Unknown).
     unhealthy_no_fallback: bool,
-    /// The uniform wire account a non-discard unhealthy read cleared (Lead B
-    /// Addendum 4); the bound owner admits the Unknown body only if it was its own.
+    /// The uniform wire account a non-discard unhealthy read cleared; the
+    /// bound owner admits the Unknown body only if it was its own.
     unhealthy_cleared_account: Option<String>,
     /// Copy-prefix switch on: per counted request whose account a copied
     /// marker had lent (the copy decision re-derived it without the marker),
@@ -3073,7 +3073,7 @@ pub(crate) struct RequestAccounts {
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis, account_source);
 crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
 
-/// Requests placed by Ron's carry rule (class N, local counts line).
+/// Requests placed by the carry rule (local counts line).
 #[derive(Clone, Copy, Debug, Default)]
 struct CarryCounts {
     forward: u64,
@@ -3090,8 +3090,8 @@ struct CarryCounts {
 }
 crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, keys_over_cap);
 
-/// Ron's rule under `session_request_account_source:v1`, within one
-/// transcript in native order (SOURCE 2026-10-31): a gap (a request with no
+/// The carry rule under `session_request_account_source:v1`, within one
+/// transcript in native order: a gap (a request with no
 /// telemetry row) takes the account the latest earlier request's own
 /// telemetry named, marked `carried_forward`; gaps before the first such
 /// request take it, marked `carried_backward`. Only own telemetry seeds, never
@@ -3927,7 +3927,7 @@ pub(crate) fn reconcile_request_accounts(
     no_fallback
 }
 
-/// Lead B Addendum 4 (option 1): the account this page cleared from `item` for
+/// The account this page cleared from `item` for
 /// a non-discard unhealthy read. If it was the bound owner's, main would have
 /// uploaded the body, so it uploads Unknown now instead of being held.
 pub(crate) fn unhealthy_cleared_account(item: &SnapshotItem) -> Option<&str> {
@@ -4591,7 +4591,7 @@ impl<'a> ScanEvidence<'a> {
 
     /// Adds this scan's status-coverage copy: the `transcript_email` window
     /// check, and each qualified status-pass (login, org) pairing as org
-    /// membership (plan §2a.12(b)). `None` (feed off or failed) adds nothing.
+    /// membership. `None` (feed off or failed) adds nothing.
     pub(crate) fn with_status_coverage(
         mut self,
         coverage: Option<crate::claude_status_coverage::Ledger>,
@@ -5068,7 +5068,7 @@ impl DesktopCensusWitness {
     }
 }
 
-fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
+pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
     let mut digest = sha2::Sha256::new();
     for dir in store_dirs {
         digest.update(dir.to_string_lossy().as_bytes());
