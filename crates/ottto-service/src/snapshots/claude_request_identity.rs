@@ -2370,13 +2370,6 @@ fn shed_display_leaves(
     let rest = grouping.item_bytes(&probe);
     drop(probe);
     let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= max_item_bytes;
-    if without_curve > max_item_bytes {
-        // No curve can fit: go straight to the unavailable curve without
-        // measuring the whole body once per pruned point.
-        super::fit_context_curve(item, |_| false);
-    } else {
-        super::fit_context_curve(item, fits);
-    }
     while !fits(item) {
         let Some(cache) = item.cache_observations.as_mut() else {
             break;

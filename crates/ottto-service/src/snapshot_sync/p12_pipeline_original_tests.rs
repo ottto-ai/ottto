@@ -415,7 +415,6 @@ impl RearmFixture {
             committed_index: index,
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "replay-generation-rearm".to_owned(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),

@@ -351,10 +351,10 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     assert_eq!(measured.item_bytes, identity::item_bytes(&second));
 }
 /// [money] [regress] #909 P0 (05f7bf85: 582 hours over 6 accounts, untagged
-/// baseline over the cap): the context curve and cache observations are shed
-/// before any money tag. Every accepted share keeps its tag; totals unchanged.
+/// baseline over the cap): cache observations are shed before any money tag.
+/// Every accepted share keeps its tag; totals unchanged.
 #[test]
-fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
+fn sticky_budget_sheds_cache_before_stripping_any_tag() {
     let (mut item, mut proof) = sticky_session(48);
     item.session_display_name = Some("x".into());
     item.workspace_display_label = Some("x".into());
@@ -377,8 +377,6 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
     let mut expected = padded.clone();
     sticky_apply(&mut expected, &proof, &accepted).unwrap();
 
-    padded.context_curve = Some(max_fractional_context_curve_fixture());
-    let curve_points = padded.context_curve.as_ref().unwrap().retained_point_count;
     let upsert = crate::snapshots::cache_adapter_tests::cache_fixture_item()
         .cache_observations
         .unwrap()
@@ -427,14 +425,12 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
         .sum::<u64>(),
         bytes("item")
     );
-    assert!(padded.context_curve.as_ref().unwrap().retained_point_count < curve_points);
     let cache = padded.cache_observations.take().unwrap();
     assert_eq!(cache.coverage, "partial");
     assert!(cache.operations.len() < cache_observations::MAX_OPERATIONS);
     assert_eq!(cache.omitted_observation_count, None);
     sticky_assert_reconciled(&padded);
     // Only the display leaves changed: tags, shares, refusals and totals match.
-    padded.context_curve = None;
     padded.snapshot_fingerprint = expected.snapshot_fingerprint.clone();
     assert_eq!(
         serde_json::to_value(&padded).unwrap(),
@@ -2487,11 +2483,10 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             .is_some_and(|n| n > 0)
     ));
     let curve = serde_json::to_value(&item.context_curve).unwrap();
-    apply_upload_policy_with_item_limit(
+    apply_upload_policy(
         SnapshotSource::ClaudeCode,
         std::slice::from_mut(&mut item),
         SnapshotUploadPolicy::default(),
-        3_145_728,
     );
     assert_eq!(serde_json::to_value(&item.context_curve).unwrap(), curve);
     let mut request = valid_v6_batch_request();
@@ -2510,11 +2505,10 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     // The tagged heap fixture uses a 3 MiB cap. Pad the same untagged base
     // separately so the generic upload fixture fits the receiver's 2 MiB cap.
     let (mut generic_item, _) = sticky_pad_to_bytes(&base, 1_000_000);
-    apply_upload_policy_with_item_limit(
+    apply_upload_policy(
         SnapshotSource::ClaudeCode,
         std::slice::from_mut(&mut generic_item),
         SnapshotUploadPolicy::default(),
-        2_097_152,
     );
     // The receiver advertises the same item limit for every source.
     for source in [
@@ -2537,11 +2531,10 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             "{source:?}: {wire_bytes}"
         );
         let before = serde_json::to_vec(&charged_request.snapshots).unwrap();
-        apply_upload_policy_with_item_limit(
+        apply_upload_policy(
             source,
             &mut charged_request.snapshots,
             SnapshotUploadPolicy::default(),
-            2_097_152,
         );
         assert!(
             serde_json::to_vec(&charged_request.snapshots).unwrap() == before,
@@ -2552,19 +2545,6 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
         assert!(validate_snapshot_batch_request(&charged_request)
             .unwrap_err()
             .contains("wire body"));
-        let mut default_items = charged_request.snapshots.clone();
-        let mut no_hint_items = default_items.clone();
-        apply_upload_policy(source, &mut default_items, SnapshotUploadPolicy::default());
-        apply_upload_policy_with_item_limit(
-            source,
-            &mut no_hint_items,
-            SnapshotUploadPolicy::default(),
-            identity::effective_item_cap(None),
-        );
-        assert_eq!(
-            serde_json::to_vec(&no_hint_items).unwrap(),
-            serde_json::to_vec(&default_items).unwrap()
-        );
     }
     // Lead B's increased-cap last resort: preserve tags and money, and use
     // the existing upload hold instead of sending a smaller stripped revision.
