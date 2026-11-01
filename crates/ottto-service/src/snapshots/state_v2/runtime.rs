@@ -1145,6 +1145,139 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
     Ok(())
 }
 
+/// Store-only rows of one kind, read on the graph's own session in one short
+/// read transaction. `Some`: those families' rows by key (a missing row is no
+/// callback). `None`: the whole kind, complete by its manifest count. Each
+/// value comes with its row digest as stored. A graph whose generation is not
+/// the session's committed one, or a store changed elsewhere, holds.
+pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
+    index: &ScanIndex,
+    kind: &str,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
+) -> Result<()> {
+    let runtime = index
+        .v2()
+        .persistence_v2
+        .as_ref()
+        .ok_or(Hold::DbUnavailable)?;
+    let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+    let session = guard.as_mut().ok_or(Hold::DbUnavailable)?;
+    ensure!(
+        !session.reload && !session.db.reload_required(),
+        Hold::DbUnavailable
+    );
+    let stamp = session.db.stamp()?;
+    ensure!(
+        stamp == session.stamp && index.generation == stamp.0,
+        Hold::DbUnavailable
+    );
+    let mut tx = session.db.begin(TxnMode::Read)?;
+    let expected = match roots {
+        Some(_) => None,
+        None => {
+            let h = tx
+                .get(&mapper::key(kind, "", 0)?)?
+                .context("state_v2_missing_manifest")?;
+            Some(mapper::read::<usize>(&mut tx, &h, None)?)
+        }
+    };
+    let mut count = 0_usize;
+    kinds_accounts::visit(&mut tx, kind, roots, |tx, h| {
+        let RowKey::Record {
+            key_bytes,
+            position,
+            ..
+        } = &h.key
+        else {
+            bail!("state_v2_record_key")
+        };
+        if *position == 0 {
+            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+            return Ok(());
+        }
+        ensure!(*position == 1, "state_v2_member_position");
+        count += 1;
+        let mut digests = mapper::Digests::new();
+        let value = mapper::read(tx, &h, Some(&mut digests))?;
+        let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
+        f(mapper::family(key_bytes)?, value, digest)
+    })?;
+    ensure!(
+        expected.map_or(true, |expected| expected == count),
+        "state_v2_missing_member"
+    );
+    Ok(())
+}
+
+/// Cold usage pending: load the families a page names before it
+/// accumulates (`Some`), or every family before a decision that joins them
+/// (`None`). A missing, changed or unreadable row, or a store this graph does
+/// not hold, is Unknown: nothing is installed for the caller to apply, and
+/// the caller refuses its whole decision. Counted.
+pub(in super::super) fn load_usage(
+    index: &mut ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    if usage.cold().is_none() {
+        return Ok(());
+    }
+    let wanted = match roots {
+        Some(roots) => {
+            let wanted = usage.unloaded(roots.iter().map(String::as_str));
+            if wanted.is_empty() {
+                return Ok(());
+            }
+            Some(wanted)
+        }
+        None if usage.all().is_ok() => return Ok(()),
+        None => None,
+    };
+    let result = (|| -> Result<()> {
+        let mut read = Vec::new();
+        read_cold(
+            index,
+            "usage.pending",
+            wanted.as_ref(),
+            &mut |root, value, digest| {
+                read.push((root, value, digest));
+                Ok(())
+            },
+        )?;
+        let cold = index
+            .claude_usage_family_pending
+            .cold_mut()
+            .ok_or(Hold::DbUnavailable)?;
+        for (root, value, digest) in read {
+            cold.install(root, value, digest)?;
+        }
+        match &wanted {
+            Some(wanted) => ensure!(
+                wanted.iter().all(|root| cold.loaded().contains_key(root)),
+                super::super::usage_pending::Unknown
+            ),
+            None => cold.complete()?,
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        telemetry::count("usage_pending_unknown", 1);
+    }
+    result
+}
+
+/// End a decision that loaded every cold usage family: values unchanged
+/// since their row was read return to heads, except the `keep` families.
+pub(in super::super) fn settle_usage(
+    index: &mut ScanIndex,
+    keep: &std::collections::BTreeSet<String>,
+) {
+    if let Some(cold) = index.claude_usage_family_pending.cold_mut() {
+        cold.settle(keep, |family| mapper::digest(family).ok());
+    }
+}
+
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;

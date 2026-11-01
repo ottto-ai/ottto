@@ -217,6 +217,14 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
+                // Loaded usage families now match the rows this save left.
+                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
+                    let rows = &digests.rows;
+                    cold.saved(|root| {
+                        let key = mapper::key("usage.pending", root, 1).ok()?;
+                        rows.get(&key).copied()
+                    });
+                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
