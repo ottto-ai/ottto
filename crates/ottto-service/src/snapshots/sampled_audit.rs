@@ -608,10 +608,7 @@ mod open_backoff_tests;
 
 /// The queued progress Full for `key` passed its secure open: the slot's
 /// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends. Terminal-off clears throttling, NOT the
-/// owed verification: another key may own the slot, so it retains the exact
-/// numeric due in the bounded map until a marker/native acquisition carries
-/// it or a completed source verification retires it.
+/// any failed-open backoff ends.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
     if let Some(slot) = index
         .held_audit_progress
@@ -619,9 +616,7 @@ pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-        {
-            with_open_backoff(|backoff| backoff.keys.remove(key));
-        }
+        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
 }
 

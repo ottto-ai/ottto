@@ -1,15 +1,17 @@
 # Delete Claude terminal-off
 
 Terminal-off will not be enabled. Remove its marker, scheduling/retention
-containment, strict-reader allowance, and opt-in test variants. Production keeps
-the previous absent-marker behavior: ordinary terminal completion, census,
-upload/ACK ordering, checkpoint identity, and clock reads stay unchanged.
+containment, ON strict-cohort pass budget, and opt-in test variants. Production
+keeps the previous absent-marker behavior: ordinary terminal completion, census,
+upload/ACK ordering, checkpoint identity, and clock reads stay unchanged. The
+ordinary reader keeps its protected per-pair allowance; that helper moves
+unchanged from `claude_local_otel/strict_budget.rs` into `claude_local_otel.rs`.
 
-The switch macro and thread-scoped test guard move to `snapshots/local_switch.rs`
-because the existing money-freshness switch still uses them. The terminal-off
-invocation is deleted. Only the unchanged OFF checkpoint test retains a test-only
-`claude_terminal_off()` returning false; its source moves to
-`snapshots/checkpoint_main_tests.rs`.
+The switch macro, thread-scoped test guard and `marker_at` helper move to
+`snapshots/local_switch.rs`, which the other local switches (money freshness,
+admission re-offer, resumed prefix) still use. The terminal-off invocation is
+deleted, and no `claude_terminal_off()` remains, including in tests. The OFF
+checkpoint test moves to `snapshots/checkpoint_main_tests.rs`.
 
 `traversal_healthy` retains the gate's false conjunct: an existing Claude retry
 admission still prevents healthy completion. It must not become
