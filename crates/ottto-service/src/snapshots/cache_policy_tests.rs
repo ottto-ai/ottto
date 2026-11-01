@@ -1503,7 +1503,9 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
 /// refused and the next page is Full again. Small residents keep `|P*|` above
 /// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
 /// Full has no X_out (ruling 5), so nothing proves its output fits and it
-/// evicts nothing, whatever the residents' rank.
+/// evicts nothing, even beside strictly older residents. Its equal and newer
+/// rows are dropped: strictly-older ranking already keeps those residents for
+/// every source, and the Claude rows pin that.
 #[test]
 fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     if unexecuted("full_singleton_release") {
@@ -1512,12 +1514,19 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
+    let ranks = [
+        (now - OLD_SECONDS, true),
+        (file_modified, false),
+        (newer_modified, false),
+    ];
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for (idle_modified, older) in [
-            (now - OLD_SECONDS, true),
-            (file_modified, false),
-            (newer_modified, false),
-        ] {
+        // Codex: the strictly-older row alone, the only rank a release reaches.
+        let rows = if source == SnapshotSource::Codex {
+            &ranks[..1]
+        } else {
+            &ranks[..]
+        };
+        for &(idle_modified, older) in rows {
             let releases = older && source == SnapshotSource::ClaudeCode;
             let label = format!("{source:?} idle_modified={idle_modified}");
             let cache = Arc::new(sampled_scan::SharedCache::default());
