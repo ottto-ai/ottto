@@ -752,6 +752,18 @@ pub struct SnapshotBatchResponse {
     pub rejected_entities: Vec<SnapshotEntityRejection>,
     #[serde(default)]
     pub conflict_entities: Vec<SnapshotEntityRef>,
+    /// Local-only, keyed by conflicted snapshot fingerprint. Bound from the
+    /// request at the network boundary; never read from the response wire.
+    #[serde(skip)]
+    pub(crate) conflict_rescans: std::collections::BTreeMap<String, SnapshotConflictRescan>,
+}
+
+/// The exact refused request body a head-CAS challenge was minted over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotConflictRescan {
+    pub(crate) revision_v2_hash: String,
+    /// The refused body already carried an answer to an earlier challenge.
+    pub(crate) answered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -894,6 +906,36 @@ pub(crate) fn snapshot_ack_body_witness_version(
 }
 
 impl SnapshotBatchResponse {
+    /// Bind each challenged head-CAS conflict to the revision v2 hash its
+    /// request body carried, recomputed with the same envelope function the
+    /// serializer used. A later upload answers the challenge through the
+    /// backend's existing rescan handshake. Call after ACK validation.
+    pub(crate) fn bind_conflict_rescans(&mut self, request: &SnapshotBatchRequest) {
+        let Some(source) = crate::snapshots::snapshot_source_from_api_slug(&request.source) else {
+            return;
+        };
+        for reference in &self.conflict_entities {
+            if !valid_snapshot_head_token(reference.head_challenge.as_deref()) {
+                continue;
+            }
+            let Some(item) = request.snapshots.iter().find(|item| {
+                item.source_session_id == reference.source_session_id
+                    && item.snapshot_fingerprint == reference.snapshot_fingerprint
+            }) else {
+                continue;
+            };
+            let envelope =
+                crate::snapshots::snapshot_semantic_envelope(source, item, request.upload_policy);
+            self.conflict_rescans.insert(
+                reference.snapshot_fingerprint.clone(),
+                SnapshotConflictRescan {
+                    revision_v2_hash: envelope.revision_v2_hash,
+                    answered: envelope.conflict_head_challenge.is_some(),
+                },
+            );
+        }
+    }
+
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -1030,6 +1072,7 @@ impl SnapshotBatchResponse {
 
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
+        let mut answered = std::collections::BTreeSet::new();
         for item in &request.snapshots {
             let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
@@ -1038,6 +1081,9 @@ impl SnapshotBatchResponse {
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
+            if item.cache_conflict_answer.is_some() {
+                answered.insert(key.clone());
+            }
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())
@@ -1063,6 +1109,13 @@ impl SnapshotBatchResponse {
             if reference.body_witness_version.as_ref() != Some(expected_version)
                 || reference.body_witness_digest.as_ref() != Some(expected_digest)
             {
+                if answered.contains(&key) {
+                    warn_answered_body_witness_rejection(
+                        &reference.source_session_id,
+                        *expected_version,
+                        reference.body_witness_version,
+                    );
+                }
                 return Err(anyhow!(
                     "snapshot ACK lacks exact durable context curve body witness proof"
                 ));
@@ -1153,6 +1206,38 @@ impl SnapshotBatchResponse {
         }
         Ok(())
     }
+}
+
+/// The one residual risk of a head-CAS challenge answer: the server stored
+/// it, but its ACK echoes a different body witness, so this cycle cannot
+/// settle. The next upload conflicts again and the existing refused-answer
+/// count and window take over. Session hash and versions only; no content.
+fn warn_answered_body_witness_rejection(
+    source_session_id: &str,
+    expected_version: u64,
+    echoed_version: Option<u64>,
+) {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(source_session_id.as_bytes());
+    let line = format!(
+        "warning: local snapshot head-CAS answer ACK rejected: session_hash={:02x}{:02x}{:02x}{:02x} \
+         witness_version={expected_version} echoed_witness_version={} \
+         reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
+    );
+    eprintln!("{line}");
+    #[cfg(test)]
+    ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANSWERED_WITNESS_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn valid_snapshot_head_token(value: Option<&str>) -> bool {
@@ -4554,6 +4639,7 @@ mod tests {
         accepted_entities: Vec<SnapshotEntityRef>,
     ) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted,
             sessions_reconciled: 0,
             session_ids: Vec::new(),
