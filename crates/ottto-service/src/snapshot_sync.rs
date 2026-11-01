@@ -3674,10 +3674,9 @@ fn clear_source_manifests_for_test() {
 /// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
 ///
 /// The cost tiers are allowed to stretch a quiet source out to here and no
-/// further, and the 6-hour full sweep is unconditional on top of it: neither the
-/// filesystem watcher nor a server directive can suppress a sweep, because a
-/// watcher that silently stops delivering events would otherwise stop collection
-/// with every health signal green.
+/// further: neither the filesystem watcher nor a server directive can suppress
+/// a scan, because a watcher that silently stops delivering events would
+/// otherwise stop collection with every health signal green.
 const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How long the loop is willing to sit inside one wait before re-deciding.
@@ -3714,7 +3713,6 @@ fn record_finished_snapshot_cadence(
         cadence.record_scan_failure(now);
     } else {
         cadence.record_scan_success(now, accepted);
-        cadence.record_full_sweep(now);
     }
 }
 
@@ -7635,6 +7633,14 @@ fn finish_sync_source(
         ledger.set_retained_enabled(retained_enabled);
         ledger.set_item_cap(identity_item_cap);
     }
+    upload_progress
+        .accepted_identity_buckets
+        .set_account_source_enabled(
+            activity_hint
+                .session_request_account_source_contract
+                .as_deref()
+                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
+        );
     // Settled-history segments: only the server's exact token cuts a body.
     let history_segments_now = (activity_hint.session_history_segments_contract.as_deref()
         == Some(crate::snapshots::history_segments::CONTRACT))
@@ -10384,7 +10390,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // A settled-history size hold joins the same custody (any item cap).
     let mut identity_custody = (wire_budget.max_item_bytes
         > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES
-        || history_segments.is_some())
+        || history_segments.is_some()
+        || accepted_identity_buckets.is_some_and(
+            crate::snapshots::claude_request_identity::AcceptedBuckets::account_source_enabled,
+        ))
     .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {

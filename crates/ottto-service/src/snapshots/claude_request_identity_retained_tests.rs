@@ -80,6 +80,7 @@ fn retained_wide_open_hour(
                 login: Some(format!("{:064x}", 100 + login)),
                 org: Some("f".repeat(64)),
                 basis: identity::TELEMETRY,
+                account_source: None,
             }),
         });
     }
@@ -806,6 +807,7 @@ fn copy_unproven_twin_rows_freeze_and_prove_separately() {
                         login: Some(format!("{login:064x}")),
                         org: Some(format!("{:064x}", login + 32)),
                         basis: identity::TELEMETRY,
+                        account_source: None,
                     }),
                 })
                 .collect::<Vec<_>>()

@@ -110,6 +110,7 @@ fn sticky_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
                         login: Some(format!("{key:064x}")),
                         org: Some(format!("{:064x}", key + 32)),
                         basis: identity::TELEMETRY,
+                        account_source: None,
                     }),
                 });
             }
@@ -460,6 +461,7 @@ fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_
             login: Some(login.to_string().repeat(64)),
             org: Some("f".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         });
         proof.push(extra);
     }
@@ -751,6 +753,7 @@ fn sticky_unencodable_open_bucket_does_not_erase_independent_older_accepted_proo
             login: Some(format!("{n:064x}")),
             org: None,
             basis: identity::TELEMETRY,
+            account_source: None,
         });
         proof.push(extra);
         item.model_usage[0].input_tokens += 1;
@@ -850,6 +853,7 @@ fn sticky_assert_joint_pair_survives(large_parts: bool) {
                 login: Some(format!("{n:064x}")),
                 org: None,
                 basis: identity::TELEMETRY_LOGIN,
+                account_source: None,
             });
             proof.push(extra);
         }
@@ -1001,6 +1005,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
                     login: None,
                     org: Some(org.to_string().repeat(64)),
                     basis: identity::TRANSCRIPT_ORG,
+                    account_source: None,
                 }),
                 Some(bad_hour),
             ));
@@ -2529,6 +2534,7 @@ fn segment_session_until(
                 login: Some(format!("{key:064x}")),
                 org: Some(format!("{:064x}", key + 32)),
                 basis: identity::TELEMETRY,
+                account_source: None,
             });
         }
         sticky_receiver_totals(&mut item);
@@ -2587,6 +2593,7 @@ fn hot_session(days: i64, models: usize) -> (SnapshotItem, Vec<Contribution>, i6
                         login: Some(format!("{key:064x}")),
                         org: Some(format!("{:064x}", key + 32)),
                         basis: identity::TELEMETRY,
+                        account_source: None,
                     }),
                 });
             }
@@ -2973,6 +2980,7 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             login: Some(format!("{index:064x}")),
             org: Some("a".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         });
     }
     let before = sticky_money(&key_item);
@@ -3085,6 +3093,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
                     login: None,
                     org: Some(D64.into()),
                     basis: identity::TRANSCRIPT_ORG,
+                    account_source: None,
                 }),
             });
         }
@@ -3154,6 +3163,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
             login: None,
             org: Some(D64.into()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         }),
     });
     let top = over

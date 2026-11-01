@@ -40,9 +40,9 @@ impl std::fmt::Debug for FingerprintKey {
     }
 }
 /// Third field: epoch changed this pass; fourth: per-cycle retained
-/// capability; fifth: runtime receiver item cap; sixth: the sibling
-/// settled-history segment ledger, which has no session cap and no recency
-/// eviction.
+/// capability; fifth: runtime receiver item cap; sixth: per-cycle
+/// account-source capability; seventh: the sibling settled-history segment
+/// ledger, which has no session cap and no recency eviction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
@@ -50,6 +50,7 @@ pub(crate) struct AcceptedBuckets(
     bool,
     bool,
     usize,
+    bool,
     bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
@@ -352,12 +353,17 @@ fn row_proof(key: &FingerprintKey, row: &Value, evidence: &Value) -> Option<[u8;
             None => None,
             Some(reference) => {
                 let entry = evidence.get(usize::try_from(reference.as_u64()?).ok()?)?;
+                // A row holding a carried share is never proof.
+                if entry.get("account_source").is_some() {
+                    return None;
+                }
                 Some(authority_hash(
                     key,
                     &AuthorityKey {
                         login: part["account_identifier_hash"].as_str().map(str::to_owned),
                         org: entry["provider_workspace_hash"].as_str().map(str::to_owned),
                         basis: entry["identity_basis"].as_str().and_then(basis_token)?,
+                        account_source: None,
                     },
                 ))
             }
@@ -426,18 +432,22 @@ impl AcceptedSession {
                             else {
                                 continue;
                             };
-                            Some(authority_hash(
-                                fingerprint_key,
-                                &AuthorityKey {
-                                    login: part["account_identifier_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    org: evidence["provider_workspace_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    basis,
-                                },
-                            ))
+                            // A carried share is placement, never a proven authority.
+                            evidence.get("account_source").is_none().then(|| {
+                                authority_hash(
+                                    fingerprint_key,
+                                    &AuthorityKey {
+                                        login: part["account_identifier_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        org: evidence["provider_workspace_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        basis,
+                                        account_source: None,
+                                    },
+                                )
+                            })
                         }
                     };
                     row_shares.insert(AcceptedShare {
@@ -645,6 +655,7 @@ impl<'de> Visitor<'de> for Hints {
             false,
             false,
             0,
+            false,
             self.segments,
         ))
     }
@@ -659,6 +670,7 @@ impl<'de> Visitor<'de> for Hints {
             false,
             false,
             0,
+            false,
             self.segments,
         ))
     }
@@ -681,15 +693,31 @@ impl<'de> Visitor<'de> for Hints {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
+        Self(
+            BTreeMap::new(),
+            Some(fixture_key()),
+            false,
+            false,
+            0,
+            false,
+            false,
+        )
     }
     #[cfg(test)]
     pub(crate) fn segments_for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, true)
+        Self(
+            BTreeMap::new(),
+            Some(fixture_key()),
+            false,
+            false,
+            0,
+            false,
+            true,
+        )
     }
     /// An empty sibling segment ledger.
     pub(crate) fn segments() -> Self {
-        Self(BTreeMap::new(), None, false, false, 0, true)
+        Self(BTreeMap::new(), None, false, false, 0, false, true)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -740,6 +768,7 @@ impl AcceptedBuckets {
             false,
             0,
             false,
+            false,
         )
     }
     #[cfg(test)]
@@ -779,6 +808,7 @@ impl AcceptedBuckets {
         self.2 = live.2;
         self.3 = live.3;
         self.4 = live.4;
+        self.5 = live.5;
     }
     /// Runtime-only receiver cap; never serialized as accepted proof.
     pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
@@ -802,6 +832,14 @@ impl AcceptedBuckets {
     }
     pub(crate) fn retained_enabled(&self) -> bool {
         self.3
+    }
+    /// Account carry marking for this cycle: only the server's exact
+    /// capability token emits `account_source`; absent keeps main's bytes.
+    pub(crate) fn set_account_source_enabled(&mut self, enabled: bool) {
+        self.5 = enabled;
+    }
+    pub(crate) fn account_source_enabled(&self) -> bool {
+        self.5
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -883,7 +921,7 @@ impl AcceptedBuckets {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        if self.5 {
+        if self.6 {
             // Segment entries leave only with their session's cut (`retire`).
             if !self.0.contains_key(&key) && self.0.len() >= SEGMENT_DESIGN_MAX && report {
                 super::budget::record(&super::budget::Counts {
@@ -1085,7 +1123,7 @@ impl AcceptedBuckets {
         else {
             return;
         };
-        if !self.5 || live_body["history_segment"].is_object() {
+        if !self.6 || live_body["history_segment"].is_object() {
             return;
         }
         let of = session_key(key, live);
@@ -1103,7 +1141,7 @@ impl AcceptedBuckets {
     /// session that still has one referenced segment, or any item on this
     /// page (`page`: live session ids), keeps all of them.
     pub(crate) fn retire_absent(&mut self, absent: &BTreeSet<String>, page: &BTreeSet<&str>) {
-        if !self.5 || absent.is_empty() {
+        if !self.6 || absent.is_empty() {
             return;
         }
         let Some(key) = self.1.as_ref() else {
@@ -1174,7 +1212,7 @@ impl AcceptedBuckets {
         }
         let item_cap = self.4;
         let limit = max_shares(item_cap);
-        let segments = self.5;
+        let segments = self.6;
         let segment_of = body["history_segment"]["of"]
             .as_str()
             .zip(self.1.as_ref())
@@ -1398,6 +1436,7 @@ mod heap_tests {
             false,
             0,
             false,
+            false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
@@ -1523,6 +1562,7 @@ mod keyed_tests {
             login: Some("low-entropy-login".into()),
             org: Some("low-entropy-org".into()),
             basis: TELEMETRY_LOGIN,
+            account_source: None,
         };
         let material = json!([
             "claude_accepted_authority:v2",
@@ -1896,6 +1936,7 @@ mod retained_heap_tests {
             false,
             false,
             0,
+            false,
             false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);
