@@ -20,8 +20,9 @@ pub(super) const fn max_shares(item_cap: usize) -> usize {
     }
 }
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
-/// Stated design maximum of settled-history segment entries (heap bound). Above it only an alarm counts: segment entries are never evicted
-/// by count or recency, only with their session's retirement.
+/// Stated design maximum of settled-history segment entries (heap bound).
+/// Above it only an alarm counts: segment entries are never evicted by count
+/// or recency, only with their session's retirement.
 pub(crate) const SEGMENT_DESIGN_MAX: usize = 64;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];

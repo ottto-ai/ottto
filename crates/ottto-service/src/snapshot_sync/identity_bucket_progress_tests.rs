@@ -638,6 +638,15 @@ fn history_group_settles_whole_segments_before_live() {
     ] {
         ledger.bind_test_key(Some([0x42; 32]));
     }
+    // The reloaded live entry still protects the moved bucket.
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        2
+    );
     progress.active_quarantine_retries.clear();
     progress.quarantined_fingerprints.clear();
     group_page(&mut progress, &items, &[]);

@@ -4513,9 +4513,6 @@ pub(crate) struct ScanEvidence<'a> {
     accepted_segments: Option<&'a AcceptedBuckets>,
     /// `session_history_segments:v1` on: this pass's cut.
     history_cut: Option<history_segments::Cut>,
-    /// Sessions whose settled history cannot keep its identity even in
-    /// one-day windows: held by the caller this pass.
-    pub(crate) history_held: std::cell::RefCell<BTreeSet<String>>,
     wire_budget: WireBudget<'a>,
 }
 
@@ -5906,7 +5903,7 @@ fn apply_cut(
         max_item_bytes,
     )
     .and_then(|plan| history_segments::split(SnapshotSource::ClaudeCode, &original, &plan)) else {
-        // The whole body's item-limit hold stands with nothing to cut.
+        // The whole body's item-limit hold stands: nothing was cut.
         if matches!(tagged, Ok(Tagged::Held)) {
             history_segments::alarm(
                 SnapshotSource::ClaudeCode,
@@ -5965,11 +5962,7 @@ fn apply_cut(
                     SnapshotSource::ClaudeCode,
                     history_segments::Skipped::PieceHeld,
                 );
-                evidence
-                    .history_held
-                    .borrow_mut()
-                    .insert(original.source_session_id.clone());
-                return tagged;
+                return Ok(Tagged::Held);
             }
             // Any other cause is the whole session's too: today's path.
             _ => {

@@ -2806,31 +2806,44 @@ fn settled_history_cut_measures_the_tagged_body() {
     assert!(live.history_segments.is_some() && !live.history_cut.is_empty());
     assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
     // Cut-time tags equal the unsegmented tags from the same ledger state:
-    // empty, then the whole body ACKed (the segments read the live entry).
+    // empty, then the whole body ACKed and the oldest request's account
+    // changed, so the whole body and the segment holding it (reading the
+    // live entry) both refuse its accepted share (#909).
+    let cut = Cut {
+        now,
+        trigger: trigger / 2,
+    };
+    let mut proof = proof;
     let mut ledger = identity::AcceptedBuckets::for_test();
     for round in 0..2 {
         let mut whole = full.clone();
         identity::cut_for_test::apply_cut(&mut whole, &proof, &ledger, &segments, None).unwrap();
         let mut live = full.clone();
-        identity::cut_for_test::apply_cut(
-            &mut live,
-            &proof,
-            &ledger,
-            &segments,
-            Some(Cut::at(now)),
-        ).unwrap();
+        identity::cut_for_test::apply_cut(&mut live, &proof, &ledger, &segments, Some(cut))
+            .unwrap();
         assert!(!live.history_cut.is_empty(), "round {round} cuts");
         assert_placement_equivalent(
             &bucket_route(&[&whole]),
             &bucket_route(&segment_pieces(&live)),
         );
         ledger.record(&serde_json::to_value(&whole).unwrap());
+        let oldest = proof
+            .iter_mut()
+            .min_by(|a, b| a.bucket_start.cmp(&b.bucket_start))
+            .unwrap();
+        oldest.identity = RequestIdentity::Tagged(AuthorityKey {
+            login: Some(format!("{:064x}", 7)),
+            org: Some(format!("{:064x}", 39)),
+            basis: identity::TELEMETRY,
+            account_source: None,
+        });
     }
 }
 
 /// [money] A settled window over a size cap once tagged holds the session for
-/// this pass (counted, delayed): the receiver takes whole 7-day windows only,
-/// so it is never halved, and no piece is cut, budget-trimmed or stripped.
+/// this pass (counted, delayed, through the tagger's ordinary hold): the
+/// receiver takes whole 7-day windows only, so it is never halved, and no
+/// piece is cut, budget-trimmed or stripped.
 #[test]
 fn settled_history_window_over_a_size_cap_holds_the_session() {
     let (full, proof, now) = hot_session(1, 6);
@@ -2841,15 +2854,14 @@ fn settled_history_window_over_a_size_cap_holds_the_session() {
     let uncut = identity::cut_for_test::apply_cut(&mut whole, &proof, &accepted, &segments, None);
     assert!(matches!(uncut, Ok(Tagged::Sent { .. })), "{uncut:?}");
     let mut item = full.clone();
-    let (tagged, held) = identity::cut_for_test::apply_cut_held(
+    let tagged = identity::cut_for_test::apply_cut(
         &mut item,
         &proof,
         &accepted,
         &segments,
         Some(Cut::at(now)),
     );
-    assert_eq!(tagged, uncut);
-    assert_eq!(held, BTreeSet::from([full.source_session_id.clone()]));
+    assert_eq!(tagged, Ok(Tagged::Held));
     assert!(item.history_cut.is_empty() && item.history_segments.is_none());
     assert_eq!(
         serde_json::to_vec(&item).unwrap(),

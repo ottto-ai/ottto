@@ -10,17 +10,6 @@ pub(crate) fn apply_cut(
     segments: &AcceptedBuckets,
     cut: Option<history_segments::Cut>,
 ) -> Result<Tagged, Ineligible> {
-    apply_cut_held(item, contributions, accepted, segments, cut).0
-}
-
-/// `apply_cut`, with the sessions the cut held this pass.
-pub(crate) fn apply_cut_held(
-    item: &mut SnapshotItem,
-    contributions: &[Contribution],
-    accepted: &AcceptedBuckets,
-    segments: &AcceptedBuckets,
-    cut: Option<history_segments::Cut>,
-) -> (Result<Tagged, Ineligible>, BTreeSet<String>) {
     let mut grouping = Grouping::new(bucket_row_count(item));
     for c in contributions {
         grouping.add_at(
@@ -35,13 +24,12 @@ pub(crate) fn apply_cut_held(
     let evidence = ScanEvidence::default()
         .with_accepted_buckets(Some(accepted))
         .with_history_segments(Some(segments), cut);
-    let tagged = super::apply_cut(
+    super::apply_cut(
         item,
         grouping,
         &evidence,
         accepted.get(&item.source_session_id),
         accepted.retained_enabled(),
         &mut Vec::new(),
-    );
-    (tagged, evidence.history_held.take())
+    )
 }

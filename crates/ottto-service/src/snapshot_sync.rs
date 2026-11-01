@@ -94,7 +94,7 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // bound for pathological backfill batches. Normal incremental scans are
 // usually a single small chunk; historical replay avoids count-only 50-item
 // requests that could consume the backend's full wire budget.
-pub(crate) const SNAPSHOT_BATCH_LIMIT: usize = 50;
+const SNAPSHOT_BATCH_LIMIT: usize = 50;
 // Leave half of the backend's 4 MiB uncompressed request cap for derived
 // semantic envelopes and bounded request metadata. The exact request serializer
 // is still checked immediately before network I/O by
@@ -10436,18 +10436,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &ownership,
         );
         disposition.copy_invalidated = request_identity.copy_invalidated;
-        // A settled-history window over a size cap once tagged holds its
-        // session the same way: delayed, never stripped.
-        let mut held = request_identity.held;
-        held.extend(evidence.history_held.take());
-        if !held.is_empty() {
+        if !request_identity.held.is_empty() {
             if let (Some((cache, committed)), Some(withheld)) =
                 (retained, identity_custody.as_mut())
             {
-                withheld.extend(held.iter().cloned());
+                withheld.extend(request_identity.held.iter().cloned());
                 cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
             }
-            disposition.hold_request_owned(held);
+            disposition.hold_request_owned(request_identity.held);
         }
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(

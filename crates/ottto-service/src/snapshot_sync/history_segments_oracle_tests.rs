@@ -1,7 +1,9 @@
 // Settled-history segments ON through the real scan, sidecar read, account
 // reconcile (the carry), contract-5 tagging, the shared cut, finalization,
 // batching and ACK. Synthetic files only; the clock is the capability's.
-use super::money_equivalence_tests::{claude_pages, compare_claude_uploads, corpus, input_clock, Disk};
+use super::money_equivalence_tests::{
+    claude_pages, compare_claude_uploads, corpus, input_clock, Disk,
+};
 use super::state_v2_money_tests::tagged_api;
 use super::*;
 use crate::snapshots::claude_request_identity::AcceptedBuckets;

@@ -117,7 +117,7 @@ pub(crate) enum Skipped {
     /// sent without it (counted deferred, never resent each pass).
     PartRefused,
     /// The whole body is held over an item limit (the account-source hold)
-    /// and has no settled window to cut: the session stays owed.
+    /// and nothing was cut: the session stays owed.
     WholeHeld,
     /// A cut live body with no cache head sent its usage without its
     /// non-empty cache patch (counted once per prepared page); the patch
