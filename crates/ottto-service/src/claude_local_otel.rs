@@ -1062,6 +1062,7 @@ pub(crate) fn load_claude_trace_paid(
         .then_some(result)
 }
 
+#[cfg(test)]
 pub fn load_claude_effort_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
@@ -1490,6 +1491,7 @@ pub(crate) fn evidence_read_counts_for_test() -> (usize, usize) {
 /// Rows without a request id (captured before the field existed) are skipped.
 /// Production snapshot enrichment no longer consults this index: a transcript
 /// record without `effort` stays effort-unknown.
+#[cfg(test)]
 pub fn load_claude_effort_by_request(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
