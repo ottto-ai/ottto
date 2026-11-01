@@ -27301,8 +27301,7 @@ for line in sys.stdin:
             .and_then(|stable| {
                 claude_account_from_local_metadata(&stable.oauth_account, &stable.credential)
             })
-            .err()
-            .expect("no identity");
+            .expect_err("no identity");
             assert_eq!(failure, expected);
             assert_eq!(default_claude_identity_diagnostic(failure).code, code);
             // The upload gate refuses either case, even with hashes present.

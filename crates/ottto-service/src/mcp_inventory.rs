@@ -2276,6 +2276,9 @@ mod tests {
             "{\"id\":1,\"result\":{}}\n",
         )
         .unwrap();
+        // One registered login: background runs never use the default home.
+        let slot_dir = fixture.fake.root.join("slot");
+        fs::create_dir_all(&slot_dir).unwrap();
         let configured: Vec<_> = ["first", "second"]
             .into_iter()
             .map(|name| ConfiguredServer {
@@ -2287,7 +2290,11 @@ mod tests {
                     command: fixture.script.to_string_lossy().into_owned(),
                     args: Vec::new(),
                     cwd: None,
-                    env: [("CLAUDE_CONFIG_DIR".to_string(), String::new())].into(),
+                    env: [(
+                        "CLAUDE_CONFIG_DIR".to_string(),
+                        slot_dir.to_string_lossy().into_owned(),
+                    )]
+                    .into(),
                 },
             })
             .collect();

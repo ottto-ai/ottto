@@ -171,11 +171,15 @@ fn owner_from_profile(body: &Value) -> Option<ProvenOwner> {
     })
 }
 
+/// Test-only stand-in for the profile endpoint: a 200 body (`Ok`) or an HTTP
+/// status (`Err`).
+#[cfg(test)]
+pub(super) type ProfileResponder = fn() -> Result<Value, u16>;
+
 #[cfg(test)]
 thread_local! {
-    /// Test-only stand-in for the profile endpoint on this test's thread: a
-    /// 200 body (`Ok`) or an HTTP status (`Err`).
-    pub(super) static PROFILE_TEST_RESPONSE: std::cell::Cell<Option<fn() -> Result<Value, u16>>> =
+    /// The responder for this test's thread.
+    pub(super) static PROFILE_TEST_RESPONSE: std::cell::Cell<Option<ProfileResponder>> =
         const { std::cell::Cell::new(None) };
 }
 
