@@ -1322,37 +1322,47 @@ impl PiLedgerCheck<'_> {
     }
 }
 
+/// One Pi page's expectations: the retained and disk acquisition modes, the
+/// actual disk restores, and an optional ledger check on every arm.
+struct PiPageExpect<'a> {
+    ram_mode: (usize, usize, usize),
+    disk_mode: (usize, usize, usize),
+    restores: u64,
+    ledger: Option<&'a PiLedgerCheck<'a>>,
+}
+
+impl PiPageExpect<'_> {
+    fn modes(
+        ram_mode: (usize, usize, usize),
+        disk_mode: (usize, usize, usize),
+        restores: u64,
+    ) -> Self {
+        Self {
+            ram_mode,
+            disk_mode,
+            restores,
+            ledger: None,
+        }
+    }
+}
+
 // Return each arm's own finished index, so a later page cannot borrow another
 // arm's settlement. Quarantined files have no emitted body; compare their
 // disposition and retryability instead of inventing a successful upload.
-#[allow(clippy::too_many_arguments)]
 fn pi_pages(
     proof: &mut PiProof,
     c: &Corpus,
     retained: &E2ScanFixture,
     restart: &E2ScanFixture,
     priors: [ScanIndex; 3],
-    ram_mode: (usize, usize, usize),
-    disk_mode: (usize, usize, usize),
-    restores: u64,
+    expect: PiPageExpect<'_>,
 ) -> ([ScanIndex; 3], SourceScanResult) {
-    pi_pages_checked(
-        proof, c, retained, restart, priors, ram_mode, disk_mode, restores, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pi_pages_checked(
-    proof: &mut PiProof,
-    c: &Corpus,
-    retained: &E2ScanFixture,
-    restart: &E2ScanFixture,
-    priors: [ScanIndex; 3],
-    ram_mode: (usize, usize, usize),
-    disk_mode: (usize, usize, usize),
-    restores: u64,
-    ledger: Option<&PiLedgerCheck<'_>>,
-) -> ([ScanIndex; 3], SourceScanResult) {
+    let PiPageExpect {
+        ram_mode,
+        disk_mode,
+        restores,
+        ledger,
+    } = expect;
     save_inputs(c);
     let page = |scanner: &E2ScanFixture, prior| match ledger {
         Some(check) => check.page(c, scanner, prior),
@@ -1440,9 +1450,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
             &scanner,
             &restart,
             priors,
-            (0, 1, 0),
-            (0, 1, 0),
-            1,
+            PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
         );
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
@@ -1488,7 +1496,7 @@ fn pi_ledger_splits(
     // stage_preparation preserves the durable predecessor on an uncertified
     // lossy Tail. Required: unchanged pre-conflict record bytes (including
     // generation), exactly one restore on the next page, and Tail with zero Full.
-    // pi_pages_checked compares the replayed suffix's emitted wire to cold Full.
+    // pi_pages compares the replayed suffix's emitted wire to cold Full.
     let mut pre_conflict_records = None;
     for (value, step) in suffix {
         pi_grow(&path, value);
@@ -1503,19 +1511,19 @@ fn pi_ledger_splits(
             assert_eq!(records.len(), 1, "one pre-conflict durable record");
             pre_conflict_records = Some(records);
         }
-        let ([tail, full, mut restored], scan) = pi_pages_checked(
+        let ([tail, full, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
             priors,
-            ram_mode,
-            (0, 1, 0),
-            1,
-            Some(&PiLedgerCheck {
-                step,
-                accepted: &accepted,
-            }),
+            PiPageExpect {
+                ledger: Some(&PiLedgerCheck {
+                    step,
+                    accepted: &accepted,
+                }),
+                ..PiPageExpect::modes(ram_mode, (0, 1, 0), 1)
+            },
         );
         if let Some(before) = restored_before {
             assert_eq!(
@@ -1916,9 +1924,7 @@ fn pi_cli_fork_preserves_double_count() {
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        (1, 1, 0),
-        (1, 1, 0),
-        1,
+        PiPageExpect::modes((1, 1, 0), (1, 1, 0), 1),
     );
     assert_eq!(scan.snapshots.len(), 2);
     assert_eq!(
@@ -2036,7 +2042,12 @@ fn pi_lifecycle_case(name: &str) {
             ((0, 1, 0), 1)
         };
         let ([tail, full, mut restored], scan) = pi_pages(
-            &mut proof, &c, &scanner, &restart, priors, ram_mode, disk_mode, restores,
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            PiPageExpect::modes(ram_mode, disk_mode, restores),
         );
         if migrating {
             assert_eq!(scan.snapshots[0].request_count, 3, "{name}");
@@ -2111,9 +2122,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        (0, 0, 0),
-        (0, 0, 0),
-        0,
+        PiPageExpect::modes((0, 0, 0), (0, 0, 0), 0),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     std::fs::File::options()
@@ -2129,9 +2138,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [tail, full, next],
-        (1, 0, 0),
-        (1, 0, 0),
-        0,
+        PiPageExpect::modes((1, 0, 0), (1, 0, 0), 0),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(
@@ -2150,9 +2157,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [tail, full, next],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
+        PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
     );
     proof.finish(&c, &disk);
 }
