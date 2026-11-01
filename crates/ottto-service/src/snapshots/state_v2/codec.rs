@@ -387,6 +387,13 @@ pub(super) fn check_field<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned
         .map(|_| ())
         .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))
 }
+/// Usage pending keeps the v1 record-map check; only its RAM shape differs.
+pub(super) fn check_usage<'de, A: serde::de::MapAccess<'de>>(
+    map: &mut A,
+    _: &super::super::usage_pending::UsagePending,
+) -> std::result::Result<(), A::Error> {
+    check_map(map, &super::super::usage_pending::Families::new())
+}
 pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned + Serialize>(
     map: &mut A,
     _: &std::collections::BTreeMap<String, T>,

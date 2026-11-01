@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped Mapper writes,
+//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
 }
 
 fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, importable, published(path)?)
+    Ok(load_locked(path, importable, published(path)?)?.0)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -48,13 +48,28 @@ thread_local! {
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 
 /// A loaded graph with its cold archives read back from the session store.
-fn materialized(index: &ScanIndex) -> ScanIndex {
+pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
     let mut view = index.clone();
     with_session_db(index, |db| {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         kinds_accounts::materialize(&mut tx, &mut view).unwrap();
     });
     view
+}
+
+/// Delete one stored usage-pending row on the session's own connection,
+/// outside a transaction: neither the generation nor the data version moves,
+/// so the session's stamp still matches the graph.
+pub(in crate::snapshots) fn delete_usage_row_in_session(index: &ScanIndex, root: &str) {
+    let key = mapper::key("usage.pending", root, 1).unwrap();
+    with_session_db(index, |db| sqlite::delete_row_for_test(db, &key));
+}
+
+/// Process-lifetime count of refused cold usage-pending loads.
+pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
+    telemetry::latest_for_test("usage_pending_unknown")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
 }
 
 /// Apply a per-store seam to the live session store behind `index`; the
@@ -108,8 +123,6 @@ impl Fixture {
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
                 .unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         let mut generation = 0;
@@ -337,7 +350,7 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
+    assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
 }
 /// A synthetic account window ending on October `day`.
 fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
@@ -545,6 +558,163 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             && w.member_requests
                 .values()
                 .all(|r| r.identity_revision.is_some())));
+}
+/// [money] Cold usage pending stores what the resident graph stores: a page
+/// loads only its own families, a sibling subset saves one of them, and the
+/// working graph then loads another, changes its occurrence count, removes a
+/// third and saves itself with no Unknown refusal. Its heads are refreshed by
+/// that save; a whole-kind join and a restart see the explicit rows, and the
+/// running total equals the sum of heads and the fold of the rows (A1).
+#[test]
+fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
+    use crate::snapshots::usage_pending::{tests::family, Families, UsagePending};
+    let total = |families: &Families| UsagePending::from(families.clone()).total_occurrences();
+    let roots =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|r| (*r).into()).collect() };
+    // r1 as the sibling saved it, r2 with one member's occurrences dropped
+    // by the working graph, r3 removed and r4 untouched.
+    let mut expected = Families::from([
+        ("r1".to_owned(), family("w1", 2, false)),
+        ("r2".to_owned(), family("w1", 3, false)),
+        ("r4".to_owned(), family("w1", 2, false)),
+    ]);
+    expected.get_mut("r1").unwrap().invalid = true;
+    expected
+        .get_mut("r2")
+        .unwrap()
+        .member_occurrences
+        .pop_first()
+        .unwrap();
+    let run = |cold: bool| {
+        let f = Fixture::new();
+        let mut pre = ScanIndex::default();
+        for (root, members) in [("r1", 2), ("r2", 3), ("r3", 4), ("r4", 2)] {
+            pre.claude_usage_family_pending
+                .insert(root.into(), family("w1", members, false));
+        }
+        f.import_graph(Some(&pre));
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        let loaded = load_with(&f.path, false).unwrap().unwrap();
+        let stored = materialized(&loaded).claude_usage_family_pending.clone();
+        assert_eq!(*stored, *pre.claude_usage_family_pending);
+        let mut working = if cold { loaded } else { materialized(&loaded) };
+        let usage = &working.claude_usage_family_pending;
+        assert_eq!(usage.cold().is_some(), cold);
+        assert_eq!(usage.total_occurrences(), total(&stored));
+        assert_eq!(
+            usage.roots().collect::<Vec<_>>(),
+            stored.keys().collect::<Vec<_>>()
+        );
+        let committed = working.clone();
+
+        // The page loads r1 alone; r2 stays Unknown, never absent.
+        load_usage(&mut working, Some(&roots(&["r1"]))).unwrap();
+        assert_eq!(
+            working.claude_usage_family_pending.family("r2").is_err(),
+            cold
+        );
+        let usage = &mut working.claude_usage_family_pending;
+        usage.family_mut("r1").unwrap().unwrap().invalid = true;
+        let mut subset = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(save_with(&f.path, &mut subset).unwrap());
+
+        // The working graph loads r2 after the sibling's save, drops one
+        // member's occurrences from it, removes r3 and saves itself: r1 is
+        // rewritten as the sibling saved it and r4 is kept by its head.
+        working.generation = subset.generation;
+        load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
+        let usage = &mut working.claude_usage_family_pending;
+        let r2 = usage.family_mut("r2").unwrap().unwrap();
+        r2.member_occurrences.pop_first().unwrap();
+        usage.discard("r3");
+        assert!(save_with(&f.path, &mut working).unwrap());
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
+        );
+        // The save refreshed the loaded heads: settling returns every loaded
+        // family to its head, and the running total is unchanged.
+        settle_usage(&mut working, &BTreeSet::new());
+        if let Some(cold) = working.claude_usage_family_pending.cold() {
+            assert!(cold.loaded().is_empty());
+        }
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
+        );
+
+        // A join loads every family and sees exactly the saved rows.
+        load_usage(&mut working, None).unwrap();
+        assert_eq!(
+            *working.claude_usage_family_pending.all().unwrap(),
+            expected
+        );
+        settle_usage(&mut working, &BTreeSet::new());
+        assert_eq!(
+            working.claude_usage_family_pending.family("r4").is_err(),
+            cold
+        );
+
+        // Restart: production reloads this hold-free store cold in both runs.
+        // A1: running total == sum of heads == fold of the stored rows.
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        let usage = &reloaded.claude_usage_family_pending;
+        assert!(usage.cold().is_some());
+        let families = materialized(&reloaded)
+            .claude_usage_family_pending
+            .resident()
+            .unwrap()
+            .clone();
+        let heads: usize = usage.views().map(|(_, view)| view.occurrences()).sum();
+        assert_eq!(usage.total_occurrences(), heads);
+        assert_eq!(heads, total(&families));
+        assert_eq!(families, expected);
+        families
+    };
+    let cold = run(true);
+    assert_eq!(cold, run(false));
+    assert_eq!(cold, expected);
+}
+
+/// [money] A row deleted out of band makes the page's keyed load refuse as a
+/// whole (counted): no family of the page is applied and the deleted family
+/// stays discoverable, Unknown rather than absent.
+#[test]
+fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
+    use crate::snapshots::usage_pending::tests::family;
+    let f = Fixture::new();
+    let mut pre = ScanIndex::default();
+    for root in ["r1", "r2"] {
+        pre.claude_usage_family_pending
+            .insert(root.into(), family("w1", 2, false));
+    }
+    f.import_graph(Some(&pre));
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let mut working = load_with(&f.path, false).unwrap().unwrap();
+    assert!(working.claude_usage_family_pending.cold().is_some());
+    with_session_db(&working, |db| {
+        let key = mapper::key("usage.pending", "r2", 1).unwrap();
+        sqlite::delete_row_elsewhere_for_test(db, &key);
+    });
+    let unknown = || {
+        telemetry::latest_for_test("usage_pending_unknown")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let before = unknown();
+    let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
+    assert!(load_usage(&mut working, Some(&page)).is_err());
+    assert!(unknown() > before);
+    let usage = &working.claude_usage_family_pending;
+    assert!(usage.cold().unwrap().loaded().is_empty());
+    assert!(usage.family("r1").is_err());
+    assert!(usage.contains_key("r2"));
+    assert!(usage.family("r2").is_err());
 }
 /// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
 /// and exposes only committed file membership to the restart-record sweep.
@@ -997,8 +1167,14 @@ mod hydrate_parity {
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
+        // A loaded graph's cold usage map does not serialize: compare the
+        // families it stores.
+        let view = match actual.claude_usage_family_pending.cold() {
+            Some(_) => materialized(actual),
+            None => actual.clone(),
+        };
         assert_eq!(
-            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&view).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         assert!(actual.decode_holds.same_as(&expected.decode_holds));
@@ -1133,7 +1309,7 @@ mod hydrate_parity {
             let f = Fixture::new();
             publish(&f, &index);
             let before = fs::read(&f.path).unwrap();
-            let error = load_locked(&f.path, None, published(&f.path).unwrap()).unwrap_err();
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }

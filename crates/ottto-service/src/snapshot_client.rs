@@ -43,34 +43,41 @@ pub struct BatchRejected {
 
 impl BatchRejected {
     pub(crate) fn from_response(status: u16, reader: impl std::io::Read, count: usize) -> Self {
-        let snapshot_indexes = (|| {
-            if status != 422 {
-                return None;
-            }
-            let body: serde_json::Value = serde_json::from_reader(reader).ok()?;
-            let errors = body.get("errors")?.as_array()?;
-            if errors.is_empty() {
-                return None;
-            }
-            let mut indexes = std::collections::BTreeSet::new();
-            for error in errors {
-                let loc = error.get("loc")?.as_array()?;
-                if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
-                    return None;
-                }
-                let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
-                if index >= count {
-                    return None;
-                }
-                indexes.insert(index);
-            }
-            Some(indexes.into_iter().collect())
-        })();
+        let snapshot_indexes = if status == 422 {
+            serde_json::from_reader::<_, Value>(reader)
+                .ok()
+                .and_then(|body| snapshot_error_indexes(&body, count))
+        } else {
+            None
+        };
         Self {
             status,
             snapshot_indexes,
         }
     }
+}
+
+/// The request-local items an error body names in `errors[].loc`
+/// (`["body", "snapshots", i, ...]`, three or more elements), deduplicated.
+/// `None` unless every entry names an index of this `count`-item request.
+fn snapshot_error_indexes(body: &Value, count: usize) -> Option<Vec<usize>> {
+    let errors = body.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let mut indexes = std::collections::BTreeSet::new();
+    for error in errors {
+        let loc = error.get("loc")?.as_array()?;
+        if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
+            return None;
+        }
+        let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
+        if index >= count {
+            return None;
+        }
+        indexes.insert(index);
+    }
+    Some(indexes.into_iter().collect())
 }
 
 impl std::fmt::Display for BatchRejected {
@@ -204,8 +211,26 @@ pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
     /// The backend's error code when it is one the daemon recognizes. Only
-    /// this fixed name survives; the rest of the response body is discarded.
+    /// this fixed name and an identity deferral's named items
+    /// (`ShedSnapshotIndexes`) survive; the rest of the body is discarded.
     pub code: Option<UploadShedCode>,
+}
+
+/// The request-local items an identity-deferral shed names: only those wait
+/// for the identity. Carried as context on its `UploadShed` error; a shed
+/// without it keeps the whole-pass path.
+pub struct ShedSnapshotIndexes(pub Vec<usize>);
+
+impl std::fmt::Display for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reason=identity_deferred count={}", self.0.len())
+    }
+}
+
+impl std::fmt::Debug for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// The backend error code of the 503 that defers a batch while an original
@@ -296,30 +321,49 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
 /// envelope is a few hundred bytes; a longer body is not recognized.
 const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
 
-fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+fn shed_from_response(status: u16, response: ureq::Response, count: usize) -> anyhow::Error {
     let retry_after = response
         .header("Retry-After")
         .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
     let mut excerpt = Vec::new();
-    let code = response
+    let (code, named) = match response
         .into_reader()
         .take(SHED_BODY_EXCERPT_BYTES)
         .read_to_end(&mut excerpt)
-        .ok()
-        .and_then(|_| shed_code(&excerpt));
-    UploadShed {
+    {
+        Ok(_) => shed_body(&excerpt, count),
+        Err(_) => (None, None),
+    };
+    let shed = anyhow::Error::new(UploadShed {
         status,
         retry_after,
         code,
+    });
+    match named {
+        Some(indexes) => shed.context(ShedSnapshotIndexes(indexes)),
+        None => shed,
     }
 }
 
 /// The recognized top-level `code` of a backend error envelope, which must be
-/// a JSON object. Any other code, a malformed or truncated body, a non-object
-/// body or a non-string code is `None`; no body text outlives this call.
-fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
-    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
-    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
+/// a JSON object, and the items an identity deferral names (see
+/// `snapshot_error_indexes`). Any other code, a malformed or truncated body,
+/// a non-object body or a non-string code is `None`, as are the items of any
+/// other shed; no body text outlives this call.
+fn shed_body(excerpt: &[u8], count: usize) -> (Option<UploadShedCode>, Option<Vec<usize>>) {
+    let Ok(envelope @ Value::Object(_)) = serde_json::from_slice::<Value>(excerpt) else {
+        return (None, None);
+    };
+    let code = envelope
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(UploadShedCode::recognize);
+    let named = if code == Some(UploadShedCode::OriginalIdentityUnavailable) {
+        snapshot_error_indexes(&envelope, count)
+    } else {
+        None
+    };
+    (code, named)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
@@ -2342,16 +2386,18 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let shed = shed_from_response(code, response);
+                let shed = shed_from_response(code, response, request.snapshots.len());
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
                     code,
                     server_request_id.as_deref(),
-                    shed.retry_after.map(|retry_after| retry_after.as_secs()),
+                    shed.downcast_ref::<UploadShed>()
+                        .and_then(|shed| shed.retry_after)
+                        .map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(shed))
+                Err(shed)
             }
             // 401/403 means relay authorization failed, not schema drift.
             // Keep it typed and body-free so the caller can surface an auth
@@ -3944,13 +3990,39 @@ mod tests {
             .is_none());
     }
 
+    /// [format] A shed keeps only a recognized code and, for the identity
+    /// deferral, the request items it names; anything else names none.
     #[test]
     fn shed_code_keeps_only_a_recognized_backend_code() {
         let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
         assert_eq!(
-            shed_code(identity),
-            Some(UploadShedCode::OriginalIdentityUnavailable)
+            shed_body(identity, 2),
+            (Some(UploadShedCode::OriginalIdentityUnavailable), None)
         );
+        let named = |code: &str, locs: &str| {
+            format!(r#"{{"error":"ServiceOverloadedError","code":"{code}","errors":[{locs}]}}"#)
+        };
+        let identity_code = SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE;
+        for (body, indexes) in [
+            // 3-element (this shed) and 4-element (422) locations; a
+            // duplicate occurrence names its item once.
+            (
+                named(
+                    identity_code,
+                    r#"{"loc":["body","snapshots",1]},{"loc":["body","snapshots",1]},{"loc":["body","snapshots",0,"x"]}"#,
+                ),
+                Some(vec![0, 1]),
+            ),
+            (
+                named(
+                    "cursor_allocation_timeout",
+                    r#"{"loc":["body","snapshots",0]}"#,
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(shed_body(body.as_bytes(), 2).1, indexes, "{body}");
+        }
         assert_eq!(
             UploadShedCode::OriginalIdentityUnavailable.as_str(),
             SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
@@ -3975,7 +4047,7 @@ mod tests {
         ];
         for body in bodies {
             assert_eq!(
-                shed_code(body),
+                shed_body(body, 2).0,
                 None,
                 "{}",
                 String::from_utf8_lossy(&body[..body.len().min(80)])

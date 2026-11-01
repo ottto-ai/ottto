@@ -114,8 +114,8 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 /// skeletons precede census-owned request membership; no partial graph escapes.
 /// Test view: cold archives are read back resident, for graph comparisons.
 #[cfg(test)]
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+pub(super) fn hydrate(
+    store: &mut sqlite::Sqlite,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
@@ -247,6 +247,14 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
+                // Loaded usage families now match the rows this save left.
+                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
+                    let rows = &digests.rows;
+                    cold.saved(|root| {
+                        let key = mapper::key("usage.pending", root, 1).ok()?;
+                        rows.get(&key).copied()
+                    });
+                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;

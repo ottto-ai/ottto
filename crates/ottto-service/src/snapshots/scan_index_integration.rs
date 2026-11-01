@@ -187,7 +187,7 @@ pub(super) fn check_missing(
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
         // A missing fence plus final DB is a hold; a valid fence raced into
         // place requires restarting the ordinary loaded route.
-        if super::state_v2::load_locked(path, support, _lock.custody)?
+        if super::state_v2::load_locked(path, support.is_some(), _lock.custody)?
             .0
             .is_some()
         {

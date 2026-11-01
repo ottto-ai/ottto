@@ -54,7 +54,9 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// [regress] An indexed validation hold preserves money and lets exact-ACK siblings settle.
+/// [regress] An indexed validation hold, or an identity deferral naming the
+/// same item (it ended the whole pass), preserves money and lets exact-ACK
+/// siblings settle; its custody survives a restart and reaches a due retry.
 #[test]
 #[serial(client_report)]
 fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
@@ -125,7 +127,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             &[],
         );
         page.enrich(&c);
-        page.finish();
+        let holds = page.finish();
         assert!(page.scan.snapshots.len() >= 2);
         let root = page
             .scan
@@ -187,11 +189,14 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             "tagged placement control"
         );
 
-        for source in [
+        for (source, identity) in [
             SnapshotSource::ClaudeCode,
             SnapshotSource::Codex,
             SnapshotSource::Pi,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|source| [(source, false), (source, true)])
+        {
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -303,6 +308,14 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                 if !retrying && batch.len() > 1 {
                                     assert!(index > 0, "post-packing nonzero request index");
                                 }
+                                if identity {
+                                    return Err(anyhow::Error::new(UploadShed {
+                                        status: 503,
+                                        retry_after: Some(Duration::from_secs(60)),
+                                        code: Some(crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable),
+                                    })
+                                    .context(ShedSnapshotIndexes(vec![index])));
+                                }
                                 let text = json!({"errors":[
                                     {"ctx":{"validator": "x".repeat(700)},"loc":["body","snapshots",index,"session_artifacts",0,"value"]},
                                     {"loc":["body","snapshots",index,"session_artifacts",1,"value"]}
@@ -340,10 +353,25 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             let (_, accepted, _) = send(&[old], &mut progress, &mut backend, false);
             assert_eq!(accepted, 1, "one ACK for the distinct prior revision");
             let prior = route(Mode::Ram, vec![], &backend, &progress);
+            let sent_at = current_unix_seconds();
             let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+            // Deferred, never Shed: the caller sets no source backoff.
             assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
             assert_eq!(accepted as usize, items.len() - 1);
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
+            let record = &progress.quarantined_fingerprints[&fp];
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert_eq!(record.failed_reconstruction_count, 1);
+            if identity {
+                assert!(
+                    (sent_at + 60..=current_unix_seconds() + 72)
+                        .contains(&record.retry_after_unix_seconds),
+                    "the identity hold waits the server's Retry-After window, not 6-12 h"
+                );
+            }
             assert!(!progress.accepted_fingerprints.contains(&fp));
             assert!(!progress.accepted_body_witnesses.contains_key(&fp));
             assert!(progress
@@ -395,6 +423,52 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             progress
                 .accepted_identity_buckets
                 .bind_test_key(Some([0x42; 32]));
+            if source == SnapshotSource::ClaudeCode {
+                // The index custody survives the same restart: the reopened
+                // index keeps the hold RetryPending, never terminal, and once
+                // it is due the next scan re-reads the held file and offers
+                // the held body again. The scan reads the wall clock, so the
+                // reopened deadline is moved into the past.
+                let mut settled = settle_checkpointed_upload(
+                    page.index.clone(),
+                    &page.committed,
+                    &progress,
+                    &holds,
+                    false,
+                    None,
+                )
+                .index;
+                settle_index_after_upload(&mut settled, &page.committed, &progress);
+                // One index file per row: each row is its own install.
+                let mut reopened =
+                    c.reload_in(&mut settled, &format!("restart-identity-{identity}.json"));
+                let record = reopened
+                    .quarantined_snapshot_fingerprints
+                    .get_mut(&fp)
+                    .expect("the hold survives the restart");
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                record.retry_after_unix_seconds = 0;
+                let mut next = c.raw(
+                    &E2ScanFixture::capturing_identity(),
+                    reopened,
+                    100,
+                    true,
+                    &[],
+                );
+                next.enrich(&c);
+                next.finish();
+                assert!(
+                    next.scan
+                        .snapshots
+                        .iter()
+                        .any(|item| item.source_session_id == entity),
+                    "identity={identity}: the due retry re-reads the held file"
+                );
+                assert_eq!(next.index.snapshot_unproven_terminal_count(), 0);
+            }
             let deadline = progress.quarantined_fingerprints[&fp].retry_after_unix_seconds;
             with_retry_clock(deadline - 1, || {
                 assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));

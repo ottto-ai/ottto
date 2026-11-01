@@ -18,11 +18,6 @@ struct Stats {
     decoded_per_pass: Decoded,
     bytes_written_per_pass: Option<u64>,
     import_peak_rss_bytes: Option<u64>,
-    v1_load_peak_rss_bytes: Option<u64>,
-    import_exceeds_v1_load: Option<bool>,
-    comparison_same_process_corpus: bool,
-    #[serde(skip)]
-    v1_path: Option<std::path::PathBuf>,
 }
 #[derive(Default, Serialize)]
 struct Rss {
@@ -64,6 +59,10 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
             PASS.with(|pass| pass.borrow_mut().active = matches!(value.as_str(), Some("v2")));
         }
     }
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(value) {
+        THREAD_EVENTS.with(|events| events.borrow_mut().insert(name, value));
+    }
     if let Ok(mut stats) = stats().lock() {
         if let Ok(value) = serde_json::to_value(value) {
             stats.latest.insert(name, value);
@@ -75,6 +74,17 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
 #[cfg(test)]
 pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
     stats().lock().ok()?.latest.get(name).cloned()
+}
+#[cfg(test)]
+thread_local! {
+    static THREAD_EVENTS: std::cell::RefCell<BTreeMap<&'static str, serde_json::Value>> =
+        Default::default();
+}
+/// Test evidence only: takes this thread's latest value of an event, so a
+/// concurrent test cannot supply or overwrite it.
+#[cfg(test)]
+pub(super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
+    THREAD_EVENTS.with(|events| events.borrow_mut().remove(name))
 }
 /// Cumulative process-lifetime count, kept in the same inventory as events.
 pub(super) fn count(name: &'static str, n: u64) {
@@ -94,12 +104,10 @@ pub(super) enum Kind {
     Save,
     Hydrate,
     Import,
-    V1,
 }
-pub(in super::super) struct Stage {
+pub(super) struct Stage {
     kind: Kind,
     probe: crate::local_resource_diagnostics::StateV2Probe,
-    path: Option<std::path::PathBuf>,
     finished: bool,
 }
 impl Stage {
@@ -116,21 +124,8 @@ impl Stage {
         Self {
             kind,
             probe: crate::local_resource_diagnostics::StateV2Probe::begin(),
-            path: None,
             finished: false,
         }
-    }
-    pub(in super::super) fn v1(path: &Path, sample_v1: bool) -> Option<Self> {
-        // A load that cannot import has no probe/thread/allocation side effects.
-        if !sample_v1 {
-            return None;
-        }
-        let mut stage = Self::new(Kind::V1);
-        stage.path = Some(path.to_owned());
-        Some(stage)
-    }
-    pub(in super::super) fn finish(mut self) {
-        self.record();
     }
     fn record(&mut self) {
         if self.finished {
@@ -140,21 +135,8 @@ impl Stage {
         let (_cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
             match self.kind {
-                Kind::V1 => {
-                    stats.v1_load_peak_rss_bytes = peak;
-                    stats.v1_path = self.path.take();
-                }
                 Kind::Import => {
                     stats.import_peak_rss_bytes = peak;
-                    stats.comparison_same_process_corpus = self
-                        .path
-                        .as_ref()
-                        .is_some_and(|p| stats.v1_path.as_ref() == Some(p));
-                    stats.import_exceeds_v1_load = if stats.comparison_same_process_corpus {
-                        peak.zip(stats.v1_load_peak_rss_bytes).map(|(a, b)| a > b)
-                    } else {
-                        None
-                    };
                 }
                 Kind::Save | Kind::Hydrate => {
                     stats.rss_bytes.steady = steady;
@@ -174,11 +156,6 @@ impl Stage {
             }
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
-    }
-    pub(super) fn import(path: &Path) -> Self {
-        let mut stage = Self::new(Kind::Import);
-        stage.path = Some(path.to_owned());
-        stage
     }
 }
 impl Drop for Stage {
@@ -371,12 +348,15 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
-    let family_requests = index
-        .claude_usage_family_pending
-        .values()
-        .try_fold(0_u64, |sum, p| {
-            sum.checked_add(heap(&p.member_request_id_hashes)?)
-        });
+    // Cold: only this pass's loaded families hold request hashes in RAM.
+    use super::super::usage_pending::UsagePending;
+    let evidence = match &index.claude_usage_family_pending {
+        UsagePending::Resident(families) => families,
+        UsagePending::Cold(cold) => cold.loaded(),
+    };
+    let family_requests = evidence.values().try_fold(0_u64, |sum, p| {
+        sum.checked_add(heap(&p.member_request_id_hashes)?)
+    });
     let usage_pending = heap(&index.claude_usage_family_pending)
         .zip(family_requests)
         .and_then(|(all, requests)| all.checked_sub(requests));
@@ -541,10 +521,6 @@ mod ops_tests {
     /// [behaviour] Claude passes with no route preserve even stale active v2 telemetry state.
     #[test]
     fn off_claude_passes_do_not_touch_v2_telemetry() {
-        let root = crate::test_scratch::private_dir("off-v2-pass");
-        let path = root
-            .join("b".repeat(64))
-            .join("claude_code-test-scan-index.json");
         // Stale state from a different source must not authorize these bridges.
         let previous = PASS.with(|pass| {
             std::mem::replace(
@@ -563,7 +539,6 @@ mod ops_tests {
             crate::local_resource_diagnostics::source_prepare(
                 "claude_code",
                 || {
-                    assert!(Stage::v1(&path, false).is_none());
                     crate::local_resource_diagnostics::source_finish("claude_code", false, || {
                         Ok(17)
                     })
@@ -581,7 +556,6 @@ mod ops_tests {
                 .collect::<Vec<_>>(),
             ["source_finish", "source_prepare"]
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// [behaviour] family requests heap is separate and diagnostics never contain its text.

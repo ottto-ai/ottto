@@ -92,7 +92,7 @@ macro_rules! scan_index_fields {
             claude_desktop_title_files => Files (map check_map) ["v1_field.claude_desktop_title_files" => 1] side,
             confirmed_empty_files => Files (hook check_field) ["file.confirmed_empty" => 1] side,
             v2 => Files (hook none) ["file.growth_retention" => 1] own,
-            claude_usage_family_pending => Accounts (map check_map) ["usage.pending" => 1] own,
+            claude_usage_family_pending => Accounts (hook check_usage) ["usage.pending" => 1] own,
             claude_account_family_witnesses => Accounts (map check_map) ["proof.account" => 1] side,
             claude_usage_family_witnesses => Accounts (map check_map) ["proof.usage" => 1] side,
             claude_usage_authority_quarantine => Accounts (map check_map) ["refusal.authority" => 1] side,

@@ -21,7 +21,7 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
+    RelayTokenAuthorizationRejected, ShedSnapshotIndexes, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
 };
@@ -1007,6 +1007,30 @@ pub(crate) fn checkpoint_account_release_for_test(
         Default::default(),
     )
 }
+
+/// The page items a server answer names: an indexed validation rejection
+/// (422) or an identity-deferral shed (503). `None` when nothing is named or
+/// a location falls outside this page; that failure keeps its own path (a
+/// shed stays a whole-pass shed).
+fn server_named_items(error: &anyhow::Error, indices: &[usize]) -> Option<BTreeSet<usize>> {
+    let named = match error.downcast_ref::<ShedSnapshotIndexes>() {
+        Some(named) => &named.0,
+        None => error
+            .downcast_ref::<BatchRejected>()?
+            .snapshot_indexes
+            .as_ref()?,
+    };
+    named
+        .iter()
+        .map(|index| indices.get(*index).copied())
+        .collect()
+}
+
+/// Process-local, content-free count of records the attempt-count ladder made
+/// `UnprovenTerminal` (all sources), apart from server verdicts, so a later
+/// `unproven_terminal` rise can be attributed.
+static UNPROVEN_TERMINAL_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Process-local, content-free count of `Rejected` pages whose local holds
 /// were all terminal-bound and settled through the `Completed` restore path.
@@ -2593,6 +2617,11 @@ impl SnapshotUploadProgress {
             .unwrap_or(1)
             .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
         let disposition = if failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            if existing.map_or(0, |record| record.failed_reconstruction_count)
+                < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+            {
+                UNPROVEN_TERMINAL_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             SnapshotQuarantineDisposition::UnprovenTerminal
         } else {
             SnapshotQuarantineDisposition::RetryPending
@@ -2714,7 +2743,14 @@ impl SnapshotUploadProgress {
         }
     }
 
-    fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+    /// `retry_after_unix_seconds`: `quarantine_retry_after` for a refusal or
+    /// conflict, the server's own `Retry-After` window for an identity deferral.
+    fn quarantine_retryable_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        retry_after_unix_seconds: u64,
+    ) {
         if self
             .active_reason_reoffers
             .get(fingerprint)
@@ -2736,7 +2772,7 @@ impl SnapshotUploadProgress {
             1
         };
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
-        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+        record.retry_after_unix_seconds = retry_after_unix_seconds;
         crate::snapshots::terminal_contract_retry::exhaust(record);
     }
 
@@ -2778,6 +2814,13 @@ impl SnapshotUploadProgress {
     fn save(&mut self, path: &Path) -> Result<()> {
         self.save_with_read_limit(path, None)
     }
+    /// The concurrent-writer stamp of every progress write: `on_disk` is this
+    /// owner's last save and nobody has saved since.
+    fn same_writer(&self, on_disk: &Self) -> bool {
+        on_disk.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && on_disk.generation == self.generation
+            && on_disk.destination_namespace_hash == self.destination_namespace_hash
+    }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
@@ -2797,10 +2840,7 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
             }
             .context("parse current snapshot upload progress for compare-and-swap")?;
-            if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-                || current.generation != self.generation
-                || current.destination_namespace_hash != self.destination_namespace_hash
-            {
+            if !self.same_writer(&current) {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));
             }
             crate::snapshots::terminal_contract_retry::merge_maps(
@@ -3150,10 +3190,7 @@ impl SnapshotUploadProgress {
             }
             Err(error) => return Err(error).context("read snapshot upload progress before clear"),
         };
-        if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            || current.generation != self.generation
-            || current.destination_namespace_hash != self.destination_namespace_hash
-        {
+        if !self.same_writer(&current) {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
         let tombstone = unique_progress_sibling(path, "cleared");
@@ -3551,7 +3588,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     } else {
         progress_owner
     };
-    let mut durable: SnapshotUploadProgress = match match read_limit {
+    let durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
     } {
@@ -3572,22 +3609,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         }
         Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
-    // These fields are runtime leases, not persisted settlement evidence.
-    durable.ack_recovery = progress.ack_recovery.clone();
-    durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
-    durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
-    durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
-    durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
-    durable.reason_reoffer_counts = progress.reason_reoffer_counts;
-    durable.ack_capacity = progress.ack_capacity;
-    durable.retained_stale_ack_count = progress.retained_stale_ack_count;
-    durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
-    durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
-    durable.context_resend = progress.context_resend.clone();
-    durable
-        .accepted_identity_buckets
-        .adopt_runtime_from(&progress.accepted_identity_buckets);
-    if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
+    // Refuse only a real concurrent writer, as `save()` does. The accepted
+    // and quarantined sets and the upload-context stamp read `durable`.
+    if !progress.same_writer(&durable) {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
         ));
@@ -3688,9 +3712,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &progress.fresh_context_body_acks,
     );
     committable.stamp_entity_upload_context_acks(
-        &progress.destination_namespace_hash,
-        &progress.accepted_body_witnesses,
-        &progress.accepted_body_contexts,
+        &durable.destination_namespace_hash,
+        &durable.accepted_body_witnesses,
+        &durable.accepted_body_contexts,
     );
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
@@ -4201,13 +4225,14 @@ impl SyncCounts {
     fn terminal_census_line(&self, source: &str) -> String {
         let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
-             uploaded={} unproven_terminal={} superseded_terminal={} \
+             uploaded={} unproven_terminal={} unproven_terminal_attempt_count={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
              dropped_usage_records={} cooldown_conflict_deferred={} terminal_contract_retry={} terminal_contract_retry_exhausted={}",
             self.census_complete,
             self.scanned_file_count,
             self.uploaded_count,
             self.snapshot_unproven_terminal_count,
+            UNPROVEN_TERMINAL_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             self.snapshot_superseded_terminal_count,
             self.ownership_incomplete_file_count,
             self.zero_snapshot_usage_evidence_count,
@@ -11106,10 +11131,18 @@ where
                 } else {
                     // A validated money-decrease hold: the backend kept the
                     // old head. Retry this or a newer body like a conflict.
-                    progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                    progress.quarantine_retryable_body(
+                        item_fingerprint,
+                        &body_witness(item),
+                        quarantine_retry_after(item_fingerprint),
+                    );
                 }
             } else if conflicted.contains(item_fingerprint) {
-                progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                progress.quarantine_retryable_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    quarantine_retry_after(item_fingerprint),
+                );
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
@@ -11644,46 +11677,55 @@ where
                     batches.push_front((remaining, false));
                 }
             }
-            Err(error)
-                if error
-                    .downcast_ref::<BatchRejected>()
-                    .is_some_and(|rejected| rejected.snapshot_indexes.is_some()) =>
-            {
-                let rejected = error
-                    .downcast_ref::<BatchRejected>()
-                    .expect("typed rejection");
-                let locations = rejected
-                    .snapshot_indexes
-                    .as_ref()
-                    .expect("validated locations");
-                let Some(held) = locations
-                    .iter()
-                    .map(|index| indices.get(*index).copied())
-                    .collect::<Option<BTreeSet<_>>>()
-                else {
-                    return Err(error);
-                };
-                if held.is_empty() {
-                    return Err(error);
-                }
+            Err(error) if server_named_items(&error, &indices).is_some() => {
+                let held = server_named_items(&error, &indices).expect("named items");
+                // The server named these items: a validation rejection, or an
+                // identity deferral that waits for its identity only. Hold
+                // them; their siblings and later batches continue this pass.
+                let (status, reason, identity_retry_at) =
+                    match error.downcast_ref::<UploadShed>().copied() {
+                        Some(shed) => (
+                            shed.status,
+                            "identity_deferred",
+                            Some(
+                                current_unix_seconds()
+                                    .saturating_add(shed_backoff(shed.retry_after).as_secs()),
+                            ),
+                        ),
+                        None => (
+                            error
+                                .downcast_ref::<BatchRejected>()
+                                .expect("typed rejection")
+                                .status,
+                            "validation_reject",
+                            None,
+                        ),
+                    };
                 let before = progress.clone();
                 for index in &held {
+                    let item_fingerprint = fingerprint(&items[*index]);
                     progress.quarantine_retryable_body(
-                        fingerprint(&items[*index]),
+                        item_fingerprint,
                         &body_witness(&items[*index]),
+                        identity_retry_at
+                            .unwrap_or_else(|| quarantine_retry_after(item_fingerprint)),
                     );
                 }
                 if persist(progress).is_err() {
                     *progress = before;
                     return Err(anyhow::Error::new(SnapshotLocalStateRejected {
-                        operation: "save validation rejection quarantine",
+                        operation: if identity_retry_at.is_some() {
+                            "save identity deferral quarantine"
+                        } else {
+                            "save validation rejection quarantine"
+                        },
                     }));
                 }
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
                 crate::local_resource_diagnostics::traversal_point(
                     "quarantine_retry",
                     poison_scope,
-                    &serde_json::json!({"reason": "validation_reject", "status": rejected.status,
+                    &serde_json::json!({"reason": reason, "status": status,
                         "count": held.len()}),
                 );
                 let remaining = indices
@@ -16552,7 +16594,11 @@ mod tests {
         let fingerprint = "f".repeat(64);
         let mut progress = test_upload_progress();
         for _ in 0..9 {
-            progress.quarantine_retryable_body(&fingerprint, &"a".repeat(64));
+            progress.quarantine_retryable_body(
+                &fingerprint,
+                &"a".repeat(64),
+                quarantine_retry_after(&fingerprint),
+            );
             let record = &progress.quarantined_fingerprints[&fingerprint];
             assert_eq!(record.failed_reconstruction_count, 1);
             assert_eq!(

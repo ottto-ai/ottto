@@ -257,6 +257,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
+/// The record map a field's codec writes. A cold usage map keeps its
+/// families in the store only, so no codec may see it.
+trait Records {
+    type Value: Serialize;
+    fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
+}
+impl<T: Serialize> Records for BTreeMap<String, T> {
+    type Value = T;
+    fn records(&self) -> Option<&Self> {
+        Some(self)
+    }
+}
+impl<T: Serialize> Records for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn records(&self) -> Option<&BTreeMap<String, Shared<T>>> {
+        Some(self)
+    }
+}
+impl Records for UsagePending {
+    type Value = ClaudeUsageFamilyPending;
+    fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
+        self.resident()
+    }
+}
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
 impl<T: Serialize> Serialize for WireMap<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -292,9 +316,11 @@ impl Serialize for ScanIndex {
             };
             (held $name:ident) => {
                 if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
+                    let records = Records::records(&self.$name)
+                        .ok_or_else(|| serde::ser::Error::custom("usage_pending_cold"))?;
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(&self.$name, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(records, self.decode_holds.0.get(stringify!($name))),
                     )?;
                 }
             };
@@ -1214,14 +1240,25 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
     }
     fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
         let roots = family_hold_roots(&self.holds.0);
+        // Only held roots are serialized. A cold usage map is refused only
+        // when a held root names one of its stored families; otherwise it
+        // contributes nothing, exactly as its resident entries would not.
+        if index.claude_usage_family_pending.cold().is_some()
+            && roots
+                .iter()
+                .any(|root| index.claude_usage_family_pending.contains_key(root))
+        {
+            return Err(Error::Refused("usage pending cold"));
+        }
         let mut input = HydrateInput(Vec::new());
         self.family_spans.clear();
         macro_rules! field {
             ($field:ident) => {{
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
+                let empty = BTreeMap::new();
                 let view = FamilyView {
-                    typed: &index.$field,
+                    typed: Records::records(&index.$field).unwrap_or(&empty),
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
@@ -1295,13 +1332,15 @@ pub(super) fn post_decode_hydrated(
     // records takes the field before the span and the debt flag after it.
     macro_rules! records {
         ($field:ident) => {
+            records!($field, index.$field)
+        };
+        ($field:ident, $records:expr) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                let records = &mut $records;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
-                    index.$field.remove(key);
+                    records.remove(key);
                 }
-                index
-                    .$field
-                    .extend(decoder.records(stringify!($field), span, true)?);
+                records.extend(decoder.records(stringify!($field), span, true)?);
             }
         };
     }
@@ -1319,7 +1358,14 @@ pub(super) fn post_decode_hydrated(
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
-    records!(claude_usage_family_pending);
+    // A cold usage map keeps its families in the store; no hold rewrites it.
+    records!(
+        claude_usage_family_pending,
+        *index
+            .claude_usage_family_pending
+            .resident_mut()
+            .ok_or(Error::Refused("usage pending cold"))?
+    );
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
             .original_holds
@@ -2185,7 +2231,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_family_pending" => {
                             index.claude_usage_family_pending =
-                                self.records("claude_usage_family_pending", value, true)?
+                                UsagePending::from(self.records::<ClaudeUsageFamilyPending>(
+                                    "claude_usage_family_pending",
+                                    value,
+                                    true,
+                                )?)
                         }
                         "claude_request_census" => {
                             index.claude_request_census = self
@@ -2600,7 +2650,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
                         "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending.remove(&key);
+                            index.claude_usage_family_pending.discard(&key);
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
