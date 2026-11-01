@@ -127,7 +127,7 @@ impl AckFixture {
     }
 }
 
-fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),

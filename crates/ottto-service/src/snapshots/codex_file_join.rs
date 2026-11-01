@@ -526,19 +526,6 @@ impl HeaderInventory {
             if index.archive_pass.ready(1) {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
-                    if index.archives.get(&key).is_some_and(|a| {
-                        a.stamp.is_none()
-                            && !matches!(
-                                a.disposition,
-                                ArchiveDisposition::HeaderValidated
-                                    | ArchiveDisposition::Held {
-                                        cause: CodexZstCause::AdmissionRefused,
-                                        ..
-                                    }
-                            )
-                    }) {
-                        continue;
-                    }
                     if let Ok(meta) = fs::symlink_metadata(path) {
                         if let Ok(a) = codex_compressed_input::ArchiveEvidence::from_metadata(meta)
                         {
@@ -549,11 +536,7 @@ impl HeaderInventory {
                             {
                                 index.archives.insert(key.clone(), a);
                             }
-                            if index
-                                .archives
-                                .get(&key)
-                                .is_some_and(|a| a.quiet_disposition())
-                            {
+                            if index.archive_quiet(&key) {
                                 continue;
                             }
                             if let Some(w) =

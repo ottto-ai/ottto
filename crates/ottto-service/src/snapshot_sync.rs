@@ -12889,7 +12889,7 @@ pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) use tests::assert_archive_debt_preserves_replay_progress;
+pub(crate) use tests::{archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress};
 
 #[cfg(test)]
 mod tests {
@@ -12899,6 +12899,67 @@ mod tests {
     }
     mod ack_retention_tests {
         include!("snapshot_sync/ack_retention_tests.rs");
+    }
+    pub(crate) fn archive_upload_checkpoint(
+        mut index: ScanIndex,
+        scan: &SourceScanResult,
+        previous: &ScanIndex,
+        outcome: &str,
+    ) -> ScanIndex {
+        let root = crate::test_scratch::ScratchDir::new("archive-upload-checkpoint");
+        let index_path = root.join("index.json");
+        let progress_path = root.join("progress.json");
+        std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
+        let mut progress = test_upload_progress();
+        progress.save(&progress_path).unwrap();
+        if outcome != "partial" {
+            let result = upload_resumable_batches_with_body_witness(
+                &scan.snapshots,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut 0,
+                |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |items| {
+                    if outcome == "shed" {
+                        Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: None,
+                            code: None,
+                        }))
+                    } else {
+                        ack_retention_tests::exact_ack(items)
+                    }
+                },
+                |state| state.save(&progress_path),
+            )
+            .unwrap();
+            if outcome == "shed" {
+                assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+            } else {
+                assert_eq!(result, ResumableUploadResult::Completed);
+            }
+        }
+        index.generation = previous.generation;
+        if outcome == "accept" {
+            index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+            index.settle_archive_outcome(|fp| {
+                progress.accepted_body_witnesses.get(fp).map(String::as_str)
+            });
+        }
+        checkpoint_partial_snapshot_index(
+            &index,
+            previous,
+            &progress,
+            &scan.snapshots,
+            Some(scan),
+            &BTreeSet::new(),
+            &index_path,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        ScanIndex::load(&index_path).unwrap()
     }
     pub(crate) fn assert_archive_debt_preserves_replay_progress(
         mut index: ScanIndex,

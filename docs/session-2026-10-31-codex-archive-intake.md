@@ -69,3 +69,11 @@ parser. Live content, archive and directory witnesses are rechecked for each
 archive at admission and publication; only immutable coverage is memoized.
 One damaged or unknown header defers every archive uniqueness proof. Resource
 receipt refusals can recur at the six-hour pace. Process memory measurement is owed.
+
+Transitions guard settled, correction, decoded structural and receipt-waiting
+states. Correction retains the ordinary file owner without creating header-less
+work. Receipt-waiting Pending is quiet only with its exact file incidence and
+before the saved deadline; an unaccepted expired body takes a paced native retry.
+Partial checkpoints retain the previous marker outside accepted safe keys, and
+reservation saves copy only their own new reservations. Header-less Reserve and
+marker creation by correctness/structural refusal are refused by the owner.

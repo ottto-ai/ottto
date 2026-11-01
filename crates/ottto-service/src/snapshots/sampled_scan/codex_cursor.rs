@@ -366,6 +366,10 @@ impl PageBudget {
     }
 
     /// Singleton-budget bytes this page may still read (group probes, R2-N2).
+    pub(in crate::snapshots) fn continue_singleton(&mut self) {
+        self.singleton_decoded = 0;
+    }
+
     pub(in crate::snapshots) fn singleton_remaining(&self, limits: Limits) -> u64 {
         limits.singleton.saturating_sub(self.singleton_decoded)
     }

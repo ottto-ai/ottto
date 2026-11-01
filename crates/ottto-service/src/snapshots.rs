@@ -28158,10 +28158,14 @@ impl OwnedSourceScan {
                     if !inventory.complete {
                         identified_candidates.retain(|candidate| {
                             if codex_archive_path(&candidate.path) {
-                                index.archive_transition(
-                                    &candidate.path,
-                                    ArchiveTransition::Correctness(CodexZstCause::OwnerUnproven),
-                                );
+                                if !index.archive_quiet(&local_index_key(&candidate.path)) {
+                                    index.archive_transition(
+                                        &candidate.path,
+                                        ArchiveTransition::Correctness(
+                                            CodexZstCause::OwnerUnproven,
+                                        ),
+                                    );
+                                }
                                 false
                             } else {
                                 true
@@ -28913,16 +28917,23 @@ impl OwnedSourceScan {
                     && index
                         .archives
                         .get(&local_index_key(&active.candidate.path))
-                        .is_some_and(|a| !a.ready_full())
+                        .map_or(true, |a| !a.ready_full())
                 {
-                    active_file = Some(active);
+                    if index
+                        .archives
+                        .contains_key(&local_index_key(&active.candidate.path))
+                    {
+                        active_file = Some(active);
+                    } else {
+                        active.parser.reader.reader.close();
+                    }
                     pending!();
                 }
                 if active.parser.reader.reader.is_compressed()
                     && codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current())
                         == 0
                 {
-                    codex_page = sampled_scan::codex_cursor::PageBudget::default();
+                    codex_page.continue_singleton();
                     index.archive_pass.power = index.archive_pass.gates.power_ready();
                     active_file = Some(active);
                     pending!();
@@ -29170,19 +29181,7 @@ impl OwnedSourceScan {
                             );
                         }
                         if codex_archive_path(&active.candidate.path) {
-                            let cause = if codex_compressed_input::structural_read_error(&error) {
-                                CodexZstCause::DecodeFailed
-                            } else {
-                                CodexZstCause::AdmissionRefused
-                            };
-                            index.archive_transition(
-                                &active.candidate.path,
-                                if cause == CodexZstCause::DecodeFailed {
-                                    ArchiveTransition::Structural(cause)
-                                } else {
-                                    ArchiveTransition::Transient(cause)
-                                },
-                            );
+                            index.archive_refusal(&active.candidate.path, &error);
                             active.parser.reader.reader.close();
                             pending!();
                         }
@@ -30317,19 +30316,7 @@ impl OwnedSourceScan {
                             );
                         }
                         if codex_archive_path(&candidate.path) {
-                            let cause = if codex_compressed_input::structural_read_error(&error) {
-                                CodexZstCause::DecodeFailed
-                            } else {
-                                CodexZstCause::AdmissionRefused
-                            };
-                            index.archive_transition(
-                                &candidate.path,
-                                if cause == CodexZstCause::DecodeFailed {
-                                    ArchiveTransition::Structural(cause)
-                                } else {
-                                    ArchiveTransition::Transient(cause)
-                                },
-                            );
+                            index.archive_refusal(&candidate.path, &error);
                             pending!();
                         }
                         census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
@@ -32705,7 +32692,7 @@ impl OwnedSourceScan {
             if codex_archive_path(&candidate.path) {
                 let key = local_index_key(&candidate.path);
                 if index.archives.get(&key).is_some_and(|a| {
-                    a.quiet_disposition()
+                    index.archive_quiet(&key)
                         && !a.ready_full()
                         && fs::symlink_metadata(&candidate.path)
                             .and_then(crate::transcript_acquisition::FileStamp::capture)
@@ -33625,12 +33612,7 @@ impl OwnedSourceScan {
                         );
                     }
                     if codex_archive_path(&candidate.path) {
-                        let change = if codex_compressed_input::structural_read_error(&error) {
-                            ArchiveTransition::Structural(CodexZstCause::DecodeFailed)
-                        } else {
-                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                        };
-                        index.archive_transition(&candidate.path, change);
+                        index.archive_refusal(&candidate.path, &error);
                         pending!();
                     }
                     census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
@@ -51897,6 +51879,13 @@ impl ScanIndex {
         result.reconcile_codex_recovery_settlement(previous, accepted);
         self.retain_terminal_off_page_retries(previous, &safe_keys, &mut result);
         result.archives.clone_from(&self.archives);
+        for key in self.archives.keys().filter(|key| !safe_keys.contains(*key)) {
+            if let Some(prior) = previous.archives.get(key) {
+                result.archives.insert(key.clone(), prior.clone());
+            } else {
+                result.archives.remove(key);
+            }
+        }
         result
     }
 

@@ -12,12 +12,49 @@ impl ScanIndex {
         let key = local_index_key(path);
         if matches!(change, ArchiveTransition::Gone) {
             self.archives.remove(&key);
-        } else if !matches!(change, ArchiveTransition::Quiet) {
-            self.archives
-                .entry(key)
-                .or_insert_with(ArchiveEvidence::unknown)
-                .transition(change);
+        } else {
+            if !self.archives.contains_key(&key)
+                && matches!(change, ArchiveTransition::Transient(_))
+            {
+                let mut a = ArchiveEvidence::unknown();
+                a.transition(ArchiveTransition::Transient(
+                    CodexZstCause::AdmissionRefused,
+                ));
+                self.archives.insert(key, a);
+                return;
+            }
+            if let Some(a) = self.archives.get_mut(&key) {
+                a.transition(change);
+            }
         }
+    }
+    pub(super) fn archive_refusal(&mut self, path: &Path, error: &anyhow::Error) {
+        self.archive_transition(
+            path,
+            if codex_compressed_input::structural_read_error(error) {
+                ArchiveTransition::Structural(CodexZstCause::DecodeFailed)
+            } else {
+                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+            },
+        );
+    }
+    pub(super) fn archive_quiet(&self, key: &str) -> bool {
+        self.archives.get(key).is_some_and(|a| {
+            a.quiet_disposition()
+                && a.work
+                    .as_ref()
+                    .and_then(|w| w.body_witness.as_ref())
+                    .map_or(true, |body| {
+                        self.files.get(key).is_some_and(|e| {
+                            e.last_upload_body_witness.as_ref() == Some(body)
+                                && self.file_snapshot_fingerprints.get(key).is_some_and(|fps| {
+                                    !fps.is_empty()
+                                        && e.last_snapshot_fingerprint.as_ref()
+                                            == Some(&snapshot_file_entity_set_hex(fps))
+                                })
+                        })
+                    })
+        })
     }
     pub(super) fn archive_owed_count(&self) -> usize {
         self.archives
@@ -54,7 +91,6 @@ impl ScanIndex {
         archive_alarm(alarm);
     }
     pub(super) fn hold_archive_corrections(&mut self) {
-        let mut changed = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
@@ -63,10 +99,8 @@ impl ScanIndex {
                 a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 ));
-                changed += 1;
             }
         }
-        archive_alarm(changed);
     }
     /// Reuse the ordinary absence owner; uncertainty in any configured root
     /// or inventoried home prevents publishing a uniqueness-dependent body.
@@ -130,10 +164,10 @@ impl ScanIndex {
         self.archive_pass.started = true;
         for c in candidates.iter().filter(|c| codex_archive_path(&c.path)) {
             let key = local_index_key(&c.path);
-            let Some(a) = self.archives.get(&key) else {
+            if !self.archives.contains_key(&key) {
                 continue;
-            };
-            if a.quiet_disposition() {
+            }
+            if self.archive_quiet(&key) {
                 continue;
             }
             if !budget.archive_ready(&self.archive_pass) {
