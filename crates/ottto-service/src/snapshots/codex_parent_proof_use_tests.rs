@@ -220,7 +220,6 @@ fn parse_forged(
         None,
         Some(Arc::new(Mutex::new(ledgers))),
         true,
-        true,
     )
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
@@ -555,7 +554,6 @@ impl Scene {
             None,
             None,
             None,
-            true,
             true,
         )
         .unwrap();

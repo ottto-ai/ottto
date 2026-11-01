@@ -96,7 +96,6 @@ impl Fixture {
             None,
             &[],
             false,
-            false,
         );
         for _ in 0..20_000 {
             match owned.step(None) {

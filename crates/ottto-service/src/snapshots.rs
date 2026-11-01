@@ -224,11 +224,11 @@ pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_lim
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
+#[cfg(test)]
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{
-    build_context_curve, prune_one_context_curve_fill_point, unavailable_context_curve,
-    validate_context_curve, ContextCurveCandidateBoundary, ContextCurveCandidatePoint,
-    CONTEXT_CURVE_SAMPLING_REVISION,
+    prune_one_context_curve_fill_point, unavailable_context_curve, validate_context_curve,
+    ContextCurveCandidateBoundary, ContextCurveCandidatePoint,
 };
 pub use context_curve::{
     SnapshotContextCurve, SnapshotContextCurveBoundary, SnapshotContextCurveModelWindow,
@@ -238,8 +238,9 @@ pub use context_curve::{
 use context_curve::{
     CONTEXT_CURVE_RETENTION_ANCHOR, CONTEXT_CURVE_RETENTION_COMPACTION_AFTER,
     CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE, CONTEXT_CURVE_RETENTION_FILL,
-    CONTEXT_CURVE_RETENTION_PEAK, CONTEXT_CURVE_RETENTION_TAIL, MAX_CONTEXT_CURVE_BOUNDARIES,
-    MAX_CONTEXT_CURVE_MODEL_WINDOWS, MAX_CONTEXT_CURVE_POINTS, MAX_CONTEXT_CURVE_WIRE_BYTES,
+    CONTEXT_CURVE_RETENTION_PEAK, CONTEXT_CURVE_RETENTION_TAIL, CONTEXT_CURVE_SAMPLING_REVISION,
+    MAX_CONTEXT_CURVE_BOUNDARIES, MAX_CONTEXT_CURVE_MODEL_WINDOWS, MAX_CONTEXT_CURVE_POINTS,
+    MAX_CONTEXT_CURVE_WIRE_BYTES,
 };
 
 pub fn collector_version() -> String {
@@ -936,47 +937,12 @@ const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// context changes (a fresh traversal starts at zero).
 const UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS: u8 = 7;
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
-const CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "codex_owned_rollout_occurrences:v1";
-const CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str =
-    "codex_token_count_model_context_window:v1";
-// v2 persists provider-owned-start census proof across bounded pages and
-// accepts the documented minimal API-log/trace request join. Advancing the
-// derivation revision rearms one bounded historical replay so already-indexed
-// transcripts receive the correction instead of limiting it to new sessions.
-const CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "claude_owned_request_start_proof:v2";
-const CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str = "claude_transcript_model:v1";
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
-
-fn context_curve_derivation_revision_key(
-    parser_revision: &str,
-    ownership_revision: &str,
-    sampling_revision: &str,
-    model_evidence_revision: &str,
-) -> String {
-    format!(
-        "parser={parser_revision};ownership={ownership_revision};sampling={sampling_revision};model_window={model_evidence_revision}"
-    )
-}
-
-pub(crate) fn context_curve_derivation_revision(source: SnapshotSource) -> Option<String> {
-    match source {
-        SnapshotSource::Codex => Some(context_curve_derivation_revision_key(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-            CONTEXT_CURVE_SAMPLING_REVISION,
-            CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
-        )),
-        SnapshotSource::ClaudeCode => Some(context_curve_derivation_revision_key(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-            CONTEXT_CURVE_SAMPLING_REVISION,
-            CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
-        )),
-        SnapshotSource::Pi => None,
-    }
-}
+/// The retired context-curve replay epoch. An index that never negotiated
+/// curve upload held 0, so digests and receipts keep that value.
+pub(crate) const RETIRED_CONTEXT_CURVE_REPLAY_EPOCH: u64 = 0;
 
 pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
     timestamps.sort();
@@ -1191,27 +1157,6 @@ fn claude_compaction_summary_paired(
         bounded_compaction_timestamps(timestamps),
         metrics,
     )
-}
-
-fn canonical_claude_curve_boundaries(
-    observations: &[ClaudeCompactionObservation],
-) -> Vec<ClaudeCompactionObservation> {
-    let matched_legacy = paired_claude_legacy_compactions(observations);
-    let mut boundaries = observations
-        .iter()
-        .enumerate()
-        .filter(|(index, observation)| {
-            observation.kind == ClaudeCompactionKind::CurrentBoundary
-                || !matched_legacy.contains(index)
-        })
-        .map(|(_, observation)| observation.clone())
-        .collect::<Vec<_>>();
-    boundaries.sort_by(|left, right| {
-        left.response_count_before
-            .cmp(&right.response_count_before)
-            .then_with(|| left.timestamp.cmp(&right.timestamp))
-    });
-    boundaries
 }
 
 fn clear_claude_context_posture(item: &mut SnapshotItem) {
@@ -3876,16 +3821,20 @@ pub struct ScanIndex {
     /// clears only derived transcript settlement state once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     historical_replay_generation: Option<String>,
-    /// Last successfully settled server capability epoch for request-index
-    /// curves. False is omitted for byte-compatible old indexes. An enabled ->
-    /// disabled -> enabled transition forces one fresh replay so files changed
-    /// while durable curve admission was unavailable are not skipped forever.
-    #[serde(default, skip_serializing_if = "is_false")]
-    context_curve_capability_enabled: bool,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    context_curve_replay_epoch: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completed_context_curve_replay_generation: Option<String>,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// The three curve replay slots retired with full context-curve upload.
+    #[serde(rename = "context_curve_capability_enabled", default, skip_serializing)]
+    retired_context_curve_capability_enabled: serde::de::IgnoredAny,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "context_curve_replay_epoch", default, skip_serializing)]
+    retired_context_curve_replay_epoch: serde::de::IgnoredAny,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(
+        rename = "completed_context_curve_replay_generation",
+        default,
+        skip_serializing
+    )]
+    retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
     /// Files that were fully read and valid but intentionally produced no
     /// snapshot. Separate from `last_snapshot_fingerprint=None`, which legacy
     /// indexes can only treat as unknown/incomplete.
@@ -4352,9 +4301,9 @@ impl Default for ScanIndex {
             claude_stale_family_carry: ClaudeStaleFamilyCarry::default(),
             scan_residue_witness: None,
             historical_replay_generation: None,
-            context_curve_capability_enabled: false,
-            context_curve_replay_epoch: 0,
-            completed_context_curve_replay_generation: None,
+            retired_context_curve_capability_enabled: serde::de::IgnoredAny,
+            retired_context_curve_replay_epoch: serde::de::IgnoredAny,
+            retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
             confirmed_empty_files: BTreeSet::new(),
             codex_counting_moved_evidence: BTreeMap::new(),
             codex_counting_tombstones: BTreeMap::new(),
@@ -7793,6 +7742,21 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
+/// RAM-only receipt inputs from existing traversal/admission state. No census
+/// decision, durable field, or scheduling change is made by this projection.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusStatus {
+    pub pending_work: bool,
+    pub retryable_problem: bool,
+    pub transport_reservation_refused: bool,
+    pub carry_admission_veto: bool,
+    pub state_loader_failed: bool,
+    pub reconciliation_incomplete: bool,
+    pub retry_attempt: u8,
+    pub retry_not_before_unix_seconds: Option<u64>,
+    pub admission_due_unix_seconds: Option<u64>,
+}
+
 macro_rules! scan_result {
     (pub struct $name:ident { pub source: SnapshotSource,
         $($(#[$attr:meta])* $vis:vis $field:ident: $ty:ty,)*
@@ -7809,6 +7773,7 @@ macro_rules! scan_result {
 scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
+    pub(crate) census_status: CensusStatus,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
     pub discovered_file_count: usize,
@@ -8181,6 +8146,15 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
+    apply_upload_policy_with_item_limit(source, snapshots, policy, MAX_SNAPSHOT_ITEM_WIRE_BYTES);
+}
+
+pub(crate) fn apply_upload_policy_with_item_limit(
+    source: SnapshotSource,
+    snapshots: &mut [SnapshotItem],
+    policy: SnapshotUploadPolicy,
+    item_limit: usize,
+) {
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -8233,12 +8207,7 @@ pub fn apply_upload_policy(
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
-        fit_context_curve_to_snapshot_item_budget(
-            source,
-            item,
-            policy,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-        );
+        fit_context_curve_to_snapshot_item_budget(source, item, policy, item_limit);
     }
 }
 
@@ -10036,139 +10005,8 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             item.cache_observations = None;
         }
         // Context posture participates in semantic identity. Recompute after
-        // the ownership fold even when curve admission is disabled.
+        // the ownership fold.
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-
-        if item.context_curve.is_none() {
-            // Activity hint did not advertise durable curve admission for this
-            // cycle. Do not mint additive evidence that cannot be settled.
-            continue;
-        }
-        let unavailable_coverage = if !item.claude_context_curve_request_index_complete {
-            "parser_unsupported"
-        } else if item.claude_file_birth_verdict() == Some(ClaudeFileBirthVerdict::Admitted) {
-            // File birth admits the scalar tuple, never the strict curve.
-            "scalars_file_birth_only"
-        } else {
-            "ownership_unresolved"
-        };
-        item.context_curve = Some(unavailable_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-            unavailable_coverage,
-            0,
-            0,
-        ));
-        let owned_start_census_verified = claude_owned_start_was_census_verified(item, index);
-        if !source_certified
-            || !(census_complete || owned_start_census_verified)
-            || !item.claude_context_curve_identity_complete
-            || !item.claude_context_curve_request_index_complete
-        {
-            continue;
-        }
-        if index
-            .claude_usage_family_pending
-            .get(&root_session_id)
-            .is_some_and(|pending| {
-                pending.invalid || pending.census_window_end != census_window_end
-            })
-        {
-            continue;
-        }
-        let owned_start_proven = item.claude_context_curve_owned_start_proven
-            || !excluded_request_hashes.is_empty()
-            || item.usage_accounting_contract.as_deref()
-                == Some("session_exclusive_reported_usage:v1");
-        if !owned_start_proven {
-            // Unique request ids in the bounded census do not prove ownership:
-            // a missing/deleted/out-of-window predecessor can leave a Fable or
-            // takeover transcript's copied prefix looking unique. Require an
-            // explicit provider fork boundary, an exactly excluded copied
-            // prefix, or complete provider-reported ownership evidence.
-            continue;
-        }
-        if unresolved_duplicate {
-            continue;
-        }
-        #[cfg(test)]
-        eprintln!("claude_curve_native_predicate: sid8={:.8x} census_complete={census_complete} owned_start_census_verified={owned_start_census_verified} native_identity_complete={} native_request_index_complete={} owned_start_proven={owned_start_proven} same_window_pending_valid=true unresolved_duplicate=false", Sha256::digest(item.source_session_id.as_bytes()), item.claude_context_curve_identity_complete, item.claude_context_curve_request_index_complete);
-
-        let mut owned_occurrences = item
-            .claude_usage_occurrences
-            .iter()
-            .filter_map(|(request_id, occurrence)| {
-                let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
-                (!excluded_request_hashes.contains(&request_hash)).then_some(occurrence)
-            })
-            .collect::<Vec<_>>();
-        owned_occurrences.sort_by_key(|occurrence| occurrence.sequence);
-        let candidates = owned_occurrences
-            .iter()
-            .map(|occurrence| ContextCurveCandidatePoint {
-                observed_at: occurrence.timestamp.clone(),
-                effective_input_tokens: occurrence.effective_input_context,
-                model: occurrence.model.clone(),
-                context_window_tokens: None,
-            })
-            .collect::<Vec<_>>();
-        let first_owned_sequence = owned_occurrences
-            .first()
-            .map(|occurrence| occurrence.sequence)
-            .unwrap_or(u64::MAX);
-        let boundaries = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries)
-            .into_iter()
-            // A copied-prefix compaction belongs to the predecessor, just like the
-            // copied responses before the first owned request.
-            .filter(|boundary| boundary.response_count_before > first_owned_sequence)
-            .map(|boundary| ContextCurveCandidateBoundary {
-                observed_at: boundary.timestamp,
-                point_count_before: owned_occurrences
-                    .iter()
-                    .filter(|occurrence| occurrence.sequence < boundary.response_count_before)
-                    .count() as u64,
-            })
-            .collect::<Vec<_>>();
-        item.context_curve = Some(build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-            CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
-            &candidates,
-            &boundaries,
-            "parser_unsupported",
-        ));
-        if item
-            .context_curve
-            .as_ref()
-            .is_some_and(|curve| matches!(curve.coverage.as_str(), "complete" | "sampled"))
-        {
-            if let Some(fingerprint) = item.source_file_fingerprint.as_ref() {
-                if let Some(witness) = index
-                    .claude_owned_start_census
-                    .get_mut(&item.source_session_id)
-                    .filter(|witness| {
-                        witness.verified_source_file_fingerprint.as_ref() == Some(fingerprint)
-                    })
-                {
-                    witness.emitted_source_file_fingerprint = Some(fingerprint.clone());
-                }
-            }
-        }
-    }
-    for item in snapshots.iter() {
-        match item
-            .context_curve
-            .as_ref()
-            .map(|curve| curve.coverage.as_str())
-        {
-            Some("scalars_file_birth_only") => {
-                context_file_birth.curve_scalars_file_birth_only_session_count += 1;
-            }
-            Some("ownership_unresolved") => {
-                context_file_birth.curve_ownership_unresolved_session_count += 1;
-            }
-            _ => {}
-        }
     }
     claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
     note_claude_reemission_stop(&context_file_birth, file_birth_tripwire.over_bound_roots());
@@ -15883,6 +15721,13 @@ impl UsageTotals {
 }
 
 pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result<(), String> {
+    validate_snapshot_batch_request_with_item_limit(request, MAX_SNAPSHOT_ITEM_WIRE_BYTES)
+}
+
+pub(crate) fn validate_snapshot_batch_request_with_item_limit(
+    request: &SnapshotBatchRequest,
+    item_limit: usize,
+) -> Result<(), String> {
     if request.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(format!(
             "schema_version {} does not match daemon SNAPSHOT_SCHEMA_VERSION {}",
@@ -15926,15 +15771,17 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
         item_without_curve.context_curve = None;
         let item_without_curve_size =
             snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
-        if !snapshot_item_wire_size_is_allowed(
-            item_size,
-            item_without_curve_size,
-            item.context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-        ) {
+        if item_size > item_limit
+            && !snapshot_item_wire_size_is_allowed(
+                item_size,
+                item_without_curve_size,
+                item.context_curve
+                    .as_ref()
+                    .map(|curve| curve.coverage.as_str()),
+            )
+        {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
             ));
         }
     }
@@ -17986,6 +17833,9 @@ struct SnapshotAccumulator {
     // Raw turn ids (class L): never uploaded except where the upload contract
     // already carries it; persisted only in the local durable-tail store.
     cache_active_turns: BTreeSet<String>,
+    /// Retired with full context-curve upload; always false. Kept, like the
+    /// three `codex_context_curve_*` slots, so the pinned durable-tail
+    /// allowlist digest and records already on disk stay valid.
     context_curve_enabled: bool,
     source_session_id: Option<String>,
     account_identifier_hash: Option<String>,
@@ -18128,6 +17978,7 @@ struct SnapshotAccumulator {
     codex_inherited_usage_records_skipped: u64,
     codex_duplicate_usage_records_skipped: u64,
     codex_cumulative_reset_count: u64,
+    // Retired durable-tail slots (see `context_curve_enabled`): always empty.
     codex_context_curve_candidates: crate::owned_heap::OwnedVec<ContextCurveCandidatePoint>,
     codex_context_curve_boundaries: crate::owned_heap::OwnedVec<ContextCurveCandidateBoundary>,
     codex_context_curve_exact_supported: bool,
@@ -18329,7 +18180,7 @@ impl SnapshotAccumulator {
             cache_task_complete_at: None,
             cache_pending_idle: None,
             cache_active_turns: BTreeSet::new(),
-            context_curve_enabled: true,
+            context_curve_enabled: false,
             source_session_id: None,
             account_identifier_hash: None,
             title: None,
@@ -20389,15 +20240,6 @@ impl SnapshotAccumulator {
                 .map_or(0, str::len)
                 .checked_mul(3)?,
         };
-        let context_curve = if self.context_curve_enabled {
-            CONTEXT_CURVE_CONTRACT_VERSION.len()
-                + self.source.parser_version().len()
-                + CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION.len()
-                + CONTEXT_CURVE_SAMPLING_REVISION.len()
-                + "ownership_unresolved".len()
-        } else {
-            0
-        };
         let single_fact = MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
             + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
             + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
@@ -20421,7 +20263,6 @@ impl SnapshotAccumulator {
             .checked_add(source_file_fingerprint.len().checked_mul(2)?)?
             .checked_add(opened_object_identity.len())? // the ownership ledger's
             .checked_add(2 * ("claude_code_jsonl".len() + "uncached".len()))?
-            .checked_add(context_curve)?
             .checked_add(5 * USD_TEXT_BYTES + "pi_usage_cost".len())?
             .checked_add("agent_capability_usage:v2".len())?
             .checked_add(RFC3339_TEXT_BYTES)? // a fallback bucket input
@@ -21176,37 +21017,6 @@ impl SnapshotAccumulator {
         } else {
             Vec::new()
         };
-        let context_curve = if !self.context_curve_enabled {
-            None
-        } else {
-            match self.source {
-                SnapshotSource::Codex if self.codex_context_curve_exact_supported => {
-                    Some(build_context_curve(
-                        self.source.parser_version(),
-                        CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                        CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
-                        &self.codex_context_curve_candidates,
-                        &self.codex_context_curve_boundaries,
-                        "pre_capture",
-                    ))
-                }
-                SnapshotSource::Codex => Some(unavailable_context_curve(
-                    self.source.parser_version(),
-                    CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                    "pre_capture",
-                    0,
-                    0,
-                )),
-                SnapshotSource::ClaudeCode => Some(unavailable_context_curve(
-                    self.source.parser_version(),
-                    CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                    "ownership_unresolved",
-                    0,
-                    0,
-                )),
-                SnapshotSource::Pi => None,
-            }
-        };
         if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
             self.cache_observations =
                 codex_cache_wire_for_requests(&source_session_id, &self.cache_requests);
@@ -21354,7 +21164,7 @@ impl SnapshotAccumulator {
             } else {
                 None
             },
-            context_curve,
+            context_curve: None,
             claude_context_curve_boundaries: self.claude_compaction_observations.into_vec(),
             claude_context_curve_identity_complete: self.claude_context_curve_identity_complete,
             claude_context_curve_request_index_complete: self
@@ -21892,11 +21702,10 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     claude_effort_support_dir: Option<&Path>,
-    context_curve_enabled: bool,
     hinted_paths: &[PathBuf],
     watcher_overflowed: bool,
 ) -> Result<SourceScanResult> {
-    scan_source_roots_with_limit_and_attribution_and_curve(
+    scan_source_roots_with_limit_and_attribution(
         source,
         roots,
         index,
@@ -21908,7 +21717,6 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
         claude_effort_support_dir,
         hinted_paths,
         watcher_overflowed,
-        context_curve_enabled,
     )
 }
 
@@ -21934,7 +21742,6 @@ pub fn scan_source_roots_with_attribution_and_claude_effort(
         artifacts_enabled,
         attribution_context,
         claude_effort_support_dir,
-        true,
         &[],
         false,
     )
@@ -22842,7 +22649,6 @@ impl CodexProofReader {
             None,
             None,
             false,
-            false,
         )?;
         parser.accumulator.codex_physical_signatures_complete = false;
         let plan = crate::transcript_acquisition::ReadPlan::prepare(
@@ -22884,7 +22690,6 @@ impl CodexProofReader {
             None,
             None,
             None,
-            false,
             false,
         )?;
         parser.accumulator.codex_proof_decision_only = true;
@@ -25988,39 +25793,6 @@ fn scan_source_roots_with_limit_and_attribution(
     watcher_overflowed: bool,
 ) -> Result<SourceScanResult> {
     index.require_persistence_available()?;
-
-    scan_source_roots_with_limit_and_attribution_and_curve(
-        source,
-        roots,
-        index,
-        collected_at,
-        requested_backfill_window_days,
-        file_limit,
-        artifacts_enabled,
-        attribution_context,
-        claude_effort_support_dir,
-        hinted_paths,
-        watcher_overflowed,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_source_roots_with_limit_and_attribution_and_curve(
-    source: SnapshotSource,
-    roots: &[PathBuf],
-    index: &mut ScanIndex,
-    collected_at: &str,
-    requested_backfill_window_days: u64,
-    file_limit: usize,
-    artifacts_enabled: bool,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-    claude_effort_support_dir: Option<&Path>,
-    hinted_paths: &[PathBuf],
-    watcher_overflowed: bool,
-    context_curve_enabled: bool,
-) -> Result<SourceScanResult> {
-    index.require_persistence_available()?;
     state_v2::before_collection(index)?;
 
     let mut state = OwnedSourceScan::new(
@@ -26034,7 +25806,6 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         claude_effort_support_dir,
         hinted_paths,
         watcher_overflowed,
-        context_curve_enabled,
     );
     loop {
         // A refusal is terminal for this attempt, not cooperative progress.
@@ -26156,7 +25927,6 @@ pub(crate) struct OwnedSourceScan {
     backfill_window_days: u64,
     file_limit: usize,
     artifacts_enabled: bool,
-    context_curve_enabled: bool,
     /// This scan's sync cycle holds a contract-5 permit.
     claude_request_identity_capture: bool,
     claude_effort_support_dir: Option<PathBuf>,
@@ -26583,7 +26353,6 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
-        context_curve_enabled: bool,
     ) -> Self {
         Self::new_with_identity_capture(
             source,
@@ -26596,7 +26365,6 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             hinted_paths,
             watcher_overflowed,
-            context_curve_enabled,
             cfg!(test) || claude_request_identity::captures(source),
         )
     }
@@ -26616,7 +26384,6 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
-        context_curve_enabled: bool,
         claude_request_identity_capture: bool,
     ) -> Self {
         Self::new_with_identity_capture_and_recovery_priority(
@@ -26630,7 +26397,6 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             hinted_paths,
             watcher_overflowed,
-            context_curve_enabled,
             claude_request_identity_capture,
             &[],
         )
@@ -26652,7 +26418,6 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
-        context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
@@ -26667,7 +26432,6 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             hinted_paths,
             watcher_overflowed,
-            context_curve_enabled,
             claude_request_identity_capture,
             recovery_priority,
         )
@@ -26682,7 +26446,6 @@ impl OwnedSourceScan {
         requested_backfill_window_days: u64,
         file_limit: usize,
         artifacts_enabled: bool,
-        context_curve_enabled: bool,
         ordinary_equivalent: Option<std::time::Duration>,
         mut evidence: Option<CodexContinuationEvidence>,
     ) -> Self {
@@ -26712,7 +26475,6 @@ impl OwnedSourceScan {
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
             artifacts_enabled,
-            context_curve_enabled,
             claude_request_identity_capture: false,
             claude_effort_support_dir: None,
             claude_title_metadata: Default::default(),
@@ -26783,7 +26545,6 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
-        context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
@@ -26800,7 +26561,6 @@ impl OwnedSourceScan {
                 requested_backfill_window_days,
                 0,
                 artifacts_enabled,
-                context_curve_enabled,
                 None,
                 None,
             );
@@ -27546,7 +27306,6 @@ impl OwnedSourceScan {
             backfill_window_days,
             file_limit,
             artifacts_enabled,
-            context_curve_enabled,
             claude_request_identity_capture,
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
             codex_title_metadata,
@@ -27754,7 +27513,6 @@ impl OwnedSourceScan {
             backfill_window_days,
             file_limit,
             artifacts_enabled,
-            context_curve_enabled,
             claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
@@ -28623,7 +28381,6 @@ impl OwnedSourceScan {
                     traces: codex_turn_traces.clone(),
                     ledgers: codex_parent_ownership_ledgers.clone(),
                     artifacts: artifacts_enabled,
-                    context_curve: context_curve_enabled,
                     index,
                 });
                 let Ok(mut job) = job else {
@@ -28759,7 +28516,6 @@ impl OwnedSourceScan {
                             codex: &codex_title_metadata,
                             claude: &claude_title_metadata,
                             support: claude_effort_support_dir_ref,
-                            context_curve_enabled,
                             traces: codex_turn_traces.clone(),
                             parents: codex_parent_ownership_ledgers.clone(),
                             inventory: codex_join_inventory.as_ref(),
@@ -28964,14 +28720,7 @@ impl OwnedSourceScan {
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
                         )?;
-                        Some(context.file_scope(
-                            source,
-                            member,
-                            &dependency,
-                            true,
-                            context_curve_enabled,
-                            index,
-                        ))
+                        Some(context.file_scope(source, member, &dependency, true, index))
                     };
                     match codex_file_join::step_group(
                         &mut active,
@@ -28979,7 +28728,6 @@ impl OwnedSourceScan {
                             metadata: &codex_title_metadata,
                             attribution: attribution_context,
                             artifacts: artifacts_enabled,
-                            context_curve: context_curve_enabled,
                             live_scope: &live_scope,
                         },
                     ) {
@@ -29317,7 +29065,6 @@ impl OwnedSourceScan {
                         codex_turn_traces.clone(),
                         codex_parent_ownership_ledgers.clone(),
                         source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                        context_curve_enabled,
                         claude_request_identity_capture,
                         index,
                     ) else {
@@ -29515,14 +29262,7 @@ impl OwnedSourceScan {
                         claude_effort_support_dir_ref,
                     )
                     .map(|dependency| {
-                        context.file_scope(
-                            source,
-                            &active.candidate,
-                            &dependency,
-                            true,
-                            context_curve_enabled,
-                            index,
-                        )
+                        context.file_scope(source, &active.candidate, &dependency, true, index)
                     });
                     let counting_now =
                         sampled_scan::codex_cursor::job_counting_view(&active, index);
@@ -29862,7 +29602,6 @@ impl OwnedSourceScan {
                                 &candidate,
                                 &dependency,
                                 source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                                context_curve_enabled,
                                 index,
                             )
                         });
@@ -32254,6 +31993,47 @@ impl OwnedSourceScan {
                     .saturating_add(usize::from(terminal_unhealthy))
                     .saturating_add(usize::from(needs_clean_followup))
                     .saturating_add(usize::from(parent_resolution_restart));
+                let traversal = index.traversal.as_ref().expect("traversal remains active");
+                let admission = index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .filter(|_| source == SnapshotSource::ClaudeCode)
+                    .and_then(|origin| origin.admission.as_ref());
+                let loaders = &codex_title_metadata.local_diagnostics;
+                let census_status = CensusStatus {
+                    pending_work: !traversal.pending_directories.is_empty()
+                        || !traversal.pending_candidates.is_empty()
+                        || !index.claude_stale_family_carry.replay.is_empty(),
+                    retryable_problem: traversal.counts.has_retryable_problems(),
+                    transport_reservation_refused: index
+                        .context_read_counts
+                        .transport_reservation_refused,
+                    carry_admission_veto: admission
+                        .is_some_and(|state| !(claude_terminal_off() && state.complete)),
+                    // Completeness also falls on identity conflicts: require
+                    // an actual failed loader (#985), not just a false gate.
+                    state_loader_failed: source == SnapshotSource::Codex
+                        && (!state_census_complete || !sidecar_census_complete)
+                        && [
+                            loaders.state_titles.failed_roots,
+                            loaders.state_threads.failed_roots,
+                            loaders.spawn_edges.failed_roots,
+                            loaders.rollout_extents.failed_roots,
+                            loaders.session_index.failed_roots,
+                        ]
+                        .into_iter()
+                        .any(|failed| failed > 0),
+                    reconciliation_incomplete: !reconciliation_complete,
+                    retry_attempt: traversal.unhealthy_retry_attempt,
+                    retry_not_before_unix_seconds: traversal
+                        .unhealthy_retry_not_before_unix_seconds,
+                    // Same immediate-due rule as ensure_bounded_traversal.
+                    // due_through is a work cutoff, not a retry deadline.
+                    admission_due_unix_seconds: admission
+                        .filter(|state| !state.complete && state.progressed)
+                        .and_then(|_| rfc3339_unix_seconds(&collected_at)),
+                };
                 if raw_census_complete {
                     index.record_scan_residue_witness(source, &traversal_snapshot);
                 }
@@ -32350,10 +32130,10 @@ impl OwnedSourceScan {
                 } else {
                     (0, 0, 0)
                 };
-                if !context_curve_enabled {
-                    for snapshot in &mut snapshots {
-                        snapshot.context_curve = None;
-                    }
+                // Full context-curve upload is retired: a restored old curve
+                // never leaves the Mac.
+                for snapshot in &mut snapshots {
+                    snapshot.context_curve = None;
                 }
                 index.preserve_decode_held_files(source, &snapshots, &mut pending_finalization);
                 snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
@@ -32448,6 +32228,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    census_status,
                     cap_counts: counts.caps,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
@@ -33542,7 +33323,6 @@ impl OwnedSourceScan {
                 codex_turn_traces.clone(),
                 codex_parent_ownership_ledgers.clone(),
                 source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                context_curve_enabled,
                 claude_request_identity_capture,
                 index,
             ) {
@@ -33743,7 +33523,6 @@ impl OwnedSourceScan {
                             &candidate,
                             &reduction_sidecar,
                             source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                            context_curve_enabled,
                             index,
                         );
                         // M1: on a RAM miss, a durable record may restore
@@ -33978,14 +33757,8 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let scope = context.file_scope(
-                            source,
-                            &candidate,
-                            &reduction_sidecar,
-                            true,
-                            context_curve_enabled,
-                            index,
-                        );
+                        let scope =
+                            context.file_scope(source, &candidate, &reduction_sidecar, true, index);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
                         let mode = match parser.prepare_acquisition(
@@ -34252,7 +34025,6 @@ impl OwnedSourceScan {
             backfill_window_days,
             file_limit,
             artifacts_enabled,
-            context_curve_enabled,
             claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
@@ -34680,13 +34452,7 @@ fn codex_state_only_snapshot(
         compaction_total_post_tokens: None,
         compaction_total_cumulative_dropped_tokens: None,
         compaction_total_duration_ms: None,
-        context_curve: Some(unavailable_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-            "pre_capture",
-            0,
-            0,
-        )),
+        context_curve: None,
         claude_context_curve_boundaries: Vec::new(),
         claude_context_curve_identity_complete: false,
         claude_context_curve_request_index_complete: false,
@@ -34972,7 +34738,6 @@ fn parse_jsonl_file(
         None,
         artifacts_enabled,
         attribution_context,
-        true,
     )?;
     Ok(ParsedSnapshotFile {
         snapshots: parsed.snapshots,
@@ -35109,7 +34874,6 @@ impl OwnedJsonlParser {
             Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>,
         >,
         artifacts_enabled: bool,
-        context_curve_enabled: bool,
     ) -> Result<Self> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
@@ -35123,7 +34887,6 @@ impl OwnedJsonlParser {
             codex_turn_traces,
             codex_parent_ownership_ledgers,
             artifacts_enabled,
-            context_curve_enabled,
         )
     }
     /// Every input kind reaches the same line parser through one opened
@@ -35141,14 +34904,12 @@ impl OwnedJsonlParser {
             Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>,
         >,
         artifacts_enabled: bool,
-        context_curve_enabled: bool,
     ) -> Result<Self> {
         // Snapshot semantics come from provider-native session evidence. Mutable
         // current config defaults are useful for live status display, but applying
         // today's defaults to cumulative historical usage would retroactively
         // rewrite old sessions and make a config edit a global replay trigger.
         let mut accumulator = SnapshotAccumulator::new(source);
-        accumulator.context_curve_enabled = context_curve_enabled;
         accumulator.artifacts_enabled = artifacts_enabled;
         accumulator.codex_turn_traces = codex_turn_traces;
         accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
@@ -35710,7 +35471,6 @@ fn parse_opened_jsonl_file(
     >,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-    context_curve_enabled: bool,
 ) -> Result<ParsedJsonlFile> {
     let mut parser = OwnedJsonlParser::new(
         file,
@@ -35721,7 +35481,6 @@ fn parse_opened_jsonl_file(
         codex_turn_traces,
         codex_parent_ownership_ledgers,
         artifacts_enabled,
-        context_curve_enabled,
     )?;
     while !parser
         .step()
@@ -38215,14 +37974,6 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // the `isCompactSummary` record the Claude parser counts.
     if string_eq_at(value, &["type"], "compacted") {
         accumulator.compaction_count += 1;
-        if accumulator.context_curve_enabled {
-            accumulator
-                .codex_context_curve_boundaries
-                .push(ContextCurveCandidateBoundary {
-                    observed_at: timestamp.clone(),
-                    point_count_before: accumulator.codex_context_curve_candidates.len() as u64,
-                });
-        }
         if let Some(timestamp) = timestamp.clone() {
             // `before` is the session's current "last" value: the last owned
             // non-zero request before this marker, in the posture measure.
@@ -38379,22 +38130,6 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 accumulator
                     .codex_compaction_sizes
                     .note_counted_request(context_tokens);
-            }
-        }
-        if admitted.is_some() && accumulator.context_curve_enabled {
-            match (last_usage, usage_event_identity) {
-                (Some(last_usage), Some(_)) if last_usage.input_tokens > 0 => {
-                    accumulator
-                        .codex_context_curve_candidates
-                        .push(ContextCurveCandidatePoint {
-                            observed_at: timestamp.clone(),
-                            // Codex input_tokens already includes cached input.
-                            effective_input_tokens: last_usage.input_tokens,
-                            model: model.or_else(|| accumulator.latest_model.clone()),
-                            context_window_tokens: codex_model_context_window(value),
-                        });
-                }
-                _ => accumulator.codex_context_curve_exact_supported = false,
             }
         }
     }
@@ -49331,26 +49066,6 @@ impl ScanIndex {
         self.historical_replay_generation.as_deref() == Some(generation)
     }
 
-    pub(crate) fn context_curve_replay_epoch(&self) -> u64 {
-        self.context_curve_replay_epoch
-    }
-
-    pub(crate) fn context_curve_replay_needed(&self, generation: &str) -> bool {
-        self.completed_context_curve_replay_generation.as_deref() != Some(generation)
-    }
-
-    pub(crate) fn mark_context_curve_replay_complete(&mut self, generation: String) {
-        self.context_curve_capability_enabled = true;
-        self.completed_context_curve_replay_generation = Some(generation);
-    }
-
-    pub(crate) fn mark_context_curve_capability_disabled(&mut self) {
-        if self.context_curve_capability_enabled {
-            self.context_curve_replay_epoch = self.context_curve_replay_epoch.saturating_add(1);
-        }
-        self.context_curve_capability_enabled = false;
-    }
-
     /// Reuse the existing quarantine retry page after a reviewed admission
     /// increase. Legacy records have no rejection reason: re-offer current
     /// refusals, preserving accepted marks and absent/superseded disclosures.
@@ -52107,11 +51822,9 @@ impl ScanIndex {
             claude_stale_family_carry: self.claude_stale_family_carry.clone(),
             scan_residue_witness: self.scan_residue_witness.clone(),
             historical_replay_generation: self.historical_replay_generation.clone(),
-            context_curve_capability_enabled: previous.context_curve_capability_enabled,
-            context_curve_replay_epoch: previous.context_curve_replay_epoch,
-            completed_context_curve_replay_generation: previous
-                .completed_context_curve_replay_generation
-                .clone(),
+            retired_context_curve_capability_enabled: serde::de::IgnoredAny,
+            retired_context_curve_replay_epoch: serde::de::IgnoredAny,
+            retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
             confirmed_empty_files,
             file_snapshot_fingerprints,
             snapshot_activity_at,
@@ -54448,6 +54161,39 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
         .collect()
 }
 
+/// Reads a curve from a committed golden fixture at a JSON pointer ("" is the
+/// whole file). The daemon no longer builds curves; retained bodies may still
+/// carry one.
+#[cfg(test)]
+pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> SnapshotContextCurve {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/snapshot-audit")
+        .join(file);
+    let value: Value =
+        serde_json::from_slice(&fs::read(path).expect("read curve fixture")).expect("json");
+    serde_json::from_value(value.pointer(pointer).expect("curve pointer").clone())
+        .expect("curve fixture decodes")
+}
+
+/// Test-only vehicle for the retained curve-bearing body path: attaches the
+/// stored Codex cache golden curve. Curves are hash-neutral, so only the body
+/// witness sees it. With `tracks_body` every point takes the item's input
+/// tokens, as the retired builder's curve followed the body.
+#[cfg(test)]
+pub(crate) fn attach_retained_context_curve(items: &mut [SnapshotItem], tracks_body: bool) {
+    let curve =
+        context_curve_golden_fixture("cache_observation_codex_v1.json", "/snapshot/context_curve");
+    for item in items {
+        let mut curve = curve.clone();
+        if tracks_body {
+            for point in &mut curve.points {
+                point.effective_input_tokens = item.input_tokens.max(1);
+            }
+        }
+        item.context_curve = Some(curve);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod claude_file_cap_tests {
@@ -54517,32 +54263,56 @@ mod tests {
     }
 
     fn max_fractional_context_curve_fixture() -> SnapshotContextCurve {
-        let candidates = (0..1_300_u64)
-            .map(|index| ContextCurveCandidatePoint {
-                observed_at: Some(format!(
-                    "2037-01-15T10:{:02}:{:02}.003000000+02:00",
-                    (index / 60) % 60,
-                    index % 60
-                )),
-                effective_input_tokens: u64::MAX - index,
-                model: Some(format!("model-{:02}-{}", index % 16, "x".repeat(119))),
-                context_window_tokens: Some(u64::MAX - index % 16),
-            })
-            .collect::<Vec<_>>();
-        let boundaries = (1..=70_u64)
-            .map(|index| ContextCurveCandidateBoundary {
-                observed_at: candidates[index as usize * 10].observed_at.clone(),
-                point_count_before: index * 10,
-            })
-            .collect::<Vec<_>>();
-        build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &candidates,
-            &boundaries,
-            "parser_unsupported",
-        )
+        context_curve_golden_fixture("context-curve-v1-max-fractional.json", "")
+    }
+
+    /// One owned request as the retired builder emitted it: ordinal 1 carries
+    /// the anchor, peak and tail flags.
+    fn single_request_context_curve(
+        parser_revision: &str,
+        ownership_revision: &str,
+        model_evidence_revision: &str,
+        observed_at: &str,
+        effective_input_tokens: u64,
+        model: &str,
+        context_window_tokens: Option<u64>,
+    ) -> SnapshotContextCurve {
+        SnapshotContextCurve {
+            contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+            parser_revision: parser_revision.to_string(),
+            ownership_revision: ownership_revision.to_string(),
+            sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
+            coverage: "complete".to_string(),
+            total_owned_request_count: 1,
+            retained_point_count: 1,
+            total_compaction_boundary_count: 0,
+            retained_boundary_count: 0,
+            points: vec![SnapshotContextCurvePoint {
+                owned_request_ordinal: 1,
+                observed_at: observed_at.to_string(),
+                effective_input_tokens,
+                model_window_index: 0,
+                segment_ordinal: 0,
+                retention_flags: CONTEXT_CURVE_RETENTION_ANCHOR
+                    | CONTEXT_CURVE_RETENTION_PEAK
+                    | CONTEXT_CURVE_RETENTION_TAIL,
+                compaction_before_request_boundary_index: None,
+                compaction_after_request_boundary_index: None,
+            }],
+            boundaries: Vec::new(),
+            model_windows: vec![SnapshotContextCurveModelWindow {
+                model_window_index: 0,
+                model: model.to_string(),
+                context_window_tokens,
+                evidence_kind: if context_window_tokens.is_some() {
+                    "provider_reported_window"
+                } else {
+                    "provider_reported_model"
+                }
+                .to_string(),
+                evidence_revision: model_evidence_revision.to_string(),
+            }],
+        }
     }
 
     fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalCheckpoint {
@@ -55158,9 +54928,7 @@ mod tests {
             ),
             (12, 8, 2, 1)
         );
-        let all_local_curve = all_local_item.context_curve.expect("all-local child curve");
-        assert_eq!(all_local_curve.coverage, "complete");
-        assert_eq!(all_local_curve.total_owned_request_count, 1);
+        assert_eq!(all_local_item.first_turn_context_tokens, Some(12));
 
         let nonfresh =
             parse_codex_test_with_metadata_and_ledgers(&nonfresh_path, &metadata, ledgers.clone());
@@ -55170,23 +54938,6 @@ mod tests {
         assert_eq!(nonfresh.dropped_usage_record_count, 1);
         assert!(nonfresh.zero_snapshot_usage_evidence);
         assert!(!nonfresh.codex_parent_resolution_pending);
-
-        let capability_off = parse_codex_test_with_metadata_ledgers_and_curve(
-            &all_local_path,
-            &metadata,
-            ledgers,
-            false,
-        )
-        .snapshots
-        .into_iter()
-        .next()
-        .expect("capability-off parser keeps native ownership hardening");
-        assert_eq!(
-            (capability_off.input_tokens, capability_off.request_count),
-            (12, 1)
-        );
-        assert_eq!(capability_off.first_turn_context_tokens, Some(12));
-        assert!(capability_off.context_curve.is_none());
 
         let _ = fs::remove_dir_all(home);
     }
@@ -56635,57 +56386,6 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_replay_completion_survives_shed_and_replays_after_toggle() {
-        let previous = ScanIndex::default();
-        let generation_zero = "codex:curve:0:destination".to_string();
-        let mut in_flight = previous.clone();
-        assert!(in_flight.context_curve_replay_needed(&generation_zero));
-        in_flight.prepare_historical_replay(generation_zero.clone());
-
-        // A partial/shed commit may retain accepted entity checkpoints and the
-        // active cursor, but must not claim the all-history curve replay done.
-        let partial = in_flight.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
-        assert!(partial.context_curve_replay_needed(&generation_zero));
-
-        let mut settled = in_flight;
-        settled.mark_context_curve_replay_complete(generation_zero.clone());
-        assert!(!settled.context_curve_replay_needed(&generation_zero));
-        assert_eq!(settled.context_curve_replay_epoch(), 0);
-
-        // The off transition is part of the baseline taken before scanning.
-        // A shed may commit no-curve file changes, so the partial checkpoint
-        // must carry the incremented epoch even if capability returns before
-        // any fully completed off cycle.
-        let mut off_baseline = settled.clone();
-        off_baseline.mark_context_curve_capability_disabled();
-        let mut off_in_flight = off_baseline.clone();
-        off_in_flight.files.insert(
-            "changed-while-off.jsonl".to_string(),
-            manifest_index_entry(Some("accepted-without-curve")),
-        );
-        let off_partial = off_in_flight.committable_subset(
-            &off_baseline,
-            &BTreeSet::from(["accepted-without-curve".to_string()]),
-            &BTreeMap::new(),
-        );
-        assert!(off_partial.files.contains_key("changed-while-off.jsonl"));
-        assert!(!off_partial.context_curve_capability_enabled);
-        assert_eq!(off_partial.context_curve_replay_epoch(), 1);
-        let generation_one = "codex:curve:1:destination".to_string();
-        assert!(off_partial.context_curve_replay_needed(&generation_one));
-        settled = off_partial;
-        settled.prepare_historical_replay(generation_one.clone());
-        settled.mark_context_curve_replay_complete(generation_one.clone());
-        assert!(!settled.context_curve_replay_needed(&generation_one));
-
-        // Repeated disabled cycles are inert; one off epoch creates one replay.
-        settled.mark_context_curve_capability_disabled();
-        assert_eq!(settled.context_curve_replay_epoch(), 2);
-        settled.mark_context_curve_capability_disabled();
-        assert_eq!(settled.context_curve_replay_epoch(), 2);
-    }
-
-    #[test]
     fn opened_replacement_is_rechecked_against_the_frozen_lookback_window() {
         let root = temp_dir("opened-object-age-recheck");
         let path = root.join("session.jsonl");
@@ -57871,14 +57571,6 @@ mod tests {
                     assert_eq!(observation.affected.cache_read_tokens, Some(0));
                     assert_eq!(observation.affected.uncached_tokens, Some(100_000));
                     assert_eq!(next.cache_read_tokens, Some(90_000));
-                    assert_eq!(
-                        stable_item
-                            .context_curve
-                            .as_ref()
-                            .unwrap()
-                            .total_owned_request_count,
-                        3
-                    );
                 }
             }
             finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
@@ -64869,11 +64561,6 @@ mod tests {
             assert_eq!(allocation.allocations, 0);
             assert_eq!(serde_json::to_vec(&items[0]).unwrap(), body);
         }
-        let child_curve = items[1].context_curve.as_ref().expect("child curve");
-        assert_eq!(child_curve.coverage, "complete");
-        assert_eq!(child_curve.total_owned_request_count, 1);
-        assert_eq!(child_curve.points[0].effective_input_tokens, 10);
-        assert_eq!(child_curve.points[0].owned_request_ordinal, 1);
         assert_eq!(
             items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.0005")
@@ -65375,26 +65062,8 @@ mod tests {
             "the healthy family's provider ledger remains exact"
         );
         assert_eq!(
-            child
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("scalars_file_birth_only"),
-            "an invalid peer family can hide a copied request, so the curve stays closed"
-        );
-        assert_eq!(
             child.claude_file_birth_verdict(),
             Some(ClaudeFileBirthVerdict::Admitted)
-        );
-        assert_eq!(
-            child.context_curve,
-            Some(unavailable_context_curve(
-                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                "scalars_file_birth_only",
-                0,
-                0,
-            ))
         );
         // The hidden family is the copier: telemetry assigns req_5 to the
         // child's own root, so the file birth rule keeps the child's scalars.
@@ -66020,14 +65689,6 @@ mod tests {
         assert!(items.iter().all(|item| {
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         }));
-        let child_curve = items[1]
-            .context_curve
-            .as_ref()
-            .expect("legacy child owned curve");
-        assert_eq!(child_curve.coverage, "complete");
-        assert_eq!(child_curve.total_owned_request_count, 2);
-        assert_eq!(child_curve.points[0].effective_input_tokens, 112);
-        assert_eq!(child_curve.total_compaction_boundary_count, 1);
         let child_witness = index
             .claude_usage_family_witnesses
             .get(child)
@@ -66106,13 +65767,6 @@ mod tests {
         assert_eq!(unproven[0].compaction_total_pre_tokens, None);
         assert_eq!(unproven[0].compaction_total_post_tokens, None);
         assert_eq!(unproven[0].compaction_total_duration_ms, None);
-        assert_eq!(
-            unproven[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
         let mut unhealthy_terminal = Vec::new();
         apply_claude_reported_usage_with_index(
             &mut unhealthy_terminal,
@@ -69866,25 +69520,6 @@ mod tests {
         assert_eq!(item.compaction_total_pre_tokens, Some(1_700_000));
         assert_eq!(item.compaction_total_post_tokens, Some(190_000));
         assert_eq!(item.compaction_total_duration_ms, Some(50));
-        // The curve sees the same events: one boundary per pair, including the
-        // pair linked 5 s apart that the time window alone would split.
-        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
-        assert_eq!(
-            curve
-                .iter()
-                .map(|boundary| (boundary.kind, boundary.timestamp.as_deref()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    ClaudeCompactionKind::CurrentBoundary,
-                    Some("2026-10-20T09:01:00.600Z")
-                ),
-                (
-                    ClaudeCompactionKind::CurrentBoundary,
-                    Some("2026-10-20T09:11:05Z")
-                ),
-            ]
-        );
     }
 
     fn parse_claude_compaction_fixture(name: &str, lines: &[&str]) -> SnapshotItem {
@@ -69929,7 +69564,7 @@ mod tests {
         assert_eq!(item.compaction_count, Some(2));
 
         // The first owned response is sequence 1, so the copied pair (one
-        // response before it) leaves the count and the curve as a whole.
+        // response before it) leaves the count as a whole.
         rebuild_claude_context_posture(&mut item, &[], Some(1));
         assert_eq!(item.compaction_count, Some(1));
         assert_eq!(
@@ -69937,12 +69572,6 @@ mod tests {
             vec!["2026-10-20T12:03:05Z".to_string()]
         );
         assert_eq!(item.compaction_total_pre_tokens, Some(800_000));
-        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries)
-            .into_iter()
-            .filter(|boundary| boundary.response_count_before > 1)
-            .map(|boundary| boundary.timestamp)
-            .collect::<Vec<_>>();
-        assert_eq!(curve, vec![Some("2026-10-20T12:03:05Z".to_string())]);
         // No owned request: the owned event has no sizes at all.
         assert_eq!(
             item.compaction_events,
@@ -70130,7 +69759,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_curve_waits_for_complete_local_ownership_census() {
+    fn claude_context_posture_waits_for_complete_local_ownership_census() {
         let path = temp_file("claude-context-curve-owned");
         fs::write(
             &path,
@@ -70150,13 +69779,6 @@ mod tests {
             "curve-fingerprint".to_string(),
         )
         .expect("parse");
-        assert_eq!(
-            items[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::new(),
             health: Default::default(),
@@ -70171,26 +69793,6 @@ mod tests {
             true,
             "2026-08-20T10:04:00Z",
         );
-        let curve = items[0].context_curve.as_ref().expect("owned curve");
-        assert_eq!(curve.coverage, "complete");
-        assert_eq!(curve.total_owned_request_count, 3);
-        assert_eq!(curve.points[0].observed_at, "2026-08-20T10:01:01Z");
-        assert_eq!(
-            curve
-                .points
-                .iter()
-                .map(|point| point.effective_input_tokens)
-                .collect::<Vec<_>>(),
-            vec![115, 220, 337]
-        );
-        assert_eq!(curve.boundaries[0].before_owned_request_ordinal, 2);
-        assert_eq!(curve.boundaries[0].after_owned_request_ordinal, 3);
-        assert_eq!(curve.model_windows[0].model, "claude-opus-4-8");
-        assert_eq!(curve.model_windows[0].context_window_tokens, None);
-        assert_eq!(
-            curve.model_windows[0].evidence_kind,
-            "provider_reported_model"
-        );
         assert_eq!(items[0].usage_accounting_contract, None);
         assert_eq!(items[0].first_turn_context_tokens, Some(115));
         assert_eq!(items[0].peak_context_fill_tokens, Some(337));
@@ -70200,7 +69802,6 @@ mod tests {
             items[0].compaction_timestamps,
             vec!["2026-08-20T10:02:30Z".to_string()]
         );
-        validate_context_curve(0, curve).expect("Claude curve validates");
         let _ = fs::remove_file(path);
     }
 
@@ -70249,13 +69850,6 @@ mod tests {
             false,
             "2026-08-20T10:02:00Z",
         );
-        assert_eq!(
-            first_page[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
 
         apply_claude_reported_usage_with_index(
             &mut [],
@@ -70268,54 +69862,6 @@ mod tests {
         assert!(index.files[&local_index_key(&path)]
             .source_file_fingerprint
             .is_empty());
-        let durable_before_corrective_upload = index.clone();
-
-        let corrective_entry = index.files.get_mut(&local_index_key(&path)).unwrap();
-        corrective_entry.source_file_fingerprint = "source".to_string();
-        corrective_entry.last_snapshot_fingerprint = Some("complete".to_string());
-        let mut corrective_page = parse();
-        apply_claude_reported_usage_with_index(
-            &mut corrective_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-            &mut index,
-            false,
-            "2026-08-20T10:03:00Z",
-        );
-        assert_eq!(
-            corrective_page[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("complete")
-        );
-        assert_eq!(
-            index.claude_owned_start_census[&source_session_id]
-                .emitted_source_file_fingerprint
-                .as_deref(),
-            Some("source")
-        );
-        let shed = index.committable_subset(
-            &durable_before_corrective_upload,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-        );
-        assert_eq!(
-            shed.claude_owned_start_census[&source_session_id].emitted_source_file_fingerprint,
-            None,
-            "a shed corrective upload must remain re-armed"
-        );
-        let accepted = index.committable_subset(
-            &durable_before_corrective_upload,
-            &BTreeSet::from(["complete".to_string()]),
-            &BTreeMap::new(),
-        );
-        assert_eq!(
-            accepted.claude_owned_start_census[&source_session_id]
-                .emitted_source_file_fingerprint
-                .as_deref(),
-            Some("source")
-        );
         let _ = fs::remove_file(path);
     }
 
@@ -70384,13 +69930,6 @@ mod tests {
             Some("session_exclusive_reported_usage:v1")
         );
         assert_eq!(items[0].cost, None);
-        assert_eq!(
-            items[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("complete")
-        );
         let _ = fs::remove_file(path);
     }
 
@@ -70430,44 +69969,7 @@ mod tests {
             "2026-08-20T12:02:00Z",
         );
         assert_eq!(items[0].usage_accounting_contract, None);
-        assert_eq!(
-            items[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_context_curve_incomplete_evidence_cases() {
-        let root_timestamp = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        for (body, coverage) in [
-("{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-missing-id\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_curve_missing\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n".to_string(), "ownership_unresolved"),
-(concat!(
-                "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_first\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
-                "{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_second\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3}}}\n"
-            ).to_string(), "ownership_unresolved"),
-("{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-multi\",\"type\":\"assistant\",\"requestId\":\"req_curve_multi\",\"message\":{\"id\":\"msg_curve_multi\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":20,\"iterations\":[{\"input_tokens\":10,\"cache_read_input_tokens\":100},{\"input_tokens\":20,\"cache_read_input_tokens\":200}]}}}\n".to_string(), "parser_unsupported"),
-(format!(
-                "{{\"type\":\"custom-title\",\"customTitle\":\"Native root\"}}\n{{\"type\":\"mode\",\"mode\":\"default\"}}\n{{\"type\":\"queue-operation\",\"operation\":\"dequeue\"}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"user\",\"parentUuid\":null,\"isCompactSummary\":false,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"assistant\",\"requestId\":\"req_native_root\",\"message\":{{\"id\":\"msg_native_root\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":2}}}}}}\n"
-            ).to_string(), "scalars_file_birth_only")
-        ] {
-            let path = temp_file("claude-curve-incomplete");
-            fs::write(&path, body).unwrap();
-            let at = if coverage == "scalars_file_birth_only" { &root_timestamp } else { "2026-08-20T11:04:00Z" };
-            let mut items = parse_claude_code_jsonl_file(&path, at, "curve-fingerprint".into()).unwrap();
-            if coverage == "parser_unsupported" { assert_eq!(items[0].peak_context_fill_tokens, Some(220)); }
-            if coverage == "scalars_file_birth_only" { assert!(!items[0].claude_context_curve_owned_start_proven); }
-            apply_claude_reported_usage_with_index(&mut items, &crate::claude_local_otel::ClaudeLocalOtelLoadReport {evidence: BTreeMap::new(),health:Default::default()}, &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), &mut ScanIndex::default(), true, at);
-            let curve = items[0].context_curve.as_ref().unwrap();
-            assert_eq!(curve.coverage,coverage);
-            assert_eq!(curve.total_owned_request_count,0);
-            assert!(curve.points.is_empty());
-            if coverage == "scalars_file_birth_only" { assert_eq!(items[0].claude_file_birth_verdict(),Some(ClaudeFileBirthVerdict::Admitted)); }
-            let _ = fs::remove_file(path);
-        }
     }
 
     #[test]
@@ -70540,13 +70042,6 @@ mod tests {
         assert_eq!(items[0].last_turn_context_tokens, None);
         assert_eq!(items[0].compaction_count, None);
         assert!(items[0].compaction_timestamps.is_empty());
-        assert_eq!(
-            items[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
 
         let mut paged_index = ScanIndex::default();
         paged_index.files.insert(
@@ -70613,13 +70108,6 @@ mod tests {
         assert_eq!(corrective_page[0].last_turn_context_tokens, None);
         assert_eq!(corrective_page[0].compaction_count, None);
         assert!(corrective_page[0].compaction_timestamps.is_empty());
-        assert_eq!(
-            corrective_page[0]
-                .context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved")
-        );
         assert_eq!(
             paged_index
                 .files
@@ -71006,7 +70494,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_curve_missing_predecessor_does_not_own_copied_prefix() {
+    fn claude_context_posture_missing_predecessor_does_not_own_copied_prefix() {
         let path = temp_file("claude-context-curve-missing-predecessor");
         fs::write(
             &path,
@@ -71042,10 +70530,6 @@ mod tests {
             true,
             "2026-08-20T11:04:00Z",
         );
-        let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(curve.coverage, "ownership_unresolved");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
         assert_eq!(items[0].first_turn_context_tokens, None);
         assert_eq!(items[0].peak_context_fill_tokens, None);
         assert_eq!(items[0].last_turn_context_tokens, None);
@@ -71106,33 +70590,6 @@ mod tests {
             item.compaction_timestamps,
             vec!["2026-07-17T03:04:00Z".to_string()]
         );
-        let curve = item.context_curve.as_ref().expect("Codex curve");
-        assert_eq!(curve.coverage, "complete");
-        assert_eq!(curve.total_owned_request_count, 4);
-        assert_eq!(curve.retained_point_count, 4);
-        assert_eq!(
-            curve
-                .points
-                .iter()
-                .map(|point| point.effective_input_tokens)
-                .collect::<Vec<_>>(),
-            vec![22_817, 33_205, 45_272, 25_182]
-        );
-        assert_eq!(curve.boundaries.len(), 1);
-        assert_eq!(curve.boundaries[0].boundary_index, 1);
-        assert_eq!(curve.boundaries[0].before_owned_request_ordinal, 3);
-        assert_eq!(curve.boundaries[0].after_owned_request_ordinal, 4);
-        assert_eq!(
-            curve.points[2].compaction_after_request_boundary_index,
-            Some(1)
-        );
-        assert_eq!(
-            curve.points[3].compaction_before_request_boundary_index,
-            Some(1)
-        );
-        assert_eq!(curve.model_windows[0].model_window_index, 0);
-        assert_eq!(curve.model_windows[0].context_window_tokens, Some(258_400));
-        validate_context_curve(0, curve).expect("Codex curve is wire-valid");
 
         let _ = fs::remove_file(path);
     }
@@ -71234,10 +70691,7 @@ mod tests {
                 changed.compaction_timestamps.clear();
                 assert_ne!(snapshot_fingerprint(source,&changed),snapshot_fingerprint(source,&item));
             } else {
-                let curve=item.context_curve.as_ref().unwrap();
-                assert_eq!(curve.coverage,"pre_capture");
-                assert_eq!(curve.total_owned_request_count,0);
-                assert!(curve.points.is_empty());
+                assert!(item.context_curve.is_none());
             }
             let _=fs::remove_file(path);
         }
@@ -71649,143 +71103,11 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_collection_is_inert_without_server_capability() {
-        let root = temp_dir("context-curve-capability-gate");
-        let path = root.join("rollout-capability-gate.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-24T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"capability-gate\"}}\n",
-                "{\"timestamp\":\"2026-08-24T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":42,\"output_tokens\":2,\"request_count\":1},\"last_token_usage\":{\"input_tokens\":42,\"output_tokens\":2},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write rollout");
-        let scan = |context_curve_enabled| {
-            scan_source_roots_with_limit_and_attribution_and_curve(
-                SnapshotSource::Codex,
-                std::slice::from_ref(&root),
-                &mut ScanIndex::default(),
-                "2026-08-24T10:02:00Z",
-                730,
-                10,
-                true,
-                None,
-                None,
-                &[],
-                false,
-                context_curve_enabled,
-            )
-            .expect("scan")
-        };
-        assert_eq!(scan(false).snapshots[0].context_curve, None);
-        assert!(scan(true).snapshots[0].context_curve.is_some());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn context_curve_fails_closed_on_unsafe_or_unbounded_model_evidence() {
-        let hostile_path = "/Users/operator/private/repository/session.jsonl";
-        let hostile = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                effective_input_tokens: 10,
-                model: Some(hostile_path.to_string()),
-                context_window_tokens: None,
-            }],
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(hostile.coverage, "complete");
-        assert_eq!(hostile.model_windows[0].model, "unknown");
-        assert_eq!(hostile.model_windows[0].evidence_kind, "unavailable");
-        assert!(!serde_json::to_string(&hostile)
-            .expect("serialize hostile evidence")
-            .contains(hostile_path));
-
-        let window_without_safe_model = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                effective_input_tokens: 10,
-                model: Some(hostile_path.to_string()),
-                context_window_tokens: Some(258_400),
-            }],
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(window_without_safe_model.coverage, "complete");
-        assert_eq!(window_without_safe_model.model_windows[0].model, "unknown");
-        assert_eq!(
-            window_without_safe_model.model_windows[0].evidence_kind,
-            "provider_reported_window"
-        );
-
-        let too_many_models = (0..17_u64)
-            .map(|index| ContextCurveCandidatePoint {
-                observed_at: Some(format!("2026-08-20T12:00:{:02}Z", index + 1)),
-                effective_input_tokens: index + 1,
-                model: Some(format!("model-{index}")),
-                context_window_tokens: None,
-            })
-            .collect::<Vec<_>>();
-        let unavailable = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &too_many_models,
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(unavailable.coverage, "parser_unsupported");
-        assert_eq!(unavailable.total_owned_request_count, 0);
-        assert!(unavailable.points.is_empty());
-    }
-
-    #[test]
     fn context_curve_cross_language_golden_is_canonical_and_current() {
-        let point = |timestamp: &str, tokens: u64, model: &str, window: Option<u64>| {
-            ContextCurveCandidatePoint {
-                observed_at: Some(timestamp.to_string()),
-                effective_input_tokens: tokens,
-                model: Some(model.to_string()),
-                context_window_tokens: window,
-            }
-        };
-        let codex = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[
-                point("2026-08-20T12:00:01Z", 18_000, "gpt-5.5", Some(258_400)),
-                point("2026-08-20T12:00:02Z", 42_000, "gpt-5.5", Some(258_400)),
-                point("2026-08-20T12:00:04Z", 21_000, "gpt-5.5", Some(258_400)),
-            ],
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
-                point_count_before: 2,
-            }],
-            "parser_unsupported",
-        );
-        let claude = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[
-                point("2026-08-20T13:00:01Z", 115, "claude-opus-4-8", None),
-                point("2026-08-20T13:00:03Z", 220, "claude-opus-4-8", None),
-                point("2026-08-20T13:00:04Z", 337, "claude-opus-4-8", None),
-            ],
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T13:00:02Z".to_string()),
-                point_count_before: 1,
-            }],
-            "parser_unsupported",
-        );
+        // The builder is retired; the committed fixture is the source of
+        // truth and must still round-trip byte-for-byte.
+        let codex = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
+        let claude = context_curve_golden_fixture("context-curve-v1-golden.json", "/claude_code");
         let witness = |curve: SnapshotContextCurve,
                        tool_usage: Option<Vec<SnapshotToolUsage>>,
                        tool_usage_truncated: bool| {
@@ -71851,11 +71173,11 @@ mod tests {
             "revisions": {
                 "sampling": CONTEXT_CURVE_SAMPLING_REVISION,
                 "codex_parser": CODEX_SNAPSHOT_PARSER_VERSION,
-                "codex_ownership": CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                "codex_model_window_evidence": CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                "codex_ownership": "codex_owned_rollout_occurrences:v1",
+                "codex_model_window_evidence": "codex_token_count_model_context_window:v1",
                 "claude_parser": CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                "claude_ownership": CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                "claude_model_window_evidence": CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                "claude_ownership": "claude_owned_request_start_proof:v2",
+                "claude_model_window_evidence": "claude_transcript_model:v1",
             },
             "body_witnesses": body_witnesses,
         });
@@ -71904,18 +71226,14 @@ mod tests {
 
     #[test]
     fn context_curve_requires_exact_durable_entity_ack_proof() {
-        let curve = build_context_curve(
+        let curve = single_request_context_curve(
             CODEX_SNAPSHOT_PARSER_VERSION,
             "codex_owned_rollout_occurrences:v1",
             "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:00.003Z".to_string()),
-                effective_input_tokens: 42,
-                model: Some("gpt-5.5".to_string()),
-                context_window_tokens: Some(258_400),
-            }],
-            &[],
-            "parser_unsupported",
+            "2026-08-20T12:00:00.003Z",
+            42,
+            "gpt-5.5",
+            Some(258_400),
         );
         let mut item = sample_session_artifact_item();
         item.context_curve = Some(curve);
@@ -72034,18 +71352,14 @@ mod tests {
 
     #[test]
     fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
-        let curve = build_context_curve(
+        let curve = single_request_context_curve(
             CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
             "claude_owned_request_start_proof:v1",
             "claude_transcript_model:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-30T12:00:00Z".to_string()),
-                effective_input_tokens: 42,
-                model: Some("claude-opus-4-8".to_string()),
-                context_window_tokens: None,
-            }],
-            &[],
-            "ownership_unresolved",
+            "2026-08-30T12:00:00Z",
+            42,
+            "claude-opus-4-8",
+            None,
         );
         let mut nonexclusive = sample_session_artifact_item();
         nonexclusive.context_curve = Some(curve.clone());
@@ -72089,9 +71403,14 @@ mod tests {
             if !exclusive {
                 item.usage_accounting_contract = None;
             }
-            if !with_curve {
-                item.context_curve = None;
-            }
+            // The parser no longer builds curves; the curve case carries its
+            // stored golden curve.
+            item.context_curve = with_curve.then(|| {
+                context_curve_golden_fixture(
+                    "body-witness-ack-normalization-v1.json",
+                    "/session_account_cases/exclusive_with_curve/wire/snapshots/0/context_curve",
+                )
+            });
             assert_eq!(
                 (item.input_tokens, item.output_tokens, item.request_count),
                 (100, 5, 1)
@@ -72357,7 +71676,9 @@ mod tests {
         prepare_cache_observations(&mut parsed, None);
         assert!(parsed.session_account_evidence.is_some());
         assert!(parsed.cache_observations.is_some());
-        assert!(parsed.context_curve.is_some());
+        assert!(parsed.context_curve.is_none());
+        // The parser no longer builds curves; curve cases carry a retained one.
+        let retained_curve = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
         let mut cases = Vec::new();
         for capability in ["creator", "cache", "combined", "legacy"] {
@@ -72380,9 +71701,7 @@ mod tests {
                         if !exclusive {
                             item.usage_accounting_contract = None;
                         }
-                        if !curve {
-                            item.context_curve = None;
-                        }
+                        item.context_curve = curve.then(|| retained_curve.clone());
                         item.tool_usage = match tools {
                             "empty_default_only" => Some(vec![]),
                             "nonempty" => Some(vec![SnapshotToolUsage {
@@ -73049,28 +72368,19 @@ mod tests {
         let root = temp_dir("context-curve-body-witness");
         let path = root.join("curve-session.jsonl");
         let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
-        let point = |tokens| ContextCurveCandidatePoint {
-            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-            effective_input_tokens: tokens,
-            model: Some("claude-opus-4-8".to_string()),
-            context_window_tokens: None,
+        let curve = |tokens| {
+            single_request_context_curve(
+                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                "claude_owned_request_start_proof:v1",
+                "claude_transcript_model:v1",
+                "2026-08-20T12:00:01Z",
+                tokens,
+                "claude-opus-4-8",
+                None,
+            )
         };
-        let curve_a = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[point(100)],
-            &[],
-            "ownership_unresolved",
-        );
-        let curve_b = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[point(125)],
-            &[],
-            "ownership_unresolved",
-        );
+        let curve_a = curve(100);
+        let curve_b = curve(125);
         let mut index = ScanIndex::default();
         let mut revision = 0_usize;
         let mut run = |curve: Option<SnapshotContextCurve>| {
@@ -73809,9 +73119,14 @@ mod tests {
                         item.cache_observations = None;
                         item.cache_observations_state = None;
                     }
-                    if !curve {
-                        item.context_curve = None;
-                    }
+                    // The parser no longer builds curves; curve cases carry the
+                    // stored golden curve.
+                    item.context_curve = curve.then(|| {
+                        context_curve_golden_fixture(
+                            "claude-original-source-corpus-v1.json",
+                            "/cases/1/wire/snapshots/0/context_curve",
+                        )
+                    });
                     let source_item = item;
                     for tools in [
                         "omitted",
@@ -76953,15 +76268,6 @@ mod tests {
         metadata: &CodexTitleMetadata,
         ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     ) -> ParsedJsonlFile {
-        parse_codex_test_with_metadata_ledgers_and_curve(path, metadata, ledgers, true)
-    }
-
-    fn parse_codex_test_with_metadata_ledgers_and_curve(
-        path: &Path,
-        metadata: &CodexTitleMetadata,
-        ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
-        context_curve_enabled: bool,
-    ) -> ParsedJsonlFile {
         let mut file = File::open(path).expect("open Codex parent-prefix fixture");
         let identity = opened_object_identity(SnapshotSource::Codex, &mut file)
             .expect("identify Codex parent-prefix fixture");
@@ -76979,17 +76285,13 @@ mod tests {
             Some(Arc::new(Mutex::new(ledgers))),
             true,
             None,
-            context_curve_enabled,
         )
         .expect("parse Codex parent-prefix fixture")
     }
 
-    fn scan_codex_test_root_with_curve(
-        root: &Path,
-        context_curve_enabled: bool,
-    ) -> (SourceScanResult, ScanIndex) {
+    fn scan_codex_test_root(root: &Path) -> (SourceScanResult, ScanIndex) {
         let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit_and_attribution_and_curve(
+        let scan = scan_source_roots_with_limit_and_attribution(
             SnapshotSource::Codex,
             std::slice::from_ref(&root.to_path_buf()),
             &mut index,
@@ -77001,39 +76303,34 @@ mod tests {
             None,
             &[],
             false,
-            context_curve_enabled,
         )
         .expect("scan Codex production-path fixture");
         (scan, index)
     }
 
-    fn parse_trusted_created_thread_test_with_curve(
+    fn parse_trusted_created_thread_test(
         name: &str,
         child_id: &str,
         parent_id: &str,
         child_values: &[Value],
         parent_values: &[Value],
-        context_curve_enabled: bool,
     ) -> (PathBuf, ParsedJsonlFile) {
-        parse_trusted_created_thread_test_with_curve_and_extent(
+        parse_trusted_created_thread_test_with_extent(
             name,
             child_id,
             parent_id,
             child_values,
             parent_values,
-            context_curve_enabled,
             None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn parse_trusted_created_thread_test_with_curve_and_extent(
+    fn parse_trusted_created_thread_test_with_extent(
         name: &str,
         child_id: &str,
         parent_id: &str,
         child_values: &[Value],
         parent_values: &[Value],
-        context_curve_enabled: bool,
         projected_next_ordinal: Option<u64>,
     ) -> (PathBuf, ParsedJsonlFile) {
         let root = temp_dir(name);
@@ -77089,12 +76386,7 @@ mod tests {
                 opened_birth_nanos: 0,
             },
         )]);
-        let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
-            &path,
-            &metadata,
-            ledgers,
-            context_curve_enabled,
-        );
+        let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers);
         (root, parsed)
     }
 
@@ -77430,56 +76722,47 @@ mod tests {
             ("01a03eee-dd5b-7851-a3c6-190c38e68ce8", 16, 59),
             ("01a03f0e-a60a-76e3-9d2b-e612b4488dd8", 17, 139),
         ];
-        for context_curve_enabled in [true, false] {
-            let mut admitted_records = 0_u64;
-            for (child_id, first_usage_ordinal, record_count) in shapes {
-                let turn_id = format!("{}-7000-8000-8000-000000000001", &child_id[..8]);
-                let mut child = vec![
-                    json!({"timestamp":"2026-08-26T16:37:18.114Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-26T16:37:17.011Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
-                    json!({"timestamp":"2026-08-26T16:37:18.115Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_787_762_237_u64}}),
-                ];
-                while child.len() < 7 {
-                    let ordinal = child.len() as u64;
-                    child.push(json!({"timestamp":"2026-08-26T16:37:19Z","ordinal":ordinal,"type":"response_item","payload":{"type":"message","id":format!("msg-{ordinal}"),"role":"developer","content":[]}}));
-                }
-                child.push(json!({"timestamp":"2026-08-26T16:37:20Z","ordinal":7,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}));
-                while (child.len() as u64) < first_usage_ordinal {
-                    let ordinal = child.len() as u64;
-                    child.push(json!({"timestamp":"2026-08-26T16:37:21Z","ordinal":ordinal,"type":"event_msg","payload":{"type":"item_completed","turn_id":turn_id}}));
-                }
-                for index in 1..=record_count {
-                    child.push(codex_test_token_line(
-                        "2026-08-26T16:37:22Z",
-                        Some(first_usage_ordinal + index - 1),
-                        (index * 10, index * 8, index * 2, index),
-                        Some((10, 8, 2, 1)),
-                    ));
-                }
-                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                    "codex-five-native-shapes",
-                    child_id,
-                    parent_id,
-                    &child,
-                    &parent,
-                    context_curve_enabled,
-                );
-                assert!(
-                    parsed.complete(),
-                    "{child_id} capability={context_curve_enabled}: {parsed:#?}"
-                );
-                assert_eq!(parsed.snapshots.len(), 1, "{child_id}");
-                assert_eq!(parsed.snapshots[0].input_tokens, record_count * 10);
-                assert_eq!(
-                    parsed.snapshots[0].context_curve.is_some(),
-                    context_curve_enabled
-                );
-                assert_eq!(parsed.recognized_usage_drop_count, 0);
-                assert_eq!(parsed.ownership_incomplete_file_count, 0);
-                admitted_records += record_count;
-                let _ = fs::remove_dir_all(root);
+        let mut admitted_records = 0_u64;
+        for (child_id, first_usage_ordinal, record_count) in shapes {
+            let turn_id = format!("{}-7000-8000-8000-000000000001", &child_id[..8]);
+            let mut child = vec![
+                json!({"timestamp":"2026-08-26T16:37:18.114Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-26T16:37:17.011Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
+                json!({"timestamp":"2026-08-26T16:37:18.115Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_787_762_237_u64}}),
+            ];
+            while child.len() < 7 {
+                let ordinal = child.len() as u64;
+                child.push(json!({"timestamp":"2026-08-26T16:37:19Z","ordinal":ordinal,"type":"response_item","payload":{"type":"message","id":format!("msg-{ordinal}"),"role":"developer","content":[]}}));
             }
-            assert_eq!(admitted_records, 1_377);
+            child.push(json!({"timestamp":"2026-08-26T16:37:20Z","ordinal":7,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}));
+            while (child.len() as u64) < first_usage_ordinal {
+                let ordinal = child.len() as u64;
+                child.push(json!({"timestamp":"2026-08-26T16:37:21Z","ordinal":ordinal,"type":"event_msg","payload":{"type":"item_completed","turn_id":turn_id}}));
+            }
+            for index in 1..=record_count {
+                child.push(codex_test_token_line(
+                    "2026-08-26T16:37:22Z",
+                    Some(first_usage_ordinal + index - 1),
+                    (index * 10, index * 8, index * 2, index),
+                    Some((10, 8, 2, 1)),
+                ));
+            }
+            let (root, parsed) = parse_trusted_created_thread_test(
+                "codex-five-native-shapes",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+            );
+            assert!(parsed.complete(), "{child_id}: {parsed:#?}");
+            assert_eq!(parsed.snapshots.len(), 1, "{child_id}");
+            assert_eq!(parsed.snapshots[0].input_tokens, record_count * 10);
+            assert!(parsed.snapshots[0].context_curve.is_none());
+            assert_eq!(parsed.recognized_usage_drop_count, 0);
+            assert_eq!(parsed.ownership_incomplete_file_count, 0);
+            admitted_records += record_count;
+            let _ = fs::remove_dir_all(root);
         }
+        assert_eq!(admitted_records, 1_377);
     }
 
     #[test]
@@ -77517,30 +76800,24 @@ mod tests {
             parent[4].clone(),
         ];
 
-        for context_curve_enabled in [true, false] {
-            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                "codex-created-thread-internal-parent-omission",
-                child_id,
-                parent_id,
-                &child,
-                &parent,
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.snapshots.is_empty(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert!(parsed.zero_snapshot_usage_evidence);
-            assert_eq!(parsed.recognized_usage_drop_count, 1);
-            assert_eq!(parsed.ownership_incomplete_file_count, 1);
-            assert_eq!(parsed.dropped_usage_record_count, 1);
-            assert_eq!(
-                parsed.state_only_blocked_session_ids,
-                BTreeSet::from([child_id.to_string()])
-            );
-            assert!(parsed.codex_parent_ledger_identity_used.is_none());
-            let _ = fs::remove_dir_all(root);
-        }
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-internal-parent-omission",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
+        assert!(parsed.zero_snapshot_usage_evidence);
+        assert_eq!(parsed.recognized_usage_drop_count, 1);
+        assert_eq!(parsed.ownership_incomplete_file_count, 1);
+        assert_eq!(parsed.dropped_usage_record_count, 1);
+        assert_eq!(
+            parsed.state_only_blocked_session_ids,
+            BTreeSet::from([child_id.to_string()])
+        );
+        assert!(parsed.codex_parent_ledger_identity_used.is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -77570,49 +76847,33 @@ mod tests {
             ),
         ];
 
-        for context_curve_enabled in [true, false] {
-            for (name, mut child) in [
-                ("native-ordinal-gap", valid.clone()),
-                ("native-ordinal-restart", valid.clone()),
-                ("native-retrograde-time", valid.clone()),
-                ("native-turn-mismatch", valid.clone()),
-                ("native-spawn-delay", valid.clone()),
-            ] {
-                match name {
-                    "native-ordinal-gap" => child[3]["ordinal"] = json!(4),
-                    "native-ordinal-restart" => child[3]["ordinal"] = json!(2),
-                    "native-retrograde-time" => {
-                        child[3]["timestamp"] = json!("2026-08-02T08:19:59Z")
-                    }
-                    "native-turn-mismatch" => {
-                        child[2]["payload"]["turn_id"] =
-                            json!("01a03e99-5000-7000-8000-000000000002")
-                    }
-                    "native-spawn-delay" => {
-                        child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z")
-                    }
-                    _ => unreachable!(),
+        for (name, mut child) in [
+            ("native-ordinal-gap", valid.clone()),
+            ("native-ordinal-restart", valid.clone()),
+            ("native-retrograde-time", valid.clone()),
+            ("native-turn-mismatch", valid.clone()),
+            ("native-spawn-delay", valid.clone()),
+        ] {
+            match name {
+                "native-ordinal-gap" => child[3]["ordinal"] = json!(4),
+                "native-ordinal-restart" => child[3]["ordinal"] = json!(2),
+                "native-retrograde-time" => child[3]["timestamp"] = json!("2026-08-02T08:19:59Z"),
+                "native-turn-mismatch" => {
+                    child[2]["payload"]["turn_id"] = json!("01a03e99-5000-7000-8000-000000000002")
                 }
-                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                    name,
-                    child_id,
-                    parent_id,
-                    &child,
-                    &parent,
-                    context_curve_enabled,
-                );
-                assert!(
-                    parsed.snapshots.is_empty(),
-                    "{name} capability={context_curve_enabled}: {parsed:#?}"
-                );
-                assert!(parsed.report.complete(), "{name}");
-                assert!(!parsed.complete(), "{name}");
-                assert!(parsed.zero_snapshot_usage_evidence, "{name}");
-                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
-                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
-                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
-                let _ = fs::remove_dir_all(root);
+                "native-spawn-delay" => child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z"),
+                _ => unreachable!(),
             }
+            let (root, parsed) =
+                parse_trusted_created_thread_test(name, child_id, parent_id, &child, &parent);
+            assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
+            assert!(parsed.report.complete(), "{name}");
+            assert!(!parsed.complete(), "{name}");
+            assert!(parsed.zero_snapshot_usage_evidence, "{name}");
+            assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
+            assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -77633,45 +76894,38 @@ mod tests {
             ),
         ];
 
-        for context_curve_enabled in [true, false] {
-            let root = temp_dir("codex-created-thread-malformed-crash-tail");
-            let path = root.join(format!("rollout-{child_id}.jsonl"));
-            let mut body = child
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            body.push_str("\n{");
-            fs::write(&path, body).expect("write malformed crash-tail fixture");
+        let root = temp_dir("codex-created-thread-malformed-crash-tail");
+        let path = root.join(format!("rollout-{child_id}.jsonl"));
+        let mut body = child
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push_str("\n{");
+        fs::write(&path, body).expect("write malformed crash-tail fixture");
 
-            let mut metadata = CodexTitleMetadata::default();
-            metadata.state_created_threads.insert(child_id.to_string());
-            metadata
-                .spawn_parents
-                .insert(child_id.to_string(), parent_id.to_string());
-            metadata.state_threads.insert(
-                child_id.to_string(),
-                CodexStateThread {
-                    tokens_used: 1,
-                    created_at: Some("2026-08-02T08:20:00Z".to_string()),
-                    ..CodexStateThread::default()
-                },
-            );
-            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
-                &path,
-                &metadata,
-                BTreeMap::new(),
-                context_curve_enabled,
-            );
-            assert!(!parsed.report.complete());
-            assert!(!parsed.complete());
-            assert_eq!(parsed.report.malformed_json_line_count, 1);
-            assert_eq!(
-                parsed.state_only_blocked_session_ids,
-                BTreeSet::from([child_id.to_string()])
-            );
-            let _ = fs::remove_dir_all(root);
-        }
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(child_id.to_string());
+        metadata
+            .spawn_parents
+            .insert(child_id.to_string(), parent_id.to_string());
+        metadata.state_threads.insert(
+            child_id.to_string(),
+            CodexStateThread {
+                tokens_used: 1,
+                created_at: Some("2026-08-02T08:20:00Z".to_string()),
+                ..CodexStateThread::default()
+            },
+        );
+        let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
+        assert!(!parsed.report.complete());
+        assert!(!parsed.complete());
+        assert_eq!(parsed.report.malformed_json_line_count, 1);
+        assert_eq!(
+            parsed.state_only_blocked_session_ids,
+            BTreeSet::from([child_id.to_string()])
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -77800,30 +77054,21 @@ mod tests {
                 "{name}"
             );
             let path = sessions_dir.join(format!("rollout-{rollout_child_id}.jsonl"));
-            for context_curve_enabled in [true, false] {
-                let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
-                    &path,
-                    &metadata,
-                    BTreeMap::new(),
-                    context_curve_enabled,
-                );
-                assert!(
-                    parsed.snapshots.is_empty(),
-                    "{name} capability={context_curve_enabled}: {parsed:#?}"
-                );
-                assert!(parsed.report.complete(), "{name}");
-                assert!(!parsed.complete(), "{name}");
-                assert!(parsed.zero_snapshot_usage_evidence, "{name}");
-                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
-                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
-                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
-                assert_eq!(
-                    parsed.state_only_blocked_session_ids,
-                    BTreeSet::from([child_id.clone()]),
-                    "{name}"
-                );
-                assert!(parsed.codex_parent_ledger_identity_used.is_none(), "{name}");
-            }
+            let parsed =
+                parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
+            assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
+            assert!(parsed.report.complete(), "{name}");
+            assert!(!parsed.complete(), "{name}");
+            assert!(parsed.zero_snapshot_usage_evidence, "{name}");
+            assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
+            assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+            assert_eq!(
+                parsed.state_only_blocked_session_ids,
+                BTreeSet::from([child_id.clone()]),
+                "{name}"
+            );
+            assert!(parsed.codex_parent_ledger_identity_used.is_none(), "{name}");
         }
         let _ = fs::remove_dir_all(home);
     }
@@ -77893,25 +77138,22 @@ mod tests {
                 codex_session_id_from_path(&path),
                 Some(expected_key.clone())
             );
-            for context_curve_enabled in [true, false] {
-                let (scan, index) =
-                    scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-                assert_eq!(scan.discovered_file_count, 1, "{name}");
-                assert_eq!(scan.scanned_file_count, 1, "{name}");
-                assert_eq!(scan.scanned_session_count, 0, "{name}");
-                assert!(scan.snapshots.is_empty(), "{name}: {scan:#?}");
-                assert!(scan.state_census_complete, "{name}");
-                assert!(scan.sidecar_census_complete, "{name}");
-                assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
-                assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
-                assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
-                assert!(
-                    index
-                        .codex_state_only_blocked_session_ids
-                        .contains(expected_key.as_str()),
-                    "{name}"
-                );
-            }
+            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            assert_eq!(scan.discovered_file_count, 1, "{name}");
+            assert_eq!(scan.scanned_file_count, 1, "{name}");
+            assert_eq!(scan.scanned_session_count, 0, "{name}");
+            assert!(scan.snapshots.is_empty(), "{name}: {scan:#?}");
+            assert!(scan.state_census_complete, "{name}");
+            assert!(scan.sidecar_census_complete, "{name}");
+            assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
+            assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
+            assert!(
+                index
+                    .codex_state_only_blocked_session_ids
+                    .contains(expected_key.as_str()),
+                "{name}"
+            );
 
             database
                 .execute(
@@ -77920,28 +77162,25 @@ mod tests {
                 )
                 .expect("turn identity into ordinary control");
             drop(database);
-            for context_curve_enabled in [true, false] {
-                let (scan, index) =
-                    scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-                assert!(scan.census_complete, "{name}: {scan:#?}");
-                assert_eq!(scan.scanned_session_count, 1, "{name}");
-                assert_eq!(scan.snapshots.len(), 1, "{name}");
-                assert_eq!(scan.snapshots[0].source_session_id, raw_id, "{name}");
-                assert_eq!(scan.snapshots[0].input_tokens, 30, "{name}");
-                assert_eq!(scan.snapshots[0].cache_read_tokens, 8, "{name}");
-                assert_eq!(scan.snapshots[0].output_tokens, 12, "{name}");
-                assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1, "{name}");
-                assert_eq!(scan.snapshots[0].request_count, 1, "{name}");
-                assert_eq!(scan.recognized_usage_drop_count, 0, "{name}");
-                assert_eq!(scan.ownership_incomplete_file_count, 0, "{name}");
-                assert_eq!(scan.dropped_usage_record_count, 0, "{name}");
-                assert!(
-                    !index
-                        .codex_state_only_blocked_session_ids
-                        .contains(expected_key.as_str()),
-                    "{name}"
-                );
-            }
+            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            assert!(scan.census_complete, "{name}: {scan:#?}");
+            assert_eq!(scan.scanned_session_count, 1, "{name}");
+            assert_eq!(scan.snapshots.len(), 1, "{name}");
+            assert_eq!(scan.snapshots[0].source_session_id, raw_id, "{name}");
+            assert_eq!(scan.snapshots[0].input_tokens, 30, "{name}");
+            assert_eq!(scan.snapshots[0].cache_read_tokens, 8, "{name}");
+            assert_eq!(scan.snapshots[0].output_tokens, 12, "{name}");
+            assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1, "{name}");
+            assert_eq!(scan.snapshots[0].request_count, 1, "{name}");
+            assert_eq!(scan.recognized_usage_drop_count, 0, "{name}");
+            assert_eq!(scan.ownership_incomplete_file_count, 0, "{name}");
+            assert_eq!(scan.dropped_usage_record_count, 0, "{name}");
+            assert!(
+                !index
+                    .codex_state_only_blocked_session_ids
+                    .contains(expected_key.as_str()),
+                "{name}"
+            );
             let _ = fs::remove_dir_all(home);
         }
     }
@@ -78033,41 +77272,37 @@ mod tests {
         assert!(metadata.state_threads.contains_key(healthy_created));
         assert!(metadata.state_threads.contains_key(ordinary));
 
-        for context_curve_enabled in [true, false] {
-            let (collision_scan, collision_index) =
-                scan_codex_test_root_with_curve(&collision_root, context_curve_enabled);
-            assert_eq!(collision_scan.discovered_file_count, 1);
-            assert_eq!(collision_scan.scanned_file_count, 1);
-            assert_eq!(collision_scan.scanned_session_count, 0);
-            assert!(collision_scan.snapshots.is_empty());
-            assert!(!collision_scan.census_complete);
-            assert!(!collision_scan.state_census_complete);
-            assert!(!collision_scan.sidecar_census_complete);
-            assert_eq!(collision_scan.recognized_usage_drop_count, 1);
-            assert_eq!(collision_scan.ownership_incomplete_file_count, 1);
-            assert_eq!(collision_scan.dropped_usage_record_count, 1);
-            assert!(collision_index
-                .codex_state_only_blocked_session_ids
-                .contains(collided));
+        let (collision_scan, collision_index) = scan_codex_test_root(&collision_root);
+        assert_eq!(collision_scan.discovered_file_count, 1);
+        assert_eq!(collision_scan.scanned_file_count, 1);
+        assert_eq!(collision_scan.scanned_session_count, 0);
+        assert!(collision_scan.snapshots.is_empty());
+        assert!(!collision_scan.census_complete);
+        assert!(!collision_scan.state_census_complete);
+        assert!(!collision_scan.sidecar_census_complete);
+        assert_eq!(collision_scan.recognized_usage_drop_count, 1);
+        assert_eq!(collision_scan.ownership_incomplete_file_count, 1);
+        assert_eq!(collision_scan.dropped_usage_record_count, 1);
+        assert!(collision_index
+            .codex_state_only_blocked_session_ids
+            .contains(collided));
 
-            let (control_scan, control_index) =
-                scan_codex_test_root_with_curve(&control_root, context_curve_enabled);
-            assert_eq!(control_scan.discovered_file_count, 2);
-            assert_eq!(control_scan.scanned_file_count, 2);
-            assert_eq!(control_scan.scanned_session_count, 1);
-            assert_eq!(control_scan.snapshots.len(), 1);
-            assert_eq!(control_scan.snapshots[0].source_session_id, ordinary);
-            assert_eq!(control_scan.snapshots[0].input_tokens, 12);
-            assert_eq!(control_scan.recognized_usage_drop_count, 1);
-            assert_eq!(control_scan.ownership_incomplete_file_count, 1);
-            assert_eq!(control_scan.dropped_usage_record_count, 1);
-            assert!(control_index
-                .codex_state_only_blocked_session_ids
-                .contains(healthy_created));
-            assert!(!control_index
-                .codex_state_only_blocked_session_ids
-                .contains(ordinary));
-        }
+        let (control_scan, control_index) = scan_codex_test_root(&control_root);
+        assert_eq!(control_scan.discovered_file_count, 2);
+        assert_eq!(control_scan.scanned_file_count, 2);
+        assert_eq!(control_scan.scanned_session_count, 1);
+        assert_eq!(control_scan.snapshots.len(), 1);
+        assert_eq!(control_scan.snapshots[0].source_session_id, ordinary);
+        assert_eq!(control_scan.snapshots[0].input_tokens, 12);
+        assert_eq!(control_scan.recognized_usage_drop_count, 1);
+        assert_eq!(control_scan.ownership_incomplete_file_count, 1);
+        assert_eq!(control_scan.dropped_usage_record_count, 1);
+        assert!(control_index
+            .codex_state_only_blocked_session_ids
+            .contains(healthy_created));
+        assert!(!control_index
+            .codex_state_only_blocked_session_ids
+            .contains(ordinary));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -78103,22 +77338,19 @@ mod tests {
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert!(!metadata.created_thread_census_failed_homes.is_empty());
-        for context_curve_enabled in [true, false] {
-            let (scan, index) =
-                scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-            assert_eq!(scan.discovered_file_count, 1);
-            assert_eq!(scan.scanned_file_count, 1);
-            assert_eq!(scan.scanned_session_count, 0);
-            assert!(scan.snapshots.is_empty());
-            assert!(!scan.state_census_complete);
-            assert!(!scan.sidecar_census_complete);
-            assert_eq!(scan.recognized_usage_drop_count, 1);
-            assert_eq!(scan.ownership_incomplete_file_count, 1);
-            assert_eq!(scan.dropped_usage_record_count, 1);
-            assert!(index
-                .codex_state_only_blocked_session_ids
-                .contains(session_id));
-        }
+        let (scan, index) = scan_codex_test_root(&sessions_dir);
+        assert_eq!(scan.discovered_file_count, 1);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert_eq!(scan.scanned_session_count, 0);
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.state_census_complete);
+        assert!(!scan.sidecar_census_complete);
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.ownership_incomplete_file_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(session_id));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -78421,25 +77653,22 @@ mod tests {
                 !metadata.created_thread_census_failed_homes.is_empty(),
                 "{name}"
             );
-            for context_curve_enabled in [true, false] {
-                let (scan, index) =
-                    scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-                assert_eq!(scan.discovered_file_count, 1, "{name}");
-                assert_eq!(scan.scanned_file_count, 1, "{name}");
-                assert_eq!(scan.scanned_session_count, 0, "{name}");
-                assert!(scan.snapshots.is_empty(), "{name}: {scan:#?}");
-                assert!(!scan.state_census_complete, "{name}");
-                assert!(!scan.sidecar_census_complete, "{name}");
-                assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
-                assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
-                assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
-                assert!(
-                    index
-                        .codex_state_only_blocked_session_ids
-                        .contains(session_id),
-                    "{name}"
-                );
-            }
+            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            assert_eq!(scan.discovered_file_count, 1, "{name}");
+            assert_eq!(scan.scanned_file_count, 1, "{name}");
+            assert_eq!(scan.scanned_session_count, 0, "{name}");
+            assert!(scan.snapshots.is_empty(), "{name}: {scan:#?}");
+            assert!(!scan.state_census_complete, "{name}");
+            assert!(!scan.sidecar_census_complete, "{name}");
+            assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
+            assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
+            assert!(
+                index
+                    .codex_state_only_blocked_session_ids
+                    .contains(session_id),
+                "{name}"
+            );
             let _ = fs::remove_dir_all(home);
         }
 
@@ -78471,21 +77700,19 @@ mod tests {
         .expect("write additive schema rollout");
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert!(metadata.created_thread_census_failed_homes.is_empty());
-        for context_curve_enabled in [true, false] {
-            let (scan, _) = scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-            assert!(scan.state_census_complete, "{scan:#?}");
-            assert!(scan.sidecar_census_complete, "{scan:#?}");
-            assert_eq!(scan.scanned_session_count, 1);
-            assert_eq!(scan.snapshots.len(), 1);
-            assert_eq!(scan.snapshots[0].input_tokens, 30);
-            assert_eq!(scan.snapshots[0].cache_read_tokens, 8);
-            assert_eq!(scan.snapshots[0].output_tokens, 12);
-            assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1);
-            assert_eq!(scan.snapshots[0].request_count, 1);
-            assert_eq!(scan.recognized_usage_drop_count, 0);
-            assert_eq!(scan.ownership_incomplete_file_count, 0);
-            assert_eq!(scan.dropped_usage_record_count, 0);
-        }
+        let (scan, _) = scan_codex_test_root(&sessions_dir);
+        assert!(scan.state_census_complete, "{scan:#?}");
+        assert!(scan.sidecar_census_complete, "{scan:#?}");
+        assert_eq!(scan.scanned_session_count, 1);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots[0].input_tokens, 30);
+        assert_eq!(scan.snapshots[0].cache_read_tokens, 8);
+        assert_eq!(scan.snapshots[0].output_tokens, 12);
+        assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1);
+        assert_eq!(scan.snapshots[0].request_count, 1);
+        assert_eq!(scan.recognized_usage_drop_count, 0);
+        assert_eq!(scan.ownership_incomplete_file_count, 0);
+        assert_eq!(scan.dropped_usage_record_count, 0);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -78559,25 +77786,22 @@ mod tests {
                 .as_deref(),
             Some(modern)
         );
-        for context_curve_enabled in [true, false] {
-            let (scan, index) =
-                scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
-            assert_eq!(scan.discovered_file_count, 2);
-            assert_eq!(scan.scanned_file_count, 2);
-            assert_eq!(scan.scanned_session_count, 1);
-            assert_eq!(scan.snapshots.len(), 1, "{scan:#?}");
-            assert_eq!(scan.snapshots[0].source_session_id, modern);
-            assert_eq!(scan.snapshots[0].input_tokens, 12);
-            assert_eq!(scan.snapshots[0].cache_read_tokens, 8);
-            assert_eq!(scan.snapshots[0].output_tokens, 12);
-            assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1);
-            assert_eq!(scan.snapshots[0].request_count, 1);
-            assert_eq!(scan.recognized_usage_drop_count, 1);
-            assert_eq!(scan.ownership_incomplete_file_count, 1);
-            assert_eq!(scan.dropped_usage_record_count, 1);
-            assert!(index.codex_state_only_blocked_session_ids.contains(legacy));
-            assert!(!index.codex_state_only_blocked_session_ids.contains(modern));
-        }
+        let (scan, index) = scan_codex_test_root(&sessions_dir);
+        assert_eq!(scan.discovered_file_count, 2);
+        assert_eq!(scan.scanned_file_count, 2);
+        assert_eq!(scan.scanned_session_count, 1);
+        assert_eq!(scan.snapshots.len(), 1, "{scan:#?}");
+        assert_eq!(scan.snapshots[0].source_session_id, modern);
+        assert_eq!(scan.snapshots[0].input_tokens, 12);
+        assert_eq!(scan.snapshots[0].cache_read_tokens, 8);
+        assert_eq!(scan.snapshots[0].output_tokens, 12);
+        assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1);
+        assert_eq!(scan.snapshots[0].request_count, 1);
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.ownership_incomplete_file_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(index.codex_state_only_blocked_session_ids.contains(legacy));
+        assert!(!index.codex_state_only_blocked_session_ids.contains(modern));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -78751,7 +77975,6 @@ mod tests {
             Some(Arc::new(Mutex::new(BTreeMap::new()))),
             true,
             None,
-            true,
         )
         .expect("parse parentless created-thread fixture");
         let _ = fs::remove_dir_all(root);
@@ -78869,7 +78092,6 @@ mod tests {
             None,
             Some(Arc::new(Mutex::new(BTreeMap::new()))),
             true,
-            true,
         )
         .expect("retention parser");
         // A sampled full read observes priority turns, as `prepare_acquisition` does.
@@ -78968,7 +78190,6 @@ mod tests {
                 Some(metadata),
                 None,
                 Some(Arc::new(Mutex::new(ledgers))),
-                true,
                 true,
             )
             .expect("lineage parser");
@@ -79599,25 +78820,12 @@ mod tests {
         );
         assert!(!metadata.state_created_threads.contains(ordinary_id));
 
-        for context_curve_enabled in [true, false] {
-            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
-                &path,
-                &metadata,
-                BTreeMap::new(),
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.complete(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert_eq!(parsed.snapshots.len(), 1);
-            assert_eq!(parsed.snapshots[0].source_session_id, ordinary_id);
-            assert_eq!(parsed.snapshots[0].input_tokens, 12);
-            assert_eq!(
-                parsed.snapshots[0].context_curve.is_some(),
-                context_curve_enabled
-            );
-        }
+        let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
+        assert!(parsed.complete(), "{parsed:#?}");
+        assert_eq!(parsed.snapshots.len(), 1);
+        assert_eq!(parsed.snapshots[0].source_session_id, ordinary_id);
+        assert_eq!(parsed.snapshots[0].input_tokens, 12);
+        assert!(parsed.snapshots[0].context_curve.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -80960,18 +80168,14 @@ mod tests {
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
-            context_curve: Some(build_context_curve(
+            context_curve: Some(single_request_context_curve(
                 CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
                 "claude_owned_request_start_proof:v1",
                 "claude_transcript_model:v1",
-                &[ContextCurveCandidatePoint {
-                    observed_at: Some("2026-05-28T17:05:00Z".to_string()),
-                    effective_input_tokens: 115,
-                    model: Some("claude-opus-4-7".to_string()),
-                    context_window_tokens: None,
-                }],
-                &[],
-                "parser_unsupported",
+                "2026-05-28T17:05:00Z",
+                115,
+                "claude-opus-4-7",
+                None,
             )),
             claude_context_curve_boundaries: Vec::new(),
             claude_context_curve_identity_complete: false,
@@ -81199,18 +80403,14 @@ mod tests {
                     request.source = SnapshotSource::Codex.api_slug().to_string();
                     let item = &mut request.snapshots[0];
                     item.provenance.collector = "codex_state_sqlite".to_string();
-                    item.context_curve = Some(build_context_curve(
+                    item.context_curve = Some(single_request_context_curve(
                         CODEX_SNAPSHOT_PARSER_VERSION,
                         "codex_owned_rollout_occurrences:v1",
                         "codex_token_count_model_context_window:v1",
-                        &[ContextCurveCandidatePoint {
-                            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                            effective_input_tokens: 10,
-                            model: Some("gpt-5.5".to_string()),
-                            context_window_tokens: Some(258_400),
-                        }],
-                        &[],
-                        "pre_capture",
+                        "2026-08-20T12:00:01Z",
+                        10,
+                        "gpt-5.5",
+                        Some(258_400),
                     ));
                     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
                 },
@@ -84335,6 +83535,8 @@ pub(crate) mod cache_adapter_tests {
                 None,
             )
             .remove(0);
+        // The parser no longer builds curves; restore the stored golden curve.
+        super::attach_retained_context_curve(std::slice::from_mut(&mut item), false);
         prepare_cache_observations(&mut item, None);
         item
     }
@@ -84774,7 +83976,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
