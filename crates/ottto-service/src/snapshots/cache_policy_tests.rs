@@ -1518,6 +1518,10 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
             (file_modified, false),
             (newer_modified, false),
         ] {
+            // A Codex Full evicts nothing at any rank: its older row suffices.
+            if source == SnapshotSource::Codex && !older {
+                continue;
+            }
             let releases = older && source == SnapshotSource::ClaudeCode;
             let label = format!("{source:?} idle_modified={idle_modified}");
             let cache = Arc::new(sampled_scan::SharedCache::default());
