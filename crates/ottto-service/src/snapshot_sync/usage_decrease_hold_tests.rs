@@ -176,7 +176,46 @@ fn hold_ack_contract_is_declared_only_on_claude_literal_batches() {
 fn ack_accepts_non_permanent_only_for_declared_literal_holds() {
     let literal = vec![item(0, true), item(1, true)];
     let mixed = vec![item(0, true), item(1, false)];
+    // A cut session's group: its live body and one segment.
+    let mut grouped = vec![item(0, false), item(1, false)];
+    grouped[0].history_segments = Some(
+        crate::snapshots::history_segments::SnapshotHistorySegments {
+            through: "2026-08-27T00:00:00Z".into(),
+            count: 1,
+        },
+    );
+    grouped[1].source_session_id = format!("{}#w20260820", grouped[0].source_session_id);
+    grouped[1].history_segment = Some(crate::snapshots::history_segments::SnapshotHistorySegment {
+        of: grouped[0].source_session_id.clone(),
+        window_start: "2026-08-20T00:00:00Z".into(),
+        window_end: "2026-08-27T00:00:00Z".into(),
+    });
+    for item in &mut grouped {
+        item.snapshot_fingerprint =
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+    }
+    const GROUP_REFUSED: &str = "history_segments_part_count_mismatch";
     for (source, items, rejected, valid) in [
+        // A retryable settled-history group refusal names a group member,
+        // live or segment, from any source; never another body.
+        (
+            SnapshotSource::ClaudeCode,
+            &grouped,
+            (0, GROUP_REFUSED, false),
+            true,
+        ),
+        (
+            SnapshotSource::Codex,
+            &grouped,
+            (1, GROUP_REFUSED, false),
+            true,
+        ),
+        (
+            SnapshotSource::ClaudeCode,
+            &literal,
+            (0, GROUP_REFUSED, false),
+            false,
+        ),
         (SnapshotSource::ClaudeCode, &literal, (0, HELD, false), true),
         (
             SnapshotSource::ClaudeCode,
@@ -220,6 +259,8 @@ fn ack_accepts_non_permanent_only_for_declared_literal_holds() {
         let result = response.validate_entity_ack(&request(source, items.clone()));
         assert_eq!(result.is_ok(), valid, "{source:?} {rejected:?}: {result:?}");
     }
+    let rejection = &ack(&grouped, &[(1, GROUP_REFUSED, false)]).rejected_entities[0];
+    assert!(rejection.history_segments_hold() && !rejection.usage_decrease_hold());
     let rejection = &ack(&literal, &[(0, HELD, false)]).rejected_entities[0];
     assert_eq!(rejection.safe_reason(), HELD);
     assert!(rejection.usage_decrease_hold());

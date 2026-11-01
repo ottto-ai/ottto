@@ -67,6 +67,7 @@ fn upload_families(
         |item| Some(item.session.as_str()),
         |item| item.class,
         |item| item.root.as_deref(),
+        no_history_group,
         &mut InplaceRetryBudget::default(),
         |batch| {
             batches.push(batch.iter().map(|item| item.session.clone()).collect());
@@ -318,6 +319,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
             |item| Some(item.source_session_id.as_str()),
             |_| false,
             crate::snapshots::claude_request_money::request_owned_family_root,
+            crate::snapshots::history_segments::history_group,
             &mut InplaceRetryBudget::default(),
             |batch| {
                 sent.push(serde_json::to_vec(&batch).unwrap());

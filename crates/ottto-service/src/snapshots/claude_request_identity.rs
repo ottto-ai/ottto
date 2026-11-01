@@ -15,6 +15,7 @@
 //! aggregation, then feeds those exact final shares to this same tag installer.
 
 use super::claude_request_accounts::{local_subscription, normalize_activity};
+use super::history_segments;
 use super::{
     activity_bucket_from_timestamp, build_row_identity, claude_snapshot_request_id_hashes,
     codex_identity_is_uuid_shaped, rfc3339_unix_seconds, row_key_from_model_usage,
@@ -38,7 +39,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
-pub(crate) use accepted::AcceptedBuckets;
+#[cfg(test)]
+pub(crate) mod cut_for_test;
+pub(crate) use accepted::{decode_segments, AcceptedBuckets};
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -446,7 +449,7 @@ fn usage_costs(usage: &UsageTotals) -> [Option<u128>; 5] {
     ]
 }
 
-fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
+pub(super) fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
     [
         row.input_tokens,
         row.output_tokens,
@@ -459,7 +462,7 @@ fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
     ]
 }
 
-fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
+pub(super) fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
     [
         &row.cost_usd,
         &row.input_cost_usd,
@@ -654,6 +657,57 @@ impl Grouping {
 
     fn item_bytes(&self, item: &SnapshotItem) -> usize {
         item_bytes(item).saturating_add(self.extra_wire_bytes)
+    }
+
+    /// The groups of `starts` only, for one settled-history piece. Requests
+    /// were grouped (and carried) over the whole session; only the live piece
+    /// keeps the cache reservation and the local newest-request display.
+    fn piece(&self, starts: &BTreeSet<&str>, live: bool) -> Self {
+        let groups = self
+            .groups
+            .iter()
+            .filter(|(start, _)| starts.contains(start.as_str()))
+            .map(|(start, rows)| (start.clone(), rows.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Self {
+            group_count: groups.values().map(BTreeMap::len).sum(),
+            keys: groups
+                .values()
+                .flat_map(BTreeMap::values)
+                .flat_map(|group| group.by_key.keys().flatten())
+                .cloned()
+                .collect(),
+            groups,
+            max_groups: self.max_groups,
+            keys_over_cap: self.keys_over_cap,
+            hold_over_cap: self.hold_over_cap,
+            upstream_proof_lost: self.upstream_proof_lost,
+            extra_wire_bytes: if live { self.extra_wire_bytes } else { 0 },
+            accepted_share_changed: BTreeSet::new(),
+            accepted_rows_vanished: 0,
+            accepted_miss: self.accepted_miss,
+            copy_invalidated: self
+                .copy_invalidated
+                .iter()
+                .filter(|(start, _)| starts.contains(start.as_str()))
+                .map(|(start, rows)| (start.clone(), rows.clone()))
+                .collect(),
+            failed: self.failed,
+            transcript_requests: self.transcript_requests,
+            telemetry_only_requests: self.telemetry_only_requests,
+            excluded_requests: self.excluded_requests,
+            unowned_request: self.unowned_request,
+            desktop_recent: if live {
+                self.desktop_recent.clone()
+            } else {
+                Default::default()
+            },
+            latest: if live {
+                self.latest.clone()
+            } else {
+                LatestRequests::default()
+            },
+        }
     }
 
     #[cfg(test)]
@@ -981,11 +1035,23 @@ pub(crate) fn apply_grouped(
 /// allocation priority, and fresh tags use the plain newest-first order.
 fn apply_grouped_with_accepted(
     item: &mut SnapshotItem,
-    mut grouping: Grouping,
+    grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
     max_item_bytes: usize,
 ) -> Result<Tagged, Ineligible> {
+    apply_grouped_trimmed(item, grouping, known, retained, max_item_bytes).map(|(tagged, _)| tagged)
+}
+
+/// `apply_grouped_with_accepted`, with the caps behind a `Sent` body that
+/// kept only the budget's buckets tagged (the rest stripped).
+fn apply_grouped_trimmed(
+    item: &mut SnapshotItem,
+    mut grouping: Grouping,
+    known: Option<&accepted::AcceptedSession>,
+    retained: bool,
+    max_item_bytes: usize,
+) -> Result<(Tagged, BTreeSet<OverCap>), Ineligible> {
     let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
     let (accepted, proved) = if retained {
         (None, known)
@@ -1231,9 +1297,8 @@ fn apply_grouped_with_accepted(
                 &grouping,
                 grouping.unowned_request,
             )));
-            return Ok(Tagged::Sent {
-                refusals: item.request_identity_refusals,
-            });
+            let refusals = item.request_identity_refusals;
+            return Ok((Tagged::Sent { refusals }, BTreeSet::new()));
         }
         over_cap.insert(OverCap::Bytes);
     }
@@ -1247,7 +1312,7 @@ fn apply_grouped_with_accepted(
             components.as_ref(),
         );
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        return Ok(Tagged::Held);
+        return Ok((Tagged::Held, BTreeSet::new()));
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(
         &over_cap,
@@ -1309,9 +1374,8 @@ fn apply_grouped_with_accepted(
         // Withholding only that request must not anonymize retained history.
         item.claude_account_display =
             Some(Box::new(account_display(&visible, visible.unowned_request)));
-        return Ok(Tagged::Sent {
-            refusals: item.request_identity_refusals,
-        });
+        let refusals = item.request_identity_refusals;
+        return Ok((Tagged::Sent { refusals }, over_cap));
     }
     let mut counts = attempted_counts;
     counts.accepted_overflow.differs = accepted_tagged_attempted;
@@ -1369,10 +1433,8 @@ fn apply_grouped_with_accepted(
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     // The rows carry no identity, so neither may the display.
     item.claude_account_display = Some(Box::new(account_display(&grouping, true)));
-    Ok(Tagged::Fallback {
-        over_cap: over_cap.into_iter().collect(),
-        refusals,
-    })
+    let over_cap = over_cap.into_iter().collect();
+    Ok((Tagged::Fallback { over_cap, refusals }, BTreeSet::new()))
 }
 
 /// Bytes one `identity_retained` member adds to a compact wire row.
@@ -1942,33 +2004,40 @@ pub(crate) fn measure_identity_cap(
     Some(measured)
 }
 
+/// A canonical wire money string as picodollars: digits, at most 12
+/// decimals, and the exact spelling `usd_picos_string` gives it back.
+pub(super) fn wire_usd_picos(text: &str) -> Option<u128> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || fraction.len() > 12
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let picos = whole
+        .parse::<u128>()
+        .ok()?
+        .checked_mul(USD_PICO_SCALE)?
+        .checked_add(if fraction.is_empty() {
+            0
+        } else {
+            fraction
+                .parse::<u128>()
+                .ok()?
+                .checked_mul(10u128.pow((12 - fraction.len()) as u32))?
+        })?;
+    (usd_picos_string(picos) == text).then_some(picos)
+}
+
 fn wire_usage(row: &SnapshotModelUsage) -> Option<UsageTotals> {
     let mut amounts = [None; 5];
     for (slot, text) in amounts.iter_mut().zip(row_costs(row)) {
         if let Some(text) = text {
-            let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-            if whole.is_empty()
-                || fraction.len() > 12
-                || !whole
-                    .bytes()
-                    .chain(fraction.bytes())
-                    .all(|byte| byte.is_ascii_digit())
-            {
-                return None;
-            }
-            let picos = whole
-                .parse::<u128>()
-                .ok()?
-                .checked_mul(USD_PICO_SCALE)?
-                .checked_add(if fraction.is_empty() {
-                    0
-                } else {
-                    fraction
-                        .parse::<u128>()
-                        .ok()?
-                        .checked_mul(10u128.pow((12 - fraction.len()) as u32))?
-                })?;
-            if !micro_exact(picos) || usd_picos_string(picos) != *text {
+            let picos = wire_usd_picos(text)?;
+            if !micro_exact(picos) {
                 return None;
             }
             *slot = Some(picos);
@@ -4454,6 +4523,10 @@ pub(crate) struct ScanEvidence<'a> {
     /// unambiguous native account used by local Desktop activity.
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
+    /// Settled-history segment entries, a sibling of `accepted_buckets`.
+    accepted_segments: Option<&'a AcceptedBuckets>,
+    /// `session_history_segments:v1` on: this pass's cut.
+    history_cut: Option<history_segments::Cut>,
     wire_budget: WireBudget<'a>,
 }
 
@@ -4530,6 +4603,17 @@ impl<'a> ScanEvidence<'a> {
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
+        self
+    }
+
+    /// Segment entries and the cut; `cut` is `None` with the capability off.
+    pub(crate) fn with_history_segments(
+        mut self,
+        accepted: Option<&'a AcceptedBuckets>,
+        cut: Option<history_segments::Cut>,
+    ) -> Self {
+        self.accepted_segments = accepted;
+        self.history_cut = cut;
         self
     }
 
@@ -5786,6 +5870,137 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             })
 }
 
+/// Tag `item`; with `session_history_segments:v1` on, a body over the trigger
+/// as sent (tagged), or one that could keep its identity only by stripping,
+/// is cut into its settled 7-day windows first. Every piece is tagged from
+/// the whole-session grouping (carry already ran over the whole session).
+/// Each segment's accepted hints are its own entry per bucket, else the live
+/// entry's; retained proof is its own entry's only. A window over a size cap
+/// once tagged holds the session (delayed, never stripped; the receiver takes
+/// whole windows only). Any other failed piece keeps the whole body on
+/// today's path. Segments wait on the live body. Copy-prefix invalidation
+/// acts per entity: a segment's own entry tombstones the lent rows it holds
+/// (`invalidated_rows` names the segment), the live entry the rest.
+fn apply_cut(
+    item: &mut SnapshotItem,
+    grouping: Grouping,
+    evidence: &ScanEvidence<'_>,
+    accepted: Option<&accepted::AcceptedSession>,
+    retained: bool,
+    invalidated_rows: &mut Vec<CopyInvalidation>,
+) -> Result<Tagged, Ineligible> {
+    let max_item_bytes = evidence.wire_budget.max_item_bytes;
+    let Some(cut) = evidence.history_cut else {
+        return apply_grouped_with_accepted(item, grouping, accepted, retained, max_item_bytes);
+    };
+    let original = item.clone();
+    let starts = |piece: &SnapshotItem| {
+        piece
+            .usage_buckets
+            .iter()
+            .map(|bucket| bucket.bucket_start.clone())
+            .collect::<Vec<_>>()
+    };
+    let everything = starts(&*item);
+    let whole = grouping.piece(&everything.iter().map(String::as_str).collect(), true);
+    let tagged = apply_grouped_with_accepted(item, whole, accepted, retained, max_item_bytes);
+    let sent = matches!(tagged, Ok(Tagged::Sent { .. }));
+    if tagged.is_err() || (sent && grouping.item_bytes(item) <= cut.trigger) {
+        return tagged;
+    }
+    let mut segment_rows = Vec::new();
+    let Some((mut segments, mut live)) = history_segments::plan(
+        SnapshotSource::ClaudeCode,
+        &original,
+        cut.trigger + 1,
+        cut,
+        max_item_bytes,
+    )
+    .and_then(|plan| history_segments::split(SnapshotSource::ClaudeCode, &original, &plan)) else {
+        // The whole body's item-limit hold stands: nothing was cut.
+        if matches!(tagged, Ok(Tagged::Held)) {
+            history_segments::alarm(
+                SnapshotSource::ClaudeCode,
+                history_segments::Skipped::WholeHeld,
+            );
+        }
+        return tagged;
+    };
+    for segment in &mut segments {
+        let owned = starts(&*segment);
+        let keys = owned
+            .iter()
+            .filter_map(|start| accepted::bucket_key(start))
+            .collect::<Vec<_>>();
+        let own = evidence
+            .accepted_segments
+            .and_then(|ledger| ledger.get(&segment.source_session_id));
+        let mut piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
+        // The whole body's lent slots, against the rows this entry holds.
+        let derived = copy_derived_rows(&original, &piece, own);
+        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+            // A segment is flagged from its own entry alone (none: no flags).
+            piece.copy_invalidated = copy_invalidated_rows(segment, &derived, own);
+        }
+        let own_invalidated = own
+            .filter(|_| !derived.is_empty())
+            .map(|own| own.invalidated(&derived));
+        let view = accepted::segment_view(own_invalidated.as_ref().or(own), accepted, &keys);
+        let caps =
+            match apply_grouped_trimmed(segment, piece, view.as_ref(), retained, max_item_bytes) {
+                Ok((Tagged::Sent { .. }, trimmed)) => trimmed.into_iter().collect(),
+                Ok((Tagged::Fallback { over_cap, .. }, _)) if !over_cap.is_empty() => over_cap,
+                // Any other cause is the whole session's too: today's path.
+                _ => {
+                    history_segments::alarm(
+                        SnapshotSource::ClaudeCode,
+                        history_segments::Skipped::PieceFailed,
+                    );
+                    return tagged;
+                }
+            };
+        segment_rows.extend(derived.into_iter().map(|(bucket, row)| CopyInvalidation {
+            session: segment.source_session_id.clone(),
+            bucket,
+            row,
+        }));
+        match caps.as_slice() {
+            [] => {}
+            // A window over a size cap stays over it: hold, never strip
+            // (wholly, or a budget's older buckets).
+            caps if caps
+                .iter()
+                .all(|cap| matches!(cap, OverCap::Bytes | OverCap::PartsPerItem)) =>
+            {
+                history_segments::alarm(
+                    SnapshotSource::ClaudeCode,
+                    history_segments::Skipped::PieceHeld,
+                );
+                return Ok(Tagged::Held);
+            }
+            // Any other cause is the whole session's too: today's path.
+            _ => {
+                history_segments::alarm(
+                    SnapshotSource::ClaudeCode,
+                    history_segments::Skipped::PieceFailed,
+                );
+                return tagged;
+            }
+        }
+    }
+    let owned = starts(&live);
+    let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), true);
+    match apply_grouped_with_accepted(&mut live, piece, accepted, retained, max_item_bytes) {
+        Ok(result) => {
+            live.history_cut = segments;
+            *item = live;
+            invalidated_rows.extend(segment_rows);
+            Ok(result)
+        }
+        Err(_) => tagged,
+    }
+}
+
 fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
@@ -5844,12 +6059,13 @@ fn tag_item(
         let invalidated = accepted
             .filter(|_| !copy_derived.is_empty())
             .map(|accepted| accepted.invalidated(&copy_derived));
-        let tagged = apply_grouped_with_accepted(
+        let tagged = apply_cut(
             item,
             grouping,
+            evidence,
             invalidated.as_ref().or(accepted),
             retained,
-            evidence.wire_budget.max_item_bytes,
+            invalidated_rows,
         );
         if tagged.is_err() {
             (
@@ -5925,12 +6141,13 @@ fn tag_item(
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     grouping.accepted_miss = miss;
-    let tagged = apply_grouped_with_accepted(
+    let tagged = apply_cut(
         item,
         grouping,
+        evidence,
         accepted,
         retained,
-        evidence.wire_budget.max_item_bytes,
+        invalidated_rows,
     );
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);

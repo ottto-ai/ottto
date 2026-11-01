@@ -347,6 +347,7 @@ impl PreparedRetry {
                 &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+                &crate::snapshots::history_segments::history_group,
                 &mut |snapshots| {
                     let lease = crate::client_report::lease();
                     let request = SnapshotBatchRequest {

@@ -77,6 +77,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
             &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
             &|_: &Value| "c".repeat(64),
             &|value: &Value| value["source_session_id"].as_str(),
+            &json_group,
             &mut |_| {
                 let entity = crate::snapshot_client::SnapshotEntityRef {
                     source_session_id: "synthetic-sticky-session".into(),
@@ -267,6 +268,7 @@ fn retained_ack(
                 .map_or_else(|| "d".repeat(64), str::to_owned)
         },
         &|value: &Value| value["source_session_id"].as_str(),
+        &json_group,
         &mut |_| {
             let entity = crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: "synthetic-sticky-session".into(),
@@ -422,6 +424,7 @@ fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
             &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
             &|_: &Value| "d".repeat(64),
             &|value: &Value| value["source_session_id"].as_str(),
+            &json_group,
             &mut |_| {
                 assert_eq!(saved.get(), Some((0, 0)), "persisted before the POST");
                 Err(anyhow!("reply lost"))
@@ -475,4 +478,611 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
             .unwrap();
     assert_eq!(counts["identity_cap"]["retained_set_cleared"], json!(2));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// One settled-history group: a segment of the old window and the live body
+/// past `through`, each tagged with its own account, as bodies on the wire.
+/// The JSON page item's settled-history group descriptor.
+fn json_group(value: &Value) -> Option<(&str, Option<u64>)> {
+    match value["history_segment"]["of"].as_str() {
+        Some(live) => Some((live, None)),
+        None => value["history_segments"]["count"]
+            .as_u64()
+            .zip(value["source_session_id"].as_str())
+            .map(|(count, live)| (live, Some(count))),
+    }
+}
+
+fn history_group() -> [Value; 2] {
+    let row = |account: char| json!({"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":account.to_string().repeat(64)});
+    let body = |session: &str, fingerprint: char, start: &str, account: char, extra: Value| {
+        let mut body = json!({"source_session_id": session, "snapshot_fingerprint": fingerprint.to_string().repeat(64),
+            "provenance":{"collector":crate::snapshots::claude_request_identity::COLLECTOR},
+            "request_evidence":[{"identity_basis":"telemetry_login"}],
+            "usage_buckets":[{"bucket_start": start, "model_usage":[row(account)]}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    [
+        body(
+            "synthetic-group#w20260827",
+            'd',
+            "2026-08-28T10:00:00Z",
+            'a',
+            json!({"history_segment":{"of":"synthetic-group","window_start":"2026-08-27T00:00:00Z","window_end":"2026-09-03T00:00:00Z"}}),
+        ),
+        body(
+            "synthetic-group",
+            'e',
+            "2026-09-29T10:00:00Z",
+            'b',
+            json!({"history_segments":{"through":"2026-09-03T00:00:00Z","count":1}}),
+        ),
+    ]
+}
+
+fn group_page(progress: &mut SnapshotUploadProgress, items: &[Value], conflicted: &[usize]) {
+    group_page_at(
+        progress,
+        items,
+        &(0..items.len()).collect::<Vec<_>>(),
+        conflicted,
+    );
+}
+
+/// One page of `indices` out of `items`; every page entity ACKs except
+/// `conflicted`, which conflict. Returns the page's pending count.
+fn group_page_at(
+    progress: &mut SnapshotUploadProgress,
+    items: &[Value],
+    indices: &[usize],
+    conflicted: &[usize],
+) -> usize {
+    let mut accepted = 0;
+    let outcome = attempt_snapshot_page(
+        items,
+        indices,
+        "synthetic-history-group",
+        progress,
+        &mut accepted,
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+        &|_: &Value| "c".repeat(64),
+        &|value: &Value| value["source_session_id"].as_str(),
+        &json_group,
+        &mut |_| {
+            let entity = |index: usize| crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: items[index]["source_session_id"].as_str().unwrap().into(),
+                snapshot_fingerprint: items[index]["snapshot_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                occurrence_count: 1,
+                body_witness_version: None,
+                body_witness_digest: None,
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
+            };
+            let (conflict, accepted): (Vec<_>, Vec<_>) = indices
+                .iter()
+                .copied()
+                .partition(|index| conflicted.contains(index));
+            Ok(crate::snapshot_client::SnapshotBatchResponse {
+                accepted: accepted.len() as u64,
+                sessions_reconciled: 0,
+                session_ids: vec![],
+                disabled: false,
+                disabled_reason: None,
+                entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                accepted_entities: accepted.into_iter().map(entity).collect(),
+                unchanged_entities: vec![],
+                rejected_entities: vec![],
+                conflict_entities: conflict.into_iter().map(entity).collect(),
+            })
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    match outcome {
+        SnapshotPageOutcome::Settled { conflicted } => conflicted,
+        SnapshotPageOutcome::Disabled(_) => unreachable!("never disabled"),
+    }
+}
+
+/// [money] A settled-history group settles whole. With the live
+/// ACK lost (conflicted), nothing of the group is recorded or settled, so
+/// the moved bucket stays protected by the live entry and the segment is
+/// offered again; once the whole group ACKs, the segment records into its own
+/// sibling entry before the live body drops the moved bucket. A restart
+/// between the passes (saved progress) changes none of it: each bucket is
+/// held by exactly one entry, once.
+#[test]
+fn history_group_settles_whole_segments_before_live() {
+    let mut progress = progress();
+    progress
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    let [segment, live] = history_group();
+    // The unsegmented body was ACKed before: the live entry holds both hours.
+    let mut whole = live.clone();
+    whole.as_object_mut().unwrap().remove("history_segments");
+    whole["usage_buckets"] = json!([segment["usage_buckets"][0], live["usage_buckets"][0]]);
+    progress.record_cache_state(&whole, false).unwrap();
+    let held = progress
+        .accepted_identity_buckets
+        .get("synthetic-group")
+        .unwrap()
+        .len();
+    assert_eq!(held, 2);
+    let items = [segment, live];
+    group_page(&mut progress, &items, &[1]);
+    assert!(!progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    assert!(progress
+        .accepted_identity_segments
+        .get("synthetic-group#w20260827")
+        .is_none());
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut progress: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+    for ledger in [
+        &mut progress.accepted_identity_buckets,
+        &mut progress.accepted_identity_segments,
+    ] {
+        ledger.bind_test_key(Some([0x42; 32]));
+    }
+    // The reloaded live entry still protects the moved bucket.
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        2
+    );
+    progress.active_quarantine_retries.clear();
+    progress.quarantined_fingerprints.clear();
+    group_page(&mut progress, &items, &[]);
+    for fingerprint in ['d', 'e'] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+    assert_eq!(
+        progress
+            .accepted_identity_segments
+            .get("synthetic-group#w20260827")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// [money] A live body sent alone waits for its segment outside the page:
+/// its ACK is not recorded until the segment's exact bytes are ACKed, so its
+/// `through` never settles over history the receiver may not hold. The
+/// blocked live body counts as pending, so the page is never Completed.
+#[test]
+fn history_live_waits_on_a_segment_outside_its_page() {
+    let mut progress = progress();
+    let items = history_group();
+    assert_eq!(group_page_at(&mut progress, &items, &[1], &[]), 1);
+    assert!(!progress.accepted_fingerprints.contains(&"e".repeat(64)));
+    assert_eq!(group_page_at(&mut progress, &items, &[0], &[]), 0);
+    assert!(progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    assert_eq!(group_page_at(&mut progress, &items, &[1], &[]), 0);
+    assert!(progress.accepted_fingerprints.contains(&"e".repeat(64)));
+}
+
+/// [money] Two local copies of one cut session: the packer sends one copy
+/// of the group, and that ACK settles it (both copies' segments are the
+/// same entity, counted once against `count`).
+#[test]
+fn history_group_with_a_duplicate_local_copy_settles_once() {
+    let mut progress = progress();
+    let [segment, live] = history_group();
+    let items = [segment.clone(), live.clone(), segment, live];
+    assert_eq!(group_page_at(&mut progress, &items, &[0, 1], &[]), 0);
+    for fingerprint in ['d', 'e'] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+}
+
+/// [money] A live body whose `count` names a segment missing from the input
+/// (held, quarantined or deferred) settles nothing of its group.
+#[test]
+fn history_live_waits_for_every_counted_segment() {
+    let mut progress = progress();
+    let [segment, mut live] = history_group();
+    live["history_segments"]["count"] = json!(2);
+    group_page(&mut progress, &[segment, live], &[]);
+    for fingerprint in ['d', 'e'] {
+        assert!(!progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+}
+
+/// [money][regress] Re-offer after a whole upload: a later whole (or lower)
+/// body retires the receiver's segment, so the next cut live body conflicts.
+/// That conflict forgets the group's earlier segment ACKs, so the next pass
+/// offers the byte-identical segment again instead of skipping it.
+#[test]
+fn history_live_conflict_forgets_its_earlier_segment_acks() {
+    let mut progress = progress();
+    let items = history_group();
+    group_page(&mut progress, &items, &[]);
+    assert!(progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    let mut changed = items.clone();
+    changed[1]["snapshot_fingerprint"] = json!("f".repeat(64));
+    group_page_at(&mut progress, &changed, &[1], &[1]);
+    assert!(!progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    assert!(!progress
+        .accepted_body_witnesses
+        .contains_key(&"d".repeat(64)));
+}
+
+/// [behaviour][money] A group's unACKed members travel in ONE request, up
+/// to the receiver's limits, against a minimal receiver model: at most 100
+/// entities, and it REFUSES (retryable, nothing written) a segment without
+/// its live body or a live body whose held plus sent parts miss its `count`.
+/// - At the limit (99 segments + live) one request carries all of it and
+///   every token settles once.
+/// - A later pass sends only changed segments, with their live body even
+///   when that is ACKed and unchanged; ACKed unchanged segments are skipped.
+/// - After a group refusal every member waits on its own retry clock; when
+///   any one comes due the whole unACKed group goes again, never a part.
+/// - A 422 isolates bodies but retries the group as one part.
+/// - One over the limit sends nothing: the pass is Deferred (counted) and
+///   every member is held on the retry backoff, owed for a later pass.
+#[test]
+fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
+    let live = "synthetic-long";
+    let other = "synthetic-other";
+    let group = |segments: u64| {
+        let mut items = (0..segments)
+            .map(|n| {
+                json!({"source_session_id": format!("{live}#w{}", 20_250_101 + n),
+                    "snapshot_fingerprint": format!("{:064x}", 0x1000 - n),
+                    "history_segment": {"of": live}, "input_tokens": 10 + n})
+            })
+            .collect::<Vec<_>>();
+        items.push(
+            json!({"source_session_id": live, "snapshot_fingerprint": "f".repeat(64),
+            "history_segments": {"count": segments}, "input_tokens": 7}),
+        );
+        items
+    };
+    let tokens = |items: &[Value]| {
+        items
+            .iter()
+            .map(|item| item["input_tokens"].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let id = |value: &Value| value["source_session_id"].as_str().unwrap().to_owned();
+    // `stored`: segment ids the receiver holds. `refuse`: refuse the next
+    // group once (e.g. a head conflict).
+    let upload = |progress: &mut SnapshotUploadProgress,
+                  items: &[Value],
+                  stored: &mut BTreeSet<String>,
+                  refuse: &mut bool| {
+        let mut requests = Vec::<Vec<Value>>::new();
+        let mut accepted = 0;
+        let result = upload_resumable_batches_with_literal_families(
+            items,
+            "synthetic-history-over-batch",
+            progress,
+            &mut accepted,
+            |value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            |value: &Value| value["snapshot_fingerprint"].as_str().unwrap().to_owned(),
+            |value: &Value| value["source_session_id"].as_str(),
+            |_: &Value| false,
+            |value: &Value| (value["source_session_id"] != other).then_some(live),
+            json_group,
+            &mut InplaceRetryBudget::default(),
+            |batch: Vec<Value>| {
+                requests.push(batch.clone());
+                if batch
+                    .iter()
+                    .any(|value| value["source_session_id"] == other)
+                {
+                    return Err(anyhow::Error::new(crate::snapshot_client::BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0]}]}"#.into()),
+                    }));
+                }
+                assert!(batch.len() <= crate::snapshots::history_segments::GROUP_MAX_ITEMS);
+                let sent = batch
+                    .iter()
+                    .filter(|value| value["history_segment"].is_object())
+                    .map(id)
+                    .collect::<BTreeSet<_>>();
+                let whole = batch
+                    .iter()
+                    .find(|value| value["source_session_id"] == live)
+                    .is_some_and(|value| {
+                        stored.union(&sent).count() as u64
+                            == value["history_segments"]["count"].as_u64().unwrap()
+                    });
+                let history = batch.iter().any(|value| json_group(value).is_some());
+                let refused = std::mem::take(refuse) || (history && !whole);
+                if !refused {
+                    stored.extend(sent);
+                }
+                let entity = |value: &Value| crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: id(value),
+                    snapshot_fingerprint: value["snapshot_fingerprint"].as_str().unwrap().into(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                    unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
+                };
+                let rejection = |value: &Value| crate::snapshot_client::SnapshotEntityRejection {
+                    source_session_id: id(value),
+                    snapshot_fingerprint: value["snapshot_fingerprint"].as_str().unwrap().into(),
+                    reason: "history_segments_part_count_mismatch".into(),
+                    detail: "synthetic group refusal".into(),
+                    permanent: false,
+                    occurrence_count: 1,
+                };
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: if refused { 0 } else { batch.len() as u64 },
+                    sessions_reconciled: 0,
+                    session_ids: vec![],
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into(),
+                    ),
+                    accepted_entities: if refused {
+                        vec![]
+                    } else {
+                        batch.iter().map(entity).collect()
+                    },
+                    unchanged_entities: vec![],
+                    rejected_entities: if refused {
+                        batch.iter().map(rejection).collect()
+                    } else {
+                        vec![]
+                    },
+                    conflict_entities: vec![],
+                })
+            },
+            |_| Ok(()),
+        );
+        (result, requests)
+    };
+    let segment_only = |request: &Vec<Value>| {
+        request
+            .iter()
+            .any(|value| value["history_segment"].is_object())
+            && !request
+                .iter()
+                .any(|value| value["source_session_id"] == live)
+    };
+    // At the limit: one request with every member, segments oldest first.
+    let fresh = progress;
+    let mut items = group(99);
+    let mut progress = fresh();
+    let mut stored = BTreeSet::new();
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].len(), 100);
+    assert_eq!(tokens(&requests[0]), tokens(&items));
+    let ids = requests[0].iter().map(id).collect::<Vec<_>>();
+    assert_eq!(ids.last().map(String::as_str), Some(live));
+    assert!(ids[..99].windows(2).all(|pair| pair[0] < pair[1]));
+    for item in &items {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+    }
+    // Next pass: only changed members are sized and sent.
+    items[3]["snapshot_fingerprint"] = json!("a".repeat(64));
+    items[99]["snapshot_fingerprint"] = json!("e".repeat(64));
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(requests.len(), 1);
+    let pair = vec![format!("{live}#w20250104"), live.to_owned()];
+    assert_eq!(requests[0].iter().map(id).collect::<Vec<_>>(), pair);
+    // A changed segment alone brings its ACKed, unchanged live body.
+    items[3]["snapshot_fingerprint"] = json!("b".repeat(64));
+    let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].iter().map(id).collect::<Vec<_>>(), pair);
+    assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
+
+    // A refused group: every member is held on its own retry clock. When
+    // any one comes due the whole unACKed group goes again in one request.
+    let items = group(3);
+    for due in [3, 0] {
+        let mut progress = fresh();
+        let mut stored = BTreeSet::new();
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut true);
+        assert_eq!(
+            result.unwrap(),
+            ResumableUploadResult::Deferred { count: 4 }
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(progress.quarantined_fingerprints.len(), 4);
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(requests.is_empty(), "nothing is due yet");
+        progress.active_quarantine_retries = BTreeSet::from([items[due]["snapshot_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned()]);
+        let (result, requests) = upload(&mut progress, &items, &mut stored, &mut false);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].len(), 4);
+        assert_eq!(stored.len(), 3);
+        for item in &items {
+            assert!(progress
+                .accepted_fingerprints
+                .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+        }
+    }
+
+    // A group never shares a request with another body, not even an uncut
+    // member of its own literal family: a headless live's request carries
+    // no other body's cache patch, so it declares no head-CAS and cannot
+    // conflict; the group's money lands. The other body's 422 stays its
+    // own; no request carries a segment without its live body.
+    let child = "synthetic-long-child";
+    let mut mixed = group(3);
+    mixed.push(
+        json!({"source_session_id": other, "snapshot_fingerprint": "c".repeat(64),
+        "input_tokens": 1, "cache_observations": {"cache_read_tokens": 1}}),
+    );
+    mixed.push(
+        json!({"source_session_id": child, "snapshot_fingerprint": "9".repeat(64),
+        "input_tokens": 2, "cache_observations": {"cache_read_tokens": 1}}),
+    );
+    let mut progress = fresh();
+    let mut stored = BTreeSet::new();
+    let (result, requests) = upload(&mut progress, &mixed, &mut stored, &mut false);
+    assert!(result.is_err(), "the poison body still fails the cycle");
+    assert!(requests.iter().any(|request| {
+        request.len() == 4
+            && !request
+                .iter()
+                .any(|value| value["source_session_id"] == other)
+    }));
+    assert!(requests.iter().any(|request| request.len() == 1));
+    assert!(requests.iter().all(|request| {
+        !request.iter().any(|value| json_group(value).is_some())
+            || request.iter().all(|value| json_group(value).is_some())
+    }));
+    assert!(progress.accepted_fingerprints.contains(&"9".repeat(64)));
+    assert!(!requests.iter().any(segment_only));
+    assert_eq!(stored.len(), 3);
+    for item in &mixed[..4] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+    }
+
+    // One over the limit: nothing is sent; Deferred, counted, and held.
+    let items = group(100);
+    let mut progress = fresh();
+    let (result, requests) = upload(&mut progress, &items, &mut BTreeSet::new(), &mut false);
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 101 }
+    );
+    assert!(requests.is_empty());
+    assert!(progress.accepted_fingerprints.is_empty());
+    assert!(progress.accepted_body_witnesses.is_empty());
+    assert_eq!(progress.quarantined_fingerprints.len(), 101);
+    assert!(progress
+        .quarantined_fingerprints
+        .values()
+        .all(|record| { record.disposition == SnapshotQuarantineDisposition::RetryPending }));
+}
+
+/// [format] Segment hints persist in their own sibling field, beside the
+/// live map; an older progress decoder ignores the field and keeps ACKs.
+#[test]
+fn segment_hints_persist_in_a_sibling_field_older_decoders_ignore() {
+    let mut progress = progress();
+    progress
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    let [segment, _] = history_group();
+    progress.record_body(&"d".repeat(64), &"c".repeat(64));
+    progress.record_cache_state(&segment, false).unwrap();
+    assert!(progress
+        .accepted_identity_buckets
+        .get("synthetic-group#w20260827")
+        .is_none());
+    let bytes = serde_json::to_vec(&progress).unwrap();
+    let saved: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(saved.get("accepted_identity_buckets").is_none());
+    assert_eq!(
+        saved["accepted_identity_segments"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+    restored
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    assert_eq!(
+        restored.accepted_identity_segments,
+        progress.accepted_identity_segments
+    );
+    #[derive(Deserialize)]
+    struct OlderProgress {
+        accepted_body_witnesses: BTreeMap<String, String>,
+    }
+    let older: OlderProgress = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        older.accepted_body_witnesses,
+        progress.accepted_body_witnesses
+    );
+}
+
+/// [off=main][regress] Each pass binds the attribution key on both ledgers;
+/// the partial checkpoint re-reads progress from disk (no key) and must adopt
+/// that runtime state for both before comparing, even with the sibling empty
+/// and the capability off.
+#[test]
+fn partial_checkpoint_adopts_both_ledgers_runtime_state() {
+    let scratch = crate::test_scratch::ScratchDir::new("segments-partial-checkpoint");
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(
+            SnapshotSource::ClaudeCode,
+            &"d".repeat(64),
+        ),
+    );
+    for ledger in [
+        &mut progress.accepted_identity_buckets,
+        &mut progress.accepted_identity_segments,
+    ] {
+        ledger.bind_test_key(Some([0x42; 32]));
+    }
+    let progress_path = scratch.join("progress.json");
+    let index_path = scratch.join("index.json");
+    progress.save(&progress_path).unwrap();
+    let index = ScanIndex::default();
+    checkpoint_partial_snapshot_index(
+        &index,
+        &index,
+        &progress,
+        &[],
+        None,
+        &BTreeSet::new(),
+        &index_path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
 }
