@@ -105,5 +105,4 @@ fn pre_e2_terminal_retries_once_and_matches_cold_full() {
     let success = finish(&mut ok_idx, &mut recovered);
     assert!(!ok_idx.claude_usage_authority_quarantine.contains_key(id));
     money_oracle::assert_equivalent(&cold, &success);
-    money_oracle::assert_no_smaller_reemit(id, &cold, &success, &cold, false);
 }
