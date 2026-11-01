@@ -602,7 +602,7 @@ fn save_with_custody(
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let mut stale_graph = false;
-    let mut result = held(with_state(path, |state| {
+    let result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = index.v2().persistence_v2.clone() else {
             ensure!(pair.is_none(), Hold::DbUnavailable);
