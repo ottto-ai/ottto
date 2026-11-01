@@ -257,19 +257,21 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
-/// The record map a field's codec reads or writes. A cold usage map keeps its
+/// The record map a field's codec writes. A cold usage map keeps its
 /// families in the store only, so no codec may see it.
 trait Records {
     type Value: Serialize;
     fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
-    fn records_mut(&mut self) -> Option<&mut BTreeMap<String, Self::Value>>;
 }
 impl<T: Serialize> Records for BTreeMap<String, T> {
     type Value = T;
     fn records(&self) -> Option<&Self> {
         Some(self)
     }
-    fn records_mut(&mut self) -> Option<&mut Self> {
+}
+impl<T: Serialize> Records for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn records(&self) -> Option<&BTreeMap<String, Shared<T>>> {
         Some(self)
     }
 }
@@ -277,9 +279,6 @@ impl Records for UsagePending {
     type Value = ClaudeUsageFamilyPending;
     fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
         self.resident()
-    }
-    fn records_mut(&mut self) -> Option<&mut BTreeMap<String, ClaudeUsageFamilyPending>> {
-        self.resident_mut()
     }
 }
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
@@ -1331,9 +1330,11 @@ pub(super) fn post_decode_hydrated(
     // records takes the field before the span and the debt flag after it.
     macro_rules! records {
         ($field:ident) => {
+            records!($field, index.$field)
+        };
+        ($field:ident, $records:expr) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
-                let records = Records::records_mut(&mut index.$field)
-                    .ok_or(Error::Refused("usage pending cold"))?;
+                let records = &mut $records;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
                     records.remove(key);
                 }
@@ -1355,7 +1356,14 @@ pub(super) fn post_decode_hydrated(
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
-    records!(claude_usage_family_pending);
+    // A cold usage map keeps its families in the store; no hold rewrites it.
+    records!(
+        claude_usage_family_pending,
+        *index
+            .claude_usage_family_pending
+            .resident_mut()
+            .ok_or(Error::Refused("usage pending cold"))?
+    );
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
             .original_holds
