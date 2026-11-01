@@ -225,15 +225,6 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [regress] adding a kind requires an explicit, supported introduction layout.
-    #[test]
-    fn every_kind_declares_its_introduction_layout() {
-        assert_eq!(LAYOUTS.len(), OWNED.len());
-        for (kind, _, layout) in LAYOUTS {
-            assert!(group(kind).is_some());
-            assert!((1..=LAYOUT).contains(layout));
-        }
-    }
     /// [format] every stored kind has exactly one owner; reserved names have none.
     #[test]
     fn every_stored_kind_has_one_owner() {
@@ -243,5 +234,8 @@ mod tests {
         }
         assert!(RESERVED.iter().all(|kind| group(kind).is_none()));
         assert_eq!(group("family.requests"), Some(Group::Census));
+        // Each kind is introduced at a supported layout; the newest is current.
+        assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
+        assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
     }
 }

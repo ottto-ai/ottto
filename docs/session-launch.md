@@ -63,9 +63,9 @@ probe at prepare; supported ranges are Claude Code >=2.0 and <3, and Codex
 >=0.150 and <1. Unknown versions refuse with `cli_version_unsupported`.
 The daemon records the version and executable path, dev/ino, size and mtime.
 Any executable change before consume refuses with `cli_changed`.
-Lookup searches the inherited daemon PATH first, then known per-user install
-prefixes; Codex app bundles come last, and Claude Desktop's private binary is
-excluded. The version probe includes the selected install's bin directory in
+Lookup uses agent status's order: Codex app bundles first, then the inherited
+daemon PATH and known per-user install prefixes; Claude Desktop's private binary
+is excluded. The version probe includes the selected install's bin directory in
 PATH so npm/nvm shebang interpreters work under launchd. That exact PATH is also
 applied at exec, with the same selected folder and account environment as the probe.
 

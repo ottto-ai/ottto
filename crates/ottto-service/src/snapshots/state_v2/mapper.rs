@@ -551,11 +551,7 @@ pub(super) fn layout(tx: &mut dyn Transaction) -> Result<u32> {
     let layout = if let Some(h) = recorded {
         serde_json::from_slice::<u32>(&bytes(tx, &h)?)?
     } else {
-        let h = tx
-            .get(&RowKey::Meta("field_presence".into()))?
-            .context("state_v2_misc_missing_control")?;
-        let presence = serde_json::from_slice(&bytes(tx, &h)?)?;
-        catalogue::legacy_layout(&presence)
+        catalogue::legacy_layout(&kinds_misc::read_control("field_presence", tx)?)
     };
     ensure!(layout > 0, "state_v2_catalogue_layout");
     ensure!(layout <= catalogue::LAYOUT, Hold::Future);
