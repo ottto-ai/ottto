@@ -13126,6 +13126,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use tests::claude_money_e2_pipeline_tests::money_equivalence_tests::durable_transition_tests::codex_24b_on_published_state_v2;
+
 #[cfg(test)]
 mod tests {
     use super::*;

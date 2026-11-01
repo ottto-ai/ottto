@@ -1430,10 +1430,9 @@ fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
     codex_24b_old_writer_row(false, false);
 }
 
-/// [money] Codex-ON: the same 24b row with its index published to state v2.
-/// Cold Full, restored Tail and restarted arms emit equal money and placement.
-#[test]
-fn shared_24b_old_writer_on_published_state_v2() {
+/// Codex-ON's 24b row on a published state v2 route; its test lives in
+/// state_v2's codex_on_tests.
+pub(crate) fn codex_24b_on_published_state_v2() {
     if supported("shared_24b_state_v2") {
         codex_24b_old_writer_row(false, true);
     }

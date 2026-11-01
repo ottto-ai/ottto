@@ -208,6 +208,15 @@ fn source_rows_import_hydrate_save_and_key_like_v1() {
     }
 }
 
+/// [money] Codex-ON: the existing 24b Codex transition row with its index
+/// published to state v2. Cold Full, restored Tail and restarted arms emit
+/// equal money and placement.
+#[cfg(unix)]
+#[test]
+fn codex_transition_on_published_state_v2_emits_equal_money_and_placement() {
+    crate::snapshot_sync::codex_24b_on_published_state_v2();
+}
+
 /// [regress] D62: a state v2 reload whose store holds no incarnation mints a
 /// fresh RAM nonce each time, though its fence is unchanged; the path's
 /// first-load flag and seq high-water still come from the memo.
