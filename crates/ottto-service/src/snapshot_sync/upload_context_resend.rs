@@ -126,9 +126,6 @@ impl Cycle {
             .count()
     }
     pub(super) fn emit(&self, source: &str) {
-        #[cfg(test)]
-        LAST_COUNTS.with(|value| value.set((self.counts.entities, self.counts.bytes)));
-
         let held: Vec<_> = self
             .files
             .iter()
@@ -228,10 +225,3 @@ impl SnapshotUploadProgress {
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed, budget_deferred, server_conflicts);
 crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
-
-#[cfg(test)]
-thread_local! { static LAST_COUNTS: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
-#[cfg(test)]
-pub(super) fn last_counts() -> (u64, u64) {
-    LAST_COUNTS.with(std::cell::Cell::get)
-}

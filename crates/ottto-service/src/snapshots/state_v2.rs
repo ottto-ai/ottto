@@ -493,6 +493,7 @@ fn control_name(name: &str) -> bool {
         name,
         "identity"
             | "schema_version"
+            | "catalogue_layout"
             | "generation"
             | "phase"
             | "erasure_success"
@@ -545,7 +546,7 @@ mod money_fault_tests;
 #[cfg(test)]
 pub(super) mod money_test_support;
 // Growth receipts attest confirmed DB custody, independently of the root fence.
-pub(super) use runtime::confirmed_growth_stamp;
+pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 
 pub(super) fn growth_claim_refused(reason: &'static str) {
     telemetry::event("growth_claim_refused", &reason);

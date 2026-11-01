@@ -355,9 +355,6 @@ pub(crate) fn prepare(
     collected_at: &str,
     window_days: u64,
 ) -> Result<Vec<PathBuf>> {
-    if !claude_request_money::e2::resumed_prefix_enabled() {
-        return Ok(Vec::new());
-    }
     let path = support.join("snapshots").join(REQUEST);
     if !path.try_exists()? {
         return Ok(Vec::new());
@@ -532,8 +529,7 @@ pub(super) fn select(
 /// Real changes and independent audit/authority reasons keep their rules.
 pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
     let key = local_index_key(&candidate.path);
-    claude_request_money::e2::resumed_prefix_enabled()
-        && index
+    index
             .claude_money_birth_store
             .money_marks(claude_money_birth_store::location_key(&key))
             & REOWED

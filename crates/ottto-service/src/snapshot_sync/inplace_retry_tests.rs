@@ -208,11 +208,11 @@ fn never_retried_failure(name: &str) -> anyhow::Error {
     match name {
         "400" => anyhow::Error::new(BatchRejected {
             status: 400,
-            body_excerpt: None,
+            snapshot_indexes: None,
         }),
         "422" => anyhow::Error::new(BatchRejected {
             status: 422,
-            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0]}]}"#.into()),
+            snapshot_indexes: None,
         }),
         "401" => anyhow::Error::new(BatchAuthorizationRejected { status: 401 }),
         "403" => anyhow::Error::new(BatchAuthorizationRejected { status: 403 }),
@@ -766,7 +766,7 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
     })
     .unwrap()
     .expect("a due Claude cycle prepares a scan");
-    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
     assert!(!scan.snapshots.is_empty(), "the synthetic session uploads");
     let index_path = preparation.index_path.clone();
     let (result, waits) = with_inplace_retry_test_clock(None, || {
