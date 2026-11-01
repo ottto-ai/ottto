@@ -1455,6 +1455,14 @@ pub struct SnapshotSemanticEnvelope {
     /// bootstrap that admits only an exact repeat or a genuinely missing head.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_head_etag: Option<String>,
+    /// Answer to a head-CAS conflict: the server's opaque challenge plus the
+    /// refused revision v2 hash it binds. Never combined with a base token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_head_challenge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescan_from_revision_hash: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub forced_full_rescan: bool,
 }
 
 #[derive(Serialize)]
@@ -1754,6 +1762,12 @@ pub struct SnapshotItem {
     pub(crate) cache_observations_state: Option<Value>,
     #[serde(skip)]
     pub(crate) cache_base_head_etag: Option<String>,
+    /// Local-only answer to this session's head-CAS conflict: the server's
+    /// opaque challenge and the exact revision v2 hash it was minted over.
+    /// When set, the envelope replaces the stale base with the existing
+    /// rescan handshake. Never part of the snapshot body.
+    #[serde(skip)]
+    pub(crate) cache_conflict_answer: Option<(String, String)>,
     #[serde(skip)]
     pub(crate) cache_requests: Vec<OwnedRequest>,
     #[serde(skip)]
@@ -8248,7 +8262,7 @@ pub(crate) fn apply_upload_policy_with_item_limit(
     }
 }
 
-fn snapshot_item_wire_size(
+pub(crate) fn snapshot_item_wire_size(
     source: SnapshotSource,
     item: &SnapshotItem,
     policy: SnapshotUploadPolicy,
@@ -15545,6 +15559,15 @@ pub(crate) fn snapshot_semantic_envelope(
     upload_policy: SnapshotUploadPolicy,
 ) -> SnapshotSemanticEnvelope {
     let component_hashes = snapshot_semantic_component_hashes(source, item);
+    // The backend refuses a base token combined with a challenge; the answer
+    // replaces the stale base rather than adding to it.
+    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash) =
+        match &item.cache_conflict_answer {
+            Some((challenge, stale_revision)) => {
+                (None, Some(challenge.clone()), Some(stale_revision.clone()))
+            }
+            None => (item.cache_base_head_etag.clone(), None, None),
+        };
     SnapshotSemanticEnvelope {
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
@@ -15557,7 +15580,10 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_v2_hash: snapshot_revision_v2_hash(source, item, upload_policy, &component_hashes),
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
-        base_head_etag: item.cache_base_head_etag.clone(),
+        base_head_etag,
+        forced_full_rescan: conflict_head_challenge.is_some(),
+        conflict_head_challenge,
+        rescan_from_revision_hash,
         component_hashes,
     }
 }
@@ -21138,6 +21164,7 @@ impl SnapshotAccumulator {
             cache_observations: self.cache_observations,
             cache_observations_state: None,
             cache_base_head_etag: None,
+            cache_conflict_answer: None,
             cache_requests: self.cache_requests.into_vec(),
             cache_requests_complete: self.cache_requests_complete,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
@@ -34384,6 +34411,7 @@ fn codex_state_only_snapshot(
         cache_observations: None,
         cache_observations_state: None,
         cache_base_head_etag: None,
+        cache_conflict_answer: None,
         cache_requests: Vec::new(),
         cache_requests_complete: true,
         avg_duration_ms: None,
@@ -62020,6 +62048,7 @@ mod tests {
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,
+            cache_conflict_answer: None,
             cache_requests: Vec::new(),
             cache_requests_complete: true,
             avg_duration_ms: None,
@@ -70833,6 +70862,7 @@ mod tests {
         };
         let response = |version: Option<u64>, digest: Option<String>| {
             crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
                 accepted: 1,
                 sessions_reconciled: 0,
                 session_ids: Vec::new(),
@@ -70856,6 +70886,7 @@ mod tests {
             }
         };
         let legacy = crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 0,
             session_ids: Vec::new(),
@@ -70905,6 +70936,7 @@ mod tests {
             ..request
         };
         let exclusive_response = |version| crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 0,
             session_ids: Vec::new(),
@@ -71363,6 +71395,7 @@ mod tests {
                                 retained_proof_missing: Vec::new(),
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
+                                conflict_rescans: Default::default(),
                                 accepted: 1,
                                 sessions_reconciled: 0,
                                 session_ids: vec![],
@@ -72732,6 +72765,7 @@ mod tests {
                                 retained_proof_missing: Vec::new(),
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
+                                conflict_rescans: Default::default(),
                                 accepted: 1,
                                 sessions_reconciled: 0,
                                 session_ids: vec![],
@@ -79664,6 +79698,7 @@ mod tests {
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,
+            cache_conflict_answer: None,
             cache_requests: Vec::new(),
             cache_requests_complete: true,
             avg_duration_ms: None,
@@ -81244,6 +81279,7 @@ mod tests {
         assert!(!body.contains("creator_user_id"));
         assert!(!body.contains("creator_account_id"));
         let response = |version, digest| crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 0,
             session_ids: vec![],
@@ -81397,6 +81433,7 @@ mod tests {
                 cache_observations: None,
                 cache_observations_state: None,
                 cache_base_head_etag: None,
+                cache_conflict_answer: None,
                 cache_requests: Vec::new(),
                 cache_requests_complete: true,
                 avg_duration_ms: None,
@@ -83767,7 +83804,7 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
+crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);

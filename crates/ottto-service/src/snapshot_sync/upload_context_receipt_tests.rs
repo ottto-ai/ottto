@@ -19,6 +19,7 @@ pub(crate) fn exact_acks(
         snapshot_upload_body_witness,
         |batch| {
             let response = crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
                 accepted: batch.len() as u64,
                 sessions_reconciled: batch.len() as u64,
                 session_ids: Vec::new(),
@@ -145,6 +146,7 @@ fn upload_context_receipt_count_only_ack_refused() {
         |_| "c".repeat(64),
         |_| {
             Ok(crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
                 accepted: 1,
                 sessions_reconciled: 1,
                 session_ids: Vec::new(),
@@ -470,6 +472,7 @@ impl Uploader {
                         })
                         .collect::<Vec<_>>();
                 let response = crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: if refuse { 0 } else { batch.len() as u64 },
                     sessions_reconciled: batch.len() as u64,
                     session_ids: Vec::new(),
