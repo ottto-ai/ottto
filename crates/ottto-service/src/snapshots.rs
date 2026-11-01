@@ -50,6 +50,7 @@ macro_rules! discovery_retention {
 }
 
 pub(crate) mod account_pending_retention;
+use account_pending_retention::ArchivedWindows;
 pub(crate) mod cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
@@ -5086,8 +5087,8 @@ struct ClaudeAccountFamilyPending {
     #[serde(flatten)]
     current: ClaudeAccountFamilyPendingWindow,
     /// Windows are retired only by save after newer identity bodies settle.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    previous_windows: Vec<ClaudeAccountFamilyPendingWindow>,
+    #[serde(default, skip_serializing_if = "ArchivedWindows::is_empty_resident")]
+    previous_windows: ArchivedWindows,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     confirmed_absent_members: BTreeSet<String>,
 }
@@ -5098,7 +5099,7 @@ impl From<ClaudeAccountFamilyPendingWire> for ClaudeAccountFamilyPending {
         let confirmed_absent_members = std::mem::take(&mut wire.confirmed_absent_members);
         Self {
             current: wire.into(),
-            previous_windows,
+            previous_windows: ArchivedWindows::Resident(previous_windows),
             confirmed_absent_members,
         }
     }
@@ -13567,20 +13568,14 @@ fn accumulate_claude_family_pending(
             .entry(root_session_id.clone())
             .or_insert_with(|| ClaudeAccountFamilyPending {
                 current: fresh(),
-                previous_windows: Vec::new(),
+                previous_windows: ArchivedWindows::default(),
                 confirmed_absent_members: BTreeSet::new(),
             });
         if pending.census_window_end != census_window_end {
             // Even withheld/RetryPending windows survive a restart. Only a
             // later accepted identity may retire them, never census completion.
             let old = std::mem::replace(&mut pending.current, fresh());
-            if retain_strict_runs {
-                pending.retain_previous_window(old);
-            } else {
-                // Opaque evidence is funded by the whole encoded index. Keep
-                // its historical byte allowance until the hold is resolved.
-                pending.previous_windows.push(old);
-            }
+            pending.archive(old, retain_strict_runs);
         } else if pending.account_identifier_hash != account_hash
             || pending.evidence_request_count != evidence_request_count
         {
@@ -67235,7 +67230,7 @@ mod tests {
         );
         assert_eq!(
             index.claude_account_family_pending[&root].previous_windows,
-            vec![old.clone()]
+            ArchivedWindows::Resident(vec![old.clone()])
         );
         let path = dir.join("held-index.json");
         index.save(&path).unwrap();
@@ -67243,7 +67238,7 @@ mod tests {
             lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code").unwrap();
         assert_eq!(
             reloaded.claude_account_family_pending[&root].previous_windows,
-            vec![old]
+            ArchivedWindows::Resident(vec![old])
         );
         apply_claude_effort_evidence_with_index(
             &mut items[1..].to_vec(),
@@ -67307,6 +67302,7 @@ mod tests {
             assert_eq!(
                 partial.claude_account_family_pending[&root]
                     .previous_windows
+                    .resident()
                     .len(),
                 1
             );
@@ -67319,6 +67315,7 @@ mod tests {
             assert_eq!(
                 held.claude_account_family_pending[&root]
                     .previous_windows
+                    .resident()
                     .len(),
                 1,
                 "{blocker}"
@@ -67362,8 +67359,8 @@ mod tests {
         d2_finalize_identity_revisions(&mut index);
         let pending = &index.claude_account_family_pending[&root];
         assert!(pending.census_complete);
-        assert_eq!(pending.previous_windows.len(), 1);
-        assert!(!pending.previous_windows[0].census_complete);
+        assert_eq!(pending.previous_windows.resident().len(), 1);
+        assert!(!pending.previous_windows.resident()[0].census_complete);
         // Positive O1 control: old completion is unnecessary once every newest
         // exact identity is committed and the current census completed.
         let mut committed = index.clone();
@@ -67472,6 +67469,7 @@ mod tests {
             assert_eq!(
                 loaded.claude_account_family_pending[&root]
                     .previous_windows
+                    .resident()
                     .len(),
                 1
             );
@@ -67522,7 +67520,7 @@ mod tests {
         let pending = &index.claude_account_family_pending[&root];
         assert!(!pending.invalid, "the evidence itself is consistent");
         assert!(!pending.census_complete, "no census credit");
-        assert!(pending.previous_windows.is_empty());
+        assert!(pending.previous_windows.resident().is_empty());
         assert!(
             claude_pending_family_session_ids(&index).contains(&root),
             "custody is retained and counted"
@@ -67643,6 +67641,7 @@ mod tests {
         assert_eq!(
             index.claude_account_family_pending[&root]
                 .previous_windows
+                .resident()
                 .len(),
             1
         );
@@ -67815,6 +67814,7 @@ mod tests {
         assert_eq!(
             index.claude_account_family_pending[&root]
                 .previous_windows
+                .resident()
                 .len(),
             1
         );
@@ -67886,6 +67886,7 @@ mod tests {
             assert_eq!(
                 loaded.claude_account_family_pending[&root]
                     .previous_windows
+                    .resident()
                     .len(),
                 1
             );

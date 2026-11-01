@@ -4,6 +4,7 @@ use super::{
     rfc3339_unix_seconds, ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow,
     ClaudeAccountRequestSet, ScanIndex,
 };
+use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -79,34 +80,231 @@ impl ClaudeAccountFamilyPendingWindow {
     }
 }
 
+/// A family's archived windows. v1, import, raw holds and CAS custody keep
+/// them `Resident`. A complete v2 hydrate without raw holds keeps them `Cold`:
+/// the rows stay in the store and RAM keeps their summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ArchivedWindows {
+    Resident(Vec<ClaudeAccountFamilyPendingWindow>),
+    Cold(Box<ColdWindows>),
+}
+impl Default for ArchivedWindows {
+    fn default() -> Self {
+        Self::Resident(Vec::new())
+    }
+}
+impl Serialize for ArchivedWindows {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Resident(windows) => windows.serialize(serializer),
+            // Only the store holds these windows. An image without them would
+            // drop their custody, so no encoder may write one.
+            Self::Cold(_) => Err(serde::ser::Error::custom("account_windows_cold")),
+        }
+    }
+}
+impl HeapLayoutBound for ArchivedWindows {
+    fn stable_heap(&self) -> bool {
+        match self {
+            Self::Resident(windows) => windows.stable_heap(),
+            Self::Cold(cold) => cold.stable_heap(),
+        }
+    }
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        match self {
+            Self::Resident(windows) => windows.heap_bound(c),
+            Self::Cold(cold) => cold.heap_bound(c),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        match self {
+            Self::Resident(windows) => windows.completed_heap_bound(c),
+            Self::Cold(cold) => cold.completed_heap_bound(c),
+        }
+    }
+}
+impl ArchivedWindows {
+    #[cfg(test)]
+    pub(super) fn resident(&self) -> &Vec<ClaudeAccountFamilyPendingWindow> {
+        match self {
+            Self::Resident(windows) => windows,
+            Self::Cold(_) => panic!("account_windows_cold"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_mut(&mut self) -> &mut Vec<ClaudeAccountFamilyPendingWindow> {
+        match self {
+            Self::Resident(windows) => windows,
+            Self::Cold(_) => panic!("account_windows_cold"),
+        }
+    }
+
+    pub(super) fn is_empty_resident(&self) -> bool {
+        matches!(self, Self::Resident(windows) if windows.is_empty())
+    }
+
+    /// Interior windows of equal-evidence runs left in the store: the v1
+    /// load walk would collapse them, a cold archive is never walked.
+    pub(super) fn uncollapsed(&self) -> usize {
+        match self {
+            Self::Resident(_) => 0,
+            Self::Cold(cold) => cold.uncollapsed,
+        }
+    }
+
+    /// After a committed save the store holds the replayed archive.
+    pub(super) fn saved(&mut self, archived: &[u64]) {
+        match self {
+            Self::Resident(_) => {}
+            Self::Cold(cold) => {
+                cold.stored = archived.len();
+                cold.last_id = archived.last().copied();
+                cold.rolled = Vec::new();
+            }
+        }
+    }
+}
+
+/// The summary of a family's stored archive, which rows it is (ids are never
+/// reused, so the count and last id identify it) and the windows rolled
+/// since, which the next save replays over the stored tail.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(super) struct ColdWindows {
+    summary: HistorySummary,
+    stored: usize,
+    last_id: Option<u64>,
+    uncollapsed: usize,
+    rolled: Vec<Rolled>,
+}
+crate::heap_layout_bound::fields!(ColdWindows; summary, stored, last_id, uncollapsed, rolled);
+impl std::fmt::Debug for ColdWindows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColdWindows")
+            .field("stored", &self.stored)
+            .field("rolled", &self.rolled.len())
+            .finish_non_exhaustive()
+    }
+}
+/// One rollover under a cold archive, with the arguments the resident
+/// archive would have applied it with.
+#[derive(Clone, PartialEq, Eq)]
+struct Rolled {
+    window: ClaudeAccountFamilyPendingWindow,
+    strict: bool,
+    current_end: String,
+}
+crate::heap_layout_bound::fields!(Rolled; window, strict, current_end);
+impl ColdWindows {
+    /// Stored archived rows and the last one's id.
+    pub(super) fn base(&self) -> (usize, Option<u64>) {
+        (self.stored, self.last_id)
+    }
+
+    pub(super) fn has_rolled(&self) -> bool {
+        !self.rolled.is_empty()
+    }
+
+    /// `tail` is the stored archive's last (at most two) windows, oldest
+    /// first. The endpoint rule reads only those, so the result ends exactly
+    /// as the resident archive would after the same rollovers.
+    pub(super) fn replay(
+        &self,
+        mut tail: Vec<ClaudeAccountFamilyPendingWindow>,
+    ) -> Vec<ClaudeAccountFamilyPendingWindow> {
+        for rolled in &self.rolled {
+            let window = rolled.window.clone();
+            if rolled.strict {
+                retain_run_endpoint(&mut tail, window, &rolled.current_end);
+            } else {
+                tail.push(window);
+            }
+        }
+        tail
+    }
+}
+/// Streams one family's stored archive, oldest first, into a cold archive.
+/// Only the previous window is held, to count equal-evidence runs.
+#[derive(Default)]
+pub(super) struct ColdFold {
+    cold: ColdWindows,
+    last: Option<ClaudeAccountFamilyPendingWindow>,
+    run: usize,
+}
+impl ColdFold {
+    pub(super) fn push(&mut self, window: ClaudeAccountFamilyPendingWindow) {
+        self.cold.summary.fold(&window);
+        self.cold.stored += 1;
+        let same = self
+            .last
+            .as_ref()
+            .is_some_and(|last| last.strict_evidence() == window.strict_evidence());
+        self.run = if same { self.run + 1 } else { 1 };
+        if self.run > 2 {
+            self.cold.uncollapsed += 1;
+        }
+        self.last = Some(window);
+    }
+
+    pub(super) fn finish(self, last_id: Option<u64>) -> ArchivedWindows {
+        ArchivedWindows::Cold(Box::new(ColdWindows {
+            last_id,
+            ..self.cold
+        }))
+    }
+}
+
 impl ClaudeAccountFamilyPending {
     pub(super) fn has_history(&self) -> bool {
-        !self.previous_windows.is_empty()
+        match &self.previous_windows {
+            ArchivedWindows::Resident(windows) => !windows.is_empty(),
+            ArchivedWindows::Cold(cold) => cold.stored != 0 || cold.has_rolled(),
+        }
     }
 
     pub(super) fn history_summary(&self) -> HistorySummary {
-        HistorySummary::from_windows(&self.previous_windows)
+        match &self.previous_windows {
+            ArchivedWindows::Resident(windows) => HistorySummary::from_windows(windows),
+            ArchivedWindows::Cold(cold) => cold.summary.clone(),
+        }
     }
 
-    pub(super) fn retain_previous_window(&mut self, old: ClaudeAccountFamilyPendingWindow) {
-        retain_run_endpoint(
-            &mut self.previous_windows,
-            old,
-            &self.current.census_window_end,
-        );
+    /// Archive the replaced current window. Strict archives keep only the
+    /// endpoints of equal runs; opaque evidence is funded by the whole
+    /// encoded index, so it keeps every window until the hold resolves. A
+    /// cold archive folds the window now and queues it for the next save.
+    pub(super) fn archive(&mut self, old: ClaudeAccountFamilyPendingWindow, strict: bool) {
+        let current_end = &self.current.census_window_end;
+        match &mut self.previous_windows {
+            ArchivedWindows::Resident(windows) if strict => {
+                retain_run_endpoint(windows, old, current_end)
+            }
+            ArchivedWindows::Resident(windows) => windows.push(old),
+            ArchivedWindows::Cold(cold) => {
+                cold.summary.fold(&old);
+                cold.rolled.push(Rolled {
+                    window: old,
+                    strict,
+                    current_end: current_end.clone(),
+                });
+            }
+        }
     }
 
     fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
-        if HistorySummary::from_windows(&self.previous_windows)
-            != HistorySummary::from_windows(retained.iter().map(|&i| &self.previous_windows[i]))
+        let ArchivedWindows::Resident(windows) = &mut self.previous_windows else {
+            return None;
+        };
+        if HistorySummary::from_windows(&*windows)
+            != HistorySummary::from_windows(retained.iter().map(|&i| &windows[i]))
         {
             return None;
         }
-        let removed = self.previous_windows.len() - retained.len();
+        let removed = windows.len() - retained.len();
         if removed != 0 {
             let mut retained = retained.into_iter().peekable();
             let mut position = 0;
-            self.previous_windows.retain(|_| {
+            windows.retain(|_| {
                 let keep = retained.peek() == Some(&position);
                 if keep {
                     retained.next();
@@ -121,9 +319,12 @@ impl ClaudeAccountFamilyPending {
     /// Validate before proposing any removal. Unsafe histories stay byte-for-
     /// byte equivalent in RAM; in particular no malformed boundary disappears.
     fn collapse_plan(&self) -> Option<Vec<usize>> {
+        let ArchivedWindows::Resident(windows) = &self.previous_windows else {
+            return None;
+        };
         let current = rfc3339_unix_seconds(&self.census_window_end)?;
         let mut previous = None;
-        for window in &self.previous_windows {
+        for window in windows {
             let time = rfc3339_unix_seconds(&window.census_window_end)?;
             if time >= current || previous.is_some_and(|previous| time <= previous) {
                 return None;
@@ -132,12 +333,11 @@ impl ClaudeAccountFamilyPending {
         }
         let mut retained = Vec::new();
         let mut read = 0;
-        while read < self.previous_windows.len() {
+        while read < windows.len() {
             let start = read;
             read += 1;
-            while read < self.previous_windows.len()
-                && self.previous_windows[start].strict_evidence()
-                    == self.previous_windows[read].strict_evidence()
+            while read < windows.len()
+                && windows[start].strict_evidence() == windows[read].strict_evidence()
             {
                 read += 1;
             }
@@ -186,12 +386,13 @@ fn retain_run_endpoint(
 /// boundary/account/invalid/revision (first wins on ties). Retirement reads it
 /// with the current window; the load self-check compares it alone.
 /// Current-window gates and family-level holds are untouched.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct HistorySummary {
     newest_boundary: Option<u64>,
     unparsable: bool,
     latest: BTreeMap<String, Latest>,
 }
+crate::heap_layout_bound::fields!(HistorySummary; newest_boundary, unparsable, latest);
 /// A member's winning (boundary, account, invalid, revision).
 pub(super) type Latest = (u64, String, bool, Option<String>);
 impl HistorySummary {
@@ -275,10 +476,16 @@ impl ScanIndex {
         // compact an index containing opaque holds, even in unrelated roots.
         let opaque_holds = !self.decode_holds.is_empty();
         for pending in self.claude_account_family_pending.values_mut() {
-            let before = window_bytes(&pending.previous_windows);
+            // A cold archive is not loaded: v2 replays the endpoint rule at
+            // save.
+            let ArchivedWindows::Resident(windows) = &pending.previous_windows else {
+                continue;
+            };
+            let empty = windows.is_empty();
+            let before = window_bytes(windows);
             counts.window_bytes_before = counts.window_bytes_before.saturating_add(before);
             let mut after = before;
-            let plan = if opaque_holds && !pending.previous_windows.is_empty() {
+            let plan = if opaque_holds && !empty {
                 None
             } else {
                 pending.collapse_plan()
@@ -292,7 +499,10 @@ impl ScanIndex {
                         None => counts.roots_refused = counts.roots_refused.saturating_add(1),
                         Some(0) => {}
                         Some(removed) => {
-                            after = window_bytes(&pending.previous_windows);
+                            after = match &pending.previous_windows {
+                                ArchivedWindows::Resident(windows) => window_bytes(windows),
+                                ArchivedWindows::Cold(_) => before,
+                            };
                             counts.roots_collapsed = counts.roots_collapsed.saturating_add(1);
                             counts.windows_collapsed =
                                 counts.windows_collapsed.saturating_add(removed as u64);
@@ -328,11 +538,11 @@ mod tests {
         };
         let mut pending = ClaudeAccountFamilyPending {
             current: window(3, "current"),
-            previous_windows: vec![
+            previous_windows: ArchivedWindows::Resident(vec![
                 window(0, "historical"),
                 window(1, "historical"),
                 window(2, "historical"),
-            ],
+            ]),
             confirmed_absent_members: BTreeSet::new(),
         };
         let before = serde_json::to_vec(&pending).unwrap();
