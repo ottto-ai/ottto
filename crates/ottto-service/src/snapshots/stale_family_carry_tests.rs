@@ -5016,3 +5016,140 @@ fn owed_evidence_drop_keeps_unserved_due_service_once() {
         CARRY_RETRY
     ));
 }
+
+const CARRY_SHARER: &str = "d4444444-4444-4444-8444-444444444444";
+
+/// Add `hash` to one member's pending requests and occurrences; a witnessed
+/// family's witness follows, so the family still matches it.
+fn carry_add_request(index: &mut ScanIndex, root: &str, member: &str, hash: &str) {
+    let pending = index.claude_usage_family_pending.get_mut(root).unwrap();
+    let hashes = pending.member_request_id_hashes.get_mut(member).unwrap();
+    hashes.insert(hash.to_string());
+    let hashes = hashes.clone();
+    let occurrences = pending.member_occurrences.get_mut(member).unwrap();
+    occurrences.insert(hash.to_string(), carry_occurrence(9, 10));
+    let occurrences = occurrences.clone();
+    if let Some(witness) = index.claude_usage_family_witnesses.get_mut(root) {
+        witness.member_request_id_fingerprints.insert(
+            member.to_string(),
+            claude_request_id_set_fingerprint(&hashes),
+        );
+        witness.member_occurrence_fingerprints.insert(
+            member.to_string(),
+            claude_occurrence_map_fingerprint(&occurrences),
+        );
+    }
+}
+
+/// The failed window plus a second witnessed family, rooted after the first
+/// in root order. `shared`: the root's first request is also read in the
+/// second family, and another request is read by both of the root's own
+/// members.
+fn carry_shared_index(shared: bool) -> ScanIndex {
+    let mut index = carry_index();
+    carry_family(&mut index, CARRY_SHARER, &[None], true);
+    if shared {
+        let root = carry_member(CARRY_ROOT, None);
+        let agent = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+        let first = index.claude_usage_family_pending[CARRY_ROOT].member_request_id_hashes[&root]
+            .first()
+            .unwrap()
+            .clone();
+        carry_add_request(&mut index, CARRY_SHARER, CARRY_SHARER, &first);
+        let own = "e".repeat(64);
+        carry_add_request(&mut index, CARRY_ROOT, &root, &own);
+        carry_add_request(&mut index, CARRY_ROOT, &agent, &own);
+    }
+    index
+}
+
+/// [money] R2, the shared-owner tie-breaks as on main: a request read in two
+/// carried families is owned by the later root in root order, so only that
+/// owner keeps its re-arm; a request read twice inside one family names no
+/// other owner. Control: without them both witnessed families are carried.
+#[test]
+fn stale_carry_shared_request_is_owned_by_the_later_carried_root() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let carried = |shared: bool| {
+        let mut index = carry_shared_index(shared);
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        index.claude_stale_family_carry.roots
+    };
+    assert_eq!(
+        carried(false),
+        BTreeSet::from([CARRY_ROOT.to_string(), CARRY_SHARER.to_string()])
+    );
+    assert_eq!(carried(true), BTreeSet::from([CARRY_ROOT.to_string()]));
+}
+
+/// [money] R3 and R1 under state v2, on the same failed window published
+/// cold: the streamed two-pass join carries and compacts exactly what the
+/// resident graph and a whole-kind load (M2a's join) do, whether the pass
+/// holds no family or the sharer first, and keeps no family it does not
+/// carry. A row gone from the store defers the start, counted: nothing
+/// carried, no fingerprint cleared, no family compacted.
+#[test]
+fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
+    use state_v2::money_test_support as v2;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let dir = crate::test_scratch::canonical_private_dir("stale-carry-cold");
+    let (custody, cold) = v2::ColdSession::publish(&carry_shared_index(true), &dir);
+    assert!(cold
+        .claude_usage_family_pending
+        .family(CARRY_SHARER)
+        .is_err());
+    let start = |mut index: ScanIndex| {
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        index
+    };
+    let outcome = |index: &ScanIndex| {
+        let view = v2::resident(index);
+        (
+            format!("{:?}", view.claude_stale_family_carry),
+            serde_json::to_value(&view.files).unwrap(),
+            serde_json::to_value(&view.claude_usage_family_pending).unwrap(),
+        )
+    };
+    let resident = start(v2::resident(&cold));
+    assert_eq!(
+        resident.claude_stale_family_carry.roots,
+        BTreeSet::from([CARRY_ROOT.to_string()])
+    );
+    let expected = outcome(&resident);
+    let mut whole = cold.clone();
+    state_v2::load_usage(&mut whole, None).unwrap();
+    assert_eq!(outcome(&start(whole)), expected, "whole-kind load");
+    let streamed = start(cold.clone());
+    assert_eq!(outcome(&streamed), expected, "streamed");
+    assert!(v2::usage_head_only(&streamed, CARRY_SHARER));
+    assert!(v2::usage_loaded(&streamed, CARRY_ROOT), "compacted");
+    let mut held = cold.clone();
+    state_v2::load_usage(&mut held, Some(&BTreeSet::from([CARRY_SHARER.to_string()]))).unwrap();
+    assert_eq!(outcome(&start(held)), expected, "sharer held first");
+
+    let mut gone = cold.clone();
+    v2::delete_usage_row_in_session(&gone, CARRY_SHARER);
+    let before = v2::usage_unknown_count();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut gone,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert!(v2::usage_unknown_count() > before, "counted");
+    assert!(gone.claude_stale_family_carry.roots.is_empty());
+    for key in carry_family_keys() {
+        assert_eq!(
+            gone.files[&key].source_file_fingerprint,
+            cold.files[&key].source_file_fingerprint
+        );
+    }
+    assert!(v2::usage_head_only(&gone, CARRY_ROOT), "nothing compacted");
+    drop(custody);
+    let _ = std::fs::remove_dir_all(dir);
+}
