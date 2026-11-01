@@ -48,6 +48,10 @@ pub(crate) enum ClaudeSpawnRefusal {
     RefreshInProgress,
     #[cfg(unix)]
     CleanupPending,
+    /// A background run would use the default `~/.claude` home (or an empty
+    /// config dir), which other Claude writers share. Ottto never starts
+    /// Claude Code there on its own.
+    DefaultHome,
 }
 
 impl ClaudeSpawnRefusal {
@@ -59,6 +63,7 @@ impl ClaudeSpawnRefusal {
             Self::RefreshInProgress => "refresh_in_progress",
             #[cfg(unix)]
             Self::CleanupPending => "cleanup_pending",
+            Self::DefaultHome => "default_home",
         }
     }
 
@@ -134,6 +139,30 @@ pub(crate) fn check_short_claude_run(slot: &ClaudeConfigDirSlot) -> Result<(), C
         );
     }
     decision
+}
+
+/// Every Claude Code run Ottto starts on its own (refresh, `/context`, MCP
+/// inventory) needs an explicit, non-empty registered config dir. The default
+/// home is refused, counted, and never used as a fallback; a person's own
+/// action on the default home (Verify) does not ask this.
+pub(crate) fn require_explicit_claude_home(
+    slot: &ClaudeConfigDirSlot,
+) -> Result<(), ClaudeSpawnRefusal> {
+    if slot.config_dir().is_some_and(|dir| !dir.is_empty()) {
+        return Ok(());
+    }
+    static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let refused = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!("claude_background_run decision=refused reason=default_home refused_total={refused}");
+    Err(ClaudeSpawnRefusal::DefaultHome)
+}
+
+/// [`require_explicit_claude_home`], then the quiet window.
+pub(crate) fn check_background_claude_run(
+    slot: &ClaudeConfigDirSlot,
+) -> Result<(), ClaudeSpawnRefusal> {
+    require_explicit_claude_home(slot)?;
+    check_short_claude_run(slot)
 }
 
 /// Claude Code's own refresh window: it refreshes when the access token
@@ -242,16 +271,32 @@ pub(crate) fn stop_claude_child(
     true
 }
 
+/// Environment that points Claude Code at another credential store or login
+/// than the pinned config dir: the secure-storage selector, and the
+/// host-owned token and account a Claude Desktop session passes its children.
+const CLAUDE_LOGIN_REDIRECT_ENV: &[&str] = &[
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+    "CLAUDE_CODE_ACCOUNT_UUID",
+    "CLAUDE_CODE_ORGANIZATION_UUID",
+    "CLAUDE_CODE_USER_EMAIL",
+];
+
 /// Pin a short Claude run to the login the gate evaluated: `CLAUDE_CONFIG_DIR`
-/// set to that login's config dir (unset for the default login), and no
-/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which would select another keychain
-/// item.
+/// set to that login's config dir (unset for the default login), and none of
+/// [`CLAUDE_LOGIN_REDIRECT_ENV`], which would select another keychain item or
+/// login.
 pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &ClaudeConfigDirSlot) {
     match slot.config_dir() {
         Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),
         None => command.env_remove("CLAUDE_CONFIG_DIR"),
     };
-    command.env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    for name in CLAUDE_LOGIN_REDIRECT_ENV {
+        command.env_remove(name);
+    }
 }
 
 /// The directory holding this login's refresh lock (its config dir;
@@ -1279,16 +1324,21 @@ mod tests {
         }
     }
 
+    /// [behaviour] Short runs are pinned to the evaluated login with every
+    /// credential redirect cleared, and a background run (refresh, probe)
+    /// never starts on the default home.
     #[test]
     fn short_runs_are_pinned_to_the_evaluated_login() {
+        assert_eq!(
+            check_background_claude_run(&ClaudeConfigDirSlot::Default),
+            Err(ClaudeSpawnRefusal::DefaultHome)
+        );
         let run = |slot: &ClaudeConfigDirSlot| {
             let mut command = std::process::Command::new("/usr/bin/env");
-            command
-                .env("CLAUDE_CONFIG_DIR", "/tmp/ottto-ambient-slot")
-                .env(
-                    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-                    "/tmp/ottto-ambient-store",
-                );
+            command.env("CLAUDE_CONFIG_DIR", "/tmp/ottto-ambient-slot");
+            for name in CLAUDE_LOGIN_REDIRECT_ENV {
+                command.env(name, "/tmp/ottto-ambient-store");
+            }
             pin_claude_login(&mut command, slot);
             String::from_utf8(command.output().expect("env").stdout).expect("utf8")
         };
@@ -1300,7 +1350,9 @@ mod tests {
         assert!(registered
             .lines()
             .any(|line| line == "CLAUDE_CONFIG_DIR=/tmp/ottto-evaluated-slot"));
-        assert!(!registered.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR="));
+        for name in CLAUDE_LOGIN_REDIRECT_ENV {
+            assert!(!registered.contains(&format!("{name}=")), "{name}");
+        }
     }
 
     #[test]

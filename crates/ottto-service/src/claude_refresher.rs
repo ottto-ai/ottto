@@ -191,13 +191,17 @@ pub(crate) fn judge_refresh(
 }
 
 /// Decide for one login and, when due, start its refresher. `slot_id` is the
-/// daemon's opaque slot id (`default` for the default login).
+/// daemon's opaque slot id. The default home is never refreshed: Ottto
+/// starts no background Claude run there.
 pub(crate) fn maybe_refresh(
     slot_id: &str,
     slot: &ClaudeConfigDirSlot,
     live: &ClaudeLiveLogin,
     enabled: bool,
 ) -> RefreshDecision {
+    if crate::claude_spawn_gate::require_explicit_claude_home(slot).is_err() {
+        return RefreshDecision::NotNeeded;
+    }
     maybe_refresh_with(
         slot_id,
         slot,

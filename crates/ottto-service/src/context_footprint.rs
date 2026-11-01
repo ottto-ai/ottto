@@ -539,10 +539,10 @@ fn run_claude_context(
     env: &SpawnEnv,
     include_mcp_servers: bool,
 ) -> Result<String> {
-    // Quiet window: never start Claude Code from 15 minutes before the
-    // default login's access expiry until the refresher confirmed a new one.
+    // A background run never starts on the default home (other Claude
+    // writers share it), and never inside a login's quiet window.
     let login = ottto_core::ClaudeConfigDirSlot::Default;
-    crate::claude_spawn_gate::check_short_claude_run(&login)
+    crate::claude_spawn_gate::check_background_claude_run(&login)
         .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
     let mut command = env.claude_command()?;
     crate::claude_spawn_gate::pin_claude_login(&mut command, &login);
@@ -2067,11 +2067,11 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The `/context` read runs an hour before expiry and is refused ten
-    /// minutes before it (never started), with a 30-minute retry.
+    /// [behaviour] The `/context` read is a background run on the default
+    /// home: refused even an hour before expiry, never started, not logged.
     #[test]
     #[serial_test::serial]
-    fn context_run_waits_inside_the_quiet_window() {
+    fn context_run_never_starts_on_the_default_home() {
         use crate::provider_calls::CallKind;
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("context");
         let account = fake.default_account("context-account-uuid");
@@ -2081,24 +2081,11 @@ mod tests {
             provider: BTreeMap::new(),
         };
         fake.default_login_expires_in(time::Duration::hours(1));
-        run_claude_context(&workspace, &env, false).expect("admitted an hour out");
-        assert_eq!(fake.spawns().len(), 1);
-        fake.default_login_expires_in(time::Duration::minutes(10));
         let error = run_claude_context(&workspace, &env, false).expect_err("refused");
         assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
-        assert_eq!(fake.spawns().len(), 1, "the refused run never started");
-        // The started run is logged as a possible Anthropic contact (at
-        // least zero requests); the refused one is not logged.
-        let lines = crate::provider_calls::test_lines(CallKind::ClaudeContextProbe, &account);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(
-            (
-                lines[0].provider.as_str(),
-                lines[0].trigger.as_str(),
-                lines[0].result.as_str(),
-                lines[0].requests_at_least
-            ),
-            ("anthropic", "schedule", "ok", 0)
+        assert!(fake.spawns().is_empty(), "the refused run never started");
+        assert!(
+            crate::provider_calls::test_lines(CallKind::ClaudeContextProbe, &account).is_empty()
         );
         assert_eq!(next_context_cycle_delay(true), Duration::from_secs(30 * 60));
         let _ = fs::remove_dir_all(workspace);

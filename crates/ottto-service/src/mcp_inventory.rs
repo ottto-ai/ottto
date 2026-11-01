@@ -1407,7 +1407,7 @@ fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput,
                         return (unreachable_server(server), true);
                     }
                     Some(Ok(slot)) => {
-                        if crate::claude_spawn_gate::check_short_claude_run(&slot).is_err() {
+                        if crate::claude_spawn_gate::check_background_claude_run(&slot).is_err() {
                             eprintln!("mcp_harvest claude_server=deferred reason=quiet_window");
                             return (unreachable_server(server), true);
                         }
@@ -3683,11 +3683,11 @@ done
         );
     }
 
-    /// Fake `claude` and fake keychain only: a Claude Code server is not
-    /// started inside its login's quiet window, and is started outside it.
+    /// Fake `claude` and fake keychain only: a Claude Code server on the
+    /// default home is never started, inside its quiet window or outside it.
     #[test]
     #[serial_test::serial]
-    fn a_claude_code_server_is_not_started_inside_its_logins_quiet_window() {
+    fn a_claude_code_server_is_never_started_on_the_default_home() {
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp");
         let server = ConfiguredServer {
             name: "claude-self".to_string(),
@@ -3713,8 +3713,11 @@ done
 
         fake.default_login_expires_in(time::Duration::hours(3));
         let (_, deferred) = harvest_server(&server, &env);
-        assert!(!deferred);
-        assert_eq!(fake.spawns(), vec!["|mcp serve".to_string()]);
+        assert!(deferred);
+        assert!(
+            fake.spawns().is_empty(),
+            "never started on the default home"
+        );
     }
 
     #[test]
