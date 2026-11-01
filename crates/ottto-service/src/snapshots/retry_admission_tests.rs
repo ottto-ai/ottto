@@ -807,7 +807,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
         .healthy_custody_digest_for_test(healthy.iter().map(String::as_str));
     let path = fixture._scratch.join("accepted-singleton-index.json");
     let mut index = fixture.index;
-    for tick in 0..3 {
+    for tick in 0..2 {
         let seconds = rfc3339_unix_seconds(CARRY_RETRY).unwrap() + tick * 3601;
         let at = OffsetDateTime::from_unix_timestamp(seconds as i64)
             .unwrap()

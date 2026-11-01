@@ -83,14 +83,6 @@ impl Vanished {
     }
 }
 
-fn source_index(source: SnapshotSource) -> usize {
-    match source {
-        SnapshotSource::Codex => 0,
-        SnapshotSource::ClaudeCode => 1,
-        SnapshotSource::Pi => 2,
-    }
-}
-
 struct Counters {
     counts: [AtomicU64; 4],
     not_found_sites: [AtomicU64; SITES * OUTCOMES],
@@ -179,22 +171,22 @@ pub(super) fn increment(count: &mut usize, source: SnapshotSource, cause: Cause)
 }
 
 fn record(source: SnapshotSource, cause: Cause) {
-    TOTALS[source_index(source)].record(cause);
+    TOTALS[source.slot()].record(cause);
     #[cfg(test)]
     TEST_EVENTS.with(|events| {
         if let Some(mut counts) = events.get() {
-            counts[source_index(source)][cause.index()] += 1;
+            counts[source.slot()][cause.index()] += 1;
             events.set(Some(counts));
         }
     });
 }
 
 fn record_not_found_site(source: SnapshotSource, site: Site, removal: bool) {
-    TOTALS[source_index(source)].record_not_found_site(site, removal);
+    TOTALS[source.slot()].record_not_found_site(site, removal);
     #[cfg(test)]
     TEST_SITE_EVENTS.with(|events| {
         if let Some(mut counts) = events.get() {
-            counts[source_index(source)][site.index()][usize::from(removal)] += 1;
+            counts[source.slot()][site.index()][usize::from(removal)] += 1;
             events.set(Some(counts));
         }
     });
@@ -215,11 +207,11 @@ pub(super) fn not_found_removal(source: SnapshotSource, site: Site) {
 
 /// The page merge dropped `vanished` with a vanished Claude member's entry.
 pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
-    TOTALS[source_index(source)].record_vanished(vanished);
+    TOTALS[source.slot()].record_vanished(vanished);
     #[cfg(test)]
     TEST_VANISHED_EVENTS.with(|events| {
         if let Some(mut counts) = events.get() {
-            counts[source_index(source)][vanished.index()] += 1;
+            counts[source.slot()][vanished.index()] += 1;
             events.set(Some(counts));
         }
     });
@@ -227,18 +219,18 @@ pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
 
 /// A census member below a missing parent settled as a removal.
 pub(super) fn parent_missing_removal(source: SnapshotSource) {
-    let counters = &TOTALS[source_index(source)];
+    let counters = &TOTALS[source.slot()];
     counters.bump(&counters.parent_missing_removals);
 }
 
 /// The shared pin budget refused a new absence witness.
 pub(super) fn vanished_pin_refused(source: SnapshotSource) {
-    let counters = &TOTALS[source_index(source)];
+    let counters = &TOTALS[source.slot()];
     counters.bump(&counters.vanished_pin_refusals);
 }
 
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
-    TOTALS[source_index(source)].snapshot()
+    TOTALS[source.slot()].snapshot()
 }
 
 #[cfg(test)]
@@ -446,7 +438,7 @@ mod tests {
             assert_eq!(census.disappeared_file_count, expected, "{source:?}");
             assert_eq!(census.unreadable_path_count, 0);
             let mut expected_events = [[0; 4]; 3];
-            expected_events[source_index(source)][0] = event;
+            expected_events[source.slot()][0] = event;
             assert_eq!(events, expected_events, "{source:?}");
             assert_eq!(
                 census.removed_index_keys.contains(&local_index_key(&path)),
@@ -606,7 +598,7 @@ mod tests {
             });
             assert!(opened.is_none());
             let mut expected_events = [[0; 4]; 3];
-            expected_events[source_index(source)][0] = 1;
+            expected_events[source.slot()][0] = 1;
             assert_eq!(events, expected_events, "{source:?}");
             assert_eq!(
                 census.disappeared_file_count,

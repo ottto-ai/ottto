@@ -218,7 +218,10 @@ fn integrated_send(
                         .map_err(|e| anyhow!("preflight: {e}"))?;
                     let body = serde_json::to_vec(&request)?;
                     assert!(body.len() <= SNAPSHOT_BATCH_MAX_BYTES);
-                    let encoded = crate::snapshot_client::retention_gzip_probe(&body);
+                    let encoded = crate::snapshot_client::retention_gzip_probe(
+                        &body,
+                        crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+                    );
                     integrated_post(slot, now + 2_000, current, "main", trace)?;
                     match script {
                         IntegratedScript::FallbackShed => {
