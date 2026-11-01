@@ -1309,6 +1309,7 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
                 let f = Fixture::new(if append_native { 1 } else { 2 });
@@ -1403,6 +1404,7 @@ mod durable_restart {
     /// equals a cold full read.
     #[test]
     fn carry_after_restart_tail_matches_cold_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             let mut accepted = claude_request_identity::AcceptedBuckets::default();
             accepted.set_account_source_enabled(true);

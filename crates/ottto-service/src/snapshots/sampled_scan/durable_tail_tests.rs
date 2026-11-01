@@ -2658,15 +2658,16 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.durable_held, [0; 9]);
-            // The read-only privacy retry counts its own refusal even after
-            // ordinary restore disabled the store. It cannot hold native work.
+            // Both read-only privacy checks count their refusal after ordinary
+            // restore disables the store: consent erasure and verification of
+            // a live key in an unknown inventory. Neither can hold native work.
             let mut privacy_refusals = [0; 9];
             let reason = if fault == "body" {
                 store::Refusal::Corrupt
             } else {
                 store::Refusal::Undecodable
             };
-            privacy_refusals[reason as usize] = 1;
+            privacy_refusals[reason as usize] = 2;
             assert_eq!(stats.format_hold, privacy_refusals, "{source:?}/{fault}");
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
@@ -7346,7 +7347,19 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     );
     index.save(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-    let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+    let (reduction, checkpoint) = {
+        // Configure the same active counting view as the production singleton read.
+        let mut parser =
+            fixture::parser(source, &path, File::open(&path).unwrap(), apply_codex_line);
+        codex_counting_version::configure_group_once(
+            &mut parser.accumulator,
+            codex_counting_version::AckEvidence::None,
+        );
+        parser
+            .prepare_acquisition(None, &scope, None, 1_800_000_000)
+            .unwrap();
+        fixture::finish_record(&mut parser, &scope, 1_800_000_000)
+    };
     assert!(reduction.supports_frozen_charge());
     let incoming = Retained {
         checkpoint,
@@ -7501,6 +7514,10 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 false,
             )
             .unwrap();
+            codex_counting_version::configure_group_once(
+                &mut parser.accumulator,
+                codex_counting_version::AckEvidence::None,
+            );
             assert_eq!(
                 parser
                     .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_001)
@@ -7790,7 +7807,7 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                             key: digest,
                             context: store::context_digest(&owner.namespace.0, None),
                             scope: [2; 32],
-                            entry: [3; 32],
+                            entry: [0; 32],
                         },
                         certificate(&path, &owner.namespace),
                         body.clone(),
