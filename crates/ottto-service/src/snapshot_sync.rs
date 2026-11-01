@@ -23550,11 +23550,7 @@ mod tests {
                     &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
                     &mut |body| {
                         posts += 1;
-                        let mut ack = same_source_fixture_ack(body)?;
-                        for entity in &mut ack.accepted_entities {
-                            entity.head_etag = Some("e".repeat(64));
-                        }
-                        Ok(ack)
+                        head_cas_fixture_ack(body, true, &"e".repeat(64))
                     },
                     &mut |_| Ok(()),
                 )
@@ -23623,7 +23619,7 @@ mod tests {
                             if disposition == "partial" {
                                 return Err(anyhow!("synthetic partial exact-ACK rejection"));
                             }
-                            let mut ack = same_source_fixture_ack(body)?;
+                            let mut ack = head_cas_fixture_ack(body, true, &"e".repeat(64))?;
                             if disposition == "not_stored" {
                                 ack.unchanged_entities = std::mem::take(&mut ack.accepted_entities);
                                 for entity in &mut ack.unchanged_entities {
