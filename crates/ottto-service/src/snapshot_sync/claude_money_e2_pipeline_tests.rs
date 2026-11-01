@@ -527,7 +527,6 @@ fn ready(
     p
 }
 
-
 /// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
@@ -2925,6 +2924,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
+}
+
+pub(in crate::snapshot_sync) mod reject_isolation_tests {
+    include!("reject_isolation_tests.rs");
 }
 
 // V2-only fixtures must not enter the cross-build harness transplanted to v1.

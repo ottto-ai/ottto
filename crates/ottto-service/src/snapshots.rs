@@ -46707,6 +46707,12 @@ impl ScanIndex {
         self.active_upload_context_fingerprint = Some(fingerprint);
     }
 
+    /// Preserve the census's existing context adoption when only retryable
+    /// upload refusals remain; this grants no new context or acknowledgement.
+    pub(crate) fn preserve_scanned_upload_context_from(&mut self, scanned: &Self) {
+        self.upload_context_fingerprint = scanned.upload_context_fingerprint.clone();
+    }
+
     /// Select before taking the committed baseline and scanning. Nonzero
     /// revisions adopt each unchanged file once; zero opts out of adoption.
     /// A revision with no history-policy row is refused: the previous active

@@ -1889,9 +1889,12 @@ the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
 (>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records a
-whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
-`state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+whole-save refusal above 256 MiB, with `save_ceiling_cause`; at page size one,
+`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
+string diff passed its 32 MiB memory budget: the save commits and requires
+erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
