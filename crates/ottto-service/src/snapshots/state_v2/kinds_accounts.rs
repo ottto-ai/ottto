@@ -401,9 +401,15 @@ pub(super) fn materialize(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Re
     for (root, family) in resident.claude_account_family_pending {
         index.claude_account_family_pending.insert(root, family);
     }
-    if index.claude_usage_family_pending.cold().is_some() {
-        index.claude_usage_family_pending =
-            mapper::read_map::<ClaudeUsageFamilyPending>(tx, "usage.pending", None, None)?.into();
+    if let Some(cold) = index.claude_usage_family_pending.cold() {
+        // The graph's own view: its loaded values, the stored rows of heads
+        // it has not loaded, and none of the families it removed.
+        let usage = &index.claude_usage_family_pending;
+        let mut families =
+            mapper::read_map::<ClaudeUsageFamilyPending>(tx, "usage.pending", None, None)?;
+        families.retain(|root, _| usage.contains_key(root));
+        families.extend(cold.loaded().clone());
+        index.claude_usage_family_pending = families.into();
     }
     Ok(())
 }
