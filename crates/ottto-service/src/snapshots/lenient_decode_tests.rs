@@ -2671,8 +2671,8 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             "{context}"
         );
         assert_eq!(
-            restarted.accepted_rebuild_incidence,
-            seed.file_snapshot_fingerprints
+            seed.file_snapshot_fingerprints,
+            restarted.accepted_rebuild_incidence
         );
         restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
         assert_eq!(

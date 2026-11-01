@@ -289,7 +289,6 @@ mod tests {
     };
     use super::*;
     use std::{
-        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
     };

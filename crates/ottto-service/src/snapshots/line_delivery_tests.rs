@@ -1311,9 +1311,9 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
         assert_eq!(
             index.traversal.as_ref().unwrap().observed_index_keys,
-            ["big", "grown", "held"]
-                .map(|name| local_index_key(&path(name)))
-                .into()
+            std::collections::BTreeSet::from(
+                ["big", "grown", "held"].map(|name| local_index_key(&path(name)))
+            )
         );
         let counts = discovery_page(source.api_slug());
         assert_eq!(counts["discovery_retained"], json!({"grown": 3}));
