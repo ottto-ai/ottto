@@ -2021,10 +2021,6 @@ impl SnapshotUploadProgress {
             }
         }
         self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
-        let active = self
-            .active_quarantine_witness
-            .as_ref()
-            .expect("upload progress always has an active quarantine witness");
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
@@ -2032,8 +2028,7 @@ impl SnapshotUploadProgress {
                 .expect("selected quarantine retry exists");
             if record.contract_retry_claims.is_some() {
                 crate::snapshots::terminal_contract_retry::claim(record);
-                record.witness = active.clone();
-                record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+                self.pace_retry(fingerprint);
             }
             // Selection is not a send. Offered or still-queued work keeps its
             // deadline; source-held work is paced at the final offer boundary.
@@ -2256,6 +2251,20 @@ impl SnapshotUploadProgress {
             }
         }
         changed
+    }
+
+    /// Re-witness a quarantined retry at the active witness and give it the
+    /// ordinary backoff, without spending a failure.
+    fn pace_retry(&mut self, fingerprint: &str) {
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("paced quarantine retry exists");
+        record.witness = self
+            .active_quarantine_witness
+            .clone()
+            .expect("upload progress always has an active quarantine witness");
+        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
     }
 
     /// Source-held retries use ordinary pacing without spending a failure.
@@ -10919,17 +10928,14 @@ where
         let mut retry_attempted = false;
         for index in indices {
             let fp = fingerprint(&items[*index]);
-            if progress.active_quarantine_retries.contains(fp) {
-                if let Some(record) = progress.quarantined_fingerprints.get_mut(fp) {
-                    if record.contract_retry_claims.is_none() {
-                        record.witness = progress
-                            .active_quarantine_witness
-                            .clone()
-                            .expect("upload progress always has an active quarantine witness");
-                        record.retry_after_unix_seconds = quarantine_retry_after(fp);
-                        retry_attempted = true;
-                    }
-                }
+            if progress.active_quarantine_retries.contains(fp)
+                && progress
+                    .quarantined_fingerprints
+                    .get(fp)
+                    .is_some_and(|record| record.contract_retry_claims.is_none())
+            {
+                progress.pace_retry(fp);
+                retry_attempted = true;
             }
         }
         if retry_attempted {
@@ -18111,59 +18117,6 @@ mod tests {
             progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
             0
         );
-        // Round 4 P2b (theoretical): a retained unreadable first incidence
-        // releases ownership to the next copy through the same pending queue.
-        #[cfg(unix)]
-        let hints = {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o000))
-                .unwrap();
-            let (held, reads) =
-                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-                    crate::snapshots::scan_source_roots_with_test_limit_and_hints(
-                        SnapshotSource::Pi,
-                        std::slice::from_ref(&root),
-                        &mut index,
-                        collected_at,
-                        crate::snapshots::BACKFILL_WINDOW_DAYS,
-                        1,
-                        true,
-                        &hints,
-                    )
-                    .unwrap()
-                });
-            assert!(held.snapshots.is_empty());
-            assert!(reads.is_empty());
-            assert!(held.unreadable_path_count > 0);
-            assert!(index.quarantine_retry_is_queued(&fingerprint));
-            assert!(!progress.defer_held_quarantine_retries(
-                &held.snapshots,
-                &index,
-                SnapshotSource::Pi
-            ));
-            assert_eq!(
-                progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
-                0
-            );
-            assert_eq!(
-                progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
-                failures
-            );
-            index.save(&index_path).unwrap();
-            progress.save(&progress_path).unwrap();
-            index = ScanIndex::load(&index_path).unwrap();
-            progress = SnapshotUploadProgress::load(
-                &progress_path,
-                &progress.destination_namespace_hash,
-                snapshot_quarantine_witness(SnapshotSource::Pi),
-            )
-            .unwrap();
-            assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
-            let hints =
-                save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
-            assert_eq!(hints, vec![duplicate_path.clone()]);
-            hints
-        };
         let (mut retry, reads) =
             crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                 crate::snapshots::scan_source_roots_with_test_limit_and_hints(
@@ -18180,8 +18133,7 @@ mod tests {
             });
         crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut retry, &mut index);
         assert_eq!(reads.values().sum::<usize>(), 1);
-        #[cfg(unix)]
-        assert_eq!(reads.get(&duplicate_path), Some(&1));
+        assert_eq!(reads.get(&session_path), Some(&1));
         assert_eq!(retry.snapshots.len(), 1);
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
         assert!(!progress.defer_held_quarantine_retries(
@@ -18288,12 +18240,6 @@ mod tests {
         assert!(reads.is_empty());
         assert!(quiet.snapshots.is_empty());
         assert_eq!((upload_calls, accepted), (1, 1));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600))
-                .unwrap();
-        }
         let _ = std::fs::remove_dir_all(root);
     }
 

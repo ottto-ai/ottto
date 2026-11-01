@@ -2760,13 +2760,8 @@ struct ScanTraversalCheckpoint {
     listing_started_unix_seconds: Option<u64>,
     /// Owed files with an unchanged stamp that a re-listing pass queued,
     /// with that pass's start. Bounded: past the bound the oldest stamp is
-    /// dropped, so the bound can only bring a re-queue forward. Decoded
-    /// leniently (`deserialize_listing_owed_paces`), never failing the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_listing_owed_paces"
-    )]
+    /// dropped, so the bound can only bring a re-queue forward.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
 
@@ -31489,40 +31484,6 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
-                // A failed/held ordinary owner cannot strand a readable copy.
-                // At this boundary every selected candidate has ended; queued
-                // work still owns its lease. Reuse the existing hint queue for
-                // the next incidence, leaving the unsent deadline due.
-                let retry_copies = index
-                    .terminal_contract_retries
-                    .iter()
-                    .filter(|(fp, _)| {
-                        index
-                            .quarantined_snapshot_fingerprints
-                            .get(*fp)
-                            .is_some_and(|r| r.contract_retry_claims.is_none())
-                            && !snapshots
-                                .iter()
-                                .any(|item| &item.snapshot_fingerprint == *fp)
-                            && !index.quarantine_retry_is_queued(fp)
-                    })
-                    .filter_map(|(fp, owner)| {
-                        index
-                            .file_snapshot_fingerprints
-                            .range((
-                                std::ops::Bound::Excluded(owner.clone()),
-                                std::ops::Bound::Unbounded,
-                            ))
-                            .find(|(_, fingerprints)| fingerprints.contains(fp))
-                            .map(|(key, _)| (fp.clone(), key.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                for (fp, key) in retry_copies {
-                    index.terminal_contract_retries.insert(fp, key.clone());
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        enqueue_watcher_hints(source, traversal, &[PathBuf::from(key)], false);
-                    }
-                }
                 if codex_page.continuation() {
                     let cap_counts = index
                         .traversal
@@ -41143,47 +41104,44 @@ fn load_codex_logs2_priority_turns(
     if !path.exists() {
         return true;
     }
-    let Ok(connection) =
-        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return false;
-    };
-    let _ = connection.busy_timeout(std::time::Duration::from_millis(
-        CODEX_LOGS2_BUSY_TIMEOUT_MS,
-    ));
-    // Only `response.create` request rows carry the *requested* service_tier.
-    // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
-    // then filters to the sparse request rows (hundreds, not the full table).
-    let Ok(mut statement) = connection.prepare(
-        "SELECT feedback_log_body FROM logs \
-         WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
-         ORDER BY ts DESC LIMIT ?2",
+    let Ok(connection) = codex_sqlite_read::CodexSqliteRead::open(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        std::time::Duration::from_millis(CODEX_LOGS2_BUSY_TIMEOUT_MS),
     ) else {
         return false;
     };
-    let Ok(rows) = statement.query_map(
-        rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
-        |row| row.get::<_, String>(0),
-    ) else {
+    let Ok((turns, complete, read)) = connection.read(|connection| {
+        // Only `response.create` request rows carry the *requested* service_tier.
+        // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
+        // then filters to the sparse request rows (hundreds, not the full table).
+        let mut statement = connection.prepare(
+            "SELECT feedback_log_body FROM logs \
+             WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
+             ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut complete = true;
+        let mut read = 0_u64;
+        let mut turns = Vec::new();
+        for body in rows {
+            let Ok(body) = body else {
+                complete = false;
+                continue;
+            };
+            read += 1;
+            turns.extend(codex_logs2_priority_turn_from_body(&body));
+        }
+        if read == CODEX_LOGS2_MAX_ROWS as u64 {
+            CapCounts::record("codex", 3, 1);
+        }
+        Ok((turns, complete, read))
+    }) else {
         return false;
     };
-    let mut complete = true;
-    let mut read = 0_u64;
-    let mut turns = Vec::new();
-    for body in rows {
-        let Ok(body) = body else {
-            complete = false;
-            continue;
-        };
-        read += 1;
-        turns.extend(codex_logs2_priority_turn_from_body(&body));
-    }
-    if read == CODEX_LOGS2_MAX_ROWS as u64 {
-        CapCounts::record("codex", 3, 1);
-    }
-    if connection.verify().is_err() {
-        return false;
-    }
     priority_turns.extend(turns);
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
@@ -41296,20 +41254,12 @@ fn load_codex_sqlite_titles(
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex title database")?;
     let loaded = connection.read(|connection| {
-        let mut statement = connection
-            .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex title census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let loaded = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex title census row")?;
-        Ok(loaded)
+        census_rows(
+            connection,
+            "SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''",
+            "Codex title census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
     })?;
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
@@ -41355,39 +41305,28 @@ fn load_codex_sqlite_state_threads(
             sqlite_select_expr(&columns, "model", "NULL"),
             sqlite_select_expr(&columns, "rollout_path", "NULL"),
         );
-        let mut statement = connection
-            .prepare(sql.as_str())
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex state thread census")?;
-        let rows = statement
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let title: Option<String> = row.get(1)?;
-                let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-                let archived = row.get::<_, i64>(3)? != 0;
-                let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-                let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-                let model: Option<String> = row.get(8)?;
-                let rollout_path: Option<String> = row.get(9)?;
-                Ok((
-                    id,
-                    CodexStateThread {
-                        title,
-                        tokens_used,
-                        archived,
-                        created_at,
-                        updated_at,
-                        model,
-                        rollout_path,
-                    },
-                ))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex state thread census row")?;
-        Ok(rows)
+        census_rows(connection, &sql, "Codex state thread census", |row| {
+            let id: String = row.get(0)?;
+            let title: Option<String> = row.get(1)?;
+            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
+            let archived = row.get::<_, i64>(3)? != 0;
+            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
+            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
+            let model: Option<String> = row.get(8)?;
+            let rollout_path: Option<String> = row.get(9)?;
+            Ok((
+                id,
+                CodexStateThread {
+                    title,
+                    tokens_used,
+                    archived,
+                    created_at,
+                    updated_at,
+                    model,
+                    rollout_path,
+                },
+            ))
+        })
     })?;
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
@@ -41480,26 +41419,19 @@ fn load_codex_rollout_extents(
             return Err(anyhow::Error::new(IncompleteShape)
                 .context("Codex thread-history database has an incomplete projection schema"));
         }
-        let mut statement = connection
-            .prepare(
-                "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
-                 FROM thread_history_projection_state",
-            )
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex rollout-extent census")?;
-        let rows = statement
-            .query_map([], |row| {
+        census_rows(
+            connection,
+            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
+             FROM thread_history_projection_state",
+            "Codex rollout-extent census",
+            |row| {
                 let thread_id: String = row.get(0)?;
                 let next_byte_offset: i64 = row.get(1)?;
                 let next_ordinal: i64 = row.get(2)?;
                 Ok((thread_id, next_byte_offset, next_ordinal))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex rollout-extent census row")?;
-        Ok(Some(rows))
+            },
+        )
+        .map(Some)
     })?
     else {
         return Ok(());
@@ -41578,23 +41510,13 @@ fn load_codex_sqlite_spawn_edges(
                 )));
             }
         }
-        let mut statement = connection
-            .prepare(
-                "SELECT id, first_user_message FROM threads \
-                 WHERE thread_source = 'agent_created_thread'",
-            )
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex created-thread census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex created-thread census row")?;
-        Ok(rows)
+        census_rows(
+            connection,
+            "SELECT id, first_user_message FROM threads \
+             WHERE thread_source = 'agent_created_thread'",
+            "Codex created-thread census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
     })?;
     let mut raw_created_ids_by_key = BTreeMap::new();
     let mut created_in_database = Vec::new();
@@ -41632,20 +41554,13 @@ fn load_codex_sqlite_spawn_edges(
         if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
             return Ok(None);
         }
-        let mut statement = connection
-            .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
-            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-            .context("prepare Codex spawn-edge census")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-        let loaded = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-            .context("read Codex spawn-edge census row")?;
-        Ok(Some(loaded))
+        census_rows(
+            connection,
+            "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges",
+            "Codex spawn-edge census",
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map(Some)
     })?
     else {
         // Without the edge table, a missing edge is not evidence of no parent.
@@ -41768,6 +41683,8 @@ fn record_codex_identity_key(
 /// So does CANTOPEN when Codex removed the `-wal` after that check.
 const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
 const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long a sidecar census statement waits on a lock Codex holds.
+const CODEX_SIDECAR_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Open a Codex sidecar database read-only and read its schema, which opens
 /// the WAL and its index for the connection's later statements. A transient
@@ -41779,7 +41696,11 @@ fn open_codex_sidecar_database(
     open: &mut SidecarOpenCounts,
 ) -> Result<codex_sqlite_read::CodexSqliteRead> {
     let connection = retry_transient_sqlite(&mut open.retries, || {
-        codex_sqlite_read::CodexSqliteRead::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        codex_sqlite_read::CodexSqliteRead::open(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            CODEX_SIDECAR_BUSY_TIMEOUT,
+        )
     })?;
     if connection.is_snapshot() {
         open.snapshots = open.snapshots.saturating_add(1);
@@ -41817,16 +41738,32 @@ fn retry_transient_sqlite<T>(
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
+    let columns = census_rows(
+        connection,
+        &format!("PRAGMA table_info({table_name})"),
+        "SQLite table census",
+        |row| row.get::<_, String>(1),
+    )?;
+    Ok(columns.into_iter().collect())
+}
+
+/// Every row of one census query. Failures carry their loader stage and
+/// "prepare {label}" or "read {label} row".
+fn census_rows<T>(
+    connection: &Connection,
+    sql: &str,
+    label: &str,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    use crate::codex_scan_diagnostics::LoaderStage;
     let mut statement = connection
-        .prepare(format!("PRAGMA table_info({table_name})").as_str())
-        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        .context("prepare SQLite table census")?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
-    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
-        .context(crate::codex_scan_diagnostics::LoaderStage::Row)
-        .context("read SQLite table census")
+        .prepare(sql)
+        .context(LoaderStage::Prepare)
+        .with_context(|| format!("prepare {label}"))?;
+    let rows = statement.query_map([], map).context(LoaderStage::Query)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context(LoaderStage::Row)
+        .with_context(|| format!("read {label} row"))
 }
 
 fn sqlite_select_expr(columns: &BTreeSet<String>, column: &str, fallback: &str) -> String {
@@ -43550,10 +43487,7 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
         traversal.listing_started_unix_seconds = Some(now);
         return;
     };
-    // A clock moved backwards cannot postpone the pass indefinitely.
-    if now < started.saturating_add(LISTING_INTERVAL_SECONDS)
-        && started <= now.saturating_add(LISTING_INTERVAL_SECONDS)
-    {
+    if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
         return;
     }
     traversal.listing_started_unix_seconds = Some(now);
@@ -43571,13 +43505,12 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
 
 /// Whether this re-listing pass may queue an owed file whose stamp is
 /// unchanged: once per file per `LISTING_OWED_PACE_SECONDS`, measured from
-/// the start of the pass that queued it. A stamp from a clock that moved
-/// backwards expires rather than holds.
+/// the start of the pass that queued it.
 fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool {
     let Some(now) = traversal.listing_started_unix_seconds else {
         return true;
     };
-    let fresh = |at: &u64| *at <= now && now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
+    let fresh = |at: &u64| now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
     let paced = &mut traversal.listing_owed_requeued_unix_seconds;
     if paced.get(key).is_some_and(&fresh) {
         return false;
@@ -43605,17 +43538,6 @@ fn trim_listing_owed_paces(paces: &mut BTreeMap<String, u64>, bound: usize) -> u
         paces.remove(&key);
     }
     excess as u64
-}
-
-/// The owed re-queue pacing map through the lenient map decoder: a stamp
-/// this binary cannot decode is dropped, and past the bound the oldest are
-/// dropped. Either only brings a re-queue forward; the traversal is kept.
-fn deserialize_listing_owed_paces<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, u64>, D::Error> {
-    let mut paces = deserialize_lenient_map(deserializer)?;
-    trim_listing_owed_paces(&mut paces, MAX_LISTING_OWED_PACES);
-    Ok(paces)
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -49191,29 +49113,6 @@ impl ScanIndex {
                 self.terminal_contract_retries
                     .entry(fingerprint.clone())
                     .or_insert_with(|| key.clone());
-            }
-        }
-        // A prior page's failed owner queued its next copy. That durable queue
-        // keeps the fallback ahead of the first incidence after save/reload.
-        for (fingerprint, owner) in &mut self.terminal_contract_retries {
-            if self
-                .quarantined_snapshot_fingerprints
-                .get(fingerprint)
-                .is_some_and(|r| r.contract_retry_claims.is_none())
-            {
-                if let Some(pending) = self
-                    .traversal
-                    .iter()
-                    .flat_map(|walk| walk.pending_candidates.iter())
-                    .chain(self.claude_stale_family_carry.replay.iter())
-                    .find(|pending| {
-                        self.file_snapshot_fingerprints
-                            .get(&local_index_key(&pending.path))
-                            .is_some_and(|fingerprints| fingerprints.contains(fingerprint))
-                    })
-                {
-                    *owner = local_index_key(&pending.path);
-                }
             }
         }
         // Use the same revalidated candidate admission as exact refusal re-offers.
@@ -77124,9 +77023,8 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    /// [behaviour] Routing by name. A database with a second hard link is
-    /// refused for good (not retried), and a link added after a snapshot was
-    /// taken fails that snapshot's rows as busy. An idle database reached
+    /// [behaviour] Routing by name. A link added after a snapshot was taken
+    /// fails that snapshot's rows as busy. An idle database reached
     /// through a symlink is read as a snapshot of its target. A database with
     /// a `-wal` takes the plain open: with no connection attached, its frames
     /// are read through a private index, also through a symlink, and an
@@ -77157,26 +77055,10 @@ mod tests {
         assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
 
         let other_name = codex_dir.join("other.sqlite");
-        fs::hard_link(&history_path, &other_name).expect("hard-link history fixture");
-        let (ordinal, open) = rollout_ordinal(&history_path);
-        let linked = ordinal.expect_err("second hard link refused");
-        assert!(linked
-            .downcast_ref::<crate::codex_scan_diagnostics::LinkedDatabase>()
-            .is_some());
-        assert_eq!((open.retries, open.snapshots), (0, 0));
-        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
-        evidence.observe_root(&Err(linked), open, false, "codex root");
-        assert_eq!(
-            evidence.reason,
-            crate::codex_scan_diagnostics::LoaderReason::LinkedDatabase
-        );
-        assert_eq!(evidence.transient_retries, 0);
-        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
-        fs::remove_file(&other_name).expect("unlink second name");
-
         let snapshot = codex_sqlite_read::CodexSqliteRead::open(
             &history_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
+            CODEX_SIDECAR_BUSY_TIMEOUT,
         )
         .expect("open idle snapshot");
         assert!(snapshot.is_snapshot());
@@ -77290,6 +77172,7 @@ mod tests {
             let snapshot = codex_sqlite_read::CodexSqliteRead::open(
                 &history_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
             )
             .expect("open idle snapshot");
             assert!(snapshot.is_snapshot());
