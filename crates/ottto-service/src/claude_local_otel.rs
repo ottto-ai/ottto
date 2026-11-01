@@ -1496,6 +1496,22 @@ pub(crate) fn reset_evidence_read_counts_for_test() {
     TRACE_READ_RECEIPT.with(|count| count.set(0));
 }
 
+/// Runs `f`, then puts this thread's read receipts back as they were before
+/// it; a pending trace-read hook is set aside so `f` cannot fire it.
+#[cfg(test)]
+pub(crate) fn without_read_receipts<T>(f: impl FnOnce() -> T) -> T {
+    let api = API_READ_RECEIPT.with(std::cell::Cell::get);
+    let trace = TRACE_READ_RECEIPT.with(std::cell::Cell::get);
+    let bytes = TRACE_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    let hook = TRACE_BEFORE_READ.with(|slot| slot.borrow_mut().take());
+    let value = f();
+    API_READ_RECEIPT.with(|slot| slot.set(api));
+    TRACE_READ_RECEIPT.with(|slot| slot.set(trace));
+    TRACE_BYTES_FOR_TEST.with(|slot| slot.set(bytes));
+    TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
+    value
+}
+
 #[cfg(test)]
 pub(crate) fn evidence_read_counts_for_test() -> (usize, usize) {
     (

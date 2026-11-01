@@ -214,18 +214,21 @@ impl Page {
         wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         // The streamed-evidence arm: the same enrichment, keeping every root's
-        // rows, first (taking the check so it does not recurse).
+        // rows, first (taking the check so it does not recurse). It only
+        // observes: the fixture's diag, read receipts and hooks stay its own.
         let checks = STREAMED_CHECKS.with(std::cell::Cell::take);
         let terminal = self.scan.census_complete;
         let whole = checks.map(|_| {
-            let mut whole = twin(self);
-            let mut accepted = accepted.as_deref().cloned();
-            crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
-            let reads = api_reads(|| {
-                whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
-            });
-            crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
-            (whole, accepted, reads)
+            unobserved(|| {
+                let mut whole = twin(self);
+                let mut accepted = accepted.as_deref().cloned();
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
+                let reads = api_reads(|| {
+                    whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
+                });
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
+                (whole, accepted, reads)
+            })
         });
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
@@ -274,11 +277,13 @@ impl Page {
         self.disposition = disposition.clone();
         if let (Some(mut checks), Some((whole, whole_accepted, whole_reads))) = (checks, whole) {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
-            checks.compare(
-                terminal,
-                (&whole, whole_accepted.as_ref(), whole_reads),
-                (self, accepted.as_deref(), reads),
-            );
+            unobserved(|| {
+                checks.compare(
+                    terminal,
+                    (&whole, whole_accepted.as_ref(), whole_reads),
+                    (self, accepted.as_deref(), reads),
+                )
+            });
             STREAMED_CHECKS.with(|slot| slot.set(Some(checks)));
         }
         disposition
@@ -402,6 +407,12 @@ impl StreamedChecks {
         self.dropped += usize::from(streamed.stats.complete_sidecar_root_count > page_roots);
         self.reread += usize::from(terminal && reads > whole_reads);
     }
+}
+
+/// Runs the arm's own work leaving this thread's e2 diag, stage timers,
+/// evidence read receipts and pending trace hook as the fixture left them.
+fn unobserved<T>(f: impl FnOnce() -> T) -> T {
+    e2::without_diag(|| crate::claude_local_otel::without_read_receipts(f))
 }
 
 /// The API sidecar opens `read` makes on this thread.
