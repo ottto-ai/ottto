@@ -101,7 +101,7 @@ impl ContinuationFixture {
             );
         }
         assert!(!index.legacy_settlement_ledger_needs_migration());
-        let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
+        let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
         let now = reason_reoffer::now_unix_seconds();
         let _ = prepare_upload_progress_for_cycle_with_reoffer(
             &mut progress,
@@ -147,7 +147,6 @@ impl ContinuationFixture {
             scan_started_at: "2026-10-24T00:00:00Z".into(),
             activity_hint: continuation_hint(true),
             receipt_window_days: 30,
-            context_curve_enabled: false,
             cache_observations_enabled: false,
             scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
@@ -325,7 +324,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert_eq!(prepared.source, SnapshotSource::Codex);
     assert_eq!(prepared.account_witness, minted.account_witness);
     assert_eq!(prepared.receipt_window_days, minted.receipt_window_days);
-    assert_eq!(prepared.context_curve_enabled, minted.context_curve_enabled);
     assert_eq!(
         prepared.cache_observations_enabled,
         minted.cache_observations_enabled
@@ -386,7 +384,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         &mut index,
         &mut progress,
     );
-    let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
+    let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -455,36 +453,24 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
     use crate::snapshots::claude_request_identity::captures;
     let witness = [3u8; 32];
     let index_path = Path::new("/tmp/ottto-continuation-scope-index.json");
-    for (source, curve, golden) in [
+    // The retired curve flag stays in the scope as a literal `false`.
+    for (source, golden) in [
         (
             SnapshotSource::ClaudeCode,
-            false,
             "c58cf74dc52ebcdb56cce301dde881fac71e0045ddf127d0137ed7d16b80ae55",
         ),
         (
-            SnapshotSource::ClaudeCode,
-            true,
-            "2d63534231ce46641c37958033fe49bdfb683d2592f1648ddd715ac412022292",
-        ),
-        (
             SnapshotSource::Codex,
-            false,
             "26648c9996bbbd2102f21bab2bd0a6c2fc6a522bb3b159ba6869d5c645d9df04",
-        ),
-        (
-            SnapshotSource::Codex,
-            true,
-            "a9cd90d380262e8c616ed6ff63cb6bbc1b568a8b375526a90b32a94f6537103d",
         ),
     ] {
         let scope = cycle_sampled_scope(
             &witness,
             CONTINUATION_NAMESPACE,
             index_path,
-            curve,
             captures(source),
         );
-        assert_eq!(scope.0, golden, "{source:?} curve={curve}");
+        assert_eq!(scope.0, golden, "{source:?}");
     }
 }
 
@@ -649,7 +635,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     assert!(prepare_upload_progress_for_cycle_with_reoffer(
         &mut selected,
         &index,
-        &cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
+        &cycle_replay_generation(SnapshotSource::Codex, CONTINUATION_NAMESPACE),
         false,
         Some(&reason_reoffer::Scope {
             index: &index,
@@ -748,11 +734,10 @@ fn ordinary_durable_continuation_to_eof(
         &inputs.upload_destination_namespace,
         &inputs.index_path,
         false,
-        false,
     );
     let (_, mut index) = fixture.load();
     index.activate_upload_context(cycle_upload_context(inputs.upload_policy, None, false));
-    index.mark_context_curve_capability_disabled();
+
     index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
         SnapshotSource::Codex,
     ));
@@ -777,7 +762,6 @@ fn ordinary_durable_continuation_to_eof(
             false,
             None,
             &[],
-            false,
             false,
         )
         .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
@@ -850,7 +834,7 @@ fn ordinary_durable_continuation_to_eof(
                             None,
                             false,
                         ));
-                        index.mark_context_curve_capability_disabled();
+
                         index.activate_effective_upload_body_witness_revision(
                             cycle_body_witness_revision(SnapshotSource::Codex),
                         );
@@ -864,7 +848,6 @@ fn ordinary_durable_continuation_to_eof(
                             false,
                             None,
                             &[],
-                            false,
                             false,
                         )
                         .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());

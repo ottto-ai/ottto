@@ -65,12 +65,13 @@ impl Fixture {
         &self.index.files[&self.key()]
     }
     fn walk(&mut self, finalize: bool) -> (SourceScanResult, u64) {
-        self.walk_with_file_limit(finalize, 10)
+        self.walk_with_file_limit(finalize, 10, false)
     }
     fn walk_with_file_limit(
         &mut self,
         finalize: bool,
         file_limit: usize,
+        allow_census_complete: bool,
     ) -> (SourceScanResult, u64) {
         let mut scan = OwnedSourceScan::new(
             self.source,
@@ -83,7 +84,6 @@ impl Fixture {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             self.cache.clone(),
@@ -100,9 +100,11 @@ impl Fixture {
                     index, mut scan, ..
                 } => {
                     self.index = index;
-                    // Model a source whose census cannot complete; no page can
-                    // advance source-wide context even when its file settles.
-                    scan.census_complete = false;
+                    // Most fixtures model an incomplete census. Terminal-page
+                    // regressions retain the scanner's actual completion result.
+                    if !allow_census_complete {
+                        scan.census_complete = false;
+                    }
                     apply_upload_policy(
                         self.source,
                         &mut scan.snapshots,
@@ -148,6 +150,7 @@ impl Fixture {
             files,
             bytes,
             local_bytes: self.index.context_read_counts.local_bytes,
+            ..RearmCounts::default()
         }
     }
 
@@ -199,7 +202,7 @@ impl Fixture {
                             self.index.active_upload_context_fingerprint.as_ref()
                                 == Some(&receipt.context_fingerprint)
                                 && receipt.replay_generation
-                                    == self.index.context_curve_replay_epoch
+                                    == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
                                 && receipt.source_witness == entry.source_file_fingerprint
                                 && entry.last_upload_body_witness.as_ref()
                                     == Some(&receipt.body_witness)
@@ -499,9 +502,20 @@ fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
         assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
     }
     // A context alias grants no body/source/replay authority of its own.
-    f.index.context_curve_replay_epoch += 1;
+    let key = f.key();
+    let receipt_generation = |index: &mut ScanIndex, delta: i64| {
+        let receipt = index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .upload_context_receipt
+            .as_mut()
+            .unwrap();
+        receipt.replay_generation = receipt.replay_generation.wrapping_add_signed(delta);
+    };
+    receipt_generation(&mut f.index, 1);
     assert!(f.index.file_upload_context_requires_adoption(&f.key()));
-    f.index.context_curve_replay_epoch -= 1;
+    receipt_generation(&mut f.index, -1);
     let witness = f.entry().source_file_fingerprint.clone();
     f.index
         .files
@@ -615,19 +629,6 @@ fn upload_context_receipt_stale_body_witness_refused() {
     );
 }
 #[test]
-fn upload_context_receipt_stale_generation_refused() {
-    let mut f = Fixture::new(SnapshotSource::Codex);
-    let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
-    f.index.context_curve_replay_epoch += 1;
-    assert_eq!(
-        f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
-            .files,
-        0
-    );
-}
-#[test]
 fn upload_context_receipt_partial_entity_ack_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, _) = f.pending();
@@ -662,7 +663,7 @@ fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
     assert!(f.entry().upload_context_receipt.is_none());
 }
 #[test]
-fn upload_context_receipt_restart_and_generation_rearm_once() {
+fn upload_context_receipt_survives_restart() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let size = fs::metadata(&f.path).unwrap().len();
     let counts = f.adopt();
@@ -684,24 +685,6 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
     f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
-    f.assert_quiet();
-    f.index.context_curve_replay_epoch += 1;
-    // The real prepare resets both index and upload progress for a new replay.
-    f.uploader.replay("synthetic-curve-epoch-1");
-    let counts = f.adopt();
-    assert_eq!(counts.files, 1);
-    assert_eq!(
-        counts.bytes,
-        f.uploader
-            .posts
-            .last()
-            .unwrap()
-            .iter()
-            .map(|item| serde_json::to_vec(item).unwrap().len() as u64)
-            .sum::<u64>(),
-        "wire item bytes, not native file length"
-    );
-    assert!(counts.local_bytes <= size);
     f.assert_quiet();
 }
 #[test]
@@ -1306,6 +1289,207 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
     }
 }
 
+/// [money] Lead B Q1 (2026-10-31): one file's two context bodies split across
+/// passes, with a crash between them. The receipt waits for the second exact
+/// ACK, only the unACKed body resends, and the server receives each entity's
+/// unchanged body exactly once, so the money totals are unchanged.
+#[test]
+fn split_context_ack_set_receipts_after_every_body_and_keeps_money_totals() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let empty = f.index.clone();
+        let items = uploader_group(&mut f, 2);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        assert_eq!(
+            f.uploader
+                .send(source, &mut f.index, &empty, &items)
+                .unwrap()
+                .0,
+            1
+        );
+        let key = f.key();
+        let previous = f.index.clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        // Room for exactly one body, including separators and the array reserve.
+        let one_body = items
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() + 3)
+            .max()
+            .unwrap();
+        let mut sent = Vec::new();
+        for pass in 0..2u64 {
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            if pass == 0 {
+                f.uploader.set_byte_allowance(one_body);
+            }
+            let first = f.uploader.posts.len();
+            let (files, _) = f
+                .uploader
+                .send(source, &mut f.index, &previous, &items)
+                .unwrap();
+            let posted = f.uploader.posts[first..]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(posted.len(), 1, "pass {pass} sends only an unACKed body");
+            assert_eq!(files, pass, "the receipt waits for every exact ACK");
+            assert_eq!(
+                f.index.files[&key]
+                    .upload_context_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.context_fingerprint == "e".repeat(64)),
+                pass == 1
+            );
+            sent.extend(posted);
+            // A crash between batches keeps only the durable ACK ledger.
+            f.uploader.restart(source, &"e".repeat(64));
+        }
+        let mut expected = items
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect::<Vec<_>>();
+        let order = |value: &serde_json::Value| value["snapshot_fingerprint"].to_string();
+        expected.sort_by_key(order);
+        sent.sort_by_key(order);
+        assert_eq!(
+            sent, expected,
+            "each unchanged body reaches the server once"
+        );
+        let totals = |values: &[serde_json::Value]| {
+            ["input_tokens", "output_tokens", "request_count"].map(|field| {
+                values
+                    .iter()
+                    .map(|value| value[field].as_u64().unwrap())
+                    .sum::<u64>()
+            })
+        };
+        let item_totals = items.iter().fold([0u64; 3], |sum, item| {
+            [
+                sum[0] + item.input_tokens,
+                sum[1] + item.output_tokens,
+                sum[2] + item.request_count,
+            ]
+        });
+        assert!(item_totals[0] > 0);
+        assert_eq!(totals(&sent), item_totals);
+    }
+}
+
+/// [regress] Strict review P1: a terminal Codex census adopted its source
+/// context before a budget-deferred body, hiding that body's debt after restart.
+#[test]
+fn terminal_census_context_deferral_stays_owed_after_restart() {
+    let source = SnapshotSource::Codex;
+    let mut f = Fixture::new(source);
+    f.adopt();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk_with_file_limit(false, 10, true);
+    assert!(scan.census_complete, "the actual scanner closes its census");
+    assert!(f.index.traversal.is_none(), "the terminal queue is retired");
+    finalize_scan_after_policy(source, &mut scan, &mut f.index);
+    assert_eq!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
+    f.uploader.activate(source, context.clone(), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    let first = f.uploader.posts.len();
+    assert_eq!(
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(f.uploader.posts.len(), first);
+    assert_ne!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
+
+    // Restart with only persisted index/ACK evidence and no retained traversal.
+    f.index = serde_json::from_slice(&serde_json::to_vec(&f.index).unwrap()).unwrap();
+    f.uploader.restart(source, &context);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk_with_file_limit(true, 10, true);
+    assert_eq!(scan.scanned_file_count, 1, "the owed body is rediscovered");
+    assert_eq!(scan.snapshots.len(), 1);
+    f.uploader.activate(source, context, &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        1,
+        "only the final exact ACK earns the receipt"
+    );
+    assert_eq!(f.uploader.posts.len(), first + 1);
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [regress] B1 (M4, 2026-10-31): a census page read one context file,
+/// because each file reserved three worst-case item bodies (about 1.88 MiB of
+/// the 2 MiB pass). Real-size reservation reads 40 small context files in one
+/// page, and each earns its receipt in that pass.
+#[test]
+fn real_scan_reads_forty_small_context_files_in_one_page() {
+    let source = SnapshotSource::Codex;
+    let mut f = Fixture::new(source);
+    let template = fs::read_to_string(&f.path).unwrap();
+    let mut paths = vec![f.path.clone()];
+    for n in 1..40 {
+        let session = format!("019fa111-2222-7333-8444-{n:012}");
+        let path = f
+            .root
+            .join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+        fs::write(&path, template.replace(SESSION, &session)).unwrap();
+        paths.push(path);
+    }
+    let receipted = |index: &ScanIndex, context: &str| {
+        paths
+            .iter()
+            .filter(|path| {
+                index
+                    .files
+                    .get(&local_index_key(path))
+                    .and_then(|entry| entry.upload_context_receipt.as_ref())
+                    .is_some_and(|receipt| receipt.context_fingerprint == context)
+            })
+            .count()
+    };
+    for _ in 0..40 {
+        let previous = f.index.clone();
+        let (scan, _) = f.walk_with_file_limit(true, 64, false);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        if receipted(&f.index, &"d".repeat(64)) == paths.len() {
+            break;
+        }
+    }
+    assert_eq!(receipted(&f.index, &"d".repeat(64)), 40);
+    f.index.activate_file_upload_context(source, "e".repeat(64));
+    f.cache = Arc::default(); // force cold Full reads
+    let previous = f.index.clone();
+    let ((scan, _), per_file) =
+        terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 64, false));
+    assert_eq!(
+        per_file.len(),
+        40,
+        "one page reads every small context file"
+    );
+    assert_eq!(f.index.context_read_counts.files, 40);
+    f.uploader.activate(source, "e".repeat(64), &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(files, 40, "every file earns its receipt in the same pass");
+    assert_eq!(receipted(&f.index, &"e".repeat(64)), 40);
+}
+
 /// Cold acquisition on every page makes repeated Full reads observable. Each
 /// file must get its real ACK/receipt in the same page as its sole body parse.
 #[test]
@@ -1527,8 +1711,12 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
     f.assert_quiet();
 }
 
+/// [behaviour] Lead B Q1: a file whose context bodies exceed the pass
+/// allowance no longer gets a one-off oversized allowance. Each pass sends at
+/// most the allowance; a pass that ACKed part of the file re-queues it owed,
+/// and the next read resends only the unACKed tail before the receipt.
 #[test]
-fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
+fn real_scan_oversized_context_unit_splits_bounded_and_progresses() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let (mut scan, _) = f.walk(false);
@@ -1562,50 +1750,97 @@ fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
     );
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
-    f.cache = Arc::default();
-    let previous = f.index.clone();
-    let (((mut scan, _), parses), _) =
-        upload_context_read::with_read_limit(fs::metadata(&f.path).unwrap().len(), || {
-            terminal_contract_retry::source_acquisitions(|| f.walk(false))
-        });
-    assert_eq!(parses.get(&f.path), Some(&1));
-    assert!(
-        f.index.context_read_counts.wire_allowance > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
-    );
-    scan.snapshots = items;
-    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
-    let first = f.uploader.posts.len();
-    let received_before = f.uploader.received_catchup_bytes;
-    let allowance = f.index.context_read_counts.wire_allowance as u64;
-    assert_eq!(
-        f.index.context_read_counts.files, 1,
-        "the oversized exception admits one logical file alone"
-    );
-    assert!(f.index.context_read_counts.local_bytes <= fs::metadata(&f.path).unwrap().len());
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+    {
+        // Other traffic spent the whole allowance: nothing advances, so the
+        // owed file waits instead of being re-queued (no pressure loop).
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let ((mut scan, _), _) =
+            upload_context_read::with_read_limit(fs::metadata(&f.path).unwrap().len(), || {
+                f.walk(false)
+            });
+        scan.snapshots = items.clone();
+        finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+        f.index.traversal = Some(super::claude_family_census_shadow_tests::traversal());
+        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(0);
+        let first = f.uploader.posts.len();
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(f.uploader.posts.len(), first);
+        assert!(f
+            .index
+            .traversal
+            .take()
             .unwrap()
-            .0,
-        1,
-        "the complete unit receives fresh ACKs in the same pass"
-    );
-    assert_eq!(
-        f.uploader.posts[first..]
+            .pending_candidates
+            .is_empty());
+    }
+    let mut sent = Vec::new();
+    for pass in 0..2 {
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let (((mut scan, _), parses), _) =
+            upload_context_read::with_read_limit(fs::metadata(&f.path).unwrap().len(), || {
+                terminal_contract_retry::source_acquisitions(|| f.walk(false))
+            });
+        assert_eq!(
+            parses.get(&f.path),
+            Some(&1),
+            "pass {pass} reads the owed file"
+        );
+        assert_eq!(f.index.context_read_counts.files, 1);
+        scan.snapshots = items.clone();
+        finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+        // A live generation queue to return the owed file to.
+        f.index.traversal = Some(super::claude_family_census_shadow_tests::traversal());
+        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+        let first = f.uploader.posts.len();
+        let received_before = f.uploader.received_catchup_bytes;
+        let (files, _) = f
+            .uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        let posted = f.uploader.posts[first..]
             .iter()
-            .map(Vec::len)
-            .sum::<usize>(),
-        4
-    );
-    assert!(f.uploader.posts[first..]
-        .iter()
-        .all(|post| serde_json::to_vec(post).unwrap().len()
-            <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES));
-    let received = f.uploader.received_catchup_bytes - received_before;
-    assert!(received > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64);
-    assert!(received <= allowance);
-    assert_eq!(f.uploader.counts().1, received);
+            .flatten()
+            .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!posted.is_empty(), "pass {pass} makes progress");
+        assert!(
+            f.uploader.received_catchup_bytes - received_before
+                <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64,
+            "pass {pass} catch-up stays within the pass allowance"
+        );
+        assert!(f.uploader.posts[first..]
+            .iter()
+            .all(|post| serde_json::to_vec(post).unwrap().len()
+                <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES));
+        sent.extend(posted);
+        let requeued = f
+            .index
+            .traversal
+            .take()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|pending| pending.path == f.path);
+        if pass == 0 {
+            assert_eq!(files, 0, "no receipt while a body is unACKed");
+            assert!(requeued, "the owed file returns to its generation queue");
+        } else {
+            assert_eq!(files, 1, "the last exact ACK completes the receipt");
+            assert!(!requeued);
+        }
+    }
+    let unique = sent.iter().collect::<BTreeSet<_>>();
+    assert_eq!(sent.len(), 4, "only unACKed bodies resend");
+    assert_eq!(unique.len(), 4);
     f.assert_quiet();
 }
 
@@ -1656,7 +1891,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     f.cache = Arc::default();
     let previous = f.index.clone();
     let ((scan, _), order) =
-        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3));
+        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3, false));
     assert!(
         order
             .first()
@@ -1797,7 +2032,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         let previous = f.index.clone();
         let (((scan, native), reads), group_native) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 2, false)
+                })
             });
         assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
@@ -1835,7 +2072,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         let previous = f.index.clone();
         let (((scan, native), reads), group_native) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 2, false)
+                })
             });
         assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
@@ -1995,7 +2234,9 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         let previous = f.index.clone();
         let (((scan, native), reads), physical_group_bytes) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 3, false)
+                })
             });
         assert!(scan.scanned_file_count <= 3);
         assert!(

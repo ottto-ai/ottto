@@ -49,7 +49,7 @@ fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlPa
     } else {
         apply_claude_code_line
     };
-    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
 }
 
 struct ClearPreparationFault;
@@ -218,7 +218,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _reset = ResetActiveBudget;
     let _clear = ClearPreparationFault;
     let source = SnapshotSource::ClaudeCode;
@@ -271,7 +270,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 None,
                 &[],
                 false,
-                true,
                 true,
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone())
@@ -453,7 +451,6 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 None,
                 &[],
                 false,
-                true,
                 true,
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone())
@@ -1355,7 +1352,6 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone());
             let (mut index, mut scan, _) = fixture::scan_modes(scan, 10_000);
@@ -2219,7 +2215,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache.clone(), namespace);
                 if bypass == "sampling_none" || bypass == "compressed" {
@@ -2531,7 +2526,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     Some(&root),
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache, namespace.clone());
                 for _ in 0..10_000 {
@@ -2843,7 +2837,6 @@ pub(super) fn known_corrupt_scan(
         Some(support),
         &[],
         false,
-        true,
         capture,
     )
     .with_sampled_acquisition(cache.clone(), namespace.clone());
@@ -3859,7 +3852,6 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     let taken = cache
@@ -3964,7 +3956,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
         for _ in 0..10000 {
@@ -4319,7 +4310,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     None,
                     &[],
                     rediscover,
-                    true,
                     true,
                 );
                 if at.starts_with("2028") {
@@ -4858,7 +4848,6 @@ fn a1a_scan_at(
             Some(support),
             &[],
             false,
-            true,
             false,
         )
         .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
@@ -5446,7 +5435,6 @@ fn b1g_owned(
         Some(root),
         &[],
         false,
-        true,
         false,
     )
     .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()))
@@ -6141,7 +6129,6 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
                     &[],
                     false,
                     true,
-                    true,
                 )
                 .with_sampled_acquisition(cache.clone(), namespace.clone());
                 fixture::scan_reads(scan, 10_000)
@@ -6350,7 +6337,6 @@ impl O3Fixture {
             Some(&self.root),
             &[],
             false,
-            true,
             false,
         )
         .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
@@ -6613,7 +6599,6 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
             &[],
             false,
             true,
-            true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
         fixture::scan_reads(scan, 10_000)
@@ -6812,7 +6797,6 @@ fn b4_structural_transition(near_cap: bool) {
                 None,
                 &[],
                 false,
-                true,
                 true,
             )
             .with_sampled_acquisition(cache, namespace.clone());
@@ -7039,7 +7023,6 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
                 None,
                 &[],
                 false,
-                true,
                 true,
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone());
@@ -7517,7 +7500,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
@@ -10256,7 +10238,6 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 &[],
                 false,
                 true,
-                true,
             )
             .with_sampled_acquisition(cache, namespace.clone());
             let (mut index, mut scan, modes) = fixture::scan_reads(scan, 10_000);
@@ -11180,7 +11161,6 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));

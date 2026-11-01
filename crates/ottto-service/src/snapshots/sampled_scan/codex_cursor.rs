@@ -5893,7 +5893,6 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) codex: &'a CodexTitleMetadata,
     pub(in crate::snapshots) claude: &'a ClaudeTitleMetadata,
     pub(in crate::snapshots) support: Option<&'a Path>,
-    pub(in crate::snapshots) context_curve_enabled: bool,
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) parents:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
@@ -5951,14 +5950,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.support,
         )
         .map(|dependency| {
-            sampling.file_scope(
-                context.source,
-                &job.candidate,
-                &dependency,
-                true,
-                context.context_curve_enabled,
-                index,
-            )
+            sampling.file_scope(context.source, &job.candidate, &dependency, true, index)
         })
     });
     // A group's counting view is built over every member (R1-M2).

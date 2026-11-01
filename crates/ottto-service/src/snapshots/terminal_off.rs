@@ -427,11 +427,14 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
     // Existing queue is durable demand; re-list metadata without throwing it
     // away, changing the frozen window or minting a new native owner.
     for root in &traversal.scan_roots {
-        if !traversal
+        if let Some(position) = traversal
             .pending_directories
             .iter()
-            .any(|p| p.path == *root)
+            .position(|p| p.path == *root)
         {
+            // A pending re-listing root becomes this full rediscovery walk.
+            traversal.pending_directories[position].census_member = true;
+        } else {
             traversal.pending_directories.push_back(ScanTraversalPath {
                 scan_root: root.clone(),
                 path: root.clone(),
@@ -499,7 +502,7 @@ fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 3
     ] {
         update_length_prefixed(&mut digest, value.as_bytes());
     }
-    digest.update(index.context_curve_replay_epoch.to_be_bytes());
+    digest.update(crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH.to_be_bytes());
     Some(digest.finalize().into())
 }
 fn terminal_off_empty_context_seen(index: &ScanIndex, key: &str) -> bool {

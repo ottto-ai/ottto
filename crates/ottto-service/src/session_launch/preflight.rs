@@ -131,9 +131,11 @@ fn claude(binding: &Binding, cwd: &Path) -> Result<(), Block> {
         ));
         paths.push((Layer::Project, main.join(".claude/settings.json")));
     }
+    // Claude Code caches the organization's server-managed settings here
+    // for Team and Enterprise logins; it uses the settings.json schema.
+    paths.push((Layer::Managed, binding.root.join("remote-settings.json")));
     // These policy sources are not statically evaluable by this version.
     for path in [
-        binding.root.join("remote-settings.json"),
         binding.root.join("managed-settings.json"),
         binding
             .user

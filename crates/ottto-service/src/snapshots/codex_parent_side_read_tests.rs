@@ -106,7 +106,6 @@ fn page(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(
         Arc::clone(cache),

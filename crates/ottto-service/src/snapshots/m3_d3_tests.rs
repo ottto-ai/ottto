@@ -122,7 +122,6 @@ fn scan_with_window(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(cache, namespace.clone());
     let (mut index, mut scan, _, _) = fixture::scan(scan, 10_000);

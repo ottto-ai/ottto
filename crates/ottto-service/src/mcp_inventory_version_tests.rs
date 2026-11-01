@@ -149,7 +149,6 @@ fn full_version_feed(home: &Path, start: &str, version: &str) -> Arc<CodexVersio
         None,
         &[],
         false,
-        true,
     )
     .with_codex_versions(feed.clone());
     loop {

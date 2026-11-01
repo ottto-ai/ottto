@@ -83,7 +83,6 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
             Some(&scratch),
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
         fixture::scan(scan, 1000).1.snapshots

@@ -679,34 +679,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn expired_live_access_pauses_without_worker_spawn_or_collection() {
-        let access = rfc3339_from_now(-TimeDuration::minutes(1));
-        let refresh = rfc3339_from_now(TimeDuration::days(20));
-
-        let observation = observe_registered_slot_upkeep_reading(
-            &descriptor_without_persisted_deadline(),
-            true,
-            true,
-            &live(ClaudeLocalLoginState::RefreshPending, &access, &refresh),
-            RefreshDecision::Disabled,
-            OffsetDateTime::now_utc(),
-        );
-
-        assert!(!observation.proceed_with_collection);
-        assert!(observation.paused_awaiting_claude_refresh);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-        );
-        assert_eq!(
-            observation.status.due_access_expires_at.as_deref(),
-            Some(access.as_str())
-        );
-        assert_eq!(observation.status.attempted_at, None);
-    }
-
-    #[test]
-    #[serial]
     fn unreadable_or_absent_live_login_lets_resolution_report_the_exact_failure() {
         let unreadable = observe_registered_slot_upkeep_reading(
             &descriptor_without_persisted_deadline(),
@@ -834,28 +806,6 @@ mod tests {
             cleared_by_cli: true,
             has_profile_scope: false,
         }
-    }
-
-    #[test]
-    #[serial]
-    fn cli_cleared_credential_needs_login_without_worker_or_collection() {
-        let observation = observe_registered_slot_upkeep_reading(
-            &descriptor_without_persisted_deadline(),
-            true,
-            true,
-            &ClaudeLiveLogin {
-                state: ClaudeLocalLoginState::SignedOutByCli,
-                metadata: Some(cli_cleared_metadata()),
-            },
-            RefreshDecision::Disabled,
-            OffsetDateTime::now_utc(),
-        );
-
-        assert!(!observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        );
     }
 
     #[test]

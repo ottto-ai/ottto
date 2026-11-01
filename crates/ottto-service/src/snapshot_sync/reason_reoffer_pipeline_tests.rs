@@ -1079,15 +1079,14 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
 /// SOURCE proves the original pair and a late API capture adds the session's
 /// identity. The session's next offer is rebuilt from the current evidence,
 /// never from the refused body: the server accepts a body with the refused
-/// body's usage and the late rows' login and org tags, and the refused body
-/// is never sent again.
+/// body's usage and the late rows' tags under R2-N2 (a request whose late row
+/// contradicts its own org marker keeps the starting account, no login), and
+/// the refused body is never sent again.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
-    // R2-N2: gate on, conflicting org markers go to the starting account; the login is dropped.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
         return;
     }
@@ -1146,30 +1145,59 @@ fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
         usage_of(&refused),
         "same usage; only the identity tags are new"
     );
-    // The late rows' tags: every usage row carries the login and links to a
-    // telemetry entry naming the org.
+    // The late rows' tags, per request (R2-N2). req_1 sits on the transcript's
+    // own credential_org marker and its late row names another org: two orgs
+    // on one request go to the starting account and drop the login. req_2
+    // has no own marker, so its late row's login and org tag it.
     let evidence = accepted["request_evidence"]
         .as_array()
         .unwrap_or_else(|| panic!("the tagged body declares its evidence: {accepted}"));
     let rows = usage_rows(accepted);
     assert!(!rows.is_empty(), "{accepted}");
+    let mut tags = Vec::new();
     for row in rows {
-        assert_eq!(
-            row["account_identifier_hash"],
-            login.as_str(),
-            "login tag: {accepted}"
-        );
-        let reference = row["evidence_ref"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("every usage row has an identity tag: {accepted}"));
-        let entry = &evidence[usize::try_from(reference).unwrap()];
-        assert_eq!(entry["identity_basis"], identity::TELEMETRY, "{accepted}");
-        assert_eq!(
-            entry["provider_workspace_hash"],
-            org.as_str(),
-            "org tag: {accepted}"
-        );
+        let shares = match row["identity_parts"].as_array() {
+            Some(parts) => parts.iter().collect::<Vec<_>>(),
+            None => vec![row],
+        };
+        for share in shares {
+            let reference = share["evidence_ref"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("every usage share has an identity tag: {accepted}"));
+            let entry = &evidence[usize::try_from(reference).unwrap()];
+            tags.push((
+                share["input_tokens"].as_u64(),
+                share["request_count"].as_u64(),
+                share["account_identifier_hash"].as_str().map(str::to_owned),
+                entry["identity_basis"].as_str().map(str::to_owned),
+                entry["provider_workspace_hash"].as_str().map(str::to_owned),
+            ));
+        }
     }
+    tags.sort();
+    tags.dedup();
+    let org_hash = |id| ottto_core::billing_identity_hash("anthropic", "organization", id);
+    assert_eq!(
+        tags,
+        vec![
+            (
+                Some(10),
+                Some(1),
+                None,
+                Some(identity::TRANSCRIPT_ORG.to_owned()),
+                org_hash(IDENTITY_PIPELINE_ORG),
+            ),
+            (
+                Some(20),
+                Some(1),
+                Some(login.clone()),
+                Some(identity::TELEMETRY.to_owned()),
+                Some(org.clone()),
+            ),
+        ],
+        "R2-N2: the two-org request keeps the starting account without the login; \
+         the later request carries the late login and org: {accepted}"
+    );
     assert!(
         accepted.get("request_identity_refusals").is_none(),
         "{accepted}"
@@ -2230,15 +2258,18 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
     assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
 }
 
-/// #705's returning tombstoned member remains held by #712 when its
-/// pre-cutoff history belongs to a move without an explicit full claim.
+/// #705's returning tombstoned member under #712's move hold, on the
+/// always-on path (E2 ruling on U10): (a) the E2 page clears the tombstone,
+/// whatever the proof's health; (b) the #712 hold still withholds the body,
+/// with nothing uploaded or stamped; (c) once the hold releases (an explicit
+/// `full` claim, then readable proof) the family's money is exactly its
+/// request-owned total: one request-owned body, never a legacy one beside it,
+/// and no identity beyond what the first accepted body carried.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn tombstoned_returning_history_obeys_the_move_hold() {
-    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("tombstoned_returning_history_obeys_the_move_hold") {
         return;
     }
@@ -2247,6 +2278,22 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     let mut pipeline = ReofferPipeline::new("patha-return-history-held", Answer::Accept, t0);
     let first = pipeline.cycle(t0);
     assert!(first.result.is_ok(), "{:?}", first.result);
+    let root_offers = |offered: &[serde_json::Value]| {
+        offered
+            .iter()
+            .filter(|offer| offer["source_session_id"] == root)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let baseline = root_offers(&pipeline.server.offered());
+    assert_eq!(baseline.len(), 1, "the root is offered once at first");
+    let baseline = baseline[0].clone();
+    assert_eq!(
+        baseline["usage_accounting_contract"],
+        crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+        "the unlisted baseline is request-owned: {baseline}"
+    );
+    assert_eq!(usage_of(&baseline), (2, 30, 3), "req_1 + req_2");
     let key = first
         .index
         .files
@@ -2254,6 +2301,8 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         .find(|key| key.ends_with(&format!("{root}.jsonl")))
         .cloned()
         .expect("the root is indexed");
+    let settled_revision = first.index.files[&key].effective_upload_body_witness_revision;
+    assert_ne!(settled_revision, 0, "the accepted baseline is stamped");
     let mut index = ScanIndex::load(&first.index_path).unwrap();
     index.tombstone_claude_family_for_test(root);
     index.save(&first.index_path).unwrap();
@@ -2288,9 +2337,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         0
     );
 
-    // Retire it again, then return without healthy proof. This is the
-    // retained-tombstone case: the history hold and the authority debt both
-    // stay owed. Keep all the original retention and wire assertions below.
+    // Retire it again, then return without healthy proof.
     let mut index = ScanIndex::load(&proved_return.index_path).unwrap();
     index.tombstone_claude_family_for_test(root);
     index.save(&proved_return.index_path).unwrap();
@@ -2315,150 +2362,142 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     .unwrap();
     let returned = pipeline.cycle(t0 + 2_400);
     assert!(returned.result.is_ok(), "{:?}", returned.result);
+    // (b) The #712 hold still withholds the body: nothing uploaded, nothing
+    // stamped, and the durable move marker stands.
     assert_eq!(
         pipeline.server.offered().len(),
         offered_before,
         "history stays held"
     );
-    assert!(returned.index.claude_family_tombstoned_for_test(root));
     assert_eq!(
         returned.index.files[&key].effective_upload_body_witness_revision,
         0
     );
-}
-
-/// COST (Round 16): a family whose tombstone was used and that then returns
-/// goes back through the normal authority/proof path, through the real
-/// prepare/finish pipeline and the server's offer recorder. The root is
-/// accepted, retired with its tombstone and returns with the same bytes
-/// while its local proof is unhealthy: it is read against the retained
-/// witness (a bounded RetryPending record re-forms), never as a new file,
-/// and nothing is offered. Once the evidence is healthy, its next changed
-/// revision (a note, so the request set still matches the witness)
-/// re-proves and its body is offered exactly once with the same usage: never
-/// added again as new history, nothing offered twice across later cycles,
-/// and the root is never dropped (indexed, accepted, tombstone cleared).
-/// #712's history hold over a returning member is
-/// `tombstoned_returning_history_obeys_the_move_hold` above.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
-    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !supported("returning_tombstoned_family_is_held_until_proof_then_reoffered_once") {
-        return;
-    }
-    let root = IDENTITY_PIPELINE_ROOT;
-    let t0 = current_unix_seconds();
-    let mut pipeline = ReofferPipeline::new("patha-return-reoffered-once", Answer::Accept, t0);
-    let first = pipeline.cycle(t0);
-    assert!(first.result.is_ok(), "{:?}", first.result);
-    let root_offers = |offered: &[serde_json::Value]| {
-        offered
-            .iter()
-            .filter(|offer| offer["source_session_id"] == root)
-            .map(fingerprint_of)
-            .collect::<Vec<_>>()
-    };
-    let accepted = root_offers(&pipeline.server.offered());
-    assert_eq!(accepted.len(), 1, "the root is offered once at first");
-    let key = first
-        .index
-        .files
-        .keys()
-        .find(|key| key.ends_with(&format!("{root}.jsonl")))
-        .cloned()
-        .expect("the root is indexed");
-    let witness = first
-        .index
-        .claude_usage_family_witness_digest_for_test(root)
-        .expect("the proven root keeps a witness");
-
-    // Retire the family: its tombstone stands while it is absent.
-    let mut index = ScanIndex::load(&first.index_path).unwrap();
-    index.tombstone_claude_family_for_test(root);
-    index.save(&first.index_path).unwrap();
-    let transcript = pipeline
-        .fixture
-        .home
-        .join(".claude/projects/-synthetic-repo")
-        .join(format!("{root}.jsonl"));
-    let bytes = std::fs::read(&transcript).unwrap();
-    std::fs::remove_file(&transcript).unwrap();
-    let absent = pipeline.cycle(t0 + 600);
-    assert!(absent.result.is_ok(), "{:?}", absent.result);
-    assert!(!absent.index.files.contains_key(&key));
-    assert!(absent.index.claude_family_tombstoned_for_test(root));
-    assert!(!reemission_list_path(&pipeline.support).exists());
-    let offered_before = pipeline.server.offered().len();
-
-    // It returns with the same bytes while its proof is unhealthy: the
-    // tombstone routes it to the authority path, held, nothing offered.
-    let api = pipeline
-        .support
-        .join("local-otel/claude-code-effort")
-        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
-    std::fs::write(&api, b"{ malformed synthetic proof\n").unwrap();
-    std::fs::write(&transcript, &bytes).unwrap();
-    let returned = pipeline.cycle(t0 + 1_200);
-    assert!(returned.result.is_ok(), "{:?}", returned.result);
-    assert!(
-        root_offers(&pipeline.server.offered()[offered_before..]).is_empty(),
-        "nothing is offered before the proof"
-    );
-    let record = returned
-        .index
-        .claude_authority_record_for_test(root)
-        .expect("the returning root re-forms its record, never a new file");
-    assert!(record.bound_to_retained_witness && !record.terminal);
-    assert_eq!(record.proven_witness_fingerprint, witness);
-    assert_eq!(record.failed_reconstruction_count, 1);
-    assert!(returned.index.claude_family_tombstoned_for_test(root));
-
-    // Healthy evidence and a changed revision that adds no request: the
-    // retained witness reconstructs, and its body is offered once.
-    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
-        .replace_nanosecond(0)
-        .unwrap()
-        .format(&Rfc3339)
-        .unwrap();
-    let note = serde_json::json!({"timestamp": at, "type": "user", "sessionId": root,
-        "message": {"role": "user", "content": "synthetic note"}});
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript)
-        .unwrap()
-        .write_all(format!("{note}\n").as_bytes())
-        .unwrap();
-    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
-    // It starts with the RetryPending record, which withholds this scan's
-    // census; the next cycle, with the debt settled, completes it again.
-    let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
-    assert!(proved.result.is_ok(), "{:?}", proved.result);
-    let later = pipeline.cycle(t0 + 2_400);
-    assert!(later.result.is_ok(), "{:?}", later.result);
-    let offered = pipeline.server.offered();
-    let reoffered = root_offers(&offered[offered_before..]);
-    assert_eq!(reoffered.len(), 1, "re-offered exactly once: {reoffered:?}");
-    let body = |fingerprint: &str| {
-        offered
-            .iter()
-            .find(|offer| fingerprint_of(offer) == fingerprint)
-            .unwrap()
-    };
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&returned.index_path).unwrap()).unwrap();
     assert_eq!(
-        usage_of(body(&reoffered[0])),
-        usage_of(body(&accepted[0])),
-        "the same usage, never added again as new history"
+        saved["claude_history_move_not_full"].as_bool(),
+        Some(true),
+        "the move hold stands"
     );
-    assert!(later.index.files.contains_key(&key), "never dropped");
-    assert!(later
-        .index
-        .accepted_snapshot_fingerprint_recorded(&reoffered[0]));
-    assert!(later.index.claude_authority_record_for_test(root).is_none());
-    assert!(!later.index.claude_family_tombstoned_for_test(root));
+    assert!(saved.get("claude_history_move_released").is_none());
+    // (a) The E2 page settles the family's authority even with unhealthy
+    // proof: the tombstone clears (snapshots.rs fold, E2 ruling on U10).
+    assert!(!returned.index.claude_family_tombstoned_for_test(root));
+
+    // (c) Release the hold the production way: an explicit `full` claim
+    // clears the move marker for good. The proof is still unreadable, so its
+    // own hold keeps the owed body back: no Unknown body is sent that a
+    // later account could replace.
+    crate::backfill::apply_claim_backfill_policy(&pipeline.support, Some("full"), None, "user")
+        .expect("explicit full claim");
+    let claimed = pipeline.cycle(t0 + 3_000);
+    assert!(claimed.result.is_ok(), "{:?}", claimed.result);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&claimed.index_path).unwrap()).unwrap();
+    assert!(
+        saved.get("claude_history_move_not_full").is_none(),
+        "the full claim clears the move hold"
+    );
+    assert_eq!(saved["claude_history_move_released"].as_bool(), Some(true));
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered_before,
+        "unreadable proof still withholds the owed body"
+    );
+    assert_eq!(
+        claimed.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+    assert!(!claimed.index.claude_family_tombstoned_for_test(root));
+
+    // Readable proof: the released body settles.
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    let release_offers_start = pipeline.server.offered().len();
+    let released = pipeline.cycle(t0 + 3_600);
+    assert!(released.result.is_ok(), "{:?}", released.result);
+    assert_eq!(
+        released.index.files[&key].effective_upload_body_witness_revision, settled_revision,
+        "the hold released and the body settled"
+    );
+    assert!(!released.index.claude_family_tombstoned_for_test(root));
+    let offered = pipeline.server.offered();
+    let new_offers = root_offers(&offered[offered_before..]);
+    assert!(
+        new_offers.len() <= 1,
+        "at most one replacement body: {new_offers:?}"
+    );
+    // The family's money: its current body is the request-owned total, and
+    // no legacy body was ever sent beside it.
+    let all_offers = root_offers(&offered);
+    for offer in &all_offers {
+        assert_eq!(
+            offer["usage_accounting_contract"],
+            crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+            "no legacy body: {offer}"
+        );
+        assert_ne!(
+            offer["usage_accounting_contract"],
+            "session_exclusive_reported_usage:v1"
+        );
+    }
+    let current = all_offers.last().unwrap();
+    assert_eq!(
+        usage_of(current),
+        usage_of(&baseline),
+        "family total == request-owned total, counted once"
+    );
+    // The durable ACK ledger is the index. finish_sync_source resets the
+    // progress file once this release page fully settles; the index keeps
+    // the exact rebuilt body uploaded on the page.
+    let uploaded_on_release = &offered[release_offers_start..];
+    let uploaded_fingerprints = uploaded_on_release
+        .iter()
+        .map(fingerprint_of)
+        .collect::<BTreeSet<_>>();
+    let release_accepted = released.index.accepted_snapshot_fingerprints_for_test();
+    assert_eq!(uploaded_on_release.len(), 1,
+        "U10(c1): exactly one release-page upload; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        release_accepted);
+    assert!(uploaded_fingerprints.is_subset(release_accepted),
+        "U10(c1): every uploaded body has its exact ACK; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        release_accepted);
+    // No Unknown -> account upgrade: a replacement carries exactly the
+    // first accepted body's identity, never an account it lacked. With no
+    // replacement, the server already holds that exact accepted body.
+    let accounts = |offer: &serde_json::Value| {
+        usage_rows(offer)
+            .into_iter()
+            .flat_map(|row| {
+                std::iter::once(row)
+                    .chain(json_array(&row["identity_parts"]))
+                    .filter_map(|tag| tag["account_identifier_hash"].as_str())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    match new_offers.first() {
+        Some(replacement) => {
+            assert_eq!(accounts(replacement), accounts(&baseline), "{replacement}");
+            assert_eq!(
+                replacement["request_evidence"], baseline["request_evidence"],
+                "{replacement}"
+            );
+        }
+        None => assert_eq!(fingerprint_of(current), fingerprint_of(&baseline)),
+    }
+
+    // Quiet: nothing more is sent and the stamp holds.
+    let quiet = pipeline.cycle(t0 + 4_200);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(pipeline.server.offered().len(), offered.len(),
+        "U10(c2): quiet cycle offers nothing; release_uploaded={uploaded_fingerprints:?} release_accepted={:?} quiet_accepted={:?}",
+        release_accepted, quiet.index.accepted_snapshot_fingerprints_for_test());
+    assert_eq!(
+        quiet.index.files[&key].effective_upload_body_witness_revision,
+        settled_revision
+    );
 }
 
 /// A returning family that grew needs one cumulative replacement body.
@@ -2467,8 +2506,8 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
-    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Tombstone hold until reported proof is ordinary-money policy: the family is listed below.
+
     if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {
         return;
     }
@@ -2514,6 +2553,10 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
     assert!(!absent.index.files.contains_key(&key));
     assert!(absent.index.claude_family_tombstoned_for_test(root));
     assert!(!reemission_list_path(&pipeline.support).exists());
+    // The family keeps ordinary money: an installed list names it, and every
+    // later cycle loads that list (`load_claude_reemission_exclusions`).
+    crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
+    assert!(reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
 
     // It returns with the same bytes while its proof is unhealthy: the

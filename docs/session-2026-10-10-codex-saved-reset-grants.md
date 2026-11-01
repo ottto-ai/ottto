@@ -155,7 +155,8 @@ No live provider calls were made; all fixtures are synthetic.
   of the old 2.
 - The cost figures are inferred from the upstream client's request pattern,
   not measured provider calls.
-- The legacy OAuth fallback path (opt-in, default home only) gains `kind` but
-  no grants; it never read the reset list.
+- The legacy OAuth fallback path (opt-in, default home only) gained `kind` but
+  no grants; it never read the reset list. It was retired on 2026-10-31, so
+  every home reads quota from the app-server.
 - Emitting pools as meters, an exact-decimal credit balance and an
   `ordinaryUsageAllowed` passthrough remain out of scope.

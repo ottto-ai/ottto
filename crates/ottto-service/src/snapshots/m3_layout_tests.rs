@@ -75,7 +75,6 @@ impl Fixture {
             Some(&self.root),
             &[],
             false,
-            true,
         );
         if let Some(cache) = cache {
             scan = scan.with_sampled_acquisition(cache, self.namespace.clone());

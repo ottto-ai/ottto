@@ -236,7 +236,6 @@ fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
         None,
         None,
         false,
-        false,
     )
     .unwrap();
     while !parser.step().unwrap() {}

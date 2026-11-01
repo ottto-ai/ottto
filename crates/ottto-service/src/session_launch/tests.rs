@@ -750,3 +750,26 @@ fn codex_system_configuration_is_presence_refused() {
     fs::remove_file(path).unwrap();
     assert!(preflight::codex(&binding, &cwd, &system).is_ok());
 }
+
+#[test]
+fn claude_remote_settings_are_validated_not_presence_refused() {
+    let scratch = crate::test_scratch::ScratchDir::new("claude-remote-settings");
+    let home = scratch.as_ref().join("home");
+    let cwd = scratch.as_ref().join("project");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    let binding = fixture_binding(&home);
+    let path = home.join(".claude/remote-settings.json");
+    // Team and Enterprise logins cache organization settings in this file.
+    fs::write(&path, r#"{"channelsEnabled":false}"#).unwrap();
+    assert!(preflight::evaluate(&binding, &cwd).is_ok());
+    fs::write(&path, "{}").unwrap();
+    assert!(preflight::evaluate(&binding, &cwd).is_ok());
+    fs::write(&path, r#"{"forceLoginMethod":"console"}"#).unwrap();
+    let error = preflight::evaluate(&binding, &cwd).unwrap_err();
+    assert_eq!(error.reason, Reason::ForcedLoginMethod);
+    assert_eq!(
+        error.setting_layer,
+        Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
+    );
+}

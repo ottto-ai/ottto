@@ -420,6 +420,13 @@ impl Counts {
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
     }
+    /// What a non-Claude page emits: the shared retained cache's events only.
+    pub(super) fn retained_cache_only(self) -> Self {
+        Self {
+            retained_cache_page_events: self.retained_cache_page_events,
+            ..Self::default()
+        }
+    }
     pub(super) fn without_terminal_rearm(mut self) -> Self {
         self.rearm_veto_ignored = Default::default();
         self.rearm_fingerprints_preserved = 0;

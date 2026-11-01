@@ -11,7 +11,7 @@ fn supported(name: &str) -> bool {
     true
 }
 
-fn corpus(name: &str) -> Corpus {
+pub(super) fn corpus(name: &str) -> Corpus {
     // A shared absolute root gives base and candidate identical input paths.
     // No PID, wall clock or random IDs; raw within-build bodies stay exact.
     let base = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
@@ -39,7 +39,7 @@ fn corpus(name: &str) -> Corpus {
 }
 
 // Pin physical input clocks rather than deleting volatile fields from uploads.
-fn input_clock(path: &Path) {
+pub(super) fn input_clock(path: &Path) {
     std::fs::File::options()
         .write(true)
         .open(path)
@@ -86,7 +86,7 @@ fn save_inputs(c: &Corpus) {
 
 // Retain the actual emitted items: SnapshotItem intentionally has no wire
 // deserializer, and production hashes must be recomputed from production types.
-struct ReceiptBody {
+pub(super) struct ReceiptBody {
     raw: Vec<u8>,
     source: SnapshotSource,
     items: Vec<SnapshotItem>,
@@ -167,6 +167,20 @@ fn assert_cross_build_scope(raw: &Value, cross: &Value) {
 }
 
 fn receipt(name: &str, bodies: &[ReceiptBody]) {
+    receipt_with_output(
+        name,
+        bodies,
+        "OTTTO_MONEY_EQUIVALENCE_OUTPUT",
+        "MONEY_EQUIVALENCE",
+    );
+}
+
+pub(super) fn receipt_with_output(
+    name: &str,
+    bodies: &[ReceiptBody],
+    output_env: &str,
+    marker: &str,
+) {
     assert!(!bodies.is_empty(), "zero emitted bodies is no proof");
     let bytes = serde_json::to_vec(&bodies.iter().map(|b| &b.raw).collect::<Vec<_>>()).unwrap();
     let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -178,7 +192,7 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
     )
     .unwrap();
     let cross_digest = format!("{:x}", Sha256::digest(&cross));
-    if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
+    if let Some(out) = std::env::var_os(output_env) {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join(format!("{name}.json")), &bytes).unwrap();
@@ -191,7 +205,7 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
         .unwrap();
     }
     println!(
-        "MONEY_EQUIVALENCE {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={cross_digest}",
+        "{marker} {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={cross_digest}",
         bytes.len()
     );
 }
@@ -382,7 +396,7 @@ fn claude_pages(
     [tail, full, disk]
 }
 
-fn finish_claude_pages(c: &Corpus, pages: &mut [Page; 3]) {
+pub(super) fn finish_claude_pages(c: &Corpus, pages: &mut [Page; 3]) {
     for page in pages {
         page.enrich(c); // attach, side calls, identity reconcile and emission
         page.finish(); // policy/body witnesses/holds, as in the real pipeline
@@ -394,7 +408,7 @@ fn compare_claude_pages(c: &Corpus, mut pages: [Page; 3]) -> ReceiptBody {
     compare_claude_uploads(&pages)
 }
 
-fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
+pub(super) fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
     let [tail, full, disk] = pages;
     let (a, wire_a, _) = upload(&tail.scan.snapshots, &mut e2_progress(), ack);
     let (b, wire_b, _) = upload(&full.scan.snapshots, &mut e2_progress(), ack);
@@ -893,7 +907,7 @@ fn disk_corpus(name: &str) -> (Corpus, Disk, PathBuf, E2ScanFixture, ScanIndex) 
     (c, disk, path, scanner, prior)
 }
 
-fn grow(path: &Path, request: &str, tokens: u64) {
+pub(super) fn grow(path: &Path, request: &str, tokens: u64) {
     append(path, &line(ROOT, request, AT, tokens));
     input_clock(path);
 }

@@ -31,17 +31,8 @@ fn freshness_touched_families_do_not_refuse_a_parkable_frame() {
     }
     // Reuse the I/O-free scan constructor; the bound walks the same fields
     // for every source. Removed keys model the rest of a busy Claude page.
-    let mut frame = OwnedSourceScan::new_continuation(
-        &[],
-        index(),
-        WINDOW,
-        30,
-        10_000,
-        false,
-        false,
-        None,
-        None,
-    );
+    let mut frame =
+        OwnedSourceScan::new_continuation(&[], index(), WINDOW, 30, 10_000, false, None, None);
     frame.source = SnapshotSource::ClaudeCode;
     frame.census.removed_index_keys = (0..2_500)
         .map(|n| root_key("removed", &root_id(n)))
@@ -80,7 +71,7 @@ fn freshness_touched_families_do_not_refuse_a_parkable_frame() {
     );
 }
 
-fn traversal() -> ScanTraversalCheckpoint {
+pub(super) fn traversal() -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
         context_fingerprint: "context".to_string(),
         census_window_end: WINDOW.to_string(),
@@ -101,6 +92,8 @@ fn traversal() -> ScanTraversalCheckpoint {
         oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
+        listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
     }
 }
 

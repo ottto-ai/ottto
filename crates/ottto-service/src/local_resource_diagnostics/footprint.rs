@@ -1,4 +1,5 @@
 //! Bounded, process-wide footprint samples for local prepare/finish diagnostics.
+use super::StateV2Memory;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -21,17 +22,21 @@ pub(super) struct Observation {
     footprint_samples: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     footprint_sample_failures: Option<u64>,
+    #[serde(skip)]
+    memory_end: StateV2Memory,
+    #[serde(skip)]
+    memory_peak: StateV2Memory,
 }
 
 #[derive(Debug)]
-struct Counters {
+struct Metric {
     start: Option<u64>,
     end: AtomicU64,
     peak: AtomicU64,
     samples: AtomicU64,
     failures: AtomicU64,
 }
-impl Counters {
+impl Metric {
     fn new(start: Option<u64>) -> Self {
         let counters = Self {
             start,
@@ -60,6 +65,60 @@ impl Counters {
             stage_end_footprint_bytes: (end != UNKNOWN).then_some(end),
             footprint_samples: (samples > 0).then_some(samples),
             footprint_sample_failures: Some(self.failures.load(Relaxed)),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Counters {
+    primary: Metric,
+    resident: Metric,
+    physical: Metric,
+}
+impl Counters {
+    fn new(sample: StateV2Memory) -> Self {
+        Self {
+            primary: Metric::new(sample.phys_footprint_bytes.or(sample.rss_bytes)),
+            resident: Metric::new(sample.rss_bytes),
+            physical: Metric::new(sample.phys_footprint_bytes),
+        }
+    }
+    fn record(&self, sample: StateV2Memory) {
+        self.primary
+            .record(sample.phys_footprint_bytes.or(sample.rss_bytes));
+        self.resident.record(sample.rss_bytes);
+        self.physical.record(sample.phys_footprint_bytes);
+    }
+    fn finish(&self, sample: StateV2Memory) {
+        self.primary.end.store(
+            sample
+                .phys_footprint_bytes
+                .or(sample.rss_bytes)
+                .unwrap_or(UNKNOWN),
+            Relaxed,
+        );
+        self.resident
+            .end
+            .store(sample.rss_bytes.unwrap_or(UNKNOWN), Relaxed);
+        self.physical
+            .end
+            .store(sample.phys_footprint_bytes.unwrap_or(UNKNOWN), Relaxed);
+        self.record(sample);
+    }
+    fn observation(&self) -> Observation {
+        let resident = self.resident.observation();
+        let physical = self.physical.observation();
+        Observation {
+            memory_end: StateV2Memory {
+                rss_bytes: resident.stage_end_footprint_bytes,
+                phys_footprint_bytes: physical.stage_end_footprint_bytes,
+            },
+            memory_peak: StateV2Memory {
+                rss_bytes: resident.stage_peak_footprint_bytes,
+                phys_footprint_bytes: physical.stage_peak_footprint_bytes,
+            },
+            ..self.primary.observation()
         }
     }
 }
@@ -68,17 +127,17 @@ impl Counters {
 struct Sampler {
     slots: Mutex<Slots>,
     wake: Condvar,
-    read: fn() -> Option<u64>,
+    read: fn() -> StateV2Memory,
 }
 impl Sampler {
-    fn new(read: fn() -> Option<u64>) -> Self {
+    fn new(read: fn() -> StateV2Memory) -> Self {
         Self {
             slots: Mutex::new(std::array::from_fn(|_| None)),
             wake: Condvar::new(),
             read,
         }
     }
-    fn spawn(read: fn() -> Option<u64>) -> Option<Arc<Self>> {
+    fn spawn(read: fn() -> StateV2Memory) -> Option<Arc<Self>> {
         let sampler = Arc::new(Self::new(read));
         let worker = sampler.clone();
         std::thread::Builder::new()
@@ -180,8 +239,7 @@ impl Stage {
             let end = (self.sampler.read)();
             if let Ok(mut slots) = self.sampler.slots.lock() {
                 if open(&slots) {
-                    self.counters.end.store(end.unwrap_or(UNKNOWN), Relaxed);
-                    self.counters.record(end);
+                    self.counters.finish(end);
                     slots[self.index] = None;
                 }
             }
@@ -205,9 +263,7 @@ pub(super) fn unavailable() -> Observation {
 }
 
 #[cfg(target_os = "macos")]
-fn current() -> Option<u64> {
-    // TASK_VM_INFO rev1 prefix, through phys_footprint. Later revisions append
-    // fields; Darwin accepts the prefix word count. Mirrors the cap-test reader.
+pub(super) fn current() -> StateV2Memory {
     #[repr(C)]
     #[derive(Default)]
     struct TaskVmInfo {
@@ -222,9 +278,9 @@ fn current() -> Option<u64> {
         static mach_task_self_: libc::mach_port_t;
     }
     let mut vm = TaskVmInfo::default();
-    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
-    // SAFETY: both task_info calls get writable, correctly sized buffers, and
-    // fields are used only after success and a sufficient returned word count.
+    let words = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    let mut count = words;
+    // SAFETY: task_info receives writable, correctly sized prefix buffers.
     unsafe {
         if libc::task_info(
             mach_task_self_,
@@ -232,13 +288,12 @@ fn current() -> Option<u64> {
             (&mut vm as *mut TaskVmInfo).cast(),
             &mut count,
         ) == 0
+            && count >= 6
         {
-            if count >= (std::mem::size_of::<TaskVmInfo>() / 4) as u32 {
-                return Some(vm.phys_footprint);
-            }
-            if count >= 6 {
-                return Some(vm.resident_size);
-            }
+            return StateV2Memory {
+                rss_bytes: Some(vm.resident_size),
+                phys_footprint_bytes: (count >= words).then_some(vm.phys_footprint),
+            };
         }
         let mut basic = std::mem::zeroed::<libc::mach_task_basic_info>();
         let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
@@ -250,40 +305,61 @@ fn current() -> Option<u64> {
         ) == 0
             && count >= libc::MACH_TASK_BASIC_INFO_COUNT
         {
-            return Some(basic.resident_size);
+            return StateV2Memory {
+                rss_bytes: Some(basic.resident_size),
+                phys_footprint_bytes: None,
+            };
         }
     }
-    None
+    StateV2Memory::default()
 }
 #[cfg(target_os = "linux")]
-fn current() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    // SAFETY: sysconf has no pointer arguments; an unavailable page size fails closed.
-    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-    resident.checked_mul(page_size).filter(|_| page_size > 0)
+pub(super) fn current() -> StateV2Memory {
+    let rss_bytes = (|| {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        // SAFETY: sysconf has no pointer arguments.
+        let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        resident.checked_mul(page_size).filter(|_| page_size > 0)
+    })();
+    StateV2Memory {
+        rss_bytes,
+        phys_footprint_bytes: None,
+    }
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn current() -> Option<u64> {
-    None
+pub(super) fn current() -> StateV2Memory {
+    StateV2Memory::default()
+}
+
+impl Observation {
+    pub(super) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
+        (self.memory_end, self.memory_peak)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sample(bytes: Option<u64>) -> StateV2Memory {
+        StateV2Memory {
+            rss_bytes: bytes,
+            phys_footprint_bytes: None,
+        }
+    }
 
     #[test]
     fn slow_reader_never_holds_the_registry_lock() {
         static IN_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        fn read() -> Option<u64> {
+        fn read() -> StateV2Memory {
             IN_READ.store(true, Relaxed);
             while !RELEASE.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Some(10)
+            sample(Some(10))
         }
-        let sampler = Arc::new(Sampler::new(|| Some(10)));
+        let sampler = Arc::new(Sampler::new(|| sample(Some(10))));
         let stage = sampler.begin().unwrap();
         let slow = Arc::new(Sampler {
             slots: Mutex::new(sampler.slots.lock().unwrap().clone()),
@@ -312,13 +388,13 @@ mod tests {
         slow.slots.lock().unwrap()[stage.index] = None;
         drop(release);
         // The stage closed mid-read, so the late sample never lands on it.
-        assert_eq!(stage.counters.samples.load(Relaxed), 1);
+        assert_eq!(stage.counters.primary.samples.load(Relaxed), 1);
         drop(stage);
     }
 
     #[test]
     fn unavailable_samples_are_unknown_and_counted() {
-        let sampler = Arc::new(Sampler::new(|| None));
+        let sampler = Arc::new(Sampler::new(|| sample(None)));
         let stage = sampler.begin().unwrap();
         sampler.sample();
         let observation = stage.finish();
@@ -332,9 +408,9 @@ mod tests {
 
     #[test]
     fn overlapping_stages_have_independent_peaks_and_endpoints() {
-        fn read() -> Option<u64> {
+        fn read() -> StateV2Memory {
             static NEXT: AtomicU64 = AtomicU64::new(10);
-            Some(NEXT.fetch_add(10, Relaxed))
+            sample(Some(NEXT.fetch_add(10, Relaxed)))
         }
         let sampler = Arc::new(Sampler::new(read));
         let first = sampler.begin().unwrap(); // 10
@@ -362,10 +438,10 @@ mod tests {
 
     #[test]
     fn periodic_peak_survives_lower_end_and_partial_reader_failure() {
-        let sampler = Arc::new(Sampler::new(|| Some(10)));
+        let sampler = Arc::new(Sampler::new(|| sample(Some(10))));
         let stage = sampler.begin().unwrap();
-        stage.counters.record(Some(100));
-        stage.counters.record(None);
+        stage.counters.record(sample(Some(100)));
+        stage.counters.record(sample(None));
         let row = stage.finish();
         assert_eq!(row.stage_peak_footprint_bytes, Some(100));
         assert_eq!(row.stage_start_footprint_bytes, Some(10));
@@ -376,7 +452,7 @@ mod tests {
 
     #[test]
     fn slots_are_bounded_and_unwinding_releases_them() {
-        let sampler = Arc::new(Sampler::new(|| Some(10)));
+        let sampler = Arc::new(Sampler::new(|| sample(Some(10))));
         let mut stages: Vec<_> = (0..SLOTS).map(|_| sampler.begin().unwrap()).collect();
         assert!(sampler.begin().is_none());
         stages.pop();
@@ -393,17 +469,19 @@ mod tests {
     #[test]
     fn background_sampler_parks_and_stops_counting_after_end() {
         static READS: AtomicU64 = AtomicU64::new(0);
-        fn read() -> Option<u64> {
+        fn read() -> StateV2Memory {
             READS.fetch_add(1, Relaxed);
-            Some(100)
+            sample(Some(100))
         }
         let sampler = Sampler::spawn(read).unwrap();
         let stage = sampler.begin().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while stage.counters.samples.load(Relaxed) < 3 && std::time::Instant::now() < deadline {
+        while stage.counters.primary.samples.load(Relaxed) < 3
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(stage.counters.samples.load(Relaxed) >= 3);
+        assert!(stage.counters.primary.samples.load(Relaxed) >= 3);
         let ended = stage.finish().footprint_samples;
         let reads = READS.load(Relaxed);
         std::thread::sleep(INTERVAL * 3);
@@ -415,6 +493,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn native_reader_returns_current_bytes() {
-        assert!(current().is_some_and(|bytes| bytes > 0));
+        assert!(current().rss_bytes.is_some_and(|bytes| bytes > 0));
     }
 }

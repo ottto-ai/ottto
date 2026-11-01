@@ -60,7 +60,6 @@ fn money_facts(session: &str, count: usize) -> Box<[u8]> {
 
 #[test]
 fn money_birth_is_carried_only_for_the_same_object() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let key = "/money/projects/a.jsonl";
     let first = ClaudeRequestBirth {
         unix_seconds: 100,
@@ -123,7 +122,6 @@ fn money_birth_is_carried_only_for_the_same_object() {
 
 #[test]
 fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let dir = temp_dir("money-birth-open-read");
     let path = dir.join("d0000000-0000-4000-8000-00000000000d.jsonl");
     fs::write(&path, "{}\n").expect("write transcript fixture");
@@ -137,7 +135,6 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         None,
         None,
         None,
-        false,
         false,
     )
     .expect("claude parser");
@@ -165,7 +162,6 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
 
 #[test]
 fn money_birth_floor_makes_placeholder_births_unknown() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     for placeholder in [0, 1, 86_400, 1_577_836_800] {
         assert_eq!(crate::snapshots::claude_birth_seconds(placeholder), None);
     }
@@ -181,7 +177,6 @@ fn money_birth_floor_makes_placeholder_births_unknown() {
 
 #[test]
 fn money_ledger_records_are_invisible_to_d1() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let root = "a1111111-1111-4111-8111-111111111111";
     let otel = telemetry_key(root);
     assert!(otel.starts_with(TELEMETRY_KEY_PREFIX));
@@ -280,7 +275,6 @@ fn distinct_hashes(seed: char) -> Vec<u64> {
 
 #[test]
 fn money_transcript_records_retire_after_35_days() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let mut index = ScanIndex::default();
     // (name, record mtime age, entry mtime age, seed, record seed). Each
@@ -466,7 +460,6 @@ fn fill_census_to(index: &mut ScanIndex, total: usize) {
 /// other, so both keep their ids; a lone aged record still retires.
 #[test]
 fn census_retirement_keeps_aged_records_that_share_request_ids() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let mut index = ScanIndex::default();
     let holder = indexed_census(&mut index, "h", 'a', 60, vec![1, 2, 3, 4]);
     let copy = indexed_census(&mut index, "c", 'b', 40, vec![1, 2, 9]);
@@ -506,7 +499,6 @@ fn census_retirement_keeps_aged_records_that_share_request_ids() {
 /// nothing, retires and reports no kept row.
 #[test]
 fn census_retirement_without_overlap_is_unchanged() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let mut index = ScanIndex::default();
     let aged = indexed_census(&mut index, "aged", 'a', 40, vec![1, 2]);
     let retired = indexed_census(&mut index, "retired", 'b', 40, vec![1, 2]);
@@ -528,7 +520,6 @@ fn census_retirement_without_overlap_is_unchanged() {
 /// occupancy overflow, and the alarm fires. Only as many as needed go.
 #[test]
 fn census_retirement_occupancy_overflow_retires_the_oldest_and_alarms() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     assert_eq!(KEEP_OCCUPANCY, 1_887_436);
     const SIZE: u64 = 200_000;
     let mut index = ScanIndex::default();
@@ -567,7 +558,6 @@ fn census_retirement_occupancy_overflow_retires_the_oldest_and_alarms() {
 /// decision on a copy, retire exactly the same record.
 #[test]
 fn census_retirement_overlap_decision_is_deterministic() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     const SIZE: u64 = 200_000;
     let chain = |at: u64| (at * (SIZE - 1)..at * (SIZE - 1) + SIZE).collect::<Vec<_>>();
     // (name, seed, age in days, chain link): "a-tie" and "b-tie" are equally
@@ -618,7 +608,6 @@ fn census_retirement_overlap_decision_is_deterministic() {
 /// pruned (its file vanished) or retired, the survivor retires.
 #[test]
 fn census_retirement_survivor_retires_after_its_partner_goes() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     for partner_goes in ["pruned", "retired"] {
         let mut index = ScanIndex::default();
         let survivor = indexed_census(&mut index, "survivor", 'a', 40, vec![1, 2]);
@@ -731,7 +720,6 @@ fn admission_overflow(rows: &[serde_json::Value], stage: &str) -> u64 {
 /// and `y` is stored whole instead of as a hashless tombstone.
 #[test]
 fn census_admission_releases_kept_records_oldest_first() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, true);
     let scans = derive_scans_for_test();
@@ -824,7 +812,6 @@ fn census_admission_never_releases_held_residue() {
 /// by key retires, whatever order the index was built in, on every run.
 #[test]
 fn census_admission_release_is_deterministic() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (forward, [_, copy, young]) = admission_index(40, false, true);
     let (reverse, _) = admission_index(40, true, true);
@@ -865,7 +852,6 @@ fn census_admission_release_is_deterministic() {
 /// tombstones it, and a record that fits releases nothing.
 #[test]
 fn census_admission_without_releasable_records_is_unchanged() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, true);
     // The pre-stopgap terminal's census: every aged record retired.
@@ -907,7 +893,6 @@ fn census_admission_without_releasable_records_is_unchanged() {
 /// released (sum first) and `y` is tombstoned as before.
 #[test]
 fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (kept, [holder, copy, young]) = admission_index(60, false, true);
     let mut retired = kept.clone();
@@ -959,7 +944,6 @@ fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
 /// kept: no row, and both kept records keep their ids.
 #[test]
 fn census_admission_with_room_releases_nothing() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, false);
     let scans = derive_scans_for_test();
@@ -988,7 +972,6 @@ fn census_admission_with_room_releases_nothing() {
 /// releases both kept records.
 #[test]
 fn census_admission_hopeless_release_is_remembered_by_size() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, true);
     let scans = derive_scans_for_test();
@@ -1063,7 +1046,6 @@ fn serialized_pair() -> (ScanIndex, String, String) {
 /// 90% (occupancy overflow, with the alarm).
 #[test]
 fn census_retirement_serialized_occupancy_overflow_retires_the_oldest() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     assert_eq!(KEEP_OCCUPANCY_BYTES, 45_298_483);
     let (mut index, holder, copy) = serialized_pair();
     fill_serialized_to(&mut index, KEEP_OCCUPANCY_BYTES + 100);
@@ -1092,7 +1074,6 @@ fn census_retirement_serialized_occupancy_overflow_retires_the_oldest() {
 /// instead releases the oldest kept record and is stored whole.
 #[test]
 fn census_admission_release_driven_by_the_serialized_budget() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, holder, copy) = serialized_pair();
     let young = indexed_census(&mut index, "y", 'c', 5, vec![500_000]);
@@ -1135,7 +1116,6 @@ fn census_admission_release_driven_by_the_serialized_budget() {
 /// the grown record fits.
 #[test]
 fn census_admission_release_survives_reload_and_restart() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     for restart in [false, true] {
         let (mut index, [holder, copy, young]) = admission_index(60, false, true);
@@ -1223,7 +1203,6 @@ fn exhausted_index() -> (ScanIndex, String) {
 /// filler, now aged.
 #[test]
 fn census_admission_release_memo_rescans_when_the_cutoff_advances() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let (mut index, _) = exhausted_index();
     let later = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap() + 40 * 86_400;
     let scans = derive_scans_for_test();
@@ -1254,7 +1233,6 @@ fn census_admission_release_memo_rescans_when_the_cutoff_advances() {
 /// memo's re-check sees it, a scan runs and releases it.
 #[test]
 fn census_admission_release_memo_rechecks_its_suspects() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, dirty) = exhausted_index();
     index.files.get_mut(&dirty).unwrap().source_file_fingerprint = money_fingerprint('a');
@@ -1286,7 +1264,6 @@ fn census_admission_release_memo_rechecks_its_suspects() {
 /// is released only when an insert would otherwise be tombstoned.
 #[test]
 fn census_retirement_keeps_overlap_under_pressure_until_admission() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     const SIZE: u64 = 300_000;
     const Y: u64 = 1 << 41;
@@ -1335,7 +1312,6 @@ fn census_retirement_keeps_overlap_under_pressure_until_admission() {
 /// missing, as a decode drops it); a key already held is still replaced.
 #[test]
 fn census_live_insert_mirrors_the_decoder_record_bound() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     assert_eq!(MAX_CLAUDE_REQUEST_CENSUS_RECORDS, 65_536);
     let mut index = ScanIndex::default();
@@ -1393,7 +1369,6 @@ fn census_live_insert_mirrors_the_decoder_record_bound() {
 
 #[test]
 fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let mut census = ClaudeRequestCensus::default();
     let birth = ClaudeRequestBirth {
         unix_seconds: 1_700_000_000,
@@ -1530,7 +1505,6 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
 
 #[test]
 fn money_census_decoder_refuses_hostile_ledger_fields() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     use base64::Engine as _;
     let base = || {
         serde_json::json!({
@@ -1670,7 +1644,6 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
 
 #[test]
 fn money_serialized_budget_keeps_a_tombstone_reserve() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let mut census = ClaudeRequestCensus::default();
     // Long keys spend the serialized budget without spending hashes.
     let key = |number: usize| format!("/{number:03}{}", "k".repeat(1024 * 1024 - 4096));
@@ -1710,7 +1683,6 @@ fn money_serialized_budget_keeps_a_tombstone_reserve() {
 
 #[test]
 fn money_census_round_trips_at_the_hash_cap() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let mut census = ClaudeRequestCensus::default();
     assert_eq!(
         census.insert_for_test(

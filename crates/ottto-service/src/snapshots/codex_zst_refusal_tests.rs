@@ -193,7 +193,6 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
         None,
         None,
         false,
-        false,
     )
     .unwrap();
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
