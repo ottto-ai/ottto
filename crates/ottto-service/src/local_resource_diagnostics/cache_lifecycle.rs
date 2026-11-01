@@ -49,7 +49,7 @@ sparse_lifetime_counters! {
     // Pi source-field parsing observations, independent of retention decisions.
     pi_cost_refused_overflow: PiCostRefusedOverflow,
     pi_cost_precision_rounded: PiCostPrecisionRounded,
-    // M-2 Pi fork copies (SOURCE option (a)): fixed content-free totals.
+    // Pi fork copies stamped before the fork header: fixed content-free totals.
     // Skipped copied usage entries and their tokens, and the skipped entries
     // whose parent is not a known Pi session (Full reads only). Full reads of
     // a fork header without a valid cutoff time, whose copies all count.

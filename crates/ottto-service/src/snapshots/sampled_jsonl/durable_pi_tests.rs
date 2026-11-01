@@ -157,7 +157,7 @@ fn pi_section_bytes_are_pinned() {
 }
 
 /// [format] Pi fork accounting and durable body contract.
-/// E1-4: the ledger charges the decode allowance before it allocates, and a
+/// The ledger charges the decode allowance before it allocates, and a
 /// refused charge leaves nothing allocated.
 #[test]
 fn ledger_decode_funds_the_tree_before_any_allocation() {
@@ -325,7 +325,7 @@ fn corrupt_or_truncated_trailing_fields_are_refused() {
 }
 
 /// [format] Pi fork accounting and durable body contract.
-/// SOURCE condition 1: every ledger key and digest is 64-char lower hex.
+/// Every ledger key and digest is 64-char lower hex.
 #[test]
 fn ledger_h_values_must_be_lower_hex_digests() {
     for invalid in [
@@ -365,7 +365,7 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     let pin = row.allowlist();
     assert_eq!(
         row.representation(3, &pin).unwrap().allowlist_pin,
-        // A_P with M-2's PiSection fields; SOURCE approval required before merge.
+        // The Pi allowlist pin, including the fork fields of PiSection.
         "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8"
     );
     for format in [0, 1, 2, 4] {

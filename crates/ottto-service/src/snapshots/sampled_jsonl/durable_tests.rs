@@ -1616,7 +1616,7 @@ const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     ),
     (
         SnapshotSource::Pi,
-        // A_P with M-2's PiSection fields; SOURCE approval required before merge.
+        // The Pi allowlist pin, including the fork fields of PiSection.
         "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
     ),
 ];
@@ -2944,14 +2944,14 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
     }
 }
 
-// E1 conditions (b)-(d) for M-2's labelled `E` field. (b) is the unchanged
-// pins in durable_tail_store_tests.rs and released_decoders_tests.rs.
+// The Pi ledger's labelled `E` field. The Claude and Codex side is the
+// unchanged pins in durable_tail_store_tests.rs and released_decoders_tests.rs.
 
 /// The label text the shape keeps for `SnapshotAccumulator.seen_pi_usage_keys`.
 const PI_LEDGER_LABEL: &str = "BTreeMap<String, PiUsageDedupState>";
 
 /// [format] Pi native accounting and restore contract.
-/// E1 (c): the recorded label, the shape line it prints, and the real types
+/// The recorded label, the shape line it prints, and the real types
 /// behind it. Fails if the label changes or the ledger's type drifts.
 #[test]
 fn pi_only_e_label_is_recorded_and_names_the_real_ledger_type() {

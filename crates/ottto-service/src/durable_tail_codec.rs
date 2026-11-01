@@ -797,9 +797,9 @@ pub(crate) trait PiOnlyDurable: pi_only_sealed::Sealed + DurableEmpty + Default 
 /// The labelled `E` allowlist: (field path, label text). One entry per sealed
 /// type; anything else is a compile error in `durable_struct!`.
 pub(crate) const PI_ONLY_E_LABELS: &[(&str, &str)] = &[
-    // M-2 (E1, 2026-10-30): the Pi usage ledger plus the Pi fork state. An
-    // `E` field: Claude and Codex must leave it empty, and Pi moves it into
-    // the Pi section under `A_P`. The shape keeps the pre-M-2 type text, so
+    // The Pi usage ledger plus the Pi fork state. An `E` field: Claude and
+    // Codex must leave it empty, and Pi moves it into the Pi section, whose
+    // allowlist binds its shape. The shape keeps the earlier type text, so
     // the Claude and Codex allowlist digests stay byte-identical.
     (
         "SnapshotAccumulator.seen_pi_usage_keys",

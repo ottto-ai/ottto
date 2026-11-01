@@ -1,5 +1,6 @@
 //! Pi's durable body: the shared reduction with its ledger moved out,
-//! `Rederive`, then a plain trailing `PiSection`. A_P binds its field shape.
+//! `Rederive`, then a plain trailing `PiSection`. The Pi allowlist pin binds
+//! its field shape.
 //! Ledger keys and occurrence digests are H; the fork header time is local L.
 //! `parentSession` is never persisted.
 use super::*;
@@ -18,7 +19,7 @@ crate::durable_tail_codec::durable_struct!(borrowed PiSection {
     L header_nanos: Option<i128>,
 });
 
-/// What `A_P` adds after the shared shapes.
+/// What the Pi allowlist adds after the shared shapes.
 pub(in crate::snapshots) fn shape_extension(shape: &mut Shape) {
     shape.push("ottto-dt-ext:pi-ledger:v1");
     PiSection::shape(shape);

@@ -1669,10 +1669,9 @@ incomplete. Malformed owned evidence retains normal loss handling.
 
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
-Pi inherits the accepted sampled residual (Ron's decisions, 2026-10-30 and
-2026-10-31): an interior same-length rewrite plus growth can Tail a stale prefix
-until the next Full. Pi's writer is append-only, and its header rewrite reads
-Full. The shared
+Pi inherits the accepted sampled residual: an interior same-length rewrite plus
+growth can Tail a stale prefix until the next Full. Pi's writer is append-only,
+and its header rewrite reads Full. The shared
 `sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
 pins it for Claude Code, Codex and Pi.
 Age and clock changes do not invalidate checkpoints. Admission of a new sampled

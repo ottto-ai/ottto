@@ -1485,8 +1485,8 @@ fn pi_ledger_splits(
     }
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut ram_mode = (0, 1, 0);
-    // R1's stage_preparation preserves the durable predecessor on an uncertified
-    // lossy Tail. Lead B's condition: unchanged pre-conflict record bytes (including
+    // stage_preparation preserves the durable predecessor on an uncertified
+    // lossy Tail. Required: unchanged pre-conflict record bytes (including
     // generation), exactly one restore on the next page, and Tail with zero Full.
     // pi_pages_checked compares the replayed suffix's emitted wire to cold Full.
     let mut pre_conflict_records = None;
@@ -1546,7 +1546,7 @@ fn pi() {
     if !supported("pi") {
         return;
     }
-    // P1: every appended line boundary, including model/thinking changes,
+    // Every appended line boundary, including model/thinking changes,
     // the large system message, and the user/assistant flush boundary.
     let lines: Vec<Value> = pi_seed()
         .lines()
@@ -1673,7 +1673,7 @@ fn pi_ledger_seal_boundaries() {
     );
     let mut end = message.clone();
     end["type"] = json!("message_end");
-    // SOURCE duplicate on both sides of the seal; count > 1 must survive.
+    // A duplicate on both sides of the seal; count > 1 must survive.
     let prefix = pi_seed() + &pi_json(message.clone()) + &pi_json(message.clone());
     pi_ledger_splits(
         "pi_ledger_count_above_one",
@@ -1687,7 +1687,7 @@ fn pi_ledger_seal_boundaries() {
         ],
         (4, 70),
     );
-    // SOURCE paired_digests is nonempty at commit, before another exact pair.
+    // paired_digests is nonempty at commit, before another exact pair.
     pi_ledger_splits(
         "pi_ledger_paired_digest",
         &(pi_seed() + &pi_json(message.clone()) + &pi_json(end.clone())),
@@ -1885,7 +1885,7 @@ fn pi_cli_fork_preserves_double_count() {
     if !supported("pi_cli_fork_preserves_double_count") {
         return;
     }
-    // M-2 skips only copies stamped before the fork header; these copies are
+    // The fork rule skips only copies stamped before the fork header; these copies are
     // stamped at or after it, so they stay counted.
     const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
     let (c, mut disk, path, scanner, prior, mut proof) =

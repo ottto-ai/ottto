@@ -1,8 +1,7 @@
-//! P-ACTIVE-BOUND for Pi (E5 growth-hold audit, Lead A 2026-10-29): Pi
-//! enters E1's ONE shared fallback and per-key pace owner. A structural
-//! `ActiveOverBudget` is the counted no-record Full under
-//! `degraded_no_record{active_bound}`, at most once per key
-//! per 6 h; `LeaseBusy` stays a counted fair delay. A full pace map evicting
+//! The active-file bound for Pi: Pi enters the one shared fallback and
+//! per-key pace owner. A structural `ActiveOverBudget` is the counted
+//! no-record Full under `degraded_no_record{active_bound}`, at most once per
+//! key per 6 h; `LeaseBusy` stays a counted fair delay. A full pace map evicting
 //! its oldest stamp is the shared owner's (`m3_owed_tests`). This row adds no
 //! Pi path: it drives the real OwnedSourceScan over a native Pi receipt and
 //! reads the shared owner's slot 2.

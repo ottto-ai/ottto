@@ -30098,7 +30098,7 @@ impl OwnedSourceScan {
                 });
                 let mut parser = parser;
                 if parser.accumulator.source == SnapshotSource::Pi {
-                    // M-2: RAM-only membership of the fork's parent; counts only.
+                    // RAM-only membership of the fork's parent; counts only.
                     parser
                         .accumulator
                         .seen_pi_usage_keys
@@ -42175,7 +42175,7 @@ impl PiUsageDedupState {
 }
 
 /// The accumulator's Pi-only state: the usage dedup ledger and the fork
-/// state (M-2). A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
+/// state. A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
 /// Claude and Codex leave it empty and never persist it; Pi persists it only
 /// in the Pi record section.
 #[derive(Debug, Clone, Default)]
@@ -42186,10 +42186,9 @@ pub(crate) struct PiLedger {
     fork: Option<Box<PiFork>>,
 }
 
-/// M-2 (SOURCE ruling, Pi fork copies option (a)): Pi `--fork` and `/fork`
-/// copy the parent's entries, with their ids and timestamps, after a header
-/// that names `parentSession` at the fork time. The fork owns only what
-/// happened at or after its header time.
+/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
+/// their ids and timestamps, after a header that names `parentSession` at the
+/// fork time. The fork owns only what happened at or after its header time.
 #[derive(Default, PartialEq, Eq)]
 pub(crate) struct PiFork {
     /// Persisted (N): the header named a parent.

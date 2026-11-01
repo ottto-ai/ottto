@@ -1,16 +1,14 @@
-// Pi rows of the shared transition matrix (E5). Included beside E1's
+// Pi rows of the shared transition matrix. Included beside
 // `durable_transition_tests` inside the money-equivalence pipeline fixture, so
 // Corpus/Disk/other_page/other_wire and the Pi line builders are its native
 // adapters. Every row compares through `money_oracle`; there is no Pi comparator.
 //
-// Evidence: Lead B accepts #882's oracle as DoD evidence only once C1/C2/C3/C5
-// are met. On this base `assert_held` still reads the driver's accepted map
-// (C2) and E1's follow-up is unmerged, so these rows ALSO assert whole-body
-// equality (`whole_body`) and the index's own body fingerprint/witness
-// (`stored_bodies`); the populated Pi body's byte identity is E1-2's codec
-// fixture (`plain_trailing_pi_body_counts_and_round_trips`).
+// `assert_held` reads the driver's accepted map, so these rows also assert
+// whole-body equality (`whole_body`) and the index's own body
+// fingerprint/witness (`stored_bodies`); the populated Pi body's byte identity
+// is the codec fixture (`plain_trailing_pi_body_counts_and_round_trips`).
 //
-// P-PREACT (a binary without Pi support meeting Pi files and a Pi store) is a
+// A binary without Pi support meeting Pi files and a Pi store is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
 // lane, not to this in-process matrix.
 use super::*;
@@ -79,7 +77,7 @@ fn pi_route(
     (result, index, emitted)
 }
 
-/// E5's own whole-body equality: every field of every emitted body and the
+/// Whole-body equality: every field of every emitted body and the
 /// normalized batch bytes, not only the money fields.
 fn whole_body(cold: &RouteResult, route: &RouteResult) {
     assert_eq!(
@@ -152,7 +150,7 @@ fn store_records(disk: &Disk) -> Records {
     }
 }
 
-/// One synthetic Pi session on the real store. Mirrors M1's routes: Ram and
+/// One synthetic Pi session on the real store. Mirrors the Claude routes: Ram and
 /// EvictRetry reuse the live owner, DiskRestore/Restart begin a new owner.
 pub(super) struct PiDriver {
     c: Corpus,
@@ -407,7 +405,7 @@ impl<F: FnMut()> Drop for Reset<F> {
     }
 }
 
-// P-Q x2: two consecutive quiet restarts read no transcript bytes, emit
+// Two consecutive quiet restarts read no transcript bytes, emit
 // nothing and rewrite no record.
 /// [format] Pi native accounting and restore contract.
 #[test]
@@ -436,7 +434,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
         assert_eq!(quiet.io.rederive_named, 0, "{restart}: named-line pread");
         assert!(quiet.batches.is_empty(), "{restart}: quiet restart POSTed");
         // Cheap/anchor/raw I/O is unmeasured, so the zero-byte receipt cannot
-        // be claimed yet (unmet, disclosed like the shared M1 quiet row).
+        // be claimed yet (unmet, disclosed like the shared Claude quiet row).
         assert!(quiet.io.cheap_checks.is_none() && quiet.io.other_reads.is_none());
         assert!(
             std::panic::catch_unwind(|| money_oracle::assert_quiet_restart_zero_bytes(&quiet))
@@ -453,7 +451,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
     assert_eq!(f.restarts, 2);
 }
 
-// P-S (restore path: restart or RAM miss; Lead B 2026-10-30: no Pi floor): an
+// Restore path (restart or RAM miss; Pi has no accepted floor): an
 // older surviving record on the same object, same head, whose restored Tail
 // ends behind the accepted extent restores and PUBLISHES the smaller body. It
 // equals a cold Full of the file, today's Pi behaviour: the floor is
@@ -600,7 +598,7 @@ fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
     assert!(f.prior.files[&key].size_bytes < accepted_size);
 }
 
-// P-S in-process control (RAM resident): the same object cut below the
+// In-process control (RAM resident): the same object cut below the
 // accepted extent with the same head, its entry still in RAM, is classified
 // Shrunk by the certificate/ReadPlan and takes one A2 Full
 // `real_edit.<check>` outside the restore seam.
@@ -746,7 +744,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
     }
 }
 
-// P-REWRITE, restart arms: Pi's own writer rewrites the same inode at a version
+// Rewrite, restart arms: Pi's own writer rewrites the same inode at a version
 // upgrade. v1->v3 grows (HeadChanged) and v2->v3 shrinks (Shrunk); the cheap
 // checks classify either before restore, so a restarted owner reads exactly
 // ONE A2 Full equal to cold Full, counted by its certificate class, never T14
@@ -918,7 +916,7 @@ fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
     whole_body(&cold, &restored);
 }
 
-// P-X: Pi beside a Claude row in one state directory and one process owner.
+// Pi beside a Claude row in one state directory and one process owner.
 // A held Pi record leaves the Claude sibling equal to its cold Full, and each
 // source's save/GC leaves the other's record; then both restore together.
 /// [format] Pi native accounting and restore contract.
@@ -1048,7 +1046,7 @@ fn assert_private(what: &str, bytes: &[u8]) {
     }
 }
 
-/// A Pi 1.4.0 session carrying every SOURCE condition 6 canary: the raw
+/// A Pi 1.4.0 session carrying every privacy canary: the raw
 /// response id, the prompt, a ~7 KB system message, a compaction checkpoint
 /// and a path-like `parentSession`.
 fn canary_session() -> String {
@@ -1101,14 +1099,13 @@ fn assert_store_private(f: &PiDriver, mode: Mode) {
     );
 }
 
-// Canaries (SOURCE condition 6, Addenda 2/5): no raw response id, prompt, ~7 KB
+// Privacy canaries: no raw response id, prompt, ~7 KB
 // system message, compaction checkpoint, `parentSession` or rejected selector
 // text reaches a persisted Pi record, the store's counters/summary or the
 // durable diagnostics, through the native receipt, a restore + Tail and the
 // re-receipted record. The selector is validated at capture by the known-key
 // table: an unknown key is dropped identically in cold Full and restore + Tail
-// while a known key publishes. (#852's value-format rejection and its
-// `selector_key_rejected` gauge are not on this base.)
+// while a known key publishes.
 /// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
@@ -1331,9 +1328,9 @@ fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
     assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0));
 }
 
-/// M-2: copied usage arrives after the header, preserving old envelope time.
+/// Fork copy: copied usage arrives after the header, preserving old envelope time.
 /// Include every entry shape and a message/message_end pair split by restore.
-fn m2_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
+fn fork_copy_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
     if matches!(kind, "compaction" | "branch_summary" | "usage") {
         json!({"type":kind, "id":id, "timestamp":at,
             "usage":{"input":input,"output":2,"cost":{"total":0.001}}})
@@ -1352,7 +1349,7 @@ fn m2_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
 )]
 fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_m2_fork") {
+    if !supported("pi_fork_cuts") {
         return;
     }
     let initial = pi_seed().replacen(
@@ -1360,7 +1357,7 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
         &pi_header("synthetic-pi-session", 3, Some(CANARY_PARENT)),
         1,
     );
-    let mut f = PiDriver::warm("pi-m2-fork", &initial);
+    let mut f = PiDriver::warm("pi-fork-cuts", &initial);
     let mut requests = 1_u64;
     let mut lines = Vec::new();
     for kind in [
@@ -1371,25 +1368,25 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
         "usage",
     ] {
         lines.push((
-            m2_turn(kind, &format!("copied-{kind}"), "2026-10-27T05:59:59Z", 100),
+            fork_copy_turn(kind, &format!("copied-{kind}"), "2026-10-27T05:59:59Z", 100),
             false,
         ));
         lines.push((
-            m2_turn(kind, &format!("at-{kind}"), "2026-10-27T06:00:00Z", 20),
+            fork_copy_turn(kind, &format!("at-{kind}"), "2026-10-27T06:00:00Z", 20),
             true,
         ));
         lines.push((
-            m2_turn(kind, &format!("after-{kind}"), "2026-10-27T06:01:00Z", 30),
+            fork_copy_turn(kind, &format!("after-{kind}"), "2026-10-27T06:01:00Z", 30),
             true,
         ));
     }
     // Same identity at/after the header uses the normal pairing ledger.
     lines.push((
-        m2_turn("message", "paired", "2026-10-27T06:02:00Z", 40),
+        fork_copy_turn("message", "paired", "2026-10-27T06:02:00Z", 40),
         true,
     ));
     lines.push((
-        m2_turn("message_end", "paired", "2026-10-27T06:02:00Z", 40),
+        fork_copy_turn("message_end", "paired", "2026-10-27T06:02:00Z", 40),
         false,
     ));
     for (line, counted) in lines {
@@ -1426,16 +1423,16 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
 )]
 fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_publishes() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_m2_lower") {
+    if !supported("pi_fork_lower") {
         return;
     }
     for all_copied in [false, true] {
         use crate::local_resource_diagnostics::cache_lifecycle;
-        let copy = m2_turn("message", "copied", "2026-10-27T05:59:59Z", 100);
+        let copy = fork_copy_turn("message", "copied", "2026-10-27T05:59:59Z", 100);
         let inflated = pi_seed() + &pi_json(copy);
-        let mut f = PiDriver::warm("pi-m2-lower", &inflated);
+        let mut f = PiDriver::warm("pi-fork-lower", &inflated);
         assert_eq!(f.accepted[&f.entity].body["request_count"], json!(2));
-        // A normal file edit exercises the correction; M-2 adds no replay cause.
+        // A normal file edit exercises the correction; the fork rule adds no replay cause.
         let mut fork_header = pi_header("synthetic-pi-session", 3, Some(CANARY_PARENT));
         if all_copied {
             fork_header = fork_header.replace("2026-10-27T06:00:00Z", "2026-10-27T08:00:00Z");
@@ -1494,7 +1491,7 @@ fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_
 )]
 fn pi_fork_pre_header_copies_reduce_double_counted_money() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_m2_pre_header") {
+    if !supported("pi_fork_pre_header") {
         return;
     }
     let mut f = PiDriver::warm("pi-fork-pre-header", &pi_seed());
