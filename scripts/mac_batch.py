@@ -533,7 +533,8 @@ QUEUE_BRANCH = re.compile(r"^gh-readonly-queue/[^/]+/pr-(\d+)-([0-9a-f]{40})$")
 TRAIN_MERGE = re.compile(r"^train: merge #(\d+)\b")
 
 
-def queue_members(r: Runner, a: argparse.Namespace, branch: str) -> Tuple[str, List[Tuple[int, str]]]:
+def queue_members(r: Runner, a: argparse.Namespace, branch: str,
+                  tested: str) -> Tuple[str, List[Tuple[int, str]]]:
     """Base and members of a merge-queue run: the queued PR, or, for a train
     PR, each member merged by a first-parent "train: merge #<n>" commit."""
     m = QUEUE_BRANCH.match(branch)
@@ -542,6 +543,10 @@ def queue_members(r: Runner, a: argparse.Namespace, branch: str) -> Tuple[str, L
     number, base = int(m.group(1)), m.group(2)
     head = gh_json(r, "pr", "view", str(number), "-R", a.repo, "--json", "headRefOid")["headRefOid"]
     fetch(r, a.remote, [base, head])
+    # The queue squashes, so only the tree ties the run to the PR's head.
+    tree, _ = merge_tree(r, base, head)
+    if tree != r.git("rev-parse", f"{tested}^{{tree}}").stdout.strip():
+        raise Refused(f"#{number} head {head[:10]} is not the head this queue run tested; it moved since")
     members = []
     log = r.git("log", "--first-parent", "--merges", "--format=%P%x00%s", f"{base}..{head}").stdout
     for line in reversed(log.splitlines()):
@@ -864,7 +869,7 @@ def cmd_report(r: Runner, a: argparse.Namespace) -> int:
         return EXIT_WAIT
     fetch(r, a.remote, [run["headSha"]])
     if run["event"] == "merge_group":
-        base, trailer_members = queue_members(r, a, run["headBranch"])
+        base, trailer_members = queue_members(r, a, run["headBranch"], run["headSha"])
     else:
         base, trailer_members = parse_trailers(r.git("log", "-1", "--format=%B", run["headSha"]).stdout)
     if base is None or not trailer_members:

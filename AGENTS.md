@@ -64,9 +64,10 @@
   commits). `detect <pr>`
   tells from the diff alone whether a PR needs macOS evidence (exit 10).
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
-  ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
-  commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency
-  review`; macOS `Rust contracts` is skipped on pull requests), and enqueues
+  ready, waits until the pull-request checks on the PR's head commit pass
+  (`ci.yml`: `Public surface checks`, `Rust advisory audit`, `Dependency review`,
+  with macOS `Rust contracts` skipped on pull requests; `linux-tests.yml`: `Rust
+  tests (Linux)`, `Rust format (Linux)`), and enqueues
   exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
   checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
   not evidence, and no Linux job stands in for the macOS `Rust contracts` job.
