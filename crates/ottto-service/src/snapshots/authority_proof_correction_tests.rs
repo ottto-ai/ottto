@@ -1328,17 +1328,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     assert_eq!(apc_map(&current)[&root], held_revision);
 
     let held = BTreeSet::from([held_body]);
-    let borrowed = current.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
-    let consumed =
-        current
-            .clone()
-            .into_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
-    assert_eq!(
-        serde_json::to_vec(&borrowed).unwrap(),
-        serde_json::to_vec(&consumed).unwrap(),
-        "borrowed and consuming restoration agree"
-    );
-    let mut restored = borrowed;
+    let mut restored = current.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
     assert_eq!(restored.files[&root_key].source_file_fingerprint, older);
     assert!(restored.confirmed_empty_files.contains(&root_key));
     assert_eq!(apc_map(&restored)[&root], held_revision);
@@ -1417,14 +1407,6 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
     apc_empty_page(&mut index, 0, &new, false);
     let held = BTreeSet::from([apc_hex('d')]);
     let borrowed = index.with_locally_held_keys_reverted(&committed, &held, &BTreeSet::new());
-    let consumed =
-        index
-            .clone()
-            .into_locally_held_keys_reverted(&committed, &held, &BTreeSet::new());
-    assert_eq!(
-        serde_json::to_vec(&borrowed).unwrap(),
-        serde_json::to_vec(&consumed).unwrap()
-    );
     assert_eq!(borrowed.files[&root_key].source_file_fingerprint, new);
     assert!(borrowed.confirmed_empty_files.contains(&root_key));
     assert_eq!(

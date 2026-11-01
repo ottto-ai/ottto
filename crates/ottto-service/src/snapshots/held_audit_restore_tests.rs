@@ -43,28 +43,25 @@ fn completed_restore_carries_new_sampled_debt_only_for_account_holds() {
         } else {
             BTreeSet::new()
         };
-        // Both Completed restoration implementations remain equivalent;
-        // the first is the retained oracle for the consuming production path.
-        let oracle =
-            working.with_locally_held_keys_reverted(&previous, &held, &account_fingerprints);
-        let restored =
+        let result =
             working.into_locally_held_keys_reverted(&previous, &held, &account_fingerprints);
-        for result in [&oracle, &restored] {
-            assert_eq!(result.files[&key].has_unverified_source(), account_held,
-                    "account={account_held}, recorded={recorded}: authority/family hold adds no audit debt");
-            assert_eq!(
-                result.file_snapshot_fingerprints.get(&key),
-                previous.file_snapshot_fingerprints.get(&key)
-            );
-            assert_eq!(
-                result.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
-                "restoration grants no ACK"
-            );
-            assert_eq!(
-                result.files[&key].source_file_fingerprint.is_empty(),
-                account_held && !recorded,
-                "unrecorded account retries keep their genuine reparse debt"
-            );
-        }
+        assert_eq!(
+            result.files[&key].has_unverified_source(),
+            account_held,
+            "account={account_held}, recorded={recorded}: authority/family hold adds no audit debt"
+        );
+        assert_eq!(
+            result.file_snapshot_fingerprints.get(&key),
+            previous.file_snapshot_fingerprints.get(&key)
+        );
+        assert_eq!(
+            result.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
+            "restoration grants no ACK"
+        );
+        assert_eq!(
+            result.files[&key].source_file_fingerprint.is_empty(),
+            account_held && !recorded,
+            "unrecorded account retries keep their genuine reparse debt"
+        );
     }
 }

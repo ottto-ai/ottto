@@ -49,8 +49,8 @@ impl PaidReservation {
         self.allocated = allocated;
         true
     }
-    /// Refresh from the SAME rotation after queues, parked siblings and
-    /// retained process owners. Unknown prevents new optional growth, while
+    /// Refresh from the SAME rotation after the queue and retained process
+    /// owners. Unknown prevents new optional growth, while
     /// the already-paid recovery promise remains owned.
     pub(crate) fn at_turn(&mut self, remaining: Option<usize>) {
         self.remaining = remaining;
@@ -162,14 +162,11 @@ pub(crate) trait Owner {
         frame: Self::Frame,
         remaining: Option<usize>,
     ) -> Step<Self::Frame, Self::Completed>;
-    fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize>;
     fn finish(&mut self, completed: Self::Completed, remaining: Option<usize>) -> Result<()>;
     fn outcome(&mut self, source: Self::Source, result: Result<()>);
     fn monotonic(&self) -> Duration;
-    fn parked(&mut self, _bytes: usize) {}
-    fn serial_fallback(&mut self, _source: Self::Source) {}
-    /// Optional process-retained graphs outside every moving/parked frame.
-    /// A graph moved into a frame is charged by `bound`, never here as well.
+    /// Optional process-retained graphs outside the active frame. A graph
+    /// moved into the frame is charged by that frame, never here as well.
     /// Concrete owners must use the existing requested-layout admission;
     /// unsupported layout, unavailable locks or unknown ownership return None.
     fn retained_bound(&self, _limit: usize) -> Option<usize> {
@@ -182,13 +179,12 @@ pub(crate) trait Owner {
     fn retained_budget_unavailable(&mut self) {
         self.discard_retained();
     }
-    /// One optional turn after all due siblings have been offered. Every
-    /// parked source remains busy, so a retry cannot publish beneath its
-    /// unfinished native parser. No new thread, timer or parser ownership.
-    fn boundary(&mut self, _busy: impl Iterator<Item = Self::Source>) {}
+    /// One optional turn after all due sources have been offered and run
+    /// serially. No new thread, timer or parser ownership.
+    fn boundary(&mut self) {}
 }
 
-/// The rotation owns the one allowance: queues + parked frames + carry.
+/// The rotation owns the one allowance: queue + carry.
 /// No independently granted carry budget. A refused charge gets one discard
 /// and one recheck; persistent unknown runs the same active frame serially.
 fn retained_remainder<O: Owner>(owner: &mut O, available: Option<usize>) -> Option<(usize, usize)> {
@@ -206,50 +202,34 @@ fn retained_remainder<O: Owner>(owner: &mut O, available: Option<usize>) -> Opti
     Some((available - bytes, bytes))
 }
 
-pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget: usize) {
+pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], rotation_budget: usize) {
     let mut remaining: VecDeque<_> = sources.iter().copied().collect();
-    let mut parked = VecDeque::<(O::Source, O::Frame, usize)>::with_capacity(sources.len());
-    // Charge queue capacity even when spare slots are empty. Frame bounds
-    // additionally include their inline bytes, deliberately overcounting them.
-    let queue_bytes = parked
+    // Charge queue capacity even when spare slots are empty.
+    let budget = remaining
         .capacity()
-        .checked_mul(size_of::<(O::Source, O::Frame, usize)>())
-        .and_then(|n| {
-            remaining
-                .capacity()
-                .checked_mul(size_of::<O::Source>())
-                .and_then(|m| n.checked_add(m))
-        });
-    let budget = queue_bytes.and_then(|n| parked_budget.checked_sub(n));
-    let mut parked_bytes = 0usize;
+        .checked_mul(size_of::<O::Source>())
+        .and_then(|n| rotation_budget.checked_sub(n));
     loop {
         if remaining.is_empty() {
-            owner.boundary(parked.iter().map(|(source, _, _)| *source));
+            owner.boundary();
         }
         // Includes carry entering a new cycle and ownership changes made by a
-        // finished sibling. Queue capacity and already parked frames stay paid.
-        let _ = retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)));
-        // Offer each due sibling before returning to a previously parked source.
-        let (source, frame) = if let Some(source) = remaining.pop_front() {
-            let available =
-                retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)))
-                    .map(|(available, _)| available);
-            match owner.prepare(source, available) {
-                Ok(Some(frame)) => (source, frame),
-                Ok(None) => {
-                    owner.outcome(source, Ok(()));
-                    continue;
-                }
-                Err(error) => {
-                    owner.outcome(source, Err(error));
-                    continue;
-                }
-            }
-        } else if let Some((source, frame, bytes)) = parked.pop_front() {
-            parked_bytes -= bytes;
-            (source, frame)
-        } else {
+        // finished source. Queue capacity stays paid.
+        let _ = retained_remainder(owner, budget);
+        let Some(source) = remaining.pop_front() else {
             break;
+        };
+        let available = retained_remainder(owner, budget).map(|(available, _)| available);
+        let frame = match owner.prepare(source, available) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                owner.outcome(source, Ok(()));
+                continue;
+            }
+            Err(error) => {
+                owner.outcome(source, Err(error));
+                continue;
+            }
         };
         let mut frame = Some(frame);
         'source_turn: loop {
@@ -265,9 +245,7 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
             // run and process carry is published only by finish. A moved-out
             // carry may leave this smaller than necessary, never larger. Do
             // not walk a retained graph again for every physical parser step.
-            let available =
-                retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)))
-                    .map(|(available, _)| available);
+            let available = retained_remainder(owner, budget).map(|(available, _)| available);
             for _ in 0..TURN_STEPS {
                 match owner.step(frame.take().expect("active frame"), available) {
                     Step::Pending(next) => frame = Some(next),
@@ -285,39 +263,16 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
                 }
             }
             if let Some(result) = complete {
-                let available =
-                    retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)))
-                        .map(|(available, _)| available);
+                let available = retained_remainder(owner, budget).map(|(available, _)| available);
                 let result = owner.finish(result, available);
                 // A finish may move a graph out of the completed frame into
                 // process retention. Admit it against the SAME remaining space.
-                let _ = retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)));
+                let _ = retained_remainder(owner, budget);
                 owner.outcome(source, result);
                 break;
             }
-            if !remaining.is_empty() || !parked.is_empty() {
-                if let Some((available, retained)) =
-                    retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)))
-                {
-                    if let Some(bytes) =
-                        owner.bound(frame.as_ref().expect("active frame"), available)
-                    {
-                        if bytes <= available {
-                            parked_bytes += bytes;
-                            parked.push_back((source, frame.take().expect("active frame"), bytes));
-                            owner.parked(
-                                parked_bytes
-                                    .saturating_add(retained)
-                                    .saturating_add(queue_bytes.unwrap_or(parked_budget)),
-                            );
-                            break;
-                        }
-                    }
-                }
-                owner.serial_fallback(source);
-            }
-            // Unsupported layout, opaque state or budget exhaustion: continue
-            // this SAME owned frame serially. Never restart files for a turn.
+            // Continue this SAME owned frame serially. Never restart files
+            // for a turn.
         }
     }
 }
@@ -339,7 +294,6 @@ mod retained_budget_tests {
     }
     struct ProofOwner {
         steps: Vec<usize>,
-        frame_charge: usize,
         carry: Option<Box<Carry>>,
         take_at: Option<usize>,
         create_at: Option<usize>,
@@ -349,7 +303,6 @@ mod retained_budget_tests {
         unknown: bool,
         persistent_unknown: bool,
         discards: usize,
-        parks: Vec<usize>,
         outcomes: Vec<(usize, bool)>,
         moves: Vec<usize>,
         step_count: usize,
@@ -359,7 +312,6 @@ mod retained_budget_tests {
         fn default() -> Self {
             Self {
                 steps: vec![TURN_STEPS + 1, 1],
-                frame_charge: PARKED_BUDGET / 2,
                 carry: None,
                 take_at: None,
                 create_at: None,
@@ -369,7 +321,6 @@ mod retained_budget_tests {
                 unknown: false,
                 persistent_unknown: false,
                 discards: 0,
-                parks: Vec::new(),
                 outcomes: Vec::new(),
                 moves: Vec::new(),
                 step_count: 0,
@@ -415,12 +366,6 @@ mod retained_budget_tests {
                 Step::Pending(frame)
             }
         }
-        fn bound(&self, frame: &Frame, limit: usize) -> Option<usize> {
-            let bytes = self
-                .frame_charge
-                .checked_add(frame.carry.as_ref().map_or(0, |graph| graph.charge))?;
-            (bytes <= limit).then_some(bytes)
-        }
         fn finish(&mut self, frame: Frame, remaining: Option<usize>) -> Result<()> {
             self.allowances.push(("finish", frame.source, remaining));
             if self.fail_at == Some(frame.source) {
@@ -447,16 +392,6 @@ mod retained_budget_tests {
         fn monotonic(&self) -> Duration {
             Duration::ZERO
         }
-        fn parked(&mut self, bytes: usize) {
-            assert!(bytes <= PARKED_BUDGET);
-            self.parks.push(bytes);
-        }
-        fn serial_fallback(&mut self, source: usize) {
-            crate::local_resource_diagnostics::source_rotation_serial_fallback(
-                ["claude_code", "codex"][source],
-                crate::heap_layout_bound::layout_supported(),
-            );
-        }
         fn retained_bound(&self, limit: usize) -> Option<usize> {
             if self.persistent_unknown || (self.unknown && self.carry.is_some()) {
                 return None;
@@ -467,99 +402,6 @@ mod retained_budget_tests {
         fn discard_retained(&mut self) {
             self.discards += 1;
             self.carry = None;
-        }
-    }
-
-    #[test]
-    /// [regress] Production over-limit bounds return None, not an oversized Some.
-    fn serial_fallback_counts_real_bound_refusal_and_unsupported_layout() {
-        use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
-        // No frame/owner fields: inject only the diagnostics layout admission.
-        struct Bounded<const LAYOUT_SUPPORTED: bool>;
-        impl<const LAYOUT_SUPPORTED: bool> Owner for Bounded<LAYOUT_SUPPORTED> {
-            type Source = &'static str;
-            type Frame = Vec<u8>;
-            type Completed = ();
-            fn prepare(&mut self, _: Self::Source, _: Option<usize>) -> Result<Option<Vec<u8>>> {
-                let mut frame = Vec::with_capacity(1024);
-                frame.resize(2 * TURN_STEPS + 1, 0);
-                Ok(Some(frame))
-            }
-            fn validate(&mut self, _: &Vec<u8>) -> Result<()> {
-                Ok(())
-            }
-            fn step(&mut self, mut frame: Vec<u8>, _: Option<usize>) -> Step<Vec<u8>, ()> {
-                frame.pop();
-                if frame.is_empty() {
-                    Step::Complete(())
-                } else {
-                    Step::Pending(frame)
-                }
-            }
-            fn bound(&self, frame: &Vec<u8>, limit: usize) -> Option<usize> {
-                crate::heap_layout_bound::bound(frame, limit)
-            }
-            fn finish(&mut self, _: (), _: Option<usize>) -> Result<()> {
-                Ok(())
-            }
-            fn outcome(&mut self, _: Self::Source, result: Result<()>) {
-                result.unwrap();
-            }
-            fn monotonic(&self) -> Duration {
-                Duration::ZERO
-            }
-            fn serial_fallback(&mut self, source: Self::Source) {
-                crate::local_resource_diagnostics::source_rotation_serial_fallback(
-                    source,
-                    LAYOUT_SUPPORTED,
-                );
-            }
-        }
-        let frame = Bounded::<true>
-            .prepare("claude_code", None)
-            .unwrap()
-            .unwrap();
-        assert!(Bounded::<true>.bound(&frame, 1024).is_none());
-        assert!(Bounded::<true>.bound(&frame, 4096).is_some());
-        let emit_page = |source| {
-            Probe::start().collection(
-                source,
-                CollectionCounts {
-                    scanned_files: 0,
-                    semantic_noops: 0,
-                    sampled_acquisition: None,
-                    full_causes: Default::default(),
-                },
-            );
-        };
-        // Other rotation fixtures can leave this thread's page counts pending.
-        capture(|| {
-            emit_page("claude_code");
-            emit_page("codex");
-        });
-        for (supported, budget, expected) in [
-            (true, 1024, serde_json::json!({"bound_refused": 2})),
-            (false, 1024, serde_json::json!({"unsupported_layout": 2})),
-            (true, 4096, serde_json::Value::Null),
-        ] {
-            let (_, rows) = capture(|| {
-                let sources = ["claude_code", "codex"];
-                if supported {
-                    run(&mut Bounded::<true>, &sources, budget);
-                } else {
-                    run(&mut Bounded::<false>, &sources, budget);
-                }
-                for source in ["codex", "claude_code", "claude_code"] {
-                    emit_page(source);
-                }
-            });
-            assert_eq!(rows.len(), 3, "fallback adds no emitter");
-            assert!(rows[0]["counts"]["source_rotation_serial_fallback"].is_null());
-            assert_eq!(
-                rows[1]["counts"]["source_rotation_serial_fallback"],
-                expected
-            );
-            assert!(rows[2]["counts"]["source_rotation_serial_fallback"].is_null());
         }
     }
 
@@ -608,23 +450,6 @@ mod retained_budget_tests {
     }
 
     #[test]
-    fn retained_budget_finish_cannot_borrow_already_parked_siblings_space() {
-        let mut owner = ProofOwner {
-            create_at: Some(1),
-            create_charge: PARKED_BUDGET / 2 + PARKED_BUDGET / 4,
-            ..Default::default()
-        };
-        run(&mut owner, &[0, 1], PARKED_BUDGET);
-        assert_eq!(owner.parks.len(), 1, "first source was genuinely parked");
-        assert_eq!(owner.outcomes, vec![(1, true), (0, true)]);
-        assert!(
-            owner.carry.is_none(),
-            "finish must discard excess carry before resuming sibling"
-        );
-        assert_eq!(owner.discards, 1);
-    }
-
-    #[test]
     fn retained_budget_moves_one_graph_through_frame_finish_and_next_cycle() {
         let graph = Box::new(Carry {
             charge: PARKED_BUDGET / 2,
@@ -634,15 +459,9 @@ mod retained_budget_tests {
         let mut owner = ProofOwner {
             carry: Some(graph),
             take_at: Some(0),
-            frame_charge: 128,
             ..Default::default()
         };
         run(&mut owner, &[0, 1], PARKED_BUDGET);
-        assert_eq!(
-            owner.parks.len(),
-            1,
-            "moving carry into a frame must not double charge it"
-        );
         assert_eq!(owner.discards, 0);
         assert_eq!(owner.moves, vec![pointer, pointer]);
         assert_eq!(
@@ -650,7 +469,6 @@ mod retained_budget_tests {
             pointer
         );
         run(&mut owner, &[0, 1], PARKED_BUDGET);
-        assert_eq!(owner.parks.len(), 2);
         assert_eq!(owner.moves, vec![pointer; 4]);
         assert_eq!(owner.discards, 0);
         assert!(
@@ -677,10 +495,6 @@ mod retained_budget_tests {
             assert_eq!(owner.step_count, TURN_STEPS + 2);
             assert_eq!(owner.outcomes.len(), 2);
             if persistent {
-                assert!(
-                    owner.parks.is_empty(),
-                    "unaccountable retention uses serial base"
-                );
                 assert_eq!(owner.outcomes, vec![(0, true), (1, true)]);
             }
         }
@@ -698,7 +512,7 @@ mod retained_budget_tests {
             ..Default::default()
         };
         run(&mut owner, &[0, 1], PARKED_BUDGET);
-        assert_eq!(owner.outcomes, vec![(1, true), (0, false)]);
+        assert_eq!(owner.outcomes, vec![(0, false), (1, true)]);
         assert!(owner.carry.is_none());
         assert_eq!(
             owner.moves.len(),
@@ -708,28 +522,23 @@ mod retained_budget_tests {
     }
 
     #[test]
-    fn native_comparison_remainder_reaches_prepare_step_finish_after_sibling_charge() {
+    fn native_comparison_remainder_reaches_prepare_step_finish() {
         let mut owner = ProofOwner::default();
         run(&mut owner, &[0, 1], PARKED_BUDGET);
-        let granted = |stage, source| {
+        let granted = |stage| {
             owner
                 .allowances
                 .iter()
-                .filter(|(s, n, _)| *s == stage && *n == source)
+                .filter(|(s, _, _)| *s == stage)
                 .map(|(_, _, bytes)| bytes.expect("known existing allowance"))
                 .collect::<Vec<_>>()
         };
-        let first = granted("prepare", 0)[0];
-        let sibling = granted("prepare", 1)[0];
-        assert_eq!(
-            first - sibling,
-            owner.frame_charge,
-            "parked first source is paid before sibling prepare"
-        );
-        assert!(granted("step", 1).iter().all(|bytes| *bytes == sibling));
-        assert_eq!(granted("finish", 1), vec![sibling]);
+        let first = granted("prepare")[0];
+        assert_eq!(granted("prepare"), vec![first; 2]);
+        assert!(granted("step").iter().all(|bytes| *bytes == first));
+        assert_eq!(granted("finish"), vec![first; 2]);
         assert!(first < PARKED_BUDGET, "queue storage is already paid");
-        assert_eq!(owner.outcomes, vec![(1, true), (0, true)]);
+        assert_eq!(owner.outcomes, vec![(0, true), (1, true)]);
     }
 
     #[test]

@@ -413,9 +413,6 @@ impl crate::source_rotation::Owner for NativeRetryRotation {
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
         crate::source_rotation::Owner::step(&mut self.scan, frame, remaining)
     }
-    fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
-        crate::source_rotation::Owner::bound(&self.scan, frame, limit)
-    }
     fn finish(&mut self, completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
         crate::source_rotation::Owner::finish(&mut self.scan, completed, remaining)
     }
@@ -425,10 +422,7 @@ impl crate::source_rotation::Owner for NativeRetryRotation {
     fn monotonic(&self) -> Duration {
         crate::source_rotation::Owner::monotonic(&self.scan)
     }
-    fn parked(&mut self, bytes: usize) {
-        crate::source_rotation::Owner::parked(&mut self.scan, bytes);
-    }
-    fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
+    fn boundary(&mut self) {
         assert_eq!(
             self.scan.offered.len(),
             3,
@@ -439,7 +433,7 @@ impl crate::source_rotation::Owner for NativeRetryRotation {
         let scan = &self.scan;
         let expected = self.expected_account;
         let turns = &mut self.turns;
-        self.retry.boundary(busy, Instant::now(), |page| {
+        self.retry.boundary(Instant::now(), |page| {
             *turns += 1;
             page.turn(
                 &self.client,
@@ -461,7 +455,7 @@ impl crate::source_rotation::Owner for NativeRetryRotation {
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
 #[serial(client_report)]
-fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery() {
+fn bounded_retry_actual_owner_boundary_fairness_and_recovery() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -471,24 +465,13 @@ fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery()
         .unwrap_or_else(|p| p.into_inner());
     let (_, allocation) = crate::retry_allocation_probe::measure(|| {
         for cancel in [false, true] {
-            let mut scan =
-                OwnedRotationProof::new(1, None, false, crate::source_rotation::PARKED_BUDGET);
+            let mut scan = OwnedRotationProof::new(1, None);
             scan.slots = [None, None]; // This oracle uses the native bounded transport, never the scripted uploader.
             let mut retry = super::bounded_snapshot_retry::RetryOwner::default();
             let page = bounded_native_capture(&scan.a, Instant::now() - Duration::from_secs(61));
             let ordinary = Instant::now() + SNAPSHOT_SYNC_INTERVAL;
             assert!(retry.admit(page));
             assert!(retry.wake_before(ordinary) < ordinary);
-            let mut blocked_calls = 0;
-            retry.boundary(
-                std::iter::once(SnapshotSource::Codex),
-                Instant::now(),
-                |_| {
-                    blocked_calls += 1;
-                    unreachable!("same-source parser is still owned");
-                },
-            );
-            assert_eq!(blocked_calls, 0);
             let before = std::fs::read(&scan.a.index_path).unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -881,7 +864,7 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
         .with_bounded_retry_loopback_http_for_test();
     let mut turns = 0;
     for expected_posts in [3, 2] {
-        retry.boundary(std::iter::empty(), Instant::now(), |page| {
+        retry.boundary(Instant::now(), |page| {
             turns += 1;
             assert_eq!(page.budget.expires(), expiry);
             assert_eq!(page.budget.posts_left(), expected_posts);
