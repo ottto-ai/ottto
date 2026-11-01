@@ -1392,8 +1392,6 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
 }
 
-include!("retry_admission_pipeline_tests.rs");
-
 // Mirror prepare's existing baseline ordering, then use the shared full pipeline
 // and save/reload every synthetic page. No fixture alters acquisition policy.
 fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<RearmPage> {

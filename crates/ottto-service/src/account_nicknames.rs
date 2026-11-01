@@ -331,6 +331,44 @@ pub(crate) fn normalize(text: Option<&str>) -> Result<Option<String>, ()> {
     Ok(Some(text.to_owned()))
 }
 
+/// Per-stage wall time of one nickname save, logged on every exit. Stage
+/// names and milliseconds only: never the nickname, pair or any identifier.
+struct SaveTiming {
+    began: std::time::Instant,
+    last: std::time::Instant,
+    stages: String,
+}
+
+impl SaveTiming {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            began: now,
+            last: now,
+            stages: String::new(),
+        }
+    }
+
+    fn mark(&mut self, stage: &str) {
+        let now = std::time::Instant::now();
+        let _ = std::fmt::Write::write_fmt(
+            &mut self.stages,
+            format_args!(" {stage}_ms={}", (now - self.last).as_millis()),
+        );
+        self.last = now;
+    }
+}
+
+impl Drop for SaveTiming {
+    fn drop(&mut self) {
+        eprintln!(
+            "account nickname save: total_ms={}{}",
+            self.began.elapsed().as_millis(),
+            self.stages
+        );
+    }
+}
+
 pub(crate) fn set(
     pair: Pair,
     nickname: Option<SecretString>,
@@ -346,10 +384,13 @@ pub(crate) fn set(
     if !valid_pair(&pair) {
         return finish(Outcome::Invalid);
     }
+    let mut timing = SaveTiming::start();
     let Some(generation) = generation() else {
         return finish(Outcome::NotConnected);
     };
+    timing.mark("generation");
     let status = read();
+    timing.mark("status");
     if status.connected != Some(true) {
         let rejected = CACHE
             .lock()
@@ -365,15 +406,19 @@ pub(crate) fn set(
     let Ok((device, secret)) = crate::snapshot_client::load_snapshot_device_credentials() else {
         return finish(Outcome::NotConnected);
     };
+    timing.mark("device");
     if generation_for_device_blocking(&device).as_ref() != Some(&generation) {
         return finish(Outcome::NotConnected);
     }
+    timing.mark("binding");
     let Ok(Some(machine_id)) = crate::snapshot_sync::snapshot_machine_id(&device) else {
         return finish(Outcome::NotConnected);
     };
+    timing.mark("machine");
     if !crate::session_launch::nickname_target_is_current(&pair) {
         return finish(Outcome::TargetUnknown);
     }
+    timing.mark("target");
     let source = match pair.source {
         Provider::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
         Provider::Codex => crate::snapshots::SnapshotSource::Codex,
@@ -390,6 +435,7 @@ pub(crate) fn set(
         return finish(Outcome::Unavailable);
     };
     let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url);
+    timing.mark("api_base");
     let token = match client.issue_relay_token(&device, &secret, source) {
         Ok(token) => token,
         Err(error) => {
@@ -403,9 +449,11 @@ pub(crate) fn set(
             return finish(Outcome::Unavailable);
         }
     };
+    timing.mark("relay_token");
     if generation_for_device_blocking(&device).as_ref() != Some(&generation) {
         return finish(Outcome::NotConnected);
     }
+    timing.mark("binding_again");
     let mut payload = serde_json::json!({ "machine_id":machine_id, "source":pair.source,
         "account_identifier_hash":pair.account_identifier_hash,
         "organization_identifier_hash":pair.organization_identifier_hash,
@@ -413,7 +461,9 @@ pub(crate) fn set(
     if let Some(revision) = base_revision {
         payload["base_revision"] = serde_json::json!(revision);
     }
-    match client.put_account_nickname(&token, &payload) {
+    let response = client.put_account_nickname(&token, &payload);
+    timing.mark("put");
+    match response {
         Ok(Some(entry))
             if entry.pair.as_ref() == Some(&pair)
                 && entry.revision.is_some_and(|revision| revision > 0)
