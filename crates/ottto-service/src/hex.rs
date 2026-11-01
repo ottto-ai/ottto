@@ -17,6 +17,7 @@ pub(crate) fn is_sha256_any_case(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// [behaviour] Lowercase-only shape: exact length 64, digits and a-f.
     #[test]
     fn sha256_lower_accepts_only_64_lowercase_hex_digits() {
         assert!(is_sha256_lower(&"0a".repeat(32)));
@@ -26,6 +27,7 @@ mod tests {
         assert!(!is_sha256_lower(&format!("{}g", "a".repeat(63))));
     }
 
+    /// [behaviour] Any-case shape: exact length 64, digits and a-f/A-F.
     #[test]
     fn sha256_any_case_accepts_64_hex_digits_of_either_case() {
         assert!(is_sha256_any_case(&"0a".repeat(32)));
