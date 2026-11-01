@@ -11221,6 +11221,7 @@ where
                 .filter(|entity| !entity.permanent)
                 .count(),
         );
+        progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     } else {
         for index in indices {
             let item = &items[*index];
@@ -11613,6 +11614,9 @@ where
                 order.push(item);
             } else {
                 context_budget_deferred += 1;
+                // Labelled apart from backend conflicts below; both still
+                // report Deferred until receipts are authoritative.
+                progress.context_resend.counts.budget_deferred += 1;
                 progress
                     .context_resend
                     .deferred
@@ -11855,14 +11859,6 @@ where
                 .is_some_and(|record| record.body_witness == **body)
         })
         .count();
-    // Labelled apart; both still report Deferred until receipts are authoritative.
-    let resend_counts = &mut progress.context_resend.counts;
-    resend_counts.budget_deferred = resend_counts
-        .budget_deferred
-        .saturating_add(context_budget_deferred as u64);
-    resend_counts.server_conflicts = resend_counts
-        .server_conflicts
-        .saturating_add(conflicted_entities as u64);
     if let Some(error) = deferred_validation_error {
         Err(error)
     } else if conflicted_entities > 0 || context_budget_deferred > 0 {
