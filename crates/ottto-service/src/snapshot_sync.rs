@@ -760,6 +760,18 @@ impl LocalHoldSettlement {
                 scan_result.completed_parses(),
                 &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
+        if held_entity_count > 0 {
+            let counts = serde_json::json!({
+                "request_owned": disposition.request_owned_hold_reasons,
+                "account_binding": account_deferred_fingerprints.len(),
+                "authority_demotion": disposition.context_file_birth.demotion_quarantined_session_count,
+            });
+            eprintln!(
+                "local snapshot sync: hold disposition source={} held_entities={} counts={counts}",
+                source.api_slug(),
+                held_entity_count,
+            );
+        }
         scan_result.remember_withheld_content(index);
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,
@@ -6753,7 +6765,8 @@ fn prepare_sync_source_inner(
         // advance. Existing generation CAS rejects overlapping stale writers.
         index.save(&index_path)?;
     }
-    let admission_reoffer_pending = index.snapshot_admission_reoffer_pending();
+    let admission_reoffer_pending =
+        index.snapshot_admission_reoffer_pending_for_scan(source, receipt_window_days);
     let mut legacy_reconciliation_pending = BTreeSet::new();
     if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
@@ -7673,7 +7686,7 @@ fn finish_sync_source(
             Some(&upload_progress.accepted_identity_buckets),
             Some(&reserve_cache_bytes),
         );
-        let (disposition, census_withheld, stats) = match applied {
+        let (mut disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
                 if let Some(lease) = native_comparison_lease.as_mut() {
@@ -7685,6 +7698,15 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
+        // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
+        // rows as never accepted; the ledger records that durably before any
+        // upload, so a lost reply or restart cannot restore their proof.
+        if upload_progress
+            .accepted_identity_buckets
+            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
+        {
+            upload_progress.save(&upload_progress_path)?;
+        }
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
@@ -9834,6 +9856,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
         index,
+        accepted_identity_buckets,
     )
     .apply(index);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
@@ -10225,7 +10248,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         } else {
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
+        &mut disposition.request_owned_hold_reasons,
+        &scan_result.claude_queued_family_deferred_paths,
     );
+    if !trace_discard_unfolded.is_empty() {
+        *disposition
+            .request_owned_hold_reasons
+            .entry("trace_discarded")
+            .or_default() += trace_discard_unfolded.len() as u64;
+    }
     withheld.extend(trace_discard_unfolded);
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
@@ -10258,13 +10289,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 index,
                 &disposition,
             );
-        let _request_identity =
-            crate::snapshots::claude_request_identity::apply_scan_with_ownership(
-                &mut scan_result.snapshots,
-                evidence,
-                std::mem::take(&mut disposition.request_groupings),
-                &ownership,
-            );
+        let request_identity = crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+            &mut scan_result.snapshots,
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
+            &ownership,
+        );
+        disposition.copy_invalidated = request_identity.copy_invalidated;
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,

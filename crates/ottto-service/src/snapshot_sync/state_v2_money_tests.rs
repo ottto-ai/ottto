@@ -434,7 +434,7 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
                 restored.accepted_identity_buckets,
                 progress.accepted_identity_buckets
             );
-            page.enrich_with_accepted(&c, Some(&restored.accepted_identity_buckets));
+            page.enrich_with(&c, Some(&mut restored.accepted_identity_buckets));
             page.finish();
             let (result, sent, _) = upload(&page.scan.snapshots, &mut restored, ack);
             assert_eq!(result.unwrap(), ResumableUploadResult::Completed);

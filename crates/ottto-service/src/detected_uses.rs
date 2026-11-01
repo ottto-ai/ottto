@@ -328,6 +328,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "test-model".to_string(),
             input_tokens,
             output_tokens,

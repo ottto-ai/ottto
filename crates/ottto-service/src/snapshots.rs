@@ -75,6 +75,7 @@ pub(crate) use claude_history_upgrade::{
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use ownership_diagnostics as ownership;
+mod admission_reoffer_window;
 mod claude_family_census_shadow;
 #[cfg(test)]
 mod claude_family_census_shadow_tests;
@@ -2083,6 +2084,14 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
+    /// Wire contract 5, bucket rows only, copy-prefix switch on (X-B1, Lead B
+    /// 2026-10-31): the row's accepted proof was copy-derived and is
+    /// tombstoned; a retaining receiver drops that proof for good. Like
+    /// `identity_retained`, only sent when the server advertised option (ii)
+    /// and hashed in the identity leaf. Omitted when false, so switch-off
+    /// bytes are unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4059,10 +4068,12 @@ pub struct ScanIndex {
     /// E2 stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
-    /// it; absent/damaged metadata stays uncertain until the current proof decides.
+    /// it. Only an empty undamaged store is never written, so an absent field
+    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// the current proof decides.
     #[serde(
-        default = "claude_request_money::copy_removals::CopyRemovals::missing",
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_empty",
+        default,
+        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
@@ -5135,10 +5146,17 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// The account-deferred subset of `quarantined_source_session_ids`. Upload
     /// retention still uses the union; this only classifies settlement.
     account_deferred_source_session_ids: BTreeSet<String>,
+    /// Fixed-label E2 emission veto counts for this page. Diagnostic only;
+    /// never serialized, persisted, or used to decide upload eligibility.
+    pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// SOURCE 2026-10-31 (#944 xPR F5): the copy-derived accepted rows this
+    /// pass's bodies treat as never accepted. The sync loop tombstones them
+    /// through `AcceptedBuckets` and saves before any upload.
+    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
     /// Contract-5 only: this terminal census compared every indexed Claude
     /// family member's current requests. Unlike fence coverage, a bound
     /// authority quarantine excuses nothing. Taken before the census prunes
@@ -7740,6 +7758,8 @@ pub struct SourceScanResult {
     pub census_residue_archived_rollout_count: usize,
     pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
+    /// Exact selection deferrals from this page, diagnostic only; never persisted.
+    pub(crate) claude_queued_family_deferred_paths: BTreeSet<claude_money_birth_store::LocationKey>,
     pending_finalization: Vec<PendingIndexFinalization>,
     /// RAM-only observations of this bounded page; never serialized or uploaded.
     discovery_growth: discovery_growth::Page,
@@ -16017,11 +16037,7 @@ impl SelectorHashes {
 // a native selector hash ("base" or hexadecimal).
 const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
 fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
-    let selector_hash = if row.copy_unproven {
-        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
-    } else {
-        selector_hash
-    };
+    let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
     RowKey {
         model: row.model.clone(),
         selector_hash,
@@ -16032,6 +16048,18 @@ fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -
         gateway_provider: row.gateway_provider.clone(),
         model_provider: row.model_provider.clone(),
         subscription_product: row.subscription_product.clone(),
+    }
+}
+
+/// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
+/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
+/// #944 proved rows), must partition through here so a marked row and an
+/// unmarked twin never share a key.
+pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
+    if copy_unproven {
+        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
+    } else {
+        selector_hash
     }
 }
 
@@ -21547,6 +21575,7 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
         evidence_ref: None,
         identity_parts: None,
         identity_retained: false,
+        copy_invalidated: false,
         model: row_key.model.clone(),
         input_tokens: row.usage.input_tokens,
         output_tokens: row.usage.output_tokens,
@@ -26146,16 +26175,16 @@ fn finish_claude_retry_selection(
     pending_paths: &mut Vec<ScanTraversalPath>,
     retry_service_end: usize,
     service_at: &str,
-) {
-    claude_request_money::e2::defer_roots_of_queued_families(
+) -> BTreeSet<claude_money_birth_store::LocationKey> {
+    let deferred = claude_request_money::e2::defer_roots_of_queued_families(
         pending_paths,
         index.traversal.as_mut().expect("traversal initialized"),
     );
-
     let offered_end = retry_service_end.min(pending_paths.len());
     if offered_end > 0 {
         claude_retry_note_offered(index, &pending_paths[..offered_end], service_at);
     }
+    deferred
 }
 
 impl OwnedSourceScan {
@@ -26612,7 +26641,7 @@ impl OwnedSourceScan {
             scanned_file_count: 0,
             scanned_session_count: 0,
             semantic_noop_count: 0,
-            history_upgrade: HistoryPage::with_twin_groups(Default::default()),
+            history_upgrade: HistoryPage::with_twin_groups(Default::default(), BTreeSet::new()),
             context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
             codex_state_only_blocked_session_ids: Default::default(),
             codex_parent_resolution_retry_required: false,
@@ -27075,7 +27104,7 @@ impl OwnedSourceScan {
         }
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
-        if source == SnapshotSource::ClaudeCode {
+        let claude_queued_family_deferred_paths = if source == SnapshotSource::ClaudeCode {
             // Credit service at this observation, within the admission horizon.
             // The retained census clock stays frozen for proof and completeness.
             finish_claude_retry_selection(
@@ -27083,8 +27112,10 @@ impl OwnedSourceScan {
                 &mut pending_paths,
                 retry_service_end,
                 collected_at,
-            );
-        }
+            )
+        } else {
+            BTreeSet::new()
+        };
         index.resume_census_window_end = Some(census_window_end.clone());
         let mut census = ScanCensus {
             causes,
@@ -27445,7 +27476,10 @@ impl OwnedSourceScan {
             scanned_file_count,
             scanned_session_count,
             semantic_noop_count,
-            history_upgrade: HistoryPage::with_twin_groups(claude_twin_groups),
+            history_upgrade: HistoryPage::with_twin_groups(
+                claude_twin_groups,
+                claude_queued_family_deferred_paths,
+            ),
             context_read_budget: upload_context_read::Budget::new(source),
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
@@ -32281,6 +32315,9 @@ impl OwnedSourceScan {
                 }
                 let scan = SourceScanResult {
                     cap_counts: counts.caps,
+                    claude_queued_family_deferred_paths: std::mem::take(
+                        &mut history_upgrade.queued_family_deferred_paths,
+                    ),
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     strict_cohort_deferred_root_count: 0,
                     source,
@@ -34409,6 +34446,7 @@ fn codex_state_only_snapshot(
         identity_parts: None,
         copy_unproven: false,
         identity_retained: false,
+        copy_invalidated: false,
         model,
         input_tokens: 0,
         output_tokens: 0,
@@ -49071,6 +49109,61 @@ impl ScanIndex {
                 record.witness.item_wire_byte_limit == MAX_SNAPSHOT_ITEM_WIRE_BYTES
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
             })
+    }
+
+    /// Q-W: every current-limit pending retry uses the same outside/unknown
+    /// incidence rule, regardless of which operation created or armed it.
+    pub(crate) fn snapshot_admission_reoffer_pending_for_scan(
+        &self,
+        source: SnapshotSource,
+        window_days: u64,
+    ) -> bool {
+        if source != SnapshotSource::ClaudeCode || !admission_reoffer_window::enabled() {
+            return self.snapshot_admission_reoffer_pending();
+        }
+        let Some(now) = unix_seconds(SystemTime::now()) else {
+            return self.snapshot_admission_reoffer_pending();
+        };
+        let (mut outside, mut inside) = (0, 0);
+        for (fingerprint, record) in &self.quarantined_snapshot_fingerprints {
+            if record.witness.item_wire_byte_limit != MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                continue;
+            }
+            // A retry can age out after its refusal. Use the scanner's mtime
+            // cutoff on current metadata: committed mtimes can be stale after
+            // a restore/copy. Unknown incidence or metadata stays wide.
+            let mut found = false;
+            let outside_window = self
+                .file_snapshot_fingerprints
+                .iter()
+                .any(|(key, entities)| {
+                    if !entities.contains(fingerprint) {
+                        return false;
+                    }
+                    found = true;
+                    fs::symlink_metadata(key)
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(unix_seconds)
+                        .map_or(true, |modified| {
+                            !is_recent_enough_at(modified, now, window_days)
+                        })
+                });
+            if outside_window || !found {
+                outside += 1;
+            } else {
+                inside += 1;
+            }
+        }
+        if outside + inside > 0 {
+            eprintln!(
+                "ottto-service: Claude admission scan window: outside_or_unknown={outside} inside={inside}"
+            );
+        }
+        outside > 0
     }
 
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
@@ -80336,6 +80429,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "claude-opus-4-7".to_string(),
             input_tokens: 100,
             output_tokens: 40,
@@ -82091,6 +82185,7 @@ mod tests {
             identity_parts: None,
             copy_unproven: false,
             identity_retained: false,
+            copy_invalidated: false,
             model: "claude-opus-4-7".to_string(),
             input_tokens: 100,
             output_tokens: 40,
@@ -84478,7 +84573,7 @@ crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capabi
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
 crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
-crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
+crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
