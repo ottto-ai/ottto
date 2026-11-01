@@ -8,7 +8,7 @@ use super::*;
 use crate::snapshots::claude_request_money::e2;
 use crate::snapshots::e2_pipeline_scan_fixture::{
     accept_upload_context_acks_for_test, birth_store_bytes, upload_context_owed_diagnosis_for_test,
-    E2ScanFixture,
+    upload_context_receipt_earned_for_test, E2ScanFixture,
 };
 use serde_json::json;
 

@@ -272,6 +272,26 @@ pub(crate) fn accept_upload_context_acks_for_test(
     index.stamp_entity_upload_context_acks("e2-fixture-destination", acks, &contexts);
 }
 
+/// `path` holds a receipt for its current body under the active context
+/// (its revision may still be cleared for a forced reparse).
+pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &Path) -> bool {
+    index
+        .files
+        .get(&local_index_key(path))
+        .is_some_and(|entry| {
+            entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    index.active_upload_context_fingerprint.as_ref()
+                        == Some(&receipt.context_fingerprint)
+                        && receipt.replay_generation
+                            == super::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                })
+        })
+}
+
 /// Why `path` still owes its upload-context proof after a page whose `items`
 /// were sent and `acks` exact-ACKed (empty when no page was delivered).
 /// `None` when the file is proven. Counts and flags only.
