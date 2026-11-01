@@ -726,7 +726,7 @@ fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
 
 /// [format] #938 copy removals map losslessly between checked v1 bytes and v2.
 /// Goldens are CCR2 of #938's persisted-field fixture plus one prefix-hold
-/// debt file, with definite and lost metadata; an absent slot stays lost.
+/// debt file, with definite and lost metadata; an absent slot stays empty.
 #[test]
 fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
     use crate::snapshots::claude_money_birth_store::location_key;
@@ -736,7 +736,7 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
         location_key("/synthetic/copy.jsonl"),
         location_key("/synthetic/held.jsonl"),
     );
-    for (golden, metadata_lost) in [(Some(DEFINITE), false), (Some(LOST), true), (None, true)] {
+    for (golden, metadata_lost) in [(Some(DEFINITE), false), (Some(LOST), true), (None, false)] {
         let mut v1 = serde_json::to_value(fixture()).unwrap();
         let object = v1.as_object_mut().unwrap();
         object.remove("claude_copy_removals");

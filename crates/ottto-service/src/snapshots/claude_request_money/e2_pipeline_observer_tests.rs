@@ -65,6 +65,17 @@ pub(crate) fn lossy_census(index: &mut ScanIndex, file_name: &str, ids: &[&str])
     index.claude_request_census.insert(key, record);
 }
 
+/// The indexed file named `file_name` leaves the index through the
+/// production removal path, as when its transcript is deleted.
+pub(crate) fn forget_file(index: &mut ScanIndex, file_name: &str) {
+    let key = census_key(index, file_name);
+    index.remove_file_entry(&key);
+    assert!(
+        !index.files.contains_key(&key),
+        "{file_name} left the index"
+    );
+}
+
 /// An indexed file left without a census record.
 pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
     let key = census_key(index, file_name);
