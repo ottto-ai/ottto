@@ -4885,19 +4885,20 @@ fn owed_restamp_equals_a_real_fold_of_the_same_bytes() {
         let key = local_index_key(path);
         let (_, member) = claude_index_path_family_member(path).unwrap();
         let fingerprint = owed.files[&key].source_file_fingerprint.clone();
+        let hashes = owed.claude_usage_family_pending[&parent]
+            .member_request_id_hashes
+            .get(&member)
+            .map(|hashes| hashes.iter().map(|hash| &hash[..16]).collect::<String>());
         let mut record = serde_json::json!({
             "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
             "fp": fingerprint,
             "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
-            "s": "exact",
+            "s": if hashes.is_some() { "exact" } else { "empty" },
             "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
             "bd": 1, "bn": 1,
         });
-        if let Some(hashes) = owed.claude_usage_family_pending[&parent]
-            .member_request_id_hashes
-            .get(&member)
-        {
-            record["h"] = hashes.iter().map(|hash| &hash[..16]).collect::<String>().into();
+        if let Some(hashes) = hashes {
+            record["h"] = hashes.into();
         }
         owed.claude_request_census
             .insert(key.clone(), scoped_retry_record(&key, record));
