@@ -605,7 +605,6 @@ mod tests {
             &[],
             false,
             false,
-            false,
         );
         assert_eq!(state.identified_candidates.len(), 1);
         assert!(
@@ -1103,7 +1102,6 @@ mod tests {
             None,
             &[],
             false,
-            true,
         );
         assert!(
             state

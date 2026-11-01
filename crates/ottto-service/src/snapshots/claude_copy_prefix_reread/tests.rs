@@ -67,7 +67,6 @@ fn walk(
         &[],
         false,
         true,
-        true,
         scope,
     );
     let mut opened = Vec::new();
