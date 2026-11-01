@@ -2410,6 +2410,13 @@ impl DurableTailStore {
         writer: &W,
         key: Digest32,
     ) -> io::Result<()> {
+        self.check_writer(writer)?;
+        let mut keys = self.private_label_keys().unwrap_or(None);
+        // A key already in the known positive inventory changes nothing: no
+        // rewrite, no sync, and the erase cursor keeps its place.
+        if keys.as_ref().is_some_and(|keys| keys.contains(&key)) {
+            return Ok(());
+        }
         // A newly staged literal invalidates a prior partial no-label sweep,
         // including a new canonical key ordered before its old cursor.
         self.private_purge_entries = None;
@@ -2418,7 +2425,6 @@ impl DurableTailStore {
         self.private_purge_overflow = false;
         self.private_purge_after = None;
         self.private_purge_kept.clear();
-        let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
             keys.insert(key);
         }
