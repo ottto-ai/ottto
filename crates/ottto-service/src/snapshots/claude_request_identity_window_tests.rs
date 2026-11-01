@@ -1413,7 +1413,8 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
     let mut projected = padded.clone();
     prepare_cache_observations(&mut projected, Some(&prior));
     let reserved = identity::item_bytes(&projected) - identity::item_bytes(&padded);
-    identity::apply_with_reserved_bytes_for_test(&mut padded, &proof, &accepted, reserved).unwrap();
+    identity::apply_with_reserved_bytes_for_test(&mut padded, &proof, &accepted, reserved, None)
+        .unwrap();
     assert!(sticky_tagged(&padded.usage_buckets[23].model_usage[0]));
     let refused = padded.usage_buckets[..24]
         .iter()
@@ -2248,7 +2249,8 @@ fn sticky_unpriced_share_after_budget_selection_is_stripped_from_the_final_rows(
     sticky_receiver_totals(&mut item);
     identity::take_identity_counts();
     let result =
-        identity::apply_with_reserved_bytes_for_test(&mut item, &proof, &ledger, reserve).unwrap();
+        identity::apply_with_reserved_bytes_for_test(&mut item, &proof, &ledger, reserve, None)
+            .unwrap();
     assert_eq!(result, Tagged::Sent { refusals: 24 });
     assert!(item.request_evidence.is_empty());
     assert!(!sticky_any_tagged(&item));
@@ -2451,4 +2453,406 @@ fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
         assert_eq!(sticky_money(&item), sticky_money(&baseline), "case {case}");
     }
     assert!(stripped_cases > 0 && kept_parts_cases > 0);
+}
+
+/// [money][regress] #909: the advertised cap preserves every tag and total;
+/// the real heap walker charges the large graph or refuses parking, never money.
+#[test]
+fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
+    let (mut base, mut proof) = sticky_session(400);
+    sticky_price_fixture(&mut base, &mut proof);
+    sticky_receiver_totals(&mut base);
+    base.session_display_name = Some("x".into());
+    base.workspace_display_label = Some("x".into());
+    base.repository_label = Some("x".into());
+    base.context_curve = Some(max_fractional_context_curve_fixture());
+    let (mut item, filler) = sticky_pad_to_bytes(&base, 1_600_000);
+    proof.extend(filler);
+    let baseline = sticky_money(&item);
+    let ledger = identity::AcceptedBuckets::for_test();
+    let (result, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply_with_reserved_bytes_for_test(&mut item, &proof, &ledger, 0, Some(3_145_728))
+            .unwrap()
+    });
+    assert_eq!(result, Tagged::Sent { refusals: 0 });
+    assert!(item.usage_buckets[..400]
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    assert_eq!(sticky_money(&item), baseline);
+    let bytes = identity::item_bytes(&item);
+    assert!(bytes > 655_360 && bytes <= 3_145_728);
+    assert!(diagnostics.iter().any(
+        |record| record["counts"]["claude_request_identity_over_cap"]["near_cap"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    ));
+    let curve = serde_json::to_value(&item.context_curve).unwrap();
+    apply_upload_policy_with_item_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_mut(&mut item),
+        SnapshotUploadPolicy::default(),
+        3_145_728,
+    );
+    assert_eq!(serde_json::to_value(&item.context_curve).unwrap(), curve);
+    let mut request = valid_v6_batch_request();
+    request.snapshots = vec![item.clone()];
+    assert!(validate_snapshot_batch_request(&request)
+        .unwrap_err()
+        .contains("wire body"));
+    validate_snapshot_batch_request_with_item_limit(&request, 3_145_728).unwrap();
+    // The same production graph used by SourcePreparation::bound includes all
+    // vector capacity and nested identity parts. A visit/budget refusal selects
+    // source_rotation's existing same-frame serial continuation.
+    assert!(crate::heap_layout_bound::layout_supported());
+    let charge = crate::heap_layout_bound::completed_bound(&item, usize::MAX).unwrap();
+    assert!(charge > 1_600_000);
+    assert!(crate::heap_layout_bound::bound(&item, 655_360).is_none());
+    // The tagged heap fixture uses a 3 MiB cap. Pad the same untagged base
+    // separately so the generic upload fixture fits the receiver's 2 MiB cap.
+    let (mut generic_item, _) = sticky_pad_to_bytes(&base, 1_000_000);
+    apply_upload_policy_with_item_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_mut(&mut generic_item),
+        SnapshotUploadPolicy::default(),
+        2_097_152,
+    );
+    // The receiver advertises the same item limit for every source.
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut charged_request = request.clone();
+        charged_request.source = source.api_slug().into();
+        charged_request.snapshots = vec![generic_item.clone()];
+        charged_request.snapshots[0].snapshot_fingerprint =
+            snapshot_fingerprint(source, &charged_request.snapshots[0]);
+        let wire_bytes = snapshot_item_wire_size(
+            source,
+            &charged_request.snapshots[0],
+            SnapshotUploadPolicy::default(),
+        );
+        assert!(
+            (655_361..=2_097_152).contains(&wire_bytes),
+            "{source:?}: {wire_bytes}"
+        );
+        let before = serde_json::to_vec(&charged_request.snapshots).unwrap();
+        apply_upload_policy_with_item_limit(
+            source,
+            &mut charged_request.snapshots,
+            SnapshotUploadPolicy::default(),
+            2_097_152,
+        );
+        assert!(
+            serde_json::to_vec(&charged_request.snapshots).unwrap() == before,
+            "{source:?}: upload policy changed an item that fits the advertised cap"
+        );
+        assert_eq!(charged_request.snapshots.len(), 1);
+        validate_snapshot_batch_request_with_item_limit(&charged_request, 2_097_152).unwrap();
+        assert!(validate_snapshot_batch_request(&charged_request)
+            .unwrap_err()
+            .contains("wire body"));
+        let mut default_items = charged_request.snapshots.clone();
+        let mut no_hint_items = default_items.clone();
+        apply_upload_policy(source, &mut default_items, SnapshotUploadPolicy::default());
+        apply_upload_policy_with_item_limit(
+            source,
+            &mut no_hint_items,
+            SnapshotUploadPolicy::default(),
+            identity::effective_item_cap(None),
+        );
+        assert_eq!(
+            serde_json::to_vec(&no_hint_items).unwrap(),
+            serde_json::to_vec(&default_items).unwrap()
+        );
+    }
+    // Lead B's increased-cap last resort: preserve tags and money, and use
+    // the existing upload hold instead of sending a smaller stripped revision.
+    let mut held = item.clone();
+    let before = sticky_money(&held);
+    let (result, alarms) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply_with_reserved_bytes_for_test(&mut held, &proof, &ledger, 0, Some(1_048_576))
+            .unwrap()
+    });
+    assert!(alarms.iter().any(
+        |record| record["counts"]["claude_request_identity_over_cap"]["identity_over_cap_held"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    ));
+    assert_eq!(result, Tagged::Held);
+    assert_eq!(sticky_money(&held), before);
+    assert!(held.usage_buckets[..400]
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    disposition.hold_request_owned(BTreeSet::from([held.source_session_id.clone()]));
+    let mut uploadable = vec![held];
+    disposition.retain_uploadable(&mut uploadable);
+    assert!(uploadable.is_empty());
+
+    // The same last resort covers non-byte caps: no second strip/hold policy.
+    let (mut key_item, mut key_proof) = sticky_session(6);
+    sticky_receiver_totals(&mut key_item);
+    for (index, contribution) in key_proof.iter_mut().enumerate() {
+        contribution.identity = RequestIdentity::Tagged(AuthorityKey {
+            login: Some(format!("{index:064x}")),
+            org: Some("a".repeat(64)),
+            basis: identity::TELEMETRY,
+            account_source: None,
+        });
+    }
+    let before = sticky_money(&key_item);
+    let mut no_hint = key_item.clone();
+    assert_eq!(
+        sticky_apply(&mut no_hint, &key_proof, &ledger).unwrap(),
+        Tagged::Sent { refusals: 1 }
+    );
+    assert_eq!(sticky_money(&no_hint), before);
+    let (result, alarms) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply_with_reserved_bytes_for_test(
+            &mut key_item,
+            &key_proof,
+            &ledger,
+            0,
+            Some(2_097_152),
+        )
+        .unwrap()
+    });
+    assert_eq!(result, Tagged::Held);
+    assert_eq!(sticky_money(&key_item), before);
+    assert!(alarms.iter().any(|record| {
+        let reasons = &record["counts"]["claude_request_identity_over_cap"];
+        reasons["authority_keys"].as_u64().is_some_and(|n| n > 0)
+            && reasons["identity_over_cap_held"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+    }));
+}
+
+/// [money] Previously stripped buckets are new accepted tags on the next ACK,
+/// with no share-change refusal or ledger drift on the following upload.
+#[test]
+fn advertised_cap_retags_previously_stripped_accepted_body() {
+    let (mut base, mut proof) = sticky_session(400);
+    sticky_price_fixture(&mut base, &mut proof);
+    sticky_receiver_totals(&mut base);
+    base.session_display_name = Some("x".into());
+    base.workspace_display_label = Some("x".into());
+    base.repository_label = Some("x".into());
+    let (original, filler) = sticky_pad_to_bytes(&base, 620_000);
+    proof.extend(filler);
+    let mut ledger = identity::AcceptedBuckets::for_test();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &ledger).unwrap();
+    assert!(first.request_identity_refusals > 0);
+    let refused = first.usage_buckets[..400]
+        .iter()
+        .filter(|b| !sticky_tagged(&b.model_usage[0]))
+        .count();
+    assert!(refused > 0);
+    ledger.record(&serde_json::to_value(&first).unwrap());
+    let previous = ledger.get(&first.source_session_id).unwrap().len();
+    assert!(previous < 400);
+    identity::take_identity_counts();
+    let mut second = original.clone();
+    let result = identity::apply_with_reserved_bytes_for_test(
+        &mut second,
+        &proof,
+        &ledger,
+        0,
+        Some(2_097_152),
+    )
+    .unwrap();
+    assert_eq!(result, Tagged::Sent { refusals: 0 });
+    assert!(second.usage_buckets[..400]
+        .iter()
+        .all(|b| sticky_tagged(&b.model_usage[0])));
+    assert_eq!(sticky_money(&second), sticky_money(&first));
+    let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
+    assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
+    assert_eq!(counts["identity_cap"]["refused_new_buckets"], 0);
+    ledger.record(&serde_json::to_value(&second).unwrap());
+    assert_eq!(ledger.get(&second.source_session_id).unwrap().len(), 400);
+    let mut expected_ledger = serde_json::to_value(&ledger).unwrap();
+    for session in expected_ledger.as_object_mut().unwrap().values_mut() {
+        session["last_ack"] = json!(session["last_ack"].as_u64().unwrap() + 1);
+    }
+    let mut third = original;
+    identity::apply_with_reserved_bytes_for_test(&mut third, &proof, &ledger, 0, Some(2_097_152))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&third).unwrap(),
+        serde_json::to_vec(&second).unwrap()
+    );
+    ledger.record(&serde_json::to_value(&third).unwrap());
+    assert_eq!(serde_json::to_value(&ledger).unwrap(), expected_ledger);
+
+    // Extend this ACK/re-tag fixture to the receiver-derived ledger boundary.
+    // Two single-authority rows per hour keep 6,553 shares below MAX_BUCKETS.
+    let (mut large, _) = sticky_session(3_277);
+    let mut rows = Vec::new();
+    let mut proof = Vec::new();
+    for (index, bucket) in large.usage_buckets.iter_mut().enumerate() {
+        let mut row = bucket.model_usage[0].clone();
+        row.model = "a".into();
+        let mut other = row.clone();
+        other.model = "b".into();
+        bucket.model_usage = if index == 3_276 {
+            vec![row]
+        } else {
+            vec![row, other]
+        };
+        for row in &bucket.model_usage {
+            proof.push(Contribution {
+                bucket_start: bucket.bucket_start.clone(),
+                row_key: row_key_from_model_usage(row),
+                usage: holder_usage(row, None),
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: None,
+                    org: Some(D64.into()),
+                    basis: identity::TRANSCRIPT_ORG,
+                    account_source: None,
+                }),
+            });
+        }
+    }
+    for (name, hours) in [("a", 3_277), ("b", 3_276)] {
+        let mut row = large.usage_buckets[0].model_usage[0].clone();
+        row.model = name.into();
+        row.input_tokens *= hours;
+        row.request_count *= hours;
+        rows.push(row);
+    }
+    large.model_usage = rows;
+    sticky_receiver_totals(&mut large);
+    let mut ledger = identity::AcceptedBuckets::for_test();
+    ledger.set_item_cap(2_097_152);
+    identity::take_identity_counts();
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut large,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Sent { refusals: 0 }
+    );
+    assert!(identity::item_bytes(&large) <= 2_097_152);
+    ledger.record(&serde_json::to_value(&large).unwrap());
+    let bytes = serde_json::to_vec(&ledger).unwrap();
+    ledger = identity::AcceptedBuckets::restore_for_test(&bytes);
+    ledger.set_item_cap(2_097_152);
+    let before = sticky_money(&large);
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut large,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Sent { refusals: 0 }
+    );
+    assert_eq!(sticky_money(&large), before);
+    assert!(large
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .all(sticky_tagged));
+    let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
+    assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
+    assert_eq!(
+        counts["identity_cap"]["accepted_state_unknown_cause"]["incomplete"],
+        0
+    );
+    // One more share must hold before POST and leave accepted proof untouched.
+    let mut over = large.clone();
+    let added = over.usage_buckets[0].model_usage[1].clone();
+    let last = over.usage_buckets.last_mut().unwrap();
+    last.model_usage.push(added.clone());
+    proof.push(Contribution {
+        bucket_start: last.bucket_start.clone(),
+        row_key: row_key_from_model_usage(&added),
+        usage: holder_usage(&added, None),
+        identity: RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(D64.into()),
+            basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
+        }),
+    });
+    let top = over
+        .model_usage
+        .iter_mut()
+        .find(|row| row.model == "b")
+        .unwrap();
+    top.input_tokens += added.input_tokens;
+    top.request_count += added.request_count;
+    sticky_receiver_totals(&mut over);
+    let before = sticky_money(&over);
+    let accepted = serde_json::to_vec(&ledger).unwrap();
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut over,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Held
+    );
+    assert_eq!(sticky_money(&over), before);
+    assert_eq!(serde_json::to_vec(&ledger).unwrap(), accepted);
+}
+
+/// [off=main] No hint, malformed values and smaller limits use main's exact
+/// body bytes. Valid integer hints are bounded by the daemon's 3 MiB maximum.
+#[test]
+fn advertised_cap_absent_or_invalid_is_byte_identical_to_main() {
+    let (original, proof) = sticky_session(24 * 24);
+    let ledger = identity::AcceptedBuckets::for_test();
+    let mut main = original.clone();
+    sticky_apply(&mut main, &proof, &ledger).unwrap();
+    assert!(main.request_identity_refusals > 0);
+    let main_bytes = serde_json::to_vec(&main).unwrap();
+    for value in [
+        None,
+        Some(json!(null)),
+        Some(json!("3145728")),
+        Some(json!(-1)),
+        Some(json!(655_360.5)),
+        Some(json!({})),
+        Some(json!([])),
+        Some(json!(true)),
+        Some(json!(655_359)),
+    ] {
+        let mut hint = json!({"source":"claude_code", "server_time":"2026-10-31T00:00:00Z", "last_data_at":null, "record_count_15m":0, "record_count_24h":0, "local_usage_reconciliation_enabled":true, "backfill_window_days":183,"recommended_scan_after":"2026-10-31T00:01:00Z"});
+        if let Some(value) = value {
+            hint["max_snapshot_item_bytes"] = value;
+        }
+        let hint = crate::snapshot_client::decode_activity_hint(hint).unwrap();
+        let mut item = original.clone();
+        sticky_receiver_totals(&mut item);
+        identity::apply_with_reserved_bytes_for_test(
+            &mut item,
+            &proof,
+            &ledger,
+            0,
+            hint.max_snapshot_item_bytes,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&item).unwrap(), main_bytes);
+    }
+    for (advertised, expected) in [
+        (655_360, 655_360),
+        (1_048_576, 1_048_576),
+        (3_145_728, 3_145_728),
+        (u64::MAX, 3_145_728),
+    ] {
+        assert_eq!(identity::effective_item_cap(Some(advertised)), expected);
+    }
 }

@@ -170,7 +170,6 @@ fn raw_scan_at(
         Some(&fixture.support),
         &[],
         false,
-        true,
         identity_capture,
     );
     if let Some(cache) = cache {
@@ -1495,7 +1494,6 @@ mod durable_restart {
             Some(&f.support),
             &[],
             false,
-            true,
             capture_by_default(),
         )
         .with_sampled_acquisition(cache, Scope(namespace.into()));

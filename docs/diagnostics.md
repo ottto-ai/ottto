@@ -151,7 +151,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
-| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -1222,7 +1222,9 @@ canonical digests, not collected content.
 
 Schema 2's existing `native_collection_page` and `native_comparison_decision`
 records can include two sparse, counts-only objects for `source: claude_code`:
-`counts.claude_reread` and `counts.retained_cache_page_events`. Missing keys
+`counts.claude_reread` and `counts.retained_cache_page_events`. A
+`native_collection_page` for any other source can carry
+`counts.retained_cache_page_events` only. Missing keys
 mean zero events in that observation. Counters saturate at `u64::MAX`. They
 add no wire fields, collected data kinds, persisted state or transcript reads.
 No paths, identifiers, fingerprints, bodies or content are emitted.
@@ -1335,7 +1337,7 @@ sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
 `copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
 `prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
 cumulative, cross-source and labelled `unknown`), these are exact deltas from
-operations executed by the Claude page. Eviction/clear counts describe the
+operations executed by that source's page. Eviction/clear counts describe the
 causing page, **not** the source of each victim in the shared cache. No victim
 identity/history is retained. Existing refusal causes include entry/key/frozen
 charge, layout/disabled, live reservation, missing/invalid plan, incomplete or
@@ -1890,8 +1892,7 @@ whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
 `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history. The fixed import pause label
-`r1_staging_not_installed` means **R1 staging not installed**.
+account-window pressure without capping owed history.
 These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows

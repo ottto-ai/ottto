@@ -2405,7 +2405,6 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(cache.clone(), Scope("unchanged-census".into()));
             let mut mode = None;

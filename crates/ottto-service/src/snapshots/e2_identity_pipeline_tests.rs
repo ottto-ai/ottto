@@ -707,6 +707,8 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
     }
 }
 
+/// [money] Existing own-key overflow and carried-twin exhaustion conserve
+/// all money; provenance-enabled overflow stays held before any strip.
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");
@@ -765,6 +767,44 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     assert_eq!(item.request_identity_refusals, 1);
     assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
+    // The existing seventeen-request fixture also reaches the cap through
+    // a forward twin, a backward twin, and a twin occupying a later own key's
+    // slot. No raised byte limit is required for provenance to remain owed.
+    for gaps in [vec![1], vec![17], (2..=16).step_by(2).collect()] {
+        let own = api
+            .iter()
+            .filter(|row| !gaps.iter().any(|n| row.request_id == format!("req_{n}")))
+            .cloned()
+            .collect::<Vec<_>>();
+        e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &own);
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
+            let (off, off_disposition, failed, _) = e2_page_counted_with(
+                std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
+            );
+            assert!(!failed);
+            assert_eq!(off_disposition.quarantined_entity_count(), 0);
+            accepted.set_account_source_enabled(true);
+            let (on, disposition, failed, _) = e2_page_counted_with(
+                std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
+            );
+            assert!(!failed);
+            assert_eq!(on.len(), 1);
+            assert_eq!(disposition.quarantined_entity_count(), 1, "{gaps:?}: item Held");
+            assert!(disposition.quarantined_source_session_ids.contains(root));
+            assert_eq!(on[0].request_count, off[0].request_count);
+            assert_eq!(on[0].input_tokens, off[0].input_tokens);
+            assert_eq!(on[0].output_tokens, off[0].output_tokens);
+            assert_eq!(on[0].cost, off[0].cost, "{gaps:?}: money conserved while Held");
+            assert_eq!(on[0].request_count, 17);
+            assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
+            assert!(e2_source_counts(&on[0]).keys().any(|(account, _)| account.is_some()),
+                "known identity is retained while the item is owed");
+            let mut uploadable = on;
+            disposition.retain_uploadable(&mut uploadable);
+            assert!(uploadable.is_empty(), "no held revision can upload or settle");
+        });
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 

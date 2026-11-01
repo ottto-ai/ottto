@@ -152,14 +152,14 @@ impl ClaudeMapper {
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
-        prev: &ScanIndex,
+        previous: kinds::Baseline,
         next: &mut ScanIndex,
         cx: &mut KindCx,
         claim_only: bool,
-    ) -> Result<()> {
+    ) -> Result<kinds::Baseline> {
         {
             let mut tx = db.begin(TxnMode::Read)?;
-            kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
+            kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
             kinds_files::merge_growth_cas(&mut tx, next)?;
         }
         super::super::sampled_audit::prune_growth_retention(
@@ -170,7 +170,7 @@ impl ClaudeMapper {
             next.retire_committed_claude_account_pending_windows();
         }
         super::super::lenient_decode::check_held_output(next)?;
-        kinds::save_graph(db, identity, prev, next, cx)
+        kinds::save_graph(db, identity, previous, next, cx)
     }
 }
 

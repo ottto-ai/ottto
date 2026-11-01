@@ -393,7 +393,7 @@ fn retained_fallback_keeps_only_the_newest_markers_that_fit() {
     retained_ack(&mut state, &first, &[]);
     let reserved = |item: &mut SnapshotItem, extra: usize| {
         sticky_receiver_totals(item);
-        identity::apply_with_reserved_bytes_for_test(item, &proof, &state, extra)
+        identity::apply_with_reserved_bytes_for_test(item, &proof, &state, extra, None)
     };
     // No room beside the stripped body: each proved row is a stripped refusal.
     let mut bare = original.clone();
@@ -500,7 +500,7 @@ fn retained_golden_cases() -> Value {
     let mut refusal = login.clone();
     let mut changed = login_proof.clone();
     for contribution in &mut changed[..3] { contribution.identity = login_key(D64); }
-    identity::apply_with_reserved_bytes_for_test(&mut refusal, &changed, &login_state, identity::MAX_ITEM_BYTES).unwrap();
+    identity::apply_with_reserved_bytes_for_test(&mut refusal, &changed, &login_state, identity::MAX_ITEM_BYTES, None).unwrap();
     assert!(!refusal.usage_buckets[0].model_usage[0].identity_retained);
     assert!(!sticky_tagged(&refusal.usage_buckets[0].model_usage[0]));
     assert!(refusal.request_identity_refusals > 0);

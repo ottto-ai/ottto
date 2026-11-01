@@ -1389,7 +1389,6 @@ fn census_failed_read_invalidates_old_record() {
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(
         std::sync::Arc::new(sampled_scan::SharedCache::default()),
@@ -1999,7 +1998,6 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(cache.clone(), namespace);
         let (mut index, result) = loop {

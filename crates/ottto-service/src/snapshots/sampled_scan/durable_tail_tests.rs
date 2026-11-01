@@ -198,7 +198,6 @@ fn native_record_of(
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     parser
@@ -963,7 +962,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache.clone(), namespace);
                 if bypass == "sampling_none" || bypass == "compressed" {
@@ -1251,7 +1249,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(cache, namespace.clone());
                 for _ in 0..10_000 {
@@ -1518,7 +1515,6 @@ pub(super) fn known_corrupt_scan(
         None,
         &[],
         false,
-        true,
         capture,
     )
     .with_sampled_acquisition(cache.clone(), namespace.clone());
@@ -2166,7 +2162,6 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             None,
             None,
             false,
-            true,
         )
         .unwrap();
         codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
@@ -3478,7 +3473,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
