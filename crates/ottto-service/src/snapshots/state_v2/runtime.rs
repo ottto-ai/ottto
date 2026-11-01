@@ -785,11 +785,16 @@ pub(in super::super) fn claim_growth_locked(
                     "synthetic concurrent commit"
                 );
             }
-            let claimed = growth_claim_txn(&mut session.db, &id, expected, key, decide)?;
+            let claimed = growth_claim_txn(
+                &mut session.db,
+                &id,
+                expected,
+                key,
+                state.save_digests.as_mut(),
+                decide,
+            )?;
             if claimed.0 {
                 session.stamp = session.db.stamp()?;
-                // As after a claim-only save, the next save reads its baseline.
-                state.save_digests = None;
             }
             Ok(claimed)
         })
@@ -801,9 +806,13 @@ fn growth_claim_txn(
     identity: &Identity,
     expected: u64,
     key: &str,
+    baseline: Option<&mut kinds::Baseline>,
     decide: impl FnOnce(&mut GrowthRows, bool, &BTreeSet<String>) -> bool,
 ) -> Result<(bool, GrowthRows)> {
     const KIND: &str = "file.growth_retention";
+    if let Some(baseline) = &baseline {
+        ensure!(baseline.generation == expected, Hold::ReloadRequired);
+    }
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     let mut span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
@@ -827,14 +836,25 @@ fn growth_claim_txn(
         ..Default::default()
     };
     writer.map(KIND, &rows)?;
-    writer.finish()?;
+    let digests = writer.finish()?;
     // COMMIT re-checks the generation control against G inside this write.
     let outcome = tx.commit(expected, next);
     span.outcome(&outcome);
     let refused = outcome == DurableCommitOutcome::NotPublished;
     span.emit(db, if refused { expected } else { next });
     match outcome {
-        DurableCommitOutcome::Committed(generation) if generation == next => Ok((true, rows)),
+        DurableCommitOutcome::Committed(generation) if generation == next => {
+            if let Some(baseline) = baseline {
+                // A reclaimed member can return with identical bytes; its old
+                // digest would skip recreating it. Replace manifest and members.
+                baseline.rows.retain(
+                    |key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND),
+                );
+                baseline.rows.extend(digests);
+                baseline.generation = next;
+            }
+            Ok((true, rows))
+        }
         DurableCommitOutcome::NotPublished => {
             bail!(db.save_failure().unwrap_or(Hold::ReloadRequired))
         }
