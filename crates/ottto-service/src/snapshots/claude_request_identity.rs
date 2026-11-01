@@ -5823,8 +5823,8 @@ fn tag_item(
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
         // Like `identity_retained`, only a receiver advertising option (ii)
         // retention mirrors the flag in its identity leaf (and only it holds
-        // proof to drop). Switch off sends no flag, so its bytes stay main's.
-        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+        // proof to drop).
+        if retained {
             grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
         }
         let invalidated = accepted

@@ -93,8 +93,6 @@ fn e2_page_counted_with(
     bool,
     serde_json::Value,
 ) {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -817,8 +815,6 @@ fn e2_page_with_stats(
     ClaudeUsageAuthorityDisposition,
     crate::snapshot_sync::ClaudeLocalEvidenceStats,
 ) {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
@@ -976,8 +972,6 @@ fn e2_bound_trace_page(
     ClaudeUsageAuthorityDisposition,
     crate::snapshot_sync::ClaudeLocalEvidenceStats,
 ) {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         // Sidecar changes must select the root and child even when their
         // transcript bytes are unchanged (notably malformed -> clean).

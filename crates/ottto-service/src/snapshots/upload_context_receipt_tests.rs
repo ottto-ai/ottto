@@ -432,53 +432,6 @@ fn acknowledged_unaffected_receipt_survives_resumed_prefix_mode_changes() {
 }
 
 #[test]
-fn receipt_acknowledged_under_on_is_current_on_mains_off_path() {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let base = "d".repeat(64);
-    f.index.copy_prefix_base_upload_context = Some(base.clone());
-    f.index.activate_file_upload_context(
-        f.source,
-        crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true),
-    );
-    assert_eq!(f.adopt().files, 1);
-    let receipt = f.entry().upload_context_receipt.clone().unwrap();
-    assert_eq!(
-        receipt.context_fingerprint, base,
-        "unaffected files earn the base"
-    );
-    // OFF launch: the source never adopted an ON context, so no base is kept.
-    f.index.activate_file_upload_context(f.source, base.clone());
-    f.index
-        .set_copy_prefix_base_upload_context(Some(base), false);
-    assert!(f.index.copy_prefix_base_upload_context.is_none());
-    let (scan, bytes) = f.walk(true);
-    assert_eq!((scan.scanned_file_count, bytes), (0, 0));
-    assert!(scan.snapshots.is_empty());
-    assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
-}
-
-#[test]
-fn off_launch_keeps_the_base_for_a_pre_scope_on_receipt() {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let base = "d".repeat(64);
-    let old_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
-    f.index
-        .activate_file_upload_context(f.source, old_on.clone());
-    assert_eq!(f.adopt().files, 1);
-    let receipt = f.entry().upload_context_receipt.clone().unwrap();
-    assert_eq!(receipt.context_fingerprint, old_on);
-    // The source-wide census never adopted ON; the file receipt is the evidence.
-    f.index.activate_file_upload_context(f.source, base.clone());
-    f.index
-        .set_copy_prefix_base_upload_context(Some(base.clone()), false);
-    assert_eq!(f.index.copy_prefix_base_upload_context, Some(base));
-    let (scan, bytes) = f.walk(true);
-    assert_eq!((scan.scanned_file_count, bytes), (0, 0));
-    assert!(scan.snapshots.is_empty());
-    assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
-}
-
-#[test]
 fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let base = "d".repeat(64);
