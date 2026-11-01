@@ -39237,9 +39237,11 @@ fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
 }
 
 /// Locate the first PR/issue/MR marker in path segments, returning its kind and
-/// the index of the numeric-id segment.
+/// the index of the numeric-id segment. A marker needs at least one repository
+/// segment before it (contract: backend agent_session_snapshots.py
+/// `_ISSUE_PATH_RE`/`_PR_PATH_RE`), so `https://host/issues/1` is not an issue.
 fn find_artifact_marker(segments: &[&str]) -> Option<(&'static str, usize)> {
-    for i in 0..segments.len() {
+    for i in 1..segments.len() {
         if segments[i] == "-"
             && i + 2 < segments.len()
             && segments[i + 1] == "merge_requests"
@@ -62151,6 +62153,50 @@ mod tests {
             let actual: BTreeSet<_> = extract_session_artifacts(text).into_iter().map(|a| (a.kind, a.value)).collect();
             let expected: BTreeSet<_> = expected.into_iter().map(|(kind, value)| (kind.to_string(), value.to_string())).collect();
             assert_eq!(actual, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn parse_artifact_url_requires_a_repository_prefix_before_the_marker() {
+        // Cases mirror the server contract: backend agent_session_snapshots.py _ISSUE_PATH_RE/_PR_PATH_RE.
+        for (path, expected) in [
+            (
+                "/owner/repo/issues/9",
+                Some(("issue", "/owner/repo/issues/9")),
+            ),
+            (
+                "/owner/repo/pull/42",
+                Some(("pull_request", "/owner/repo/pull/42")),
+            ),
+            (
+                "/team/repo/pull-requests/3",
+                Some(("pull_request", "/team/repo/pull-requests/3")),
+            ),
+            (
+                "/group/sub/proj/-/merge_requests/7",
+                Some(("pull_request", "/group/sub/proj/-/merge_requests/7")),
+            ),
+            (
+                "/group/proj/-/issues/7",
+                Some(("issue", "/group/proj/-/issues/7")),
+            ),
+            (
+                "/owner/repo/pull/42/files",
+                Some(("pull_request", "/owner/repo/pull/42")),
+            ),
+            ("/issues/12345", None),
+            ("/pull/5", None),
+            ("/pull-requests/3", None),
+            ("/-/merge_requests/7", None),
+            ("//issues/1", None),
+            ("/owner/repo/issues/abc", None),
+            ("/owner/repo/pull/\u{0661}", None),
+        ] {
+            let actual = parse_artifact_url(&format!("https://example.com{path}"))
+                .map(|a| (a.kind, a.value));
+            let expected = expected
+                .map(|(kind, value)| (kind.to_string(), format!("https://example.com{value}")));
+            assert_eq!(actual, expected, "{path}");
         }
     }
 
