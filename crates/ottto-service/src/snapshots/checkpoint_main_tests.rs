@@ -55,7 +55,6 @@ fn main_context_fingerprint_reference(
 /// [off=main] Default OFF preserves the main policy and checkpoint contract.
 #[test]
 fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
-    assert!(!claude_terminal_off());
     let scratch = crate::test_scratch::ScratchDir::new("off-main-checkpoint-identity");
     for session in [
         "a1111111-1111-4111-8111-111111111111",

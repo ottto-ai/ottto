@@ -1,4 +1,4 @@
-use super::super::terminal_off_policy::ThreadSwitchForTest;
+use super::super::local_switch::ThreadSwitchForTest;
 use super::super::tests::manifest_index_entry;
 use super::super::*;
 
