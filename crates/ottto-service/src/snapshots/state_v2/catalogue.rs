@@ -62,6 +62,7 @@ macro_rules! scan_index_fields {
             bounded_sweep_had_unsettled_upload => Misc (misc check_field Field) ["scan_state.bounded_sweep_had_unsettled_upload" => 1] side,
             bounded_sweep_unsettled_causes => Misc (misc check_field Field) ["scan_state.bounded_sweep_unsettled_causes" => 1] side,
             traversal => Misc (misc check_field Field) ["scan_state.traversal" => 1] side,
+            oversized_discovery => Misc (misc check_field Map) ["scan_state.oversized_discovery" => 3] side,
             claude_stale_family_carry => Misc (misc check_field Field) ["scan_state.claude_stale_family_carry" => 1] side,
             scan_residue_witness => Misc (misc check_field Field) ["scan_state.scan_residue_witness" => 1] side,
             historical_replay_generation => Misc (misc check_field Field) ["setting.historical_replay_generation" => 1] side,
@@ -167,7 +168,7 @@ pub(super) enum Group {
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 2;
+pub(super) const LAYOUT: u32 = 3;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS

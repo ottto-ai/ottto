@@ -2144,7 +2144,11 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             NOW,
             BACKFILL_WINDOW_DAYS,
         );
-        crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
+        crate::snapshots::line_delivery_tests::walk_all(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            BACKFILL_WINDOW_DAYS,
+        );
         assert!(index.files.is_empty(), "held-new has no committed entry");
         withheld_account::support::clock(&index.withheld_memo);
         sampled_scan::set_test_now(Some(1_000));
@@ -2207,7 +2211,11 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
+    crate::snapshots::line_delivery_tests::walk_all(
+        SnapshotSource::ClaudeCode,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+    );
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(

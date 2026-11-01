@@ -27,13 +27,7 @@ fn oversized_seed(case: &'static str) -> (RearmFixture, PathBuf) {
     assert!(seed.red && !seed.census_complete);
     let saved = c1a_saved(&fixture);
     assert_eq!(saved["traversal"]["counts"]["oversized_file_count"], 1);
-    assert_eq!(
-        saved["traversal"]["oversized_discovery"]
-            .as_object()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(saved["oversized_discovery"].as_object().unwrap().len(), 1);
     (fixture, path)
 }
 
@@ -105,17 +99,16 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         );
         assert_eq!(c1a_latch(&fixture), latch);
     }
-    // The only new durable content consists of hashes plus a sighting count.
-    for (key, debt) in saved["traversal"]["oversized_discovery"]
-        .as_object()
-        .unwrap()
-    {
+    // Local debt contains hashes, a sighting count, byte length and scheduling time.
+    for (key, debt) in saved["oversized_discovery"].as_object().unwrap() {
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let hash = debt["content_hash"].as_str().unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(debt.as_object().unwrap().len(), 2);
+        assert_eq!(debt.as_object().unwrap().len(), 4);
+        assert!(debt["size_bytes"].as_u64().unwrap() > OVERSIZED_BYTES - 1);
+        assert!(debt["first_seen_unix_seconds"].as_u64().unwrap() > 0);
     }
 }
 
@@ -141,8 +134,8 @@ fn oversized_growth_retries_only_its_discovery_then_shrink_admits_it() {
     assert_eq!(page.scan.scanned_file_count, 0);
     let retried = c1a_saved(&fixture);
     assert_ne!(
-        retried["traversal"]["oversized_discovery"],
-        before["traversal"]["oversized_discovery"]
+        retried["oversized_discovery"],
+        before["oversized_discovery"]
     );
     assert_eq!(
         retried["traversal"]["census_window_end"],
@@ -182,10 +175,7 @@ fn oversized_same_size_sample_edit_wakes_discovery() {
     let page = oversized_tick(&fixture, oversized_deadline(&before));
     assert!(!page.scan.census_complete);
     let after = c1a_saved(&fixture);
-    assert_ne!(
-        after["traversal"]["oversized_discovery"],
-        before["traversal"]["oversized_discovery"]
-    );
+    assert_ne!(after["oversized_discovery"], before["oversized_discovery"]);
     assert_eq!(
         oversized_deadline(&after),
         oversized_deadline(&before) + 120
@@ -630,9 +620,7 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     let seed = c1b_generation(&fixture, "oversized-two", (8, 10));
     assert!(seed.red && !seed.census_complete);
     let before = c1a_saved(&fixture);
-    let debts = before["traversal"]["oversized_discovery"]
-        .as_object()
-        .unwrap();
+    let debts = before["oversized_discovery"].as_object().unwrap();
     assert_eq!(debts.len(), 2);
     assert_eq!(before["traversal"]["counts"]["oversized_file_count"], 2);
     std::fs::OpenOptions::new()
@@ -643,9 +631,7 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
         .unwrap();
     let page = oversized_tick(&fixture, oversized_deadline(&before));
     let grown = c1a_saved(&fixture);
-    let grown_debts = grown["traversal"]["oversized_discovery"]
-        .as_object()
-        .unwrap();
+    let grown_debts = grown["oversized_discovery"].as_object().unwrap();
     assert_eq!(grown_debts.len(), 2);
     assert_eq!(
         debts
@@ -668,9 +654,7 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     .unwrap();
     let page = oversized_tick(&fixture, oversized_deadline(&grown));
     let after = c1a_saved(&fixture);
-    let remaining = after["traversal"]["oversized_discovery"]
-        .as_object()
-        .unwrap();
+    let remaining = after["oversized_discovery"].as_object().unwrap();
     assert_eq!(remaining.len(), 1);
     assert!(
         remaining.iter().all(|(key, debt)| debts[key] == *debt),
@@ -698,14 +682,17 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     let listed = c1a_saved(&fixture);
     assert!(listed["traversal"]["counts"]["listing_generations"].as_u64() >= Some(1));
     assert_eq!(
-        listed["traversal"]["oversized_discovery"],
-        after["traversal"]["oversized_discovery"],
+        listed["oversized_discovery"], after["oversized_discovery"],
         "a re-listing pass records no oversized debt"
     );
     assert_eq!(listed["traversal"]["counts"]["oversized_file_count"], 1);
     assert_eq!(page.scan.oversized_file_count, 1);
     assert!(!page.scan.census_complete);
-    std::fs::write(&late, rearm_transcript_line(LATE, None, "req_late_shrunk", 0)).unwrap();
+    std::fs::write(
+        &late,
+        rearm_transcript_line(LATE, None, "req_late_shrunk", 0),
+    )
+    .unwrap();
     let page = oversized_tick(
         &fixture,
         oversized_deadline(&listed).max(listed_at + interval + 60),
@@ -716,8 +703,8 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
         "the remaining file's loss stays counted"
     );
     assert_eq!(
-        reloaded["traversal"]["oversized_discovery"],
-        after["traversal"]["oversized_discovery"]
+        reloaded["oversized_discovery"],
+        after["oversized_discovery"]
     );
     assert_eq!(page.scan.oversized_file_count, 1);
     assert!(!page.scan.census_complete);

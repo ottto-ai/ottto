@@ -3006,6 +3006,7 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
             &mut traversal,
             &[processed.clone(), pending.clone(), unobserved.clone()],
             false,
+            &index.oversized_discovery,
         );
         let flags = |path: &Path| {
             let matches = traversal
@@ -3575,7 +3576,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(@entries index),
+        discovery_retention!(index),
     );
     assert!(!index
         .traversal

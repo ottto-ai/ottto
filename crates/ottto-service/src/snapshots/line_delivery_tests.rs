@@ -1053,7 +1053,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            discovery_retention!(@entries index),
+            discovery_retention!(index),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1082,7 +1082,7 @@ fn withhold(index: &mut ScanIndex, path: &Path) {
         .insert(local_index_key(path), "held-source".into());
 }
 
-pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
+pub(in crate::snapshots) fn walk_all(source: SnapshotSource, index: &mut ScanIndex, days: u64) {
     while !index
         .traversal
         .as_ref()
@@ -1090,7 +1090,7 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None);
+        advance_bounded_directory_traversal(source, index, days, None);
     }
 }
 
@@ -1113,7 +1113,7 @@ pub(in crate::snapshots) fn next_walk(
         .format(&Rfc3339)
         .unwrap();
     ensure_bounded_traversal(SnapshotSource::ClaudeCode, roots, index, &at, days);
-    walk_all(index, days);
+    walk_all(SnapshotSource::ClaudeCode, index, days);
 }
 
 /// [behaviour] Gate 1 with a 7-day request: an aged withheld key is still discovered and
@@ -1146,7 +1146,7 @@ fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
             NOW,
             7,
         );
-        walk_all(&mut index, 7);
+        walk_all(SnapshotSource::ClaudeCode, &mut index, 7);
         let traversal = index.traversal.as_ref().unwrap();
         let observed = ["held", "old", "big"]
             .into_iter()
@@ -1227,11 +1227,8 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 census_at,
                 7,
                 crate::snapshots::DiscoveryRetention {
-                    files: &SharedMap::default(),
-                    oversized: None,
                     account_holds: holds,
-                    memo: None,
-                    growth: None,
+                    ..DiscoveryRetention::unverified(&SharedMap::default())
                 },
             )
             .is_some()
@@ -1263,7 +1260,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
     );
 }
 
-/// [regress] An initial size refusal remains owed after save/reload and a
+/// [behaviour] An initial size refusal remains owed after save/reload and a
 /// recovery re-walk beyond the discovery window, without an indexed entry.
 #[test]
 fn never_indexed_oversized_debt_survives_the_age_window() {
@@ -1278,27 +1275,13 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
         File::create(&path).unwrap().set_len(bytes).unwrap();
         let mut index = ScanIndex::default();
         let roots = [root.projects()];
-        let walk = |index: &mut ScanIndex, at: &str| {
-            ensure_bounded_traversal(source, &roots, index, at, 7);
-            while !index
-                .traversal
-                .as_ref()
-                .unwrap()
-                .pending_directories
-                .is_empty()
-            {
-                advance_bounded_directory_traversal(source, index, 7, None);
-            }
-        };
-        walk(&mut index, NOW);
-        assert_eq!(
-            index.traversal.as_ref().unwrap().oversized_discovery.len(),
-            1
-        );
+        ensure_bounded_traversal(source, &roots, &mut index, NOW, 7);
+        walk_all(source, &mut index, 7);
+        assert_eq!(index.oversized_discovery.len(), 1);
         assert!(index.files.is_empty());
         let mut saved = serde_json::to_value(&index).unwrap();
         let first_seen = sampled_scan::now_seconds().saturating_sub(7200);
-        saved["traversal"]["oversized_discovery"]
+        saved["oversized_discovery"]
             .as_object_mut()
             .unwrap()
             .values_mut()
@@ -1306,10 +1289,11 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
             .unwrap()["first_seen_unix_seconds"] = first_seen.into();
         let mut index: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
         set_old(&path);
-        index.reset_traversal();
+        index.traversal = None;
         let mut index: ScanIndex =
             serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
-        walk(&mut index, "2026-10-15T12:00:00Z");
+        ensure_bounded_traversal(source, &roots, &mut index, "2026-10-15T12:00:00Z", 7);
+        walk_all(source, &mut index, 7);
         let traversal = index.traversal.as_ref().unwrap();
         assert_eq!(traversal.counts.oversized_file_count, 1);
         assert!(traversal
@@ -1318,16 +1302,13 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
         assert!(discovery_retention!(index).owes(&path));
         assert!(candidates(&index).is_empty(), "Full remains size bounded");
         assert!(index.files.is_empty());
-        let (_, rows) = capture(|| oversized_discovery::alarm(source, traversal));
+        let (_, rows) = capture(|| oversized_discovery::alarm(source, &index.oversized_discovery));
         let counts = &rows[0]["counts"];
         assert_eq!(counts["outstanding_file_count"], 1);
         assert_eq!(counts["outstanding_bytes"], bytes);
         assert!(counts["first_seen_oversized_age_seconds"].as_u64().unwrap() >= 7200);
-        let before = serde_json::to_value(traversal).unwrap();
-        assert_eq!(
-            before["oversized_discovery"],
-            saved["traversal"]["oversized_discovery"]
-        );
+        let before = serde_json::to_value(&index).unwrap();
+        assert_eq!(before["oversized_discovery"], saved["oversized_discovery"]);
 
         // Once it fits, the same debt rescues both candidate and open age
         // gates, so recovery can use the ordinary reader.
@@ -1336,7 +1317,11 @@ fn never_indexed_oversized_debt_survives_the_age_window() {
         if source == SnapshotSource::ClaudeCode {
             let traversal = index.traversal.as_mut().unwrap();
             traversal.unhealthy_retry_not_before_unix_seconds = Some(0);
-            oversized_discovery::retry_changed(traversal, "2026-10-15T12:00:00Z");
+            oversized_discovery::retry_changed(
+                traversal,
+                "2026-10-15T12:00:00Z",
+                &mut index.oversized_discovery,
+            );
             assert_eq!(traversal.pending_candidates.len(), 1);
         }
         let candidate = candidate_from_traversal_path(
@@ -1576,7 +1561,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         7,
-        discovery_retention!(@entries index),
+        discovery_retention!(index),
     );
     assert!(candidates(&index).contains(&path));
     assert!(index
@@ -1959,7 +1944,7 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
         NOW,
         7,
     );
-    walk_all(&mut index, 7);
+    walk_all(SnapshotSource::ClaudeCode, &mut index, 7);
     assert!(reconcile_missing_index_entries_with_limit(
         &mut index,
         usize::MAX
@@ -2251,7 +2236,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             // D can arrive only by hint in this generation, even after 600 s.
             held.traversal = None;
             ensure_bounded_traversal(source, &[root.projects()], &mut held, &at, 1_000);
-            walk_all(&mut held, 1_000);
+            walk_all(SnapshotSource::ClaudeCode, &mut held, 1_000);
             assert!(held
                 .traversal
                 .as_ref()
@@ -2291,6 +2276,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 active.traversal.as_mut().unwrap(),
                 std::slice::from_ref(&moved),
                 false,
+                &active.oversized_discovery,
             );
             let hinted = active
                 .traversal
@@ -3973,13 +3959,7 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
         &mut ScanCensus::default(),
         None,
         BACKFILL_WINDOW_DAYS,
-        DiscoveryRetention {
-            files: &index.files,
-            oversized: None,
-            account_holds: &index.claude_account_deferred_holds,
-            memo: Some(&index.withheld_memo),
-            growth: None,
-        },
+        discovery_retention!(index),
     )
     .unwrap()
     .0

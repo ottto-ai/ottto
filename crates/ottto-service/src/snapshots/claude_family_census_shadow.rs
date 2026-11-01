@@ -875,9 +875,9 @@ impl<'a> View<'a> {
         {
             return Some(Incomplete::Queued);
         }
-        if !traversal.oversized_discovery.is_empty()
+        if !self.index.oversized_discovery.is_empty()
             && members.iter().any(|key| {
-                traversal
+                self.index
                     .oversized_discovery
                     .contains_key(&oversized_discovery::path_hash(Path::new(key)))
             })

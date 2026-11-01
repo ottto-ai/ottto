@@ -7,11 +7,11 @@ use super::*;
 pub(super) struct Debt {
     content_hash: String,
     /// The public loss counter counts sightings, including duplicate hints.
-    observations: usize,
+    pub(super) observations: usize,
     #[serde(default)]
     size_bytes: u64,
-    /// Local scheduling clock; never uploaded. Older records start at the next sighting.
-    #[serde(default)]
+    /// Local scheduling clock; never uploaded.
+    #[serde(default = "sampled_scan::now_seconds")]
     first_seen_unix_seconds: u64,
 }
 
@@ -64,9 +64,7 @@ pub(super) fn merge(target: &mut BTreeMap<String, Debt>, incoming: BTreeMap<Stri
     for (key, mut debt) in incoming {
         if let Some(old) = target.get(&key) {
             debt.observations = debt.observations.saturating_add(old.observations);
-            if old.first_seen_unix_seconds > 0 {
-                debt.first_seen_unix_seconds = old.first_seen_unix_seconds;
-            }
+            debt.first_seen_unix_seconds = old.first_seen_unix_seconds;
         }
         target.insert(key, debt);
     }
@@ -98,37 +96,23 @@ pub(super) fn record(
     debt.content_hash = content_hash;
     debt.size_bytes = size_bytes;
     debt.observations = debt.observations.saturating_add(1);
-    if debt.first_seen_unix_seconds == 0 {
-        debt.first_seen_unix_seconds = sampled_scan::now_seconds();
-    }
 }
 
-/// Re-walks reset sighting counters, but never reset an outstanding alarm's age.
-pub(super) fn restart(traversal: Option<&mut ScanTraversalCheckpoint>) -> BTreeMap<String, Debt> {
-    let mut debts = traversal
-        .map(|walk| std::mem::take(&mut walk.oversized_discovery))
-        .unwrap_or_default();
-    for debt in debts.values_mut() {
-        debt.observations = 0;
-    }
-    debts
-}
-
-pub(super) fn alarm(source: SnapshotSource, traversal: &ScanTraversalCheckpoint) {
+pub(super) fn alarm(source: SnapshotSource, debts: &BTreeMap<String, Debt>) {
     let now = sampled_scan::now_seconds();
     let mut files = 0_u64;
     let mut bytes = 0_u64;
     let mut age = 0_u64;
-    for debt in traversal
-        .oversized_discovery
+    for debt in debts
         .values()
         .filter(|debt| debt.size_bytes > max_jsonl_file_bytes(source))
     {
         files += 1;
         bytes = bytes.saturating_add(debt.size_bytes);
-        if debt.first_seen_unix_seconds > 0 {
-            age = age.max(now.saturating_sub(debt.first_seen_unix_seconds));
-        }
+        age = age.max(now.saturating_sub(debt.first_seen_unix_seconds));
+    }
+    if files == 0 {
+        return;
     }
     crate::local_resource_diagnostics::traversal_point(
         "oversized_discovery_alarm",
@@ -141,7 +125,7 @@ pub(super) fn alarm(source: SnapshotSource, traversal: &ScanTraversalCheckpoint)
     );
 }
 
-pub(super) fn release(counts: &mut ScanTraversalCounts, debt: Debt) {
+pub(super) fn release(counts: &mut ScanTraversalCounts, debt: &Debt) {
     counts.oversized_file_count = counts
         .oversized_file_count
         .saturating_sub(debt.observations);
@@ -150,19 +134,14 @@ pub(super) fn release(counts: &mut ScanTraversalCounts, debt: Debt) {
 pub(super) fn clock_retry_required(
     source: SnapshotSource,
     traversal: &ScanTraversalCheckpoint,
+    debts: &BTreeMap<String, Debt>,
 ) -> bool {
     if source != SnapshotSource::ClaudeCode {
         return traversal.counts.has_errors();
     }
     let mut counts = traversal.counts.clone();
-    for debt in traversal
-        .oversized_discovery
-        .values()
-        .filter(|debt| !debt.content_hash.is_empty())
-    {
-        counts.oversized_file_count = counts
-            .oversized_file_count
-            .saturating_sub(debt.observations);
+    for debt in debts.values().filter(|debt| !debt.content_hash.is_empty()) {
+        release(&mut counts, debt);
     }
     counts.has_errors()
 }
@@ -174,21 +153,26 @@ pub(super) fn floor_retry_due(
     source: SnapshotSource,
     traversal: &ScanTraversalCheckpoint,
     collected_at: &str,
+    debts: &BTreeMap<String, Debt>,
 ) -> bool {
     const FLOOR_SECONDS: u64 = 6 * 60 * 60;
     source == SnapshotSource::ClaudeCode
-        && !traversal.oversized_discovery.is_empty()
+        && !debts.is_empty()
         && rfc3339_unix_seconds(collected_at).map_or(true, |now| {
             rfc3339_unix_seconds(&traversal.census_window_end)
                 .map_or(true, |started| now >= started.saturating_add(FLOOR_SECONDS))
         })
 }
 
-pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
+pub(super) fn retry_changed(
+    traversal: &mut ScanTraversalCheckpoint,
+    collected_at: &str,
+    debts: &mut BTreeMap<String, Debt>,
+) {
     if !traversal.pending_directories.is_empty()
         || !traversal.pending_candidates.is_empty()
-        || traversal.oversized_discovery.is_empty()
-        || clock_retry_required(SnapshotSource::ClaudeCode, traversal)
+        || debts.is_empty()
+        || clock_retry_required(SnapshotSource::ClaudeCode, traversal, debts)
     {
         return;
     }
@@ -207,7 +191,7 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
     for key in &traversal.observed_index_keys {
         let path = Path::new(key);
         let hash = path_hash(path);
-        let Some(debt) = traversal.oversized_discovery.get(&hash) else {
+        let Some(debt) = debts.get(&hash) else {
             continue;
         };
         let Some(scan_root) = traversal.owning_scan_root(path) else {
@@ -222,14 +206,14 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
         changed = true;
         if size > MAX_CLAUDE_JSONL_FILE_BYTES {
             // Retried this file's discovery cap, with the new content witness.
-            let debt = traversal.oversized_discovery.get_mut(&hash).unwrap();
+            let debt = debts.get_mut(&hash).unwrap();
             debt.content_hash = content_hash;
             debt.size_bytes = size;
         } else {
             let scan_root = scan_root.clone();
             // Keep the age rescue until the ordinary open succeeds. A shrink
             // after the discovery window is still owed, not proof of a read.
-            let debt = traversal.oversized_discovery.get_mut(&hash).unwrap();
+            let debt = debts.get_mut(&hash).unwrap();
             debt.content_hash = content_hash;
             debt.size_bytes = size;
             traversal.pending_candidates.push_back(ScanTraversalPath {

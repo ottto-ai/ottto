@@ -467,7 +467,6 @@ impl Scene {
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: Default::default(),
-                oversized_discovery: Default::default(),
                 codex_rollout_paths: BTreeSet::from([
                     local_index_key(&parent),
                     local_index_key(&child_path),
