@@ -359,11 +359,11 @@ off), Ottto keeps each registered slot and the default login signed in:
   was blanked, it is not refreshed again and asks to sign in again until a new
   credential appears.
 
-The daemon's other short Claude runs (the `-p /context` footprint read, the
-Verify smoke, and the MCP inventory probe of a server that is Claude Code
-itself, such as `claude mcp serve`) do not start from 15 minutes before a login's access expiry until
+The daemon's other short Claude runs (the Verify smoke and the MCP inventory
+probe of a server that is Claude Code itself, such as `claude mcp serve`) do
+not start from 15 minutes before a login's access expiry until
 the refresh has advanced it, nor while it is expired or Claude Code holds its
-refresh lock. A skipped `/context` read retries in 30 minutes; a skipped Verify
+refresh lock. A skipped Verify
 returns a warning asking to open Claude Code once (or wait), then Verify. A
 deferred MCP probe keeps the last uploaded inventory (or, without a fresh one,
 reports that server unreachable). Each of these runs is pinned to the login
@@ -387,7 +387,9 @@ this Mac: the default login, registered slots and accounts read through a
 slot alike. Stored readings are still served and age as usual; a login with no
 stored reading says background limit refresh is off. A person's **Refresh
 limits**, setup and account checks still read, as does a collection outside the
-lane. Nothing new is read, stored or uploaded.
+lane. Nothing new is read, stored or uploaded. The same setting gates the
+default login's owner check (`oauth/profile`): with it off, no call is made and
+an unproven default login fails closed (`claude_login_owner_unproven`).
 
 The setting keeps its name and wire contract
 (`claude_account_set_upkeep_consent`, `consent`). A status that carries
@@ -398,8 +400,7 @@ logins with a valid access token.
 Residual risks not removed: a server-side 401 makes Claude Code refresh
 regardless of the local clock; a crash or power loss between the provider
 rotating the token and Claude Code saving it; the customer's own short Claude
-Code commands; and Claude processes started under user MCP servers or hooks of
-the `/context` read.
+Code commands; and Claude processes started under user MCP servers.
 
 ## Tips
 

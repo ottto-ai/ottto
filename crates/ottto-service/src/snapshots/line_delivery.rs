@@ -10,7 +10,7 @@ pub(crate) const fn checked_observer_heap_bytes(bytes: usize) -> usize {
     assert!(bytes <= 256 * 1024);
     bytes
 }
-/// Default declared pass-state charge, preserved for the Claude observer.
+/// Default declared pass-state charge for an observer.
 const OBSERVER_HEAP_BYTES: usize = checked_observer_heap_bytes(64 * 1024);
 /// Synchronous in the read: O(line), no I/O or cache/rotation lock, pass
 /// state within its static declaration; never paces or blocks acquisition.

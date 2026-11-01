@@ -29,26 +29,6 @@ pub(crate) struct FileCounts {
     pub(crate) truncated_by_limit: Option<bool>,
 }
 
-pub(crate) fn measure_file(
-    path: &Path,
-    auto_memory: bool,
-    salt: Option<&[u8; 32]>,
-) -> Option<FileCounts> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES as u64 {
-        return None;
-    }
-    let file = File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    measure_bytes(&bytes, auto_memory, salt)
-}
-
 /// Counts for complete file bytes already in memory (never a partial prefix).
 pub(crate) fn measure_bytes(
     bytes: &[u8],
@@ -159,12 +139,7 @@ mod tests {
     use super::*;
 
     fn measured(text: &str, auto_memory: bool) -> FileCounts {
-        let dir = crate::test_scratch::private_dir("context-file-counts");
-        let path = dir.join("MEMORY.md");
-        fs::write(&path, text).unwrap();
-        let result = measure_file(&path, auto_memory, Some(&[7; 32])).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-        result
+        measure_bytes(text.as_bytes(), auto_memory, Some(&[7; 32])).unwrap()
     }
 
     #[test]
@@ -197,16 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_oversize_binary_and_directory_are_unknown() {
-        let dir = crate::test_scratch::private_dir("context-file-invalid");
-        let path = dir.join("MEMORY.md");
-        assert!(measure_file(&path, true, None).is_none());
-        assert!(measure_file(&dir, true, None).is_none());
-        fs::write(&path, [0xff]).unwrap();
-        assert!(measure_file(&path, true, None).is_none());
-        fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
-        assert!(measure_file(&path, true, None).is_none());
-        fs::remove_dir_all(dir).unwrap();
+    fn oversize_and_binary_are_unknown() {
+        assert!(measure_bytes(&[0xff], true, None).is_none());
+        assert!(measure_bytes("x".repeat(MAX_FILE_BYTES + 1).as_bytes(), true, None).is_none());
     }
 
     #[test]

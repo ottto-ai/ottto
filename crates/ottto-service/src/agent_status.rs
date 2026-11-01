@@ -4058,10 +4058,6 @@ const CLAUDE_RELOGIN_APPROACHING_CODE: &str = "claude_relogin_approaching";
 /// the one its `.claude.json` names (Claude Desktop and the terminal signed
 /// in as different accounts there).
 const CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE: &str = "claude_default_home_split_login";
-/// The existing add-account sign-in into a new slot, for the default home's
-/// token owner (`adopt_target_account_hash`).
-const CLAUDE_ADOPT_DEFAULT_LOGIN_ACTION: &str = "claude_adopt_default_login";
-
 /// The default home's owner check: the binding `.claude.json` names, and the
 /// token's owner once proven and known.
 struct ClaudeDefaultHomeOwner {
@@ -4102,7 +4098,11 @@ fn resolve_claude_default_home_owner(
     known_identities: &[ClaudeCliOauthAccount],
 ) -> ClaudeDefaultHomeOwner {
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
-    let may_call = !claude_oauth_usage_network_disabled() && !claude_pass_saved_only();
+    // The same gates as a background usage read, "Background limit refresh"
+    // included: no call means unproven.
+    let may_call = !claude_oauth_usage_network_disabled()
+        && !claude_pass_saved_only()
+        && !claude_background_read_withheld();
     let owner = stable
         .credential
         .access_token
@@ -4141,7 +4141,8 @@ fn apply_claude_default_home_owner(
     ) = owner.proven_binding().unzip();
     status.owner_proven_at = owner.proven.as_ref().map(|owner| owner.proven_at.clone());
     if owner.split_login() {
-        status.recommended_action = Some(CLAUDE_ADOPT_DEFAULT_LOGIN_ACTION.to_string());
+        status.recommended_action =
+            Some(ottto_protocol::ClaudeConfigSlotRecommendedActionV1::ClaudeAdoptDefaultLogin);
         status.adopt_target_account_hash = status.token_owner_account_hash.clone();
     }
 }
@@ -27390,7 +27391,9 @@ for line in sys.stdin:
                 status.token_owner_organization_hash.as_deref(),
                 status.cached_account_hash.as_deref(),
                 status.cached_organization_hash.as_deref(),
-                status.recommended_action.as_deref(),
+                status
+                    .recommended_action
+                    .map(|action| serde_json::to_value(action).expect("action")),
                 status.adopt_target_account_hash.as_deref(),
             ),
             (
@@ -27398,7 +27401,7 @@ for line in sys.stdin:
                 Some(terminal_org.as_str()),
                 Some(desktop_account.as_str()),
                 Some(desktop_org.as_str()),
-                Some("claude_adopt_default_login"),
+                Some(serde_json::json!("claude_adopt_default_login")),
                 Some(terminal_account.as_str()),
             )
         );
@@ -27427,7 +27430,26 @@ for line in sys.stdin:
             assert!(owner.proven.is_none());
         }
         assert_eq!(calls() - before, 1);
+
+        // (d) "Background limit refresh" off: no call inside a pass, unproven.
+        PROFILE_TEST_RESPONSE.with(|respond| respond.set(Some(terminal_profile)));
+        let support = std::env::temp_dir().join(format!(
+            "ottto-owner-check-consent-off-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&support).expect("support dir");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let before = calls();
+        let owner = with_claude_pass(false, current_unix_seconds(), || {
+            resolve_claude_default_home_owner(&mut stable("owner-check-token-d"), known)
+        });
+        assert!(owner.proven.is_none());
+        assert_eq!(calls(), before, "no profile call with consent off");
         PROFILE_TEST_RESPONSE.with(|respond| respond.set(None));
+        let _ = fs::remove_dir_all(&support);
     }
 
     #[test]

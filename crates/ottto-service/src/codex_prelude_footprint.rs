@@ -812,7 +812,6 @@ fn sized_item(
             truncated_by_limit: Some(truncated),
             ..counts
         },
-        local_path: None,
     }
 }
 
@@ -899,7 +898,6 @@ pub(crate) fn skill_items(
             relative_path: None,
             loading_mode: "always_on".to_string(),
             file_counts: FileCounts::default(),
-            local_path: None,
         });
     }
     items
@@ -1040,8 +1038,6 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         memory_files,
         skills,
         custom_agents: Vec::new(),
-        mcp_tools: Vec::new(),
-        instruction_inventory: None,
     })
 }
 
