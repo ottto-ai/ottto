@@ -12673,12 +12673,13 @@ pub(crate) fn erase_disabled_sources(
         if matches!(state.as_deref(), None | Some("done")) {
             continue;
         }
+        // Transcript readers close before the first unlink.
+        if source == SnapshotSource::Codex {
+            cache.forget_codex_jobs();
+        }
         let marker = source_marker_path(support_dir, source);
         let erased = erase_source_files(support_dir, source, || {
             cache.durable_forget_source(source);
-            if source == SnapshotSource::Codex {
-                cache.forget_codex_job();
-            }
             // Reconnect is this source's first bootstrap again: a full replay.
             update_backfill_state(support_dir, |backfill| {
                 let slug = source.api_slug();
