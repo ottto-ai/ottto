@@ -6458,8 +6458,8 @@ fn cycle_upload_context(
     }
 }
 
-/// Bind persisted retry pages to the local money mode. OFF is the released
-/// context; an operator's next launch in another mode cannot replay old bodies.
+/// Bind persisted retry pages to the Claude copy-prefix money mode; pages
+/// persisted under the earlier context cannot replay old bodies.
 pub(crate) fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
     if enabled {
         format!(
@@ -6835,13 +6835,11 @@ fn prepare_sync_source_inner(
         cache_observations_enabled,
     );
     let base_upload_context = upload_context.clone();
-    let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_request_money::e2::resumed_prefix_enabled();
-    let copy_unproven_enabled = resumed_prefix_enabled
-        && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
+    let claude = source == SnapshotSource::ClaudeCode;
+    let copy_unproven_enabled =
+        claude && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
     // Context adoption invalidates stale pending pages on capability downgrade.
-    // OFF preserves the exact released context and body bytes.
-    let upload_context = resumed_prefix_upload_context(upload_context, resumed_prefix_enabled);
+    let upload_context = resumed_prefix_upload_context(upload_context, claude);
     let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
@@ -6928,10 +6926,7 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
-    index.set_copy_prefix_base_upload_context(
-        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
-        resumed_prefix_enabled,
-    );
+    index.set_copy_prefix_base_upload_context(claude.then_some(base_upload_context));
     index.note_upload_context_inputs(
         source,
         crate::snapshots::UploadContextInputs::new(
@@ -6939,7 +6934,7 @@ fn prepare_sync_source_inner(
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
             copy_unproven_enabled,
-            resumed_prefix_enabled,
+            claude,
         ),
     );
     let backfill_state = load_backfill_state(support_dir);

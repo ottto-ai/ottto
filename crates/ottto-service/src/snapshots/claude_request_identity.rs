@@ -509,8 +509,8 @@ pub(crate) struct Grouping {
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
     /// Bucket rows sent with `copy_invalidated`,
-    /// by bucket start. Empty unless the copy-prefix switch is on and the
-    /// receiver advertised option (ii) retention.
+    /// by bucket start. Empty unless the receiver advertised option (ii)
+    /// retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
@@ -1750,7 +1750,7 @@ pub(crate) struct CopyInvalidation {
 
 /// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
-/// markers lent to that very row's requests (ones the copy-prefix switch
+/// markers lent to that very row's requests (ones copy-prefix dedupe
 /// re-derived without them) is copy-derived: it is treated as never accepted
 /// (fresh own tags or untagged, never a refusal or marker). Other changed
 /// rows keep #909's refusal, and rows their own evidence still proves are
@@ -5848,8 +5848,8 @@ fn tag_item(
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
         // Like `identity_retained`, only a receiver advertising option (ii)
         // retention mirrors the flag in its identity leaf (and only it holds
-        // proof to drop). Switch off sends no flag, so its bytes stay main's.
-        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+        // proof to drop).
+        if retained {
             grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
         }
         let invalidated = accepted

@@ -162,16 +162,13 @@ fn publish(
             index,
         );
     }
-    {
-        let _resumed_prefix = ResumedPrefixForTest::set(true);
-        finish_page(
-            &mut items,
-            index,
-            telemetry,
-            &mut Default::default(),
-            &Default::default(),
-        )
-    };
+    finish_page(
+        &mut items,
+        index,
+        telemetry,
+        &mut Default::default(),
+        &Default::default(),
+    );
     items
 }
 fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {
@@ -187,35 +184,8 @@ fn cleanup(paths: &[&Path]) {
     }
 }
 
-/// [behaviour] DS1: the copy-prefix switch is the owner's support-dir marker,
-/// not process environment. Present (a regular file) is ON; absent, a
-/// directory or the old environment key is OFF; tests never read the host.
-#[test]
-fn copy_prefix_switch_is_the_support_marker_and_defaults_off() {
-    let scratch = crate::test_scratch::ScratchDir::new("e2-copy-prefix-marker");
-    assert!(!resumed_prefix_enabled_at(&scratch), "absent marker is OFF");
-    fs::write(scratch.join(RESUMED_PREFIX_MARKER), b"").unwrap();
-    assert!(resumed_prefix_enabled_at(&scratch), "marker present is ON");
-    fs::remove_file(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
-    fs::create_dir(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
-    assert!(
-        !resumed_prefix_enabled_at(&scratch),
-        "a directory is not the marker"
-    );
-    assert!(
-        !resumed_prefix_enabled(),
-        "fixtures never consult the host marker"
-    );
-    let on = ResumedPrefixForTest::set(true);
-    assert!(resumed_prefix_enabled());
-    drop(on);
-    assert!(!resumed_prefix_enabled());
-}
-
 #[test]
 fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("thinking");
@@ -250,8 +220,6 @@ fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
 
 #[test]
 fn e2_model_less_record_attaches_through_its_native_fallback_key() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("model-none");
@@ -279,8 +247,6 @@ fn e2_model_less_record_attaches_through_its_native_fallback_key() {
 
 #[test]
 fn e2_untimed_record_attaches_from_the_bucket_fallback() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("untimed");
@@ -311,8 +277,6 @@ fn e2_untimed_record_attaches_from_the_bucket_fallback() {
 
 #[test]
 fn e2_hour_boundary_keeps_the_transcript_hour() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("hour");
@@ -339,8 +303,6 @@ fn e2_hour_boundary_keeps_the_transcript_hour() {
 
 #[test]
 fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("speed");
@@ -372,8 +334,6 @@ fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
 
 #[test]
 fn e2_failed_or_missing_telemetry_read_is_never_complete() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -409,8 +369,6 @@ fn e2_failed_or_missing_telemetry_read_is_never_complete() {
 
 #[test]
 fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -439,8 +397,6 @@ fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
 
 #[test]
 fn e2_path_twins_attach_the_row_once() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -481,8 +437,6 @@ fn e2_path_twins_attach_the_row_once() {
 
 #[test]
 fn e2_unpriced_row_is_telemetry_unpriced() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -512,8 +466,6 @@ fn e2_unpriced_row_is_telemetry_unpriced() {
 
 #[test]
 fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("mixed");
@@ -555,8 +507,6 @@ fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
 
 #[test]
 fn e2_move_then_copy_across_restart_counts_each_request_once() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -610,8 +560,6 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
 
 #[test]
 fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -691,8 +639,6 @@ fn e2_writer_certificate_refuses_mixed_versions_in_either_order() {
 
 #[test]
 fn e2_exact_removal_totals() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -730,8 +676,6 @@ fn e2_exact_removal_totals() {
 
 #[test]
 fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("side");
@@ -797,8 +741,6 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
 
 #[test]
 fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // A trace-named member the walk has not discovered may still have a
     // transcript that counts the row: the root holds rather than count it
     // twice. Once the family directory is listed, a member still without a
@@ -908,8 +850,6 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
 
 #[test]
 fn e2_resolver_conflict_is_counted_and_emitted() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -940,8 +880,6 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
 
 #[test]
 fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let first = root_file("withheld-a");
     let copy = root_file("withheld-b");
     let index = ScanIndex::default();
@@ -1090,8 +1028,6 @@ fn e2_diagnostic_fields_are_nonzero_only() {
 
 #[test]
 fn e2_reported_selector_inputs_keep_model_speed_effort_and_hour() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1241,8 +1177,6 @@ fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
 
 #[test]
 fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,
     };
@@ -1528,8 +1462,6 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
 
 #[test]
 fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1582,8 +1514,6 @@ fn agent_file(name: &str) -> PathBuf {
 
 #[test]
 fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1644,8 +1574,6 @@ fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
 
 #[test]
 fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1738,8 +1666,6 @@ fn without_version(mut value: Value) -> Value {
 
 #[test]
 fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1777,8 +1703,6 @@ fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
 
 #[test]
 fn e2_all_prebirth_twins_require_known_response_writers() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1902,8 +1826,6 @@ fn assert_evidence_referenced(item: &SnapshotItem) {
 
 #[test]
 fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identically() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-mixed");
         let index = ScanIndex::default();
@@ -1983,8 +1905,6 @@ fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identical
 
 #[test]
 fn e2_identity_conflict_preserves_own_and_earlier_orgs() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-conflict");
         let mut index = ScanIndex::default();
@@ -2021,8 +1941,6 @@ fn e2_identity_conflict_preserves_own_and_earlier_orgs() {
 
 #[test]
 fn e2_identity_subagent_inherits_root_and_unknown_root_stays_unknown() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for known in [true, false] {
             let path = root_file("identity-agent");
@@ -2075,8 +1993,6 @@ fn e2_identity_subagent_inherits_root_and_unknown_root_stays_unknown() {
 
 #[test]
 fn e2_identity_single_account_bytes_unchanged_by_repeated_same_org_evidence() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-single");
         let index = ScanIndex::default();
@@ -2113,8 +2029,6 @@ fn e2_identity_single_account_bytes_unchanged_by_repeated_same_org_evidence() {
 
 #[test]
 fn e2_identity_later_org_cannot_claim_unknown_start_or_other_session() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-no-lookahead");
         let index = ScanIndex::default();
@@ -2161,8 +2075,6 @@ fn e2_identity_later_org_cannot_claim_unknown_start_or_other_session() {
 
 #[test]
 fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-same-request-conflict");
         let index = ScanIndex::default();
@@ -2195,8 +2107,6 @@ fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() 
 
 #[test]
 fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // R3-N2 (QUOTA): two different trusted orgs on one later request are
     // never guessed (neither the first nor the last); the request goes to
     // the starting account, counted, and a later markerless request inherits it.
@@ -2240,8 +2150,6 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
 
 #[test]
 fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting_account() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // SOURCE R2-N2: the R3-N2 pair request also carries its own exact
     // telemetry login. Two orgs on one request are never guessed, and the
     // login does not move it either: starting account, counted.
@@ -2301,8 +2209,6 @@ fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting
 
 #[test]
 fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-attached");
         let index = ScanIndex::default();
@@ -2448,8 +2354,6 @@ fn e2_side_call_with_incomplete_account_falls_back_to_the_session() {
 
 #[test]
 fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         use crate::claude_local_otel::{
             ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
@@ -2503,8 +2407,6 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
 
 #[test]
 fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-copy");
         let index = ScanIndex::default();
@@ -2538,8 +2440,6 @@ fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
 
 #[test]
 fn e2_identity_final_grouping_includes_disjoint_path_twins_in_either_order() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let path_a = root_file("identity-twin-a");
@@ -2593,8 +2493,6 @@ fn identity_api_row(id: &str, sequence: u64, input: u64, org: &str) -> ClaudeLoc
 
 #[test]
 fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let a = root_file("identity-native-a");
@@ -2642,8 +2540,6 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
 
 #[test]
 fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for count in [64, 65] {
             for bound in [None, Some("b".repeat(64))] {
@@ -2685,8 +2581,6 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
 
 #[test]
 fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         let path = root_file("identity-account-conflict");
@@ -2734,8 +2628,6 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
 
 #[test]
 fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
@@ -2781,8 +2673,6 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
 
 #[test]
 fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let a = root_file("identity-count-a");
         let b = root_file("identity-count-b");
@@ -2820,8 +2710,6 @@ fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
 
 #[test]
 fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let a = root_file("identity-count-disjoint-a");
         let b = root_file("identity-count-disjoint-b");
@@ -2861,8 +2749,6 @@ fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
 
 #[test]
 fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-count-copy");
         let index = ScanIndex::default();
@@ -2897,8 +2783,6 @@ fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copie
 
 #[test]
 fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for (field, value) in [("auth_mode", "api_key"), ("billing_provider", "bedrock")] {
             let path = root_file("identity-external");
@@ -2947,8 +2831,6 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
 
 #[test]
 fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let a = root_file("identity-retained-a");
@@ -2995,8 +2877,6 @@ fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
 
 #[test]
 fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-desktop-activity");
         let index = ScanIndex::default();
@@ -3035,8 +2915,6 @@ fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
 
 #[test]
 fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let cli = root_file("identity-activity-cli-twin");
@@ -3115,8 +2993,6 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
 
 #[test]
 fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for same_start in [false, true] {
             for reverse in [false, true] {
@@ -3169,8 +3045,6 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
 
 #[test]
 fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_restart() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let root = root_file("identity-off-page-root");
         let agent = root
@@ -3223,8 +3097,6 @@ fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_resta
 
 #[test]
 fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for operation in ["/branch", "/resume"] {
             for fresh_marker in [false, true] {
@@ -3301,8 +3173,6 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
 
 #[test]
 fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-markerless-desktop");
         let index = ScanIndex::default();
@@ -3375,8 +3245,6 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
 
 #[test]
 fn e2_identity_failed_tag_restores_activity_and_refusals() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-failed-tag");
         let index = ScanIndex::default();
@@ -3421,8 +3289,6 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
 
 #[test]
 fn e2_identity_twin_start_fills_only_unmarked_prefix_before_own_org_run() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let a = root_file("identity-prefix-twin-a");
@@ -3477,8 +3343,6 @@ fn e2_identity_twin_start_fills_only_unmarked_prefix_before_own_org_run() {
 
 #[test]
 fn e2_identity_retained_session_binding_fills_only_missing_native_shares() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-retained-start");
         let mut index = ScanIndex::default();
@@ -3531,8 +3395,6 @@ fn e2_identity_retained_session_binding_fills_only_missing_native_shares() {
 
 #[test]
 fn e2_identity_three_contradictory_start_twins_preserve_own_orgs_deterministically() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let a = root_file("identity-start-conflict-a");
         let b = root_file("identity-start-conflict-b");
@@ -3582,8 +3444,6 @@ fn e2_identity_three_contradictory_start_twins_preserve_own_orgs_deterministical
 
 #[test]
 fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let path = root_file("identity-own-start");
         let agent = path
@@ -3660,8 +3520,6 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
 
 #[test]
 fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-marker-overflow");
@@ -3740,8 +3598,6 @@ fn org_amounts(item: &SnapshotItem) -> BTreeMap<String, (u64, u64)> {
 
 #[test]
 fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for partial in [false, true] {
             let path = root_file("identity-restored-timed");
@@ -3783,8 +3639,6 @@ fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
 
 #[test]
 fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let original = root_file("identity-real-original");
         let copy = root_file("identity-real-branch");
@@ -3868,8 +3722,6 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
 
 #[test]
 fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         // Durable, qualified telemetry and Desktop-bound login variants.
         for login_source in [0, 1, 2] {
@@ -3963,8 +3815,6 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
 
 #[test]
 fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-boundary");
@@ -4028,8 +3878,6 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
 
 #[test]
 fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         let a = root_file("identity-bound-conflict-a");
         let b = root_file("identity-bound-conflict-b");
@@ -4130,8 +3978,6 @@ fn remove_agent_scratch(paths: &[&Path]) {
 
 #[test]
 fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
     {
         let p = root_file("side-ghost");
@@ -4205,8 +4051,6 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
 
 #[test]
 fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -4248,8 +4092,6 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
 /// diverged absent twins retain their hold and co-read release.
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -4669,8 +4511,6 @@ fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
 
 #[test]
 fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
         for reverse in [false, true] {
             let path_a = root_file("identity-clock-twin-a");

@@ -2065,12 +2065,11 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only, copy-prefix switch on: the row's
+    /// Wire contract 5, bucket rows only: the row's
     /// accepted proof was copy-derived and is tombstoned; a retaining receiver
     /// drops that proof for good. Like
     /// `identity_retained`, only sent when the server advertised option (ii)
-    /// and hashed in the identity leaf. Omitted when false, so switch-off
-    /// bytes are unchanged.
+    /// and hashed in the identity leaf. Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26858,9 +26857,7 @@ impl OwnedSourceScan {
             claude_retry_queue_due_families(index, collected_at);
         }
         let mut scoped_prefix_paths = Vec::new();
-        if source == SnapshotSource::ClaudeCode
-            && claude_request_money::e2::resumed_prefix_enabled()
-        {
+        if source == SnapshotSource::ClaudeCode {
             claude_copy_prefix_reread::select(
                 index,
                 recovery_priority,
@@ -52388,10 +52385,9 @@ impl ScanIndex {
         // re-parse, usually the binding read, instead of a Full every pass.
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if claude_request_money::e2::resumed_prefix_enabled()
-            && self
-                .claude_copy_removals
-                .pending(claude_money_birth_store::location_key(&key))
+        if self
+            .claude_copy_removals
+            .pending(claude_money_birth_store::location_key(&key))
         {
             return (
                 CandidateDecision::Parse,
@@ -52806,10 +52802,8 @@ impl ScanIndex {
         );
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
-                if claude_request_money::e2::resumed_prefix_enabled() {
-                    self.claude_copy_removals
-                        .clear_hold(claude_money_birth_store::location_key(&key));
-                }
+                self.claude_copy_removals
+                    .clear_hold(claude_money_birth_store::location_key(&key));
                 self.note_empty_file_upload_context(&key);
                 self.confirmed_empty_files.insert(key);
             }
@@ -54190,8 +54184,6 @@ mod tests {
 
     #[test]
     fn e2_deferred_retry_root_keeps_service_debt_and_committed_fingerprints() {
-        let _resumed_prefix =
-            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
         {
             let root = "11111111-1111-4111-8111-111111111111";
             let project = PathBuf::from("/synthetic/projects/p");
