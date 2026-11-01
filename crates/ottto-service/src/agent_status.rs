@@ -16276,7 +16276,19 @@ fn run_codex_app_server_rate_limits_for_home(
         return Err("Codex app-server user identity was unavailable.".to_string());
     };
     let mut command = Command::new(program_path);
-    command.args(["app-server", "--stdio"]).env_clear();
+    // Turn off Codex's startup installers, which write into the account's home:
+    // the bundled system-skill install and the curated plugin sync. A CLI that
+    // lacks either key warns and keeps its default.
+    command
+        .args([
+            "-c",
+            "skills.bundled.enabled=false",
+            "-c",
+            "features.plugins=false",
+            "app-server",
+            "--stdio",
+        ])
+        .env_clear();
     command
         .env("HOME", &identity.home_dir)
         .env("USER", identity.account_name)
@@ -22517,7 +22529,7 @@ if sys.argv[1:] == ["login", "status"]:
 if sys.argv[1:] == ["debug", "models", "--bundled"]:
     print('{"models":[{"id":"synthetic-model"}]}')
     sys.exit(0)
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 
 for line in sys.stdin:
@@ -23809,6 +23821,9 @@ for line in sys.stdin:
         .is_none());
     }
 
+    /// [behaviour] The probe starts Codex with its home-writing startup
+    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
+    /// keys and keeps stdin open until the asynchronous answer arrives.
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
@@ -23821,7 +23836,9 @@ for line in sys.stdin:
             r#"import os
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[1:] != [
+    "-c", "skills.bundled.enabled=false", "-c", "features.plugins=false", "app-server", "--stdio"
+]:
     sys.exit(1)
 if os.environ.get("CODEX_SQLITE_HOME") != os.environ.get("CODEX_HOME"):
     sys.exit(2)
@@ -23925,7 +23942,7 @@ import os
 import signal
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 mode = os.environ["FAKE_CODEX_MODE"]
 if mode in ("early_exit", "signal_exit", "line_bound", "message_bound", "total_bound"):
