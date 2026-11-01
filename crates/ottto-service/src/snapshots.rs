@@ -15529,21 +15529,28 @@ pub(crate) fn snapshot_revision_v2_hash(
     format!("{:x}", digest.finalize())
 }
 
+impl SnapshotItem {
+    /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
+    /// The backend refuses a base token combined with a challenge; the answer
+    /// replaces the stale base rather than adding to it.
+    fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
+        match &self.cache_conflict_answer {
+            Some((challenge, revision)) => {
+                (None, Some(challenge.clone()), Some(revision.clone()), true)
+            }
+            None => (self.cache_base_head_etag.clone(), None, None, false),
+        }
+    }
+}
+
 pub(crate) fn snapshot_semantic_envelope(
     source: SnapshotSource,
     item: &SnapshotItem,
     upload_policy: SnapshotUploadPolicy,
 ) -> SnapshotSemanticEnvelope {
     let component_hashes = snapshot_semantic_component_hashes(source, item);
-    // The backend refuses a base token combined with a challenge; the answer
-    // replaces the stale base rather than adding to it.
-    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash) =
-        match &item.cache_conflict_answer {
-            Some((challenge, stale_revision)) => {
-                (None, Some(challenge.clone()), Some(stale_revision.clone()))
-            }
-            None => (item.cache_base_head_etag.clone(), None, None),
-        };
+    let (base_head_etag, conflict_head_challenge, rescan_from_revision_hash, forced_full_rescan) =
+        item.cache_handshake();
     SnapshotSemanticEnvelope {
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
@@ -15557,9 +15564,9 @@ pub(crate) fn snapshot_semantic_envelope(
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
         base_head_etag,
-        forced_full_rescan: conflict_head_challenge.is_some(),
         conflict_head_challenge,
         rescan_from_revision_hash,
+        forced_full_rescan,
         component_hashes,
     }
 }
