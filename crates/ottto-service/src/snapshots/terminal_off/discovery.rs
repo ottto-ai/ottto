@@ -127,7 +127,7 @@ fn revision(index: &ScanIndex) -> [u8; 32] {
     ] {
         update_length_prefixed(&mut h, value.as_bytes());
     }
-    h.update(index.context_curve_replay_epoch.to_be_bytes());
+    h.update(crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH.to_be_bytes());
     h.update(
         index
             .active_effective_upload_body_witness_revision

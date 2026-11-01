@@ -52,13 +52,30 @@ pub(crate) struct Counts {
     pub(crate) retained_missing_unfit: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) proved_rows_capped: u64,
+    /// Copy-prefix switch on: accepted rows whose proof a copied marker lent
+    /// (SOURCE 2026-10-31, #944 xPR F5), tombstoned once per row.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_proof_invalidated: u64,
+    /// Lent rows kept on #909 per pass (Lead B Addendum 4): an OFF-era freeze
+    /// mixing lent and other shares, or lent requests whose own evidence this
+    /// pass could not read.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_mixed_not_invalidated: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_skipped_evidence_unavailable: u64,
+    /// X-B1: bucket rows sent with `copy_invalidated`, and tombstoned rows
+    /// whose flag did not fit beside a stripped body (still tombstoned).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_invalidated_rows: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_invalidated_unfit: u64,
 }
 impl Counts {
     pub(super) fn is_empty(&self) -> bool {
         self == &Self::default()
     }
 }
-const COUNTER_COUNT: usize = 18;
+const COUNTER_COUNT: usize = 23;
 #[cfg(not(test))]
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 #[cfg(test)]
@@ -97,13 +114,18 @@ pub(super) fn record(counts: &Counts) {
             counts.retained_set_cleared,
             counts.retained_missing_unfit,
             counts.proved_rows_capped,
+            counts.copy_derived_proof_invalidated,
+            counts.copy_derived_mixed_not_invalidated,
+            counts.copy_derived_skipped_evidence_unavailable,
+            counts.copy_invalidated_rows,
+            counts.copy_invalidated_unfit,
         ]) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, copy_derived_proof_invalidated, copy_derived_mixed_not_invalidated, copy_derived_skipped_evidence_unavailable, copy_invalidated_rows, copy_invalidated_unfit] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
@@ -128,6 +150,11 @@ pub(super) fn take_counts() -> Counts {
         retained_set_cleared,
         retained_missing_unfit,
         proved_rows_capped,
+        copy_derived_proof_invalidated,
+        copy_derived_mixed_not_invalidated,
+        copy_derived_skipped_evidence_unavailable,
+        copy_invalidated_rows,
+        copy_invalidated_unfit,
     }
 }
 
@@ -311,6 +338,7 @@ fn intrinsically_fits(
     base: usize,
     additional_refusal_rows: usize,
     mandatory_refusals: u64,
+    max_item_bytes: usize,
 ) -> bool {
     let minimum = || -> Option<Metrics> {
         let mut total = Metrics::default();
@@ -387,7 +415,7 @@ fn intrinsically_fits(
         minimum.parts <= MAX_PARTS_PER_ITEM
             && base
                 .checked_add(minimum.bytes)
-                .is_some_and(|bytes| bytes <= MAX_ITEM_BYTES)
+                .is_some_and(|bytes| bytes <= max_item_bytes)
     })
 }
 
@@ -488,6 +516,7 @@ fn fits(
     selection: &Selection,
     base_bytes: usize,
     prior_refusals: u64,
+    max_item_bytes: usize,
 ) -> Option<usize> {
     for (row, groups) in item.model_usage.iter().zip(&selection.top) {
         let mut total = Amounts::default();
@@ -498,10 +527,15 @@ fn fits(
         }
         reproduces(row, &total).ok()?;
     }
-    fits_caps(selection, base_bytes, prior_refusals)
+    fits_caps(selection, base_bytes, prior_refusals, max_item_bytes)
 }
 
-fn fits_caps(selection: &Selection, base_bytes: usize, prior_refusals: u64) -> Option<usize> {
+fn fits_caps(
+    selection: &Selection,
+    base_bytes: usize,
+    prior_refusals: u64,
+    max_item_bytes: usize,
+) -> Option<usize> {
     if selection.metrics.parts > MAX_PARTS_PER_ITEM {
         return None;
     }
@@ -525,7 +559,7 @@ fn fits_caps(selection: &Selection, base_bytes: usize, prior_refusals: u64) -> O
             &evidence,
             prior_refusals.saturating_add(selection.refused_rows),
         )?)?;
-    (bytes <= MAX_ITEM_BYTES).then_some(bytes)
+    (bytes <= max_item_bytes).then_some(bytes)
 }
 
 /// Pure allocation over current proof; mutates only the supplied output body.
@@ -537,6 +571,7 @@ pub(super) fn select(
     grouping: &Grouping,
     prior_refusals: u64,
     accepted: Option<&accepted::AcceptedSession>,
+    max_item_bytes: usize,
 ) -> Option<(Vec<bool>, Measurement)> {
     let is_accepted = item
         .usage_buckets
@@ -653,6 +688,7 @@ pub(super) fn select(
                     base_bytes,
                     additional_refusal_rows,
                     mandatory_refusals,
+                    max_item_bytes,
                 )
         })
         .collect::<Vec<_>>();
@@ -670,7 +706,7 @@ pub(super) fn select(
         bucket_identities[index] = rows;
     }
     for &index in accepted_order.iter().rev() {
-        if fits(item, &selection, base_bytes, prior_refusals).is_some() {
+        if fits(item, &selection, base_bytes, prior_refusals, max_item_bytes).is_some() {
             break;
         }
         if !kept[index] {
@@ -741,7 +777,7 @@ pub(super) fn select(
                 trial = next;
                 added.push((member, identities));
             }
-            if !valid || fits(item, &trial, base_bytes, prior_refusals).is_none() {
+            if !valid || fits(item, &trial, base_bytes, prior_refusals, max_item_bytes).is_none() {
                 continue;
             }
             admitted = Some((trial, added));
@@ -792,7 +828,7 @@ pub(super) fn select(
         item_bytes: grouping.item_bytes(item),
         ..Default::default()
     };
-    if measurement.item_bytes > MAX_ITEM_BYTES {
+    if measurement.item_bytes > max_item_bytes {
         return None;
     }
     for (index, keep) in kept.iter().enumerate() {

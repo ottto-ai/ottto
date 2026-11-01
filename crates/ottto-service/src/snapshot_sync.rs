@@ -19,22 +19,23 @@ use crate::local_resource_diagnostics::claude_contract;
 use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
-    AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
+    AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
-    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
+    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
 };
+#[cfg(test)]
+use crate::snapshots::apply_upload_policy;
+use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
-    apply_upload_policy, collector_version, context_curve_derivation_revision,
-    finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
-    snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness,
-    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
+    collector_version, finalize_scan_after_policy_with_body_witness,
+    prepare_codex_recovery_diagnostics, snapshot_quarantine_deadline_is_bounded,
+    snapshot_upload_body_witness, ScanIndex, SnapshotBatchRequest, SnapshotItem,
     SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
     SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult,
-    UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    UnsettledUploadCause, MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -603,20 +604,17 @@ fn note_claude_history_cutoff_for_cycle(
 struct ReplayArming {
     /// The source's bootstrap for this destination is pending.
     backfill_pending: bool,
-    /// The index needs the current context-curve replay.
-    curve_replay_pending: bool,
 }
 
 impl ReplayArming {
     /// One decision for production and the history pipeline tests. An
-    /// unreadable backfill state arms no Claude replay of either kind (its
-    /// history is unknown, and a replay would drop the index's entries);
-    /// Codex and Pi replays are not affected.
+    /// unreadable backfill state arms no Claude replay (its history is
+    /// unknown, and a replay would drop the index's entries); Codex and Pi
+    /// replays are not affected.
     fn decide(
         source: SnapshotSource,
         backfill_state: &crate::backfill::BackfillState,
         destination_namespace: &str,
-        curve_replay_needed: bool,
     ) -> Self {
         Self {
             backfill_pending: pending_backfill_sources_for_destination(
@@ -624,8 +622,6 @@ impl ReplayArming {
                 destination_namespace,
             )
             .contains(&source),
-            curve_replay_pending: curve_replay_needed
-                && !claude_replay_suppressed(source, backfill_state),
         }
     }
 }
@@ -760,6 +756,18 @@ impl LocalHoldSettlement {
                 scan_result.completed_parses(),
                 &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
+        if held_entity_count > 0 {
+            let counts = serde_json::json!({
+                "request_owned": disposition.request_owned_hold_reasons,
+                "account_binding": account_deferred_fingerprints.len(),
+                "authority_demotion": disposition.context_file_birth.demotion_quarantined_session_count,
+            });
+            eprintln!(
+                "local snapshot sync: hold disposition source={} held_entities={} counts={counts}",
+                source.api_slug(),
+                held_entity_count,
+            );
+        }
         scan_result.remember_withheld_content(index);
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,
@@ -1850,6 +1858,20 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
+        let mut version_only_kept = 0;
+        for record in self.quarantined_fingerprints.values_mut() {
+            if record.witness != *active && record.witness.same_retry_contract(active) {
+                record.witness = active.clone();
+                version_only_kept += 1;
+            }
+        }
+        if version_only_kept > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                "unknown",
+                &serde_json::json!({"action": "version_only_kept", "count": version_only_kept}),
+            );
+        }
         let mut candidates = self
             .quarantined_fingerprints
             .iter()
@@ -1863,7 +1885,7 @@ impl SnapshotUploadProgress {
                     })
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && ((record.contract_retry_claims.is_none()
-                        && &record.witness != active
+                        && !record.witness.same_retry_contract(active)
                         && !crate::snapshots::quarantine_context_only_changed(
                             &record.witness,
                             active,
@@ -1872,7 +1894,7 @@ impl SnapshotUploadProgress {
             })
             .map(|(fingerprint, record)| {
                 (
-                    (&record.witness == active) as u8,
+                    record.witness.same_retry_contract(active) as u8,
                     record.retry_after_unix_seconds,
                     fingerprint.clone(),
                 )
@@ -1940,12 +1962,19 @@ impl SnapshotUploadProgress {
                 .quarantined_fingerprints
                 .get_mut(fingerprint)
                 .expect("selected quarantine retry exists");
-            crate::snapshots::terminal_contract_retry::claim(record);
-            record.witness = active.clone();
-            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            if record.contract_retry_claims.is_some() {
+                crate::snapshots::terminal_contract_retry::claim(record);
+                record.witness = active.clone();
+                record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            }
+            // Selection is not a send. Offered or still-queued work keeps its
+            // deadline; source-held work is paced at the final offer boundary.
         }
         self.active_quarantine_retries = retry;
-        !self.active_quarantine_retries.is_empty() || reoffer_changed || contract_retry_changed
+        !self.active_quarantine_retries.is_empty()
+            || version_only_kept > 0
+            || reoffer_changed
+            || contract_retry_changed
     }
 
     /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
@@ -2063,7 +2092,12 @@ impl SnapshotUploadProgress {
                         .get(*fingerprint)
                         .is_some_and(|record| {
                             record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                && self
+                                    .active_quarantine_witness
+                                    .as_ref()
+                                    .is_some_and(|active| {
+                                        record.witness.same_retry_contract(active)
+                                    })
                                 && record.upload_body_witness.as_deref()
                                     == Some(refusal.body_witness.as_str())
                         })
@@ -2154,6 +2188,49 @@ impl SnapshotUploadProgress {
             }
         }
         changed
+    }
+
+    /// Source-held retries use ordinary pacing without spending a failure.
+    /// Offered bodies keep their lease: transport/token failures still owe it.
+    fn defer_held_quarantine_retries(
+        &mut self,
+        offered: &[SnapshotItem],
+        index: &ScanIndex,
+        source: SnapshotSource,
+    ) -> bool {
+        let mut deferred = 0;
+        self.active_quarantine_retries.retain(|fingerprint| {
+            if offered
+                .iter()
+                .any(|item| &item.snapshot_fingerprint == fingerprint)
+                || index.quarantine_retry_is_queued(fingerprint)
+            {
+                return true;
+            }
+            let Some(record) = self.quarantined_fingerprints.get_mut(fingerprint) else {
+                return true;
+            };
+            if record.contract_retry_claims.is_some()
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                return true;
+            }
+            record.witness = self
+                .active_quarantine_witness
+                .clone()
+                .expect("upload progress always has an active quarantine witness");
+            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            deferred += 1;
+            false
+        });
+        if deferred > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                source.api_slug(),
+                &serde_json::json!({"action": "deferred_held", "count": deferred}),
+            );
+        }
+        deferred > 0
     }
 
     /// The logical offer ends with the main upload call. Classify each
@@ -2396,7 +2473,7 @@ impl SnapshotUploadProgress {
                     || (record.upload_body_witness.is_none()
                         && record.contract_retry_claims.is_some())
             });
-        let existing = budget.filter(|record| record.witness == witness);
+        let existing = budget.filter(|record| record.witness.same_retry_contract(&witness));
         let contract_retry_claims = budget.and_then(|record| record.contract_retry_claims);
         let reconstruction_contract = budget.map_or(
             crate::snapshots::terminal_contract_retry::current_contract(),
@@ -3831,6 +3908,7 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
+    census_status: crate::snapshots::CensusStatus,
     cap_counts: crate::local_resource_diagnostics::CapCounts,
     local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
@@ -3957,6 +4035,7 @@ impl SyncCounts {
             // this field and the manifest describe only the server-negotiated
             // semantic activity window.
             backfill_window_days: receipt_window_days,
+            census_status: scan_result.census_status,
             backfill_file_limit: scan_result.backfill_file_limit as u64,
             discovered_file_count: scan_result.discovered_file_count as u64,
             skipped_file_count_due_to_limit: scan_result.skipped_file_count_due_to_limit as u64,
@@ -4065,12 +4144,8 @@ fn validated_receipt_window_days(negotiated_window_days: u64) -> Result<u64> {
     Ok(negotiated_window_days)
 }
 
-fn scan_request_window_days(
-    receipt_window_days: u64,
-    backfill_pending: bool,
-    curve_replay_pending: bool,
-) -> u64 {
-    if backfill_pending || curve_replay_pending {
+fn scan_request_window_days(receipt_window_days: u64, backfill_pending: bool) -> u64 {
+    if backfill_pending {
         // The scanner applies its own local safety ceiling. `u64::MAX` means
         // "walk the complete replay range", not "claim this width upstream".
         u64::MAX
@@ -5699,7 +5774,6 @@ struct SourcePreparation {
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
-    context_curve_enabled: bool,
     cache_observations_enabled: bool,
     scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
     attribution_context: Option<SessionAttributionContext>,
@@ -6233,34 +6307,15 @@ pub(crate) fn copy_unproven_upload_context(context: String, enabled: bool) -> St
     }
 }
 
-/// The replay generation of a cycle over `index` (pure; shared as above).
-fn cycle_replay_generation(
-    source: SnapshotSource,
-    context_curve_enabled: bool,
-    index: &ScanIndex,
-    upload_destination_namespace: &str,
-) -> String {
+/// The replay generation of a cycle (pure; shared as above).
+fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace: &str) -> String {
     let replay = current_historical_replay(source);
-    if context_curve_enabled {
-        let curve_derivation_revision = context_curve_derivation_revision(source)
-            .expect("curve capability is supported only for local Codex and Claude sources");
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            CONTEXT_CURVE_CONTRACT_VERSION,
-            curve_derivation_revision,
-            index.context_curve_replay_epoch(),
-            upload_destination_namespace
-        )
-    } else {
-        format!(
-            "{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            upload_destination_namespace
-        )
-    }
+    format!(
+        "{}:{}:{}",
+        source.api_slug(),
+        replay.revision,
+        upload_destination_namespace
+    )
 }
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
@@ -6269,13 +6324,13 @@ fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,
-    context_curve_enabled: bool,
     request_identity_capture: bool,
 ) -> crate::transcript_acquisition::Scope {
+    // The trailing `false` is the retired context-curve flag; the scope bytes
+    // are unchanged.
     let mut sampled_scope = format!(
-        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:false",
         index_path.display(),
-        context_curve_enabled
     );
     if request_identity_capture {
         // A retained parser never crosses capture modes; the dark scope bytes
@@ -6444,9 +6499,6 @@ fn prepare_sync_source_inner(
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
     let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
-    let context_curve_enabled = source != SnapshotSource::Pi
-        && activity_hint.session_context_curve_contract.as_deref()
-            == Some(CONTEXT_CURVE_CONTRACT_VERSION);
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
@@ -6704,13 +6756,6 @@ fn prepare_sync_source_inner(
         (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
         resumed_prefix_enabled,
     );
-    if !context_curve_enabled {
-        // Stamp the off transition before taking the partial-commit baseline.
-        // If an ordinary no-curve upload is partially accepted and then shed,
-        // `committable_subset` must persist the new epoch so an immediate
-        // re-enable replays every file changed during that off cycle.
-        index.mark_context_curve_capability_disabled();
-    }
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.
@@ -6728,24 +6773,12 @@ fn prepare_sync_source_inner(
             prior == crate::snapshots::PriorHistory::Unverified,
         );
     }
-    let replay_generation = cycle_replay_generation(
-        source,
-        context_curve_enabled,
-        &index,
-        &upload_destination_namespace,
-    );
-    // An unreadable backfill state arms no Claude replay of either kind, and
-    // no replay-wide scan window (StateMissing H1, N2).
-    let ReplayArming {
-        backfill_pending,
-        curve_replay_pending,
-    } = ReplayArming::decide(
-        source,
-        &backfill_state,
-        &upload_destination_namespace,
-        context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
-    );
-    let historical_replay_pending = backfill_pending || curve_replay_pending;
+    let replay_generation = cycle_replay_generation(source, &upload_destination_namespace);
+    // An unreadable backfill state arms no Claude replay and no replay-wide
+    // scan window (StateMissing H1, N2).
+    let ReplayArming { backfill_pending } =
+        ReplayArming::decide(source, &backfill_state, &upload_destination_namespace);
+    let historical_replay_pending = backfill_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
@@ -6753,7 +6786,8 @@ fn prepare_sync_source_inner(
         // advance. Existing generation CAS rejects overlapping stale writers.
         index.save(&index_path)?;
     }
-    let admission_reoffer_pending = index.snapshot_admission_reoffer_pending();
+    let admission_reoffer_pending =
+        index.snapshot_admission_reoffer_pending_for_scan(source, receipt_window_days);
     let mut legacy_reconciliation_pending = BTreeSet::new();
     if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
@@ -6796,7 +6830,15 @@ fn prepare_sync_source_inner(
         // identical entities and gives overlapping writers a CAS boundary.
         upload_progress.save(&upload_progress_path)?;
     }
-    save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
+    let quarantine_retry_paths =
+        save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
+    if !quarantine_retry_paths.is_empty() {
+        crate::local_resource_diagnostics::traversal_point(
+            "quarantine_retry",
+            source.api_slug(),
+            &serde_json::json!({"action": "enqueued", "count": quarantine_retry_paths.len()}),
+        );
+    }
     let active_legacy_reconciliation = upload_progress
         .active_quarantine_retries
         .intersection(&legacy_reconciliation_pending)
@@ -6836,7 +6878,6 @@ fn prepare_sync_source_inner(
     let scan_window_days = scan_request_window_days(
         receipt_window_days,
         backfill_pending || admission_reoffer_pending,
-        curve_replay_pending,
     );
     let copy_prefix_scope = if source == SnapshotSource::ClaudeCode {
         match crate::snapshots::claude_copy_prefix_reread::prepare(
@@ -6869,6 +6910,7 @@ fn prepare_sync_source_inner(
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
     watcher_hints.paths.extend(reoffer_paths);
+    watcher_hints.paths.extend(quarantine_retry_paths);
     if watcher_hints.overflowed {
         eprintln!(
             "local snapshot watcher hint queue overflowed for {}; durable traversal will reconcile",
@@ -6898,7 +6940,6 @@ fn prepare_sync_source_inner(
         &account_witness,
         &upload_destination_namespace,
         &index_path,
-        context_curve_enabled,
         request_identity_capture,
     );
     #[cfg(unix)]
@@ -6923,7 +6964,6 @@ fn prepare_sync_source_inner(
             (source == SnapshotSource::ClaudeCode).then_some(support_dir),
             &watcher_hints.paths,
             watcher_hints.overflowed,
-            context_curve_enabled,
             request_identity_capture,
             &copy_prefix_scope,
         )
@@ -6941,7 +6981,7 @@ fn prepare_sync_source_inner(
     }
     if let Some(lease) = native_comparison_lease.as_mut() {
         if let Some(native_context) = scan.native_comparison_context() {
-            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}"));
+            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:false"));
             lease.bind_scope(scope);
         } else {
             lease.revoke();
@@ -6960,7 +7000,6 @@ fn prepare_sync_source_inner(
         scan_started_at,
         activity_hint,
         receipt_window_days,
-        context_curve_enabled,
         cache_observations_enabled,
         scan_agent_status_collection,
         attribution_context,
@@ -6994,7 +7033,6 @@ struct ContinuationInputs {
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
-    context_curve_enabled: bool,
     cache_observations_enabled: bool,
     scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
     attribution_context: Option<SessionAttributionContext>,
@@ -7008,7 +7046,7 @@ struct ContinuationInputs {
 }
 
 crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
-    receipt_window_days, context_curve_enabled, cache_observations_enabled,
+    receipt_window_days, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
 
@@ -7063,7 +7101,6 @@ fn take_continuation_inputs(
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
-        context_curve_enabled: preparation.context_curve_enabled,
         cache_observations_enabled: preparation.cache_observations_enabled,
         scan_agent_status_collection: std::sync::Arc::clone(
             &preparation.scan_agent_status_collection,
@@ -7247,19 +7284,13 @@ fn prepare_continuation_source(
     index.require_persistence_available()?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
-    let replay_generation = cycle_replay_generation(
-        source,
-        inputs.context_curve_enabled,
-        &index,
-        &inputs.upload_destination_namespace,
-    );
+    let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
     let arming = ReplayArming::decide(
         source,
         &backfill_state,
         &inputs.upload_destination_namespace,
-        inputs.context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
     );
-    if arming.backfill_pending || arming.curve_replay_pending {
+    if arming.backfill_pending {
         return Ok(Err(ContinuationRefusal::HistoricalReplay));
     }
     if index.snapshot_admission_reoffer_pending() {
@@ -7333,10 +7364,9 @@ fn prepare_continuation_source(
         &roots,
         index,
         &scan_started_at,
-        scan_request_window_days(inputs.receipt_window_days, false, false),
+        scan_request_window_days(inputs.receipt_window_days, false),
         MAX_BACKFILL_FILES_PER_SOURCE,
         inputs.upload_policy.session_artifacts_enabled,
-        inputs.context_curve_enabled,
         ordinary_equivalent,
         inputs.evidence.take(),
     )
@@ -7348,7 +7378,6 @@ fn prepare_continuation_source(
             &inputs.account_witness,
             &inputs.upload_destination_namespace,
             &inputs.index_path,
-            inputs.context_curve_enabled,
             false,
         ),
     )
@@ -7368,7 +7397,6 @@ fn prepare_continuation_source(
         scan_started_at,
         activity_hint: inputs.activity_hint.clone(),
         receipt_window_days: inputs.receipt_window_days,
-        context_curve_enabled: inputs.context_curve_enabled,
         cache_observations_enabled: inputs.cache_observations_enabled,
         scan_agent_status_collection: std::sync::Arc::clone(&inputs.scan_agent_status_collection),
         attribution_context: inputs.attribution_context.take(),
@@ -7503,7 +7531,6 @@ fn finish_sync_source(
         scan_started_at,
         activity_hint,
         receipt_window_days,
-        context_curve_enabled,
         cache_observations_enabled,
         scan_agent_status_collection,
         attribution_context,
@@ -7516,14 +7543,20 @@ fn finish_sync_source(
         mut committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation,
+        replay_generation: _,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
+        activity_hint.max_snapshot_item_bytes,
+    );
     upload_progress
         .accepted_identity_buckets
         .bind_context(attribution_context.as_ref());
+    upload_progress
+        .accepted_identity_buckets
+        .set_item_cap(identity_item_cap);
     upload_progress
         .accepted_identity_buckets
         .set_retained_enabled(
@@ -7671,9 +7704,12 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
-            Some(&reserve_cache_bytes),
+            crate::snapshots::claude_request_identity::WireBudget {
+                max_item_bytes: identity_item_cap,
+                reservation: Some(&reserve_cache_bytes),
+            },
         );
-        let (disposition, census_withheld, stats) = match applied {
+        let (mut disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
                 if let Some(lease) = native_comparison_lease.as_mut() {
@@ -7685,6 +7721,15 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
+        // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
+        // rows as never accepted; the ledger records that durably before any
+        // upload, so a lost reply or restart cannot restore their proof.
+        if upload_progress
+            .accepted_identity_buckets
+            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
+        {
+            upload_progress.save(&upload_progress_path)?;
+        }
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
@@ -7742,7 +7787,12 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
-    apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    crate::snapshots::apply_upload_policy_with_item_limit(
+        source,
+        &mut scan_result.snapshots,
+        upload_policy,
+        identity_item_cap,
+    );
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -7777,7 +7827,12 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            apply_upload_policy(source, snapshots, upload_policy);
+            crate::snapshots::apply_upload_policy_with_item_limit(
+                source,
+                snapshots,
+                upload_policy,
+                identity_item_cap,
+            );
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -8124,7 +8179,12 @@ fn finish_sync_source(
                     upload_policy,
                     client_report: crate::client_report::ClientReport::empty(),
                 };
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        identity_item_cap,
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -8183,6 +8243,9 @@ fn finish_sync_source(
     }
     // The same hook every resend path calls; nothing held is left by now.
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
+    if upload_progress.defer_held_quarantine_retries(&scan_result.snapshots, &index, source) {
+        upload_progress.save(&upload_progress_path)?;
+    }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -8229,7 +8292,12 @@ fn finish_sync_source(
                         }),
                     "legacy reconciliation must stay isolated at a batch boundary"
                 );
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        identity_item_cap,
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -8789,19 +8857,6 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    // A Claude curve replay an unreadable backfill state suppressed stays
-    // pending (StateMissing H1), so it runs once the marker clears.
-    let curve_replay_suppressed = context_curve_enabled
-        && claude_replay_suppressed(source, &backfill_state)
-        && index.context_curve_replay_needed(&replay_generation);
-    if !curve_replay_suppressed {
-        settle_context_curve_replay_state(
-            &mut index,
-            context_curve_enabled,
-            scan_result.census_complete && upload_fully_settled,
-            &replay_generation,
-        );
-    }
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -9087,30 +9142,18 @@ fn finish_sync_source(
     Ok(())
 }
 
-/// The progress claim was saved by the caller. Mirror its maximum into the
-/// durable index before granting the source selector a runtime lease.
+/// Contract-origin progress claims were saved by the caller. Mirror those
+/// claims before source acquisition, then bind every selected retry to one file.
+/// Ordinary offered/queued retries stay due; source-held ones use ordinary backoff.
 fn save_terminal_contract_claims_for_scan(
     index: &mut ScanIndex,
     progress: &SnapshotUploadProgress,
     index_path: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     if index.merge_terminal_contract_claims(&progress.quarantined_fingerprints) {
         index.save(index_path)?;
     }
-    index.activate_terminal_contract_retries(
-        progress
-            .active_quarantine_retries
-            .iter()
-            .filter(|fp| {
-                progress
-                    .quarantined_fingerprints
-                    .get(*fp)
-                    .is_some_and(|record| record.contract_retry_claims.is_some())
-            })
-            .cloned()
-            .collect(),
-    );
-    Ok(())
+    Ok(index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone()))
 }
 
 /// Prepare the disposable upload ledger against the durable scan-index replay.
@@ -9196,26 +9239,6 @@ fn prepare_upload_progress_for_cycle_with_reoffer(
             upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     }
     progress_changed
-}
-
-fn settle_context_curve_replay_state(
-    index: &mut ScanIndex,
-    context_curve_enabled: bool,
-    census_complete: bool,
-    replay_generation: &str,
-) {
-    if context_curve_enabled && census_complete {
-        // This point is reached only after every curve-bearing entity received
-        // an exact durable v5/v6 proof and the bounded traversal reached the
-        // end of its frozen census. Partial pages retain the replay epoch so a
-        // later cycle keeps the full historical window and traversal cursor.
-        index.mark_context_curve_replay_complete(replay_generation.to_string());
-    } else if !context_curve_enabled {
-        // Mark the off epoch only after the ordinary no-curve cycle succeeds.
-        // A later re-enable uses the incremented epoch to force exactly one
-        // fresh historical replay, including files changed while off.
-        index.mark_context_curve_capability_disabled();
-    }
 }
 
 fn reconciliation_agent_status(collection: &AgentStatusCollection) -> &AgentStatusSnapshot {
@@ -9707,7 +9730,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         None,
         None,
         accepted_identity_buckets,
-        None,
+        Default::default(),
     )
     .expect("evidence fixture has no resource refusal")
 }
@@ -9753,7 +9776,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         lease,
         None,
         None,
-        None,
+        Default::default(),
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -9776,7 +9799,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-    wire_size_reservation: Option<&dyn Fn(&SnapshotItem) -> usize>,
+    wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -9834,6 +9857,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
         index,
+        accepted_identity_buckets,
     )
     .apply(index);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
@@ -10159,7 +10183,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_size_reservation(wire_size_reservation)
+        .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -10225,11 +10249,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         } else {
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
+        &mut disposition.request_owned_hold_reasons,
+        &scan_result.claude_queued_family_deferred_paths,
     );
+    if !trace_discard_unfolded.is_empty() {
+        *disposition
+            .request_owned_hold_reasons
+            .entry("trace_discarded")
+            .or_default() += trace_discard_unfolded.len() as u64;
+    }
     withheld.extend(trace_discard_unfolded);
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
+    let mut identity_custody = (wire_budget.max_item_bytes
+        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES)
+        .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {
         for item in &mut scan_result.snapshots {
@@ -10258,13 +10293,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 index,
                 &disposition,
             );
-        let _request_identity =
-            crate::snapshots::claude_request_identity::apply_scan_with_ownership(
-                &mut scan_result.snapshots,
-                evidence,
-                std::mem::take(&mut disposition.request_groupings),
-                &ownership,
-            );
+        let request_identity = crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+            &mut scan_result.snapshots,
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
+            &ownership,
+        );
+        disposition.copy_invalidated = request_identity.copy_invalidated;
+        if !request_identity.held.is_empty() {
+            if let (Some((cache, committed)), Some(withheld)) =
+                (retained, identity_custody.as_mut())
+            {
+                withheld.extend(request_identity.held.iter().cloned());
+                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
+            }
+            disposition.hold_request_owned(request_identity.held);
+        }
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,
@@ -10462,16 +10506,16 @@ fn require_normal_write_ack_for_legacy_reconciliation(
         return Ok(());
     }
     if response.disabled {
-        return Err(anyhow!(
-            "disabled snapshot response cannot settle legacy reconciliation"
-        ));
+        return Err(anyhow::Error::new(SnapshotAckRejected {
+            reason: "disabled snapshot response cannot settle legacy reconciliation",
+        }));
     }
     if response.entity_ack_contract.as_deref()
         != Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT)
     {
-        return Err(anyhow!(
-            "legacy snapshot reconciliation requires the exact entity ACK contract"
-        ));
+        return Err(anyhow::Error::new(SnapshotAckRejected {
+            reason: "legacy snapshot reconciliation requires the exact entity ACK contract",
+        }));
     }
     Ok(())
 }
@@ -10817,7 +10861,41 @@ where
     if replaced_retained_proof || custody_pruned {
         persist(progress)?;
     }
-    let response = upload(batch)?;
+    let response = upload(batch);
+    // The callback includes local preflight and authority checks. Only a reply
+    // or a typed batch response proves this ordinary retry reached a send.
+    if response.is_ok()
+        || response.as_ref().is_err_and(|error| {
+            error.downcast_ref::<BatchRejected>().is_some()
+                || error.downcast_ref::<BatchAuthorizationRejected>().is_some()
+                || error
+                    .downcast_ref::<UploadFailureDiagnostics>()
+                    .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_response)
+                || error.downcast_ref::<UploadShed>().is_some()
+                || error.downcast_ref::<SnapshotAckRejected>().is_some()
+        })
+    {
+        let mut retry_attempted = false;
+        for index in indices {
+            let fp = fingerprint(&items[*index]);
+            if progress.active_quarantine_retries.contains(fp) {
+                if let Some(record) = progress.quarantined_fingerprints.get_mut(fp) {
+                    if record.contract_retry_claims.is_none() {
+                        record.witness = progress
+                            .active_quarantine_witness
+                            .clone()
+                            .expect("upload progress always has an active quarantine witness");
+                        record.retry_after_unix_seconds = quarantine_retry_after(fp);
+                        retry_attempted = true;
+                    }
+                }
+            }
+        }
+        if retry_attempted {
+            persist(progress)?;
+        }
+    }
+    let response = response?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
@@ -11694,15 +11772,19 @@ fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
     census_residue_status_admitted: bool,
+    census_status_admitted: bool,
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let disclosed_loss = status.counts.disclosed_loss();
+    let census_status_active = census_status_admitted
+        && matches!(&status.state, CollectorState::Success)
+        && !status.counts.census_complete;
     let (
         enabled,
         disabled_reason,
-        last_error_code,
+        mut last_error_code,
         last_error_message,
-        consecutive_failures,
+        mut consecutive_failures,
         terminal_succeeded,
     ) = match status.state {
         // A census that completed and whose every disclosed loss class is
@@ -11748,6 +11830,51 @@ fn collector_status_request(
             false,
         ),
     };
+    let mut block_cause = None;
+    let mut next_retry_at = None;
+    if census_status_active {
+        let census = status.counts.census_status;
+        // First failed gate wins, even if discovery is still progressing.
+        block_cause = if status.counts.unreadable_path_count > 0 {
+            Some(CensusBlockCause::UnreadableEvents)
+        } else if status.counts.disappeared_file_count > 0 {
+            Some(CensusBlockCause::DisappearedFiles)
+        } else if census.carry_admission_veto {
+            Some(CensusBlockCause::CarryAdmission)
+        } else if census.state_loader_failed {
+            Some(CensusBlockCause::StateLoader)
+        } else if census.transport_reservation_refused {
+            Some(CensusBlockCause::TransportReservation)
+        } else if census.reconciliation_incomplete
+            && status.counts.ownership_incomplete_file_count > 0
+        {
+            Some(CensusBlockCause::OwnershipIncomplete)
+        } else if !census.pending_work || census.retryable_problem {
+            Some(CensusBlockCause::Other)
+        } else {
+            None
+        };
+        last_error_code = Some(
+            if block_cause.is_some() {
+                "census_blocked"
+            } else {
+                "census_incomplete"
+            }
+            .to_string(),
+        );
+        consecutive_failures = u64::from(census.retry_attempt);
+        let due = if block_cause == Some(CensusBlockCause::CarryAdmission) {
+            census
+                .admission_due_unix_seconds
+                .or(census.retry_not_before_unix_seconds)
+        } else {
+            census.retry_not_before_unix_seconds
+        };
+        next_retry_at = due
+            .and_then(|seconds| i64::try_from(seconds).ok())
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+            .and_then(|time| time.format(&Rfc3339).ok());
+    }
     let manifest = cached_source_manifest(destination_namespace, status.source);
     if let Some(manifest) = manifest.as_ref() {
         if manifest.window_end != status.scan_started_at {
@@ -11830,8 +11957,11 @@ fn collector_status_request(
         last_census_residue_blocked_session_count: status
             .counts
             .census_residue_blocked_session_count,
+        last_census_pending_file_count: census_status_admitted
+            .then_some(status.counts.skipped_file_count_due_to_limit),
+        last_census_block_cause: block_cause,
         consecutive_failures,
-        next_retry_at: None,
+        next_retry_at,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
@@ -11865,13 +11995,13 @@ fn report_status(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
-    let request = collector_status_request(destination_namespace, status, false)?;
+    let request = collector_status_request(destination_namespace, status, false, false)?;
     client.report_status(relay_token, &request)?;
     Ok(())
 }
 
-/// What the server's activity hint decides for a terminal receipt: the
-/// evidence width, and whether the backend admits the `census_residue` code.
+/// The terminal activity hint owns evidence width and admission of census
+/// status codes; all contracts are read from the same fresh server answer.
 #[derive(Debug, Clone, Copy)]
 struct TerminalReceiptPolicy {
     receipt_window_days: u64,
@@ -11881,6 +12011,7 @@ struct TerminalReceiptPolicy {
     /// its entire terminal receipt rejected by a backend that predates the
     /// admission — whatever order the two are deployed in.
     census_residue_status_admitted: bool,
+    census_status_admitted: bool,
 }
 
 fn current_terminal_receipt_policy(
@@ -11892,6 +12023,8 @@ fn current_terminal_receipt_policy(
         receipt_window_days: validated_receipt_window_days(activity_hint.backfill_window_days)?,
         census_residue_status_admitted: activity_hint.census_residue_status_contract.as_deref()
             == Some(CENSUS_RESIDUE_STATUS_CONTRACT),
+        census_status_admitted: activity_hint.census_status_contract.as_deref()
+            == Some(CENSUS_STATUS_CONTRACT),
     })
 }
 
@@ -12029,11 +12162,12 @@ fn report_status_with_fresh_relay_token(
     // This is the single terminal report boundary. Every terminal outcome
     // reacquires its width here, after scanning/uploading and immediately
     // before deriving both the manifest and status scalar from that same hint
-    // — and reads the residue admission off the same hint, so the receipt
-    // shape and the width are decided by one server answer.
+    // — and reads census status admissions off that hint, so receipt shape
+    // and evidence width are decided by one server answer.
     let TerminalReceiptPolicy {
         receipt_window_days,
         census_residue_status_admitted,
+        census_status_admitted,
     } = current_terminal_receipt_policy(client, &relay_token)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     status.counts.backfill_window_days = receipt_window_days;
@@ -12057,6 +12191,7 @@ fn report_status_with_fresh_relay_token(
         &destination_namespace,
         status,
         census_residue_status_admitted,
+        census_status_admitted,
     )?;
     let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
     // Commit the exact typed receipt before it can reach the backend. A later
@@ -12192,6 +12327,8 @@ fn report_checkin_status(
         last_census_residue_index_key_count: 0,
         last_census_residue_archived_rollout_count: 0,
         last_census_residue_blocked_session_count: 0,
+        last_census_pending_file_count: None,
+        last_census_block_cause: None,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
@@ -13840,7 +13977,7 @@ mod tests {
     fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         let root = cache_effective_wire_fixture_root();
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -13849,7 +13986,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
             let request = SnapshotBatchRequest {
@@ -14121,7 +14261,7 @@ mod tests {
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -14130,7 +14270,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let mut off = scan(&mut index);
         assert_eq!(off.snapshots.len(), 1);
@@ -15353,7 +15496,7 @@ mod tests {
         assert_eq!(scan.snapshots.len(), 1);
         let item = &mut scan.snapshots[0];
         item.context_curve = Some(crate::snapshots::SnapshotContextCurve {
-            contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+            contract_version: crate::snapshots::CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
             parser_revision: "claude_code_jsonl:v28".to_string(),
             ownership_revision: "claude_owned_request_start_proof:v1".to_string(),
             sampling_revision: "context_curve_sampling:v1".to_string(),
@@ -17669,8 +17812,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// [regress] M4 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
     #[test]
-    fn snapshot_upload_progress_retries_same_fingerprint_after_contract_upgrade() {
+    fn version_only_quarantine_witness_change_keeps_retry_after() {
         let root = test_dir("snapshot-upload-progress-quarantine-upgrade");
         let path = root.join("progress-v2.json");
         let namespace = format!("{:064x}", 45);
@@ -17678,19 +17822,41 @@ mod tests {
         let old_witness = test_quarantine_witness();
         let mut progress = SnapshotUploadProgress::new(namespace.clone(), old_witness);
         progress.quarantine([fingerprint.as_str()]);
+        let original = progress.quarantined_fingerprints[&fingerprint].clone();
         progress.save(&path).expect("persist quarantine");
 
-        let mut repaired_witness = test_quarantine_witness();
-        repaired_witness.collector_version.push_str("-repair");
-        let mut repaired = SnapshotUploadProgress::load(&path, &namespace, repaired_witness)
-            .expect("load after repair");
+        let mut upgraded = test_quarantine_witness();
+        upgraded.collector_version.push_str("-upgrade");
+        upgraded.parser_version.push_str("-upgrade");
+        let mut repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone())
+            .expect("load after version-only upgrade");
+        repaired.prepare_quarantine_retries(&BTreeMap::new());
+        assert!(repaired.contains(&fingerprint));
+        assert!(repaired.active_quarantine_retries.is_empty());
+        let retained = &repaired.quarantined_fingerprints[&fingerprint];
+        assert_eq!(
+            retained.retry_after_unix_seconds,
+            original.retry_after_unix_seconds
+        );
+        assert_eq!(retained.upload_body_witness, original.upload_body_witness);
+        assert_eq!(
+            retained.failed_reconstruction_count,
+            original.failed_reconstruction_count
+        );
+        repaired.save(&path).unwrap();
+        repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone()).unwrap();
+        assert!(!repaired.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(
+            repaired.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            original.retry_after_unix_seconds
+        );
+
+        // A real contract correction retains the existing immediate retry.
+        upgraded.contract.push_str("-repair");
+        repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded).unwrap();
         repaired.prepare_quarantine_retries(&BTreeMap::new());
         assert!(!repaired.contains(&fingerprint));
         assert!(repaired.active_quarantine_retries.contains(&fingerprint));
-        assert!(repaired
-            .quarantined_fingerprints
-            .get(&fingerprint)
-            .is_some_and(|record| record.retry_after_unix_seconds > current_unix_seconds()));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17740,13 +17906,14 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
-    /// Regression for the live 0.1.121 strand: the quarantine deadline became
+    /// [regress] M4 q8: four due quarantines had already left census pending.
+    /// Also retains the live 0.1.121 strand: the quarantine deadline became
     /// due after a settled sibling had already advanced the shared backend
     /// head, but an independently backed-off terminal-unhealthy traversal
     /// yielded no upload item. A vacuous completed upload must not let the
     /// disposable ledger erase the index-owned retry obligation.
     #[test]
-    fn due_quarantine_empty_scan_rearms_instead_of_clearing_the_obligation() {
+    fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         let root = test_dir("due-quarantine-terminal-unhealthy-empty-scan");
         let session_path = root.join("session.jsonl");
         std::fs::create_dir_all(&root).expect("create retry fixture root");
@@ -17758,6 +17925,8 @@ mod tests {
             ),
         )
         .expect("write manifest-present source revision");
+        let duplicate_path = root.join("z-copy.jsonl");
+        std::fs::copy(&session_path, &duplicate_path).unwrap();
         let mut index = ScanIndex::default();
         let mut first_scan = crate::snapshots::scan_source_roots(
             SnapshotSource::Pi,
@@ -17773,6 +17942,11 @@ mod tests {
             &mut index,
         );
         let fingerprint = first_scan.snapshots[0].snapshot_fingerprint.clone();
+        assert_eq!(index.file_snapshot_fingerprints.len(), 2);
+        assert!(index
+            .file_snapshot_fingerprints
+            .values()
+            .all(|fingerprints| { fingerprints == &BTreeSet::from([fingerprint.clone()]) }));
         let mut quarantine = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Pi);
         quarantine.retry_after_unix_seconds = 0;
         quarantine.upload_body_witness = Some(fingerprint.clone());
@@ -17798,15 +17972,27 @@ mod tests {
             snapshot_quarantine_witness(SnapshotSource::Pi),
         );
         progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-        let scan = crate::snapshots::scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            collected_at,
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-        )
-        .expect("independently backed-off terminal traversal returns a scan receipt");
+        let failures = progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count;
+        let (scan, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                collected_at,
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+            )
+            .expect("independently backed-off terminal traversal returns a scan receipt")
+        });
+        assert!(
+            reads.is_empty(),
+            "source hold must not acquire the transcript"
+        );
         assert!(scan.snapshots.is_empty());
+        assert!(progress.defer_held_quarantine_retries(
+            &scan.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
         assert!(!scan.census_complete);
         let mut accepted = 0;
         let mut upload_calls = 0;
@@ -17831,16 +18017,255 @@ mod tests {
             .quarantined_snapshot_fingerprints
             .get(&fingerprint)
             .expect("an empty scan must leave the retry armed");
-        assert!(
-            retained.retry_after_unix_seconds > current_unix_seconds(),
-            "the fired deadline must be replaced by a future deadline"
-        );
+        assert!(retained.retry_after_unix_seconds > current_unix_seconds());
+        assert!(snapshot_quarantine_deadline_is_bounded(retained));
+        assert_eq!(retained.failed_reconstruction_count, failures);
         assert!(
             index
                 .legacy_settlement_reconciliation_pending_fingerprints()
                 .is_empty(),
             "the current-schema manifest revision stays armed rather than becoming unproven"
         );
+        // Resume the retained traversal with this file already observed and
+        // absent from its candidate queue, just like the four M4 quarantines.
+        let mut state = serde_json::to_value(&index).unwrap();
+        state["traversal"]["scan_roots"] = serde_json::json!([root]);
+        state["traversal"]["observed_index_keys"] =
+            serde_json::json!([session_path, duplicate_path]);
+        assert_eq!(
+            state["traversal"]["pending_candidates"],
+            serde_json::json!([])
+        );
+        index = serde_json::from_value(state).unwrap();
+        let index_path = root.join("index.json");
+        let progress_path = root.join("progress.json");
+        index.save(&index_path).unwrap();
+        progress.save(&progress_path).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        )
+        .unwrap();
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let hints =
+            save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+        assert_eq!(hints, vec![session_path.clone()]);
+        let (pending, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    collected_at,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    0,
+                    true,
+                    &hints,
+                )
+                .unwrap()
+            });
+        assert!(reads.is_empty());
+        assert!(pending.snapshots.is_empty());
+        assert!(index.quarantine_retry_is_queued(&fingerprint));
+        assert!(!progress.defer_held_quarantine_retries(
+            &pending.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            0
+        );
+        // Round 4 P2b (theoretical): a retained unreadable first incidence
+        // releases ownership to the next copy through the same pending queue.
+        #[cfg(unix)]
+        let hints = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let (held, reads) =
+                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                    crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                        SnapshotSource::Pi,
+                        std::slice::from_ref(&root),
+                        &mut index,
+                        collected_at,
+                        crate::snapshots::BACKFILL_WINDOW_DAYS,
+                        1,
+                        true,
+                        &hints,
+                    )
+                    .unwrap()
+                });
+            assert!(held.snapshots.is_empty());
+            assert!(reads.is_empty());
+            assert!(held.unreadable_path_count > 0);
+            assert!(index.quarantine_retry_is_queued(&fingerprint));
+            assert!(!progress.defer_held_quarantine_retries(
+                &held.snapshots,
+                &index,
+                SnapshotSource::Pi
+            ));
+            assert_eq!(
+                progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+                0
+            );
+            assert_eq!(
+                progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
+                failures
+            );
+            index.save(&index_path).unwrap();
+            progress.save(&progress_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &progress.destination_namespace_hash,
+                snapshot_quarantine_witness(SnapshotSource::Pi),
+            )
+            .unwrap();
+            assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+            let hints =
+                save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+            assert_eq!(hints, vec![duplicate_path.clone()]);
+            hints
+        };
+        let (mut retry, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    collected_at,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    1,
+                    true,
+                    &hints,
+                )
+                .unwrap()
+            });
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut retry, &mut index);
+        assert_eq!(reads.values().sum::<usize>(), 1);
+        #[cfg(unix)]
+        assert_eq!(reads.get(&duplicate_path), Some(&1));
+        assert_eq!(retry.snapshots.len(), 1);
+        assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
+        assert!(!progress.defer_held_quarantine_retries(
+            &retry.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
+        // The existing DNS incident class fails before a batch can be sent.
+        let unsent = upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::for_test(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    "transport_dns",
+                    true,
+                    false,
+                )))
+            },
+            |state| state.save(&progress_path),
+        );
+        assert!(unsent.is_err());
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            0
+        );
+        // Round 4 P2a (theoretical): a count-only HTTP reply remains a real
+        // send even though it cannot settle legacy reconciliation.
+        let replied = upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| {
+                let response = accepted_batch(1);
+                let pending = BTreeSet::from([fingerprint.clone()]);
+                require_normal_write_ack_for_legacy_reconciliation(&response, &pending, &pending)?;
+                Ok(response)
+            },
+            |state| state.save(&progress_path),
+        );
+        assert!(replied
+            .unwrap_err()
+            .downcast_ref::<SnapshotAckRejected>()
+            .is_some());
+        let paced = &progress.quarantined_fingerprints[&fingerprint];
+        assert!(paced.retry_after_unix_seconds > current_unix_seconds());
+        assert!(snapshot_quarantine_deadline_is_bounded(paced));
+        assert_eq!(paced.failed_reconstruction_count, failures);
+        assert_eq!(accepted, 0);
+        assert!(!progress.accepted_fingerprints.contains(&fingerprint));
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        )
+        .unwrap();
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        // The next ordinary deadline becomes due; the retained body sends once.
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |batch| {
+                upload_calls += 1;
+                assert_eq!(batch.len(), 1);
+                Ok(accepted_batch(1))
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let hints =
+            save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+        assert!(hints.is_empty());
+        let (quiet, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                collected_at,
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                &hints,
+            )
+            .unwrap()
+        });
+        assert!(reads.is_empty());
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!((upload_calls, accepted), (1, 1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -18117,15 +18542,9 @@ mod tests {
         progress =
             SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
         assert!(
-            !progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
-            "restart honors the durable lease deadline"
+            progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
+            "restart keeps the unsent admission re-offer due"
         );
-        progress
-            .quarantined_fingerprints
-            .get_mut(&fingerprint)
-            .unwrap()
-            .retry_after_unix_seconds = 0;
-        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         let mut accepted = 0;
         let mut sent = Vec::new();
         upload_resumable_batches(
@@ -19666,6 +20085,7 @@ mod tests {
                 },
             },
             false,
+            false,
         )
         .expect("terminal error receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -19692,6 +20112,243 @@ mod tests {
             http_request_json(&requests[0])["report_kind"],
             "scan_status"
         );
+    }
+
+    /// [off=main] Absent/null/unknown admission preserves the complete legacy
+    /// payload for all three sources, including failures=1 and no retry deadline.
+    #[test]
+    #[serial(source_manifests)]
+    fn census_status_without_exact_token_preserves_legacy_bytes() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let legacy = r#"{
+  "schema_version": 5,
+  "source": "codex",
+  "machine_id": "otm_test",
+  "report_kind": "scan_status",
+  "enabled": true,
+  "disabled_reason": null,
+  "last_scan_started_at": "2026-06-01T10:00:00Z",
+  "last_scan_finished_at": "2026-06-01T10:00:01Z",
+  "last_success_at": null,
+  "last_error_code": "parse_error",
+  "last_error_message": "local usage evidence produced no session snapshot",
+  "last_uploaded_count": 0,
+  "last_scanned_session_count": 0,
+  "last_scanned_file_count": 0,
+  "last_zero_snapshot_confirmed_count": 0,
+  "last_zero_snapshot_usage_evidence_count": 0,
+  "last_dropped_usage_record_count": 0,
+  "last_ownership_incomplete_file_count": 0,
+  "last_snapshot_unproven_terminal_count": 0,
+  "last_snapshot_superseded_terminal_count": 0,
+  "last_backfill_window_days": 183,
+  "last_backfill_file_limit": 10000,
+  "last_discovered_file_count": 0,
+  "last_skipped_file_count_due_to_limit": 7,
+  "last_scan_cap_hit": true,
+  "last_semantic_noop_count": 0,
+  "last_census_complete": false,
+  "last_symlink_rejected_count": 0,
+  "last_unreadable_path_count": 2,
+  "last_oversized_file_count": 0,
+  "last_disappeared_file_count": 3,
+  "last_malformed_json_line_count": 0,
+  "last_invalid_utf8_line_count": 0,
+  "last_over_line_cap_count": 0,
+  "last_recognized_usage_drop_count": 0,
+  "last_terminal_ownership_incomplete_file_count": 0,
+  "last_terminal_zero_snapshot_usage_evidence_count": 0,
+  "last_terminal_recognized_usage_drop_count": 0,
+  "last_terminal_dropped_usage_record_count": 0,
+  "last_terminal_over_line_cap_count": 0,
+  "last_census_residue_settled": false,
+  "last_census_residue_index_key_count": 0,
+  "last_census_residue_archived_rollout_count": 0,
+  "last_census_residue_blocked_session_count": 0,
+  "consecutive_failures": 1,
+  "next_retry_at": null,
+  "collector_version": "fixed",
+  "parser_version": "fixed"
+}"#;
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            for hint in [
+                "",
+                r#","census_status_contract":null"#,
+                r#","census_status_contract":"census_status:v2""#,
+                RESIDUE_ADMITTING_HINT,
+            ] {
+                let mut counts = SyncCounts::for_policy(183);
+                counts.skipped_file_count_due_to_limit = 7;
+                counts.scan_cap_hit = true;
+                counts.unreadable_path_count = 2;
+                counts.disappeared_file_count = 3;
+                counts.census_status = crate::snapshots::CensusStatus {
+                    pending_work: true,
+                    retryable_problem: true,
+                    transport_reservation_refused: true,
+                    carry_admission_veto: true,
+                    state_loader_failed: true,
+                    reconciliation_incomplete: true,
+                    retry_attempt: 4,
+                    retry_not_before_unix_seconds: Some(60),
+                    admission_due_unix_seconds: Some(30),
+                };
+                let mut typed = collector_status_request(
+                    "destination",
+                    CollectorStatus {
+                        source,
+                        machine_id: "otm_test",
+                        scan_started_at: "2026-06-01T10:00:00Z",
+                        counts,
+                        state: CollectorState::Success,
+                    },
+                    false,
+                    false,
+                )
+                .unwrap();
+                typed.last_scan_finished_at = Some("2026-06-01T10:00:01Z".to_string());
+                typed.collector_version = Some("fixed".to_string());
+                typed.parser_version = Some("fixed".to_string());
+                assert_eq!(
+                    serde_json::to_vec_pretty(&typed).unwrap(),
+                    legacy
+                        .replace("\"codex\"", &format!("\"{}\"", source.api_slug()))
+                        .as_bytes()
+                );
+                let mut receipt = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    counts,
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    183,
+                    hint,
+                );
+                // Normalize only clocks and build identity, not census evidence.
+                receipt["last_scan_finished_at"] = serde_json::json!("2026-06-01T10:00:01Z");
+                receipt["collector_version"] = serde_json::json!("fixed");
+                receipt["parser_version"] = serde_json::json!("fixed");
+                let mut expected: serde_json::Value = serde_json::from_str(legacy).unwrap();
+                expected["source"] = serde_json::json!(source.api_slug());
+                assert_eq!(
+                    serde_json::to_vec(&receipt).unwrap(),
+                    serde_json::to_vec(&expected).unwrap(),
+                    "{source:?} {hint}"
+                );
+            }
+        }
+    }
+
+    /// [behaviour] The real hint boundary and shared builder emit all seven
+    /// causes plus advancing work, with fixed priority and truthful retries.
+    #[test]
+    #[serial(source_manifests)]
+    fn census_status_contract_reports_first_gate_and_real_retry() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            // One row per cause; each earlier row also fails later gates.
+            for (
+                cause,
+                (
+                    unreadable,
+                    disappeared,
+                    carry,
+                    state,
+                    transport,
+                    reconciliation,
+                    ownership,
+                    pending,
+                    retryable,
+                ),
+            ) in [
+                (
+                    Some("unreadable_events"),
+                    (2, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("disappeared_files"),
+                    (0, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("carry_admission"),
+                    (0, 0, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("state_loader"),
+                    (0, 0, false, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("transport_reservation"),
+                    (0, 0, false, false, true, true, 1, true, true),
+                ),
+                (
+                    Some("ownership_incomplete"),
+                    (0, 0, false, false, false, true, 1, true, true),
+                ),
+                (
+                    Some("other"),
+                    (0, 0, false, false, false, true, 0, true, true),
+                ),
+                (None, (0, 0, false, false, false, false, 1, true, false)),
+            ] {
+                let mut counts = SyncCounts::for_policy(183);
+                counts.skipped_file_count_due_to_limit = 7;
+                counts.scan_cap_hit = true;
+                counts.unreadable_path_count = unreadable;
+                counts.disappeared_file_count = disappeared;
+                counts.ownership_incomplete_file_count = ownership;
+                counts.census_status = crate::snapshots::CensusStatus {
+                    pending_work: pending,
+                    retryable_problem: retryable,
+                    transport_reservation_refused: transport,
+                    carry_admission_veto: carry,
+                    state_loader_failed: state,
+                    reconciliation_incomplete: reconciliation,
+                    retry_attempt: 4,
+                    retry_not_before_unix_seconds: Some(60),
+                    admission_due_unix_seconds: Some(30),
+                };
+                let receipt = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    counts,
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    183,
+                    r#","census_status_contract":"census_status:v1""#,
+                );
+                assert_eq!(
+                    receipt["last_error_code"],
+                    if cause.is_some() {
+                        "census_blocked"
+                    } else {
+                        "census_incomplete"
+                    }
+                );
+                assert_eq!(
+                    receipt.get("last_census_block_cause"),
+                    cause.map(|value| serde_json::json!(value)).as_ref()
+                );
+                assert_eq!(receipt["last_census_pending_file_count"], 7);
+                assert_eq!(receipt["consecutive_failures"], 4);
+                assert_eq!(
+                    receipt["next_retry_at"],
+                    if cause == Some("carry_admission") {
+                        "1970-01-01T00:00:30Z"
+                    } else {
+                        "1970-01-01T00:01:00Z"
+                    }
+                );
+                assert_eq!(receipt["last_success_at"], serde_json::Value::Null);
+                assert_eq!(receipt["last_census_complete"], false);
+            }
+        }
     }
 
     /// The M1 codex witness once its residue settles (ottto#399): a COMPLETED
@@ -21047,6 +21704,7 @@ mod tests {
                 },
             },
             false,
+            false,
         )
         .expect("terminal receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -21337,23 +21995,18 @@ mod tests {
     }
 
     #[test]
-    fn backfill_and_curve_replay_keep_report_width_at_current_hint() {
+    fn backfill_replay_keeps_report_width_at_current_hint() {
         let receipt_window_days = validated_receipt_window_days(183).expect("valid hint");
         assert_eq!(
-            scan_request_window_days(receipt_window_days, false, false),
+            scan_request_window_days(receipt_window_days, false),
             receipt_window_days,
             "after replay the scan returns to the current policy width"
         );
 
-        for (replay_name, backfill_pending, curve_replay_pending) in
-            [("backfill", true, false), ("curve", false, true)]
         {
+            let (replay_name, backfill_pending) = ("backfill", true);
             assert_eq!(
-                scan_request_window_days(
-                    receipt_window_days,
-                    backfill_pending,
-                    curve_replay_pending,
-                ),
+                scan_request_window_days(receipt_window_days, backfill_pending),
                 u64::MAX,
                 "{replay_name} replay requests the scanner's broad local range"
             );
@@ -21374,11 +22027,7 @@ mod tests {
                     std::slice::from_ref(&root),
                     &mut index,
                     "2026-08-30T12:00:00Z",
-                    scan_request_window_days(
-                        receipt_window_days,
-                        backfill_pending,
-                        curve_replay_pending,
-                    ),
+                    scan_request_window_days(receipt_window_days, backfill_pending),
                 )
                 .expect("broad replay scan");
                 assert_eq!(
@@ -21441,7 +22090,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut policy_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, false, false),
+            scan_request_window_days(183, false),
         )
         .expect("policy-width scan");
         assert_eq!(policy_scan.discovered_file_count, 0);
@@ -21453,7 +22102,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut replay_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, true, false),
+            scan_request_window_days(183, true),
         )
         .expect("wide replay scan");
         assert_eq!(replay_scan.backfill_window_days, 730);
@@ -21534,7 +22183,6 @@ mod tests {
         assert_eq!(status["manifest"]["window_start"], manifest.window_start);
         assert_eq!(status["manifest"]["window_end"], manifest.window_end);
         assert_eq!(status["manifest"]["rolling_hash"], manifest.rolling_hash);
-        assert_eq!(scan_request_window_days(183, false, true), u64::MAX);
     }
 
     #[test]
@@ -22662,13 +23310,15 @@ mod tests {
             .snapshots
             .iter()
             .map(|item| {
+                let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
+                // As the backend's entity ACK does, the digest travels only with
+                // a witness version.
                 Ok(serde_json::json!({
                     "source_session_id": item.source_session_id,
                     "snapshot_fingerprint": item.snapshot_fingerprint,
                     "occurrence_count": 1,
-                    "body_witness_version":
-                        crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
-                    "body_witness_digest": snapshot_upload_body_witness(item),
+                    "body_witness_version": version,
+                    "body_witness_digest": version.map(|_| snapshot_upload_body_witness(item)),
                     "head_etag": headed.then_some(head),
                 }))
             })
@@ -23969,7 +24619,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 

@@ -522,7 +522,7 @@ fn recovery_emission_boundaries(
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
-    e2::decide_page_copies(&mut items, index);
+    e2::decide_page_copies(&mut items, index, None);
     e2::attach_page(&mut items, evidence);
     let unresolved = e2::side_calls_page(
         &mut items,
@@ -533,7 +533,13 @@ fn recovery_emission_boundaries(
         &Default::default(),
         index,
     );
-    let held = e2::finish_page(&mut items, index, e2::TelemetryRead::Loaded);
+    let held = e2::finish_page(
+        &mut items,
+        index,
+        e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
     if index.persistence_available() {
         assert_eq!(items.len(), 1, "positive E2 body before finalization");
         assert!(matches!(
