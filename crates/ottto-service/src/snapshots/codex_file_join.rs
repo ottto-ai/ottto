@@ -412,6 +412,13 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
+    /// Keep only the headers `keep` names, in path order, and release the
+    /// rest; completeness, roots and the directory census are unchanged.
+    pub(super) fn retain_headers(&mut self, keep: impl Fn(&HeaderWitness) -> bool) {
+        self.headers.retain(keep);
+        self.headers.shrink_to_fit();
+        self.pending.shrink_to_fit();
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).

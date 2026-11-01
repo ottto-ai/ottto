@@ -762,6 +762,7 @@ thread_local! {
     pub(in crate::snapshots) static EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(in crate::snapshots) static GROUP_EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_EOF_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NARROW_MISSES_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 // Build certified fixture evidence through the same constructor and header
 // steps as an ordinary scan, without retaining evidence from a completed scan.
@@ -790,6 +791,17 @@ pub(in crate::snapshots) fn constrain_eof_park(job: &mut OwnedActiveFile) {
         let charge = paused_charge(job).expect("bounded EOF job");
         job.parser.restore_live_reduction_inputs(inputs);
         TEST_STATE_BUDGET.with(|limit| limit.set(Some(charge - 1)));
+    }
+}
+/// While `NARROW_MISSES_ROW` is set, the narrowed view disagrees with its
+/// page's full view (a conflict row the full view lacks).
+pub(in crate::snapshots) fn constrain_narrowed(codex: &mut CodexTitleMetadata, path: &Path) {
+    if NARROW_MISSES_ROW.with(std::cell::Cell::get) {
+        codex.identity_conflicts.extend(
+            codex_session_id_candidates_from_path(path)
+                .iter()
+                .map(|id| resolve_codex_identity(id)),
+        );
     }
 }
 fn carry(root: &Path, scan: &mut SourceScanResult) {
@@ -11392,6 +11404,176 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
             }
         }
         panic!("{}", counters(&cache));
+    });
+}
+
+/// The continuation mints of one page, as their `continuation_mint` counts.
+fn mint_counts(rows: &[Value]) -> Vec<Value> {
+    rows.iter()
+        .filter(|row| row["stage"] == "codex_continuation_mint")
+        .map(|row| row["counts"].clone())
+        .collect()
+}
+
+/// [regress] A paused job's ticket carried its page's whole join evidence,
+/// whose lineage rows alone exceed the ticket's bounded walk, so every mint
+/// on a realistic Codex home was `over_bound` and no continuation page ran.
+/// The job's own share now fits; the continuation pages resume and read the
+/// job contiguously, and it publishes the unpaged read's output.
+#[test]
+fn a_realistic_home_mints_the_jobs_share_and_continuation_reads_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let state =
+        rusqlite::Connection::open(fixture.root.parent().unwrap().join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "CREATE TABLE threads (\
+                id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                rollout_path TEXT\
+            );\
+            CREATE TABLE thread_spawn_edges (\
+                parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO threads VALUES (?1, 'Thread', 1, 'user', 'Summarize', ?2, ?3)",
+            rusqlite::params![
+                SESSION,
+                1_791_367_200_000_i64,
+                fixture.file(SESSION).to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    for n in 0..2_500 {
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("019fb000-0000-7000-8000-{n:012}"),
+                    format!("019fc000-0000-7000-8000-{n:012}")
+                ],
+            )
+            .unwrap();
+    }
+    drop(state);
+    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+        std::slice::from_ref(&fixture.root),
+        &BTreeSet::from([fixture.file(SESSION).to_string_lossy().into_owned()]),
+    );
+    assert!(
+        crate::heap_layout_bound::bound(&whole, 8 << 20).is_none(),
+        "the page's whole evidence exceeds the ticket's walk"
+    );
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert!(mint_counts(&rows).is_empty(), "no refusal at the mint");
+        let share = CARRIED.with(|v| {
+            v.borrow()
+                .get(&fixture.root)
+                .map(|evidence| crate::heap_layout_bound::bound(evidence, 8 << 20))
+        });
+        assert!(
+            matches!(share, Some(Some(_))),
+            "the job's share fits the ticket's walk"
+        );
+        let paused_at = NATIVE_RANGES.with(|v| v.borrow().as_ref().unwrap().last().unwrap().end);
+        let mut published = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                Some(secs(600)),
+                |_| {},
+            );
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert!(scan.snapshots.is_empty());
+            if parked_eof(&cache) {
+                let (_, ordinary) = page(&fixture, index, Some(Arc::clone(&cache)));
+                published = Some(ordinary);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert!(end > paused_at, "the continuation pages advanced the job");
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert!(!published.snapshots.is_empty());
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
+    });
+}
+
+/// [behaviour] A narrowed view that cannot reproduce its page's reduction
+/// fingerprint mints nothing (`not_mintable`, no evidence carried), and the
+/// next ordinary pages resume the same job where it paused, reading no byte
+/// twice, to the unpaged read's output.
+#[test]
+fn an_unproven_share_mints_nothing_and_ordinary_pages_resume_the_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NARROW_MISSES_ROW.with(|v| v.set(false));
+        }
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    let _reset = Reset;
+    NARROW_MISSES_ROW.with(|v| v.set(true));
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert_eq!(
+            mint_counts(&rows),
+            vec![json!({"continuation_mint": {"not_mintable": 1}})]
+        );
+        assert!(carried(&fixture.root).is_none(), "no continuation inputs");
+        let mut published = None;
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if !scan.snapshots.is_empty() {
+                published = Some(scan);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
     });
 }
 
