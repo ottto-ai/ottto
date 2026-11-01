@@ -2795,6 +2795,13 @@ impl SnapshotUploadProgress {
     fn save(&mut self, path: &Path) -> Result<()> {
         self.save_with_read_limit(path, None)
     }
+    /// The concurrent-writer stamp of every progress write: `on_disk` is this
+    /// owner's last save and nobody has saved since.
+    fn same_writer(&self, on_disk: &Self) -> bool {
+        on_disk.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && on_disk.generation == self.generation
+            && on_disk.destination_namespace_hash == self.destination_namespace_hash
+    }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
@@ -2814,10 +2821,7 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
             }
             .context("parse current snapshot upload progress for compare-and-swap")?;
-            if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-                || current.generation != self.generation
-                || current.destination_namespace_hash != self.destination_namespace_hash
-            {
+            if !self.same_writer(&current) {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));
             }
             crate::snapshots::terminal_contract_retry::merge_maps(
@@ -3167,10 +3171,7 @@ impl SnapshotUploadProgress {
             }
             Err(error) => return Err(error).context("read snapshot upload progress before clear"),
         };
-        if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            || current.generation != self.generation
-            || current.destination_namespace_hash != self.destination_namespace_hash
-        {
+        if !self.same_writer(&current) {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
         let tombstone = unique_progress_sibling(path, "cleared");
@@ -3629,12 +3630,9 @@ fn checkpoint_partial_snapshot_index_with_refusals(
         }
         Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
-    // The same concurrent-writer stamp as `save()`. Settlement below reads
-    // only this durable ledger, never in-memory-only progress state.
-    if durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-        || durable.generation != progress.generation
-        || durable.destination_namespace_hash != progress.destination_namespace_hash
-    {
+    // Refuse only a real concurrent writer, as `save()` does. The accepted
+    // and quarantined sets and the upload-context stamp read `durable`.
+    if !progress.same_writer(&durable) {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
         ));
