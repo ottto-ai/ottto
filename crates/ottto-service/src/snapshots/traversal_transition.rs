@@ -6,7 +6,7 @@ use super::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +86,11 @@ pub(super) struct Starting {
     /// Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) contract_unproven_families: usize,
+    /// Evidence owed ON: request occurrences of pending kept from earlier
+    /// windows at this start. They use the shared pending occurrence cap a new
+    /// window's families and owed cap-room reads also need. Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_pending_occurrences: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -161,8 +166,17 @@ impl Starting {
             contract_unproven_families: index
                 .claude_usage_family_pending
                 .values()
-                .filter(|pending| pending.contract_unproven)
+                .filter(|pending| super::evidence_owed::enabled() && pending.contract_unproven)
                 .count(),
+            stale_pending_occurrences: index
+                .claude_usage_family_pending
+                .values()
+                .filter(|pending| {
+                    super::evidence_owed::enabled() && pending.census_window_end != now
+                })
+                .flat_map(|pending| pending.member_occurrences.values())
+                .map(BTreeMap::len)
+                .fold(0, usize::saturating_add),
         }
     }
 
