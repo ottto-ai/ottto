@@ -803,7 +803,7 @@ impl Sqlite {
     pub(super) fn validate_references(&self) -> Result<()> {
         references::verify_counts(
             self.conn()?,
-            self.references.context("reference_extractor_missing")?,
+            self.references,
         )
     }
     #[cfg(test)]
