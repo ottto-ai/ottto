@@ -108,10 +108,6 @@ pub(in crate::snapshots) fn fixture_birth() -> Option<u64> {
 thread_local! {
     static STAGES: RefCell<BTreeMap<&'static str, Duration>> = const { RefCell::new(BTreeMap::new()) };
 }
-#[cfg(test)]
-pub(crate) fn take_stages() -> BTreeMap<&'static str, Duration> {
-    STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
-}
 #[inline(always)]
 pub(in crate::snapshots) fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
     #[cfg(test)]
