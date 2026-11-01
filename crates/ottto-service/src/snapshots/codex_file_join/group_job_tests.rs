@@ -1500,7 +1500,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
-        restored_behind_accepted: None,
+        restored_behind_accepted: false,
         no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),

@@ -1715,21 +1715,15 @@ identity and deduplication. Missing or invalid cutoff evidence never proves a
 copy; ordinary timestamp validation still applies. A fork's durable Pi section
 stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
 ledger. The L cutoff never enters logs, diagnostics or uploads.
-The `parentSession` value stays in RAM for the read and never enters records,
-logs, diagnostics or uploads.
+The `parentSession` value is checked at the header and never retained in the
+ledger or included in records, logs, diagnostics or uploads.
 
 The fixed cache lifecycle counters `pi_fork_copies_skipped_entries` and
 `pi_fork_copies_skipped_tokens` count physical usage-bearing entries excluded
 and their tokens. A copied message/message_end pair contributes two skipped
 entries, even though normal pairing would count one request. Counts accumulate
 per process and in the existing per-page observer; repeated Full reads count
-again. `pi_fork_parent_unseen` counts skipped entries whose parent path is absent
-from the Pi index at the end of a Full read. Tail restores retain the cutoff
-without the parent path, so this unseen-parent count is unavailable for Tail
-skips, rather than evidence that their parent is known.
-`pi_fork_cutoff_unknown` counts Full reads of a fork whose header names a parent
-but has a missing or invalid time; every copied entry in such a fork counts as
-the fork's own usage.
+again.
 
 Historical parent spend is excluded even if its file was never uploaded. Copies
 from a machine whose clock ran ahead can have timestamps at or after the fork
@@ -1758,15 +1752,13 @@ A Pi usage ledger above 65,536 keys refuses persistence through the shared
 `not_persisted{wa.entry_cap}` class; the ledger is never truncated.
 
 `restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
-counts a durable-restored Tail or Unchanged read ending strictly below the
-frozen indexed accepted extent when it offers a complete body after policy and
-semantic no-op suppression, or commits a smaller index extent. Both cases
-require a complete parse. Pi has no
-accepted-body floor. A semantic no-op still counts if index size moves down.
-A Full or RAM-retained read does not count. Upload retries count again. The
-same signal uses source `codex` for surviving restored Tail offers and source
-`claude_code` with outcome `held` for accepted-floor holds. It contains only
-counts, source and outcome, with no file names, response ids or content.
+counts a durable-restored Tail read ending strictly below the frozen indexed
+accepted extent when it offers a complete body after policy and semantic no-op
+suppression. Pi has no accepted-body floor. Full, Unchanged and RAM-retained
+reads do not count. Upload retries count again. The same signal uses source
+`codex` for surviving restored Tail offers and source `claude_code` with outcome
+`held` for accepted-floor holds. It contains only counts, source and outcome,
+with no file names, response ids or content.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
@@ -1943,9 +1935,8 @@ change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
-Codex reports `restored_behind_accepted.published` when a complete restored
-Tail body below the frozen accepted extent reaches publication. Pi also covers
-restored Unchanged offers and committed extent regressions as described above.
+Codex and Pi report `restored_behind_accepted.published` when a complete restored
+Tail body below the frozen accepted extent reaches publication.
 
 `rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
 **proxies**, emitted once per source pass as cumulative process totals on the

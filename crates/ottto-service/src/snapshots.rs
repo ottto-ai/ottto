@@ -8317,7 +8317,7 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    restored_behind_accepted: Option<u64>,
+    restored_behind_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8837,26 +8837,18 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
     // Settle the frozen restore observation after policy and no-op suppression.
-    // A source with no accepted floor also counts a smaller committed selection
-    // even without a surviving offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
-        let Some(accepted_extent) = pending.restored_behind_accepted else {
+        if !pending.restored_behind_accepted {
             continue;
-        };
+        }
         let offered = result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
         });
-        let regressed = durable_sources::below_accepted(source)
-            == durable_sources::BelowAccepted::NoFloor
-            && index
-                .files
-                .get(&pending.index_key)
-                .is_some_and(|entry| entry.size_bytes < accepted_extent);
         sampled_scan::durable_tail::record_restored_publication(
             source,
-            pending.parse_complete && (offered || regressed),
+            pending.parse_complete && offered,
         );
     }
 
@@ -30144,12 +30136,6 @@ impl OwnedSourceScan {
                     std::mem::take(&mut group.recovered)
                 });
                 let mut parser = parser;
-                // RAM-only membership of a fork's parent; counts only. A
-                // file whose header names no parent has no fork state.
-                parser
-                    .accumulator
-                    .seen_pi_usage_keys
-                    .finish_fork_read(|parent| index.files.contains_key(parent));
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
@@ -31683,7 +31669,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: false,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -31748,7 +31734,7 @@ impl OwnedSourceScan {
                 pending_finalization.push(PendingIndexFinalization {
                     restored_behind_accepted: file_sampling
                         .as_ref()
-                        .and_then(|active| active.restored_behind_accepted),
+                        .is_some_and(|active| active.restored_behind_accepted),
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),
@@ -34274,7 +34260,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: false,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -35121,7 +35107,7 @@ impl OwnedSourceScan {
                                 index.files.get(&key).map(|e| e.size_bytes),
                             );
                         #[cfg(not(unix))]
-                        let restored_behind_accepted = None;
+                        let restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             restored_behind_accepted,
@@ -35194,7 +35180,7 @@ impl OwnedSourceScan {
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: false,
                             key,
                             scope,
                             mode,
@@ -42199,9 +42185,7 @@ fn pi_timestamp_nanos(value: &str) -> Option<i128> {
 }
 
 fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
-    OffsetDateTime::parse(value, &Rfc3339)
-        .ok()
-        .map(|timestamp| timestamp.unix_timestamp_nanos().to_string())
+    pi_timestamp_nanos(value).map(|n| n.to_string())
 }
 
 fn timestamp_is_before(candidate: &str, current: &str) -> bool {
@@ -42305,18 +42289,13 @@ pub(crate) struct PiLedger {
 /// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
 /// their ids and timestamps, after a header that names `parentSession` at the
 /// fork time. The fork owns only what happened at or after its header time.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct PiFork {
     /// Persisted (N): the header named a parent.
     has_parent: bool,
     /// Persisted (L): the local-only header time, unix nanos; `None` when the header
     /// time is missing or invalid, which counts every entry.
     header_nanos: Option<i128>,
-    /// RAM only, never encoded, cloned or logged: the header's
-    /// `parentSession`, for the membership check after a Full read.
-    parent_ref: Option<String>,
-    /// RAM only: copies skipped since `parent_ref` was read.
-    copies_this_read: u64,
 }
 
 /// Never prints the local header time or `parentSession`.
@@ -42334,21 +42313,7 @@ impl std::fmt::Debug for PiFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PiFork")
             .field("has_parent", &self.has_parent)
-            .field("parent_ref", &self.parent_ref.is_some())
-            .field("copies_this_read", &self.copies_this_read)
             .finish()
-    }
-}
-
-/// The RAM cache keeps a clone, so the RAM-only fields end with the read.
-impl Clone for PiFork {
-    fn clone(&self) -> Self {
-        Self {
-            has_parent: self.has_parent,
-            header_nanos: self.header_nanos,
-            parent_ref: None,
-            copies_this_read: 0,
-        }
     }
 }
 
@@ -42403,7 +42368,6 @@ impl PiLedger {
                 Box::new(PiFork {
                     has_parent,
                     header_nanos,
-                    ..PiFork::default()
                 })
             }),
         }
@@ -42412,10 +42376,7 @@ impl PiLedger {
     /// The first header that names a parent marks the file a fork. Pi writes
     /// one header, as the first line.
     fn note_header(&mut self, value: &Value) {
-        if self.fork.is_some() {
-            return;
-        }
-        let Some(parent) = string_at(value, &["parentSession"]).filter(|p| !p.is_empty()) else {
+        let Some(_) = string_at(value, &["parentSession"]).filter(|p| !p.is_empty()) else {
             return;
         };
         self.fork = Some(Box::new(PiFork {
@@ -42423,8 +42384,6 @@ impl PiLedger {
             header_nanos: pi_timestamp_value(value.get("timestamp"))
                 .as_deref()
                 .and_then(pi_timestamp_nanos),
-            parent_ref: Some(parent),
-            copies_this_read: 0,
         }));
     }
 
@@ -42442,43 +42401,17 @@ impl PiLedger {
             return false;
         };
         use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
-        fork.copies_this_read = fork.copies_this_read.saturating_add(1);
         add(Event::PiForkCopiesSkippedEntries, 1);
         add(Event::PiForkCopiesSkippedTokens, usage.total_tokens());
         true
-    }
-
-    /// After a read: counts this read's skipped copies as
-    /// `pi_fork_parent_unseen` when the header's parent is not a known Pi
-    /// session, and the read as `pi_fork_cutoff_unknown` when the header has
-    /// no valid time, then drops `parentSession`. A Tail never sees the
-    /// header, so only Full reads count.
-    pub(crate) fn finish_fork_read(&mut self, known: impl FnOnce(&str) -> bool) {
-        use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
-        let Some(fork) = self.fork.as_deref_mut() else {
-            return;
-        };
-        let copies = std::mem::take(&mut fork.copies_this_read);
-        if let Some(parent) = fork.parent_ref.take() {
-            if fork.header_nanos.is_none() {
-                add(Event::PiForkCutoffUnknown, 1);
-            }
-            if copies > 0 && !known(&parent) {
-                add(Event::PiForkParentUnseen, copies);
-            }
-        }
     }
 }
 
 impl crate::durable_tail_codec::DurableEmpty for PiLedger {
     /// Claude and Codex: a fork state is as non-empty as a ledger key, so a
-    /// non-default one refuses the record (counted), never drops silently.
+    /// present one refuses the record (counted), never drops silently.
     fn durable_empty(&self) -> bool {
-        self.usage_keys.is_empty()
-            && self
-                .fork
-                .as_deref()
-                .map_or(true, |fork| *fork == PiFork::default())
+        self.usage_keys.is_empty() && self.fork.is_none()
     }
 }
 
@@ -87022,7 +86955,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
         }
     }
 }
-crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos, parent_ref, copies_this_read);
+crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,

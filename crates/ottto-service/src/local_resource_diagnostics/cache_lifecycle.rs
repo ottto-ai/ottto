@@ -50,13 +50,8 @@ sparse_lifetime_counters! {
     pi_cost_refused_overflow: PiCostRefusedOverflow,
     pi_cost_precision_rounded: PiCostPrecisionRounded,
     // Pi fork copies stamped before the fork header: fixed content-free totals.
-    // Skipped copied usage entries and their tokens, and the skipped entries
-    // whose parent is not a known Pi session (Full reads only). Full reads of
-    // a fork header without a valid cutoff time, whose copies all count.
     pi_fork_copies_skipped_entries: PiForkCopiesSkippedEntries,
     pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
-    pi_fork_parent_unseen: PiForkParentUnseen,
-    pi_fork_cutoff_unknown: PiForkCutoffUnknown,
 }
 
 pub(crate) fn snapshot() -> Counts {

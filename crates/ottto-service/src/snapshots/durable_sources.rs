@@ -30,9 +30,6 @@ pub(crate) enum BelowAccepted {
     Held,
     /// A restored Tail publishes below it.
     Tail,
-    /// There is no accepted floor: a restored Tail or Unchanged read publishes
-    /// below it, and a smaller committed index extent also counts.
-    NoFloor,
 }
 
 pub(crate) struct Properties {
@@ -111,7 +108,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         tag: 3,
-        below_accepted: BelowAccepted::NoFloor,
+        below_accepted: BelowAccepted::Tail,
         write_format: 3,
         representations: &representations(
             "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",

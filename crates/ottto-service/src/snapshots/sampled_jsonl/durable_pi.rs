@@ -68,9 +68,6 @@ pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
 pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
     let mut reduction = CachedJsonlReduction::take(d)?;
     let rederive = Rederive::take(d)?;
-    if reduction.accumulator.source != SnapshotSource::Pi {
-        return Err(Corrupt);
-    }
     reduction.accumulator.seen_pi_usage_keys = take_ledger(d)?;
     d.finish()?;
     Ok(Decoded {
