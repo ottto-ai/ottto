@@ -3259,15 +3259,41 @@ const PREFIX_KEYS: [&str; 5] = [
 /// The original (2 requests), its resume (copies a, b; own c) and the
 /// resume of that (copies a, b, c; own d), each read after the previous
 /// file settled. Returns the settled index.
-/// The page the released daemon accepted before copy-prefix dedupe: the same
-/// files `(path, text, birth)` read with no holder of their copied prefix on
-/// disk, so every copied request counts. The upgrade baseline of a ledger.
-fn released(name: &str, scanner: &E2ScanFixture, files: &[(&str, &str, &str)]) -> Page {
-    let mut c = Corpus::new(&format!("{name}-released"));
-    for (path, text, birth) in files {
-        c.write_at(path, text, birth);
-    }
-    ready(&c, scanner, ScanIndex::default(), 100, false)
+/// A checked released-format value (pre-dedupe bodies, #909 ledgers, held
+/// scan-index state), captured once from the released copy path; see
+/// `snapshots/fixtures/README.md`. `name` is `<fixture>.<value>`.
+fn released(name: &str) -> serde_json::Value {
+    static FIXTURE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let fixture = FIXTURE.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../snapshots/fixtures/claude_released_copy_prefix.json"
+        ))
+        .unwrap()
+    });
+    let value = fixture[name].clone();
+    assert!(!value.is_null(), "released fixture {name}");
+    value
+}
+/// A body's serialized form without its source-file fingerprint: a hash of
+/// the corpus path and clock, the one field another corpus legitimately changes.
+fn without_file_fingerprint(body: &impl Serialize) -> serde_json::Value {
+    let mut body = serde_json::to_value(body).unwrap();
+    body.as_object_mut()
+        .unwrap()
+        .remove("source_file_fingerprint")
+        .expect("bodies carry a source file fingerprint");
+    body
+}
+/// The five token counters of a serialized body.
+fn body_tokens(body: &serde_json::Value) -> [u64; 5] {
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+    ]
+    .map(|field| body[field].as_u64().unwrap())
 }
 fn demo_family(c: &mut Corpus, progress: &mut SnapshotUploadProgress) -> ScanIndex {
     c.root(ROOT, &resumed(ROOT, &[A, B]));
@@ -3606,13 +3632,13 @@ fn e2_pipeline_certified_resume_keeps_its_timestamp_skip() {
     });
 }
 
-/// [money] #964 proof target (Lead B audit 2026-10-31: five accepted,
-/// unchanged main files on M4 hold 857 copied requests / 315.6M tokens).
+/// [money] #964 proof target (audited resumed main files counted their
+/// copied requests twice).
 /// The shape: a resumed main file with an uncertified writer, own turns in
 /// later hours and its holder in an earlier accepted member. Its re-read of
 /// the same bytes removes exactly the copied requests; every token counter is
 /// conserved (kept + removed = the released body), the own turns
-/// keep their money, and an unrelated session's money is unchanged. Scheduling
+/// keep their money, and an unrelated session's body is unchanged. Scheduling
 /// the paced re-read is the `claude_copy_prefix_reread` tests' concern.
 #[test]
 fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
@@ -3624,41 +3650,25 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
         let page = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         let prior = settle(&c, &old, page, &mut e2_progress());
         let late = ("d-late", "2026-08-02T08:10:00Z", RESUME_WRITER);
-        let copy_text = resumed(COPY, &[A, B, C, late]);
-        let other_text = resumed(OTHER, &[("u1", "2026-08-02T07:30:10Z", RESUME_WRITER)]);
-        c.write_at(&file(COPY), &copy_text, "2026-08-02T07:03:00Z");
-        c.write_at(&file(OTHER), &other_text, "2026-08-02T07:30:00Z");
-        let off = released(
-            "e2-pipeline-audit-shape",
-            &E2ScanFixture::default(),
-            &[
-                (&file(COPY), &copy_text, "2026-08-02T07:03:00Z"),
-                (&file(OTHER), &other_text, "2026-08-02T07:30:00Z"),
-            ],
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C, late]),
+            "2026-08-02T07:03:00Z",
         );
-        let accepted = body(&off, COPY).unwrap().clone();
+        c.write_at(
+            &file(OTHER),
+            &resumed(OTHER, &[("u1", "2026-08-02T07:30:10Z", RESUME_WRITER)]),
+            "2026-08-02T07:30:00Z",
+        );
+        let accepted = released("audit.copy");
         assert_eq!(
             (
-                accepted.request_count,
-                accepted.removed_request_count.unwrap_or(0)
+                &accepted["request_count"],
+                &accepted["removed_request_count"]
             ),
-            (4, 0),
+            (&json!(4), &json!(0)),
             "the released body accepted the copied prefix"
         );
-        // The released read is another corpus: compare money, not bytes.
-        let money = |item: &SnapshotItem| {
-            json!([
-                item.request_count,
-                item.removed_request_count,
-                item.input_tokens,
-                item.output_tokens,
-                item.cache_read_tokens,
-                item.cache_creation_5m_tokens,
-                item.cache_creation_1h_tokens,
-                item.cost
-            ])
-        };
-        let unrelated = money(body(&off, OTHER).unwrap());
         let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         let copy = body(&on, COPY).unwrap();
         assert_eq!(
@@ -3667,16 +3677,7 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             "only the copied requests are removed"
         );
         let removed = copy.removed_usage.expect("removed usage is counted");
-        let tokens = |item: &SnapshotItem| {
-            [
-                item.input_tokens,
-                item.output_tokens,
-                item.cache_read_tokens,
-                item.cache_creation_5m_tokens,
-                item.cache_creation_1h_tokens,
-            ]
-        };
-        let kept = tokens(copy);
+        let kept = body_tokens(&serde_json::to_value(copy).unwrap());
         let gone = [
             removed.input_tokens,
             removed.output_tokens,
@@ -3686,7 +3687,7 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
         ];
         assert_eq!(
             std::array::from_fn::<u64, 5, _>(|n| kept[n] + gone[n]),
-            tokens(&accepted),
+            body_tokens(&accepted),
             "kept + removed tokens = the accepted released body, per counter"
         );
         assert_eq!(
@@ -3694,9 +3695,9 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             "the two own turns keep their tokens"
         );
         assert_eq!(
-            money(body(&on, OTHER).unwrap()),
-            unrelated,
-            "unrelated money unchanged"
+            canonical(&without_file_fingerprint(body(&on, OTHER).unwrap())),
+            canonical(&without_file_fingerprint(&released("audit.other"))),
+            "unrelated body unchanged"
         );
     });
 }
@@ -4213,25 +4214,65 @@ fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removal
 }
 
 /// Requests of `item` per organization hash its identity names.
-fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
+/// The released raised-cap hold's saved index over `prior`: the captured
+/// held-page delta, checked field by field. Only its path-independent fields
+/// replay (the unsettled-upload sweep marks and the held family's root digest).
+/// The resumed file's census record and birth-store entry bind its path and
+/// physical identity (device, inode, ctime), so the deduping read re-derives
+/// them from the file.
+fn released_held_index(c: &Corpus, prior: &ScanIndex) -> ScanIndex {
+    let before = released("identity.prior.index");
+    let after = released("identity.held.index");
+    let changed = after
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(field, value)| before.get(field.as_str()) != Some(*value))
+        .map(|(field, _)| field.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        changed,
+        BTreeSet::from([
+            "bounded_sweep_had_unsettled_upload",
+            "bounded_sweep_unsettled_causes",
+            "claude_full_rearm_progress",
+            "claude_money_birth_store",
+            "claude_request_census",
+            "generation",
+        ])
+    );
+    assert!(before
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|field| after.get(field.as_str()).is_some()));
+    let mut index = serde_json::to_value(prior).unwrap();
+    for field in [
+        "bounded_sweep_had_unsettled_upload",
+        "bounded_sweep_unsettled_causes",
+    ] {
+        index[field] = after[field].clone();
+    }
+    index["claude_full_rearm_progress"]["held_family_roots"] =
+        after["claude_full_rearm_progress"]["held_family_roots"].clone();
+    let mut index: ScanIndex = serde_json::from_value(index).unwrap();
+    c.reload(&mut index)
+}
+fn org_shares(item: &impl Serialize) -> BTreeMap<String, u64> {
+    let item = serde_json::to_value(item).unwrap();
+    let org = |row: &serde_json::Value| {
+        let at = usize::try_from(row["evidence_ref"].as_u64()?).ok()?;
+        item["request_evidence"][at]["provider_workspace_hash"]
+            .as_str()
+            .map(str::to_owned)
+    };
     let mut shares = BTreeMap::<String, u64>::new();
-    for row in &item.model_usage {
-        if let Some(parts) = &row.identity_parts {
-            for part in parts {
-                if let Some(org) = part.evidence_ref.and_then(|at| {
-                    item.request_evidence[usize::from(at)]
-                        .provider_workspace_hash
-                        .as_ref()
-                }) {
-                    *shares.entry(org.clone()).or_default() += part.request_count;
-                }
+    for row in item["model_usage"].as_array().into_iter().flatten() {
+        let parts = row["identity_parts"].as_array();
+        for part in parts.map_or(std::slice::from_ref(row), Vec::as_slice) {
+            if let Some(org) = org(part) {
+                *shares.entry(org).or_default() += part["request_count"].as_u64().unwrap();
             }
-        } else if let Some(org) = row.evidence_ref.and_then(|at| {
-            item.request_evidence[usize::from(at)]
-                .provider_workspace_hash
-                .as_ref()
-        }) {
-            *shares.entry(org.clone()).or_default() += row.request_count;
         }
     }
     shares
@@ -4243,7 +4284,7 @@ fn identity_count(counts: &serde_json::Value, key: &str) -> u64 {
     counts["identity_cap"][key].as_u64().unwrap_or(0)
 }
 
-/// [money] SOURCE 2026-10-31 (#944 xPR F5) fixtures 1-5, in #909 and
+/// [money] #944 xPR F5 fixtures 1-5, in #909 and
 /// option (ii) modes. Fixture 4 composes #947: the tombstoned row on an
 /// unhealthy root stays definite (no refusal, marker or second tombstone). The
 /// released body froze an own turn's org a copied prefix marker lent (X).
@@ -4290,32 +4331,33 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
             let [x, b] = [org_x, org_b].map(|org| {
                 ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
             });
-            let off = released(
-                "e2-pipeline-copy-derived-identity",
-                &scanner,
-                &[(&file(COPY), &text, "2026-08-02T07:03:00Z")],
-            );
-            let stored = body(&off, COPY).unwrap();
+            let stored = released("identity.copy");
             assert_eq!(
-                [&x, &b].map(|org| org_shares(stored).get(org).copied()),
+                [&x, &b].map(|org| org_shares(&stored).get(org).copied()),
                 [Some(2), Some(1)]
             );
             assert!(
-                !serde_json::to_string(stored)
-                    .unwrap()
-                    .contains("copy_invalidated"),
+                !stored.to_string().contains("copy_invalidated"),
                 "the released body has no X-B1 flag"
             );
             let mut ledger = AcceptedBuckets::for_test();
             ledger.set_retained_enabled(retained);
-            let ack = |ledger: &mut AcceptedBuckets, item: &SnapshotItem| {
+            fn record(ledger: &mut AcceptedBuckets, retained: bool, item: &impl Serialize) {
                 let value = serde_json::to_value(item).unwrap();
                 ledger.record(&value);
                 if retained {
                     ledger.record_proved(&value, true, &[]);
                 }
+            }
+            let ack = |ledger: &mut AcceptedBuckets, item: &SnapshotItem| {
+                record(ledger, retained, item);
             };
-            ack(&mut ledger, stored);
+            record(&mut ledger, retained, &stored);
+            assert_eq!(
+                serde_json::to_value(&ledger).unwrap(),
+                released(&format!("identity.ledger.retained-{retained}")),
+                "the released body yields the released ledger"
+            );
             // The 07:00 row X lent, the 08:00 row B proves, and money per row.
             let rows = |item: &SnapshotItem| {
                 item.usage_buckets
@@ -4340,19 +4382,20 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
                 body(&page, COPY).unwrap().clone()
             };
             let today = rows(&today_item);
-            let money = |item: &SnapshotItem| {
+            fn money(item: &impl Serialize) -> serde_json::Value {
+                let item = serde_json::to_value(item).unwrap();
                 json!([
-                    item.input_tokens,
-                    item.output_tokens,
-                    item.cache_read_tokens,
-                    item.cache_creation_5m_tokens,
-                    item.cache_creation_1h_tokens,
-                    item.reasoning_output_tokens,
-                    item.unattributed_total_tokens,
-                    item.request_count,
-                    item.cost
+                    item["input_tokens"],
+                    item["output_tokens"],
+                    item["cache_read_tokens"],
+                    item["cache_creation_5m_tokens"],
+                    item["cache_creation_1h_tokens"],
+                    item["reasoning_output_tokens"],
+                    item["unattributed_total_tokens"],
+                    item["request_count"],
+                    item["cost"]
                 ])
-            };
+            }
             assert_eq!(
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
                 [false, true]
@@ -4365,34 +4408,44 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
                     .collect::<Vec<_>>()
             };
             if retained {
-                // Discover the invalidation while held. The existing
-                // cache-byte reservation forces the real raised-cap hold
-                // without padding or changing any usage in this fixture.
+                // Upgrade boundary: the released daemon held this session
+                // (the existing cache-byte reservation forces the real
+                // raised-cap hold) and kept its ledger and accepted money.
                 let cap = 2 * 1024 * 1024;
                 ledger.set_item_cap(cap);
+                assert_eq!(
+                    serde_json::to_value(&ledger).unwrap(),
+                    released("identity.held.ledger-before")
+                );
+                assert_eq!(
+                    released("identity.held.ledger-after"),
+                    released("identity.held.ledger-before"),
+                    "the released hold kept the ledger"
+                );
+                assert_eq!(
+                    money(&released("identity.held.copy")),
+                    money(&stored),
+                    "released held money = the released accepted body"
+                );
+                assert_eq!(
+                    org_shares(&released("identity.held.copy")),
+                    org_shares(&stored)
+                );
                 let reserve = |_: &SnapshotItem| cap;
                 let budget = crate::snapshots::claude_request_identity::WireBudget {
                     max_item_bytes: cap,
                     reservation: Some(&reserve),
                 };
-                let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
-                take_identity_counts();
-                held.enrich_with_budget(&c, Some(&mut ledger), budget);
-                let counts = serde_json::to_value(take_identity_counts()).unwrap();
-                let first = identity_count(&counts, "copy_derived_proof_invalidated");
-                assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
-                    &held.disposition,
-                    COPY
-                ));
-                let held_prior = settle_captured_holds(&c, &prior, held, &mut e2_progress());
+                // The first deduping pass discovers the invalidation while held.
+                let held_prior = released_held_index(&c, &prior);
                 let mut held = c.raw(&scanner, held_prior.clone(), 100, false, &[]);
                 take_identity_counts();
                 held.enrich_with_budget(&c, Some(&mut ledger), budget);
                 let counts = serde_json::to_value(take_identity_counts()).unwrap();
                 assert_eq!(
-                    first + identity_count(&counts, "copy_derived_proof_invalidated"),
+                    identity_count(&counts, "copy_derived_proof_invalidated"),
                     1,
-                    "one tombstone while held"
+                    "one tombstone on the first deduping pass"
                 );
                 assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
                     &held.disposition,
@@ -4627,48 +4680,36 @@ fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
                 &text,
                 "2026-08-02T07:03:00Z",
             );
-            let later_text = text.clone()
-                + &line_by(COPY, "own-late", "2026-08-02T09:10:00Z", 10, RESUME_WRITER);
+            let later =
+                text + &line_by(COPY, "own-late", "2026-08-02T09:10:00Z", 10, RESUME_WRITER);
             c.write_at(
                 &format!("z-twin/{COPY}.jsonl"),
-                &later_text,
+                &later,
                 "2026-08-02T07:03:00Z",
             );
-
-            let off = released(
-                "e2-pipeline-copy-derived-twins",
-                &scanner,
-                &[
-                    (&format!("a-first/{COPY}.jsonl"), &text, "2026-08-02T07:03:00Z"),
-                    (&format!("z-twin/{COPY}.jsonl"), &later_text, "2026-08-02T07:03:00Z"),
-                ],
-            );
-            let stored = body(&off, COPY).unwrap();
-            let tagged = |item: &SnapshotItem| {
-                item.usage_buckets
+            let stored = released("twins.copy");
+            let buckets = stored["usage_buckets"].as_array().unwrap();
+            assert_eq!(buckets.len(), 2, "both twins' hours are summed");
+            assert!(
+                buckets.iter().all(|bucket| bucket["model_usage"]
+                    .as_array()
+                    .unwrap()
                     .iter()
-                    .filter(|bucket| {
-                        bucket
-                            .model_usage
-                            .iter()
-                            .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some())
-                    })
-                    .count() as u64
-            };
-            assert_eq!(
-                stored.usage_buckets.len(),
-                2,
-                "both twins' hours are summed"
+                    .any(|row| !row["evidence_ref"].is_null() || !row["identity_parts"].is_null())),
+                "the released body froze both hours under X"
             );
-            assert_eq!(tagged(stored), 2, "the released body froze both hours under X");
-            assert!(org_shares(stored).contains_key(&x));
+            assert!(org_shares(&stored).contains_key(&x));
             let mut ledger = AcceptedBuckets::for_test();
             ledger.set_retained_enabled(retained);
-            let value = serde_json::to_value(stored).unwrap();
-            ledger.record(&value);
+            ledger.record(&stored);
             if retained {
-                ledger.record_proved(&value, true, &[]);
+                ledger.record_proved(&stored, true, &[]);
             }
+            assert_eq!(
+                serde_json::to_value(&ledger).unwrap(),
+                released(&format!("twins.ledger.retained-{retained}")),
+                "the released body yields the released ledger"
+            );
             let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
@@ -4801,14 +4842,12 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
             });
             let marker = json!({"type":"attachment", "sessionId":COPY, "attachment":{
                 "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
-            let text = marker.to_string() + "\n" + &resumed(COPY, &[A, C]);
-            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
-            let off = released(
-                "e2-pipeline-copy-derived-unread",
-                &scanner,
-                &[(&file(COPY), &text, "2026-08-02T07:03:00Z")],
+            c.write_at(
+                &file(COPY),
+                &(marker.to_string() + "\n" + &resumed(COPY, &[A, C])),
+                "2026-08-02T07:03:00Z",
             );
-            let mut stored = serde_json::to_value(body(&off, COPY).unwrap()).unwrap();
+            let mut stored = released("unread.copy");
             let mut ledger = AcceptedBuckets::for_test();
             ledger.set_retained_enabled(retained);
             ledger.record(&stored);
@@ -4885,22 +4924,27 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
             let mut prior = settle(&c, &old, original, &mut progress);
             let marker = json!({"type":"attachment", "sessionId":COPY, "attachment":{
                 "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
-            let text = marker.to_string() + "\n" + &resumed(COPY, &[A, B, C]);
-            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            c.write_at(
+                &file(COPY),
+                &(marker.to_string() + "\n" + &resumed(COPY, &[A, B, C])),
+                "2026-08-02T07:03:00Z",
+            );
             let mut ledger = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
             if accepted {
-                let off = released(
-                    "e2-pipeline-accepted-prefix-hold",
-                    &scanner,
-                    &[(&file(COPY), &text, "2026-08-02T07:03:00Z")],
-                );
-                let stored = body(&off, COPY).unwrap();
+                let stored = released("accepted-hold.copy");
                 assert_eq!(
-                    stored.request_count, 3,
+                    stored["request_count"], 3,
                     "the released body stored the prefix with the own turn"
                 );
-                ledger.record(&serde_json::to_value(stored).unwrap());
-                assert!(ledger.may_have_accepted(COPY, &stored.usage_buckets[0].bucket_start));
+                ledger.record(&stored);
+                assert_eq!(
+                    serde_json::to_value(&ledger).unwrap(),
+                    released("accepted-hold.ledger")
+                );
+                assert!(ledger.may_have_accepted(
+                    COPY,
+                    stored["usage_buckets"][0]["bucket_start"].as_str().unwrap()
+                ));
             }
             let saved = serde_json::to_vec(&ledger).unwrap();
             let keys = [
