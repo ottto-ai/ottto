@@ -2746,50 +2746,17 @@ fn settled_history_cut_measures_the_tagged_body() {
     assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
 }
 
-/// [money] A window over a size cap once tagged halves at whole days until
-/// each piece keeps its identity: never stripped, placement exact.
+/// [money] A settled window over a size cap once tagged holds the session for
+/// this pass (counted, delayed): the receiver takes whole 7-day windows only,
+/// so it is never halved, and nothing of it is cut or stripped.
 #[test]
-fn settled_history_window_over_a_size_cap_halves() {
-    let (full, proof, now) = hot_session(3, 2);
+fn settled_history_window_over_a_size_cap_holds_the_session() {
+    let (full, proof, now) = hot_session(1, 6);
     let accepted = identity::AcceptedBuckets::for_test();
     let segments = identity::AcceptedBuckets::segments_for_test();
     let mut whole = full.clone();
     let uncut = identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None);
     assert!(matches!(uncut, Ok(Tagged::Fallback { .. })), "whole it strips");
-    let mut live = full.clone();
-    let (tagged, held) =
-        identity::apply_cut_held_for_test(&mut live, &proof, &accepted, &segments, Some(now));
-    assert!(matches!(tagged, Ok(Tagged::Sent { .. })));
-    assert!(held.is_empty());
-    let windows = live
-        .history_cut
-        .iter()
-        .map(|segment| {
-            let window = segment.history_segment.as_ref().unwrap();
-            (window.window_start.as_str(), window.window_end.as_str())
-        })
-        .collect::<Vec<_>>();
-    for halved in [
-        ("2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z"),
-        ("2026-09-04T00:00:00Z", "2026-09-06T00:00:00Z"),
-        ("2026-09-06T00:00:00Z", "2026-09-10T00:00:00Z"),
-    ] {
-        assert!(windows.contains(&halved), "{halved:?} in {windows:?}");
-    }
-    assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
-    for piece in segment_pieces(&live) {
-        sticky_assert_reconciled(piece);
-    }
-}
-
-/// [money] A window still over a size cap at one day holds the session for
-/// this pass (counted, delayed): nothing of it is cut or sent stripped as
-/// segments, and the caller's hold keeps the whole body off the wire.
-#[test]
-fn settled_history_day_over_a_size_cap_holds_the_session() {
-    let (full, proof, now) = hot_session(1, 6);
-    let accepted = identity::AcceptedBuckets::for_test();
-    let segments = identity::AcceptedBuckets::segments_for_test();
     let mut item = full.clone();
     let (tagged, held) =
         identity::apply_cut_held_for_test(&mut item, &proof, &accepted, &segments, Some(now));

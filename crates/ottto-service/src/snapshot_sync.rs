@@ -1303,7 +1303,11 @@ fn prepare_snapshot_cache_for_upload(
     }
     let key = cache_session_key(&snapshot.source_session_id);
     snapshot.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
-    if (head_cas_required || legacy_pending.contains(&snapshot.snapshot_fingerprint))
+    // A cut live body never bootstraps its head alone (its `through` needs
+    // its segments): without a head it travels in the probe's shape.
+    if (head_cas_required
+        || legacy_pending.contains(&snapshot.snapshot_fingerprint)
+        || snapshot.history_segments.is_some())
         && snapshot.cache_base_head_etag.is_none()
     {
         snapshot.cache_observations = None;
@@ -8096,9 +8100,17 @@ fn finish_sync_source(
     let census_absent_upload_acks =
         upload_progress.complete_census_ack_retirements(&index, scan_result.census_complete);
     // Segment entries leave with their session (complete census only).
+    let page_sessions = scan_result
+        .snapshots
+        .iter()
+        .map(|item| {
+            crate::snapshots::history_segments::group_of(item)
+                .unwrap_or(item.source_session_id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
     upload_progress
         .accepted_identity_segments
-        .retire_absent(&census_absent_upload_acks);
+        .retire_absent(&census_absent_upload_acks, &page_sessions);
     // Current scanner incidence grants live slots on a first install, too.
     // No absent ACK or unrelated entity borrows those slots.
     upload_progress.prepare_context_receipt_candidates(
@@ -8124,21 +8136,15 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     upload_progress.freeze_custody_page(&scan_result.snapshots);
-    // A cut live body never bootstraps its cache head alone: its `through`
-    // needs its segments. It travels with its group without the additive
-    // cache patch (the probe's shape); that ACK carries the head.
-    for item in &mut scan_result.snapshots {
-        if item.history_segments.is_some()
-            && item.cache_observations.is_some()
-            && item.cache_base_head_etag.is_none()
-        {
-            *item = cache_head_probe(item);
-        }
-    }
+    // A cut live body is never a probe: its `through` needs its segments.
     let probes = scan_result
         .snapshots
         .iter()
-        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
+        .filter(|item| {
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && item.history_segments.is_none()
+        })
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
@@ -10971,10 +10977,14 @@ where
                 Some((id, Some(count))) if id == live => Some(*count),
                 _ => None,
             });
+            // A positive ACK of the exact bytes: a hold or refusal of the
+            // same bytes is not a stored part.
             let ready = segments.iter().all(|index| {
                 indices.contains(index)
                     || progress
-                        .contains_body(fingerprint(&items[*index]), &body_witness(&items[*index]))
+                        .accepted_body_witnesses
+                        .get(fingerprint(&items[*index]))
+                        .is_some_and(|witness| *witness == body_witness(&items[*index]))
             });
             if !ready || count != Some(segments.len() as u64) {
                 unsettled_groups.insert(live.clone());
@@ -11041,10 +11051,38 @@ where
             .iter()
             .map(|entity| entity.snapshot_fingerprint.as_str())
             .collect::<BTreeSet<_>>();
+        // A cut live body refused for its group (the receiver lost a part
+        // under its `through`, e.g. a whole or lower body retired it since):
+        // forget the group's earlier segment ACKs so the next pass offers
+        // them again. A resend, not a loop: it is counted.
+        let forget_group = |progress: &mut SnapshotUploadProgress, item: &T| {
+            let live = session_id(item);
+            let mut forgot = 0usize;
+            for segment in group_segments
+                .iter()
+                .filter(|(id, _)| Some(id.as_str()) == live)
+                .flat_map(|(_, segments)| segments)
+            {
+                let segment_fingerprint = fingerprint(&items[*segment]);
+                if !settled.contains(segment_fingerprint) {
+                    forgot +=
+                        usize::from(progress.accepted_fingerprints.remove(segment_fingerprint));
+                    progress.accepted_body_witnesses.remove(segment_fingerprint);
+                }
+            }
+            if forgot > 0 {
+                eprintln!(
+                    "local snapshot history group offered again for {poison_scope}: segments={forgot}"
+                );
+            }
+        };
         for index in indices {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if let Some(rejection) = rejected.get(item_fingerprint) {
+                if !rejection.permanent && rejection.reason.starts_with("history_segments_") {
+                    forget_group(&mut *progress, item);
+                }
                 if rejection.permanent {
                     progress.quarantine_permanent_body(
                         item_fingerprint,
@@ -11058,22 +11096,7 @@ where
                 }
             } else if conflicted.contains(item_fingerprint) {
                 progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
-                // A cut live body conflicts when the receiver no longer holds
-                // a segment under its `through` (a whole or lower body retired
-                // it since): forget the group's segment ACKs from earlier
-                // passes so the next pass offers them again.
-                let live = session_id(item);
-                for segment in group_segments
-                    .iter()
-                    .filter(|(id, _)| Some(id.as_str()) == live)
-                    .flat_map(|(_, segments)| segments)
-                {
-                    let segment_fingerprint = fingerprint(&items[*segment]);
-                    if !settled.contains(segment_fingerprint) {
-                        progress.accepted_fingerprints.remove(segment_fingerprint);
-                        progress.accepted_body_witnesses.remove(segment_fingerprint);
-                    }
-                }
+                forget_group(&mut *progress, item);
             }
         }
         // A conflict is not a settlement, but it IS retryable: the

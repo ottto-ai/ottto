@@ -161,10 +161,7 @@ fn assert_conserved(full: &SnapshotItem, segments: &[SnapshotItem], live: &Snaps
         cost(full)
     );
     for segment in segments {
-        assert_eq!(
-            segment.session_account_evidence,
-            full.session_account_evidence
-        );
+        assert!(segment.session_account_evidence.is_none());
         assert_eq!(
             serde_json::to_value(&segment.provenance).unwrap(),
             serde_json::to_value(&full.provenance).unwrap()
@@ -186,7 +183,7 @@ fn assert_conserved(full: &SnapshotItem, segments: &[SnapshotItem], live: &Snaps
 fn shared_cut_conserves_money_and_placement_for_every_source() {
     for source in SOURCES {
         let full = session(source, 30);
-        let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);
@@ -232,28 +229,93 @@ fn shared_cut_conserves_money_and_placement_for_every_source() {
     }
 }
 
-/// [behaviour] A window over half the item limit halves at whole days into
-/// its own entities, still conserving; small or recent bodies stay whole.
+/// [format] A segment carries only the fields the receiver allows on one:
+/// its window's usage, that usage's own request evidence and provenance.
+/// Every other field keeps its default; session-level fields (creator
+/// evidence included) travel on the live body only.
 #[test]
-fn shared_cut_halves_oversized_windows_and_skips_small_or_recent_bodies() {
-    let full = session(SnapshotSource::Codex, 30);
-    let day_bytes = serde_json::to_vec(&full.usage_buckets[..24]).unwrap().len();
-    let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), 4 * day_bytes).unwrap();
-    assert!(cut.segments.len() > 4);
-    for piece in &cut.segments {
-        assert_eq!(piece.start.rem_euclid(DAY_SECONDS), 0);
-        assert_eq!(piece.end.rem_euclid(DAY_SECONDS), 0);
+fn segments_carry_only_receiver_segment_fields() {
+    const SEGMENT_ITEM_FIELDS: [&str; 22] = [
+        "source_session_id",
+        "snapshot_fingerprint",
+        "status",
+        "collected_at",
+        "provenance",
+        "semantic_envelope",
+        "content_hash",
+        "history_segment",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+        "usage_accounting_contract",
+        "cost",
+        "model_usage",
+        "usage_buckets",
+        "request_evidence",
+        "request_identity_refusals",
+    ];
+    let empty = |value: &Value| match value {
+        Value::Null => true,
+        Value::Bool(flag) => !flag,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        Value::Array(values) => values.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+    };
+    for source in SOURCES {
+        let mut full = session(source, 30);
+        // Session-level fields a whole body carries.
+        full.telemetry_owned_complete = Some(true);
+        full.source_file_fingerprint = Some("synthetic-file".into());
+        full.source_started_at = Some(full.usage_buckets[0].bucket_start.clone());
+        full.source_last_activity_at = Some(full.collected_at.clone());
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let (segments, live) = split(source, &full, &cut).unwrap();
+        assert_eq!(live.copy_unproven_counts, full.copy_unproven_counts);
+        assert_eq!(live.source_file_fingerprint, full.source_file_fingerprint);
+        for segment in &segments {
+            let Value::Object(fields) = serde_json::to_value(segment).unwrap() else {
+                panic!("a segment serializes as an object");
+            };
+            for (name, value) in &fields {
+                assert!(
+                    SEGMENT_ITEM_FIELDS.contains(&name.as_str()) || empty(value),
+                    "{source:?}: {name} belongs to the live body"
+                );
+            }
+        }
     }
-    let (segments, live) = split(SnapshotSource::Codex, &full, &cut).unwrap();
+}
+
+/// [behaviour] The receiver takes whole 7-day windows only: a window over
+/// half the item limit keeps the body whole (never halved); small or recent
+/// bodies stay whole.
+#[test]
+fn shared_cut_keeps_whole_windows_and_skips_small_or_recent_bodies() {
+    let codex = SnapshotSource::Codex;
+    let full = session(codex, 30);
+    let day_bytes = serde_json::to_vec(&full.usage_buckets[..24]).unwrap().len();
+    assert!(plan(codex, &full, TRIGGER_BYTES + 1, now(&full), 4 * day_bytes).is_none());
+    let cut = plan(codex, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+    for piece in &cut.segments {
+        assert_eq!(piece.start.rem_euclid(WINDOW_SECONDS), 0);
+        assert_eq!(piece.end - piece.start, WINDOW_SECONDS);
+    }
+    let (segments, live) = split(codex, &full, &cut).unwrap();
     let ids = segments
         .iter()
         .map(|segment| &segment.source_session_id)
         .collect::<BTreeSet<_>>();
     assert_eq!(ids.len(), segments.len());
     assert_conserved(&full, &segments, &live);
-    assert!(plan(&full, TRIGGER_BYTES, now(&full), usize::MAX).is_none());
-    let recent = session(SnapshotSource::Codex, 3);
-    assert!(plan(&recent, TRIGGER_BYTES + 1, now(&recent), usize::MAX).is_none());
+    assert!(plan(codex, &full, TRIGGER_BYTES, now(&full), usize::MAX).is_none());
+    let recent = session(codex, 3);
+    assert!(plan(codex, &recent, TRIGGER_BYTES + 1, now(&recent), usize::MAX).is_none());
     // Top rows that do not re-sum exactly keep today's whole body.
     let mut unbalanced = full.clone();
     unbalanced.model_usage[1].input_tokens += 1;
@@ -269,7 +331,7 @@ fn shared_cut_keeps_partially_priced_rows() {
         let mut full = session(source, 30);
         full.usage_buckets[5].model_usage[1].cost_usd = None;
         full.model_usage[1].cost_usd = None;
-        let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);

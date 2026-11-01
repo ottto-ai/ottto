@@ -65,9 +65,13 @@ pub(crate) struct Plan {
 pub(crate) enum Skipped {
     /// Top rows, scalars or money did not re-sum exactly: today's body is kept.
     Unbalanced,
-    /// A one-day window still could not keep its identity within the item
-    /// limit: the session is held (delayed, never stripped).
+    /// A settled window still could not keep its identity within the item
+    /// limits once tagged: the session is held (delayed, never stripped).
     PieceHeld,
+    /// A settled window alone is over the item limit (never seen at today's
+    /// sizes): the receiver takes whole 7-day windows only, so the body stays
+    /// whole on today's path.
+    WindowOverLimit,
 }
 
 #[derive(Serialize)]
@@ -142,9 +146,11 @@ pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
 }
 
 /// Plan the cut of a full body measuring `full_bytes`, or `None` when it
-/// stays one body. `item_limit` is the per-item wire limit: a window over
-/// half of it halves at whole days (never seen at today's sizes).
+/// stays one body. `item_limit` is the per-item wire limit: the receiver
+/// takes whole 7-day windows only, so a window over half of it keeps the
+/// body whole (alarm; never seen at today's sizes).
 pub(crate) fn plan(
+    source: SnapshotSource,
     item: &SnapshotItem,
     full_bytes: usize,
     now: i64,
@@ -166,63 +172,26 @@ pub(crate) fn plan(
         }
     }
     let through = windows.keys().next_back()? + WINDOW_SECONDS;
-    let mut segments = Vec::new();
+    let mut segments = Vec::with_capacity(windows.len());
     for (window, buckets) in windows {
-        let piece = Piece {
+        let bytes = buckets
+            .iter()
+            .map(|index| {
+                serde_json::to_vec(&item.usage_buckets[*index])
+                    .map_or(usize::MAX, |bytes| bytes.len() + 1)
+            })
+            .fold(0usize, usize::saturating_add);
+        if bytes > item_limit / 2 {
+            alarm(source, Skipped::WindowOverLimit);
+            return None;
+        }
+        segments.push(Piece {
             start: window,
             end: window + WINDOW_SECONDS,
             buckets,
-        };
-        halve(item, piece, item_limit / 2, &mut segments);
+        });
     }
     Some(Plan { segments, through })
-}
-
-fn halve(item: &SnapshotItem, piece: Piece, half_limit: usize, out: &mut Vec<Piece>) {
-    let bytes = piece
-        .buckets
-        .iter()
-        .map(|index| {
-            serde_json::to_vec(&item.usage_buckets[*index])
-                .map_or(usize::MAX, |bytes| bytes.len() + 1)
-        })
-        .fold(0usize, usize::saturating_add);
-    match (bytes > half_limit)
-        .then(|| halve_piece(item, &piece))
-        .flatten()
-    {
-        Some(halves) => {
-            for half in halves {
-                halve(item, half, half_limit, out);
-            }
-        }
-        None => out.push(piece),
-    }
-}
-
-/// `piece` split at its middle whole day, without empty halves; `None` for
-/// a piece under two days.
-pub(crate) fn halve_piece(item: &SnapshotItem, piece: &Piece) -> Option<Vec<Piece>> {
-    let days = (piece.end - piece.start) / DAY_SECONDS;
-    if days < 2 {
-        return None;
-    }
-    let middle = piece.start + (days / 2) * DAY_SECONDS;
-    let (older, newer): (Vec<_>, Vec<_>) =
-        piece.buckets.iter().copied().partition(|index| {
-            bucket_unix(&item.usage_buckets[*index]).is_some_and(|at| at < middle)
-        });
-    Some(
-        [(piece.start, middle, older), (middle, piece.end, newer)]
-            .into_iter()
-            .filter(|(_, _, buckets)| !buckets.is_empty())
-            .map(|(start, end, buckets)| Piece {
-                start,
-                end,
-                buckets,
-            })
-            .collect(),
-    )
 }
 
 /// Exact wire money: digits with at most 12 decimals, as picodollars.
@@ -369,22 +338,6 @@ fn top_rows(
     Some(sums)
 }
 
-fn copy_unproven(buckets: &[SnapshotUsageBucket]) -> Option<super::CopyUnprovenCounts> {
-    let mut counts = super::CopyUnprovenCounts {
-        rows: 0,
-        requests: 0,
-    };
-    for row in buckets
-        .iter()
-        .flat_map(|bucket| &bucket.model_usage)
-        .filter(|row| row.copy_unproven)
-    {
-        counts.rows += 1;
-        counts.requests += row.request_count;
-    }
-    (counts.rows > 0).then_some(counts)
-}
-
 /// A usage-only body for one window: its buckets, re-summed top rows and
 /// scalars, the session's creator evidence and provenance. No title,
 /// attribution, curve, activity or lifecycle beyond its own buckets.
@@ -432,17 +385,12 @@ fn segment_body(
             })
         }
     };
-    let first = buckets
-        .iter()
-        .filter_map(|bucket| bucket.first_activity_at.clone())
-        .min();
-    let last = buckets
-        .iter()
-        .filter_map(|bucket| bucket.last_activity_at.clone())
-        .max();
     let [input, output, cache_read, cache_5m, cache_1h, reasoning, unattributed, requests] = totals;
+    // A segment carries its window's usage, that usage's own request evidence
+    // and provenance only (the receiver refuses anything else on a segment);
+    // session-level fields, creator evidence included, stay on the live body.
     Some(SnapshotItem {
-        session_account_evidence: full.session_account_evidence.clone(),
+        session_account_evidence: None,
         source_session_id: segment_id(&full.source_session_id, piece.start)?,
         snapshot_fingerprint: String::new(),
         status: full.status.clone(),
@@ -457,11 +405,9 @@ fn segment_body(
         usage_accounting_contract: full.usage_accounting_contract.clone(),
         removed_request_count: None,
         removed_usage: None,
-        telemetry_owned_complete: full.telemetry_owned_complete,
+        telemetry_owned_complete: None,
         resolver_conflict_count: None,
-        copy_unproven_counts: full
-            .copy_unproven_counts
-            .and_then(|_| copy_unproven(&buckets)),
+        copy_unproven_counts: None,
         claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -505,9 +451,9 @@ fn segment_body(
         cost,
         session_display_name: None,
         session_display_name_source: None,
-        source_started_at: first,
+        source_started_at: None,
         source_ended_at: None,
-        source_last_activity_at: last,
+        source_last_activity_at: None,
         collected_at: full.collected_at.clone(),
         workspace_hash: None,
         workspace_display_label: None,
@@ -517,7 +463,7 @@ fn segment_body(
         repository_label_source: None,
         repository_identity_source: None,
         workspace_kind: None,
-        source_file_fingerprint: full.source_file_fingerprint.clone(),
+        source_file_fingerprint: None,
         session_artifacts: Vec::new(),
         provenance: full.provenance.clone(),
         origin: None,
@@ -649,9 +595,6 @@ fn split_conserving(full: &SnapshotItem, plan: &Plan) -> Option<(Vec<SnapshotIte
             cost.cache_creation_cost_usd,
         ] = fields;
     }
-    if full.copy_unproven_counts.is_some() {
-        live.copy_unproven_counts = copy_unproven(&live.usage_buckets);
-    }
     live.history_segments = Some(SnapshotHistorySegments {
         through: rfc3339(plan.through)?,
         count: segments.len() as u64,
@@ -696,18 +639,20 @@ pub(crate) fn expand_page(
         let mut segments = std::mem::take(&mut item.history_cut);
         if segments.is_empty() && rows_self_contained(&item) {
             let bytes = super::snapshot_item_wire_size(source, &item, policy);
-            if let Some((cut, live)) = plan(&item, bytes, now, super::MAX_SNAPSHOT_ITEM_WIRE_BYTES)
-                .and_then(|plan| split(source, &item, &plan))
+            if let Some((cut, live)) = plan(
+                source,
+                &item,
+                bytes,
+                now,
+                super::MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+            )
+            .and_then(|plan| split(source, &item, &plan))
             {
                 segments = cut;
                 item = live;
             }
         }
         for mut segment in segments {
-            // Creator evidence as the live body finally carries it.
-            segment
-                .session_account_evidence
-                .clone_from(&item.session_account_evidence);
             segment.collected_at.clone_from(&item.collected_at);
             page.push(segment);
         }
