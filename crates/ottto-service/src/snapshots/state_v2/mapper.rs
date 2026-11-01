@@ -310,6 +310,24 @@ impl Rows<'_> {
         );
         Ok(())
     }
+    /// Carry a row this save did not load. Only its committed digest, or the
+    /// one recorded when it was decoded, proves it unchanged. Anything else
+    /// is Unknown: the save refuses, and the row is never removed.
+    pub(super) fn keep(&mut self, key: RowKey, digest: [u8; 32]) -> Result<()> {
+        let known = match self.old.remove(&key) {
+            Some(known) => Some(known),
+            None => self.seed.remove(&key),
+        };
+        if known != Some(digest) {
+            telemetry::count("cold_row_unknown", 1);
+            anyhow::bail!("state_v2_cold_row_unknown");
+        }
+        ensure!(
+            self.next.insert(key, digest).is_none(),
+            "state_v2_duplicate_row"
+        );
+        Ok(())
+    }
     pub(super) fn raw(&mut self, key: RowKey, value: &[u8]) -> Result<()> {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(value).into();
