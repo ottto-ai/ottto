@@ -61,11 +61,6 @@ impl<T: PartialEq> PartialEq for Shared<T> {
     }
 }
 impl<T: Eq> Eq for Shared<T> {}
-impl<T: PartialEq> PartialEq<T> for Shared<T> {
-    fn eq(&self, other: &T) -> bool {
-        **self == *other
-    }
-}
 impl<T: fmt::Debug> fmt::Debug for Shared<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
@@ -310,6 +305,24 @@ impl<'a, K: Ord + Clone, V: Clone> IntoIterator for &'a mut SharedMap<K, V> {
         Box::new(self.iter_mut())
     }
 }
+#[cfg(test)]
+impl<T: PartialEq> PartialEq<T> for Shared<T> {
+    fn eq(&self, other: &T) -> bool {
+        **self == *other
+    }
+}
+#[cfg(test)]
+impl<K: Ord, V, const N: usize> From<[(K, V); N]> for SharedMap<K, V> {
+    fn from(entries: [(K, V); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+#[cfg(test)]
+impl<K: PartialEq, V: PartialEq> PartialEq<BTreeMap<K, V>> for SharedMap<K, V> {
+    fn eq(&self, other: &BTreeMap<K, V>) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
 
 /// The entry forms the map's callers use. Each returns the value for writing,
 /// so each unshares it.
@@ -365,11 +378,6 @@ impl<K: Ord, V> From<BTreeMap<K, V>> for SharedMap<K, V> {
         map.into_iter().collect()
     }
 }
-impl<K: Ord, V, const N: usize> From<[(K, V); N]> for SharedMap<K, V> {
-    fn from(entries: [(K, V); N]) -> Self {
-        entries.into_iter().collect()
-    }
-}
 impl<K, V> From<BTreeMap<K, Shared<V>>> for SharedMap<K, V> {
     fn from(map: BTreeMap<K, Shared<V>>) -> Self {
         Self(Shared::new(map))
@@ -404,11 +412,6 @@ impl<K: PartialEq, V: PartialEq> PartialEq for SharedMap<K, V> {
     }
 }
 impl<K: Eq, V: Eq> Eq for SharedMap<K, V> {}
-impl<K: PartialEq, V: PartialEq> PartialEq<BTreeMap<K, V>> for SharedMap<K, V> {
-    fn eq(&self, other: &BTreeMap<K, V>) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
-    }
-}
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for SharedMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
