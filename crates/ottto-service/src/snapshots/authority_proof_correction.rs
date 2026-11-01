@@ -985,9 +985,11 @@ impl ScanIndex {
             if !acked_or_rejected && !noop {
                 continue;
             }
-            for item in group.iter().filter(|item| rejected(item)) {
-                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
-            }
+            let rejected_bodies: Vec<&str> = group
+                .iter()
+                .filter(|item| rejected(item))
+                .map(|item| item.body_witness.as_str())
+                .collect();
             // Cold: the drained family's pending is the preimage a revert
             // restores, so it is loaded first. Unknown leaves this drain owed
             // (counted); nothing of it is applied.
@@ -1001,6 +1003,9 @@ impl ScanIndex {
                 continue;
             };
             let pending = pending.cloned();
+            for body_witness in rejected_bodies {
+                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={body_witness}");
+            }
             drains
                 .families
                 .entry(candidate.root.clone())
