@@ -1490,10 +1490,7 @@ pub(in super::super) fn visit_usage(
             if !unread.contains(&root) {
                 return Ok(()); // loaded above, or removed by this graph
             }
-            ensure!(
-                cold.head(&root).is_some_and(|head| head.digest == digest),
-                super::super::usage_pending::Unknown
-            );
+            cold.admits(&root, digest)?;
             seen += 1;
             f(root.as_str(), &value);
             Ok(())
