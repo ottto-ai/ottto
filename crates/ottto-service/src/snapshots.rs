@@ -85606,8 +85606,10 @@ mod state_v2_maintenance_lock_tests {
 pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::{
-    has_cold_archive as state_v2_has_cold_archive,
-    roll_account_families as state_v2_roll_account_families, ColdStore as StateV2ColdStore,
+    cold_usage_families as state_v2_cold_usage_families,
+    has_cold_archive as state_v2_has_cold_archive, resident as state_v2_resident,
+    roll_account_families as state_v2_roll_account_families, ColdSession as StateV2ColdSession,
+    ColdStore as StateV2ColdStore,
 };
 
 #[cfg(test)]
