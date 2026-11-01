@@ -4294,7 +4294,7 @@ fn e2_absent_subagent_twin_holds_its_session() {
             )
         };
         let cold = route(&expected);
-        for proof in 0..3 {
+        for proof in 0..4 {
             let mut shorter = prefix.clone();
             if proof == 1 {
                 shorter.push(json!({"type":"last-prompt"}));
@@ -4322,7 +4322,25 @@ fn e2_absent_subagent_twin_holds_its_session() {
                     .claude_request_census_mut_for_test()
                     .insert_for_test(&key, record);
             }
-            let mut items = vec![parse(&longer, Some(t0()), &index, &full)];
+            // An older, uncertified writer produced the observed longer copy
+            // at the later-born path. Its own session requests still count.
+            let mut case_full = full.clone();
+            let birth = if proof == 3 {
+                for value in &mut case_full {
+                    if value["type"] == "assistant" {
+                        value["version"] = json!("2.0.0");
+                    }
+                }
+                write(&longer, &case_full);
+                write(&shorter_path, &case_full[..prefix.len()]);
+                index = ScanIndex::default();
+                parse_and_remember(&shorter_path, t0(), &mut index, &case_full[..prefix.len()]);
+                parse_and_remember(&longer, t0() + 60_000_000_000, &mut index, &case_full);
+                t0() + 60_000_000_000
+            } else {
+                t0()
+            };
+            let mut items = vec![parse(&longer, Some(birth), &index, &case_full)];
             let mut reasons = BTreeMap::new();
             assert!(finish_page(
                 &mut items,
@@ -4333,7 +4351,10 @@ fn e2_absent_subagent_twin_holds_its_session() {
             )
             .is_empty());
             assert!(reasons.is_empty());
-            let actual = tag_owned(vec![parse(&longer, Some(t0()), &index, &full)], &index);
+            let actual = tag_owned(
+                vec![parse(&longer, Some(birth), &index, &case_full)],
+                &index,
+            );
             assert_eq!((actual[0].request_count, actual[0].input_tokens), (2, 30));
             money_oracle::assert_placement_equivalent(&cold, &route(&actual));
         }

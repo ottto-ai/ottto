@@ -3887,9 +3887,9 @@ pub(crate) fn finish_page(
         .map(|(session, mut state)| {
             state.entity.telemetry_owned_complete = state.complete;
             state.entity.held |= held.contains(&session);
-            decided.push((session.to_owned(), state.decided));
+            decided.push((session.clone(), state.decided));
             let first = (state.first_original, state.first_undo);
-            (session.to_owned(), (state.entity, first, state.twin_loans))
+            (session, (state.entity, first, state.twin_loans))
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
@@ -4102,8 +4102,8 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
                 prefix = false;
             }
             let line: serde_json::Value = serde_json::from_slice(&a).ok()?;
-            if line.get("requestId").is_some_and(|id| !id.is_null())
-                || line.pointer("/message/id").is_some_and(|id| !id.is_null())
+            if super::super::claude_code_usage_dedup_key(&line).is_some()
+                || super::super::claude_code_usage_root(&line).is_some()
             {
                 return Some(false);
             }
@@ -4150,7 +4150,7 @@ fn absent_twins(
                             && item.claude_money.as_deref().is_some_and(|fold| {
                                 fold.location == Some(Located(location_key(other)))
                                     // A folded copy that still excludes requests cannot replace its witness.
-                                    && fold.skipped.is_empty()
+                                    && fold.copied == 0
                             })
                             && redundant_twin(key, other, item, index)
                     })

@@ -16638,12 +16638,12 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_deferred(3, 0);
+        let deferred = snapshot_entity_deferred(3, 2);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
-                .map(|error| error.count),
-            Some(3)
+                .map(|error| (error.count, error.conflicted, error.context_budget)),
+            Some((3, 1, 2))
         );
     }
 
