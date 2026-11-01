@@ -760,7 +760,6 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
     }
 }
 
-/// [money] Held usage preserves file membership without confirming an empty entity.
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
@@ -4843,7 +4842,6 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
-
             restored_behind_accepted: extent,
         });
         let (_, counts) =
