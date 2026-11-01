@@ -8689,7 +8689,7 @@ fn finish_sync_source(
                         source.api_slug(),
                         safe_error(&error)
                     );
-                    committed_index.clone()
+                    committed_index
                 }
             };
             if retry.enabled()
