@@ -8562,10 +8562,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .iter()
                 .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp));
         let carried_incidence = index.accepted_rebuild_incidence.remove(&pending.index_key);
-        let entity_bodies = ((semantic_noop && receipt_eligible)
+        let entity_bodies = if (semantic_noop && receipt_eligible)
             || carried_incidence.is_some()
-            || index.accepted_rebuild_incidence.contains_key(""))
-        .then(|| {
+            || index.accepted_rebuild_incidence.contains_key("")
+        {
             result
                 .snapshots
                 .iter()
@@ -8575,8 +8575,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 })
                 .map(|item| (item.snapshot_fingerprint.clone(), body_witness(item)))
                 .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
+        } else {
+            BTreeMap::new()
+        };
         if semantic_noop && receipt_eligible {
             index.carry_upload_context_receipt(
                 &pending.index_key,
@@ -8619,7 +8620,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             carried_noop_entities.extend(
                 unknown
                     .intersection(&final_fingerprints)
-                    .filter(|fp| carried_noop(*fp))
+                    .filter(|fp| carried_noop(fp))
                     .cloned(),
             );
         }
@@ -8627,7 +8628,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             carried_noop_entities.extend(
                 carried
                     .intersection(&final_fingerprints)
-                    .filter(|fp| carried_noop(*fp))
+                    .filter(|fp| carried_noop(fp))
                     .cloned(),
             );
         }
