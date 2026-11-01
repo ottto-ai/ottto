@@ -849,6 +849,8 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// [behaviour] Doctor footprint: nested regular files and bytes, missing
+    /// store is 0/0, symlinks are not followed.
     #[test]
     fn store_size_counts_nested_files_without_following_symlinks() {
         let dir = scratch();

@@ -3274,6 +3274,8 @@ mod tests {
         assert_eq!(human_summary(&payload), normal);
     }
 
+    /// [behaviour] Doctor summary: blocker guidance first, then running state
+    /// and the local OTEL store line when present.
     #[test]
     fn doctor_human_output_surfaces_reconnect_finding_before_daemon_running() {
         let guidance = "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads";
