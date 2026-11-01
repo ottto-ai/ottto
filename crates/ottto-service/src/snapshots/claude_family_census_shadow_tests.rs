@@ -827,10 +827,10 @@ fn the_skipped_view_is_queue_plus_replay() {
     assert_eq!(view.iter().filter(|skipped| skipped.replay).count(), 1);
     assert_eq!(skipped_census_members(&index).count(), 2);
     let mut first_pending = FirstPending::default();
-    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None, 0);
+    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None);
     assert_eq!((first.count, first.replay, first.replay_repeat), (2, 1, 0));
     // Still replayed a page later: repeated, and its age a lower bound.
-    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None, 0);
+    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None);
     assert_eq!((again.replay, again.replay_repeat), (1, 1));
     assert_eq!(again.oldest_age_s, 60);
 }
@@ -1153,10 +1153,10 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     }
     let mut first_pending = FirstPending::default();
     let early = (0..100).map(path).collect::<Vec<_>>();
-    first_pending.observe(queued(&early), |_| false, NOW, None, 0);
+    first_pending.observe(queued(&early), |_| false, NOW, None);
     let all = (0..MAX_FIRST_PENDING + 10).map(path).collect::<Vec<_>>();
     let (pending, skipped) =
-        first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY, None, 0);
+        first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY, None);
     assert_eq!(pending.count, (MAX_FIRST_PENDING + 10) as u64);
     assert_eq!(pending.tracked, MAX_FIRST_PENDING as u64);
     // The ten oldest stamps go; the remaining 90 early ones still age.
@@ -1167,14 +1167,14 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     // Members that leave the queue unresolved keep their stamps; resolved
     // ones drop out.
     let (pending, _) =
-        first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY, None, 0);
+        first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY, None);
     assert_eq!(
         (pending.count, pending.tracked),
         (0, MAX_FIRST_PENDING as u64)
     );
     assert_eq!(pending.unqueued_unresolved, MAX_FIRST_PENDING as u64);
     let (pending, _) =
-        first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY, None, 0);
+        first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY, None);
     assert_eq!((pending.count, pending.tracked), (0, 0));
 }
 

@@ -86,7 +86,7 @@ mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
 mod contract5_cutover_tests;
-mod money_freshness;
+pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 mod shared_value;
@@ -32695,9 +32695,6 @@ impl OwnedSourceScan {
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
-            if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
-                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
-            }
             if preflight_source_file_fingerprint
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
@@ -42799,7 +42796,7 @@ fn scan_traversal_context_fingerprint_with(
     format!("{:x}", digest.finalize())
 }
 
-fn rfc3339_unix_seconds(value: &str) -> Option<u64> {
+pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<u64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()?
         .unix_timestamp()
@@ -44333,6 +44330,13 @@ fn advance_bounded_directory_traversal_with_budget(
         },
     );
     let mut remaining = max_entries;
+    // Marked directories are Codex days that appeared after a walk, not a walk.
+    let root_walk = traversal
+        .pending_directories
+        .iter()
+        .any(|directory| !directory.watcher_hint);
+    let mut freshness = money_freshness::WalkFold::resume(source);
+    let listed_at = sampled_scan::now_seconds();
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -44519,6 +44523,16 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
+            if index
+                .files
+                .get(&local_index_key(&path))
+                .is_some_and(|entry| !entry.same_listing_stamp_as(&metadata))
+            {
+                freshness.changed_file(
+                    index.authority_terminal_member(&path),
+                    listed_at.saturating_sub(modified_unix_seconds),
+                );
+            }
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             }) && !retention.owes_stamped(
@@ -44624,6 +44638,9 @@ fn advance_bounded_directory_traversal_with_budget(
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
         }
+    }
+    if root_walk {
+        freshness.page_end(source, traversal.pending_directories.is_empty());
     }
     index.traversal = Some(traversal);
 }
@@ -49459,6 +49476,16 @@ impl ScanIndex {
             .get(&local_index_key(path))
             .is_some_and(|entry| entry.same_listing_stamp_as(metadata))
             && !sampled_audit::path_requires_verification(&self.files, path)
+    }
+
+    /// A member of a terminal authority family: a Skip before any growth
+    /// handling, and a hold revert that keeps the pre-growth stamp.
+    fn authority_terminal_member(&self, path: &Path) -> bool {
+        claude_index_path_member_ref(path)
+            .and_then(|member| self.claude_usage_authority_quarantine.get(member.root))
+            .is_some_and(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            })
     }
 
     /// A watcher hint needs no read: the file is unchanged and not owed, and

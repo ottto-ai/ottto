@@ -1119,7 +1119,7 @@ pub(super) fn rotation(
 /// dropped for it.
 #[derive(Debug, Default)]
 pub(super) struct FirstPending {
-    stamps: Vec<(u64, u64, super::money_freshness::Metadata)>,
+    stamps: Vec<(u64, u64)>,
 }
 
 /// Freshness of the skipped set. `count` counts entries (queue + replay) as
@@ -1163,7 +1163,6 @@ impl FirstPending {
         resolved: impl Fn(u64) -> bool,
         now: u64,
         index: Option<&ScanIndex>,
-        epoch: u64,
     ) -> (PendingCensusMembers, SkippedSet) {
         // One pass, never more than `MAX_FIRST_PENDING + 1` stamps held: a
         // min-heap on stamp evicts the oldest as soon as it overflows.
@@ -1173,9 +1172,6 @@ impl FirstPending {
         const QUEUED: u8 = 1;
         const UNREAD: u8 = 2;
         const REPLAY: u8 = 4;
-        const OBSERVED: u8 = 8;
-        const KNOWN: u8 = 16;
-        const CHANGED: u8 = 32;
         let mut unread_entries = 0_u64;
         let mut retained = 0_u64;
         let (mut sum, mut xor) = (0_u64, 0_u64);
@@ -1193,33 +1189,17 @@ impl FirstPending {
             xor ^= mix64(mixed);
             let position = self
                 .stamps
-                .binary_search_by_key(&hash, |(hash, _, _)| *hash)
+                .binary_search_by_key(&hash, |(hash, _)| *hash)
                 .ok();
             let previous = position.map(|position| self.stamps[position].1);
             retained += u64::from(previous.is_some());
             pending.replay_repeat += u64::from(entry.replay && previous.is_some());
-            let metadata = position.map(|p| self.stamps[p].2).unwrap_or_default();
             let indexed =
                 index.and_then(|index| index.files.get(entry.path.path.to_string_lossy().as_ref()));
             let unread = indexed.is_none() && !entry.replay;
             unread_entries += u64::from(unread);
-            let observed = epoch != 0 && metadata.epoch == epoch;
-            let mut flags =
+            let flags =
                 QUEUED | if unread { UNREAD } else { 0 } | if entry.replay { REPLAY } else { 0 };
-            if observed {
-                flags |= OBSERVED;
-            }
-            if let Some(indexed) = indexed.filter(|_| observed) {
-                flags |= KNOWN;
-                if indexed.size_bytes != metadata.size
-                    || indexed.modified_unix_seconds != metadata.seconds
-                    || indexed
-                        .modified_unix_nanos
-                        .is_some_and(|nanos| nanos != metadata.nanos)
-                {
-                    flags |= CHANGED;
-                }
-            }
             if let Some(position) = position {
                 let observed = &mut seen[position];
                 observed.0 |= flags;
@@ -1229,7 +1209,6 @@ impl FirstPending {
             kept.push(std::cmp::Reverse((
                 previous.unwrap_or(now),
                 hash,
-                metadata,
                 flags,
                 1_u64,
                 u64::from(unread),
@@ -1241,11 +1220,9 @@ impl FirstPending {
         }
         let mut current = kept
             .into_iter()
-            .map(
-                |std::cmp::Reverse((stamp, hash, metadata, flags, entries, unread))| {
-                    (hash, stamp, metadata, flags, entries, unread)
-                },
-            )
+            .map(|std::cmp::Reverse((stamp, hash, flags, entries, unread))| {
+                (hash, stamp, flags, entries, unread)
+            })
             .collect::<Vec<_>>();
         current.sort_unstable();
         // A path both queued and in carry replay keeps its oldest stamp.
@@ -1253,9 +1230,9 @@ impl FirstPending {
             if a.0 != b.0 {
                 return false;
             }
-            b.3 |= a.3;
+            b.2 |= a.2;
+            b.3 += a.3;
             b.4 += a.4;
-            b.5 += a.5;
             true
         });
         // Keep stamps of keys that left the queue unresolved.
@@ -1263,13 +1240,13 @@ impl FirstPending {
             .stamps
             .iter()
             .zip(&seen)
-            .filter(|((hash, _, _), seen)| seen.0 == 0 && !resolved(*hash))
-            .map(|((hash, since, metadata), _)| (*hash, *since, *metadata, 0_u8, 0_u64, 0_u64))
+            .filter(|((hash, _), seen)| seen.0 == 0 && !resolved(*hash))
+            .map(|((hash, since), _)| (*hash, *since, 0_u8, 0_u64, 0_u64))
             .collect::<Vec<_>>();
         current.extend(carried);
         if current.len() > MAX_FIRST_PENDING {
             let excess = current.len() - MAX_FIRST_PENDING;
-            current.sort_unstable_by_key(|(hash, stamp, _, _, _, _)| (*stamp, *hash));
+            current.sort_unstable_by_key(|(hash, stamp, _, _, _)| (*stamp, *hash));
             current.drain(..excess);
             pending.pace_evicted += excess as u64;
         }
@@ -1282,44 +1259,33 @@ impl FirstPending {
         let mut covered_unread_entries = 0_u64;
         self.stamps = current
             .into_iter()
-            .map(
-                |(hash, since, metadata, mut flags, mut entries, mut unread)| {
-                    if flags & QUEUED != 0 {
-                        // The cap may discard an occurrence while another one of
-                        // its key survives. Reuse the existing stamp-indexed seen
-                        // buffer so all occurrences of a retained known key count.
-                        if let Ok(position) =
-                            self.stamps.binary_search_by_key(&hash, |stamp| stamp.0)
-                        {
-                            (flags, entries, unread) = seen[position];
-                        }
-                        queued += 1;
-                        covered_entries += entries;
-                        covered_unread_entries += unread;
-                        let age = now.saturating_sub(since);
-                        pending.oldest_age_s = pending.oldest_age_s.max(age);
-                        pending.over_24h += u64::from(age > OVER_24H_SECONDS);
-                        let row = &mut pending.freshness;
-                        if flags & UNREAD != 0 && flags & REPLAY == 0 {
-                            row.discovered_unread_tracked_files += 1;
-                            row.oldest_discovered_unread_age_seconds =
-                                row.oldest_discovered_unread_age_seconds.max(age);
-                            row.discovered_unread_over_24h_tracked_files +=
-                                u64::from(age > OVER_24H_SECONDS);
-                        } else {
-                            row.indexed_or_replay_tracked_files += 1;
-                        }
-                        row.metadata_observed_files += u64::from(flags & OBSERVED != 0);
-                        if flags & KNOWN != 0 {
-                            row.changed_since_scan_files += u64::from(flags & CHANGED != 0);
-                            row.unchanged_since_scan_files += u64::from(flags & CHANGED == 0);
-                        } else {
-                            row.changed_since_scan_unknown_files += 1;
-                        }
+            .map(|(hash, since, mut flags, mut entries, mut unread)| {
+                if flags & QUEUED != 0 {
+                    // The cap may discard an occurrence while another one of
+                    // its key survives. Reuse the existing stamp-indexed seen
+                    // buffer so all occurrences of a retained known key count.
+                    if let Ok(position) = self.stamps.binary_search_by_key(&hash, |stamp| stamp.0) {
+                        (flags, entries, unread) = seen[position];
                     }
-                    (hash, since, metadata)
-                },
-            )
+                    queued += 1;
+                    covered_entries += entries;
+                    covered_unread_entries += unread;
+                    let age = now.saturating_sub(since);
+                    pending.oldest_age_s = pending.oldest_age_s.max(age);
+                    pending.over_24h += u64::from(age > OVER_24H_SECONDS);
+                    let row = &mut pending.freshness;
+                    if flags & UNREAD != 0 && flags & REPLAY == 0 {
+                        row.discovered_unread_tracked_files += 1;
+                        row.oldest_discovered_unread_age_seconds =
+                            row.oldest_discovered_unread_age_seconds.max(age);
+                        row.discovered_unread_over_24h_tracked_files +=
+                            u64::from(age > OVER_24H_SECONDS);
+                    } else {
+                        row.indexed_or_replay_tracked_files += 1;
+                    }
+                }
+                (hash, since)
+            })
             .collect();
         // collect may reuse the wider transient allocation; cap retained bytes.
         self.stamps.shrink_to(MAX_FIRST_PENDING);
@@ -1328,9 +1294,6 @@ impl FirstPending {
         row.skipped_untracked_entries = pending.count.saturating_sub(covered_entries);
         row.discovered_unread_untracked_entries =
             unread_entries.saturating_sub(covered_unread_entries);
-        row.changed_since_scan_complete_count = (row.changed_since_scan_unknown_files == 0
-            && row.skipped_untracked_entries == 0)
-            .then_some(row.changed_since_scan_files);
         let skipped = SkippedSet {
             digest: format!("{sum:016x}{xor:016x}"),
             retained,
@@ -1338,21 +1301,8 @@ impl FirstPending {
         (pending, skipped)
     }
 
-    pub(super) fn observe_metadata(
-        &mut self,
-        hash: u64,
-        metadata: super::money_freshness::Metadata,
-    ) {
-        if let Ok(p) = self
-            .stamps
-            .binary_search_by_key(&hash, |(hash, _, _)| *hash)
-        {
-            self.stamps[p].2 = metadata;
-        }
-    }
-
     fn heap_bytes(&self) -> usize {
-        self.stamps.capacity() * size_of::<(u64, u64, super::money_freshness::Metadata)>()
+        self.stamps.capacity() * size_of::<(u64, u64)>()
     }
 }
 
@@ -1373,8 +1323,6 @@ pub(super) struct Runtime {
     scope_since: Option<u64>,
     cursor: Option<String>,
     first_pending: FirstPending,
-    freshness: super::money_freshness::Episode,
-    metadata_epoch: u64,
     roots: RootCounts,
     attested: Attestations,
     sticky: Sticky,
@@ -1390,8 +1338,6 @@ impl Runtime {
             scope_since: None,
             cursor: None,
             first_pending: FirstPending::new(),
-            freshness: super::money_freshness::Episode::new(),
-            metadata_epoch: 1,
             roots: RootCounts::new(),
             attested: Attestations::new(),
             sticky: Sticky::new(),
@@ -1509,19 +1455,8 @@ pub(super) fn evaluate_page<'p>(
         |hash| resolved.binary_search(&hash).is_ok(),
         now,
         Some(index),
-        runtime.metadata_epoch,
     );
     pending_census_members.stamped_for_s = now.saturating_sub(scope_since);
-    runtime
-        .freshness
-        .update(&mut pending_census_members.freshness, now);
-    // Epoch wrap only loses metadata coverage; it never affects selection.
-    runtime.metadata_epoch = runtime.metadata_epoch.checked_add(1).unwrap_or(1);
-    if runtime.metadata_epoch == 1 {
-        for (_, _, metadata) in &mut runtime.first_pending.stamps {
-            *metadata = Default::default();
-        }
-    }
     let (vetoes, sticky_vetoes) =
         runtime
             .sticky
@@ -1617,7 +1552,7 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
     const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
     const LONGEST_ROOT: usize = 255; // One path component.
     const FOLLOWUP: usize = size_of::<FamilyRef>() + LONGEST_KEY + LONGEST_ROOT;
-    MAX_FIRST_PENDING * size_of::<(u64, u64, super::money_freshness::Metadata)>()
+    MAX_FIRST_PENDING * size_of::<(u64, u64)>()
         + MAX_ATTESTATIONS * size_of::<(u64, u64)>()
         + ATTESTATION_FLUSH * size_of::<(u64, u64)>()
         + MAX_ATTESTATIONS * size_of::<u64>()
@@ -1631,11 +1566,11 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// reported per page as `cost.runtime_heap_bytes`.
 ///
 /// Retained heap, worst case, with every cap full (no maps: sorted vectors
-/// only): stamps 16,384 × 48 + attestations 16,384 × 16 + attestation buffer
+/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
 /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes before R1 metadata (which adds 524,288 bytes), plus follow-up families 256 × (48 + K + R) and the rotation and
+/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
 /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
-/// (Linux `PATH_MAX`) and R = 255 that is 2,592,512 bytes (2.47 MiB) before
+/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
 /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
 /// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
 /// typical lengths), plus at most 4 MiB for enlarged stamp transients with
@@ -1749,30 +1684,9 @@ pub(super) fn observe_page(
     let counts = with_runtime(|runtime| {
         evaluate_page(runtime, index, touched, parsed, removed_keys, scope, now)
     });
-    if let Some(mut counts) = counts {
-        counts.pending_census_members.freshness.tracker_initialized =
-            super::money_freshness::first_observation();
+    if let Some(counts) = counts {
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
-}
-
-/// Reuse only metadata already observed by this pass. New/untracked keys stay
-/// unknown until FirstPending admits them; no additional per-file map or stat.
-#[inline(never)]
-pub(super) fn observe_freshness_metadata(
-    candidate: &CandidateFile,
-    sampling: &Option<sampled_scan::Context>,
-) {
-    if !super::money_freshness::enabled() {
-        return;
-    }
-    with_runtime(|runtime| {
-        runtime.align_scope(scope_of(sampling));
-        runtime.first_pending.observe_metadata(
-            hash64(candidate.path.as_os_str().as_encoded_bytes()),
-            super::money_freshness::Metadata::new(candidate, runtime.metadata_epoch),
-        );
-    });
 }
 
 #[cfg(test)]
