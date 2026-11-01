@@ -4842,8 +4842,8 @@ fn native_restore_context(
     };
     serde_json::json!({
         "stage": stage, "modes_full_tail_unchanged": format!("{modes:?}"),
-        "emitted_actual_cold": [Some(scan.snapshots.len()), None],
-        "wire_bytes_actual_cold": [Some(serde_json::to_vec(&projection).unwrap().len()), None],
+        "emitted_actual_cold": [Some(scan.snapshots.len()), None::<usize>],
+        "wire_bytes_actual_cold": [Some(serde_json::to_vec(&projection).unwrap().len()), None::<usize>],
         "wire_finalized": false, "selector": format!("{selector:?}"), "counters": counters,
     })
 }
