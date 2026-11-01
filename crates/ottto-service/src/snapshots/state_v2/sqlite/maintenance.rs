@@ -703,7 +703,9 @@ impl Sqlite {
         let wal_debt_alarm = self.debt
             && !(pending && self.read_control::<u64>("erasure_attempt")?.is_some())
             && !self.wal_bytes().is_some_and(|b| b < max_wal);
-        super::super::telemetry::event("wal_debt_alarm", &wal_debt_alarm);
+        if wal_debt_alarm {
+            super::super::telemetry::event("wal_debt_alarm", &true);
+        }
         Ok(())
     }
 }
