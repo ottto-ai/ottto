@@ -568,19 +568,27 @@ one shared exemption from the discovery window, used by every age gate: the
 Claude/Pi walk, candidate revalidation and open, the Codex roster and
 `codex_parent_outside_window`. A key owed by a registered source stays
 discoverable and observed whatever its age while it is owed, so reconciliation
-never prunes it. Its growth goes through the counted Tail path. Only a validated
-catch-up or a proven, counted removal releases it, and it is never a Full cause.
-File-size caps still apply. Registered sources today are the unverified
-sampled-generation marker (any source) and Claude withheld-account holds. A new
-owed source (a Codex owed-residue set, a compressed hold) registers as one field
-plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
-separate exemption.
+never prunes it. Its growth goes through the counted Tail path. A validated
+catch-up or a proven, counted removal releases it. Oversized discovery debt can
+also retire without a removal counter when an effective completed census proves
+its key absent from observed keys, residue and retained files. Retention is
+never a Full cause. File-size caps still apply. Registered sources today are the
+unverified sampled-generation marker (any source), oversized discovery debt (any
+source) and Claude withheld-account holds. A new owed source (a Codex owed-residue
+set, a compressed hold) registers as one field plus its lines in
+`discovery_retention!`, `unverified` and `owes`; it adds no separate exemption.
+
+The `local_resources` stage `oversized_discovery_alarm` reports outstanding
+oversized discovery debt per source, per page: `outstanding_file_count` is the
+number of files still over cap, `outstanding_bytes` is their total size, and
+`first_seen_oversized_age_seconds` is the oldest age since first seen oversized.
+The row is omitted when the outstanding file count is zero.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the page's
-source: `age` (outside the backfill window, not held for verification and not
-withheld for an unresolved Claude account) and `size` (over the source's
-file-size cap). `withheld_oversized` counts the decisions, at the walk,
-candidate revalidation or open, that keep an over-cap key observed without a
+source: `age` (outside the backfill window, not held for verification, not owed
+for oversized discovery debt and not withheld for an unresolved Claude account)
+and `size` (over the source's file-size cap). `withheld_oversized` counts the
+decisions, at the walk, candidate revalidation or open, that keep an over-cap key observed without a
 full parse while its parsed revision is withheld for an unresolved account: the
 entry and hold stay, and growth past the cap is not read. They are recorded
 after the existing decision, are drained by that source's next completed page,
