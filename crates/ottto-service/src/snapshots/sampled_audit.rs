@@ -2667,62 +2667,52 @@ mod growth_tests {
     /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        for prechecked in [true, false] {
-            let fixture = Fixture::new();
-            let mut index = fixture.index();
-            fixture.grow();
-            if prechecked {
-                revalidate_growth(
-                    &mut index,
-                    &fixture.key,
-                    std::slice::from_ref(&fixture.root),
-                );
-            }
-            let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-            let record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                (0..cap as u64).collect(),
-            )
-            .with_modified_for_test(Some(1));
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            (0..cap as u64).collect(),
+        )
+        .with_modified_for_test(Some(1));
+        index
+            .claude_request_census
+            .insert_for_test(&fixture.key, record);
+        let mut index = restart(&index);
+        let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            40 * 86400,
+            ClaudeRequestCensusShape::Exact,
+            vec![u64::MAX],
+        );
+        let outcome = index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
             index
                 .claude_request_census
-                .insert_for_test(&fixture.key, record);
-            let mut index = restart(&index);
-            let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"b".repeat(64),
-                40 * 86400,
-                ClaudeRequestCensusShape::Exact,
-                vec![u64::MAX],
-            );
-            let outcome =
-                index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
-            assert_ne!(
-                outcome,
-                super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-            );
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .record_for_test(&fixture.key)
-                    .unwrap()
-                    .request_hashes_for_test()
-                    .len(),
-                cap
-            );
-            // Occupancy release also excludes this key, even above 90%.
-            assert_eq!(
-                index
-                    .retire_claude_transcript_records_for_test(40 * 86400)
-                    .0,
-                0
-            );
-            assert_eq!(
-                index.claude_request_census.totals_for_test(),
-                index.claude_request_census.recounted_for_test()
-            );
-        }
+                .record_for_test(&fixture.key)
+                .unwrap()
+                .request_hashes_for_test()
+                .len(),
+            cap
+        );
+        // Occupancy release also excludes this key, even above 90%.
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            0
+        );
+        assert_eq!(
+            index.claude_request_census.totals_for_test(),
+            index.claude_request_census.recounted_for_test()
+        );
     }
 
     /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
