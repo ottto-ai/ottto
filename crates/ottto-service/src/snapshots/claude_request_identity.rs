@@ -38,6 +38,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -4427,13 +4428,13 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 pub(crate) struct ScanEvidence<'a> {
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
-    /// Each request id named by loaded API or trace rows, sorted, with the
-    /// one root holding them, or `None` when rows under several roots name
-    /// it. Rows are keyed by trace root, so this is how a fork or resume copy
-    /// under another root sees that the request already has an owner. Built
-    /// on the first request without rows of its own: a pass whose requests
-    /// all have their own rows never pays for it.
-    request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
+    /// The request roots of this pass's whole corpus, from the cross-root
+    /// evidence the strict read built root by root.
+    cross_request_roots: Option<&'a RequestRootIndex>,
+    /// Without cross-root evidence: the request roots of the loaded rows,
+    /// built on the first request without rows of its own, so a pass whose
+    /// requests all have their own rows never pays for it.
+    request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
     /// Why each unhealthy root failed, for its no-fallback counter only.
@@ -4468,6 +4469,79 @@ pub(crate) struct ScanEvidence<'a> {
     wire_budget: WireBudget<'a>,
 }
 
+/// Each request id named by healthy API or trace rows, as its SHA-256, with
+/// the ordinal of the one root holding it, or `SEVERAL` when rows
+/// under several roots name it. Rows are keyed by trace root, so this is how a
+/// fork or resume copy under another root sees that the request already has
+/// an owner. A root's API and trace rows of one request are one claim: each
+/// root's ids are deduplicated as the root is added, before the collapse.
+#[derive(Default)]
+pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
+
+impl RequestRootIndex {
+    const SEVERAL: u32 = u32::MAX;
+
+    /// Adds one root's API and trace request ids, in any order. Call once per root.
+    pub(crate) fn add_root<'r>(&mut self, root: u32, request_ids: impl Iterator<Item = &'r str>) {
+        let mut ids = request_ids
+            .map(|id| <[u8; 32]>::from(sha2::Sha256::digest(id.as_bytes())))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        self.0.extend(ids.into_iter().map(|id| (id, root)));
+    }
+
+    /// Once every root is in: sort, then collapse ids held by several roots.
+    pub(crate) fn finish(&mut self) {
+        self.0.sort_unstable();
+        self.0.dedup_by(|later, kept| {
+            if later.0 != kept.0 {
+                return false;
+            }
+            kept.1 = Self::SEVERAL;
+            true
+        });
+        self.0.shrink_to_fit();
+    }
+
+    /// `Some(Some(root))`: one root's rows name `request_id`; `Some(None)`: several.
+    pub(crate) fn get(&self, request_id: &str) -> Option<Option<u32>> {
+        let id = <[u8; 32]>::from(sha2::Sha256::digest(request_id.as_bytes()));
+        let at = self.0.binary_search_by(|(known, _)| known.cmp(&id)).ok()?;
+        let root = self.0[at].1;
+        Some((root != Self::SEVERAL).then_some(root))
+    }
+}
+
+/// One root's API rows by request id: the row, or `None` when several name it.
+pub(crate) fn unique_by_request(
+    rows: &[ClaudeLocalOtelEvidence],
+) -> BTreeMap<&str, Option<&ClaudeLocalOtelEvidence>> {
+    let mut unique = BTreeMap::new();
+    for row in rows {
+        unique
+            .entry(row.request_id.as_str())
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(row));
+    }
+    unique
+}
+
+/// Only a unique row that passes the same integrity checks `classify` applies
+/// may establish a (login, org) pair. `false`: its login is invalid.
+pub(crate) fn prove_membership(
+    row: &ClaudeLocalOtelEvidence,
+    root: &str,
+    memberships: &mut BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let login = valid_login(row, root);
+    if let (Some(login), Some(org)) = (login, complete_org(row)) {
+        let orgs = memberships.entry(login.to_string()).or_default();
+        orgs.insert(org.to_string());
+    }
+    login.is_some()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DesktopCensus {
     pub(crate) completed_at_unix_seconds: u64,
@@ -4488,28 +4562,14 @@ impl<'a> ScanEvidence<'a> {
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
-            for row in rows {
-                evidence
-                    .requests
-                    .entry((root.as_str(), row.request_id.as_str()))
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some(row));
+            for (request_id, row) in unique_by_request(rows) {
+                evidence.requests.insert((root.as_str(), request_id), row);
             }
         }
-        // Only unique rows that pass the same integrity checks `classify`
-        // applies may establish a (login, org) pair.
         for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
-            let Some(login) = valid_login(row, key.0) else {
+            if !prove_membership(row, key.0, &mut evidence.memberships) {
                 evidence.invalid_logins.insert(key);
-                continue;
-            };
-            if let Some(org) = complete_org(row) {
-                evidence
-                    .memberships
-                    .entry(login.to_string())
-                    .or_default()
-                    .insert(org.to_string());
             }
         }
         for (root, rows) in &trace.evidence {
@@ -4522,6 +4582,17 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    /// The whole corpus's cross-root answers, for a pass whose reports hold
+    /// only the page roots: request roots and login memberships.
+    pub(crate) fn with_cross_root(
+        mut self,
+        cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
+    ) -> Self {
+        self.cross_request_roots = Some(&cross.request_roots);
+        self.memberships = cross.memberships.clone();
+        self
     }
 
     pub(crate) fn with_unhealthy_reasons(
@@ -4564,40 +4635,23 @@ impl<'a> ScanEvidence<'a> {
     }
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
-    fn request_root(&self, request_id: &str) -> Option<Option<&'a str>> {
-        let roots = self.request_roots.get_or_init(|| {
-            // Both maps are ordered by (root, request id); merging them
-            // yields each pair once.
-            let pairs = || {
-                let mut api = self.requests.keys().copied().peekable();
-                let mut trace = self.owners.keys().copied().peekable();
-                std::iter::from_fn(move || match (api.peek(), trace.peek()) {
-                    (Some(a), Some(t)) if a < t => api.next(),
-                    (Some(a), Some(t)) if a > t => trace.next(),
-                    (Some(_), Some(_)) => {
-                        trace.next();
-                        api.next()
-                    }
-                    (Some(_), None) => api.next(),
-                    (None, _) => trace.next(),
-                })
-            };
-            let mut roots = Vec::with_capacity(pairs().count());
-            roots.extend(pairs().map(|(root, request_id)| (request_id, Some(root))));
-            roots.sort_unstable();
-            roots.dedup_by(|later, kept| {
-                if later.0 != kept.0 {
-                    return false;
+    fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
+        let roots = match self.cross_request_roots {
+            Some(roots) => roots,
+            None => self.request_roots.get_or_init(|| {
+                let mut ids_by_root = BTreeMap::<&str, Vec<&str>>::new();
+                for &(root, id) in self.requests.keys().chain(self.owners.keys()) {
+                    ids_by_root.entry(root).or_default().push(id);
                 }
-                kept.1 = None;
-                true
-            });
-            roots
-        });
-        roots
-            .binary_search_by(|(known, _)| (*known).cmp(request_id))
-            .ok()
-            .map(|at| roots[at].1)
+                let mut roots = RequestRootIndex::default();
+                for (ordinal, ids) in (0..).zip(ids_by_root.into_values()) {
+                    roots.add_root(ordinal, ids.into_iter());
+                }
+                roots.finish();
+                roots
+            }),
+        };
+        roots.get(request_id)
     }
 
     /// Adds this scan's status-coverage copy: the `transcript_email` window
@@ -5503,7 +5557,7 @@ fn transcript_requests_counted(item: &SnapshotItem) -> bool {
 }
 
 /// The request-owner root for an item, as D1 derives it.
-fn owner_root(item: &SnapshotItem) -> Option<&str> {
+pub(crate) fn owner_root(item: &SnapshotItem) -> Option<&str> {
     match item.source_session_id.split_once("_agent-") {
         Some((root, agent)) => (!root.is_empty() && !agent.is_empty()).then_some(root),
         None => {

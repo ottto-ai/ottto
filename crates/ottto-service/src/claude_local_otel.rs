@@ -1038,6 +1038,30 @@ pub(crate) fn claude_trace_read_generation(
         .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
+/// Both sidecars' generations, taken before a strict read so a later reread
+/// of the same pair can prove it read the same bytes. `None` when either
+/// file has no generation witness (missing, not a file, or no unix metadata).
+#[derive(PartialEq, Eq)]
+pub(crate) struct ClaudePairGeneration {
+    api: ApiFileGeneration,
+    trace: ApiFileGeneration,
+}
+
+pub(crate) fn claude_pair_generation(
+    support_dir: &Path,
+    session_id: &str,
+) -> Option<ClaudePairGeneration> {
+    let generation = |path: PathBuf| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|metadata| api_file_generation(&metadata))
+    };
+    Some(ClaudePairGeneration {
+        api: generation(evidence_path(support_dir, session_id))?,
+        trace: generation(trace_evidence_path(support_dir, session_id))?,
+    })
+}
+
 pub(crate) fn load_claude_trace_paid(
     support_dir: &Path,
     root: &str,
@@ -1470,6 +1494,22 @@ pub(crate) fn reset_evidence_read_counts_for_test() {
         receipt.set((0, 0, force));
     });
     TRACE_READ_RECEIPT.with(|count| count.set(0));
+}
+
+/// Runs `f`, then puts this thread's read receipts back as they were before
+/// it; a pending trace-read hook is set aside so `f` cannot fire it.
+#[cfg(test)]
+pub(crate) fn without_read_receipts<T>(f: impl FnOnce() -> T) -> T {
+    let api = API_READ_RECEIPT.with(std::cell::Cell::get);
+    let trace = TRACE_READ_RECEIPT.with(std::cell::Cell::get);
+    let bytes = TRACE_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    let hook = TRACE_BEFORE_READ.with(|slot| slot.borrow_mut().take());
+    let value = f();
+    API_READ_RECEIPT.with(|slot| slot.set(api));
+    TRACE_READ_RECEIPT.with(|slot| slot.set(trace));
+    TRACE_BYTES_FOR_TEST.with(|slot| slot.set(bytes));
+    TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
+    value
 }
 
 #[cfg(test)]

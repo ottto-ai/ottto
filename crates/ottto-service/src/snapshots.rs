@@ -57,6 +57,7 @@ pub(crate) mod cache_overcap_tests;
 #[cfg(test)]
 mod cache_policy_tests;
 mod claude_context_file_birth;
+pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
@@ -9122,7 +9123,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         &BTreeSet::new(),
         None,
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     )
 }
 
@@ -9202,8 +9203,47 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
         identity,
         observations,
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     )
+}
+
+/// Where the Claude fold finds the evidence of roots outside its reports.
+#[derive(Clone, Copy)]
+pub(crate) enum ClaudeEvidenceRows<'a> {
+    /// The reports hold every healthy root; these are the API rows of roots
+    /// whose pair was missing or unhealthy, which only veto the file birth rule.
+    Whole(&'a ClaudeVetoApiRows),
+    /// The reports hold the page roots; every root's cross-root answers were
+    /// gathered while the pass read it, and other pairs are reread on demand.
+    Streamed(&'a claude_cross_root_evidence::CrossRootEvidence),
+}
+
+type ClaudeProofRows<'r> = (
+    Option<std::borrow::Cow<'r, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>>,
+    Option<std::borrow::Cow<'r, Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>>,
+);
+
+impl ClaudeEvidenceRows<'_> {
+    /// One root's rows for the terminal proof: the reports' rows, else a
+    /// strict reread of a pair this pass read healthy but did not keep.
+    /// `Err`: that pair changed since, so its family stays unproven.
+    fn proof_rows<'r>(
+        self,
+        root_session_id: &str,
+        api_report: &'r crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        trace_report: &'r crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    ) -> Result<ClaudeProofRows<'r>, IgnoredVeto> {
+        use std::borrow::Cow;
+        let api = api_report.evidence.get(root_session_id);
+        let trace = trace_report.evidence.get(root_session_id);
+        match self {
+            Self::Streamed(cross) if api.is_none() && trace.is_none() => {
+                let (api, trace) = cross.reread(root_session_id)?;
+                Ok((api.map(Cow::Owned), trace.map(Cow::Owned)))
+            }
+            _ => Ok((api.map(Cow::Borrowed), trace.map(Cow::Borrowed))),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9215,7 +9255,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
-    veto_api_rows: &ClaudeVetoApiRows,
+    evidence_rows: ClaudeEvidenceRows<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     if !index.persistence_available() {
         scan.census_complete = false;
@@ -9257,7 +9297,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         &current_files,
         observations,
         comparison,
-        veto_api_rows,
+        evidence_rows,
     );
     // Slice D1: report only. The shadow was measured by the scan; no fold
     // input above read it.
@@ -9320,7 +9360,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     current_files: &BTreeSet<String>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
-    veto_api_rows: &ClaudeVetoApiRows,
+    evidence_rows: ClaudeEvidenceRows<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     if !index.persistence_available() {
         return ClaudeUsageAuthorityDisposition {
@@ -9402,13 +9442,19 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // The canonical ownership reducer validates semantic evidence too (row
     // fingerprints/revisions/clocks and paired clients), beyond file health.
     // No evidence is healthy: the reducer returns Some(empty), not a refusal.
-    let ownership = reports_healthy.then(|| {
-        classify_claude_legacy_request_owners(api_report.evidence.iter(), &trace_report.evidence)
-    });
-    let ownership_refusal = ownership
-        .as_ref()
-        .and_then(|result| result.as_ref().err())
-        .copied();
+    let whole_ownership;
+    let ownership = match evidence_rows {
+        _ if !reports_healthy => None,
+        ClaudeEvidenceRows::Whole(_) => {
+            whole_ownership = classify_claude_legacy_request_owners(
+                api_report.evidence.iter(),
+                &trace_report.evidence,
+            );
+            Some(whole_ownership.as_ref().map_err(|refusal| *refusal))
+        }
+        ClaudeEvidenceRows::Streamed(cross) => Some(cross.legacy_request_owners.verdict()),
+    };
+    let ownership_refusal = ownership.and_then(Result::err);
     let legacy_request_owners = ownership.and_then(Result::ok);
     // Sidecar-content refusals cannot be repaired by rereading transcripts.
     // Keep failed reads retryable; canonical ownership remains unchanged.
@@ -9522,7 +9568,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
             index.claude_usage_family_pending.loaded_all(),
-            legacy_request_owners.as_ref(),
+            legacy_request_owners,
         );
         // Evidence owed ON: owed evidence, including a re-stamp under the
         // identity-contract latch, proves nothing until it resolves.
@@ -9563,17 +9609,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             {
                 continue;
             }
+            let (api_rows, trace_rows) =
+                match evidence_rows.proof_rows(root_session_id, api_report, trace_report) {
+                    Ok(pair) => pair,
+                    Err(refusal) => {
+                        ignored_vetoes |= refusal.bit();
+                        continue;
+                    }
+                };
             let Some(mut family) = prove_claude_usage_family(
                 root_session_id,
                 members,
                 &pending,
-                api_report.evidence.get(root_session_id),
-                trace_report.evidence.get(root_session_id),
+                api_rows.as_deref(),
+                trace_rows.as_deref(),
                 legacy_exclusions.get(root_session_id),
             ) else {
-                if api_report.evidence.contains_key(root_session_id)
-                    || trace_report.evidence.contains_key(root_session_id)
-                {
+                if api_rows.is_some() || trace_rows.is_some() {
                     ignored_vetoes |= IgnoredVeto::ProofFailure.bit();
                 }
                 continue;
@@ -9600,7 +9652,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     witness,
                     api_report,
                     trace_report,
-                    legacy_request_owners.as_ref(),
+                    legacy_request_owners,
                 );
                 if family.is_none()
                     && (api_report.evidence.contains_key(root_session_id)
@@ -9663,7 +9715,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     witness,
                     api_report,
                     trace_report,
-                    legacy_request_owners.as_ref(),
+                    legacy_request_owners,
                 );
                 if family.is_none()
                     && (api_report.evidence.contains_key(root_session_id)
@@ -9853,13 +9905,18 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // Design E: an item without a provider-proven start keeps its own-only
     // scalars by the file birth rule. Loaded telemetry only vetoes them; the
     // census fence and family pending are no longer consulted for scalars.
-    let file_birth_tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
-        snapshots,
-        max_pending_occurrences,
-        api_report,
-        trace_report,
-        veto_api_rows,
-    );
+    let file_birth_tripwire = match evidence_rows {
+        ClaudeEvidenceRows::Whole(veto_api_rows) => {
+            claude_context_file_birth::ClaudeTelemetryTripwire::build(
+                snapshots,
+                max_pending_occurrences,
+                api_report,
+                trace_report,
+                veto_api_rows,
+            )
+        }
+        ClaudeEvidenceRows::Streamed(cross) => cross.tripwire(snapshots, max_pending_occurrences),
+    };
 
     let multi_file_members = claude_context_file_birth::claude_multi_file_members(snapshots, index);
     let mut context_file_birth = ClaudeContextFileBirthCounts::default();
@@ -10294,14 +10351,21 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // skipped. It never touches the contract-5 latch or its own re-arms.
         // A held first proof waits on exactly this due re-arm (C1a's dormant
         // owner successor), so it vetoes the skip.
-        let first_proof_hold = legacy_request_owners.as_ref().map(|request_owners| {
+        let first_proof_hold = legacy_request_owners.map(|request_owners| {
             claude_dormant_owner_successors(
                 index,
                 &proven,
                 &complete_families,
                 census_window_end,
                 request_owners,
-                api_report,
+                |root_session_id| match evidence_rows {
+                    ClaudeEvidenceRows::Whole(_) => api_report
+                        .evidence
+                        .get(root_session_id)
+                        .map(Vec::as_slice)
+                        .and_then(claude_earliest_request),
+                    ClaudeEvidenceRows::Streamed(cross) => cross.earliest_request(root_session_id),
+                },
             )
         });
         let first_proof_held =
@@ -10568,7 +10632,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     &changed_duplicate_request_hashes,
                     &duplicated_request_hashes,
                 ),
-                legacy_request_owners.as_ref(),
+                legacy_request_owners,
             )
         } else {
             None
@@ -12459,7 +12523,7 @@ fn claude_unchanged_proof_roots<'p>(
         &BTreeSet<String>,
         &BTreeSet<String>,
     ),
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> Option<BTreeMap<&'p str, bool>> {
     if !index.persistence_available() {
         return None;
@@ -12578,7 +12642,7 @@ fn claude_unchanged_proof_roots<'p>(
                     continue;
                 };
                 if owner.root_session_id != *root_session_id {
-                    if let Some(unchanged) = roots.get_mut(owner.root_session_id.as_str()) {
+                    if let Some(unchanged) = roots.get_mut(owner.root_session_id) {
                         *unchanged = false;
                     }
                 }
@@ -12642,8 +12706,8 @@ fn claude_dormant_owner_successors(
     proven: &BTreeMap<String, ProvenClaudeUsageFamily>,
     complete_families: &BTreeMap<String, BTreeSet<String>>,
     census_window_end: &str,
-    request_owners: &BTreeMap<String, ClaudeLegacyRequestOwner>,
-    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    request_owners: &ClaudeLegacyRequestOwners,
+    earliest_request: impl Fn(&str) -> Option<u64>,
 ) -> ClaudeFirstProofHoldCounts {
     let dormant_witnessed_root = |root_session_id: &str| {
         index
@@ -12672,7 +12736,7 @@ fn claude_dormant_owner_successors(
         let held = occurrences.keys().any(|request_hash| {
             request_owners.get(request_hash).is_some_and(|owner| {
                 owner.root_session_id != *root_session_id
-                    && dormant_witnessed_root(&owner.root_session_id)
+                    && dormant_witnessed_root(owner.root_session_id)
             })
         });
         if !held {
@@ -12681,12 +12745,9 @@ fn claude_dormant_owner_successors(
         counts.dormant_owner_successor_family_count = counts
             .dormant_owner_successor_family_count
             .saturating_add(1);
-        let earliest_request = api_report.evidence.get(root_session_id).and_then(|rows| {
-            rows.iter()
-                .filter_map(|row| rfc3339_unix_seconds(&row.observed_at))
-                .min()
-        });
-        if let (Some(now), Some(earliest_request)) = (census_unix_seconds, earliest_request) {
+        if let (Some(now), Some(earliest_request)) =
+            (census_unix_seconds, earliest_request(root_session_id))
+        {
             let age = now.saturating_sub(earliest_request);
             oldest_age_seconds = Some(oldest_age_seconds.map_or(age, |oldest| oldest.max(age)));
         }
@@ -12696,6 +12757,15 @@ fn claude_dormant_owner_successors(
             Some(ClaudeFirstProofHoldAge::from_seconds(oldest_age_seconds));
     }
     counts
+}
+
+/// The earliest observed time of one root's API rows, its dormant age basis.
+fn claude_earliest_request(
+    rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+) -> Option<u64> {
+    rows.iter()
+        .filter_map(|row| rfc3339_unix_seconds(&row.observed_at))
+        .min()
 }
 
 /// Whether witnessed families this window did not read are all that keep a
@@ -12839,10 +12909,127 @@ fn claude_owned_start_was_census_verified(item: &SnapshotItem, index: &ScanIndex
         })
 }
 
-#[derive(Debug, Clone)]
-struct ClaudeLegacyRequestOwner {
-    root_session_id: String,
-    evidence_fingerprint: String,
+/// One request's legacy owner: its root and the owner's evidence fingerprint.
+#[derive(Clone, Copy)]
+struct ClaudeLegacyRequestOwner<'a> {
+    root_session_id: &'a str,
+    evidence_fingerprint: &'a [u8; 32],
+}
+
+/// The legacy owner of each request, keyed by the request id's SHA-256: the
+/// root whose own (root-member) API row and trace row claim it. Built root by
+/// root in sorted root order, and the first refusal stops it, so the verdict
+/// equals one pass over every root. Digests and a root ordinal keep a whole
+/// corpus small; the fingerprint hashes the root STRING (kept in `roots`).
+#[derive(Default)]
+pub(crate) struct ClaudeLegacyRequestOwners {
+    roots: Vec<String>,
+    owners: BTreeMap<[u8; 32], (u32, [u8; 32])>,
+    refusal: Option<IgnoredVeto>,
+}
+
+impl std::fmt::Debug for ClaudeLegacyRequestOwners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeLegacyRequestOwners")
+            .field("roots", &self.roots.len())
+            .field("owners", &self.owners.len())
+            .field("refusal", &self.refusal)
+            .finish()
+    }
+}
+
+impl ClaudeLegacyRequestOwners {
+    /// Adds one healthy root's rows. Call in sorted root order, once per root
+    /// with API rows; after a refusal nothing more is added.
+    pub(crate) fn add_root(
+        &mut self,
+        root_session_id: &str,
+        api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+    ) {
+        if self.refusal.is_none() {
+            if let Err(refusal) = self.try_add_root(root_session_id, api_rows, trace_rows) {
+                self.refusal = Some(refusal);
+            }
+        }
+    }
+
+    fn try_add_root(
+        &mut self,
+        root_session_id: &str,
+        api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+    ) -> Result<(), IgnoredVeto> {
+        let trace_rows = trace_rows.ok_or(IgnoredVeto::EvidenceGap)?;
+        let members = std::iter::once(root_session_id.to_owned())
+            .chain(
+                trace_rows
+                    .iter()
+                    .filter(|row| !row.agent_id.trim().is_empty())
+                    .map(|row| claude_trace_owner_session_id(root_session_id, &row.agent_id)),
+            )
+            .collect::<BTreeSet<_>>();
+        // This graph reads request ids and fingerprints only; the canonical
+        // reducer can borrow rows instead of cloning their payload strings.
+        let reduced = classify_claude_usage_ledger_with_rows(
+            root_session_id,
+            &members,
+            api_rows,
+            trace_rows,
+            |row| row,
+        )?;
+        let trace_by_request = trace_rows
+            .iter()
+            .map(|row| (row.request_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        let root = u32::try_from(self.roots.len()).map_err(|_| IgnoredVeto::EvidenceGap)?;
+        self.roots.push(root_session_id.to_owned());
+        for row in reduced
+            .rows_by_member
+            .get(root_session_id)
+            .ok_or(IgnoredVeto::EvidenceGap)?
+        {
+            let trace = trace_by_request
+                .get(row.request_id.as_str())
+                .ok_or(IgnoredVeto::EvidenceGap)?;
+            if !trace.agent_id.trim().is_empty() {
+                return Err(IgnoredVeto::EvidenceGap);
+            }
+            let request_hash = <[u8; 32]>::from(Sha256::digest(row.request_id.as_bytes()));
+            let evidence_fingerprint = <[u8; 32]>::from(sha256_digest(&[
+                "claude_legacy_request_owner:v1",
+                root_session_id,
+                claude_request_identity::digest_hex::encode(&request_hash).as_str(),
+                row.fingerprint.as_str(),
+                trace.fingerprint.as_str(),
+            ]));
+            if self
+                .owners
+                .insert(request_hash, (root, evidence_fingerprint))
+                .is_some()
+            {
+                return Err(IgnoredVeto::MultiRootClaims);
+            }
+        }
+        Ok(())
+    }
+
+    /// The owners, or the first refusal that stopped them.
+    fn verdict(&self) -> Result<&Self, IgnoredVeto> {
+        self.refusal.map_or(Ok(self), Err)
+    }
+
+    /// The owner of the request whose SHA-256 hex is `request_hash`.
+    fn get(&self, request_hash: &str) -> Option<ClaudeLegacyRequestOwner<'_>> {
+        let request_hash =
+            claude_request_identity::digest_hex::decode::<serde::de::value::Error>(request_hash)
+                .ok()?;
+        let (root, evidence_fingerprint) = self.owners.get(&request_hash)?;
+        Some(ClaudeLegacyRequestOwner {
+            root_session_id: &self.roots[*root as usize],
+            evidence_fingerprint,
+        })
+    }
 }
 
 /// Infer only the usage exclusion, never a provider graph edge, for legacy
@@ -12855,7 +13042,7 @@ struct ClaudeLegacyRequestOwner {
 fn derive_claude_legacy_usage_exclusions(
     complete_families: &BTreeMap<String, BTreeSet<String>>,
     pending_by_root: &BTreeMap<String, ClaudeUsageFamilyPending>,
-    request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> BTreeMap<String, ClaudeLegacyUsageExclusion> {
     let Some(request_owners) = request_owners else {
         return BTreeMap::new();
@@ -12889,7 +13076,7 @@ fn derive_claude_legacy_usage_exclusions(
             .iter()
             .take_while(|request_hash| {
                 request_owners
-                    .get(*request_hash)
+                    .get(request_hash)
                     .is_some_and(|owner| owner.root_session_id != *child_root)
             })
             .count();
@@ -12919,7 +13106,7 @@ fn derive_claude_legacy_usage_exclusions(
             .filter_map(|request_hash| {
                 request_owners
                     .get(request_hash)
-                    .map(|owner| owner.root_session_id.clone())
+                    .map(|owner| owner.root_session_id.to_owned())
             })
             .collect::<BTreeSet<_>>();
         let Some(evidence_fingerprint) = claude_legacy_exclusion_evidence_fingerprint(
@@ -12945,7 +13132,7 @@ fn derive_claude_legacy_usage_exclusions(
 fn claude_legacy_request_owners(
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-) -> Option<BTreeMap<String, ClaudeLegacyRequestOwner>> {
+) -> Option<ClaudeLegacyRequestOwners> {
     if !api_report.health.is_complete() || !trace_report.is_complete() {
         return None;
     }
@@ -12963,7 +13150,7 @@ fn claude_legacy_request_owners_from_rows<'a>(
         String,
         Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
     >,
-) -> Option<BTreeMap<String, ClaudeLegacyRequestOwner>> {
+) -> Option<ClaudeLegacyRequestOwners> {
     classify_claude_legacy_request_owners(api_rows, trace_rows_by_root).ok()
 }
 
@@ -12978,73 +13165,25 @@ fn classify_claude_legacy_request_owners<'a>(
         String,
         Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
     >,
-) -> Result<BTreeMap<String, ClaudeLegacyRequestOwner>, IgnoredVeto> {
-    let mut owners = BTreeMap::new();
+) -> Result<ClaudeLegacyRequestOwners, IgnoredVeto> {
+    let mut owners = ClaudeLegacyRequestOwners::default();
     for (root_session_id, api_rows) in api_rows {
-        let trace_rows = trace_rows_by_root
-            .get(root_session_id)
-            .ok_or(IgnoredVeto::EvidenceGap)?;
-        let members = std::iter::once(root_session_id.clone())
-            .chain(
-                trace_rows
-                    .iter()
-                    .filter(|row| !row.agent_id.trim().is_empty())
-                    .map(|row| claude_trace_owner_session_id(root_session_id, &row.agent_id)),
-            )
-            .collect::<BTreeSet<_>>();
-        // This graph reads request ids and fingerprints only; the canonical
-        // reducer can borrow rows instead of cloning their payload strings.
-        let reduced = classify_claude_usage_ledger_with_rows(
+        owners.add_root(
             root_session_id,
-            &members,
             api_rows,
-            trace_rows,
-            |row| row,
-        )?;
-        let trace_by_request = trace_rows
-            .iter()
-            .map(|row| (row.request_id.as_str(), row))
-            .collect::<BTreeMap<_, _>>();
-        for row in reduced
-            .rows_by_member
-            .get(root_session_id)
-            .ok_or(IgnoredVeto::EvidenceGap)?
-        {
-            let trace = trace_by_request
-                .get(row.request_id.as_str())
-                .ok_or(IgnoredVeto::EvidenceGap)?;
-            if !trace.agent_id.trim().is_empty() {
-                return Err(IgnoredVeto::EvidenceGap);
-            }
-            let request_hash = format!("{:x}", Sha256::digest(row.request_id.as_bytes()));
-            let evidence_fingerprint = sha256_hex(&[
-                "claude_legacy_request_owner:v1",
-                root_session_id,
-                request_hash.as_str(),
-                row.fingerprint.as_str(),
-                trace.fingerprint.as_str(),
-            ]);
-            if owners
-                .insert(
-                    request_hash,
-                    ClaudeLegacyRequestOwner {
-                        root_session_id: root_session_id.clone(),
-                        evidence_fingerprint,
-                    },
-                )
-                .is_some()
-            {
-                return Err(IgnoredVeto::MultiRootClaims);
-            }
-        }
+            trace_rows_by_root.get(root_session_id),
+        );
     }
-    Ok(owners)
+    match owners.refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(owners),
+    }
 }
 
 fn claude_legacy_exclusion_evidence_fingerprint(
     child_root: &str,
     excluded_request_id_hashes: &BTreeSet<String>,
-    request_owners: &BTreeMap<String, ClaudeLegacyRequestOwner>,
+    request_owners: &ClaudeLegacyRequestOwners,
 ) -> Option<String> {
     if excluded_request_id_hashes.is_empty() {
         return None;
@@ -13062,7 +13201,9 @@ fn claude_legacy_exclusion_evidence_fingerprint(
         digest.update(b"\0");
         digest.update(owner.root_session_id.as_bytes());
         digest.update(b"\0");
-        digest.update(owner.evidence_fingerprint.as_bytes());
+        digest.update(
+            claude_request_identity::digest_hex::encode(owner.evidence_fingerprint).as_bytes(),
+        );
         digest.update(b"\0");
     }
     Some(format!("{:x}", digest.finalize()))
@@ -13070,7 +13211,7 @@ fn claude_legacy_exclusion_evidence_fingerprint(
 
 fn validate_claude_legacy_exclusion_witness(
     witness: &ClaudeUsageFamilyWitness,
-    request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> bool {
     if witness.legacy_excluded_request_id_hashes.is_empty() {
         return witness.legacy_exclusion_evidence_fingerprint.is_none()
@@ -13091,7 +13232,7 @@ fn validate_claude_legacy_exclusion_witness(
         .filter_map(|request_hash| {
             owners
                 .get(request_hash)
-                .map(|owner| owner.root_session_id.clone())
+                .map(|owner| owner.root_session_id.to_owned())
         })
         .collect::<BTreeSet<_>>();
     actual_owner_roots == witness.legacy_owner_roots
@@ -13211,7 +13352,7 @@ fn reconstruct_claude_usage_family(
     witness: &ClaudeUsageFamilyWitness,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> Option<ProvenClaudeUsageFamily> {
     reconstruct_claude_usage_family_from_rows(
         root_session_id,
@@ -13227,7 +13368,7 @@ fn reconstruct_claude_usage_family_from_rows(
     witness: &ClaudeUsageFamilyWitness,
     api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> Option<ProvenClaudeUsageFamily> {
     let reduced = reconstruct_claude_usage_ledger_from_rows(
         root_session_id,
@@ -13250,7 +13391,7 @@ fn reconstruct_claude_usage_ledger_from_rows(
     witness: &ClaudeUsageFamilyWitness,
     api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> Option<ReducedClaudeUsageLedger> {
     reconstruct_claude_usage_ledger_with_rows(
         root_session_id,
@@ -13267,7 +13408,7 @@ fn reconstruct_claude_usage_ledger_borrowed<'a>(
     witness: &ClaudeUsageFamilyWitness,
     api_rows: &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
 ) -> Option<ReducedClaudeUsageLedger<&'a crate::claude_local_otel::ClaudeLocalOtelEvidence>> {
     reconstruct_claude_usage_ledger_with_rows(
         root_session_id,
@@ -13284,7 +13425,7 @@ fn reconstruct_claude_usage_ledger_with_rows<'a, R>(
     witness: &ClaudeUsageFamilyWitness,
     api_rows: &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
     row_view: impl FnMut(&'a crate::claude_local_otel::ClaudeLocalOtelEvidence) -> R,
 ) -> Option<ReducedClaudeUsageLedger<R>> {
     let members = witness
@@ -53980,12 +54121,16 @@ fn u64_at(value: &Value, path: &[&str]) -> Option<u64> {
 }
 
 fn sha256_hex(parts: &[&str]) -> String {
+    format!("{:x}", sha256_digest(parts))
+}
+
+fn sha256_digest(parts: &[&str]) -> sha2::digest::Output<Sha256> {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update(part.as_bytes());
         digest.update([0]);
     }
-    format!("{:x}", digest.finalize())
+    digest.finalize()
 }
 
 /// Feed `bytes` into `digest` behind a 4-byte big-endian length.

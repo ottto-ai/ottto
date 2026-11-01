@@ -130,6 +130,17 @@ thread_local! {
 pub(crate) fn take_diag() -> BTreeMap<&'static str, u64> {
     DIAG.with(|diag| std::mem::take(&mut *diag.borrow_mut()))
 }
+/// Runs `f`, then puts this thread's diag and stage timers back as they were
+/// before it: a comparison run that observes and leaves no count behind.
+#[cfg(test)]
+pub(crate) fn without_diag<T>(f: impl FnOnce() -> T) -> T {
+    let diag = take_diag();
+    let stages = STAGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let value = f();
+    DIAG.with(|slot| *slot.borrow_mut() = diag);
+    STAGES.with(|slot| *slot.borrow_mut() = stages);
+    value
+}
 #[inline(always)]
 fn diag(reason: &'static str, n: u64) {
     #[cfg(test)]
