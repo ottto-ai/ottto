@@ -386,16 +386,33 @@ fn condition_b(class: &str) {
                 ],
                 &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
             );
-            let mut next = [ram, restart, cold].map(|prior| {
-                c.raw(
-                    &E2ScanFixture::with_identity_capture(true),
-                    prior,
-                    100,
-                    false,
-                    &[],
-                )
-            });
-            finish_claude_pages(&c, &mut next);
+            // The first page's growth claim on the live v2 session paces a
+            // second growth Full of this file for six hours; v1 has no growth
+            // pacing. Scan the next page past that interval, every arm alike.
+            let scan = || {
+                let mut next = [ram, restart, cold].map(|prior| {
+                    c.raw(
+                        &E2ScanFixture::with_identity_capture(true),
+                        prior,
+                        100,
+                        false,
+                        &[],
+                    )
+                });
+                finish_claude_pages(&c, &mut next);
+                next
+            };
+            #[cfg(unix)]
+            let next = crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 7 * 60 * 60,
+                scan,
+            );
+            #[cfg(not(unix))]
+            let next = scan();
             for candidate in &next[1..] {
                 assert_eq!(candidate.receipt(), next[0].receipt(), "restart join keys");
                 assert_eq!(
