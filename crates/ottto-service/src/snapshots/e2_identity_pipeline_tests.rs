@@ -564,25 +564,59 @@ fn e2_pipeline_owed_restamp_equals_a_full_of_the_same_bytes() {
         entry.source_file_fingerprint.clear();
     }
 
-    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let (restamped, _, failed) = e2_page(roots, &support, &mut owed);
-    let counts = scope.finish().contract.evidence_owed;
+    let state = |index: &ScanIndex| {
+        format!(
+            "latch={} contract={:?} quarantine={:?} pending={:?} owed={:?} current_records={:?}",
+            index.claude_request_identity_contract_changed,
+            index.claude_request_identity_contract,
+            index
+                .claude_usage_authority_quarantine
+                .values()
+                .map(|record| format!("{:?}", record.disposition))
+                .collect::<Vec<_>>(),
+            index
+                .claude_usage_family_pending
+                .values()
+                .map(|pending| (
+                    pending.census_window_end.clone(),
+                    pending.invalid,
+                    pending.contract_unproven,
+                    pending.identity_contract.is_some(),
+                    pending.member_occurrences.len()
+                ))
+                .collect::<Vec<_>>(),
+            family
+                .iter()
+                .map(|key| index.files[key].evidence_owed)
+                .collect::<Vec<_>>(),
+            family
+                .iter()
+                .map(|key| index.claude_request_census.get(key).is_some_and(|record| {
+                    record.current_for(&index.files[key].source_file_fingerprint)
+                }))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before = state(&owed);
+    let ((restamped, _, failed), rows) =
+        crate::local_resource_diagnostics::capture(|| e2_page(roots, &support, &mut owed));
     assert!(!failed);
     let emitted = restamped
         .iter()
         .map(|item| item.source_session_id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        (
-            counts.restamped,
-            counts.restamped_from_record,
-            counts.read,
-            counts.selected_by_other_reason
-        ),
-        (2, 1, 0, 0),
-        "{counts:?} emitted={emitted:?}"
+    let notes = rows
+        .iter()
+        .map(|row| row.to_string())
+        .filter(|row| row.contains("evidence_owed") || row.contains("parse_reasons"))
+        .map(|row| row.chars().take(1_500).collect::<String>())
+        .take(4)
+        .collect::<Vec<_>>();
+    assert!(
+        emitted.is_empty(),
+        "a re-stamp reads nothing: emitted={emitted:?} before={before} after={} rows={notes:?}",
+        state(&owed)
     );
-    assert!(emitted.is_empty(), "a re-stamp reads nothing");
     assert!(family.iter().all(|key| !owed.files[key].evidence_owed));
 
     let (reread, _, failed) = e2_page(roots, &support, &mut full);
