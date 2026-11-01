@@ -10,6 +10,10 @@ pub(super) struct ResendCounts {
     pub local_bytes: u64,
     pub identical: u64,
     pub changed: u64,
+    /// Catch-up the local pass allowance deferred: pacing debt, not a conflict.
+    pub budget_deferred: u64,
+    /// Entities the backend answered with a real conflict.
+    pub server_conflicts: u64,
 }
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(super) struct Cycle {
@@ -86,6 +90,11 @@ impl Cycle {
         &mut self,
         candidates: &[crate::snapshots::UploadContextReceiptCandidate],
     ) {
+        // A cycle with no active context (Pi until readers switch) decides
+        // nothing from receipts; its candidates only write them.
+        if self.active.is_none() {
+            return;
+        }
         self.candidates = candidates
             .iter()
             .flat_map(|c| c.entities().map(|(fp, _)| fp.clone()))
@@ -125,7 +134,12 @@ impl Cycle {
             .iter()
             .filter(|(entities, _)| !entities.is_disjoint(&self.not_stored))
             .collect();
-        if self.counts.entities > 0 || self.counts.local_bytes > 0 || !held.is_empty() {
+        if self.counts.entities > 0
+            || self.counts.local_bytes > 0
+            || self.counts.budget_deferred > 0
+            || self.counts.server_conflicts > 0
+            || !held.is_empty()
+        {
             crate::local_resource_diagnostics::traversal_point(
                 "upload_context",
                 source,
@@ -212,7 +226,7 @@ impl SnapshotUploadProgress {
             .collect();
     }
 }
-crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed);
+crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed, budget_deferred, server_conflicts);
 crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]

@@ -106,12 +106,7 @@ fn lowest_legacy_settlement_cursor() -> String {
     "0".repeat(64)
 }
 
-fn is_snapshot_fingerprint(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+use crate::hex::is_sha256_lower as is_snapshot_fingerprint;
 
 /// Bring an out-of-shape refusal record back to its disposition's shape. The
 /// disposition is the explicit state; the count and deadline are its

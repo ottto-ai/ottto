@@ -325,18 +325,33 @@ fn load_with_custody(
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
+                        #[cfg(test)]
+                        if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
+                        {
+                            let stamps = sqlite::delete_row_elsewhere_for_test(&session.db, &key);
+                            tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
+                        }
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-                        // Digest the exact persisted image: a save then also
-                        // persists whatever normalization changes.
-                        let digests = kinds::baseline(&index, &mut cx)?;
-                        normalize_hydrated(&mut index)?;
-                        session.stamp = session.db.stamp()?;
-                        ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
-                        state.save_digests = Some(digests);
-                        session.cx = cx;
-                        index.v2_mut().persistence_v2 = Some(runtime.clone());
-                        telemetry::event("route", &"v2");
-                        return Ok(Some(index));
+                        // The image read must be the stamp this session holds:
+                        // after a commit from elsewhere neither its baseline
+                        // nor its lineage is adopted; reopen below.
+                        if session.db.stamp()? == stamp {
+                            // Digest the exact persisted image: a save then
+                            // also persists whatever normalization changes.
+                            let digests = kinds::baseline(&index, &mut cx)?;
+                            normalize_hydrated(&mut index)?;
+                            state.save_digests = Some(digests);
+                            // Same session and stamp: rollovers its commits
+                            // wrote stay committed for graphs that outlive
+                            // this load.
+                            if !session.cx.ambiguous {
+                                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
+                            }
+                            session.cx = cx;
+                            index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            telemetry::event("route", &"v2");
+                            return Ok(Some(index));
+                        }
                     }
                 }
                 // Invalidate every old clone before replacing the connection.
@@ -609,6 +624,9 @@ fn save_with_custody(
                 let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
+                // Committed rollovers outlive the dropped baseline: a sibling
+                // graph saved after a claim-only save still skips them.
+                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                 session.cx = cx;
                 digests
             }

@@ -22,13 +22,27 @@ fn retention_fixture() -> (PathBuf, String, ScanIndex) {
     let member = pending.members.keys().next().unwrap().clone();
     pending.members.remove(&member);
     pending.member_requests.remove(&member);
-    pending.previous_windows = (0..6)
-        .map(|minute| {
-            history.census_window_end = format!("2026-08-02T07:0{minute}:00Z");
-            history.clone()
-        })
-        .collect();
+    pending.previous_windows = ArchivedWindows::Resident(
+        (0..6)
+            .map(|minute| {
+                history.census_window_end = format!("2026-08-02T07:0{minute}:00Z");
+                history.clone()
+            })
+            .collect(),
+    );
     (dir, root, index)
+}
+
+/// The v2 hydrate's view of `index`: each archive folded cold, as stored.
+fn cold(mut index: ScanIndex) -> ScanIndex {
+    for pending in index.claude_account_family_pending.values_mut() {
+        let windows = std::mem::take(pending.previous_windows.resident_mut());
+        let stored = windows.len() as u64;
+        let mut fold = account_pending_retention::ColdFold::default();
+        windows.into_iter().for_each(|window| fold.push(window));
+        pending.previous_windows = fold.finish((stored != 0).then_some(stored));
+    }
+    index
 }
 
 fn retention_decision(mut index: ScanIndex, root: &str) -> (bool, serde_json::Value) {
@@ -48,7 +62,7 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
         let mut before = base.clone();
         let key = before.files.keys().next().unwrap().clone();
         let pending = before.claude_account_family_pending.get_mut(&root).unwrap();
-        for window in &mut pending.previous_windows {
+        for window in pending.previous_windows.resident_mut() {
             match blocker {
                 "revision" => {
                     for requests in window.member_requests.values_mut() {
@@ -77,6 +91,7 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
         assert_eq!(
             after.claude_account_family_pending[&root]
                 .previous_windows
+                .resident()
                 .len(),
             2
         );
@@ -85,9 +100,18 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
             claude_pending_family_session_ids(&after),
             "scheduling {blocker}"
         );
+        // [money] Cold arm: the v2 summary schedules and retires alike.
+        let cold_before = cold(before.clone());
+        assert_eq!(
+            claude_pending_family_session_ids(&cold_before),
+            claude_pending_family_session_ids(&before),
+            "cold scheduling {blocker}"
+        );
+        let cold_decision = retention_decision(cold_before, &root);
         let expected = retention_decision(before, &root);
         assert_eq!(expected.0, blocker != "none", "nonvacuous {blocker}");
         assert_eq!(retention_decision(after, &root), expected, "{blocker}");
+        assert_eq!(cold_decision, expected, "cold {blocker}");
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -107,11 +131,12 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
         "member_count",
     ] {
         let mut index = base.clone();
-        let windows = &mut index
+        let windows = index
             .claude_account_family_pending
             .get_mut(&root)
             .unwrap()
-            .previous_windows;
+            .previous_windows
+            .resident_mut();
         let seed = windows[0].clone();
         *windows = (0..9)
             .map(|minute| {
@@ -153,7 +178,9 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
             .collect();
         let original = windows.clone();
         index.collapse_account_pending_windows();
-        let collapsed = &index.claude_account_family_pending[&root].previous_windows;
+        let collapsed = index.claude_account_family_pending[&root]
+            .previous_windows
+            .resident();
         assert_eq!(
             collapsed,
             &[
@@ -174,6 +201,8 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] Unsafe archived boundaries: the load walk refuses a resident
+/// family and never walks a cold one; neither changes.
 #[test]
 fn account_window_unsafe_boundaries_are_untouched() {
     let (dir, root, base) = retention_fixture();
@@ -188,13 +217,23 @@ fn account_window_unsafe_boundaries_are_untouched() {
             .claude_account_family_pending
             .get_mut(&root)
             .unwrap()
-            .previous_windows[2]
+            .previous_windows
+            .resident_mut()[2]
             .census_window_end = boundary.into();
-        let before = index.claude_account_family_pending.clone();
-        index.collapse_account_pending_windows();
-        assert_eq!(index.claude_account_family_pending, before);
-        assert_eq!(index.claude_account_window_retention.windows_collapsed, 0);
-        assert_eq!(index.claude_account_window_retention.roots_refused, 1);
+        // Cold arm: never walked, nothing changes; `uncollapsed` counts the
+        // interior windows of equal-evidence runs, boundaries unchecked.
+        for (cold_arm, mut index) in [(false, index.clone()), (true, cold(index))] {
+            let before = index.claude_account_family_pending.clone();
+            index.collapse_account_pending_windows();
+            assert_eq!(index.claude_account_family_pending, before);
+            assert_eq!(index.claude_account_window_retention.windows_collapsed, 0);
+            let refused = u64::from(!cold_arm);
+            assert_eq!(index.claude_account_window_retention.roots_refused, refused);
+            let uncollapsed = index.claude_account_family_pending[&root]
+                .previous_windows
+                .uncollapsed();
+            assert_eq!(uncollapsed != 0, cold_arm);
+        }
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -229,13 +268,13 @@ fn account_window_boundaries_keep_retirement_outcomes() {
             .strip_prefix("tie ")
             .and_then(|tie| tie.split_once(' '))
         {
-            let member = pending.previous_windows[5]
+            let member = pending.previous_windows.resident()[5]
                 .members
                 .keys()
                 .find(|member| !pending.members.contains_key(*member))
                 .unwrap()
                 .clone();
-            let windows = &mut pending.previous_windows;
+            let windows = pending.previous_windows.resident_mut();
             windows[4].census_window_end = windows[5].census_window_end.clone();
             let window = &mut windows[if order == "first" { 4 } else { 5 }];
             match change {
@@ -250,9 +289,17 @@ fn account_window_boundaries_keep_retirement_outcomes() {
                 }
             }
         } else if boundary != "control" {
-            pending.previous_windows[2].census_window_end = boundary.into();
+            pending.previous_windows.resident_mut()[2].census_window_end = boundary.into();
         }
         let before = pending.clone();
+        // Cold arm: the same outcome from the cold summary.
+        let mut cold_index = cold(index.clone());
+        cold_index.retire_committed_claude_account_pending_windows();
+        assert_eq!(
+            cold_index.claude_account_family_pending.contains_key(&root),
+            !retires,
+            "cold {boundary}"
+        );
         index.retire_committed_claude_account_pending_windows();
         assert_eq!(
             index.claude_account_family_pending.get(&root),
@@ -369,6 +416,7 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
     assert_eq!(
         again.claude_account_family_pending[&root]
             .previous_windows
+            .resident()
             .len(),
         6
     );
