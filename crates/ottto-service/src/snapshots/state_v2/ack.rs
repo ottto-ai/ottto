@@ -34,8 +34,7 @@ fn require(ok: bool, reason: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Runtime-only. Clones retain the authenticated source scope, not environment
-/// switch state. A companion from another DB or a newer recovery set holds.
+/// Runtime-only. Clones retain the authenticated source scope. A companion from another DB or a newer recovery set holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgressRecovery {
     scope: Scope,
@@ -380,7 +379,7 @@ impl ProgressRecovery {
     }
 
     /// Caller holds the source owner; called before progress decoding/containment.
-    /// OFF/v1 and Codex/Pi perform no extra reads, writes or normalization.
+    /// v1 and Codex/Pi perform no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {
         if !state_v2_growth_retention_active(index) {
             return Ok(None);

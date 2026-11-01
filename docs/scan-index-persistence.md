@@ -1,10 +1,12 @@
 # ScanIndex staged persistence: reader release N
 
-## State-v2 backend under construction
+## State-v2 store
 
-The private state-v2 backend is not yet routed from application load/save. The
-reader and legacy-write behavior below remains the active behavior. The backend
-alone does not provide conversion, publication, recovery or a runtime switch.
+State-v2 is the Claude scan-index store. A daemon load that names its support
+directory converts a Claude v1 index to it, publishes a durable fence and uses the
+store from then on. A load without a support directory (unit tests, tools) stays
+on v1 unless the store is already published. Codex and Pi keep the reader and
+legacy-write behavior below.
 
 Its format-1 schema uses four physical tables: control, records, shared_values
 and value_chunks. Typed per-kind headers project bounded selection fields;

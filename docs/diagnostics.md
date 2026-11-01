@@ -60,11 +60,9 @@ appear in this section. Approved upload uses the existing disclosure and consent
 
 ## Local Resource Measurements
 
-The default-OFF state-v2 backend uses stage `claude_state_v2` in this same
-local sink. Conversion remains paused while publication integration is incomplete;
-these measurements alone do not establish conversion or rollout acceptance.
-Only opted-in or already active Claude custody enables the resource probes;
-Codex and Pi keep their existing measurements.
+The state-v2 store, Claude's scan-index store, uses stage `claude_state_v2` in
+this same local sink. Only Claude's daemon loads and already active Claude custody
+enable the resource probes; Codex and Pi keep their existing measurements.
 
 | Field | Measurement |
 | --- | --- |
@@ -1877,7 +1875,7 @@ Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
 
-The default-OFF Claude state-v2 route reports current bounded states through the
+The Claude state-v2 route reports current bounded states through the
 existing local resource diagnostics sink, including `growth_claim_refused` labels.
 It keeps CPU/RSS, WAL, import peak versus the same-process v1 load, erasure inventory
 and baseline-age/escalation gauges. It does not maintain a second cumulative event
