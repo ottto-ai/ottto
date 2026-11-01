@@ -696,6 +696,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -1583,6 +1584,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -1613,6 +1615,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 /// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    let _on = RestartRestoreForTest::enabled();
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
@@ -1732,6 +1735,7 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let _on = RestartRestoreForTest::enabled();
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
     let tombstone_slot = fields.len() - 3;
@@ -4090,6 +4094,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 /// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let _on = RestartRestoreForTest::enabled();
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
@@ -4259,6 +4264,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
 /// Pin the absent-field downgrade contract while preserving the census bytes.
 #[test]
 fn retired_reread_new_writer_keeps_previous_default_contract() {
+    let _on = RestartRestoreForTest::enabled();
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousCounts {

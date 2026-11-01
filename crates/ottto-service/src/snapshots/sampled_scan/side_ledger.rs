@@ -873,7 +873,8 @@ mod tests {
         assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
         assert_eq!(bound(&empty, usize::MAX).is_some(), layout_supported());
         if layout_supported() {
-            // The term is exactly the constant: one visit, no walk.
+            // The ledger remains a constant, lock-free term. The optional
+            // store root also reserves main's inline bytes without a walk.
             let mut with = Counter::new(usize::MAX);
             crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty, &mut with).unwrap();
             let mut without = Counter::new(usize::MAX);
@@ -888,7 +889,10 @@ mod tests {
                 &mut without,
             )
             .unwrap();
-            assert_eq!(with.bytes, without.bytes + SIDE_LEDGER_BYTES);
+            assert_eq!(
+                with.bytes + size_of::<SharedCache>(),
+                without.bytes + SIDE_LEDGER_BYTES + super::super::OFF_MAIN_SHARED_BYTES
+            );
         }
         // Held lock: heap_bound still answers.
         let held = full.side_ledger();
@@ -1711,7 +1715,7 @@ mod tests {
         cache.withheld_memo.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
-            size_of::<SharedCache>()
+            super::super::OFF_MAIN_SHARED_BYTES
                 + std::mem::align_of::<SharedCache>()
                 + 2 * size_of::<usize>()
                 + parts.bytes

@@ -262,6 +262,25 @@ pub(super) fn path_requires_verification(
         .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
 }
 
+/// Retain the existing partial growth safeguard and shorter/future floors
+/// until bounded old-directory rescue keeps all held growth discoverable.
+/// This predicate alone does NOT implement or qualify that dependency.
+/// Discovery grants no ACK, census proof or independent read permission.
+pub(super) fn path_requires_recovery(
+    source: SnapshotSource,
+    files: &SharedMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) -> bool {
+    path_requires_verification(files, path)
+        || (super::restart_restore::enabled()
+            && files.get(&local_index_key(path)).is_some_and(|entry| {
+                length != entry.size_bytes
+                    || entry.effective_upload_body_witness_revision
+                        > crate::snapshot_sync::effective_upload_body_witness_revision(source)
+            }))
+}
+
 fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
     entry.has_unverified_source()
         && entry
@@ -2684,7 +2703,7 @@ mod growth_tests {
                 Some(now),
                 30,
                 // v2 growth follows the index (production derivation).
-                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None, None),
             )
             .unwrap();
             assert!(open_and_identify_scan_candidate_at(
@@ -2905,7 +2924,7 @@ mod growth_tests {
             Some(now),
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .is_some());
         assert!(reconcile_missing_index_entries_with_limit(&mut index, 1));
@@ -3003,7 +3022,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .unwrap();
         let (candidate, _) = open_and_identify_scan_candidate_at(
@@ -3075,7 +3094,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(

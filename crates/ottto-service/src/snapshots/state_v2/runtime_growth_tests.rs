@@ -94,7 +94,7 @@ impl Fixture {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(
@@ -805,6 +805,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
             claude_request_census::record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
+                    held_index_keys: &Default::default(),
                     path: &f.source,
                     index_key: &f.key,
                     source_file_fingerprint: if case == "no_record" {

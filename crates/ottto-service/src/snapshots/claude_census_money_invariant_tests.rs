@@ -707,6 +707,54 @@ fn census_admission_releases_kept_records_oldest_first() {
     );
 }
 
+/// M3 with census admission: a paced residue still owns unread growth, so admission may
+/// not spend a record the terminal would keep. Each source of the held set
+/// spares the oldest record; the next kept record pays instead. The negative
+/// control is `census_admission_releases_kept_records_oldest_first`.
+/// [money] census admission never releases held residue.
+#[test]
+fn census_admission_never_releases_held_residue() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    for held_by in ["page", "traversal", "witness"] {
+        let (mut index, [holder, copy, young]) = admission_index(60, false, true);
+        let held = BTreeSet::from([holder.clone()]);
+        match held_by {
+            "traversal" => {
+                let mut traversal = super::terminal_unhealthy_traversal(String::new());
+                traversal.residue.index_keys = held.clone();
+                index.traversal = Some(traversal);
+            }
+            "witness" => {
+                index.scan_residue_witness = Some(crate::snapshots::ScanResidueWitness {
+                    index_keys: held.clone(),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+        let page_held = if held_by == "page" {
+            held
+        } else {
+            BTreeSet::new()
+        };
+        let outcome = index.insert_held_transcript_record_for_test(
+            &young,
+            young_parse(vec![100, 101]),
+            window,
+            &page_held,
+        );
+        assert_eq!(outcome, ClaudeRequestCensusInsert::Stored, "{held_by}");
+        let census = index.claude_request_census_for_test();
+        assert_eq!(census.totals_for_test(), census.recounted_for_test());
+        let record = |key: &str| census.record_for_test(key).unwrap();
+        assert_eq!(record(&holder).retired_for_test(), None, "{held_by}");
+        assert_eq!(record(&holder).request_hashes_for_test(), &[1, 2]);
+        assert_eq!(record(&copy).retired_for_test(), Some(2), "{held_by}");
+        assert_eq!(record(&young).request_hashes_for_test(), &[100, 101]);
+    }
+}
+
 /// Release order is (mtime, key): of two equally old kept records the first
 /// by key retires, whatever order the index was built in, on every run.
 #[test]

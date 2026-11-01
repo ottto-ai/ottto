@@ -2618,8 +2618,10 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 }
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
+// Keep the CI test filter stable while its base-compatible transplant stays
+// independent of the restart-restore implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
-    include!("money_equivalence_tests.rs");
+    include!("restart_restore_money_tests.rs");
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
     }
