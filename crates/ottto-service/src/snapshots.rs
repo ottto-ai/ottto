@@ -15676,7 +15676,7 @@ impl SnapshotItem {
     /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
     /// The backend refuses a base token combined with a challenge; the answer
     /// replaces the stale base rather than adding to it.
-    pub(crate) fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
+    fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
         match &self.cache_conflict_answer {
             Some((challenge, revision)) => {
                 (None, Some(challenge.clone()), Some(revision.clone()), true)
