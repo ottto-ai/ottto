@@ -544,36 +544,20 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
     std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
 }
 
-#[test]
-fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
-    if !crate::test_isolation::run_here() {
-        return;
-    }
+/// A Codex ChatGPT login with saved quota proof in `root/home`, and the
+/// support and project directories a Codex prepare reads. Returns the
+/// account and organization hashes of that login.
+fn codex_login_fixture(root: &Path) -> (String, String) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let scratch = crate::test_scratch::ScratchDir::new("codex-launch");
-    // The credential reader refuses symlinked ancestors; macOS TMPDIR uses /var.
-    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
-    let root = canonical_root.as_path();
     let home = root.join("home");
     let codex = home.join(".codex");
     let support = root.join("support");
     let project = root.join("project");
-    let bin = root.join("bin");
-    for path in [&home, &codex, &support, &project, &bin] {
+    for path in [&home, &codex, &support, &project] {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
-    let ambient_keys = [
-        "CODEX_ACCESS_TOKEN",
-        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-        "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
-        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
-    ];
-    for key in ambient_keys {
-        std::env::set_var(key, "synthetic-override");
-    }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":now+3600,
         "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
@@ -600,6 +584,36 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         "schema_version":1,"home_key":home_key,"reading":{"observed_at_epoch_seconds":now,"login":{"binding":format!("{account}:{org}")},
         "identity":{"account_identifier_hash":account,"workspace_identifier_hash":org},"provider_account_signed_in":true,"quota_windows":[window]}
     })).unwrap()).unwrap();
+    (account, org)
+}
+
+#[test]
+fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("codex-launch");
+    // The credential reader refuses symlinked ancestors; macOS TMPDIR uses /var.
+    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
+    let root = canonical_root.as_path();
+    let (account, org) = codex_login_fixture(root);
+    let home = root.join("home");
+    let codex = home.join(".codex");
+    let support = root.join("support");
+    let project = root.join("project");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    let ambient_keys = [
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    ];
+    for key in ambient_keys {
+        std::env::set_var(key, "synthetic-override");
+    }
     let witness = root.join("commands");
     let quoted = quote_launch_executable(witness.to_str().unwrap()).unwrap();
     let cli = bin.join("codex");
@@ -690,6 +704,65 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     for key in ambient_keys {
         std::env::remove_var(key);
     }
+}
+
+/// [regress] A stale Codex CLI earlier in the search order failed its version
+/// probe and blocked the launch while agent status used a desktop-bundled CLI.
+#[test]
+fn codex_launch_uses_the_bundled_cli_before_a_stale_path_install() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    // A real desktop bundle in /Applications would be searched first.
+    if ["Codex.app", "ChatGPT.app"]
+        .into_iter()
+        .any(|bundle| Path::new("/Applications").join(bundle).exists())
+    {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("codex-launch-bundle");
+    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
+    let root = canonical_root.as_path();
+    let (account, org) = codex_login_fixture(root);
+    let home = root.join("home");
+    let stale = root.join("stale-bin");
+    let bundle = home.join("Applications/Codex.app/Contents/Resources");
+    for (dir, script) in [
+        (&stale, "#!/bin/sh\nexit 1\n"),
+        (&bundle, "#!/bin/sh\nprintf 'codex-cli 0.170.0\\n'\n"),
+    ] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("codex"), script).unwrap();
+        fs::set_permissions(dir.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+    std::env::set_var("PATH", &stale);
+    let mut registry = Registry::default();
+    let result = registry
+        .prepare_for_user(
+            Provider::Codex,
+            "default",
+            &account,
+            &org,
+            SessionLaunchFolderV1 {
+                path: Some(root.join("project").to_string_lossy().into_owned()),
+                recent_id: None,
+            },
+            Some(test_executable()),
+            &root.join("support"),
+            LaunchUser {
+                home,
+                name: "synthetic".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(result.outcome, Some(Outcome::Ready));
+    assert_eq!(result.cli_version.as_deref(), Some("0.170.0"));
+    assert_eq!(
+        registry.entries[&result.launch_id.unwrap()].program,
+        bundle.join("codex").canonicalize().unwrap()
+    );
+    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
 }
 
 #[test]
