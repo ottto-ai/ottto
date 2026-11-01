@@ -336,6 +336,7 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: deferred_entity_state(false),
         },
         false,
+        false,
     )
     .unwrap();
     assert_eq!(partial.last_uploaded_count, 43);
@@ -354,6 +355,7 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             },
             state: CollectorState::Success,
         },
+        false,
         false,
     )
     .unwrap();
@@ -522,6 +524,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
+        false,
     )
     .unwrap();
     assert_eq!(status.last_uploaded_count, 0);
