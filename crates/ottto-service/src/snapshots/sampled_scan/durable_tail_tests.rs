@@ -2784,7 +2784,6 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scope_for(
     source: DurableSource,
     snapshot_source: SnapshotSource,

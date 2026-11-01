@@ -299,7 +299,6 @@ impl<'a> Interpretation<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn expected(
     source: DurableSource,
     snapshot_source: SnapshotSource,
@@ -755,7 +754,7 @@ impl SharedCache {
     /// or `None` (the read is then Full, with nothing left behind). `held` is
     /// the parser's opened FD for `path`, not yet read; a duplicate of it
     /// serves the bounded re-derivation, and the read plan repositions it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(crate) fn durable_restore(
         &self,
         snapshot_source: SnapshotSource,
@@ -826,7 +825,7 @@ impl SharedCache {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn restore_known(
         &self,
         snapshot_source: SnapshotSource,

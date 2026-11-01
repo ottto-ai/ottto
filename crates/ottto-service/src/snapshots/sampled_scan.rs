@@ -2135,7 +2135,7 @@ fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     today || in_file_fork
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 pub(super) fn new_source_parser(
     file: File,
     candidate: &CandidateFile,

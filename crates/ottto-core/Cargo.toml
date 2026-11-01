@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 # Enabled only by test targets through dev-dependencies. Keeps dependency
 # builds (where cfg(test) is false) away from the host credential stores.
 [features]

@@ -86,7 +86,10 @@ impl CodexCounting {
 
     /// Local, content-free receipts for the diagnostics owner to fold in
     /// before the accumulator is consumed (no consumer yet: activation gate).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "no consumer yet: activation gate")
+    )]
     pub(super) fn counters(&self) -> Option<&OccurrenceCounters> {
         self.reducer.as_ref().map(|reducer| &reducer.counters)
     }
@@ -836,7 +839,7 @@ impl SnapshotAccumulator {
     /// V2 counterpart of the shared UI path. Returns the occurrence-admitted
     /// `last` (published, staged or native-turn) so the existing tier/curve
     /// consumers keep their meaning; repeats and exact duplicates are `None`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(super) fn set_codex_v2_cumulative_usage(
         &mut self,
         model: Option<String>,

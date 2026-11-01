@@ -6,6 +6,9 @@ license = "Apache-2.0"
 authors = ["Ottto Team"]
 description = "Test helpers for Ottto source and collector package manifests."
 
+[lints]
+workspace = true
+
 [dependencies]
 ottto-connector-sdk = { path = "../ottto-connector-sdk" }
 

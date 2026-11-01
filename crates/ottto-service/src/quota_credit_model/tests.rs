@@ -24,7 +24,7 @@ fn openai_grant(id: &str, granted_at: &str, expires_at: Option<&str>) -> GrantIn
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "test helper, 9 case inputs")]
 fn anthropic_grant(
     id: &str,
     label: Option<&str>,

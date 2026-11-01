@@ -10,8 +10,16 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.80"
+rust-version = "1.81"
 authors = ["Ottto Team"]
+
+# CI runs clippy with -D warnings, so "warn" fails the build. Every member
+# crate opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [workspace.dependencies]
 anyhow = "1"

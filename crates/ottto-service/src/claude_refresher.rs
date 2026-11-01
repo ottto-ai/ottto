@@ -296,7 +296,7 @@ impl RefreshLauncher for ProductionLauncher {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn maybe_refresh_with(
     slot_id: &str,
     slot: &ClaudeConfigDirSlot,

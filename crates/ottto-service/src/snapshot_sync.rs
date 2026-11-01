@@ -1235,7 +1235,7 @@ struct DeferredCacheHeadIdentity {
     session_key: String,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn capture_deferred_cache_head_identities(
     source: SnapshotSource,
     items: &[SnapshotItem],
@@ -3311,7 +3311,6 @@ fn withdraw_source_manifest(destination_namespace: &str, source: SnapshotSource)
         .remove(&(destination_namespace.to_string(), source.api_slug()));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn save_index_and_publish_manifest(
     index: &mut ScanIndex,
     index_path: &Path,
@@ -3392,7 +3391,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
 /// Preserve only delivery-owned file checkpoints on an unfinished upload.
 /// Hold the progress lock through index CAS: neither an unsaved ACK nor a
 /// racing ledger generation may certify the scan's new file/body witnesses.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "test helper, 9 case inputs")]
 #[cfg(test)]
 fn checkpoint_partial_snapshot_index(
     index: &ScanIndex,
@@ -3419,7 +3418,7 @@ fn checkpoint_partial_snapshot_index(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn checkpoint_partial_snapshot_index_with_read_limit(
     index: &ScanIndex,
     committed_index: &ScanIndex,
@@ -3469,7 +3468,7 @@ impl NativeSelectedRestore<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 fn checkpoint_partial_snapshot_index_with_comparison(
     index: &ScanIndex,
     committed_index: &ScanIndex,
@@ -3527,7 +3526,10 @@ const PARTIAL_CHECKPOINT_FAILURES: [&str; 10] = [
     CHECKPOINT_INDEX_SAVE,
 ];
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial checkpoint keeps the selected body, audit and drain inputs together"
+)]
 fn checkpoint_partial_snapshot_index_with_audit_release(
     index: &ScanIndex,
     committed_index: &ScanIndex,
@@ -3566,7 +3568,10 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
 /// `isolated_refusals`: the upload sent every batch and only these items were
 /// refused (`IsolatedItemRefusals`). Every other entity then settles as on a
 /// clean page; without it only this pass's ACKs settle.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial checkpoint also validates the exact isolated refusals"
+)]
 fn checkpoint_partial_snapshot_index_with_refusals(
     index: &ScanIndex,
     committed_index: &ScanIndex,
@@ -5097,7 +5102,6 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<Sna
         .with_receipt_context(device_label, account_binding))
 }
 
-#[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
 fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
     if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
         return None;
@@ -5207,7 +5211,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
     })
 }
 
-#[allow(dead_code)] // Compiled preparation is exercised by native integration before activation.
+#[allow(dead_code, reason = "preparation is compiled ahead of its activation")]
 #[path = "bounded_snapshot_retry.rs"]
 mod bounded_snapshot_retry;
 #[path = "live_snapshot_retry.rs"]
@@ -5900,11 +5904,6 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
     }
 }
 
-// Extra parameters (the daemon handle for caching the reconciliation policy,
-// and the cycle's transport-evidence fold) push this over clippy's 7-arg
-// threshold; the alternative is a throwaway context struct for an internal
-// helper, which is not worth it.
-#[allow(clippy::too_many_arguments)]
 // Preparation stays owned by the existing cycle. No token/report lease or
 // partially finalized body crosses a collection step.
 struct SourcePreparation {
@@ -5938,7 +5937,7 @@ struct SourcePreparation {
     active_legacy_reconciliation: BTreeSet<String>,
     scan: Option<crate::snapshots::OwnedSourceScan>,
 }
-#[allow(clippy::large_enum_variant)] // Move the native owned context without boxing/cloning its graph.
+#[expect(clippy::large_enum_variant, reason = "moves the owned context unboxed")]
 enum SourcePreparationStep {
     Pending(SourcePreparation),
     Refused(SourcePreparation, crate::source_rotation::LocalRefusal),
@@ -6516,7 +6515,7 @@ fn cycle_sampled_scope(
     crate::transcript_acquisition::Scope(format!("{:x}", Sha256::digest(sampled_scope.as_bytes())))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
 fn prepare_sync_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -6626,7 +6625,10 @@ fn load_source_checkpoints(
     Ok((index, origin, progress))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preparation retains the cycle transport, identity and resource inputs"
+)]
 fn prepare_sync_source_inner(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -7440,7 +7442,6 @@ fn run_continuation_scan(
 /// loaded index and upload progress, with the same-cycle cached inputs. On
 /// `Ok(Ok(..))` the attribution context has moved into the preparation; on a
 /// refusal it is still in `inputs`.
-#[allow(clippy::too_many_arguments)]
 fn prepare_continuation_source(
     home: &Path,
     support_dir: &Path,
@@ -7674,7 +7675,7 @@ fn note_codex_side_saved(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
 fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
@@ -9969,7 +9970,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -10877,7 +10878,7 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
 #[cfg(test)]
 fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Upload, Persist>(
     items: &[T],
@@ -10919,7 +10920,7 @@ enum SnapshotPageOutcome {
 
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist>(
     items: &[T],
     indices: &[usize],
@@ -11343,7 +11344,7 @@ fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, 
     groups
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
 fn upload_resumable_batches_with_body_witness_partitioned<
     T,
     Fingerprint,
@@ -11392,7 +11393,7 @@ where
 
 /// `literal_family` names the family root of a request-owned literal body
 /// (`None` for every other body); see `literal_family_groups`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 fn upload_resumable_batches_with_literal_families<
     T,
     Fingerprint,
@@ -12349,7 +12350,7 @@ fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequ
     Ok(Some(request))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,

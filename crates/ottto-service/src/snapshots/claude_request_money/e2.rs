@@ -574,7 +574,7 @@ impl ClaudeEntityBody {
             .collect();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn add(
         &mut self,
         key: ClaudeLiveKey,
@@ -870,7 +870,7 @@ pub(crate) struct FileFold {
     idless_copy: Option<Box<ClaudeEntityBody>>,
     /// Id-less copied usage staged by its native marker until that marker's
     /// request is decided. At most one body per bounded marker run.
-    #[allow(clippy::box_collection)]
+    #[expect(clippy::box_collection, reason = "one pointer when the map is absent")]
     idless_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     first_idless: Option<u64>,
     /// The proof `decide_page_copies` checks per request before the page
@@ -879,7 +879,7 @@ pub(crate) struct FileFold {
     /// Counted requests inheriting a possibly excluded marker. Sparse and
     /// bounded by the existing 64 marker runs, never by response count.
     /// Boxed: one pointer on every fold, the map only when present.
-    #[allow(clippy::box_collection)]
+    #[expect(clippy::box_collection, reason = "one pointer when the map is absent")]
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
     first_own: Option<u64>,
@@ -4182,7 +4182,14 @@ static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN]
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
-    #[cfg_attr(not(test), allow(dead_code))] &'static str,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the stage name feeds only the test-build timing breakdown"
+        )
+    )]
+    &'static str,
 );
 impl PageSpent {
     fn start(stage: &'static str) -> Self {

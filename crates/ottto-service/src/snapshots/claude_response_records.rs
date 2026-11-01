@@ -690,7 +690,7 @@ struct ClaudeToolUse {
 impl CompactClaudeResponseRecord {
     /// `first` is the response's first retained record, absent for that
     /// record itself.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     pub(super) fn encode(
         first: Option<&Self>,
         physical_sequence: u16,

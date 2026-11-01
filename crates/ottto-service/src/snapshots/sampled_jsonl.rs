@@ -89,7 +89,7 @@ pub(super) struct CompletedNativeAcquisition {
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released, unsealed);
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
-#[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
+#[expect(clippy::large_enum_variant, reason = "moved once to the side exit")]
 pub(super) enum SideCertificate {
     /// `len` is the held file's length when the certificate was committed.
     Certified {

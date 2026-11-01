@@ -75,7 +75,7 @@ impl E2ScanFixture {
         assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
     pub(crate) fn scan(
         &self,
         roots: &[PathBuf],

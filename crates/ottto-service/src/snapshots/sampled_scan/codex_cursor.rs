@@ -3598,7 +3598,7 @@ pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
 /// member's opened identity and the live member's `{dev, ino}` (never its
 /// growing length), header digests, receipt scope, counting view, each
 /// member's path reduction facts and the census flags.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(in crate::snapshots) fn group_memo_digest(
     owner: &str,
     members: &[&CandidateFile],
@@ -5211,7 +5211,7 @@ impl SharedCache {
     /// file another waiter is ahead of is deferred; every deferred large
     /// file is recorded as waiting. `census_member`: the read holds this
     /// generation's census, so it waits ahead of every re-read (G1).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     pub(in crate::snapshots) fn cursor_plan(
         &self,
         page: &mut PageBudget,
@@ -5248,7 +5248,7 @@ impl SharedCache {
     /// completion, a fence, a skip nor a loss; it counts `deferred_paced`.
     /// The file's stamp is read before the cursor lock (no IO under it); an
     /// unreadable stamp plans as today (the start then refuses it).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     pub(in crate::snapshots) fn cursor_plan_paced(
         &self,
         page: &mut PageBudget,
@@ -6776,7 +6776,6 @@ impl SingletonMemo {
 /// context and the census flags cannot cure most holds but are kept as
 /// conservative wake inputs (K3); their cost is one re-read per held file
 /// when they change.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn memo_digest(
     index: &ScanIndex,
     candidate: &CandidateFile,

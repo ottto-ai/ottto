@@ -343,10 +343,7 @@ mod tests {
         OffsetDateTime::parse("2026-07-12T12:00:00Z", &Rfc3339).unwrap()
     }
 
-    // Eight parameters is one over clippy's threshold, but this is a test-only
-    // constructor mirroring ContextPostureCacheRow field-for-field; grouping
-    // them into a struct would just restate the type it builds.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "mirrors the cache row's fields")]
     fn row(
         session_id: &str,
         last_activity_at: &str,

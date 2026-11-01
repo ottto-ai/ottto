@@ -303,7 +303,7 @@ fn harvest_all_once(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn harvest_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -367,7 +367,7 @@ fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn harvest_recent_workspaces(
     client: &SnapshotApiClient,
     relay_token: &str,
@@ -463,7 +463,7 @@ fn should_include_mcp_servers(workspace_index: usize) -> bool {
     workspace_index == 0
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
