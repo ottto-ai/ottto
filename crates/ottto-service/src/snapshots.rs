@@ -87751,7 +87751,35 @@ crate::heap_layout_bound::fields!(OwnedJsonlParser; pending, #[cfg(test)] source
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
-crate::heap_layout_bound::fields!(PiLedger; usage_keys, fork);
+// Hand-written so an absent fork costs no visit: every Claude and Codex
+// accumulator carries an empty ledger, and their frames must keep the visit
+// count they had before the ledger gained its fork. A present fork is charged
+// exactly as `Option<Box<PiFork>>`, including the box's allocation.
+impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
+    fn stable_heap(&self) -> bool {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::stable_heap(usage_keys) && fork.as_ref().map_or(true, B::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::completed_heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::completed_heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+}
 crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos, parent_ref, copies_this_read);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
