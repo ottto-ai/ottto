@@ -9,9 +9,8 @@ use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ottto_core::{
-    compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
-    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalDeviceBinding,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, ControlTokenStore, FileDeviceStore, FilePendingDeviceCredentialStore,
+    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
@@ -37,29 +36,60 @@ const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbea
 const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
 const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
-/// The backend rejected a snapshot batch because the payload did not satisfy the
-/// strict daemon/backend contract. Carries the redacted response body so support
-/// can see the actual validator failure instead of guessing schema-version drift.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A payload rejection carries only validated request-local locations, never
+/// response text. Locations are transient and are not acknowledgement evidence.
+#[derive(Clone, PartialEq, Eq)]
 pub struct BatchRejected {
     pub status: u16,
-    pub body_excerpt: Option<String>,
+    pub snapshot_indexes: Option<Vec<usize>>,
+}
+
+impl BatchRejected {
+    pub(crate) fn from_response(status: u16, reader: impl std::io::Read, count: usize) -> Self {
+        let snapshot_indexes = (|| {
+            if status != 422 {
+                return None;
+            }
+            let body: serde_json::Value = serde_json::from_reader(reader).ok()?;
+            let errors = body.get("errors")?.as_array()?;
+            if errors.is_empty() {
+                return None;
+            }
+            let mut indexes = std::collections::BTreeSet::new();
+            for error in errors {
+                let loc = error.get("loc")?.as_array()?;
+                if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
+                    return None;
+                }
+                let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
+                if index >= count {
+                    return None;
+                }
+                indexes.insert(index);
+            }
+            Some(indexes.into_iter().collect())
+        })();
+        Self {
+            status,
+            snapshot_indexes,
+        }
+    }
 }
 
 impl std::fmt::Display for BatchRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.body_excerpt.as_deref() {
-            Some(body) => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {} body_excerpt={}",
-                self.status, body
-            ),
-            None => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {}",
-                self.status
-            ),
-        }
+        write!(
+            f,
+            "reason=validation_reject status={} count={}",
+            self.status,
+            self.snapshot_indexes.as_ref().map_or(0, Vec::len)
+        )
+    }
+}
+
+impl std::fmt::Debug for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -2349,10 +2379,8 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            // Validation-like statuses mean the backend refused the payload
-            // contract. Keep a redacted/truncated body excerpt so field logs show
-            // the exact validator failure (for example, missing usage_buckets)
-            // without leaking tokens, paths, account IDs, or machine IDs.
+            // A validation response supplies no ACK. Parse complete locations
+            // before discarding all backend text, which may contain user values.
             Err(ureq::Error::Status(code @ (400 | 422), response)) => {
                 self.record_batch_http_failure(
                     request,
@@ -2362,10 +2390,14 @@ impl SnapshotApiClient {
                     None,
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(BatchRejected {
-                    status: code,
-                    body_excerpt: response_body_excerpt(response),
-                }))
+                // Keep the HTTP client's existing complete-body size bound.
+                // A failed read has no usable locations and stays whole-batch.
+                let body = response.into_string().ok();
+                Err(anyhow::Error::new(BatchRejected::from_response(
+                    code,
+                    body.as_deref().unwrap_or_default().as_bytes(),
+                    request.snapshots.len(),
+                )))
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.record_batch_http_failure(
@@ -3479,35 +3511,6 @@ fn response_has_request_id(response: &ureq::Response) -> bool {
     .any(|header| response.header(header).is_some())
 }
 
-fn response_body_excerpt(response: ureq::Response) -> Option<String> {
-    response
-        .into_string()
-        .ok()
-        .and_then(|body| safe_response_body_excerpt(&body))
-}
-
-fn safe_response_body_excerpt(body: &str) -> Option<String> {
-    let compact = body
-        .split_whitespace()
-        .take(80)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return None;
-    }
-    Some(truncate_diagnostic(&redact_inline(&compact)))
-}
-
-fn truncate_diagnostic(value: &str) -> String {
-    const MAX_DIAGNOSTIC_CHARS: usize = 500;
-    if value.chars().count() <= MAX_DIAGNOSTIC_CHARS {
-        return value.to_string();
-    }
-    let mut truncated = value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
 /// Fence relay admission once confirmation may have reached the server and
 /// until the candidate is fully promoted into local active state. Persisted
 /// pre-confirm guards are the crash boundary immediately before the request:
@@ -3927,18 +3930,28 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejection_body_excerpt_is_redacted_and_bounded() {
-        let token = format!("ghp_{}", "AbCdEf1234567890aaaaaaaaaaaaaaaaaa");
-        let body = format!(
-            "{{\"detail\":\"usage_buckets are required Authorization: Bearer {token} machine_id otm_1234567890abcdef path /Users/ron/.codex/sessions/a.jsonl\"}}"
+    fn snapshot_rejection_locations_require_a_complete_entity_local_set() {
+        for body in [
+            r#"{"detail":"synthetic validator text"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":[] }]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",2]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",-1]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","other"]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]}]"#,
+        ] {
+            assert!(BatchRejected::from_response(422, body.as_bytes(), 2)
+                .snapshot_indexes
+                .is_none());
+        }
+        let body = br#"{"errors":[{"loc":["body","snapshots",1,"session_artifacts",0]},{"loc":["body","snapshots",1,"session_artifacts",1]}]}"#;
+        assert_eq!(
+            BatchRejected::from_response(422, body.as_slice(), 2).snapshot_indexes,
+            Some(vec![1])
         );
-        let excerpt = safe_response_body_excerpt(&body).expect("excerpt");
-        assert!(excerpt.contains("usage_buckets"));
-        assert!(excerpt.contains("[REDACTED]"));
-        assert!(excerpt.contains("[machine_id]"));
-        assert!(excerpt.contains("[path]"));
-        assert!(!excerpt.contains("/Users/ron"));
-        assert!(excerpt.chars().count() <= 503);
+        assert!(BatchRejected::from_response(400, body.as_slice(), 2)
+            .snapshot_indexes
+            .is_none());
     }
 
     #[test]

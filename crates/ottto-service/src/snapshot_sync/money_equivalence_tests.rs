@@ -1034,13 +1034,20 @@ pending!(
 /// Invoked by the existing challenge fixture: exercise the same emitted-body
 /// oracle with real account evidence, without adding a second test/receipt name.
 pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
-    assert!(crate::heap_layout_bound::layout_supported(), "placement oracle must execute");
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "placement oracle must execute"
+    );
     with_e2(|| {
         let mut c = corpus("head-conflict-account-placement");
         let org_a = "11111111-1111-4111-8111-111111111111";
         let org_b = "22222222-2222-4222-8222-222222222222";
-        let marker = |org: &str| json!({"type":"attachment","sessionId":ROOT,
-            "attachment":{"type":"credential_org","organizationUuid":org}}).to_string()+"\n";
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
         let path = c.root(ROOT, &(marker(org_a) + &line(ROOT, "r1", AT, 10)));
         input_clock(&path);
         c.evidence(&[api("r1", 10, 100)], &[]);
@@ -1053,8 +1060,13 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
         assert!(disk.records() > 0);
         let switch = json!({"type":"attachment","sessionId":ROOT,
-            "attachment":{"type":"session_context","context":{}}}).to_string()+"\n";
-        append(&path, &(switch + &marker(org_b) + &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)));
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        append(
+            &path,
+            &(switch + &marker(org_b) + &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)),
+        );
         c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
         input_clock(&path);
         let restart = E2ScanFixture::capturing_identity();
@@ -1068,30 +1080,447 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
         assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
         assert_eq!(pages[2].modes, (0, 1, 0), "restored Tail");
-        assert_eq!(durable_restores(&restart.cache, SnapshotSource::ClaudeCode).1, 1);
+        assert_eq!(
+            durable_restores(&restart.cache, SnapshotSource::ClaudeCode).1,
+            1
+        );
         finish_claude_pages(&c, &mut pages);
         let receipt = compare_claude_uploads(&pages);
         let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
         let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
-        let item = receipt.items.iter().find(|item| item.source_session_id == ROOT).unwrap();
+        let item = receipt
+            .items
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
         assert_eq!((item.request_count, item.input_tokens), (2, 30));
-        assert_eq!(item.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.0003"));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0003")
+        );
         let mut placement = Vec::new();
         for row in &item.model_usage {
             let row = serde_json::to_value(row).unwrap();
             let parts = row.get("identity_parts").and_then(Value::as_array);
             let parts = parts.map_or(std::slice::from_ref(&row), Vec::as_slice);
             for part in parts {
-                let evidence = &item.request_evidence[part["evidence_ref"].as_u64().unwrap() as usize];
-                placement.push((evidence.provider_workspace_hash.clone().unwrap(),
-                    part["request_count"].as_u64().unwrap(), part["input_tokens"].as_u64().unwrap(),
-                    part["cost_usd"].as_str().unwrap().to_string()));
+                let evidence =
+                    &item.request_evidence[part["evidence_ref"].as_u64().unwrap() as usize];
+                placement.push((
+                    evidence.provider_workspace_hash.clone().unwrap(),
+                    part["request_count"].as_u64().unwrap(),
+                    part["input_tokens"].as_u64().unwrap(),
+                    part["cost_usd"].as_str().unwrap().to_string(),
+                ));
             }
         }
         placement.sort();
-        let mut expected = vec![(a, 1, 10, "0.0001".to_string()), (b, 1, 20, "0.0002".to_string())];
+        let mut expected = vec![
+            (a, 1, 10, "0.0001".to_string()),
+            (b, 1, 20, "0.0002".to_string()),
+        ];
         expected.sort();
-        assert_eq!(placement, expected, "non-vacuous totals AND account placement across all three arms");
+        assert_eq!(
+            placement, expected,
+            "non-vacuous totals AND account placement across all three arms"
+        );
         println!("HEAD_CONFLICT_MONEY_ORACLE VERIFIED arms=cold_full,ram_tail,restored_tail accounts=2 requests=2 input_tokens=30 cost_usd=0.0003");
     });
+}
+
+/// [regress] An indexed validation hold preserves money and lets exact-ACK siblings settle.
+#[test]
+#[serial(client_report)]
+fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
+    use super::state_v2_money_tests::tagged_api;
+    use crate::snapshot_sync::tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::with_retry_clock;
+    use crate::snapshots::sampled_scan::transition_fixture::{
+        self as oracle,
+        money_oracle::{assert_equivalent, assert_held},
+        Accepted, Mode, RouteResult,
+    };
+
+    crate::client_report::reset_for_test();
+    with_e2(|| {
+        // Reuse the emitted-money corpus: A, a switch to B, a side call, and
+        // an evidence gap. The uploader exercises the same typed bodies for
+        // each source, independently of source-specific acquisition rules.
+        let mut c = corpus("indexed-validation-hold");
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
+        let switch = json!({"type":"attachment","sessionId":ROOT,
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        c.root(
+            ROOT,
+            &(marker("11111111-1111-4111-8111-111111111111")
+                + &line(ROOT, "r1", AT, 10)
+                + &switch
+                + &marker("22222222-2222-4222-8222-222222222222")
+                + &line(ROOT, "r2", "2026-08-02T08:00:20Z", 20)),
+        );
+        // The sibling has priced usage but no account or organization evidence.
+        c.root(COPY, &line(COPY, "sibling", AT, 30));
+        let attributed = |request: &str, tokens, account: &str, org: &str| {
+            use crate::claude_local_otel::{
+                ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
+            };
+            let mut row = tagged_api(request, tokens, Some(&account.repeat(64)));
+            let identity = row.request_identity.as_mut().unwrap();
+            identity.organization.origin = ClaudeIdentityAttributeOrigin::LogRecord;
+            identity.organization.disposition = ClaudeIdentityDisposition::Complete;
+            identity.organization.log_record_hash =
+                Some(ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
+            identity.disposition = ClaudeIdentityDisposition::Complete;
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            row
+        };
+        c.evidence(
+            &[
+                attributed("r1", 10, "a", "11111111-1111-4111-8111-111111111111"),
+                attributed("r2", 20, "b", "22222222-2222-4222-8222-222222222222"),
+                attributed("side", 5, "b", "22222222-2222-4222-8222-222222222222"),
+            ],
+            &[trace("r1", ""), trace("r2", ""), trace("side", "")],
+        );
+        c.evidence_for(COPY, &[api_for(COPY, "sibling", 30, 300)], &[]);
+        let mut page = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            100,
+            true,
+            &[],
+        );
+        page.enrich(&c);
+        page.finish();
+        assert!(page.scan.snapshots.len() >= 2);
+        let root = page
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        assert_eq!(
+            root.request_count, 3,
+            "two transcript requests and the side call"
+        );
+        assert!(
+            root.cost
+                .as_ref()
+                .unwrap()
+                .total_cost_usd
+                .as_deref()
+                .unwrap()
+                != "0"
+        );
+        let accounts = root
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .flat_map(|row| {
+                row.account_identifier_hash.iter().chain(
+                    row.identity_parts
+                        .iter()
+                        .flatten()
+                        .filter_map(|part| part.account_identifier_hash.as_ref()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            accounts,
+            BTreeSet::from([&"a".repeat(64), &"b".repeat(64)]),
+            "two-account placement control"
+        );
+        assert!(
+            root.request_evidence.len() >= 2,
+            "organization switch control"
+        );
+        assert!(
+            page.scan
+                .snapshots
+                .iter()
+                .flat_map(|item| &item.usage_buckets)
+                .flat_map(|bucket| &bucket.model_usage)
+                .any(|row| row.account_identifier_hash.is_none()
+                    && row.evidence_ref.is_none()
+                    && row.identity_parts.is_none()),
+            "the untagged sibling keeps the account-evidence gap explicit"
+        );
+        assert!(
+            root.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage)
+                .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some()),
+            "tagged placement control"
+        );
+
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
+            let progress_path = scratch.join("progress.json");
+            let mut items = page.scan.snapshots.clone();
+            for item in &mut items {
+                item.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, item);
+            }
+            // Packing is fingerprint sorted; reverse scan order so mapping a
+            // request index directly into the scan cannot pass this fixture.
+            items.sort_by(|a, b| b.snapshot_fingerprint.cmp(&a.snapshot_fingerprint));
+            let poison = items[0].clone();
+            assert!(
+                poison
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost.total_cost_usd.as_deref())
+                    .is_some_and(|cost| cost != "0"),
+                "rejected entity carries nonzero money"
+            );
+            let fp = poison.snapshot_fingerprint.clone();
+            let entity = poison.source_session_id.clone();
+            let mut progress =
+                SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(source));
+            progress
+                .accepted_identity_buckets
+                .bind_test_key(Some([0x42; 32]));
+            let mut backend = BTreeMap::<String, SnapshotItem>::new();
+            let mut fresh = poison.clone();
+            fresh.source_session_id = "synthetic-fresh".into();
+            fresh.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, &fresh);
+            let wire = |items: &[SnapshotItem]| {
+                let mut request = request(items);
+                request.source = source.api_slug().into();
+                request
+            };
+            let route = |mode,
+                         emitted: Vec<SnapshotItem>,
+                         backend: &BTreeMap<String, SnapshotItem>,
+                         progress: &SnapshotUploadProgress| {
+                let mut emitted = emitted;
+                emitted.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+                let batches = if emitted.is_empty() {
+                    vec![]
+                } else {
+                    vec![canonical(&wire(&emitted))]
+                };
+                let mut result = RouteResult::emitted(mode, source, batches, &emitted);
+                result.codex_evidence = oracle::codex_evidence(&page.index, &page.scan);
+                result.accepted = backend
+                    .iter()
+                    .map(|(id, item)| {
+                        (
+                            id.clone(),
+                            Accepted {
+                                body: serde_json::to_value(item).unwrap(),
+                                witness: snapshot_upload_body_witness(item),
+                            },
+                        )
+                    })
+                    .collect();
+                result.accepted_identity_buckets = Some(json!(backend
+                    .keys()
+                    .filter_map(|id| progress
+                        .accepted_identity_buckets
+                        .get(id)
+                        .map(|buckets| (id.clone(), serde_json::to_value(buckets).unwrap())))
+                    .collect::<BTreeMap<_, _>>()));
+                result
+            };
+            let send = |offered: &[SnapshotItem],
+                        progress: &mut SnapshotUploadProgress,
+                        backend: &mut BTreeMap<String, SnapshotItem>,
+                        reject: bool| {
+                let retrying = progress.active_quarantine_retries.contains(&fp);
+                let mut accepted = 0;
+                let mut emitted = Vec::new();
+                let result = upload_resumable_batches_with_literal_families(
+                    offered,
+                    source.api_slug(),
+                    progress,
+                    &mut accepted,
+                    |s| s.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    |s| Some(s.source_session_id.as_str()),
+                    |_| false,
+                    |_| None,
+                    &mut InplaceRetryBudget::default(),
+                    |batch| {
+                        if let Some(index) = batch
+                            .iter()
+                            .position(|item| item.snapshot_fingerprint == fp)
+                        {
+                            if retrying {
+                                assert_eq!(batch.len(), 1, "due retries are singleton requests");
+                            }
+                            if reject {
+                                if !retrying && batch.len() > 1 {
+                                    assert!(index > 0, "post-packing nonzero request index");
+                                }
+                                let text = json!({"errors":[
+                                    {"ctx":{"validator": "x".repeat(700)},"loc":["body","snapshots",index,"session_artifacts",0,"value"]},
+                                    {"loc":["body","snapshots",index,"session_artifacts",1,"value"]}
+                                ]}).to_string();
+                                assert!(text.len() > 500);
+                                return Err(anyhow::Error::new(BatchRejected::from_response(
+                                    422,
+                                    text.as_bytes(),
+                                    batch.len(),
+                                )));
+                            }
+                            assert_eq!(batch.len(), 1, "due retries are singleton requests");
+                        }
+                        let response = ack(&batch)?;
+                        response.validate_entity_ack(&wire(&batch))?;
+                        for item in &batch {
+                            backend.insert(item.source_session_id.clone(), item.clone());
+                        }
+                        emitted.extend(batch);
+                        Ok(response)
+                    },
+                    |state| state.save(&progress_path),
+                );
+                (result.unwrap(), accepted, emitted)
+            };
+            // Earn the old accepted money through an actual stored-body ACK.
+            let mut old = poison.clone();
+            old.status = if old.status == "completed" {
+                "active"
+            } else {
+                "completed"
+            }
+            .into();
+            old.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, &old);
+            assert_ne!(old.snapshot_fingerprint, fp);
+            send(&[old], &mut progress, &mut backend, false);
+            let prior = route(Mode::Ram, vec![], &backend, &progress);
+            let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+            assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+            assert_eq!(accepted as usize, items.len() - 1);
+            assert_eq!(progress.quarantined_fingerprints.len(), 1);
+            assert!(!progress.accepted_fingerprints.contains(&fp));
+            assert!(!progress.accepted_body_witnesses.contains_key(&fp));
+            assert!(progress
+                .context_receipt_candidates
+                .iter()
+                .flat_map(|candidate| candidate.entities())
+                .all(|(entity_fp, _)| entity_fp != &fp));
+            assert!(items
+                .iter()
+                .filter(|item| item.snapshot_fingerprint != fp)
+                .all(|item| progress
+                    .accepted_body_witnesses
+                    .get(&item.snapshot_fingerprint)
+                    == Some(&snapshot_upload_body_witness(item))));
+            let mut cold_progress =
+                SnapshotUploadProgress::new("b".repeat(64), snapshot_quarantine_witness(source));
+            cold_progress
+                .accepted_identity_buckets
+                .bind_test_key(Some([0x42; 32]));
+            let mut cold_backend = BTreeMap::new();
+            // The comparison independently accepts every cold Full body. It
+            // does not apply the due-retry-only assertion in the retry backend.
+            let mut count = 0;
+            upload_resumable_batches_with_body_witness(
+                &items,
+                source.api_slug(),
+                &mut cold_progress,
+                &mut count,
+                |s| s.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |batch| {
+                    for item in &batch {
+                        cold_backend.insert(item.source_session_id.clone(), item.clone());
+                    }
+                    ack(&batch)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            let cold = route(Mode::ColdFull, items.clone(), &cold_backend, &cold_progress);
+            let held = route(Mode::Ram, emitted, &backend, &progress);
+            assert_held(&entity, &prior, &held, &cold);
+            let namespace = progress.destination_namespace_hash.clone();
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &namespace,
+                snapshot_quarantine_witness(source),
+            )
+            .unwrap();
+            progress
+                .accepted_identity_buckets
+                .bind_test_key(Some([0x42; 32]));
+            let deadline = progress.quarantined_fingerprints[&fp].retry_after_unix_seconds;
+            with_retry_clock(deadline - 1, || {
+                assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+                let (_, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+                assert_eq!(accepted, 0);
+                assert!(emitted.is_empty());
+            });
+            items.push(fresh);
+            with_retry_clock(deadline, || {
+                assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+                let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+                assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+                assert_eq!(accepted, 1);
+                assert_eq!(emitted.len(), 1);
+                assert_eq!(emitted[0].source_session_id, "synthetic-fresh");
+                let record = &progress.quarantined_fingerprints[&fp];
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert_eq!(record.failed_reconstruction_count, 1);
+            });
+            let next = progress.quarantined_fingerprints[&fp].retry_after_unix_seconds;
+            assert!(next > deadline);
+            with_retry_clock(next, || {
+                assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+                let (result, accepted, _) = send(&items, &mut progress, &mut backend, false);
+                assert_eq!(result, ResumableUploadResult::Completed);
+                assert_eq!(accepted, 1);
+            });
+            assert!(progress.quarantined_fingerprints.is_empty());
+            let mut count = 0;
+            upload_resumable_batches_with_body_witness(
+                &items,
+                source.api_slug(),
+                &mut cold_progress,
+                &mut count,
+                |s| s.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |batch| {
+                    for item in &batch {
+                        cold_backend.insert(item.source_session_id.clone(), item.clone());
+                    }
+                    ack(&batch)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            let cold = route(Mode::ColdFull, items.clone(), &cold_backend, &cold_progress);
+            let caught_up = route(
+                Mode::Restart,
+                backend.values().cloned().collect(),
+                &backend,
+                &progress,
+            );
+            assert_equivalent(&cold, &caught_up);
+        }
+    });
+    assert_eq!(
+        crate::client_report::observe()
+            .quantity(crate::client_report::ClientReportReason::Poisoned),
+        0
+    );
+    crate::client_report::reset_for_test();
 }

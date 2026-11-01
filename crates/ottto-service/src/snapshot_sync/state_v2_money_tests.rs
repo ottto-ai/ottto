@@ -6,7 +6,7 @@ use super::money_equivalence_tests::{
 use super::*;
 use serde_json::Value;
 
-fn tagged_api(
+pub(super) fn tagged_api(
     request: &str,
     tokens: u64,
     account: Option<&str>,
@@ -191,8 +191,13 @@ fn condition_b(class: &str) {
         // flags. Only the candidate passes through composed populate/hydrate.
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        let v2 =
-            crate::snapshots::state_v2_money_roundtrip(&v1, &c.base.canonicalize().unwrap().join("money.v2.sqlite.import"));
+        let v2 = crate::snapshots::state_v2_money_roundtrip(
+            &v1,
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("money.v2.sqlite.import"),
+        );
         v1.generation = v2.generation;
         assert_eq!(canonical(&v1), canonical(&v2), "all custody and join keys");
         grow(&path, "r2", 20);
@@ -395,7 +400,10 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         recovery.adopt_synthetic(Some(&bytes));
         let v2 = crate::snapshots::state_v2_money_roundtrip(
             &warm.index,
-            &c.base.canonicalize().unwrap().join("accepted.v2.sqlite.import"),
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("accepted.v2.sqlite.import"),
         );
         recovery.recover(&progress_path).unwrap();
         assert_eq!(

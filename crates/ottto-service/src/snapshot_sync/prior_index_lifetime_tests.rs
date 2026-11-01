@@ -21,6 +21,10 @@ pub(crate) fn keep_prior() -> bool {
 pub(crate) fn retry_clock() -> Option<u64> {
     HOOK.with(|state| state.borrow().retry_clock)
 }
+pub(crate) fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
+    let _guard = Guard::new(false, None, Some(now));
+    run()
+}
 pub(crate) fn after_retirement(_retained: bool) {
     HOOK.with(|state| {
         let mut state = state.borrow_mut();
