@@ -684,11 +684,14 @@ fn commit_completed_with_local_holds(
     accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
     let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    let mut index = index.committable_subset_with_local_holds(
+    // Every batch was sent and nothing was refused, so every entity that is
+    // not held settles as on a clean page, unsent unchanged ones included.
+    let mut index = index.committable_subset_with_refusals(
         committed_index,
         &accepted_fingerprints,
         &server_quarantine,
         locally_held_fingerprints,
+        Some(&BTreeSet::new()),
     );
     index.mark_bounded_sweep_held_by_families(held_family_roots);
     index
@@ -1052,11 +1055,14 @@ fn settle_checkpointed_upload(
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
         server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        index.committable_subset_with_local_holds(
+        // Conflicts and permanent refusals are quarantined; every other
+        // entity that is not held settles as on a page without holds.
+        index.committable_subset_with_refusals(
             committed_index,
             &accepted_fingerprints,
             &server_quarantine,
             &holds.held_fingerprints,
+            Some(&BTreeSet::new()),
         )
     } else {
         index
@@ -20858,6 +20864,109 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
+    }
+
+    /// [regress] A page with one locally held entity kept only this pass's
+    /// ACKs, so a re-read file whose unchanged entity was not resent (its
+    /// committed witness was cleared) returned to that cleared witness and
+    /// was read again next pass. Every hold arm now settles it as scanned,
+    /// exactly as the same page without the hold; the held file keeps its
+    /// committed revision and credit and stays owed.
+    #[test]
+    fn local_hold_settles_unsent_siblings_without_a_reread() {
+        let entry = |fingerprint: &str, source: &str| {
+            serde_json::json!({"size_bytes": 1, "modified_unix_seconds": 2,
+                "source_file_fingerprint": source, "last_snapshot_fingerprint": fingerprint})
+        };
+        let [unchanged, sibling, held, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"reread": entry(&unchanged, ""), "held": entry(&old, "source")},
+            "file_snapshot_fingerprints": {"reread": [&unchanged], "held": [&old]},
+            "accepted_snapshot_fingerprints": [&unchanged, &old],
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {
+                "reread": entry(&unchanged, "source"),
+                "sibling": entry(&sibling, "source"),
+                "held": entry(&held, "source"),
+            },
+            "file_snapshot_fingerprints": {
+                "reread": [&unchanged], "sibling": [&sibling], "held": [&held],
+            },
+            "accepted_snapshot_fingerprints": [&unchanged, &old],
+        }));
+        // The unchanged entity is a semantic no-op: only the sibling is sent.
+        let mut progress = test_upload_progress();
+        progress.accepted_fingerprints.insert(sibling.clone());
+        let held_set = BTreeSet::from([held.clone()]);
+
+        let ack_only = scanned.committable_subset_with_local_holds(
+            &committed,
+            &progress.accepted_fingerprints,
+            &BTreeMap::new(),
+            &held_set,
+        );
+        assert!(
+            ack_only.files["reread"].source_file_fingerprint.is_empty(),
+            "control: an ACK-only subset keeps the cleared witness"
+        );
+
+        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
+            held_entity_count: held_fingerprints.len(),
+            retry_pending_family_count: 0,
+            held_fingerprints: held_fingerprints.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: true,
+            held_family_roots: None,
+        };
+        let settle = |outcome: &str, holds: &LocalHoldSettlement| {
+            let settlement = match outcome {
+                "completed" => {
+                    settle_completed_upload(scanned.clone(), &committed, &progress, holds)
+                }
+                other => settle_checkpointed_upload(
+                    scanned.clone(),
+                    &committed,
+                    &progress,
+                    holds,
+                    other == "rejected",
+                ),
+            };
+            let mut index = settlement.index;
+            settle_index_after_upload(&mut index, &committed, &progress);
+            (index, settlement.fully_settled)
+        };
+        let file = |index: &ScanIndex, key: &str| {
+            (
+                serde_json::to_value(&index.files[key]).unwrap(),
+                index.file_snapshot_fingerprints[key].clone(),
+            )
+        };
+        for outcome in ["completed", "deferred", "rejected"] {
+            let (settled, fully_settled) = settle(outcome, &holds(&held_set));
+            let (clean, _) = settle(outcome, &holds(&BTreeSet::new()));
+            assert!(!fully_settled, "{outcome}: the hold keeps a follow-up owed");
+            assert!(settled.bounded_sweep_had_unsettled_upload(), "{outcome}");
+            for key in ["reread", "sibling"] {
+                assert_eq!(
+                    file(&settled, key),
+                    file(&clean, key),
+                    "{outcome}: {key} settles as on the page without the hold"
+                );
+                assert_eq!(file(&settled, key), file(&scanned, key), "{outcome}: {key}");
+            }
+            assert_eq!(
+                file(&settled, "held"),
+                file(&committed, "held"),
+                "{outcome}: the held file keeps its committed revision"
+            );
+            let credited = settled.accepted_snapshot_fingerprints_for_test();
+            assert_eq!(
+                credited,
+                &BTreeSet::from([unchanged.clone(), sibling.clone(), old.clone()]),
+                "{outcome}: exact ACKs and prior credit only; the held revision gets none"
+            );
+        }
     }
 
     /// Path-(a) bridge: RetryPending debt elsewhere settles a page without

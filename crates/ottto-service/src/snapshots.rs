@@ -51367,6 +51367,7 @@ impl ScanIndex {
         self.committable_subset_with_local_holds(previous, accepted, quarantined, &BTreeSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn committable_subset_with_local_holds(
         &self,
         previous: &ScanIndex,
@@ -51378,10 +51379,11 @@ impl ScanIndex {
     }
 
     /// With `isolated_refusals`, the upload sent every batch and refused only
-    /// those items: every other entity not locally held settled exactly as
-    /// on a clean page, including unchanged ones this pass did not resend.
-    /// Refused and held entities keep their committed revision and stay owed.
-    /// Without it, only this pass's ACKs and quarantines settle.
+    /// those items (none on a page that only held some entities locally):
+    /// every other entity not locally held settled exactly as on a clean
+    /// page, including unchanged ones this pass did not resend. Refused and
+    /// held entities keep their committed revision and stay owed. Without it,
+    /// only this pass's ACKs and quarantines settle.
     pub(crate) fn committable_subset_with_refusals(
         &self,
         previous: &ScanIndex,
