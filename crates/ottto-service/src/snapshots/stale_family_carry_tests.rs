@@ -2116,6 +2116,8 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         .unwrap();
     record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
     record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+    // A terminal verdict formed after the E2 cutover keeps its hold.
+    record.retry_after_unix_seconds = PRE_E2_TERMINAL_DEADLINE_CUTOFF + 1;
     let holds = fixture.index.claude_usage_authority_quarantine.clone();
     let bindings = fixture.index.session_account_bindings.clone();
     let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
