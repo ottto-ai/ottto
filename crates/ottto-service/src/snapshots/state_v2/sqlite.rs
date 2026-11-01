@@ -745,6 +745,8 @@ impl Sqlite {
         // a nonzero allocated WAL by itself is not a checkpoint debt.
         store.maintenance(false)?;
         store.control("phase", &1_u8)?;
+        // Runtime loads re-emit any separate save/custody hold after hydration.
+        super::telemetry::clear_hold();
         Ok(store)
     }
     pub(super) fn finish_import(mut self) -> Result<()> {

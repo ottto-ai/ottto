@@ -58,6 +58,14 @@ impl Hold {
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
         }
+        // Keep this fixed repair refusal visible to the health classifier;
+        // generic DbUnavailable is retryable and must not hide proven damage.
+        if error
+            .chain()
+            .any(|cause| cause.to_string() == "state_v2_integrity_requires_explicit_repair")
+        {
+            return anyhow::anyhow!("state_v2_integrity_requires_explicit_repair");
+        }
         let reason = error
             .downcast_ref::<rusqlite::Error>()
             .and_then(|e| e.sqlite_error_code())
@@ -153,6 +161,15 @@ impl RouteState {
     fn custody_held(&self) -> bool {
         self.custody_retry_at.is_some_and(|at| Instant::now() < at)
     }
+    fn report_hold(&self) {
+        if self.custody_held() {
+            telemetry::event("hold", &Hold::AckCustody);
+        } else if let Some(hold) = self.save_hold {
+            telemetry::event("hold", &hold);
+        } else {
+            telemetry::clear_hold();
+        }
+    }
     fn reduce_page(&mut self) {
         let previous = self.page_limit;
         self.page_limit = (self.page_limit / 2).max(1);
@@ -171,6 +188,7 @@ impl RouteState {
             return;
         }
         self.save_hold = None;
+        self.report_hold();
         self.last_read = None;
         self.save_retry_completed = false;
         if over_target {
@@ -349,6 +367,7 @@ fn load_with_custody(
                             }
                             session.cx = cx;
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            state.report_hold();
                             telemetry::event("route", &"v2");
                             return Ok(Some(index));
                         }
@@ -385,6 +404,7 @@ fn load_with_custody(
                 })),
             }));
             register(state, &index)?;
+            state.report_hold();
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }

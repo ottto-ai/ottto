@@ -79,6 +79,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
+| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure or live ACK-custody hold remains visible after hydration. This is current posture, not an occurrence counter. |
 | `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without a deadline; a slow scan never holds collection. |
 | `sqlite_busy_slow_alarm`, `vacuum_slow_alarm` | Required SQLite lock waits beyond 100 ms and VACUUM beyond its former work allowance alarm while work continues. |
 | `maintenance_lock_deferred_alarm`, `erasure_busy_deferred_alarm`, `wal_debt_alarm` | Maintenance lock contention or excess checkpoint debt defers maintenance with an alarm while collection continues. Erasure obligations remain pending until verified completion. |
@@ -135,6 +136,14 @@ maintenance work. A pending age is null when no obligation exists or its clock
 is unavailable; `erasure_overdue` distinguishes conservative clock handling.
 Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
 by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+
+Source health uses `index_retrying` and "local index busy, retrying" for
+retryable v2 storage, reload, migration and save-pressure holds. These do not
+increment repair-required counters or recommend support/repair. Unsupported
+formats still require an update. Explicit integrity repair, lost fences, foreign
+bindings and reference drift retain `index_shard_unavailable` repair advice.
+A successful compatible load clears retrying; a different current refusal
+replaces the old reason.
 
 There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
 

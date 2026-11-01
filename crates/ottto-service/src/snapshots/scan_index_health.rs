@@ -9,6 +9,10 @@ pub(crate) const SHARD_CODE: &str = "index_shard_unavailable";
 pub(crate) const SHARD_LABEL: &str = "Not collecting: local data needs repair";
 pub(crate) const SHARD_DETAIL: &str = "Ottto paused collection for this app because some saved local data is missing or damaged. Don't delete Ottto's data folder. Contact Ottto support to restore it; collection resumes once it's complete.";
 
+pub(crate) const RETRY_CODE: &str = "index_retrying";
+const RETRY_LABEL: &str = "Not collecting: local index busy, retrying";
+const RETRY_DETAIL: &str = "Ottto is checking or retrying this app's local index. Collection resumes automatically when the check or retry succeeds. Keep the local index.";
+
 /// Fixed diagnostic causes only; these reuse the existing repair surface.
 #[derive(Clone, Copy)]
 pub(crate) enum RepairCause {
@@ -26,17 +30,6 @@ impl RepairCause {
         }
     }
     fn from_error(error: &anyhow::Error) -> Option<Self> {
-        if error
-            .downcast_ref::<super::state_v2::Hold>()
-            .is_some_and(|cause| {
-                !matches!(
-                    cause,
-                    super::state_v2::Hold::Future | super::state_v2::Hold::NewerSchema
-                )
-            })
-        {
-            return Some(Self::StateV2);
-        }
         for cause in error.chain() {
             // The loader preserves this typed refusal after the representation
             // adapter fails closed. Do not classify arbitrary IO/shape errors.
@@ -60,29 +53,60 @@ impl RepairCause {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     NewerApp,
     ShardUnavailable,
+    Retrying,
 }
-pub(crate) const REASONS: [Reason; 2] = [Reason::NewerApp, Reason::ShardUnavailable];
+pub(crate) const REASONS: [Reason; 3] =
+    [Reason::NewerApp, Reason::ShardUnavailable, Reason::Retrying];
+
+/// One exhaustive classification for both log wording and status projection.
+pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
+    use super::state_v2::Hold;
+    for cause in error.chain() {
+        if let Some(hold) = cause.downcast_ref::<Hold>() {
+            return Some(match hold {
+                Hold::Future | Hold::UnknownRecordKind | Hold::NewerSchema => Reason::NewerApp,
+                Hold::ForeignBinding | Hold::FenceLost | Hold::ReferenceDrift => {
+                    Reason::ShardUnavailable
+                }
+                Hold::DbUnavailable
+                | Hold::MigrationFailed
+                | Hold::ReloadRequired
+                | Hold::SaveCeiling
+                | Hold::SaveOversize
+                | Hold::SaveFull
+                | Hold::AckCustody => Reason::Retrying,
+            });
+        }
+        if cause.to_string() == "state_v2_integrity_requires_explicit_repair" {
+            return Some(Reason::ShardUnavailable);
+        }
+    }
+    None
+}
 impl Reason {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::NewerApp => CODE,
             Self::ShardUnavailable => SHARD_CODE,
+            Self::Retrying => RETRY_CODE,
         }
     }
     pub(crate) fn detail(self) -> &'static str {
         match self {
             Self::NewerApp => DETAIL,
             Self::ShardUnavailable => SHARD_DETAIL,
+            Self::Retrying => RETRY_DETAIL,
         }
     }
     pub(crate) fn action(self) -> &'static str {
         match self {
             Self::NewerApp => "update_ottto",
             Self::ShardUnavailable => "contact_support",
+            Self::Retrying => "retry_automatically",
         }
     }
     pub(crate) fn from_code(code: &str) -> Option<Self> {
@@ -92,6 +116,7 @@ impl Reason {
         match self {
             Self::NewerApp => 0,
             Self::ShardUnavailable => 3,
+            Self::Retrying => 6,
         }
     }
 }
@@ -107,8 +132,8 @@ pub(crate) struct Refusal {
     pub(crate) since: String,
 }
 #[cfg(not(test))]
-fn with_states<T>(f: impl FnOnce(&mut [State; 6]) -> T) -> T {
-    static STATES: std::sync::OnceLock<std::sync::Mutex<[State; 6]>> = std::sync::OnceLock::new();
+fn with_states<T>(f: impl FnOnce(&mut [State; 9]) -> T) -> T {
+    static STATES: std::sync::OnceLock<std::sync::Mutex<[State; 9]>> = std::sync::OnceLock::new();
     let mut states = STATES
         .get_or_init(|| std::sync::Mutex::new(std::array::from_fn(|_| State::default())))
         .lock()
@@ -116,9 +141,9 @@ fn with_states<T>(f: impl FnOnce(&mut [State; 6]) -> T) -> T {
     f(&mut states)
 }
 #[cfg(test)]
-fn with_states<T>(f: impl FnOnce(&mut [State; 6]) -> T) -> T {
+fn with_states<T>(f: impl FnOnce(&mut [State; 9]) -> T) -> T {
     thread_local! {
-        static STATES: std::cell::RefCell<[State; 6]> = std::cell::RefCell::new(std::array::from_fn(|_| State::default()));
+        static STATES: std::cell::RefCell<[State; 9]> = std::cell::RefCell::new(std::array::from_fn(|_| State::default()));
     }
     STATES.with(|states| f(&mut states.borrow_mut()))
 }
@@ -129,7 +154,7 @@ fn slot(source: SnapshotSource) -> usize {
         SnapshotSource::Pi => 2,
     }
 }
-pub(crate) fn observations() -> [[(Option<String>, u64); 3]; 2] {
+pub(crate) fn observations() -> [[(Option<String>, u64); 3]; 3] {
     with_states(|states| {
         std::array::from_fn(|reason| {
             std::array::from_fn(|source| {
@@ -173,21 +198,36 @@ pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex
                 unavailable != 0,
                 unavailable,
             );
+            set(source, Reason::Retrying, false, 0);
         }
-        Err(error) if is_version_refusal(error) => set(source, Reason::NewerApp, true, 0),
         Err(error) => {
-            if let Some(cause) = RepairCause::from_error(error) {
+            if let Some(reason) = state_v2_reason(error) {
+                if reason == Reason::ShardUnavailable {
+                    crate::local_resource_diagnostics::scan_index_repair_required(
+                        source.api_slug(),
+                        RepairCause::StateV2,
+                    );
+                }
+                set_refusal(source, reason);
+            } else if is_version_refusal(error) {
+                set_refusal(source, Reason::NewerApp);
+            } else if let Some(cause) = RepairCause::from_error(error) {
                 crate::local_resource_diagnostics::scan_index_repair_required(
                     source.api_slug(),
                     cause,
                 );
                 // The same source blocker and one-per-episode alarm as UNKNOWN.
                 // Zero map count: no unavailable shard inventory was loaded.
-                set(source, Reason::ShardUnavailable, true, 0);
+                set_refusal(source, Reason::ShardUnavailable);
             }
         }
         // Missing/quarantined state and unrelated errors cannot prove recovery.
         _ => {}
+    }
+}
+fn set_refusal(source: SnapshotSource, reason: Reason) {
+    for candidate in REASONS {
+        set(source, candidate, candidate == reason, 0);
     }
 }
 fn set(source: SnapshotSource, reason: Reason, blocked: bool, unavailable: usize) {
@@ -213,11 +253,12 @@ fn set(source: SnapshotSource, reason: Reason, blocked: bool, unavailable: usize
             !blocked,
             state.transitions,
             if !blocked {
-                "compatible index loaded"
+                "local index blocker cleared"
             } else {
                 match reason {
                     Reason::NewerApp => LABEL,
                     Reason::ShardUnavailable => SHARD_LABEL,
+                    Reason::Retrying => RETRY_LABEL,
                 }
             }
         );

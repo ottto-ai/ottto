@@ -70,6 +70,11 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
+/// Clear a resolved store hold explicitly; absence of a new error is not an
+/// event and otherwise leaves an old process-lifetime value behind.
+pub(super) fn clear_hold() {
+    event("hold", &"none");
+}
 /// Test evidence only: the latest value of a content-free event.
 #[cfg(test)]
 pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
