@@ -114,6 +114,7 @@ pub(crate) fn open_private_lock_file(path: &Path) -> io::Result<File> {
 
 /// Best-effort cache write: create the parent, write `<stem>.json.tmp`, rename
 /// it over `path`. No fsync; any failure leaves the old file and is ignored.
+/// Best-effort cache writes only; not for durable custody state.
 pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) {
     let Some(dir) = path.parent() else {
         return;
@@ -134,6 +135,7 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) {
 /// (truncating), write, best-effort fsync, rename while the temp is open. No
 /// directory fsync. Errors read `create|write <temp_label> temp <temp path>`
 /// and `rename <cache_label> into place <path>`.
+/// Best-effort cache writes only; not for durable custody state.
 pub(crate) fn replace_json_cache(
     path: &Path,
     payload: &[u8],

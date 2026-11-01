@@ -112,6 +112,7 @@ fn typed_row(row: &Value) -> SnapshotModelUsage {
             .get("identity_parts")
             .map(|parts| parts.as_array().unwrap().iter().map(typed_part).collect()),
         identity_retained: row.get("identity_retained").is_some_and(|v| v == true),
+        copy_invalidated: row.get("copy_invalidated").is_some_and(|v| v == true),
         cost_usd: opt_string(row, "cost_usd"),
         input_cost_usd: opt_string(row, "input_cost_usd"),
         output_cost_usd: opt_string(row, "output_cost_usd"),
@@ -5295,6 +5296,8 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
         &mut items,
         &ScanIndex::default(),
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
     );
     assert!(items
         .iter()

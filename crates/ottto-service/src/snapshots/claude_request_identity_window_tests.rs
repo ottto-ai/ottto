@@ -415,10 +415,16 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
     let bytes = |key: &str| shed[key].as_u64().unwrap();
     assert!(bytes("after_shed") <= identity::MAX_ITEM_BYTES as u64);
     assert_eq!(
-        ["context_curve", "cache_observations", "identity", "usage_buckets", "rest"]
-            .map(bytes)
-            .iter()
-            .sum::<u64>(),
+        [
+            "context_curve",
+            "cache_observations",
+            "identity",
+            "usage_buckets",
+            "rest"
+        ]
+        .map(bytes)
+        .iter()
+        .sum::<u64>(),
         bytes("item")
     );
     assert!(padded.context_curve.as_ref().unwrap().retained_point_count < curve_points);
@@ -510,6 +516,33 @@ fn sticky_missing_state_uses_current_proof_and_counts_unknown() {
     assert!(sticky_tagged(&item.usage_buckets[575].model_usage[0]));
     assert!(!sticky_tagged(&item.usage_buckets[0].model_usage[0]));
     sticky_assert_reconciled(&item);
+
+    // [money] No stored-body proof plus eight ID-less synthetic zero rows
+    // cannot erase positive usage or change the current request identities.
+    // Use the always-on ordinary E2 finalizer before identity tagging, as the
+    // neighboring zero-usage fixtures do; raw parse has no read context.
+    let dir = temp_dir("identity-window-idless-zero");
+    let (api, trace) = owned_session_reports();
+    let mut lines = owned_session();
+    let (_, expected) = tag_one(
+        &parse_ordinary_session(&dir, &lines).remove(0),
+        &api,
+        &trace,
+    );
+    lines.push(api_error_response(Some("req_error"), &second(4)));
+    for n in 5..=12 {
+        let mut zero = api_error_response(None, &second(n));
+        zero.as_object_mut().unwrap().remove("isApiErrorMessage");
+        lines.push(zero);
+    }
+    let raw = parse_ordinary_session(&dir, &lines).remove(0);
+    assert_eq!(raw.request_count, 3);
+    assert!(!raw.claude_context_curve_identity_complete);
+    let (outcome, tagged) = tag_one(&raw, &api, &trace);
+    assert_eq!(outcome.sent, 1);
+    assert_usage_conserved(&tagged, &raw);
+    assert_eq!(tagged_body(&tagged), tagged_body(&expected));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

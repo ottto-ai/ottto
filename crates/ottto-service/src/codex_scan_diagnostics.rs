@@ -922,6 +922,10 @@ impl RecoveryLineage {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CodexScanDiagnostics {
+    /// Current indexed files with known activity entirely before the trace window
+    /// and no applied-tier receipt. Exposure only, never a mispricing count.
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    pub price_tier_old_files_without_receipt: u64,
     pub version: u8,
     pub generation: u64,
     pub state_titles: LoaderEvidence,
@@ -1014,7 +1018,7 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
@@ -1215,6 +1219,7 @@ mod tests {
             ..Default::default()
         };
         // PR-P: the two parent fields at their maxima.
+        diagnostics.price_tier_old_files_without_receipt = u64::MAX;
         diagnostics.parent_unresolvable = ParentUnresolvableCauses::saturated();
         diagnostics.parent_restarts_in_scope = Some(u64::MAX);
         diagnostics.state_titles = evidence;

@@ -584,6 +584,90 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
     );
 }
 
+/// [format] X-B1 wire contract (Lead B 2026-10-31; COST PR-B #14454): the
+/// shared golden bucket row with `copy_invalidated=true`, as the canonical
+/// body serializes it, and the same row unflagged. False is omitted, so a
+/// row without the flag keeps today's bytes and an old receiver, which
+/// ignores the unknown member, reads exactly the unflagged row.
+#[test]
+fn copy_invalidated_row_wire_golden_for_the_receiver_contract() {
+    let golden = include_str!("fixtures/claude_copy_invalidated_row.jsonl");
+    let [flagged, plain] = golden.lines().collect::<Vec<_>>().try_into().unwrap();
+    let mut row = crate::snapshots::SnapshotModelUsage {
+        model: "claude-synthetic".into(),
+        copy_unproven: false,
+        input_tokens: 6,
+        output_tokens: 2,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        reasoning_effort: None,
+        unattributed_total_tokens: 0,
+        request_count: 2,
+        selector_context: BTreeMap::new(),
+        selector_sources: BTreeMap::new(),
+        auth_mode: None,
+        billing_channel: None,
+        billing_provider: None,
+        gateway_provider: None,
+        model_provider: None,
+        subscription_product: None,
+        account_identifier_hash: None,
+        evidence_ref: None,
+        identity_parts: None,
+        identity_retained: false,
+        copy_invalidated: true,
+        cost_usd: Some("0.000042".into()),
+        input_cost_usd: None,
+        output_cost_usd: None,
+        cache_read_cost_usd: None,
+        cache_creation_cost_usd: None,
+    };
+    assert_eq!(serde_json::to_value(&row).unwrap().to_string(), flagged);
+    row.copy_invalidated = false;
+    let unflagged = serde_json::to_value(&row).unwrap().to_string();
+    assert_eq!(unflagged, plain);
+    assert!(!unflagged.contains("copy_invalidated"), "omitted when false");
+    assert_eq!(flagged.replacen(r#""copy_invalidated":true,"#, "", 1), plain);
+    assert_eq!(flagged.len() - plain.len(), r#","copy_invalidated":true"#.len());
+}
+
+/// [money] X-B1: a fallback body refuses its lost rows, and the flagged row
+/// still carries `copy_invalidated`, so that refusal cannot restore its
+/// retained proof. The identity leaf hashes the flag, so a body differing only
+/// by it is a new revision. Beside the stripped body an unfit flag is
+/// counted, never silently dropped.
+#[test]
+fn copy_invalidated_survives_a_refusal_bearing_fallback_and_reaches_the_fingerprint() {
+    let (item, proof) = retained_session(2);
+    let state = retained_state();
+    let first = item.usage_buckets[0].bucket_start.clone();
+    let run = |flagged: &[&str], extra: usize| {
+        let mut item = item.clone();
+        identity::take_identity_counts();
+        let tagged = identity::apply_copy_invalidated_for_test(
+            &mut item, &proof, &state, flagged, true, extra,
+        )
+        .unwrap();
+        assert!(matches!(tagged, Tagged::Fallback { .. }));
+        (item, retained_counts())
+    };
+    let flags = |item: &SnapshotItem| {
+        item.usage_buckets.iter().map(|bucket| bucket.model_usage[0].copy_invalidated).collect::<Vec<_>>()
+    };
+    let (plain, _) = run(&[], 0);
+    let (flagged, counts) = run(&[first.as_str()], 0);
+    assert!(flagged.request_identity_refusals > 0, "a refusal-bearing body");
+    assert_eq!(flags(&flagged), [true, false]);
+    assert_eq!(counts["copy_invalidated_rows"], 1);
+    assert_ne!(flagged.snapshot_fingerprint, plain.snapshot_fingerprint);
+    assert_eq!(flagged.request_identity_refusals, plain.request_identity_refusals);
+    let (unfit, counts) = run(&[first.as_str()], identity::MAX_ITEM_BYTES);
+    assert_eq!(flags(&unfit), [false, false]);
+    assert_eq!(counts["copy_invalidated_unfit"], 1);
+}
+
 fn retained_login_session() -> (SnapshotItem, Vec<Contribution>) {
     let (item, mut proof) = retained_session(2);
     for c in &mut proof { c.identity = login_key(OWNER_A); }
@@ -694,4 +778,79 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
     assert!(!row.identity_retained && !sticky_tagged(row));
     assert!(missing.request_identity_refusals > 0);
     sticky_assert_reconciled(&missing);
+}
+
+/// Lead B F1: a copy-prefix row marked `copy_unproven` and its unmarked own
+/// twin share a bucket and every other key field. #909 freezes, and #944
+/// proves, each under the daemon's partitioned RowKey: no false refusal, no
+/// silent re-tag, and the unmarked row keeps its key when no marked row is
+/// sent (capability off).
+#[test]
+fn copy_unproven_twin_rows_freeze_and_prove_separately() {
+    for retained in [false, true] {
+        let (mut item, _) = retained_session(1);
+        // A closed hour, so an unchanged witnessed proof marks.
+        item.collected_at = "2026-09-02T00:00:00Z".into();
+        let own = item.usage_buckets[0].model_usage[0].clone();
+        let mut copy = own.clone();
+        copy.copy_unproven = true;
+        item.usage_buckets[0].model_usage = vec![copy.clone(), own.clone()];
+        item.model_usage = vec![copy.clone(), own.clone()];
+        let start = item.usage_buckets[0].bucket_start.clone();
+        let proof = |rows: &[(&SnapshotModelUsage, u64)]| {
+            rows.iter()
+                .map(|(row, login)| Contribution {
+                    bucket_start: start.clone(),
+                    row_key: row_key_from_model_usage(row),
+                    usage: holder_usage(row, None),
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{login:064x}")),
+                        org: Some(format!("{:064x}", login + 32)),
+                        basis: identity::TELEMETRY,
+                        account_source: None,
+                    }),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = if retained {
+            retained_state()
+        } else {
+            identity::AcceptedBuckets::for_test()
+        };
+        let mut first = item.clone();
+        sticky_apply(&mut first, &proof(&[(&copy, 1), (&own, 2)]), &state).unwrap();
+        retained_ack(&mut state, &first, &[]);
+        identity::take_identity_counts();
+        let mut again = item.clone();
+        sticky_apply(&mut again, &proof(&[(&copy, 1), (&own, 2)]), &state).unwrap();
+        let counts = retained_counts();
+        assert_eq!(retained_count(&counts, "accepted_share_changed"), 0, "no false refusal");
+        assert_eq!(again.request_identity_refusals, 0);
+        if retained {
+            assert!(
+                again.usage_buckets[0].model_usage.iter().all(|row| row.identity_retained),
+                "each row carries its own witnessed proof"
+            );
+            assert_eq!(retained_count(&counts, "retained_marker_rows"), 2);
+            continue;
+        }
+        // The marked row's authority changes: its own frozen share refuses it.
+        let mut moved = item.clone();
+        sticky_apply(&mut moved, &proof(&[(&copy, 3), (&own, 2)]), &state).unwrap();
+        assert_eq!(
+            retained_count(&retained_counts(), "accepted_share_changed"),
+            1,
+            "never a silent re-tag"
+        );
+        assert_eq!(moved.request_identity_refusals, 1);
+        // No marked row (capability off): the own row finds its unchanged key.
+        let mut own_only = item.clone();
+        own_only.usage_buckets[0].model_usage = vec![own.clone()];
+        own_only.model_usage = vec![own.clone()];
+        sticky_apply(&mut own_only, &proof(&[(&own, 2)]), &state).unwrap();
+        let counts = retained_counts();
+        assert_eq!(retained_count(&counts, "accepted_share_changed"), 0);
+        assert_eq!(retained_count(&counts, "accepted_row_vanished"), 1);
+        assert_eq!(own_only.request_identity_refusals, 0);
+    }
 }

@@ -4292,3 +4292,123 @@ pub(super) fn exact_pipeline_accept(
     })?;
     Ok(response)
 }
+
+/// [money] F5 root (Codex money audit: 38 observed-but-unindexed files,
+/// $202.81): a partial ACK with no restart. A page reads two of three files
+/// and only one is acknowledged, so the partial checkpoint has no entry for
+/// the other. The very next page reads it once, with the usage a fresh scan
+/// counts, and no file is read twice.
+#[test]
+fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() {
+    let dir = test_dir("f5-codex-partial-ack");
+    let root = dir.join("home/.codex/sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    for (tokens, session) in [
+        (11, "019fa111-2222-7333-8444-555555555551"),
+        (22, "019fa111-2222-7333-8444-555555555552"),
+        (33, "019fa111-2222-7333-8444-555555555553"),
+    ] {
+        std::fs::write(
+            root.join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl")),
+            [
+                serde_json::json!({"type":"session_meta","payload":{"id":session}}),
+                serde_json::json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":tokens,"output_tokens":4}}}}),
+            ]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let page = |index: &mut ScanIndex, minute: u32, file_limit: usize| {
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            index,
+            &format!("2026-10-29T12:0{minute}:00Z"),
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            file_limit,
+            false,
+        )
+        .unwrap();
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
+        scan
+    };
+    let usage = |scan: &crate::snapshots::SourceScanResult, session: &str| {
+        scan.snapshots
+            .iter()
+            .filter(|item| item.source_session_id == session)
+            .map(|item| {
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.reasoning_output_tokens,
+                    item.request_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let fresh = page(&mut ScanIndex::default(), 0, MAX_BACKFILL_FILES_PER_SOURCE);
+    assert_eq!(fresh.snapshots.len(), 3);
+
+    let committed = ScanIndex::default();
+    let mut working = committed.clone();
+    let first = page(&mut working, 1, 2);
+    assert_eq!(first.snapshots.len(), 2, "page 1 reads two of three files");
+    let acknowledged = first.snapshots[0].clone();
+    let unacknowledged = first.snapshots[1].source_session_id.clone();
+    let mut progress = test_upload_progress();
+    progress
+        .accepted_fingerprints
+        .insert(acknowledged.snapshot_fingerprint.clone());
+    progress.accepted_body_witnesses.insert(
+        acknowledged.snapshot_fingerprint.clone(),
+        snapshot_upload_body_witness(&acknowledged),
+    );
+    let index_path = dir.join("codex-index.json");
+    let progress_path = dir.join("codex-progress.json");
+    progress.save(&progress_path).unwrap();
+    let mut index = checkpoint_partial_snapshot_index(
+        &working,
+        &committed,
+        &progress,
+        &first.snapshots,
+        Some(&first),
+        &BTreeSet::new(),
+        &index_path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !index.files.keys().any(|key| key.contains(&unacknowledged)),
+        "the checkpoint keeps no entry for the unacknowledged file"
+    );
+
+    let later = (2..=4)
+        .map(|minute| page(&mut index, minute, 2))
+        .collect::<Vec<_>>();
+    let expected = usage(&fresh, &unacknowledged);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(
+        usage(&later[0], &unacknowledged),
+        expected,
+        "the next page reads the unacknowledged file"
+    );
+    assert_eq!(
+        later
+            .iter()
+            .flat_map(|scan| usage(scan, &unacknowledged))
+            .collect::<Vec<_>>(),
+        expected,
+        "read once"
+    );
+    assert!(
+        later
+            .iter()
+            .all(|scan| usage(scan, &acknowledged.source_session_id).is_empty()),
+        "the acknowledged file is not read again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
