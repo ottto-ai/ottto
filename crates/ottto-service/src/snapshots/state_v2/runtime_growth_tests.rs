@@ -336,10 +336,7 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     let durable_claim = {
         let runtime = claim.v2().persistence_v2.as_ref().unwrap();
         let mut guard = runtime.session.lock().unwrap();
-        import::ClaudeMapper
-            .hydrate_context(&mut guard.as_mut().unwrap().db)
-            .unwrap()
-            .0
+        super::super::money_test_support::hydrate_resident(&mut guard.as_mut().unwrap().db)
     };
     assert_eq!(
         serde_json::to_vec(&durable_claim).unwrap(),

@@ -29,6 +29,17 @@ fn save_with_mode(
 
 /// Generation of a freshly imported native fixture store.
 const G: u64 = 1;
+use crate::snapshots::account_pending_retention::ArchivedWindows;
+
+/// A loaded graph with its cold archives read back from the session store.
+fn materialized(index: &ScanIndex) -> ScanIndex {
+    let mut view = index.clone();
+    with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        kinds_accounts::materialize(&mut tx, &mut view).unwrap();
+    });
+    view
+}
 
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
@@ -75,6 +86,9 @@ impl Fixture {
         self.import(true);
     }
     fn import(&self, mapped: bool) {
+        self.import_graph(mapped.then(ScanIndex::default).as_ref());
+    }
+    fn import_graph(&self, mapped: Option<&ScanIndex>) {
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
                 .unwrap();
@@ -83,11 +97,11 @@ impl Fixture {
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         let mut generation = 0;
-        if mapped {
+        if let Some(graph) = mapped {
             let mut cx = KindCx::default();
             cx.binding = Some(self.identity().binding);
             let mut tx = db.begin(TxnMode::Write).unwrap();
-            kinds::populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
+            kinds::populate(graph, &mut tx, &mut cx).unwrap();
             assert_eq!(tx.commit(0, G), DurableCommitOutcome::Committed(G));
             generation = G;
         }
@@ -275,6 +289,45 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());
     assert_eq!(index.generation, G + 1);
+    // [money] Archived account windows stay row-only through the latched OFF
+    // load and save, and read back with the pre-switch placement.
+    let f = Fixture::new();
+    let window = |day: u32| crate::snapshots::ClaudeAccountFamilyPendingWindow {
+        version: crate::snapshots::CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
+        census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
+        account_identifier_hash: "d".repeat(64),
+        evidence_request_count: 0,
+        census_complete: false,
+        members: BTreeMap::new(),
+        member_requests: BTreeMap::new(),
+        invalid: false,
+    };
+    let mut pre = ScanIndex::default();
+    pre.claude_account_family_pending.insert(
+        "family".into(),
+        crate::snapshots::ClaudeAccountFamilyPending {
+            current: window(30),
+            previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
+            confirmed_absent_members: BTreeSet::new(),
+        },
+    );
+    f.import_graph(Some(&pre));
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let cold = |index: &ScanIndex| {
+        matches!(
+            index.claude_account_family_pending["family"].previous_windows,
+            ArchivedWindows::Cold(_)
+        )
+    };
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert!(cold(&index));
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert!(cold(&reloaded));
+    assert_eq!(
+        materialized(&reloaded).claude_account_family_pending,
+        pre.claude_account_family_pending
+    );
     // A fresh route must decode the missing semantic rows, never treat them as empty.
     let f = Fixture::new();
     f.import(false);
@@ -1009,16 +1062,36 @@ mod hydrate_parity {
             "other-family".into(),
             s::ClaudeAccountFamilyPending {
                 current: window(30),
-                previous_windows: vec![window(25), window(26), window(27)],
+                previous_windows: ArchivedWindows::Resident(vec![
+                    window(25),
+                    window(26),
+                    window(27),
+                ]),
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
-        let actual = typed_case(index);
+        // The shared load tail never walks a cold archive: the window a v1
+        // load collapses stays in the store, counted as refused.
+        let f = Fixture::new();
+        publish(&f, &index);
+        let (actual, _) = ScanIndex::load_inner_with_support(
+            &f.path,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let family = &actual.claude_account_family_pending["other-family"];
+        assert!(matches!(family.previous_windows, ArchivedWindows::Cold(_)));
+        assert_eq!(family.previous_windows.uncollapsed(), 1);
+        assert_eq!(actual.claude_account_window_retention.roots_refused, 1);
+        assert_eq!(actual.claude_account_window_retention.windows_collapsed, 0);
         assert_eq!(
-            actual.claude_account_family_pending["other-family"]
+            materialized(&actual).claude_account_family_pending["other-family"]
                 .previous_windows
+                .resident()
                 .len(),
-            2
+            3
         );
     }
     /// [money] raw quarantine repairs and opaque file freezes match v1 custody.

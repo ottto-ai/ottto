@@ -199,7 +199,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
             drop(tx);
         }
         let counts = assert_refs(&mut db);
-        let restored = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+        let restored = money_test_support::hydrate_resident(&mut db);
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
             serde_json::to_vec(if commit { &next } else { &prev }).unwrap()
@@ -345,7 +345,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         &index,
         BTreeMap::new(),
     );
-    let restored = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+    let restored = money_test_support::hydrate_resident(&mut db);
     let mut expected = index;
     expected.generation = 1;
     assert_eq!(
@@ -376,7 +376,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         drop(tx);
     }
     assert_eq!(
-        serde_json::to_vec(&import::ClaudeMapper.hydrate_context(&mut db).unwrap().0).unwrap(),
+        serde_json::to_vec(&money_test_support::hydrate_resident(&mut db)).unwrap(),
         serde_json::to_vec(&expected).unwrap()
     );
 }
