@@ -709,9 +709,7 @@ pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 /// MUST stay in lockstep with the backend pricing catalog's
 /// `context_bucket_threshold_tokens` for the 1M-capable Claude models and the
 /// cost projector's `_derive_context_bucket`, which honors this daemon-supplied
-/// bucket ahead of its own (request_count==1-gated) derivation. See
-/// coding-agents-observability backend/app/services/telemetry_cost_projector.py
-/// and backend/app/domain/pricing/selector_context.py.
+/// bucket ahead of its own (request_count==1-gated) derivation.
 pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 
 /// How a model's price line bills a request over it.
@@ -2037,9 +2035,9 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only, copy-prefix switch on (X-B1, Lead B
-    /// 2026-10-31): the row's accepted proof was copy-derived and is
-    /// tombstoned; a retaining receiver drops that proof for good. Like
+    /// Wire contract 5, bucket rows only, copy-prefix switch on: the row's
+    /// accepted proof was copy-derived and is tombstoned; a retaining receiver
+    /// drops that proof for good. Like
     /// `identity_retained`, only sent when the server advertised option (ii)
     /// and hashed in the identity leaf. Omitted when false, so switch-off
     /// bytes are unchanged.
@@ -2103,7 +2101,7 @@ pub struct SnapshotRequestEvidence {
 /// Missing/null/unknown keeps existing wire bytes for every source.
 pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
 
-/// How a carried account reached a request (class N).
+/// How a carried account reached a request (counts only).
 /// Shared wire shape for source reducers; unmarked provenance stays absent.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -2383,7 +2381,7 @@ struct ClaudeFullRearmProgress {
     /// loads `None`, which keeps the sweep-wide unchanged-proof veto.
     #[serde(skip_serializing_if = "Option::is_none")]
     held_family_roots: Option<BTreeSet<String>>,
-    /// Lead A ruling (a): the `""` cutover's latch re-arms at one terminal.
+    /// The `""` cutover's latch re-arms at one terminal.
     #[serde(skip_serializing_if = "is_zero_u8")]
     contract_cutover: u8,
 }
@@ -4078,7 +4076,7 @@ pub struct ScanIndex {
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
     /// it. Only an empty undamaged store is never written, so an absent field
-    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// is an empty store; damaged metadata stays uncertain until
     /// the current proof decides.
     #[serde(
         default,
@@ -5384,7 +5382,7 @@ impl ClaudeUsageAuthorityDisposition {
             .collect()
     }
 
-    /// Option A: every Claude family a held entity of this page could count
+    /// Every Claude family a held entity of this page could count
     /// under, as raw roots: the entity's own root, the path root of each index
     /// key that names its revision, and the root of every authority record
     /// that already binds it as a member. A family named here only keeps its
@@ -7238,7 +7236,7 @@ const CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL: &str = "changed_wi
 // Existing contract field records that E2 already armed paced revision debt
 // during this traversal. It cannot clear the contract latch at its terminal.
 const CLAUDE_E2_IDENTITY_ADOPTION_PENDING: &str = "e2_identity_adoption_pending";
-// Lead A ruling (a) cutover states; spent keeps the cutover's latch inert.
+// Cutover states; spent keeps the cutover's latch inert.
 const CLAUDE_CONTRACT_CUTOVER_OWED: u8 = 1;
 const CLAUDE_CONTRACT_CUTOVER_SPENT: u8 = 2;
 const CLAUDE_CONTRACT_CUTOVER_REAL: u8 = 3;
@@ -10331,7 +10329,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 .claude_full_rearm_progress
                 .first_proof_hold_since_full_rearm;
         let stays_closed = overflowed_before && index.claude_duplicate_request_witness_overflowed;
-        // Lead A ruling (a): the cutover's latch re-arms at one terminal under
+        // The cutover's latch re-arms at one terminal under
         // the recorded contract; its baseline carries over (no full re-arm).
         let cutover = index.claude_full_rearm_progress.contract_cutover;
         let contract = claude_request_identity::cycle_contract(identity.is_some());
@@ -10515,7 +10513,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // and the accepted ledger is current and not being rebuilt. Authority
         // debt alone does not unsettle the sweep; `claude_unchanged_proof_roots`
         // still excludes every quarantined or demoting root.
-        // Option A: when the sweep's only unsettled cause is scoped
+        // When the sweep's only unsettled cause is scoped
         // `CompletedBlockingHolds`, only the held families lose the skip below;
         // they stay held, re-offered and unproven residue. Any other cause, or
         // a stamp that could not name its families, keeps the sweep-wide veto.
@@ -40943,7 +40941,7 @@ impl CodexTitleMetadata {
         );
     }
 
-    /// E2 B3b (Lead B, 2026-10-31): a failed created-thread census holds only
+    /// A failed created-thread census holds only
     /// rollouts whose proof could depend on a failing home's state database.
     fn created_thread_census_incomplete_for(&self, path: &Path) -> bool {
         !self.created_thread_census_failed_homes.is_empty()
@@ -46503,7 +46501,7 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
-                        // Lead B Addendum 4 (option 1): a body whose owner
+                        // A body whose owner
                         // account this scan cleared for a non-discard unhealthy
                         // read uploads Unknown now; the owner is never rewritten.
                         (Some(owner), None)
@@ -47486,7 +47484,7 @@ impl ScanIndex {
             return;
         }
         use claude_request_identity::{COLLECTOR, E2_GROUPING};
-        // Lead A ruling (a): the first cutover from `""` owes one re-arm; once
+        // The first cutover from `""` owes one re-arm; once
         // spent, only a real contract-to-contract change re-arms again.
         let cutover = &mut self.claude_full_rearm_progress.contract_cutover;
         *cutover = match (*cutover, self.claude_request_identity_contract.as_deref()) {
@@ -77491,7 +77489,7 @@ mod tests {
         assert!(!metadata.created_thread_census_failed_homes.is_empty());
     }
 
-    /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
+    /// [money] One home's created-thread census
     /// fails. A rollout whose proof comes only from another, healthy home is
     /// not held, nor is its spawned child. A rollout that might depend on two
     /// homes (a copy of its id in the failing home), its spawned descendants, one
