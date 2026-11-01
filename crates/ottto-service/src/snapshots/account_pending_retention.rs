@@ -144,8 +144,8 @@ impl ArchivedWindows {
         matches!(self, Self::Resident(windows) if windows.is_empty())
     }
 
-    /// Interior windows of equal-evidence runs left in the store: the v1
-    /// load walk would collapse them, a cold archive is never walked.
+    /// Interior windows of equal-evidence runs, boundaries unchecked; a cold
+    /// archive is never walked.
     pub(super) fn uncollapsed(&self) -> usize {
         match self {
             Self::Resident(_) => 0,
@@ -186,18 +186,17 @@ impl std::fmt::Debug for ColdWindows {
             .finish_non_exhaustive()
     }
 }
-/// One rollover under a cold archive, with the arguments the resident
-/// archive would have applied it with. `seq` is unique in the process and
-/// survives clones, so a save of a sibling graph names the rollovers it
-/// committed.
+/// One rollover under a cold archive, with the current boundary the
+/// endpoint rule reads. Cold archives exist only without raw holds, where
+/// every rollover is strict. `seq` is unique in the process and survives
+/// clones, so a save of a sibling graph names the rollovers it committed.
 #[derive(Clone, PartialEq, Eq)]
 struct Rolled {
     window: ClaudeAccountFamilyPendingWindow,
-    strict: bool,
     current_end: String,
     seq: u64,
 }
-crate::heap_layout_bound::fields!(Rolled; window, strict, current_end, seq);
+crate::heap_layout_bound::fields!(Rolled; window, current_end, seq);
 static ROLL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 impl ColdWindows {
     /// Stored archived rows and the last one's id.
@@ -237,12 +236,7 @@ impl ColdWindows {
         skip: usize,
     ) -> Vec<ClaudeAccountFamilyPendingWindow> {
         for rolled in &self.rolled[skip..] {
-            let window = rolled.window.clone();
-            if rolled.strict {
-                retain_run_endpoint(&mut tail, window, &rolled.current_end);
-            } else {
-                tail.push(window);
-            }
+            retain_run_endpoint(&mut tail, rolled.window.clone(), &rolled.current_end);
         }
         tail
     }
@@ -305,10 +299,10 @@ impl ClaudeAccountFamilyPending {
             }
             ArchivedWindows::Resident(windows) => windows.push(old),
             ArchivedWindows::Cold(cold) => {
+                debug_assert!(strict, "cold archives exist only without raw holds");
                 cold.summary.fold(&old);
                 cold.rolled.push(Rolled {
                     window: old,
-                    strict,
                     current_end: current_end.clone(),
                     seq: ROLL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 });
