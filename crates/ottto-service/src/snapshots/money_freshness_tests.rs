@@ -32,6 +32,7 @@ fn fixture() -> ScanIndex {
             codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
+            oversized_discovery: BTreeMap::new(),
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
             context_inputs: None,

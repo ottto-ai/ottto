@@ -89,6 +89,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         codex_parent_resolution_retry_required: false,
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,
+        oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
         context_inputs: None,
@@ -357,11 +358,16 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
         case(Incomplete::RefusedRead, 1, {
             let key = target[1].clone();
             move |index| {
-                index.oversized_discovery.insert(
-                    oversized_discovery::path_hash(Path::new(&key)),
-                    serde_json::from_value(json!({"content_hash": "c", "observations": 1}))
-                        .unwrap(),
-                );
+                index
+                    .traversal
+                    .as_mut()
+                    .unwrap()
+                    .oversized_discovery
+                    .insert(
+                        oversized_discovery::path_hash(Path::new(&key)),
+                        serde_json::from_value(json!({"content_hash": "c", "observations": 1}))
+                            .unwrap(),
+                    );
             }
         }),
         // Unattributed refusals cannot name a file: every family.

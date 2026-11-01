@@ -852,6 +852,7 @@ fn drop_retires_a_keys_side_and_proof_items_and_its_ledger_generation() {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: [kept.to_owned()].into_iter().collect(),
+            oversized_discovery: Default::default(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: Some(kept.to_owned()),

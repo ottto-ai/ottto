@@ -3006,7 +3006,6 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
             &mut traversal,
             &[processed.clone(), pending.clone(), unobserved.clone()],
             false,
-            &index.oversized_discovery,
         );
         let flags = |path: &Path| {
             let matches = traversal

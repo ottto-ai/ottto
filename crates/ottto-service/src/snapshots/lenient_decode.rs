@@ -417,7 +417,6 @@ impl Serialize for ScanIndex {
             upload_context_proof,
             upload_context_receipt::ProofState::is_empty
         );
-        field!(oversized_discovery, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -512,7 +511,6 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
     "upload_context_proof",
-    "oversized_discovery",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2334,7 +2332,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                             };
                         }
                         "traversal" => index.traversal = self.typed(value)?,
-                        "oversized_discovery" => index.oversized_discovery = self.typed(value)?,
                         "claude_stale_family_carry" => {
                             index.claude_stale_family_carry = self.typed(value)?
                         }

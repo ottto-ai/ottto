@@ -866,7 +866,6 @@ impl SourceScanResult {
                     traversal,
                     &[PathBuf::from(key)],
                     false,
-                    &index.oversized_discovery,
                 );
             }
             queued += 1;
