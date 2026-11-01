@@ -1140,13 +1140,13 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
 /// callback). `None`: the whole kind, complete by its manifest count. Each
 /// value comes with its row digest as stored. A graph not at the generation
 /// its save would commit over (its own, or its confirmed growth claim's),
-/// or a store changed elsewhere, holds.
+/// or a store changed elsewhere, holds. Returns the store stamp it read at.
 pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
     index: &ScanIndex,
     kind: &str,
     roots: Option<&std::collections::BTreeSet<String>>,
     f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1203,19 +1203,27 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
         expected.map_or(true, |expected| expected == count),
         "state_v2_missing_member"
     );
-    Ok(())
+    Ok(stamp)
 }
 
 /// Cold usage pending: load the families a page names before it
 /// accumulates (`Some`), or every family before a decision that joins them
 /// (`None`). A missing, changed or unreadable row, or a store this graph does
 /// not hold, is Unknown and the caller refuses its whole decision. Counted.
-/// Rows install one at a time, only after every wanted row was read: a later
-/// digest mismatch can leave earlier verified rows installed while the caller
-/// still refuses the whole decision.
+/// Nothing installs unless every wanted row was read and matches its head.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    load_usage_shaped(index, roots, &mut |_| ())
+}
+
+/// `load_usage` that reshapes each value as it is read, so a caller that
+/// rewrites the families it loads never holds their stored form all at once.
+pub(in super::super) fn load_usage_shaped(
+    index: &mut ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    shape: &mut dyn FnMut(&mut super::super::ClaudeUsageFamilyPending),
 ) -> Result<()> {
     let usage = &index.claude_usage_family_pending;
     if usage.cold().is_none() {
@@ -1238,7 +1246,8 @@ pub(in super::super) fn load_usage(
             index,
             "usage.pending",
             wanted.as_ref(),
-            &mut |root, value, digest| {
+            &mut |root, mut value: super::super::ClaudeUsageFamilyPending, digest| {
+                shape(&mut value);
                 read.push((root, value, digest));
                 Ok(())
             },
@@ -1256,6 +1265,9 @@ pub(in super::super) fn load_usage(
             .claude_usage_family_pending
             .cold_mut()
             .ok_or(Hold::DbUnavailable)?;
+        for (root, _, digest) in &read {
+            cold.admits(root, *digest)?;
+        }
         for (root, value, digest) in read {
             cold.install(root, value, digest)?;
         }
@@ -1268,6 +1280,72 @@ pub(in super::super) fn load_usage(
         telemetry::count("usage_pending_unknown", 1);
     }
     result
+}
+
+/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
+/// time, as this graph holds it: its loaded value, else its stored row,
+/// which must still match its head. Keeps nothing and visits in no set
+/// order. Returns the store stamp it read at (`None`: it read no row).
+/// Unknown, counted: a row unlike its head, a head without a row, or a store
+/// this graph does not hold.
+pub(in super::super) fn visit_usage(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
+) -> Result<Option<(u64, u64)>> {
+    let wanted = |root: &str| roots.map_or(true, |roots| roots.contains(root));
+    let usage = &index.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        for (root, family) in usage.resident().into_iter().flatten() {
+            if wanted(root.as_str()) {
+                f(root.as_str(), family);
+            }
+        }
+        return Ok(None);
+    };
+    for (root, family) in cold.loaded() {
+        if wanted(root.as_str()) {
+            f(root.as_str(), family);
+        }
+    }
+    let unread = match roots {
+        Some(roots) => usage.unloaded(roots.iter().map(String::as_str)),
+        None => usage.unloaded(cold.head_roots().map(String::as_str)),
+    };
+    if unread.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = 0_usize;
+    let read = read_cold(
+        index,
+        "usage.pending",
+        roots.map(|_| &unread),
+        &mut |root, value: super::super::ClaudeUsageFamilyPending, digest| {
+            if !unread.contains(&root) {
+                return Ok(()); // loaded above, or removed by this graph
+            }
+            ensure!(
+                cold.head(&root).is_some_and(|head| head.digest == digest),
+                super::super::usage_pending::Unknown
+            );
+            seen += 1;
+            f(root.as_str(), &value);
+            Ok(())
+        },
+    );
+    let result = read.and_then(|stamp| {
+        ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
+        Ok(Some(stamp))
+    });
+    if result.is_err() {
+        telemetry::count("usage_pending_unknown", 1);
+    }
+    result
+}
+
+/// Counts only: the request keys a streamed usage join held at its peak.
+pub(in super::super) fn usage_join_keys(keys: usize) {
+    telemetry::event("usage_join_keys", &keys);
 }
 
 /// End a decision that loaded every cold usage family: values unchanged

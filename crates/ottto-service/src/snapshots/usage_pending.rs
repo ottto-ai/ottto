@@ -2,7 +2,8 @@
 //! them `Resident`. A complete v2 hydrate keeps them `Cold`: each family's
 //! row stays in the store and RAM keeps its head (window, flags, member names
 //! with counts, row digest). A page loads its own families before it
-//! accumulates; a decision that joins every family loads them all first. A
+//! accumulates; a terminal decision that joins every family loads them all
+//! first, and the traversal-start carry streams them one at a time. A
 //! family with a head and no loaded value is Unknown, never absent.
 use super::evidence_owed::EvidenceContract;
 use super::ClaudeUsageFamilyPending;
@@ -271,6 +272,9 @@ impl ColdUsage {
     pub(super) fn loaded(&self) -> &Families {
         &self.loaded
     }
+    pub(super) fn head_roots(&self) -> impl Iterator<Item = &String> + '_ {
+        self.heads.keys()
+    }
     fn set_head(&mut self, root: &str, head: UsageHead) {
         self.head_occurrences = self.head_occurrences.saturating_add(head.occurrences);
         if let Some(old) = self.heads.insert(root.to_owned(), head) {
@@ -290,14 +294,20 @@ impl ColdUsage {
         family: ClaudeUsageFamilyPending,
         digest: [u8; 32],
     ) -> Result<(), Unknown> {
-        if self.loaded.contains_key(&root) {
+        self.admits(&root, digest)?;
+        if !self.loaded.contains_key(&root) && self.heads.contains_key(&root) {
+            self.loaded.insert(root, family);
+        }
+        Ok(())
+    }
+    /// Whether `install` would accept this row: its digest is the head's, or
+    /// the family is loaded already or was removed by this graph.
+    pub(super) fn admits(&self, root: &str, digest: [u8; 32]) -> Result<(), Unknown> {
+        if self.loaded.contains_key(root) {
             return Ok(());
         }
-        match self.heads.get(&root) {
-            Some(head) if head.digest == digest => {
-                self.loaded.insert(root, family);
-                Ok(())
-            }
+        match self.heads.get(root) {
+            Some(head) if head.digest == digest => Ok(()),
             // A row this graph removed stays removed.
             None if !self.complete => Ok(()),
             _ => Err(Unknown),
@@ -368,6 +378,13 @@ impl ColdUsage {
             self.set_head(&root, head);
         }
     }
+}
+
+/// A request hash as a full 256-bit join key: equal hashes give equal keys,
+/// whatever their spelling, so a streamed join never needs the strings.
+pub(super) fn request_key(hash: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(hash.as_bytes()).into()
 }
 
 /// Sorted merge of the head and loaded keys; a loaded value wins.
