@@ -16648,8 +16648,12 @@ struct ClaudeDesktopIdentityEvidence {
 }
 
 // The desktop store holds one ~80KB JSON per session; both caps are far above
-// anything observed and exist only to bound a pathological store.
+// anything observed and exist only to bound a pathological store. Tests use a
+// small page so pagination fixtures need dozens of files, not thousands.
+#[cfg(not(test))]
 const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
+#[cfg(test)]
+const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 32;
 const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
