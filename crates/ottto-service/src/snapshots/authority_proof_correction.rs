@@ -218,7 +218,7 @@ impl ScanIndex {
         }
         for root in &unbound {
             self.claude_usage_authority_quarantine.remove(root);
-            self.claude_usage_family_pending.remove(root);
+            self.claude_usage_family_pending.discard(root);
         }
         let mut rearmed = 0_usize;
         for (index_key, entry) in self.files.slots_mut() {
@@ -302,7 +302,7 @@ impl ScanIndex {
         }
         for root in resolved {
             self.claude_usage_authority_quarantine.remove(&root);
-            self.claude_usage_family_pending.remove(&root);
+            self.claude_usage_family_pending.discard(&root);
         }
     }
 
@@ -504,8 +504,7 @@ impl ScanIndex {
                 .insert(drain.root.clone(), record);
             if let Some(pending) = pending {
                 self.claude_usage_family_pending
-                    .entry(drain.root.clone())
-                    .or_insert(pending);
+                    .add_absent(drain.root.clone(), pending);
             }
         }
         let mut owed_again = false;
@@ -594,7 +593,7 @@ impl ScanIndex {
                 .is_empty()
             {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -655,7 +654,7 @@ impl ScanIndex {
             correction.owed_member_ids.remove(&member);
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -862,7 +861,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
         }
@@ -986,18 +985,34 @@ impl ScanIndex {
             if !acked_or_rejected && !noop {
                 continue;
             }
-            for item in group.iter().filter(|item| rejected(item)) {
-                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
+            let rejected_bodies: Vec<&str> = group
+                .iter()
+                .filter(|item| rejected(item))
+                .map(|item| item.body_witness.as_str())
+                .collect();
+            // Cold: the drained family's pending is the preimage a revert
+            // restores, so it is loaded first. Unknown leaves this drain owed
+            // (counted); nothing of it is applied.
+            let roots = BTreeSet::from([candidate.root.clone()]);
+            if !drains.families.contains_key(&candidate.root)
+                && state_v2::load_usage(self, Some(&roots)).is_err()
+            {
+                continue;
+            }
+            let Ok(pending) = self.claude_usage_family_pending.family(&candidate.root) else {
+                continue;
+            };
+            let pending = pending.cloned();
+            for body_witness in rejected_bodies {
+                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={body_witness}");
             }
             drains
                 .families
                 .entry(candidate.root.clone())
                 .or_insert_with(|| {
                     (
-                        record.clone(),
-                        self.claude_usage_family_pending
-                            .get(&candidate.root)
-                            .cloned(),
+                        self.claude_usage_authority_quarantine[&candidate.root].clone(),
+                        pending,
                     )
                 });
             let record = self
@@ -1012,7 +1027,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             drains.drains.push(ClaudeProofBodyDrain {
                 root: candidate.root.clone(),

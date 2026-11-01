@@ -371,12 +371,15 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
-    let family_requests = index
-        .claude_usage_family_pending
-        .values()
-        .try_fold(0_u64, |sum, p| {
-            sum.checked_add(heap(&p.member_request_id_hashes)?)
-        });
+    // Cold: only this pass's loaded families hold request hashes in RAM.
+    use super::super::usage_pending::UsagePending;
+    let evidence = match &index.claude_usage_family_pending {
+        UsagePending::Resident(families) => families,
+        UsagePending::Cold(cold) => cold.loaded(),
+    };
+    let family_requests = evidence.values().try_fold(0_u64, |sum, p| {
+        sum.checked_add(heap(&p.member_request_id_hashes)?)
+    });
     let usage_pending = heap(&index.claude_usage_family_pending)
         .zip(family_requests)
         .and_then(|(all, requests)| all.checked_sub(requests));
