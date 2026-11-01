@@ -4244,8 +4244,8 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
     }
 }
 
-/// [behaviour] Absent twins disclose page coverage and exact selection deferrals;
-/// complete twins retain their existing positive-body release.
+/// [money] Redundant prefixes publish the deduplicated body and placement;
+/// diverged absent twins retain their hold and co-read release.
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
     let _resumed_prefix =
@@ -4256,6 +4256,123 @@ fn e2_absent_subagent_twin_holds_its_session() {
         let early = agent_file("absent-sub-early");
         let later = agent_file("absent-sub-later");
         let mut index = ScanIndex::default();
+        let write = |path: &Path, lines: &[Value]| {
+            fs::write(
+                path,
+                lines
+                    .iter()
+                    .map(|line| line.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        let longer = root_file("redundant-original");
+        let shorter_path = root_file("redundant-copy");
+        // The longer original contains a mid-session organization switch; the
+        // later-born path is only a prefix, with optional request-free exit lines.
+        let prefix = vec![org_marker(ORG_A), line("a", &at(1), 10)];
+        let mut full = prefix.clone();
+        full.extend([switch_context(), org_marker(ORG_B), line("b", &at(2), 20)]);
+        write(&longer, &full);
+        write(&shorter_path, &prefix);
+        index.files.insert(local_index_key(&longer), entry());
+        index.files.insert(local_index_key(&shorter_path), entry());
+        // Production stages live birth witnesses before parsing either twin.
+        // Without that proof the prefix counts as unproven, so a co-read sums it twice.
+        stage_twins(
+            &mut index,
+            &[(&longer, t0()), (&shorter_path, t0() + 60_000_000_000)],
+        );
+        let original = parse(&longer, Some(t0()), &index, &full);
+        let copy = parse(&shorter_path, Some(t0() + 60_000_000_000), &index, &prefix);
+        assert_eq!(fold(&copy).entity.totals().1, 0);
+        assert_eq!(fold(&copy).entity.removed_requests, 1);
+        let expected = tag_owned(vec![original, copy], &index);
+        assert_eq!(
+            (expected[0].request_count, expected[0].input_tokens),
+            (2, 30)
+        );
+        use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
+        let route = |items: &[SnapshotItem]| {
+            let mut request = crate::snapshots::tests::valid_v6_batch_request();
+            request.snapshots = items.to_vec();
+            RouteResult::emitted(
+                Mode::Ram,
+                SnapshotSource::ClaudeCode,
+                vec![serde_json::to_vec(&request).unwrap()],
+                items,
+            )
+        };
+        let cold = route(&expected);
+        for proof in 0..4 {
+            let mut shorter = prefix.clone();
+            if proof == 1 {
+                shorter.push(json!({"type":"last-prompt"}));
+            }
+            write(&shorter_path, &shorter);
+            if proof == 2 {
+                use crate::snapshots::claude_request_census::{
+                    ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+                };
+                let fingerprint = "a".repeat(64);
+                let metadata = fs::metadata(&shorter_path).unwrap();
+                let key = local_index_key(&shorter_path);
+                let entry = index.files.get_mut(&key).unwrap();
+                entry.source_file_fingerprint = fingerprint.clone();
+                entry.size_bytes = metadata.len();
+                entry.modified_unix_seconds =
+                    crate::snapshots::unix_seconds(metadata.modified().unwrap()).unwrap();
+                let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![claude_request_hash("a")],
+                );
+                index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&key, record);
+            }
+            // An older, uncertified writer produced the observed longer copy
+            // at the later-born path. Its own session requests still count.
+            let mut case_full = full.clone();
+            let birth = if proof == 3 {
+                for value in &mut case_full {
+                    if value["type"] == "assistant" {
+                        value["version"] = json!("2.0.0");
+                    }
+                }
+                write(&longer, &case_full);
+                write(&shorter_path, &case_full[..prefix.len()]);
+                index = ScanIndex::default();
+                parse_and_remember(&shorter_path, t0(), &mut index, &case_full[..prefix.len()]);
+                parse_and_remember(&longer, t0() + 60_000_000_000, &mut index, &case_full);
+                t0() + 60_000_000_000
+            } else {
+                t0()
+            };
+            let mut items = vec![parse(&longer, Some(birth), &index, &case_full)];
+            let mut reasons = BTreeMap::new();
+            assert!(finish_page(
+                &mut items,
+                &index,
+                TelemetryRead::Loaded,
+                &mut reasons,
+                &Default::default()
+            )
+            .is_empty());
+            assert!(reasons.is_empty());
+            let actual = tag_owned(
+                vec![parse(&longer, Some(birth), &index, &case_full)],
+                &index,
+            );
+            assert_eq!((actual[0].request_count, actual[0].input_tokens), (2, 30));
+            money_oracle::assert_placement_equivalent(&cold, &route(&actual));
+        }
+        cleanup(&[&longer, &shorter_path]);
+        // Diverged twins have disjoint requests and must still co-read.
+        index = ScanIndex::default();
+        write(&early, &[sub_line("a", 1, 10)]);
+        write(&later, &[sub_line("b", 61, 20)]);
         let first = parse_and_remember(&early, t0(), &mut index, &[sub_line("a", 1, 10)]);
         let page = |index: &ScanIndex| {
             parse(
@@ -4309,6 +4426,8 @@ fn e2_absent_subagent_twin_holds_its_session() {
         // count the family once and count all four known native paths.
         let root_early = root_file("absent-root-early");
         let root_later = root_file("absent-root-later");
+        write(&root_early, &[line("root-a", &at(1), 30)]);
+        write(&root_later, &[line("root-b", &at(2), 40)]);
         let root_first =
             parse_and_remember(&root_early, t0(), &mut index, &[line("root-a", &at(1), 30)]);
         let root_second =
