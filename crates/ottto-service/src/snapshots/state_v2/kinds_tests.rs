@@ -427,7 +427,8 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
     const EXTENDED: &str = "synthetic-family2";
     const UNREQUESTED: &str = "synthetic-unrequested";
     const MISSING: &str = "synthetic-missing";
-    let (_scratch, mut db) = Scratch::store();
+    // Published, so a rolled-back damage transaction leaves the store usable.
+    let (_scratch, mut db) = Scratch::live_store();
     let mut index = fixture();
     let family = index.claude_account_family_pending[WITH_WINDOWS].clone();
     assert!(!family.previous_windows.resident().is_empty());
@@ -583,7 +584,7 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
         serde_json::to_vec(&expected).unwrap()
     );
 }
-/// [regress] rows lost out of band at an equal generation are refused or rewritten, never Absent.
+/// [behaviour] rows lost out of band at an equal generation are refused or rewritten, never Absent.
 #[test]
 fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
     const FAMILY: &str = "synthetic-family";
