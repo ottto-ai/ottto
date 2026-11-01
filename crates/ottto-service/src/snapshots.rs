@@ -8360,7 +8360,8 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    restored_behind_accepted: Option<u64>,
+    /// Accepted extent this restored read published below; 0 = not below.
+    restored_behind_accepted: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8898,9 +8899,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
     // even without a surviving offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
-        let Some(accepted_extent) = pending.restored_behind_accepted else {
+        let accepted_extent = pending.restored_behind_accepted;
+        if accepted_extent == 0 {
             continue;
-        };
+        }
         let offered = result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
@@ -31846,7 +31848,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: 0,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -31911,7 +31913,7 @@ impl OwnedSourceScan {
                 pending_finalization.push(PendingIndexFinalization {
                     restored_behind_accepted: file_sampling
                         .as_ref()
-                        .and_then(|active| active.restored_behind_accepted),
+                        .map_or(0, |active| active.restored_behind_accepted),
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),
@@ -34514,7 +34516,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: 0,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -35361,7 +35363,7 @@ impl OwnedSourceScan {
                                 index.files.get(&key).map(|e| e.size_bytes),
                             );
                         #[cfg(not(unix))]
-                        let restored_behind_accepted = None;
+                        let restored_behind_accepted = 0;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             restored_behind_accepted,
@@ -35434,7 +35436,7 @@ impl OwnedSourceScan {
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: None,
+                            restored_behind_accepted: 0,
                             key,
                             scope,
                             mode,
@@ -87749,30 +87751,7 @@ crate::heap_layout_bound::fields!(OwnedJsonlParser; pending, #[cfg(test)] source
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
-// Hand-written so an absent fork costs no visit: every Claude/Codex
-// accumulator carries an empty ledger, and a frame's visit count must stay
-// what it was before the ledger gained its fork field.
-impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
-    fn stable_heap(&self) -> bool {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::stable_heap(usage_keys) && fork.as_deref().map_or(true, B::stable_heap)
-    }
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::heap_bound(usage_keys, c)?;
-        fork.as_deref()
-            .map_or(Some(()), |fork| B::heap_bound(fork, c))
-    }
-    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::completed_heap_bound(usage_keys, c)?;
-        fork.as_deref()
-            .map_or(Some(()), |fork| B::completed_heap_bound(fork, c))
-    }
-}
+crate::heap_layout_bound::fields!(PiLedger; usage_keys, fork);
 crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos, parent_ref, copies_this_read);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

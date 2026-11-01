@@ -854,7 +854,7 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
-        restored_behind_accepted: None,
+        restored_behind_accepted: 0,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,

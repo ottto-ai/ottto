@@ -621,7 +621,8 @@ pub(super) struct Active {
     /// Structural fallback keeps cursor/scope metadata but retains no graph.
     pub(super) no_record: bool,
     /// Frozen observation only; never participates in admission or settlement.
-    pub(super) restored_behind_accepted: Option<u64>,
+    /// Accepted extent this read publishes below; 0 = not below.
+    pub(super) restored_behind_accepted: u64,
     pub(super) key: String,
     pub(super) scope: Scope,
     pub(super) mode: ReadMode,
