@@ -4338,6 +4338,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
         fn drop(&mut self) {
             super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
             crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|v| v.set(false));
+            crate::transcript_acquisition::OLD_CHECKPOINT_INVALID.with(|v| v.set(false));
             sampled_jsonl::preparation_tests::set(None);
         }
     }
@@ -4436,6 +4437,10 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     .with(|v| v.set(matches!(refusal, "dependency" | "large_dependency")));
                 crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
                     .with(|v| v.set(refusal == "prepare_io"));
+                // Audit debt never plans Full for a checkpoint (#870); an
+                // invalid one does, and keeps the original with its custody.
+                crate::transcript_acquisition::OLD_CHECKPOINT_INVALID
+                    .with(|v| v.set(refusal == "prepare_full"));
                 let mut header_removed = false;
                 let mut full_checked = false;
                 let mut metrics = (0, 0, 0);
@@ -4574,7 +4579,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 cache.retained().unwrap().peek(&key).is_some(),
                 "actual resident premise"
             );
-            let (mut index, idle, metrics) = run(
+            let (index, idle, metrics) = run(
                 index,
                 Some(cache.clone()),
                 "original",
@@ -4666,11 +4671,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 assert!(cache
                     .return_prepared_taken(key.clone(), Box::new(original))
                     .is_ok());
-                index
-                    .files
-                    .get_mut(&key)
-                    .unwrap()
-                    .set_unverified_deadline(1);
                 let facts = guard_facts.clone();
                 let checks = guard_checks.clone();
                 sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
@@ -5682,12 +5682,16 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         if reason == "restore_semantics" {
             assert_eq!(mm, (1, 0, 0), "pre-existing certificate Full");
             assert_eq!(mio.1, accepted);
+            // The re-read body is the accepted one: finalize's semantic no-op
+            // publishes nothing, exactly as the cold Full does.
             let cold = E2ScanFixture::default();
             let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
             assert_eq!(
-                a0h_wire(&root, &mut mi, &mut ms),
-                a0h_wire(&root, &mut ci, &mut cs)
+                serde_json::to_vec(&a0h_batch(&root, &mut mi, &mut ms)).unwrap(),
+                serde_json::to_vec(&a0h_batch(&root, &mut ci, &mut cs)).unwrap()
             );
+            assert!(ms.snapshots.is_empty());
+            assert!(ms.semantic_noop_count > 0);
         } else {
             assert_eq!(mm.0, 0, "{reason}: never reaches certificate fallback");
             assert_eq!(mio, (0, 0));
@@ -5710,33 +5714,18 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
-        // Class d: the metadata step's byte-zero Full replaced the undecodable
-        // same-context current-revision predecessor with a valid successor.
-        // Only records this namespace cannot prove (context, revision) survive.
-        let replaced = reason == "restore_semantics";
+        // An undecodable body is a store-level T14 rebuild, not a stale cause:
+        // its one Full publishes, the key then holds without RAM until the
+        // post-save replacement, and the corrupt record itself survives.
+        let corrupt = reason == "restore_semantics";
         let len = || std::fs::metadata(&path).unwrap().len();
-        let survivor_or_successor = || {
-            if replaced {
-                let successor = store::tests::found(
-                    fixture::store(&index_path, ds).read(&store::key_digest(ds, &key)),
-                );
-                assert!(codec::decode(&successor.record.body, source).is_ok());
-                assert_eq!(successor.record.certificate.sealed_offset, len());
-            } else {
-                assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
-            }
-        };
+        let survivor = || assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
         let context = |stage: &str, modes: (usize, usize, usize), scan: &SourceScanResult| {
             native_restore_context(stage.into(), modes, scan, &owner.cache, None)
         };
         let c = context("stale/growth", modes, &scan);
-        if replaced {
-            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
-            assert_eq!(modes.1, 1, "{reason}: successor Tail {c:?}");
-        } else {
-            assert_eq!(modes, (1, 0, 0), "{reason}: real native Full {c:?}");
-            assert_eq!(io.1, len());
-        }
+        assert_eq!(modes, (1, 0, 0), "{reason}: real native Full {c:?}");
+        assert_eq!(io.1, len());
         let body = a0h_wire(&root, &mut index, &mut scan);
         assert_eq!(
             (
@@ -5750,7 +5739,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            u64::from(!replaced)
+            u64::from(!corrupt)
         );
         let ((), alarm) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
@@ -5759,11 +5748,15 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             .into_iter()
             .filter(|alarm| alarm["counts"][reason].is_array())
             .collect::<Vec<_>>();
-        assert_eq!(alarm.len(), usize::from(!replaced));
-        if !replaced {
+        if corrupt {
+            assert!(alarm
+                .iter()
+                .all(|alarm| alarm["counts"][reason] == serde_json::json!([0, 0])));
+        } else {
+            assert_eq!(alarm.len(), 1);
             assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
         }
-        survivor_or_successor();
+        survivor();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -5776,25 +5769,9 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             owner.begin_durable(source, &root, &index_path);
             owner.cache.durable().unwrap().retail_full_now =
                 Some(pace_time(now + std::time::Duration::from_secs(seconds)));
-            let ((mut held, mut scan, modes), io) =
+            let ((held, scan, modes), io) =
                 a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
             assert_eq!(modes.0, 0);
-            if replaced {
-                // The successor is restored; no ACK, so the unaccepted growth is
-                // read by Tail once and every publication is the exact cold body.
-                let c = context("stale/reselect", modes, &scan);
-                assert!(modes.1 == 0 || !scan.snapshots.is_empty(), "{c:?}");
-                if !scan.snapshots.is_empty() {
-                    let body = a0h_wire(&root, &mut held, &mut scan);
-                    let s = &scan.snapshots[0];
-                    assert_eq!((s.input_tokens, s.request_count), (700, 3), "{c:?}");
-                    let (mut ci, mut cs, _) =
-                        a0h_scan(&E2ScanFixture::default(), &roots, &root, prior.clone());
-                    assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
-                }
-                survivor_or_successor();
-                continue;
-            }
             assert_eq!(io, (0, 0));
             assert!(scan.snapshots.is_empty());
             assert_eq!(held.files[&key].size_bytes, accepted);
@@ -5828,13 +5805,14 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         let c = context("stale/release", modes, &scan);
-        if replaced {
-            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
+        if corrupt {
+            // The started rebuild holds the key without RAM until index save.
+            assert_eq!(modes, (0, 0, 0), "{c:?}");
+            assert_eq!(io, (0, 0));
+            assert!(scan.snapshots.is_empty());
         } else {
             assert_eq!(modes, (1, 0, 0), "{c:?}");
             assert_eq!(io.1, len());
-        }
-        if !replaced || !scan.snapshots.is_empty() {
             let body = a0h_wire(&root, &mut index, &mut scan);
             assert_eq!(
                 (
@@ -5849,7 +5827,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         }
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            if replaced { 0 } else { 2 }
+            if corrupt { 0 } else { 2 }
         );
         assert!(index.files.contains_key(&key));
         assert_eq!(
@@ -5861,27 +5839,23 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             0
         );
         owner.cache.durable_gc(lock, source, &prior).unwrap();
-        survivor_or_successor();
+        survivor();
         let restarted = E2ScanFixture::default();
         restarted.begin_durable(source, &root, &index_path);
         let ((mut ri, mut rs, modes), io) =
             a0h_observe(|| a0h_scan(&restarted, &roots, &root, prior.clone()));
-        if replaced {
-            // Restart restores the valid successor; the unaccepted growth is
-            // published again with the exact cold body (no ACK was recorded).
-            let c =
-                native_restore_context("stale/restart".into(), modes, &rs, &restarted.cache, None);
-            assert_eq!(modes.0, 0, "{reason}: successor, no byte-zero read {c:?}");
-            assert!(!rs.snapshots.is_empty(), "{c:?}");
+        let c = native_restore_context("stale/restart".into(), modes, &rs, &restarted.cache, None);
+        assert_eq!(modes.0, 1, "{c:?}");
+        assert!(io.1 > 0);
+        if corrupt {
+            // A fresh store re-authorizes T14; no ACK, so the growth republishes
+            // the exact cold body.
             let body = a0h_wire(&root, &mut ri, &mut rs);
             let s = &rs.snapshots[0];
             assert_eq!((s.input_tokens, s.request_count), (700, 3));
             let (mut ci, mut cs, _) =
                 a0h_scan(&E2ScanFixture::default(), &roots, &root, prior.clone());
             assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
-        } else {
-            assert_eq!(modes.0, 1);
-            assert!(io.1 > 0);
         }
         assert_eq!(
             restarted
@@ -5890,7 +5864,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 .unwrap()
                 .0
                 .stale_full[cause],
-            u64::from(!replaced)
+            u64::from(!corrupt)
         );
         let _ = std::fs::remove_dir_all(root);
     }
