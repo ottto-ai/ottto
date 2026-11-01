@@ -2101,6 +2101,32 @@ pub(super) fn queue_growth_retry(index: &mut ScanIndex, candidate: &CandidateFil
     );
 }
 
+/// A paced growth read (recent claim) is a deferral, never an unreadable: it
+/// keeps its debt and is not re-queued, since every page would refuse it
+/// again. Any other refusal keeps the re-queue and its unreadable Reduction.
+#[track_caller]
+pub(super) fn defer_growth_read(
+    index: &mut ScanIndex,
+    census: &mut ScanCensus,
+    candidate: &CandidateFile,
+) {
+    let key = local_index_key(&candidate.path);
+    let now = sampled_scan::now_seconds();
+    if !index
+        .v2()
+        .growth_retention
+        .get(&key)
+        .is_some_and(|state| growth_claim_recent(state, now))
+    {
+        queue_growth_retry(index, candidate);
+        return census.record_unreadable(UnreadableCause::Reduction, 1);
+    }
+    census.growth_deferred = census.growth_deferred.saturating_add(1);
+    if let Some(walk) = index.traversal.as_mut() {
+        walk.residue.index_keys.insert(key);
+    }
+}
+
 /// Only witnessed growth debt excludes retirement. An undiscovered range or
 /// residue without a growth entry conveys no retention authority.
 pub(super) fn growth_excluded_parts(

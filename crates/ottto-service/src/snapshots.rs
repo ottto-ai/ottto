@@ -2619,6 +2619,10 @@ struct ScanTraversalCounts {
     /// its file be re-queued before six hours.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_owed_pace_evicted: u64,
+    /// Diagnostic only: paced growth reads deferred until their claim ages
+    /// out. Never an unreadable path, a retryable problem or an error.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    growth_deferred: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -24991,6 +24995,7 @@ fn validate_codex_parent_ownership_ledgers(
 /// that owner go (`accept_codex_block`); any other key still blocking it, and
 /// every other owner, stay. A missing traversal skips the release: it is
 /// never read as an empty census.
+/// Owners in the traversal's residue set keep their provenance and claims.
 fn release_departed_join_owners(
     index: &mut ScanIndex,
     cache: &sampled_scan::SharedCache,
@@ -25019,9 +25024,11 @@ fn release_departed_join_owners(
     let Some(traversal) = traversal.as_ref() else {
         return;
     };
-    cache.release_join_owners(&traversal.codex_rollout_paths, keep, |owner, members| {
-        index.accept_codex_block(members, owner);
-    });
+    cache.release_join_owners(
+        &traversal.codex_rollout_paths,
+        |owner| traversal.residue.blocked_session_ids.contains(owner) || keep(owner),
+        |owner, members| index.accept_codex_block(members, owner),
+    );
 }
 
 /// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
@@ -27761,6 +27768,12 @@ impl OwnedSourceScan {
             codex_parent_identities.parents_applied = true;
         }
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
+        // A prior page's ownership refusal still vetoes inclusive fallback
+        // after its page-local block set has been lost to save/reload.
+        if let Some(traversal) = index.traversal.as_ref() {
+            codex_state_only_blocked_session_ids
+                .extend(traversal.residue.blocked_session_ids.iter().cloned());
+        }
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
         // callers even though the retained scanner state is unchanged.
@@ -31597,6 +31610,7 @@ impl OwnedSourceScan {
                         .counts
                         .unreadable_causes
                         .merge(census.unreadable_causes);
+                    traversal.counts.growth_deferred += census.growth_deferred;
                 }
                 // Per-key absence is independent of aggregate terminal authority.
                 if source == SnapshotSource::ClaudeCode {
@@ -31781,10 +31795,11 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
-                    if !index
-                        .files
-                        .get(index_key)
-                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    if !index.codex_residue_holds_entry(index_key)
+                        && !index
+                            .files
+                            .get(index_key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
@@ -33769,8 +33784,7 @@ impl OwnedSourceScan {
                             }
                         };
                         if !sampled_audit::growth_read_admitted(index, &candidate, mode) {
-                            sampled_audit::queue_growth_retry(index, &candidate);
-                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
                         }
                         // H1c: the plan uses absolute offsets; the reader's
@@ -33914,8 +33928,7 @@ impl OwnedSourceScan {
                     ),
                 )
             {
-                sampled_audit::queue_growth_retry(index, &candidate);
-                census.record_unreadable(UnreadableCause::Reduction, 1);
+                sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
@@ -40429,6 +40442,8 @@ struct ScanCensus {
     /// Count-only: parsed Claude compaction summaries on this page whose
     /// `parentUuid` chain never reached a boundary. Logged, never a decision.
     claude_compaction_unlinked_parent_count: usize,
+    /// Count-only: this page's paced growth reads (see `ScanTraversalCounts`).
+    growth_deferred: u64,
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
@@ -44976,6 +44991,7 @@ fn reconcile_missing_index_entries_with_side(
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
         if !observed
+            && !index.codex_residue_holds_entry(key)
             && !index.decode_holds_file(key)
             && !index
                 .files
@@ -51323,6 +51339,7 @@ impl ScanIndex {
         self.committable_subset_with_local_holds(previous, accepted, quarantined, &BTreeSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn committable_subset_with_local_holds(
         &self,
         previous: &ScanIndex,
@@ -51330,21 +51347,23 @@ impl ScanIndex {
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        self.committable_subset_with_refusals(previous, accepted, quarantined, locally_held, None)
+        self.committable_subset_for_upload(previous, accepted, quarantined, locally_held, false)
     }
 
-    /// With `isolated_refusals`, the upload sent every batch and refused only
-    /// those items: every other entity not locally held settled exactly as
-    /// on a clean page, including unchanged ones this pass did not resend.
-    /// Refused and held entities keep their committed revision and stay owed.
-    /// Without it, only this pass's ACKs and quarantines settle.
-    pub(crate) fn committable_subset_with_refusals(
+    /// What a save after an upload may commit. Exact ACKs and quarantines
+    /// settle; locally held and decode-held entities never do and keep their
+    /// committed revision. With `every_batch_sent` (Completed, Deferred and
+    /// Rejected: refusals already have quarantine custody) every other entity
+    /// settles exactly as on a clean page, including unchanged ones this pass
+    /// did not resend. Without it (a shed, interrupted or failed upload) only
+    /// this pass's ACKs and quarantines settle.
+    pub(crate) fn committable_subset_for_upload(
         &self,
         previous: &ScanIndex,
         accepted: &BTreeSet<String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
-        isolated_refusals: Option<&BTreeSet<String>>,
+        every_batch_sent: bool,
     ) -> ScanIndex {
         if !self.persistence_available() || !previous.persistence_available() {
             let mut held = self.clone();
@@ -51352,14 +51371,22 @@ impl ScanIndex {
             return held;
         }
 
+        let accepted = accepted
+            .iter()
+            .filter(|fingerprint| !locally_held.contains(*fingerprint))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let quarantined = quarantined
+            .iter()
+            .filter(|(fingerprint, _)| !locally_held.contains(*fingerprint))
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
                 && (accepted.contains(fingerprint)
                     || quarantined.contains_key(fingerprint)
-                    || isolated_refusals.is_some_and(|refused| {
-                        !refused.contains(fingerprint) && !locally_held.contains(fingerprint)
-                    }))
+                    || (every_batch_sent && !locally_held.contains(fingerprint)))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.decode_holds_file(key) {
@@ -51803,7 +51830,7 @@ impl ScanIndex {
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
-        result.reconcile_codex_recovery_settlement(previous, accepted);
+        result.reconcile_codex_recovery_settlement(previous, &accepted);
         result
     }
 
@@ -52045,6 +52072,18 @@ impl ScanIndex {
                 cache.and_then(|cache| cache.resident_usage(source, key)),
             );
         }
+    }
+
+    /// Ownership uncertainty survives absence until the traversal resolves it.
+    /// Filename candidates veto retirement only; they grant no ownership.
+    fn codex_residue_holds_entry(&self, key: &str) -> bool {
+        let Some(traversal) = self.traversal.as_ref() else {
+            return false;
+        };
+        let owners = &traversal.residue.blocked_session_ids;
+        codex_session_id_candidates_from_path(Path::new(key))
+            .iter()
+            .any(|owner| owners.contains(owner))
     }
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
@@ -81677,23 +81716,23 @@ mod tests {
     fn refused_item_keeps_only_its_own_file_owed() {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let no_holds = BTreeSet::new();
-        let ack_only = scanned.committable_subset_with_refusals(
+        let ack_only = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
             &no_holds,
-            None,
+            false,
         );
         assert!(ack_only.files["reread.jsonl"]
             .source_file_fingerprint
             .is_empty());
 
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &no_holds,
-            Some(&refused),
+            &refused,
+            true,
         );
         assert_eq!(
             scoped.files["reread.jsonl"].source_file_fingerprint,
@@ -81715,12 +81754,12 @@ mod tests {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let mut clean = scanned.clone();
         clean.record_accepted_snapshot_fingerprints(&accepted);
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &BTreeSet::new(),
-            Some(&refused),
+            &refused,
+            true,
         );
         let entry = |index: &ScanIndex, key: &str| {
             (
@@ -83108,11 +83147,11 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U model_provider: Option<String>,
     U subscription_product: Option<String>,
 });
-crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, context_inputs);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
