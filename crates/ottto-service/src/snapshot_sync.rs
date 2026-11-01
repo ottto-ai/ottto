@@ -6932,16 +6932,14 @@ fn prepare_sync_source_inner(
         (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
         resumed_prefix_enabled,
     );
-    index.note_upload_context_inputs(
-        source,
-        crate::snapshots::UploadContextInputs::new(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
-            checkpoint_namespace.as_deref(),
-            cache_observations_enabled,
-            copy_unproven_enabled,
-            resumed_prefix_enabled,
-        ),
-    );
+    crate::snapshots::UploadContextInputs::new(
+        &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+        checkpoint_namespace.as_deref(),
+        cache_observations_enabled,
+        copy_unproven_enabled,
+        resumed_prefix_enabled,
+    )
+    .observe(source);
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.

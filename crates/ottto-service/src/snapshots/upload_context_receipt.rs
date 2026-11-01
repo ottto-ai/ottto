@@ -23,12 +23,12 @@ pub(crate) struct EntityStamp {
     pub source_witness: Option<String>,
 }
 
-/// The inputs of the active upload context, digested, so a hash change can
-/// name what changed. Local scheduling data: only booleans reach a log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// RAM-only comparison inputs. Only numeric class-change flags reach the log;
+/// no values, namespaces or digests are serialized or debug-formatted.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextInputs {
-    policy: String,
-    namespace: String,
+    policy: [u8; 32],
+    namespace: [u8; 32],
     cache_observations: bool,
     copy_contract: bool,
     resumed_prefix: bool,
@@ -43,14 +43,44 @@ impl ContextInputs {
         resumed_prefix: bool,
     ) -> Self {
         Self {
-            policy: format!("{:x}", Sha256::digest(policy)),
-            namespace: format!(
-                "{:x}",
-                Sha256::digest(namespace.unwrap_or("none").as_bytes())
-            ),
+            policy: Sha256::digest(policy).into(),
+            namespace: Sha256::digest(namespace.unwrap_or("none").as_bytes()).into(),
             cache_observations,
             copy_contract,
             resumed_prefix,
+        }
+    }
+
+    /// One line per in-process transition, per source. Restart has no baseline.
+    pub(crate) fn observe(self, source: SnapshotSource) {
+        static PREVIOUS: std::sync::Mutex<[Option<ContextInputs>; 3]> =
+            std::sync::Mutex::new([None; 3]);
+        let slot = match source {
+            SnapshotSource::ClaudeCode => 0,
+            SnapshotSource::Codex => 1,
+            SnapshotSource::Pi => 2,
+        };
+        let previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner())[slot].replace(self);
+        if let Some(previous) = previous.filter(|previous| *previous != self) {
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_input_change",
+                source.api_slug(),
+                &BTreeMap::from([
+                    ("policy", u8::from(previous.policy != self.policy)),
+                    ("namespace", u8::from(previous.namespace != self.namespace)),
+                    (
+                        "cache",
+                        u8::from(previous.cache_observations != self.cache_observations),
+                    ),
+                    (
+                        "mode",
+                        u8::from(
+                            previous.copy_contract != self.copy_contract
+                                || previous.resumed_prefix != self.resumed_prefix,
+                        ),
+                    ),
+                ]),
+            );
         }
     }
 }
@@ -61,8 +91,6 @@ impl ContextInputs {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProofState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    inputs: Option<ContextInputs>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     destination_namespace_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_generation: Option<String>,
@@ -72,7 +100,7 @@ pub(crate) struct ProofState {
 
 impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
-        self.inputs.is_none() && self.entity_stamps.is_empty()
+        self.entity_stamps.is_empty()
     }
 }
 
@@ -679,42 +707,6 @@ impl ScanIndex {
         self.upload_context_proof.entity_stamps = stamps;
     }
 
-    /// One counts-only line when the active context's inputs change.
-    pub(crate) fn note_upload_context_inputs(
-        &mut self,
-        source: SnapshotSource,
-        inputs: ContextInputs,
-    ) {
-        if let Some(previous) = self
-            .upload_context_proof
-            .inputs
-            .as_ref()
-            .filter(|previous| **previous != inputs)
-        {
-            crate::local_resource_diagnostics::traversal_point(
-                "upload_context_input_change",
-                source.api_slug(),
-                &BTreeMap::from([
-                    ("policy", previous.policy != inputs.policy),
-                    ("namespace", previous.namespace != inputs.namespace),
-                    (
-                        "cache_flag",
-                        previous.cache_observations != inputs.cache_observations,
-                    ),
-                    (
-                        "copy_contract",
-                        previous.copy_contract != inputs.copy_contract,
-                    ),
-                    (
-                        "resumed_prefix",
-                        previous.resumed_prefix != inputs.resumed_prefix,
-                    ),
-                ]),
-            );
-        }
-        self.upload_context_proof.inputs = Some(inputs);
-    }
-
     /// Gates nothing: what per-item proof would still owe under this context.
     pub(crate) fn upload_context_owed_counts(&self) -> OwedCounts {
         let mut counts = OwedCounts::default();
@@ -799,7 +791,6 @@ impl ScanIndex {
 }
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness, source_witness);
-crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
-crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps);
+crate::heap_layout_bound::fields!(ProofState; destination_namespace_hash, replay_generation, entity_stamps);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);
