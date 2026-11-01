@@ -433,7 +433,8 @@ pub(crate) enum UnselectedReason {
     WithheldAbsenceAmbiguous = 18,
 }
 const CAP_EVENT_START: usize = 19;
-const UNSELECTED_REASONS: usize = CAP_EVENT_START + 6;
+const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
+const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -468,6 +469,28 @@ pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bo
             .unwrap_or_else(|n| n)
     });
 }
+
+/// A vanished file's index entry was retired while its parsed body was not
+/// ACKed; nothing holds or resends that body. `usage` is the resident
+/// reduction's `(requests, tokens)`; `None` (no copy in RAM, or Claude
+/// responses not yet folded) counts in `totals_unknown_files`, so
+/// `requests`/`tokens` are at least. Counted after
+/// the retirement; never a gate.
+pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u64)>) {
+    let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
+    for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
+        source_count(source, UNACKED_LOST_START + slot, |n| {
+            n.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+const UNACKED_LOST: [(&str, usize); 4] = [
+    ("files", UNACKED_LOST_START),
+    ("requests", UNACKED_LOST_START + 1),
+    ("tokens", UNACKED_LOST_START + 2),
+    ("totals_unknown_files", UNACKED_LOST_START + 3),
+];
 
 /// E3: Claude withheld-account hold events, in the slots after the reasons.
 #[derive(Clone, Copy)]
@@ -862,6 +885,8 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -899,6 +924,7 @@ impl Probe {
                 source,
                 &[("unsupported_layout", 16), ("bound_refused", 17)],
             ),
+            unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
