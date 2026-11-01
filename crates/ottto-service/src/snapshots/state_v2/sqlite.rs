@@ -1024,6 +1024,32 @@ fn scan_record_range(
     let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+fn scan_record_key(
+    conn: &Connection,
+    kind: &RecordKind,
+    key_bytes: &[u8],
+    after_position: Option<u64>,
+    limit: usize,
+) -> Result<Vec<Header>> {
+    ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
+    let mut values = vec![
+        SqlValue::Text(kind.name().into()),
+        SqlValue::Blob(key_bytes.to_vec()),
+    ];
+    let mut filter = String::from("kind=?1 AND key_bytes=?2");
+    if let Some(position) = after_position {
+        values.push(SqlValue::Integer(i64::try_from(position)?));
+        filter.push_str(" AND position>?3");
+    }
+    values.push(SqlValue::Integer(limit as i64));
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
+        projection(Table::Records),
+        values.len()
+    ))?;
+    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
     ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
     if let RowKey::Meta(name) = &h.key {
@@ -1506,6 +1532,15 @@ impl Transaction for Txn<'_> {
         limit: usize,
     ) -> Result<Vec<Header>> {
         scan_record_range(self.store.conn()?, kind, after, limit)
+    }
+    fn scan_record_key(
+        &mut self,
+        kind: &RecordKind,
+        key_bytes: &[u8],
+        after_position: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        scan_record_key(self.store.conn()?, kind, key_bytes, after_position, limit)
     }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
         self.commit_inner(expected, next)

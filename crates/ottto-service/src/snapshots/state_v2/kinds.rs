@@ -61,19 +61,11 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
             tx: Some(tx),
             ..Default::default()
         };
-        // Generation is backend-owned after import. Desktop inventory remains
-        // excluded from checkpoint custody, including the initial import.
+        // Generation is backend-owned after import.
         rows.raw(
             RowKey::Meta("generation".into()),
             &serde_json::to_vec(&index.generation)?,
         )?;
-        rows.put(
-            mapper::key("v1_field.claude_desktop_store_inventory", "", 0)?,
-            &None::<String>,
-        )?;
-        cx.presence
-            .entry("claude_desktop_store_inventory".into())
-            .or_insert(true);
         let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
         cx.account_ids = windows
             .into_iter()
