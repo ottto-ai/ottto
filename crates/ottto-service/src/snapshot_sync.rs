@@ -13993,7 +13993,7 @@ mod tests {
             )
             .unwrap();
             // The parser no longer builds curves; restore a retained one.
-            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots);
             scan
         };
         let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
@@ -14014,12 +14014,11 @@ mod tests {
                     source_session_id: item.source_session_id.clone(),
                     snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                     occurrence_count: 1,
-                    body_witness_version: Some(if item.cache_observations.is_some() {
-                        18
-                    } else {
-                        6
-                    }),
-                    body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                    body_witness_version: item.cache_observations.as_ref().map(|_| 14),
+                    body_witness_digest: item
+                        .cache_observations
+                        .as_ref()
+                        .map(|_| snapshot_upload_body_witness(item)),
                     head_etag: head,
                     head_challenge: None,
                     unchanged_basis: None,
@@ -14277,7 +14276,7 @@ mod tests {
             )
             .unwrap();
             // The parser no longer builds curves; restore a retained one.
-            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots);
             scan
         };
         let mut off = scan(&mut index);

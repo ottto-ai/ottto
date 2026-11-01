@@ -240,7 +240,7 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
 // public witness version; `retained_proof_missing` is optional and only removes.
 fn witnessed_body() -> Value {
     let mut item = body();
-    item["context_curve"] = json!({"points": []});
+    item["session_account_evidence"] = json!({"provider": "anthropic"});
     item
 }
 fn retained_ack(

@@ -9,11 +9,31 @@ fn items(count: usize) -> Vec<SnapshotItem> {
             item.source_session_id = format!("synthetic-{i}");
             item.cache_observations = None;
             item.cache_observations_state = None;
+            // Creator evidence puts every body in an exact-witness ACK domain.
+            item.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "openai",
+                account_identifier_hash: Some("b".repeat(64)),
+                provider_workspace_hash: Some("c".repeat(64)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "codex_creator_header:v1",
+                identity_disposition: None,
+                source_created_at: Some("2026-09-30T10:00:00Z".into()),
+            });
             item.snapshot_fingerprint =
                 crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
             item
         })
         .collect()
+}
+
+/// A hash-neutral change to a witnessed leaf: same entity, different body.
+fn change_witnessed_body(item: &mut SnapshotItem) {
+    item.tool_usage
+        .get_or_insert_with(Vec::new)
+        .push(crate::snapshots::SnapshotToolUsage {
+            name: "Read".into(),
+            count: 1,
+        });
 }
 
 fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
@@ -281,12 +301,7 @@ fn h357_exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
         .unwrap();
     let old = snapshot_upload_body_witness(settled);
     // A hash-neutral body change must not inherit another body's ACK.
-    settled
-        .context_curve
-        .as_mut()
-        .expect("curve-bearing fixture")
-        .points[0]
-        .effective_input_tokens += 1;
+    change_witnessed_body(settled);
     assert_ne!(snapshot_upload_body_witness(settled), old);
     assert!(!ledger.contains_body(
         &settled.snapshot_fingerprint,
@@ -437,7 +452,7 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
         Some(body.as_str())
     );
     let mut changed = item.clone();
-    changed.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut changed);
     let outcome = upload_resumable_batches_with_body_witness(
         &[changed],
         "codex",
@@ -764,7 +779,7 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
     )
     .unwrap();
     let mut changed = probes[1].clone();
-    changed.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut changed);
     assert!(!restarted.contains_body(&rejected_fp, &snapshot_upload_body_witness(&changed)));
     // Missing proof without an exact refusal still fails closed.
     let mut missing = snapshots[0].clone();
@@ -916,7 +931,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     // Same session, a different semantic entity, and different additive bytes.
     let mut held = base[0].clone();
     held.output_tokens += 1;
-    held.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut held);
     held.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &held);
     let mut probes = vec![held, base[0].clone(), base[1].clone()];
@@ -1409,7 +1424,7 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
     let body = snapshot_upload_body_witness(&probe);
     let cache_bearing = with_cache(&probe);
     let mut older = probe.clone();
-    older.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    change_witnessed_body(&mut older);
     assert_eq!(
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &older),
         fp
@@ -1475,7 +1490,6 @@ fn h360_legacy_count_only_cas_ack_still_fails_closed_without_head() {
         .unwrap_or_else(|p| p.into_inner());
     // A count-only response can acknowledge only evidence-free bodies.
     let mut probe = items(1).remove(0);
-    probe.context_curve = None;
     probe.session_account_evidence = None;
     probe.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &probe);
