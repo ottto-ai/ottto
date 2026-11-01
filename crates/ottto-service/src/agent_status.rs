@@ -181,8 +181,6 @@ struct CodexAuthCredentials {
     access_token: Option<String>,
     id_token: Option<String>,
     account_id: Option<String>,
-    /// Codex's own record of its last token refresh (`last_refresh`).
-    last_refresh: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15499,15 +15497,10 @@ fn read_codex_auth_credentials_at(
     if access_token.is_none() && id_token.is_none() {
         return Ok(None);
     }
-    let last_refresh = json
-        .get("last_refresh")
-        .and_then(Value::as_str)
-        .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok());
     Ok(Some(CodexAuthCredentials {
         access_token,
         id_token,
         account_id,
-        last_refresh,
     }))
 }
 
@@ -16352,22 +16345,12 @@ fn run_codex_app_server_rate_limits_for_home(
         }
     });
     let initialized = serde_json::json!({"method": "initialized"});
-    // The default home's login belongs to the person's Codex app, and a forced
-    // refresh would rotate it under the app: never force one there. An account
-    // home forces at most one a day; an unknown last refresh counts as due so
-    // its login is still kept alive.
-    let refresh_token = home_trust == CodexHomeTrust::Managed
-        && read_codex_auth_credentials_at(codex_home, home_trust)
-            .ok()
-            .flatten()
-            .and_then(|credentials| credentials.last_refresh)
-            .map_or(true, |last| {
-                OffsetDateTime::now_utc() - last >= TimeDuration::days(1)
-            });
+    // Codex refreshes its own login when the token nears expiry; the probe
+    // never forces a refresh on top of that.
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": refresh_token}
+        "params": {"refreshToken": false}
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it (design R7).
@@ -23849,8 +23832,7 @@ for line in sys.stdin:
     /// [behaviour] The probe starts Codex with its home-writing startup
     /// installers off, shares CODEX_HOME as the SQLite home, drops provider
     /// keys and keeps stdin open until the asynchronous answer arrives. It
-    /// never forces a token refresh in the default home, and forces one in an
-    /// account home only when that login's last refresh is over a day old.
+    /// never forces a token refresh, in the default home or an account home.
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
@@ -23921,36 +23903,16 @@ for line in sys.stdin:
             Some(2)
         );
 
-        let now = OffsetDateTime::now_utc();
-        for (label, last_refresh) in [
-            ("fresh", now - TimeDuration::hours(1)),
-            ("stale", now - TimeDuration::hours(25)),
-        ] {
-            let slot = crate::test_scratch::ScratchDir::canonical("codex-slot-refresh");
-            let auth = slot.join("auth.json");
-            std::fs::write(
-                &auth,
-                serde_json::json!({
-                    "tokens": {"access_token": "synthetic-access"},
-                    "last_refresh": last_refresh.format(&Rfc3339).expect("timestamp"),
-                })
-                .to_string(),
-            )
-            .expect("slot auth fixture");
-            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
-                .expect("slot auth mode");
-            call_codex_app_server_rate_limits_for_home(
-                &slot,
-                CodexHomeTrust::Managed,
-                &|_, _, _| false,
-            )
-            .expect(label);
-        }
+        let slot = crate::test_scratch::ScratchDir::canonical("codex-slot-refresh");
+        call_codex_app_server_rate_limits_for_home(&slot, CodexHomeTrust::Managed, &|_, _, _| {
+            false
+        })
+        .expect("account home rate limits");
         let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
         assert_eq!(
             refreshes.lines().collect::<Vec<_>>(),
-            ["false", "false", "true"],
-            "default home, fresh account home, stale account home"
+            ["false", "false"],
+            "default home, account home"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -25503,7 +25465,6 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace-a".to_string()),
-            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
@@ -25571,7 +25532,6 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace-b".to_string()),
-            last_refresh: None,
         };
         assert!(validated_codex_identity(
             &correlated,
@@ -25655,7 +25615,6 @@ for line in sys.stdin:
                 organizations,
             )),
             account_id: Some("synthetic-workspace".to_string()),
-            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}
@@ -25728,7 +25687,6 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace".to_string()),
-            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
@@ -25811,7 +25769,6 @@ for line in sys.stdin:
                 expires_at,
             )),
             account_id: Some("synthetic-workspace".to_string()),
-            last_refresh: None,
         };
         let provider_account = serde_json::json!({
             "account": {
