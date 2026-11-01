@@ -26883,6 +26883,25 @@ impl OwnedSourceScan {
             } else {
                 file_limit
             };
+        // A due quarantine retry of an unchanged file is neither fresh nor a
+        // census member, so no dedicated turn below selects it and it would
+        // wait for an ordinary page. It rides the next selecting page first.
+        // Order only: its flags, budgets and retry backoff are unchanged.
+        if selection_limit > 0 && !index.terminal_contract_retries.is_empty() {
+            let due_retries = index
+                .terminal_contract_retries
+                .values()
+                .map(Path::new)
+                .collect::<BTreeSet<_>>();
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && due_retries.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
@@ -26946,8 +26965,9 @@ impl OwnedSourceScan {
                 }
             }
         }
-        // Dedicated turns select only their own work: new hinted members,
-        // audits or old groups cannot consume the other turn's allowance.
+        // Dedicated turns select only their own work, plus any retry riders:
+        // new hinted members, audits or old groups cannot consume the other
+        // turn's allowance.
         let selection_limit = if freshness_page || census_page {
             pending_paths.len()
         } else {
@@ -27075,6 +27095,7 @@ impl OwnedSourceScan {
             // hint for a path this generation already processed), so each
             // page completes a first read and re-reads cannot starve one.
             // Audits keep their place; the order is otherwise unchanged.
+            // Queued retry leases ride ahead of this order.
             let (members, rereads): (Vec<_>, Vec<_>) = pending_paths
                 .split_off(audited)
                 .into_iter()
