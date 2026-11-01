@@ -1133,9 +1133,11 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
 /// [money] The requested tier from thread settings, from real old state: both
 /// counting versions start from pinned-writer records of a pre-epoch prefix
 /// that holds a Fast snapshot and no reducer key. Post-epoch growth then emits
-/// what a cold Full emits on RAM and restart, in totals and placement, through
-/// an explicit tier, a clearing snapshot and another explicit tier. Controls:
-/// swapped accounts and a changed tier fail the comparator.
+/// what a cold Full emits on RAM and restart, in totals and placement, first
+/// with no new snapshot, where the pre-epoch evidence stamps nothing on any
+/// route, then through an explicit tier, a clearing snapshot and another
+/// explicit tier. Controls: swapped accounts and a changed tier fail the
+/// comparator.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1234,13 +1236,15 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             assert!(!old.windows(key.len()).any(|bytes| bytes == key));
         }
         let mut flex = 0;
-        for (step, tier) in [Some("flex"), None, Some("priority")]
+        for (step, tier) in [None, Some(Some("flex")), Some(None), Some(Some("priority"))]
             .into_iter()
             .enumerate()
         {
+            let at = "2026-11-04T07:00:00Z";
+            let snapshot = tier.map_or(String::new(), |tier| settings(at, tier));
             let rows = codex_rows(&format!("tier-{step}"), 30 + step as u64)
                 .replace("2026-10-27", "2026-11-04");
-            grow(&(settings("2026-11-04T07:00:00Z", tier) + &rows));
+            grow(&(snapshot + &rows));
             let (cold_index, cold_scan, cold_modes) =
                 other_page(&c, &E2ScanFixture::default(), source, prior.clone());
             assert_eq!(cold_modes, (2, 0, 0));
@@ -1267,15 +1271,24 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             let restart = route(Mode::Restart, &restart_index, &restart_scan);
             money_oracle::assert_equivalent(&cold, &restart);
             money_oracle::assert_equivalent(&cold, &route(Mode::Ram, &ram_index, &ram_scan));
+            let restored = tiers(&restart_scan);
             let tiers = tiers(&cold_scan);
+            assert_eq!(restored, tiers, "restored and cold Full tiers");
             let flex_now = tiers.get(&Some("flex".to_string())).copied().unwrap_or(0);
             match step {
                 0 => {
+                    assert_eq!(tiers.len(), 1);
+                    assert!(
+                        tiers.contains_key(&None::<String>),
+                        "pre-epoch evidence stamps no post-epoch usage"
+                    );
+                }
+                1 => {
                     assert_eq!(tiers.len(), 2);
                     assert!(flex_now > 0);
                     flex = flex_now;
                 }
-                1 => {
+                2 => {
                     assert_eq!(tiers.len(), 2);
                     assert_eq!(flex_now, flex, "a clearing snapshot leaks no earlier tier");
                 }
