@@ -1,5 +1,6 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
+use super::super::account_pending_retention::Archived;
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::BTreeMap;
@@ -17,6 +18,8 @@ pub(super) struct KindCx {
     /// Per cold family, the last rollover a committed save wrote. A sibling
     /// graph (checkpoint subset, retry working graph) skips what it names.
     pub(super) cold_rolled: BTreeMap<String, u64>,
+    /// Outcomes of the cold rollovers this save replayed.
+    pub(super) archived: Archived,
     valid: bool,
 }
 
@@ -156,6 +159,7 @@ pub(super) fn delta(
 ) -> Result<Baseline> {
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
+    cx.archived = Archived::default();
     let result = (|| {
         let mut rows = mapper::Rows {
             tx: Some(tx),
@@ -239,11 +243,16 @@ pub(super) fn save_graph(
                 if count != 0 {
                     telemetry::event("account_windows_alarm", &count);
                 }
+                // Archived windows by outcome: this save's cold replays and
+                // resident rollovers since the last committed save.
+                let resident = Archived::take_resident();
                 telemetry::event(
                     "account_windows_retained",
                     &serde_json::json!({
                         "windows": windows, "max_per_family": max, "families_over_64": count,
-                        "uncollapsed": uncollapsed
+                        "uncollapsed": uncollapsed,
+                        "replaced": pending.archived.replaced.saturating_add(resident.replaced),
+                        "pushed": pending.archived.pushed.saturating_add(resident.pushed)
                     }),
                 );
                 Ok(digests)

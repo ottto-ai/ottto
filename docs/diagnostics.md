@@ -1894,8 +1894,11 @@ kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`
-also reports `uncollapsed`, the interior windows of equal-evidence runs left in a
-store-only archive (boundaries unchecked). A complete v2 load keeps archived account
+also reports `uncollapsed`, the windows older than their equal-evidence run's
+newest left in a store-only archive (boundaries unchecked), and `replaced` and
+`pushed`, the archived windows that replaced their run's newest window or were
+appended: this save's store-only rollovers plus in-memory rollovers since the
+last committed save. A complete v2 load keeps archived account
 windows in the store, so the retained-pending byte diagnostic is unavailable while
 any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
 `cold_row_unknown`) when a stored archived row no longer matches its baseline, and

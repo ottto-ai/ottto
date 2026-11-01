@@ -921,9 +921,8 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     }
 }
 
-/// [money] A cold archive replays the endpoint rule over at most its last two
-/// stored rows to the rows a resident save writes, replaced endpoints
-/// included. A stored tail that no longer matches the baseline is Unknown:
+/// [money] A cold archive replays the run rule over its last stored row to
+/// the rows a resident save writes, replaced windows included. A stored tail that no longer matches the baseline is Unknown:
 /// the save refuses, counted, and removes nothing. A stale base with no
 /// shared rollover refuses as a lineage miss, counted separately.
 #[test]
@@ -958,7 +957,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         let previous = baseline(&graph, &mut cx).unwrap();
         graph.generation += 1;
         // Equal evidence at increasing boundaries: each rollover replaces the
-        // stored last endpoint.
+        // stored last window.
         roll(&mut graph, &at(4));
         roll(&mut graph, &at(5));
         let mut tx = db.begin(TxnMode::Write).unwrap();
