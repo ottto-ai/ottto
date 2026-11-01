@@ -8054,6 +8054,15 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
+    apply_upload_policy_with_item_limit(source, snapshots, policy, MAX_SNAPSHOT_ITEM_WIRE_BYTES);
+}
+
+pub(crate) fn apply_upload_policy_with_item_limit(
+    source: SnapshotSource,
+    snapshots: &mut [SnapshotItem],
+    policy: SnapshotUploadPolicy,
+    item_limit: usize,
+) {
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -8106,12 +8115,7 @@ pub fn apply_upload_policy(
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
-        fit_context_curve_to_snapshot_item_budget(
-            source,
-            item,
-            policy,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-        );
+        fit_context_curve_to_snapshot_item_budget(source, item, policy, item_limit);
     }
 }
 
@@ -15625,6 +15629,13 @@ impl UsageTotals {
 }
 
 pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result<(), String> {
+    validate_snapshot_batch_request_with_item_limit(request, MAX_SNAPSHOT_ITEM_WIRE_BYTES)
+}
+
+pub(crate) fn validate_snapshot_batch_request_with_item_limit(
+    request: &SnapshotBatchRequest,
+    item_limit: usize,
+) -> Result<(), String> {
     if request.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(format!(
             "schema_version {} does not match daemon SNAPSHOT_SCHEMA_VERSION {}",
@@ -15668,15 +15679,17 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
         item_without_curve.context_curve = None;
         let item_without_curve_size =
             snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
-        if !snapshot_item_wire_size_is_allowed(
-            item_size,
-            item_without_curve_size,
-            item.context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-        ) {
+        if item_size > item_limit
+            && !snapshot_item_wire_size_is_allowed(
+                item_size,
+                item_without_curve_size,
+                item.context_curve
+                    .as_ref()
+                    .map(|curve| curve.coverage.as_str()),
+            )
+        {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
             ));
         }
     }

@@ -246,6 +246,14 @@ impl Page {
         corpus: &Corpus,
         accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+        self.enrich_with_budget(corpus, accepted, Default::default())
+    }
+    fn enrich_with_budget(
+        &mut self,
+        corpus: &Corpus,
+        accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
@@ -257,7 +265,7 @@ impl Page {
                     None,
                     Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
-                    None,
+                    wire_budget,
                 )
                 .unwrap()
             });
@@ -276,10 +284,11 @@ impl Page {
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred);
-        apply_upload_policy(
+        crate::snapshots::apply_upload_policy_with_item_limit(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
             SnapshotUploadPolicy::default(),
+            wire_budget.max_item_bytes,
         );
         let backfill = crate::backfill::load_backfill_state(&corpus.support);
         apply_backfill_cutoff_with_claude_corrections(
@@ -4452,10 +4461,24 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                     })
                     .collect::<Vec<_>>()
             };
-            let today = {
+            let today_item = {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 page.enrich_with(&c, Some(&mut AcceptedBuckets::for_test()));
-                rows(body(&page, COPY).unwrap())
+                body(&page, COPY).unwrap().clone()
+            };
+            let today = rows(&today_item);
+            let money = |item: &SnapshotItem| {
+                json!([
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.cache_creation_5m_tokens,
+                    item.cache_creation_1h_tokens,
+                    item.reasoning_output_tokens,
+                    item.unattributed_total_tokens,
+                    item.request_count,
+                    item.cost
+                ])
             };
             assert_eq!(
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
@@ -4468,6 +4491,93 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                     .map(|bucket| bucket.model_usage[0].copy_invalidated)
                     .collect::<Vec<_>>()
             };
+            if retained {
+                // Hold before copy-prefix evidence is enabled, then discover
+                // the invalidation while still held. The existing cache-byte
+                // reservation forces the real raised-cap hold without padding
+                // or changing any usage in this pipeline fixture.
+                let cap = 2 * 1024 * 1024;
+                ledger.set_item_cap(cap);
+                let reserve = |_: &SnapshotItem| cap;
+                let budget = crate::snapshots::claude_request_identity::WireBudget {
+                    max_item_bytes: cap,
+                    reservation: Some(&reserve),
+                };
+                let before = serde_json::to_vec(&ledger).unwrap();
+                let held = {
+                    let _before_copy = e2::ResumedPrefixForTest::set(false);
+                    let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
+                    held.enrich_with_budget(&c, Some(&mut ledger), budget);
+                    held
+                };
+                assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
+                    &held.disposition,
+                    COPY
+                ));
+                assert_eq!(serde_json::to_vec(&ledger).unwrap(), before);
+                assert_eq!(money(body(&held, COPY).unwrap()), money(stored));
+                let held_prior = settle_captured_holds(&c, &prior, held, &mut e2_progress());
+                let mut held = c.raw(&scanner, held_prior.clone(), 100, false, &[]);
+                take_identity_counts();
+                held.enrich_with_budget(&c, Some(&mut ledger), budget);
+                let counts = serde_json::to_value(take_identity_counts()).unwrap();
+                assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 1);
+                assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
+                    &held.disposition,
+                    COPY
+                ));
+                assert_eq!(
+                    rows(body(&held, COPY).unwrap())
+                        .iter()
+                        .map(|r| (&r.0, r.1, r.2, &r.3))
+                        .collect::<Vec<_>>(),
+                    today
+                        .iter()
+                        .map(|r| (&r.0, r.1, r.2, &r.3))
+                        .collect::<Vec<_>>(),
+                    "holding conserves every bucket's usage and money"
+                );
+                assert_eq!(money(body(&held, COPY).unwrap()), money(&today_item));
+                let tombstone = serde_json::to_vec(&ledger).unwrap();
+                let restart_index =
+                    settle_captured_holds(&c, &held_prior, held, &mut e2_progress());
+                ledger = AcceptedBuckets::restore_for_test(&tombstone);
+                ledger.set_retained_enabled(true);
+                ledger.set_item_cap(cap);
+                assert_eq!(serde_json::to_vec(&ledger).unwrap(), tombstone);
+                let mut restarted = c.raw(
+                    &E2ScanFixture::capturing_identity(),
+                    restart_index,
+                    100,
+                    false,
+                    &[],
+                );
+                take_identity_counts();
+                restarted.enrich_with_budget(
+                    &c,
+                    Some(&mut ledger),
+                    crate::snapshots::claude_request_identity::WireBudget {
+                        max_item_bytes: cap,
+                        reservation: None,
+                    },
+                );
+                let counts = serde_json::to_value(take_identity_counts()).unwrap();
+                assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+                let first = body(&restarted, COPY).unwrap().clone();
+                assert_eq!(money(&first), money(&today_item));
+                assert_eq!(
+                    flags(&first),
+                    [true, false],
+                    "first emitted body keeps the durable invalidation"
+                );
+                assert_eq!(org_shares(&first).get(&x), None);
+                restarted.finish();
+                assert!(body(&restarted, COPY).is_some());
+                upload(&restarted.scan.snapshots, &mut e2_progress(), self::ack)
+                    .0
+                    .unwrap();
+                ack(&mut ledger, body(&restarted, COPY).unwrap());
+            }
             let pass = |c: &Corpus, ledger: &mut AcceptedBuckets| {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 take_identity_counts();
@@ -4481,7 +4591,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                     identity_count(&counts, "copy_derived_proof_invalidated"),
                 )
             };
-            for once in [1, 0] {
+            for once in [u64::from(!retained), 0] {
                 let (copy, invalidated) = pass(&c, &mut ledger);
                 assert_eq!(invalidated, once, "one tombstone per copy-derived row");
                 // Option (ii) flags the X row on the invalidation upload and
@@ -4576,6 +4686,23 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 "fresh own tags"
             );
             assert_eq!(org_shares(&copy).get(&x), None);
+            if retained {
+                ack(&mut ledger, &copy);
+                let (repeat, invalidated) = pass(&c, &mut ledger);
+                assert_eq!(money(&repeat), money(&copy));
+                assert_eq!(invalidated, 0);
+                assert_eq!(
+                    flags(&repeat),
+                    [false, false],
+                    "corrected ACK replaces the invalidated proof"
+                );
+                assert!(repeat.usage_buckets[0].model_usage[0].identity_retained);
+                assert_eq!(
+                    org_shares(&repeat).get(&x),
+                    None,
+                    "ACK never freezes the copied account again"
+                );
+            }
             // A copied marker never lent B's row: its own later change is #909's.
             text += &switched(
                 "33333333-3333-4333-8333-333333333333",

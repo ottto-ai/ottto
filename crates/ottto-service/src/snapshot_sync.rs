@@ -25,15 +25,17 @@ use crate::snapshot_client::{
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
 };
+#[cfg(test)]
+use crate::snapshots::apply_upload_policy;
+use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
-    apply_upload_policy, collector_version, finalize_scan_after_policy_with_body_witness,
+    collector_version, finalize_scan_after_policy_with_body_witness,
     prepare_codex_recovery_diagnostics, snapshot_quarantine_deadline_is_bounded,
-    snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
-    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, UnsettledUploadCause, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    snapshot_upload_body_witness, ScanIndex, SnapshotBatchRequest, SnapshotItem,
+    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
+    SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult,
+    UnsettledUploadCause, MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -7546,9 +7548,15 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
+        activity_hint.max_snapshot_item_bytes,
+    );
     upload_progress
         .accepted_identity_buckets
         .bind_context(attribution_context.as_ref());
+    upload_progress
+        .accepted_identity_buckets
+        .set_item_cap(identity_item_cap);
     upload_progress
         .accepted_identity_buckets
         .set_retained_enabled(
@@ -7696,7 +7704,10 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
-            Some(&reserve_cache_bytes),
+            crate::snapshots::claude_request_identity::WireBudget {
+                max_item_bytes: identity_item_cap,
+                reservation: Some(&reserve_cache_bytes),
+            },
         );
         let (mut disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -7776,7 +7787,12 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
-    apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    crate::snapshots::apply_upload_policy_with_item_limit(
+        source,
+        &mut scan_result.snapshots,
+        upload_policy,
+        identity_item_cap,
+    );
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -7811,7 +7827,12 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            apply_upload_policy(source, snapshots, upload_policy);
+            crate::snapshots::apply_upload_policy_with_item_limit(
+                source,
+                snapshots,
+                upload_policy,
+                identity_item_cap,
+            );
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -8158,7 +8179,12 @@ fn finish_sync_source(
                     upload_policy,
                     client_report: crate::client_report::ClientReport::empty(),
                 };
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        identity_item_cap,
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -8266,7 +8292,12 @@ fn finish_sync_source(
                         }),
                     "legacy reconciliation must stay isolated at a batch boundary"
                 );
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        identity_item_cap,
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -9699,7 +9730,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         None,
         None,
         accepted_identity_buckets,
-        None,
+        Default::default(),
     )
     .expect("evidence fixture has no resource refusal")
 }
@@ -9745,7 +9776,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         lease,
         None,
         None,
-        None,
+        Default::default(),
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -9768,7 +9799,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-    wire_size_reservation: Option<&dyn Fn(&SnapshotItem) -> usize>,
+    wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -10152,7 +10183,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_size_reservation(wire_size_reservation)
+        .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -10231,6 +10262,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
+    let mut identity_custody = (wire_budget.max_item_bytes
+        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES)
+        .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {
         for item in &mut scan_result.snapshots {
@@ -10266,6 +10300,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &ownership,
         );
         disposition.copy_invalidated = request_identity.copy_invalidated;
+        if !request_identity.held.is_empty() {
+            if let (Some((cache, committed)), Some(withheld)) =
+                (retained, identity_custody.as_mut())
+            {
+                withheld.extend(request_identity.held.iter().cloned());
+                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
+            }
+            disposition.hold_request_owned(request_identity.held);
+        }
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,
