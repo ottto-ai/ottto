@@ -1366,6 +1366,15 @@ impl SnapshotSource {
         }
     }
 
+    /// The index of a process-local per-source array.
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            SnapshotSource::Codex => 0,
+            SnapshotSource::ClaudeCode => 1,
+            SnapshotSource::Pi => 2,
+        }
+    }
+
     pub fn parser_version(self) -> &'static str {
         match self {
             SnapshotSource::Codex => CODEX_SNAPSHOT_PARSER_VERSION,
@@ -29257,7 +29266,7 @@ impl OwnedSourceScan {
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
                 // A Tail/Unchanged singleton, or a grown Full with an owned
-                // finish bound (`prove_release` refuses a legacy one), also decides,
+                // finish bound (a legacy one takes the plain walk), also decides,
                 // under blocking locks, whether a release of lower-ranked
                 // residents would make its copy fit; that release is deferred
                 // into its retention, after
