@@ -64,6 +64,10 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
             PASS.with(|pass| pass.borrow_mut().active = matches!(value.as_str(), Some("v2")));
         }
     }
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(value) {
+        THREAD_EVENTS.with(|events| events.borrow_mut().insert(name, value));
+    }
     if let Ok(mut stats) = stats().lock() {
         if let Ok(value) = serde_json::to_value(value) {
             stats.latest.insert(name, value);
@@ -75,6 +79,17 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
 #[cfg(test)]
 pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
     stats().lock().ok()?.latest.get(name).cloned()
+}
+#[cfg(test)]
+thread_local! {
+    static THREAD_EVENTS: std::cell::RefCell<BTreeMap<&'static str, serde_json::Value>> =
+        Default::default();
+}
+/// Test evidence only: takes this thread's latest value of an event, so a
+/// concurrent test cannot supply or overwrite it.
+#[cfg(test)]
+pub(super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
+    THREAD_EVENTS.with(|events| events.borrow_mut().remove(name))
 }
 /// Cumulative process-lifetime count, kept in the same inventory as events.
 pub(super) fn count(name: &'static str, n: u64) {
