@@ -1391,6 +1391,20 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         {
             let mut stores = cache.durable().unwrap();
             let slot = stores.slot(ds).as_mut().unwrap();
+            // Consent erasure runs even while ordinary store work is disabled.
+            // Establish its verified-empty inventory before forbidding mutations;
+            // the synthetic pending records below contain no private labels.
+            let purge = slot
+                .store
+                .purge_private_labels(lock, |body| {
+                    codec::body_has_skill_labels(body).unwrap_or(true)
+                })
+                .unwrap();
+            assert_eq!((purge.erased, purge.refused), (0, 0));
+            assert_eq!(
+                slot.store.private_label_keys().unwrap(),
+                Some(BTreeSet::new())
+            );
             for record in &records {
                 assert_eq!(
                     slot.store
@@ -1461,10 +1475,21 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 slot.store.counters(),
             )
         };
-        // These hooks prove no write/unlink/sync, in addition to full disk equality.
-        store::test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("disabled rename"))));
-        store::test_hooks::set_before_unlink(Some(Box::new(|_| panic!("disabled unlink"))));
-        store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
+        // Count and refuse every mutation, including cleanup during unwinding.
+        // Panicking in these hooks can double-panic from a temp-file Drop.
+        let mutations = std::rc::Rc::new(std::cell::RefCell::new([0u64; 3]));
+        let reject_mutation = {
+            let mutations = mutations.clone();
+            move |kind: usize| {
+                mutations.borrow_mut()[kind] += 1;
+                Err(std::io::Error::other("disabled store mutation"))
+            }
+        };
+        let reject = reject_mutation.clone();
+        store::test_hooks::set_before_rename(Some(Box::new(move |_, _| reject(0))));
+        let reject = reject_mutation.clone();
+        store::test_hooks::set_before_unlink(Some(Box::new(move |_| reject(1))));
+        store::test_hooks::set_before_dir_sync(Some(Box::new(move |_| reject_mutation(2))));
         assert_eq!(cache.reconcile_pending_key(source, &key), None);
         assert_eq!(cache.durable_hold(source, &key, &index, &mut None), None);
         let ((mut index, degraded), events) = crate::local_resource_diagnostics::capture(|| {
@@ -1527,6 +1552,11 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             0
         );
         cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(
+            *mutations.borrow(),
+            [0; 3],
+            "disabled store performs no I/O"
+        );
         assert_eq!(store_snapshot(&dir), before);
         let mut stores = cache.durable().unwrap();
         assert_eq!(
