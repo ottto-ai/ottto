@@ -1463,6 +1463,20 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
     assert_eq!(page.len(), 1);
     assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
     assert_eq!(tx.scan_kind(&k, None, 128).unwrap().len(), 2);
+    // One exact key: every position from the start, and pages by position.
+    let page = tx.scan_record_key(&k, &root, None, 1).unwrap();
+    assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
+    let page = tx.scan_record_key(&k, &root, Some(18), 128).unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(matches!(page[0].key, RowKey::Record { position: 19, .. }));
+    assert!(tx
+        .scan_record_key(&k, b"fam", None, 128)
+        .unwrap()
+        .is_empty());
+    assert!(tx
+        .scan_record_key(&k, b"family2", None, 128)
+        .unwrap()
+        .is_empty());
     for pos in [18, 19] {
         assert!(tx
             .get(&RowKey::record(kind, root.clone(), pos).unwrap())

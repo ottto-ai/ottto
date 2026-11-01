@@ -402,6 +402,265 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
     save_graph(&mut db, &identity, &previous, &mut working, &mut cx).unwrap();
     assert_persisted(&mut db, &working);
 }
+/// One accounts-only view, as CAS custody loads it (`Some`) or a full load does.
+fn accounts_view(tx: &mut dyn Transaction, roots: Option<&BTreeSet<String>>) -> Result<ScanIndex> {
+    let mut view = ScanIndex::default();
+    kinds_accounts::hydrate_filtered(
+        tx,
+        &mut view,
+        &mut KindCx::default(),
+        roots.map(|roots| (roots, false)),
+    )?;
+    Ok(view)
+}
+/// [money] filtered hydrate equals those families of a full hydrate and refuses the same damage.
+#[test]
+fn filtered_account_hydrate_equals_full_for_requested_families_only() {
+    const WITH_WINDOWS: &str = "synthetic-family";
+    const WITH_ABSENT: &str = "synthetic-absent";
+    const MANY_WINDOWS: &str = "synthetic-many";
+    // Sorts straight after a requested family, and extends its key.
+    const EXTENDED: &str = "synthetic-family2";
+    const UNREQUESTED: &str = "synthetic-unrequested";
+    const MISSING: &str = "synthetic-missing";
+    let (_scratch, mut db) = Scratch::store();
+    let mut index = fixture();
+    let family = index.claude_account_family_pending[WITH_WINDOWS].clone();
+    assert!(!family.previous_windows.is_empty());
+    let mut absent = family.clone();
+    absent.confirmed_absent_members.insert("gone-member".into());
+    let pending = &mut index.claude_account_family_pending;
+    pending.insert(WITH_ABSENT.into(), absent);
+    let mut many = family.clone();
+    many.previous_windows = vec![family.current.clone(); 8];
+    pending.insert(MANY_WINDOWS.into(), many);
+    pending.insert(EXTENDED.into(), family.clone());
+    pending.insert(UNREQUESTED.into(), family);
+    let usage = index.claude_usage_family_pending[WITH_WINDOWS].clone();
+    index
+        .claude_usage_family_pending
+        .insert(EXTENDED.into(), usage.clone());
+    index
+        .claude_usage_family_pending
+        .insert(UNREQUESTED.into(), usage);
+    commit_populate(&mut db, &index);
+    let roots: BTreeSet<String> = [WITH_WINDOWS, WITH_ABSENT, MANY_WINDOWS, MISSING]
+        .map(str::to_owned)
+        .into();
+
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let mut expected = accounts_view(&mut tx, None).unwrap();
+    assert!(expected
+        .claude_account_family_pending
+        .contains_key(UNREQUESTED));
+    expected
+        .claude_account_family_pending
+        .retain(|family, _| roots.contains(family));
+    expected
+        .claude_usage_family_pending
+        .retain(|family, _| roots.contains(family));
+    let subset = accounts_view(&mut tx, Some(&roots)).unwrap();
+    assert_eq!(subset.claude_account_family_pending.len(), 3);
+    assert_eq!(
+        subset.claude_account_family_pending[MANY_WINDOWS]
+            .previous_windows
+            .len(),
+        8
+    );
+    assert_eq!(subset.claude_usage_family_pending.len(), 1);
+    assert!(!subset.claude_account_family_pending.contains_key(MISSING));
+    assert_eq!(
+        serde_json::to_vec(&subset).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    let control = mapper::key("account.current", WITH_WINDOWS, 1).unwrap();
+    let h = tx.get(&control).unwrap().unwrap();
+    let (_, _, ids): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
+    drop(tx);
+    let key = mapper::key;
+
+    // Same refusal as the full scan: undecodable (`Some`), removed (`None`),
+    // and an orphan or misplaced row that no control lists.
+    let window = key("account_window", WITH_WINDOWS, ids[0]).unwrap();
+    let absent = key("account.absent_members", WITH_ABSENT, 1).unwrap();
+    for (row, damage) in [
+        (control.clone(), Some("undecodable")),
+        (window.clone(), Some("undecodable")),
+        (absent.clone(), Some("undecodable")),
+        (
+            key("usage.pending", WITH_WINDOWS, 1).unwrap(),
+            Some("undecodable"),
+        ),
+        (window, None),
+        (absent, None),
+        (
+            key("account_window", WITH_WINDOWS, 0).unwrap(),
+            Some("orphan"),
+        ),
+        (
+            key("account_window", WITH_ABSENT, 9_999).unwrap(),
+            Some("orphan"),
+        ),
+        (
+            // Past the first page of this family's rows.
+            key("account_window", MANY_WINDOWS, 9_999).unwrap(),
+            Some("orphan"),
+        ),
+        (
+            key("account.absent_members", MISSING, 1).unwrap(),
+            Some("orphan"),
+        ),
+        (
+            key("account.absent_members", WITH_ABSENT, 2).unwrap(),
+            Some("orphan"),
+        ),
+        (
+            key("account.current", WITH_ABSENT, 2).unwrap(),
+            Some("orphan"),
+        ),
+    ] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        match damage {
+            Some(value) => drop(mapper::put(&mut tx, &row, value).unwrap()),
+            None => assert!(tx.delete(&row).unwrap()),
+        }
+        let full = accounts_view(&mut tx, None).err().map(|e| format!("{e:#}"));
+        let filtered = accounts_view(&mut tx, Some(&roots))
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(full.is_some(), "{row:?}");
+        assert_eq!(filtered, full, "{row:?}");
+        drop(tx);
+    }
+
+    // A removed control still refuses, by its orphaned rows. Only the full
+    // scan can see the manifest count.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    assert!(tx.delete(&control).unwrap());
+    let full = accounts_view(&mut tx, None).err().unwrap();
+    assert_eq!(full.to_string(), "accounts_missing_family");
+    let filtered = accounts_view(&mut tx, Some(&roots)).err().unwrap();
+    assert_eq!(filtered.to_string(), "accounts_orphan_window");
+    drop(tx);
+
+    // Damage outside the requested families is the full load's to refuse: a
+    // filtered read never touches it.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let other = key("account.current", UNREQUESTED, 1).unwrap();
+    mapper::put(&mut tx, &other, "undecodable").unwrap();
+    assert!(accounts_view(&mut tx, None).is_err());
+    assert_eq!(
+        serde_json::to_vec(&accounts_view(&mut tx, Some(&roots)).unwrap()).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    drop(tx);
+
+    // Nor does it validate the headers of the adjacent family, the next rows
+    // in every kind. This damage stays: nothing below may need a clean store.
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let windows = RecordKind::parse("account_window").unwrap();
+    let page = tx
+        .scan_record_key(&windows, EXTENDED.as_bytes(), None, 1)
+        .unwrap();
+    drop(tx);
+    for row in [
+        key("account.current", EXTENDED, 1).unwrap(),
+        page[0].key.clone(),
+        key("account.absent_members", EXTENDED, 1).unwrap(),
+        key("usage.pending", EXTENDED, 1).unwrap(),
+    ] {
+        sqlite::corrupt_row_header_for_test(&db, &row);
+    }
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(accounts_view(&mut tx, None).is_err());
+    assert_eq!(
+        serde_json::to_vec(&accounts_view(&mut tx, Some(&roots)).unwrap()).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+}
+/// [regress] rows lost out of band at an equal generation are refused or rewritten, never Absent.
+#[test]
+fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
+    const FAMILY: &str = "synthetic-family";
+    for (lost_account, dirty) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (_scratch, mut db) = Scratch::live_store();
+        let mut index = fixture();
+        // Its authority row makes the CAS merge request this family.
+        index.insert_retry_pending_claude_authority_for_test(FAMILY);
+        commit_populate(&mut db, &index);
+        let (previous, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let committed = baseline(&previous, &mut cx).unwrap();
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+
+        let mut lost = vec![mapper::key("usage.pending", FAMILY, 1).unwrap()];
+        if lost_account {
+            let control = mapper::key("account.current", FAMILY, 1).unwrap();
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let h = tx.get(&control).unwrap().unwrap();
+            let (_, _, ids): (Option<u64>, u64, Vec<u64>) =
+                mapper::read(&mut tx, &h, None).unwrap();
+            drop(tx);
+            lost = ids
+                .iter()
+                .map(|id| mapper::key("account_window", FAMILY, *id).unwrap())
+                .collect();
+            lost.push(mapper::key("account.absent_members", FAMILY, 1).unwrap());
+            lost.push(control);
+        }
+        for row in &lost {
+            sqlite::delete_row_for_test(&db, row);
+        }
+
+        let mut next = previous.clone();
+        if dirty && lost_account {
+            let family = next.claude_account_family_pending.get_mut(FAMILY).unwrap();
+            family.current.census_window_end = "2026-10-31T00:00:00Z".into();
+        } else if dirty {
+            next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
+        }
+        // Claim-only skips window retirement, so a clean family stays clean.
+        let saved = import::ClaudeMapper
+            .save(&mut db, &identity, committed, &mut next, &mut cx, true)
+            .err()
+            .map(|error| error.to_string());
+        let generation = db.read_control::<u64>("generation").unwrap();
+        let reload = |db: &mut sqlite::Sqlite| {
+            hydrate(db, Scratch::binding())
+                .err()
+                .map(|error| error.to_string())
+        };
+        match (lost_account, dirty) {
+            // Unchanged rows match their baseline digests, so the save writes
+            // neither them nor the manifest, which still counts them.
+            (true, false) => {
+                assert_eq!(saved, None);
+                assert_eq!(generation, Some(2));
+                assert_eq!(reload(&mut db).unwrap(), "accounts_missing_family");
+            }
+            (false, false) => {
+                assert_eq!(saved, None);
+                assert_eq!(generation, Some(2));
+                assert_eq!(reload(&mut db).unwrap(), "state_v2_missing_member");
+            }
+            // A changed family needs its control, whose absence refuses the save.
+            (true, true) => {
+                assert_eq!(saved.unwrap(), "accounts_window_inventory");
+                assert_eq!(generation, Some(1));
+                assert_eq!(reload(&mut db).unwrap(), "accounts_missing_family");
+            }
+            // A changed map row is written whole from RAM: the loss is healed.
+            (false, true) => {
+                assert_eq!(saved, None);
+                assert_eq!(generation, Some(2));
+                assert_eq!(
+                    next.claude_account_family_pending,
+                    previous.claude_account_family_pending
+                );
+                assert_persisted(&mut db, &next);
+            }
+        }
+    }
+}
 /// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
 fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {

@@ -281,6 +281,15 @@ pub(super) trait Transaction {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>>;
+    /// One exact key's rows in position order, from position 0 unless a cursor
+    /// is given (exclusive). No other key's header is read.
+    fn scan_record_key(
+        &mut self,
+        kind: &RecordKind,
+        key_bytes: &[u8],
+        after_position: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Header>>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
