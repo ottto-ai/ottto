@@ -21,10 +21,6 @@ pub(crate) fn keep_prior() -> bool {
 pub(crate) fn retry_clock() -> Option<u64> {
     HOOK.with(|state| state.borrow().retry_clock)
 }
-pub(crate) fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
-    let _guard = Guard::new(false, None, Some(now));
-    run()
-}
 pub(crate) fn after_retirement(_retained: bool) {
     HOOK.with(|state| {
         let mut state = state.borrow_mut();
@@ -69,9 +65,13 @@ fn with_rotation_budget<T>(
     (collected, seen)
 }
 
-struct Guard;
+pub(in crate::snapshot_sync) struct Guard;
 impl Guard {
-    fn new(keep: bool, conflict_path: Option<PathBuf>, retry_clock: Option<u64>) -> Self {
+    pub(in crate::snapshot_sync) fn new(
+        keep: bool,
+        conflict_path: Option<PathBuf>,
+        retry_clock: Option<u64>,
+    ) -> Self {
         HOOK.with(|state| {
             assert!(!state.borrow().enabled);
             *state.borrow_mut() = Hook {
