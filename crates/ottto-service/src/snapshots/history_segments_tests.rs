@@ -214,7 +214,6 @@ fn shared_cut_conserves_money_and_placement_for_every_source() {
                 segment.source_session_id,
                 segment_id(&full.source_session_id, start.unix_timestamp()).unwrap()
             );
-            assert!(is_segment_id(&segment.source_session_id));
             assert!(segment.usage_buckets.iter().all(|bucket| {
                 (window.window_start.as_str()..window.window_end.as_str())
                     .contains(&bucket.bucket_start.as_str())

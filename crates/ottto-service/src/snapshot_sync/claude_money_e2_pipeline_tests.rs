@@ -505,6 +505,7 @@ fn upload(
         |s| Some(s.source_session_id.as_str()),
         |_| false,
         crate::snapshots::claude_request_money::request_owned_family_root,
+        crate::snapshots::history_segments::history_group,
         &mut InplaceRetryBudget::default(),
         |batch| {
             let wire = request(&batch);

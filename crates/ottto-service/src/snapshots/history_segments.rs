@@ -11,6 +11,7 @@
 //! body exactly, else nothing is cut. Contract-5 Claude bodies are cut only
 //! by their tagger (`claude_request_identity`), which tags every piece from
 //! the whole-session grouping, so each piece carries its own evidence table.
+use super::claude_request_identity::{row_costs, row_counts};
 use super::{SnapshotCost, SnapshotItem, SnapshotModelUsage, SnapshotSource, SnapshotUsageBucket};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -216,20 +217,6 @@ pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
     group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
 }
 
-/// Whether `id` names a segment entity: `<live>#w<YYYYMMDD>`.
-pub(crate) fn is_segment_id(id: &str) -> bool {
-    segment_of(id).is_some()
-}
-
-/// The live session id a segment entity id belongs to.
-pub(crate) fn segment_of(id: &str) -> Option<&str> {
-    id.rsplit_once(SEPARATOR)
-        .filter(|(live, date)| {
-            !live.is_empty() && date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
-        })
-        .map(|(live, _)| live)
-}
-
 /// Each segment's local file, keyed by segment id: its live body's
 /// `source_file_fingerprint`. Segments name no file on the wire; locally
 /// they settle, retry and leave with that file. Empty without segments.
@@ -268,16 +255,21 @@ pub(crate) fn local_file<'a>(
     })
 }
 
-/// The live session id of a cut session's group: a segment's `of`, or the
-/// live body's own id. `None` outside any cut.
-pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
+/// A cut session's group descriptor: the live session id, plus the segment
+/// count on the live body (`None` on a segment). `None` outside any cut.
+pub(crate) fn history_group(item: &SnapshotItem) -> Option<(&str, Option<u64>)> {
     match &item.history_segment {
-        Some(segment) => Some(segment.of.as_str()),
+        Some(segment) => Some((segment.of.as_str(), None)),
         None => item
             .history_segments
             .as_ref()
-            .map(|_| item.source_session_id.as_str()),
+            .map(|history| (item.source_session_id.as_str(), Some(history.count))),
     }
+}
+
+/// The live session id of a cut session's group. `None` outside any cut.
+pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
+    history_group(item).map(|(live, _)| live)
 }
 
 /// Plan the cut of a full body measuring `full_bytes`, or `None` when it
@@ -340,29 +332,6 @@ struct RowSum {
     counts: [u64; 8],
     costs: [Option<u128>; 5],
     rows: u64,
-}
-
-fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
-    [
-        row.input_tokens,
-        row.output_tokens,
-        row.cache_read_tokens,
-        row.cache_creation_5m_tokens,
-        row.cache_creation_1h_tokens,
-        row.reasoning_output_tokens,
-        row.unattributed_total_tokens,
-        row.request_count,
-    ]
-}
-
-fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
-    [
-        &row.cost_usd,
-        &row.input_cost_usd,
-        &row.output_cost_usd,
-        &row.cache_read_cost_usd,
-        &row.cache_creation_cost_usd,
-    ]
 }
 
 impl RowSum {

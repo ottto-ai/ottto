@@ -191,6 +191,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
         &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         &snapshot_upload_body_witness,
         &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &crate::snapshots::history_segments::history_group,
         &mut |items| {
             let mut response = exact_ack(items)?;
             response.accepted = 0;

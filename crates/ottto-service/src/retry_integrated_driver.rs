@@ -188,6 +188,7 @@ fn integrated_send(
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+                &crate::snapshots::history_segments::history_group,
                 &mut |items| {
                     if !slot.budget.phase(now + 1_000, Some(current)) {
                         return Err(anyhow!("authority before token"));

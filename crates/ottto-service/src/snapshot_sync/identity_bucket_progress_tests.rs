@@ -77,6 +77,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
             &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
             &|_: &Value| "c".repeat(64),
             &|value: &Value| value["source_session_id"].as_str(),
+            &json_group,
             &mut |_| {
                 let entity = crate::snapshot_client::SnapshotEntityRef {
                     source_session_id: "synthetic-sticky-session".into(),
@@ -266,6 +267,7 @@ fn retained_ack(
                 .map_or_else(|| "d".repeat(64), str::to_owned)
         },
         &|value: &Value| value["source_session_id"].as_str(),
+        &json_group,
         &mut |_| {
             let entity = crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: "synthetic-sticky-session".into(),
@@ -420,6 +422,7 @@ fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
             &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
             &|_: &Value| "d".repeat(64),
             &|value: &Value| value["source_session_id"].as_str(),
+            &json_group,
             &mut |_| {
                 assert_eq!(saved.get(), Some((0, 0)), "persisted before the POST");
                 Err(anyhow!("reply lost"))
@@ -477,6 +480,17 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
 
 /// One settled-history group: a segment of the old window and the live body
 /// past `through`, each tagged with its own account, as bodies on the wire.
+/// The JSON page item's settled-history group descriptor.
+fn json_group(value: &Value) -> Option<(&str, Option<u64>)> {
+    match value["history_segment"]["of"].as_str() {
+        Some(live) => Some((live, None)),
+        None => value["history_segments"]["count"]
+            .as_u64()
+            .zip(value["source_session_id"].as_str())
+            .map(|(count, live)| (live, Some(count))),
+    }
+}
+
 fn history_group() -> [Value; 2] {
     let row = |account: char| json!({"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":account.to_string().repeat(64)});
     let body = |session: &str, fingerprint: char, start: &str, account: char, extra: Value| {
@@ -534,6 +548,7 @@ fn group_page_at(
         &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
         &|_: &Value| "c".repeat(64),
         &|value: &Value| value["source_session_id"].as_str(),
+        &json_group,
         &mut |_| {
             let entity = |index: usize| crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: items[index]["source_session_id"].as_str().unwrap().into(),
@@ -745,6 +760,7 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
             |value: &Value| value["source_session_id"].as_str(),
             |_: &Value| false,
             |value: &Value| (value["source_session_id"] != other).then_some(live),
+            json_group,
             &mut InplaceRetryBudget::default(),
             |batch: Vec<Value>| {
                 requests.push(batch.clone());

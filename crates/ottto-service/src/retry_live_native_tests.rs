@@ -549,6 +549,7 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
         &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         &snapshot_upload_body_witness,
         &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &crate::snapshots::history_segments::history_group,
         &mut |snapshots| {
             client.upload_batch(
                 "ordinary-retry",
@@ -670,6 +671,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+            &crate::snapshots::history_segments::history_group,
             &mut |items| {
                 assert_eq!(
                     serde_json::to_value(&items).unwrap(),

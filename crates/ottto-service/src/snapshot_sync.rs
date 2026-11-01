@@ -2397,6 +2397,19 @@ impl SnapshotUploadProgress {
         self.active_reason_reoffers.remove(fingerprint);
     }
 
+    /// The identity ledger keying `value`: settled-history segments key their
+    /// own sibling entries.
+    fn identity_ledger_mut(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> &mut crate::snapshots::claude_request_identity::AcceptedBuckets {
+        if value["history_segment"].is_object() {
+            &mut self.accepted_identity_segments
+        } else {
+            &mut self.accepted_identity_buckets
+        }
+    }
+
     fn record_cache_state<T: Serialize>(
         &mut self,
         item: &T,
@@ -2427,13 +2440,8 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        // Settled-history segments key their own sibling entries.
         let segment = value["history_segment"].is_object();
-        let ledger = if segment {
-            &mut self.accepted_identity_segments
-        } else {
-            &mut self.accepted_identity_buckets
-        };
+        let ledger = self.identity_ledger_mut(&value);
         if preview {
             ledger.preview_record(&value);
         } else {
@@ -2448,11 +2456,7 @@ impl SnapshotUploadProgress {
             ]
             .iter()
             .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
-            let ledger = if segment {
-                &mut self.accepted_identity_segments
-            } else {
-                &mut self.accepted_identity_buckets
-            };
+            let ledger = self.identity_ledger_mut(&value);
             let witnessed = ledger.retained_enabled()
                 && versioned_body
                 && entity.body_witness_version.is_some()
@@ -8338,6 +8342,7 @@ fn finish_sync_source(
             |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
             // A cut session's group is one packing unit, so it shares a batch.
             crate::snapshots::history_segments::packing_unit,
+            crate::snapshots::history_segments::history_group,
             &mut inplace_retry,
             |snapshots| {
                 // A first Codex/Claude scan can spend several minutes parsing local
@@ -10874,7 +10879,7 @@ enum SnapshotPageOutcome {
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
 #[allow(clippy::too_many_arguments)]
-fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist>(
+fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Group, Upload, Persist>(
     items: &[T],
     indices: &[usize],
     poison_scope: &str,
@@ -10883,6 +10888,7 @@ fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist
     fingerprint: &Fingerprint,
     body_witness: &BodyWitness,
     session_id: &SessionId,
+    history_group: &Group,
     upload: &mut Upload,
     persist: &mut Persist,
 ) -> Result<SnapshotPageOutcome>
@@ -10891,6 +10897,7 @@ where
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
+    Group: Fn(&T) -> Option<(&str, Option<u64>)>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -10943,12 +10950,9 @@ where
         for item in &batch {
             let value = serde_json::to_value(item)?;
             // Tombstones key per item: a segment's proof is its own entity's.
-            let ledger = if value["history_segment"].is_object() {
-                &mut progress.accepted_identity_segments
-            } else {
-                &mut progress.accepted_identity_buckets
-            };
-            replaced_retained_proof |= ledger.invalidate_replaced(&value);
+            replaced_retained_proof |= progress
+                .identity_ledger_mut(&value)
+                .invalidate_replaced(&value);
         }
     }
     // Option (ii): the server may store a replacement proof even if this
@@ -11039,8 +11043,14 @@ where
         // store this body (its head already covers the usage). Nothing
         // body-scoped is recorded as stored: the exact body is held instead,
         // so it is offered once per change and never marked emitted.
-        let groups = history_groups(items, indices)?;
-        let group_segments = history_group_segments(items, &groups, session_id);
+        let groups = indices
+            .iter()
+            .map(|index| {
+                let group = history_group(&items[*index]);
+                (*index, group.map(|(live, count)| (live.to_owned(), count)))
+            })
+            .collect::<Vec<_>>();
+        let group_segments = history_group_segments(items, &groups, history_group);
         let not_stored = response
             .unchanged_entities
             .iter()
@@ -11325,34 +11335,17 @@ fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, 
 /// cut session.
 type HistoryGroup = Option<(String, Option<u64>)>;
 
-/// Each page index with its settled-history group.
-fn history_groups<T: Serialize>(
-    items: &[T],
-    indices: &[usize],
-) -> Result<Vec<(usize, HistoryGroup)>> {
-    indices
-        .iter()
-        .map(|index| {
-            let value = serde_json::to_value(&items[*index])?;
-            let group = match value["history_segment"]["of"].as_str() {
-                Some(live) => Some((live.to_owned(), None)),
-                None => value["history_segments"]["count"]
-                    .as_u64()
-                    .zip(value["source_session_id"].as_str())
-                    .map(|(count, live)| (live.to_owned(), Some(count))),
-            };
-            Ok((*index, group))
-        })
-        .collect()
+/// Uploads that never carry a settled-history group.
+fn no_history_group<T>(_: &T) -> Option<(&str, Option<u64>)> {
+    None
 }
 
 /// For each cut live body on this page: the indices of every segment of its
-/// group in the whole input, on this page or not (by entity id: no body is
-/// serialized off the page).
+/// group in the whole input, on this page or not.
 fn history_group_segments<T>(
     items: &[T],
     groups: &[(usize, HistoryGroup)],
-    session_id: &impl Fn(&T) -> Option<&str>,
+    history_group: &impl Fn(&T) -> Option<(&str, Option<u64>)>,
 ) -> BTreeMap<String, Vec<usize>> {
     let mut lives = groups
         .iter()
@@ -11365,9 +11358,9 @@ fn history_group_segments<T>(
         return lives;
     }
     for (index, item) in items.iter().enumerate() {
-        if let Some(segments) = session_id(item)
-            .and_then(crate::snapshots::history_segments::segment_of)
-            .and_then(|live| lives.get_mut(live))
+        if let Some(segments) = history_group(item)
+            .filter(|(_, count)| count.is_none())
+            .and_then(|(live, _)| lives.get_mut(live))
         {
             segments.push(index);
         }
@@ -11416,6 +11409,7 @@ where
         session_id,
         batch_class,
         |_| None,
+        no_history_group,
         inplace_retry,
         upload,
         persist,
@@ -11432,6 +11426,7 @@ fn upload_resumable_batches_with_literal_families<
     SessionId,
     BatchClass,
     LiteralFamily,
+    Group,
     Upload,
     Persist,
 >(
@@ -11444,6 +11439,7 @@ fn upload_resumable_batches_with_literal_families<
     session_id: SessionId,
     batch_class: BatchClass,
     literal_family: LiteralFamily,
+    history_group: Group,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
@@ -11455,9 +11451,11 @@ where
     SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> bool,
     LiteralFamily: Fn(&T) -> Option<&str>,
+    Group: Fn(&T) -> Option<(&str, Option<u64>)>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
+    let is_segment = |item: &T| history_group(item).is_some_and(|(_, count)| count.is_none());
     // Input is a page/delta, not a census. Only an explicitly changed body
     // invalidates its previous ACK here. Index settlement owns retirement;
     // bounded admission below prevents unindexed revisions growing forever.
@@ -11569,10 +11567,8 @@ where
     // them). A member whose exact bytes are refused for good holds the group.
     let history_roots = items
         .iter()
-        .filter(|item| {
-            session_id(item).is_some_and(crate::snapshots::history_segments::is_segment_id)
-        })
-        .filter_map(&literal_family)
+        .filter_map(&history_group)
+        .filter_map(|(live, count)| count.is_none().then_some(live))
         .collect::<BTreeSet<_>>();
     let mut history_forced = BTreeSet::new();
     let mut history_refused = BTreeSet::new();
@@ -11666,11 +11662,7 @@ where
         // Settled-history segments lead their live body, then root first.
         members.sort_by_key(|(index, _, _)| {
             let member = session_id(&items[*index]);
-            (
-                !member.is_some_and(crate::snapshots::history_segments::is_segment_id),
-                member != Some(root),
-                member,
-            )
+            (!is_segment(&items[*index]), member != Some(root), member)
         });
         // A settled-history group's unACKed members (ACKed, unchanged ones
         // were skipped above) travel in ONE request: the receiver refuses a
@@ -11678,10 +11670,9 @@ where
         // of it goes this pass: counted deferred and alarmed, never dropped
         // or stripped, and offered again whole.
         if history_refused.contains(root)
-            || members.iter().any(|(index, _, _)| {
-                session_id(&items[*index])
-                    .is_some_and(crate::snapshots::history_segments::is_segment_id)
-            })
+            || members
+                .iter()
+                .any(|(index, _, _)| is_segment(&items[*index]))
         {
             let bytes = members
                 .iter()
@@ -11731,10 +11722,7 @@ where
     let mut catchup_units = Vec::new();
     for unit in units {
         // A settled-history group stays one ordinary unit, in order.
-        let history = unit.iter().any(|(index, _, _)| {
-            session_id(&items[*index])
-                .is_some_and(crate::snapshots::history_segments::is_segment_id)
-        });
+        let history = unit.iter().any(|(index, _, _)| is_segment(&items[*index]));
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             !history
                 && progress
@@ -11863,6 +11851,7 @@ where
             &fingerprint,
             &body_witness,
             &session_id,
+            &history_group,
             &mut upload,
             &mut persist,
         );
@@ -23857,6 +23846,7 @@ mod tests {
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+                &crate::snapshots::history_segments::history_group,
                 &mut { upload },
                 &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
             )
@@ -24514,6 +24504,7 @@ mod tests {
             &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+            &crate::snapshots::history_segments::history_group,
             &mut |items| {
                 physical += 1;
                 same_source_fixture_ack(items)

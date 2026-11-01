@@ -2828,6 +2828,8 @@ fn settled_history_cut_off_keeps_main_bytes() {
         serde_json::to_vec(&main).unwrap()
     );
     assert!(off.history_cut.is_empty());
+}
+
 /// [money][regress] #909: the advertised cap preserves every tag and total;
 /// the real heap walker charges the large graph or refuses parking, never money.
 #[test]

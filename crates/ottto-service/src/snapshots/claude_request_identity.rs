@@ -432,7 +432,7 @@ fn usage_costs(usage: &UsageTotals) -> [Option<u128>; 5] {
     ]
 }
 
-fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
+pub(super) fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
     [
         row.input_tokens,
         row.output_tokens,
@@ -445,7 +445,7 @@ fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
     ]
 }
 
-fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
+pub(super) fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
     [
         &row.cost_usd,
         &row.input_cost_usd,
