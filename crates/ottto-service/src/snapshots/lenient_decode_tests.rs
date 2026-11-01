@@ -2693,8 +2693,8 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             "{context}"
         );
         assert_eq!(
-            restarted.accepted_rebuild_incidence,
-            seed.file_snapshot_fingerprints
+            seed.file_snapshot_fingerprints,
+            restarted.accepted_rebuild_incidence
         );
         restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
         assert_eq!(
@@ -3117,7 +3117,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
         .map(|n| format!("{n:064x}"))
         .collect::<BTreeSet<_>>();
     let mut seed = ScanIndex {
-        accepted_snapshot_fingerprints: original.clone(),
+        accepted_snapshot_fingerprints: original.clone().into(),
         ..ScanIndex::default()
     };
     seed.file_snapshot_fingerprints

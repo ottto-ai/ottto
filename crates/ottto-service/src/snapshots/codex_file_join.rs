@@ -412,6 +412,15 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
+    /// What a continuation page reads: the headers `keep` names, in path
+    /// order, and completeness. The directory census goes too: only an
+    /// ordinary page's coverage and membership checks read it.
+    pub(super) fn keep_job_share(&mut self, keep: impl Fn(&HeaderWitness) -> bool) {
+        self.headers.retain(keep);
+        self.headers.shrink_to_fit();
+        self.pending.shrink_to_fit();
+        self.directories = DirectoryCensus::default();
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
@@ -3742,7 +3751,9 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
-                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+                crate::snapshots::DiscoveryRetention::unverified(
+                    &crate::snapshots::SharedMap::default(),
+                ),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

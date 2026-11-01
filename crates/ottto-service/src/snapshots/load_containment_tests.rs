@@ -43,7 +43,7 @@ fn lc_fixture() -> ScanIndex {
             .snapshot_activity_at
             .insert(body, Some(LC_WINDOW.to_string()));
     }
-    index.accepted_snapshot_fingerprints = BTreeSet::from([lc_hex('c'), lc_hex('d')]);
+    index.accepted_snapshot_fingerprints = BTreeSet::from([lc_hex('c'), lc_hex('d')]).into();
     index.quarantined_snapshot_fingerprints.insert(
         lc_hex('e'),
         snapshot_quarantine_record(SnapshotSource::ClaudeCode),
