@@ -42,6 +42,7 @@ use crate::LocalHealthUploadFailureKind;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
+pub(crate) use rejection_log::SessionHash;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -3292,9 +3293,7 @@ fn quarantine_invalid_progress(path: &Path) -> Result<()> {
     sync_progress_parent(path)
 }
 
-fn is_snapshot_fingerprint(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
+use crate::hex::is_sha256_any_case as is_snapshot_fingerprint;
 
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -11057,7 +11056,10 @@ where
         {
             let key = cache_session_key(&entity.source_session_id);
             if let Some(record) = progress.head_conflict_challenges.remove(&key) {
-                head_conflicts_recovered.push((key.clone(), record.answer_attempts));
+                head_conflicts_recovered.push((
+                    SessionHash::of(&entity.source_session_id),
+                    record.answer_attempts,
+                ));
             }
             settled_sessions.insert(key);
         }
@@ -11080,7 +11082,11 @@ where
                 rescan,
                 now,
             ) {
-                head_conflicts_recorded.push((key, attempts, rescan.answered));
+                head_conflicts_recorded.push((
+                    SessionHash::of(&entity.source_session_id),
+                    attempts,
+                    rescan.answered,
+                ));
             }
         }
         // An unchanged ref with `unchanged_basis` means the server did not
@@ -11218,18 +11224,16 @@ where
             operation: "save upload checkpoint",
         })
     })?;
-    for (key, answer_attempts) in &head_conflicts_recovered {
+    for (session_hash, answer_attempts) in &head_conflicts_recovered {
         eprintln!(
-            "local snapshot head-CAS conflict resolved for {poison_scope}: session_hash={} \
+            "local snapshot head-CAS conflict resolved for {poison_scope}: session_hash={session_hash} \
              refused_answers={answer_attempts}; saved head replaced by the server's",
-            &key[..8],
         );
     }
-    for (key, answer_attempts, answered) in &head_conflicts_recorded {
+    for (session_hash, answer_attempts, answered) in &head_conflicts_recorded {
         eprintln!(
-            "local snapshot head-CAS conflict for {poison_scope}: session_hash={} answered={answered} \
+            "local snapshot head-CAS conflict for {poison_scope}: session_hash={session_hash} answered={answered} \
              refused_answers={answer_attempts}; challenge saved, the next eligible upload answers it",
-            &key[..8],
         );
     }
     if entity_ack {
