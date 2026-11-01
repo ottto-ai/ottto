@@ -80,13 +80,16 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 
 /// Decode all four groups from one snapshot into an unpublished graph. Account
 /// skeletons precede census-owned request membership; no partial graph escapes.
+/// Test view: cold archives are read back resident, for graph comparisons.
 #[cfg(test)]
 pub(super) fn hydrate<S: Store>(
     store: &mut S,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
-    hydrate_txn(&mut tx, binding)
+    let (mut index, cx) = hydrate_txn(&mut tx, binding)?;
+    kinds_accounts::materialize(&mut tx, &mut index)?;
+    Ok((index, cx))
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
@@ -214,11 +217,21 @@ pub(super) fn save_graph(
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
-                for family in next.claude_account_family_pending.values() {
-                    let n = family.previous_windows.len() as u64 + 1;
+                let mut uncollapsed = 0_u64;
+                for (root, family) in &mut next.claude_account_family_pending {
+                    // Stored windows, current included, as this save left them.
+                    let ids = digests
+                        .windows
+                        .get(root)
+                        .map_or(&[][..], |w| w.ids.as_slice());
+                    let n = ids.len() as u64;
                     count += u64::from(n > 64);
                     windows += n;
                     max = max.max(n);
+                    family
+                        .previous_windows
+                        .saved(ids.split_last().map_or(&[][..], |(_, archived)| archived));
+                    uncollapsed += family.previous_windows.uncollapsed() as u64;
                 }
                 if count != 0 {
                     telemetry::event("account_windows_alarm", &count);
@@ -226,7 +239,8 @@ pub(super) fn save_graph(
                 telemetry::event(
                     "account_windows_retained",
                     &serde_json::json!({
-                        "windows": windows, "max_per_family": max, "families_over_64": count
+                        "windows": windows, "max_per_family": max, "families_over_64": count,
+                        "uncollapsed": uncollapsed
                     }),
                 );
                 Ok(digests)
