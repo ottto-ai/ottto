@@ -1477,6 +1477,13 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
         retry.generation
     )
     .is_err());
+    // [regress] Local receipt binding must not need the upload fence: the
+    // held pass that retries the save starts here, before collection.
+    assert!(
+        crate::snapshots::ProgressRecovery::for_index(&retry, &f.path)
+            .unwrap()
+            .is_some()
+    );
     let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
         .unwrap()
         .unwrap();
