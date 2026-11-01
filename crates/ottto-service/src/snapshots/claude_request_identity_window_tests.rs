@@ -2461,7 +2461,6 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     base.session_display_name = Some("x".into());
     base.workspace_display_label = Some("x".into());
     base.repository_label = Some("x".into());
-    base.context_curve = Some(max_fractional_context_curve_fixture());
     let (mut item, filler) = sticky_pad_to_bytes(&base, 1_600_000);
     proof.extend(filler);
     let baseline = sticky_money(&item);
@@ -2482,13 +2481,11 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             .as_u64()
             .is_some_and(|n| n > 0)
     ));
-    let curve = serde_json::to_value(&item.context_curve).unwrap();
     apply_upload_policy(
         SnapshotSource::ClaudeCode,
         std::slice::from_mut(&mut item),
         SnapshotUploadPolicy::default(),
     );
-    assert_eq!(serde_json::to_value(&item.context_curve).unwrap(), curve);
     let mut request = valid_v6_batch_request();
     request.snapshots = vec![item.clone()];
     assert!(validate_snapshot_batch_request(&request)
@@ -2538,7 +2535,7 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
         );
         assert!(
             serde_json::to_vec(&charged_request.snapshots).unwrap() == before,
-            "{source:?}: upload policy changed an item that fits the advertised cap"
+            "{source:?}: upload policy changed the item"
         );
         assert_eq!(charged_request.snapshots.len(), 1);
         validate_snapshot_batch_request_with_item_limit(&charged_request, 2_097_152).unwrap();

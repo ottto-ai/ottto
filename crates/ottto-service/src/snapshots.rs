@@ -8233,10 +8233,6 @@ fn snapshot_item_wire_size(
     .unwrap_or(usize::MAX)
 }
 
-fn snapshot_item_wire_size_is_allowed(item_size: usize) -> bool {
-    item_size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES
-}
-
 /// Bind incremental state to the exact bytes/semantics that will go on the
 /// wire. This MUST run after every enrichment, privacy policy, and account
 /// cutoff. Parser-time fingerprints are provisional only: committing them
@@ -15764,9 +15760,9 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
         })
         .map_err(|error| format!("snapshot[{index}] wire encoding: {error}"))?
         .len();
-        if item_size > item_limit && !snapshot_item_wire_size_is_allowed(item_size) {
+        if item_size > item_limit && item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit}"
             ));
         }
     }
@@ -55924,10 +55920,14 @@ mod tests {
     fn snapshot_admission_boundaries_match_backend_640_kib() {
         assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
         assert_eq!(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, 656_384);
-        for size in [128 * 1024, 128 * 1024 + 1, 640 * 1024] {
-            assert!(snapshot_item_wire_size_is_allowed(size));
+        for (size, allowed) in [
+            (128 * 1024, true),
+            (128 * 1024 + 1, true),
+            (640 * 1024, true),
+            (655_361, false),
+        ] {
+            assert_eq!(size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES, allowed);
         }
-        assert!(!snapshot_item_wire_size_is_allowed(655_361));
     }
 
     #[test]

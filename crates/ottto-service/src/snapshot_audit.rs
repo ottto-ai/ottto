@@ -86,6 +86,13 @@ pub struct SnapshotAuditReport {
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
+    // Kept for the v4 report schema; always 0 since the daemon builds no curves.
+    pub context_curve_present_session_count: usize,
+    pub context_curve_available_session_count: usize,
+    pub context_curve_unavailable_session_count: usize,
+    pub context_curve_retained_point_count: u64,
+    pub context_curve_retained_boundary_count: u64,
+    pub context_curve_serialized_bytes: usize,
     pub sessions: Vec<SnapshotAuditSession>,
 }
 
@@ -390,6 +397,12 @@ pub fn run_snapshot_audit<W: Write>(
         zero_snapshot_usage_evidence_count: scan.zero_snapshot_usage_evidence_count,
         dropped_usage_record_count: scan.dropped_usage_record_count,
         emitted_session_count: sessions.len(),
+        context_curve_present_session_count: 0,
+        context_curve_available_session_count: 0,
+        context_curve_unavailable_session_count: 0,
+        context_curve_retained_point_count: 0,
+        context_curve_retained_boundary_count: 0,
+        context_curve_serialized_bytes: 0,
         sessions,
     };
 

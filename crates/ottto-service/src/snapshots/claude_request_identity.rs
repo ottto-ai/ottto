@@ -2350,9 +2350,9 @@ fn set_row(
 }
 
 /// Money identity outranks display data (#909 P0): an over-cap tagged body
-/// first sheds context-curve points, then cache observations from the end of
-/// the patch, and only then may the selector strip tags. Returns the pre-shed component bytes
-/// (counts only) and the bytes after shedding.
+/// first sheds cache observations from the end of the patch, and only then
+/// may the selector strip tags. Returns the pre-shed component bytes (counts
+/// only) and the bytes after shedding.
 fn shed_display_leaves(
     item: &mut SnapshotItem,
     grouping: &Grouping,

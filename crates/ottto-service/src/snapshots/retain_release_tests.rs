@@ -1142,7 +1142,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             compaction_total_post_tokens: _, // I
             compaction_total_cumulative_dropped_tokens: _, // I
             compaction_total_duration_ms: _, // I
-            context_curve: _, // K (unavailable_context_curve)
+            context_curve: _, // K (None; no curves are built)
             claude_context_curve_boundaries: _, // M
             claude_context_curve_identity_complete: _, // I
             claude_context_curve_request_index_complete: _, // I
