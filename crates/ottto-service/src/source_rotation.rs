@@ -166,7 +166,7 @@ pub(crate) trait Owner {
     fn outcome(&mut self, source: Self::Source, result: Result<()>);
     fn monotonic(&self) -> Duration;
     /// Optional process-retained graphs outside the active frame. A graph
-    /// moved into the frame is charged by that frame, never here as well.
+    /// moved into the frame is not retained and is never charged here.
     /// Concrete owners must use the existing requested-layout admission;
     /// unsupported layout, unavailable locks or unknown ownership return None.
     fn retained_bound(&self, _limit: usize) -> Option<usize> {
@@ -450,6 +450,23 @@ mod retained_budget_tests {
     }
 
     #[test]
+    fn retained_budget_finish_cannot_keep_carry_over_the_allowance() {
+        // Queue capacity is already paid, so the full allowance no longer fits.
+        let mut owner = ProofOwner {
+            create_at: Some(0),
+            create_charge: PARKED_BUDGET,
+            ..Default::default()
+        };
+        run(&mut owner, &[0, 1], PARKED_BUDGET);
+        assert_eq!(owner.outcomes, vec![(0, true), (1, true)]);
+        assert!(
+            owner.carry.is_none(),
+            "finish must discard excess carry before the next source"
+        );
+        assert_eq!(owner.discards, 1);
+    }
+
+    #[test]
     fn retained_budget_moves_one_graph_through_frame_finish_and_next_cycle() {
         let graph = Box::new(Carry {
             charge: PARKED_BUDGET / 2,
@@ -645,7 +662,7 @@ mod retained_budget_tests {
         assert_eq!(
             bound(&completed),
             before,
-            "unused recovery remains part of parked charge"
+            "unused recovery remains part of the charge"
         );
     }
 }
