@@ -482,9 +482,7 @@ fn route(items: &[SnapshotItem], mode: Mode) -> RouteResult {
 /// [regress] Authorized recovery rebuilds unchanged retired proof once;
 /// legacy requests never grant revival, and a non-Full revival still owes Full.
 #[test]
-#[ignore = "needs RF1 census commit"]
 fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
-    // TODO: remove ignore with the census guard/caller integration.
     with_max_gated_claude_revision(3, || {
         let chain = ProofChain::new("copy-prefix-retired-regression");
         let (mut index, before) = chain.residue();
@@ -548,8 +546,9 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         let path = &chain.paths[0];
         let key = local_index_key(path);
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
-        // A complete but non-Full itemless parse is identity-incomplete. The
-        // census owner's parse-field plumbing must pass this scope membership.
+        // A complete but non-Full itemless parse is identity-incomplete; the
+        // prepared recovery scope authorizes its revival.
+        let accepted_recovery_member = index.copy_prefix_recovery_scope.contains(path);
         census::record_claude_request_census(
             &mut index,
             census::ClaudeRequestCensusParse {
@@ -564,6 +563,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
                 itemless_request_hashes: vec![census::claude_request_hash("request-0")],
                 opened_birth: None,
                 modified_unix_seconds: rfc3339_unix_seconds("2026-06-15T00:00:00Z").unwrap(),
+                accepted_recovery_member,
             },
             &[],
         );
@@ -589,9 +589,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
 /// [money] A six-session chain restores totals and placement to cold Full,
 /// including a mid-session account switch, a side call and an evidence gap.
 #[test]
-#[ignore = "needs RF1 census commit"]
 fn copy_prefix_proof_recovery_totals_and_placement() {
-    // TODO: remove ignore with the census guard/caller integration.
     with_max_gated_claude_revision(3, || {
         let chain = ProofChain::new("copy-prefix-recovery-money");
         let (mut cold_index, mut cold) = chain.raw(ScanIndex::default());

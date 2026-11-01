@@ -2546,6 +2546,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
                 itemless_request_hashes: vec![],
                 opened_birth: None,
                 modified_unix_seconds: 0,
+                accepted_recovery_member: false,
             },
             &[],
         );

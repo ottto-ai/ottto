@@ -773,6 +773,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 1,
+                    accepted_recovery_member: false,
                 },
                 &[held],
             );

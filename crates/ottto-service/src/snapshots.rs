@@ -30995,6 +30995,8 @@ impl OwnedSourceScan {
                     } else if !held_progress_audit || (source_verified && parse_complete) {
                         // An unsuccessful virtual audit keeps its old hold:
                         // it has no sampled marker carrying the obligation.
+                        let accepted_recovery_member =
+                            index.copy_prefix_recovery_scope.contains(&candidate.path);
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -31026,6 +31028,7 @@ impl OwnedSourceScan {
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
+                                accepted_recovery_member,
                             },
                             &parsed,
                         );

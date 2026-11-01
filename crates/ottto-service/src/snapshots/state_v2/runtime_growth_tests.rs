@@ -820,6 +820,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
                     itemless_request_hashes: vec![8, 9],
                     opened_birth: None,
                     modified_unix_seconds: 1,
+                    accepted_recovery_member: false,
                 },
                 &[],
             );

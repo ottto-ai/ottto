@@ -2897,6 +2897,10 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     /// The candidate's modification time (unix seconds; 0 unknown), kept on
     /// the record for retirement.
     pub(crate) modified_unix_seconds: u64,
+    /// Runtime only: the path is an outstanding member of the accepted
+    /// copy-prefix recovery request prepared for this scan. A complete,
+    /// loss-free parse of such a member may rebuild a retired record.
+    pub(crate) accepted_recovery_member: bool,
 }
 
 /// The request-id hashes of the Claude responses a parser buffered, taken
@@ -3009,13 +3013,15 @@ pub(crate) fn record_claude_request_census(
         }
         // An unchanged re-parse of a retired record (a backfill, a resume
         // miss) stays retired while its file is still past the cutoff: its
-        // hashes, and the index bytes, do not bounce back.
+        // hashes, and the index bytes, do not bounce back. Only a complete,
+        // loss-free parse of an accepted recovery member rebuilds it.
         let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
         if old.retired.is_some()
             && window > 0
             && old.derivation == record.derivation
             && old.source_file_fingerprint == record.source_file_fingerprint
             && record.modified.is_some_and(|modified| modified < cutoff)
+            && !(parse.accepted_recovery_member && parse.complete && !parse.lossy)
         {
             record.retire();
         }

@@ -473,6 +473,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
                     itemless_request_hashes: vec![],
                     opened_birth: None,
                     modified_unix_seconds: 0,
+                    accepted_recovery_member: false,
                 },
                 if exact {
                     std::slice::from_ref(&item)
