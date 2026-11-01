@@ -2748,21 +2748,27 @@ fn settled_history_cut_measures_the_tagged_body() {
 
 /// [money] A settled window over a size cap once tagged holds the session for
 /// this pass (counted, delayed): the receiver takes whole 7-day windows only,
-/// so it is never halved, and nothing of it is cut or stripped.
+/// so it is never halved, and no piece is cut, budget-trimmed or stripped.
 #[test]
 fn settled_history_window_over_a_size_cap_holds_the_session() {
     let (full, proof, now) = hot_session(1, 6);
     let accepted = identity::AcceptedBuckets::for_test();
     let segments = identity::AcceptedBuckets::segments_for_test();
+    // Whole, the parts budget keeps only some buckets tagged (today's path).
     let mut whole = full.clone();
     let uncut = identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None);
-    assert!(matches!(uncut, Ok(Tagged::Fallback { .. })), "whole it strips");
+    assert!(matches!(uncut, Ok(Tagged::Sent { .. })), "{uncut:?}");
     let mut item = full.clone();
     let (tagged, held) =
         identity::apply_cut_held_for_test(&mut item, &proof, &accepted, &segments, Some(now));
-    assert!(matches!(tagged, Ok(Tagged::Fallback { .. })));
+    assert_eq!(tagged, uncut);
     assert_eq!(held, BTreeSet::from([full.source_session_id.clone()]));
     assert!(item.history_cut.is_empty() && item.history_segments.is_none());
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        serde_json::to_vec(&whole).unwrap(),
+        "held, the body is today's whole"
+    );
 }
 
 /// [off=main] Without the capability nothing is cut: the same bytes as an

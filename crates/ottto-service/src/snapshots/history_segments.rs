@@ -21,6 +21,36 @@ use time::OffsetDateTime;
 pub(crate) const CONTRACT: &str = "session_history_segments:v1";
 /// Full bodies at or under this size are never cut.
 pub(crate) const TRIGGER_BYTES: usize = 512 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TRIGGER_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// `TRIGGER_BYTES`; a test may lower it for its own thread.
+pub(crate) fn trigger_bytes() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(bytes) = TRIGGER_FOR_TEST.get() {
+            return bytes;
+        }
+    }
+    TRIGGER_BYTES
+}
+
+/// Run `f` with the cut trigger at `bytes` on this thread, so a pipeline
+/// test reaches the cut with a session small enough to stay retained.
+#[cfg(test)]
+pub(crate) fn with_trigger_for_test<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TRIGGER_FOR_TEST.set(self.0);
+        }
+    }
+    let _restore = Restore(TRIGGER_FOR_TEST.replace(Some(bytes)));
+    f()
+}
 const DAY_SECONDS: i64 = 86_400;
 const WINDOW_SECONDS: i64 = 7 * DAY_SECONDS;
 const SETTLED_SECONDS: i64 = 72 * 3_600;
@@ -156,7 +186,7 @@ pub(crate) fn plan(
     now: i64,
     item_limit: usize,
 ) -> Option<Plan> {
-    if full_bytes <= TRIGGER_BYTES
+    if full_bytes <= trigger_bytes()
         || item.history_segment.is_some()
         || item.source_session_id.contains(SEPARATOR)
     {

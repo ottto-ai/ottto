@@ -969,9 +969,21 @@ pub(crate) fn apply_grouped(
 /// allocation priority, and fresh tags use the plain newest-first order.
 fn apply_grouped_with_accepted(
     item: &mut SnapshotItem,
+    grouping: Grouping,
+    known: Option<&accepted::AcceptedSession>,
+    retained: bool,
+) -> Result<Tagged, Ineligible> {
+    apply_grouped_trimmed(item, grouping, known, retained, &mut BTreeSet::new())
+}
+
+/// `apply_grouped_with_accepted`; `trimmed` gets the caps behind a `Sent`
+/// body that kept only the budget's buckets tagged (the rest stripped).
+fn apply_grouped_trimmed(
+    item: &mut SnapshotItem,
     mut grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
+    trimmed: &mut BTreeSet<OverCap>,
 ) -> Result<Tagged, Ineligible> {
     let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
     let (accepted, proved) = if retained {
@@ -1251,6 +1263,7 @@ fn apply_grouped_with_accepted(
         // Withholding only that request must not anonymize retained history.
         item.claude_account_display =
             Some(Box::new(account_display(&visible, visible.unowned_request)));
+        *trimmed = over_cap;
         return Ok(Tagged::Sent {
             refusals: item.request_identity_refusals,
         });
@@ -5177,13 +5190,13 @@ fn apply_cut(
     let whole = grouping.piece(&everything.iter().map(String::as_str).collect(), true);
     let tagged = apply_grouped_with_accepted(item, whole, accepted, retained);
     let sent = matches!(tagged, Ok(Tagged::Sent { .. }));
-    if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::TRIGGER_BYTES) {
+    if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::trigger_bytes()) {
         return tagged;
     }
     let Some((mut segments, mut live)) = history_segments::plan(
         SnapshotSource::ClaudeCode,
         &original,
-        history_segments::TRIGGER_BYTES + 1,
+        history_segments::trigger_bytes() + 1,
         now,
         MAX_ITEM_BYTES,
     )
@@ -5201,14 +5214,21 @@ fn apply_cut(
             .and_then(|ledger| ledger.get(&segment.source_session_id));
         let view = accepted::segment_view(own, accepted, &keys);
         let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
-        match apply_grouped_with_accepted(segment, piece, view.as_ref(), retained) {
-            Ok(Tagged::Sent { .. }) => {}
-            // A window over a size cap stays over it: hold, never strip.
-            Ok(Tagged::Fallback { over_cap, .. })
-                if !over_cap.is_empty()
-                    && over_cap
-                        .iter()
-                        .all(|cap| matches!(cap, OverCap::Bytes | OverCap::PartsPerItem)) =>
+        let mut trimmed = BTreeSet::new();
+        let caps =
+            match apply_grouped_trimmed(segment, piece, view.as_ref(), retained, &mut trimmed) {
+                Ok(Tagged::Sent { .. }) => trimmed.into_iter().collect(),
+                Ok(Tagged::Fallback { over_cap, .. }) if !over_cap.is_empty() => over_cap,
+                // Any other cause is the whole session's too: today's path.
+                _ => return tagged,
+            };
+        match caps.as_slice() {
+            [] => {}
+            // A window over a size cap stays over it: hold, never strip
+            // (wholly, or a budget's older buckets).
+            caps if caps
+                .iter()
+                .all(|cap| matches!(cap, OverCap::Bytes | OverCap::PartsPerItem)) =>
             {
                 history_segments::alarm(
                     SnapshotSource::ClaudeCode,

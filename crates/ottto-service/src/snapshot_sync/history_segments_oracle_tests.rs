@@ -5,9 +5,13 @@ use super::money_equivalence_tests::{claude_pages, compare_claude_uploads, corpu
 use super::state_v2_money_tests::tagged_api;
 use super::*;
 use crate::snapshots::claude_request_identity::AcceptedBuckets;
+use crate::snapshots::history_segments::with_trigger_for_test;
 
 const WEEK: i64 = 7 * 86_400;
-const WEEKS: i64 = 12;
+/// Four windows (three settled) keep the transcript inside one retained
+/// entry; the cut trigger is lowered on this thread so the session crosses it.
+const WEEKS: i64 = 4;
+const TRIGGER: usize = 32 * 1024;
 /// Hours at the start of each window whose telemetry carries no checked
 /// login: the scan's reconcile carries the earlier request's account in.
 const CARRIED_HOURS: i64 = 2;
@@ -134,7 +138,7 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         println!("MONEY_EQUIVALENCE {name} UNEXECUTED: native retained layout unavailable");
         return;
     }
-    with_e2(|| {
+    with_e2(|| with_trigger_for_test(TRIGGER, || {
         let mut requests = requests(WEEKS * 168 - 12);
         let mut c = corpus(name);
         let text = requests
@@ -192,7 +196,7 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
             .as_ref()
             .expect("the long session is cut");
         assert_eq!(through.count, cut.len() as u64);
-        assert!(cut.len() >= 8, "every settled window is its own segment");
+        assert_eq!(cut.len() as i64, WEEKS - 1, "every settled window is its own segment");
         assert!(cut
             .iter()
             .all(|segment| segment.history_segment.as_ref().unwrap().of == ROOT));
@@ -234,5 +238,5 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         let (resumed, wire, _) = upload(full, &mut progress, ack);
         assert_eq!(resumed.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(wire, cold_wire);
-    });
+    }));
 }
