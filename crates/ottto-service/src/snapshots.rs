@@ -7861,6 +7861,8 @@ pub struct SourceScanResult {
     pub symlink_rejected_count: usize,
     pub directory_entry_cap_exceeded_count: usize,
     pub unreadable_path_count: usize,
+    /// Diagnostic only: this page's paced growth reads (never unreadable).
+    pub(crate) growth_deferred: u64,
     pub oversized_file_count: usize,
     pub disappeared_file_count: usize,
     pub malformed_json_line_count: usize,
@@ -32342,6 +32344,7 @@ impl OwnedSourceScan {
                     symlink_rejected_count: counts.symlink_rejected_count,
                     directory_entry_cap_exceeded_count: counts.directory_entry_cap_exceeded_count,
                     unreadable_path_count: counts.unreadable_path_count,
+                    growth_deferred: counts.growth_deferred,
                     oversized_file_count: counts.oversized_file_count,
                     disappeared_file_count: counts.disappeared_file_count,
                     malformed_json_line_count: counts.malformed_json_line_count,
