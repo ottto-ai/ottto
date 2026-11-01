@@ -4294,12 +4294,34 @@ fn e2_absent_subagent_twin_holds_its_session() {
             )
         };
         let cold = route(&expected);
-        for tail in [false, true] {
+        for proof in 0..3 {
             let mut shorter = prefix.clone();
-            if tail {
+            if proof == 1 {
                 shorter.push(json!({"type":"last-prompt"}));
             }
             write(&shorter_path, &shorter);
+            if proof == 2 {
+                use crate::snapshots::claude_request_census::{
+                    ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+                };
+                let fingerprint = "a".repeat(64);
+                let metadata = fs::metadata(&shorter_path).unwrap();
+                let key = local_index_key(&shorter_path);
+                let entry = index.files.get_mut(&key).unwrap();
+                entry.source_file_fingerprint = fingerprint.clone();
+                entry.size_bytes = metadata.len();
+                entry.modified_unix_seconds =
+                    crate::snapshots::unix_seconds(metadata.modified().unwrap()).unwrap();
+                let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![claude_request_hash("a")],
+                );
+                index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&key, record);
+            }
             let mut items = vec![parse(&longer, Some(t0()), &index, &full)];
             let mut reasons = BTreeMap::new();
             assert!(finish_page(
