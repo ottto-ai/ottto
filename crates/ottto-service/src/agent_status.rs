@@ -22277,9 +22277,6 @@ exit 1
         assert!(status.external_slots.iter().any(|slot| {
             slot.collection.state == ClaudeConfigSlotCollectionStateV1::IdentityUnknown
         }));
-        assert!(status.external_slots.iter().any(|slot| {
-            slot.collection.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-        }));
         for (path, expected) in [
             (
                 &auth_failed,
@@ -22289,9 +22286,10 @@ exit 1
                 &missing_identity,
                 ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
             ),
+            // A plan-family contradiction is an unproven owner, not a race.
             (
                 &mismatched_identity,
-                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
             ),
         ] {
             let slot = status
