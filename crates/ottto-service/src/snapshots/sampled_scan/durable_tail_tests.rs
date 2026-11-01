@@ -4866,11 +4866,14 @@ fn native_restore_selection<T>(run: impl FnOnce() -> T) -> (T, Option<CandidateP
     }
 }
 
-// Serialize both sides before enforcing the existing nonempty premises, so a
-// failure identifies which policy/finalization stage emptied the wire body.
+// Serialize both sides before enforcing the emission premise, so a failure
+// identifies which policy/finalization stage emptied the wire body. A re-read
+// that adds no money finalizes to the accepted body: a semantic no-op on both
+// sides (`emits == false`), never a second upload of the accepted prefix.
 fn native_restore_compare_wire(
     actual: SnapshotBatchRequest,
     cold: SnapshotBatchRequest,
+    emits: bool,
     mut context: serde_json::Value,
 ) {
     let actual_wire = serde_json::to_vec(&actual).unwrap();
@@ -4879,22 +4882,27 @@ fn native_restore_compare_wire(
         serde_json::json!([actual.snapshots.len(), cold.snapshots.len()]);
     context["wire_bytes_actual_cold"] = serde_json::json!([actual_wire.len(), cold_wire.len()]);
     context["wire_finalized"] = serde_json::json!(true);
-    assert!(
+    assert_eq!(
         !actual.snapshots.is_empty(),
-        "native_restore actual_wire_nonempty {context:?}"
+        emits,
+        "native_restore actual_wire_emits {context:?}"
     );
-    assert!(
+    assert_eq!(
         !cold.snapshots.is_empty(),
-        "native_restore cold_wire_nonempty {context:?}"
+        emits,
+        "native_restore cold_wire_emits {context:?}"
     );
-    assert!(
-        validate_snapshot_batch_request(&actual).is_ok(),
-        "native_restore actual_wire_contract {context:?}"
-    );
-    assert!(
-        validate_snapshot_batch_request(&cold).is_ok(),
-        "native_restore cold_wire_contract {context:?}"
-    );
+    // The batch contract rejects an empty batch; check it on emitting bodies.
+    if emits {
+        assert!(
+            validate_snapshot_batch_request(&actual).is_ok(),
+            "native_restore actual_wire_contract {context:?}"
+        );
+        assert!(
+            validate_snapshot_batch_request(&cold).is_ok(),
+            "native_restore cold_wire_contract {context:?}"
+        );
+    }
     assert!(
         actual_wire == cold_wire,
         "native_restore exact_wire {context:?}"
@@ -5878,9 +5886,12 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
         let cold = E2ScanFixture::default();
         let (mut cold_index, mut cold_scan, cold_modes) =
             a0h_scan(&cold, &roots, &root, committed.clone());
+        // An mtime-only touch re-reads the accepted 100-token body; the final
+        // policy suppresses it as a semantic no-op on both sides.
         native_restore_compare_wire(
             a0h_batch(&root, &mut held, &mut changed),
             a0h_batch(&root, &mut cold_index, &mut cold_scan),
+            false,
             native_restore_context(
                 format!("b1g/{arm}/same-size/wire"),
                 (mode, cold_modes),
@@ -5972,6 +5983,7 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             native_restore_compare_wire(
                 actual,
                 a0h_batch(&root, &mut ci, &mut cs),
+                true,
                 native_restore_context(
                     format!("b1g/{arm}/{id}/wire"),
                     (actual_mode, mode),
@@ -7160,6 +7172,14 @@ fn b4_structural_transition(near_cap: bool) {
     std::fs::create_dir(&sessions).unwrap();
     let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
     native_fixture(&path);
+    // Freeze a real creation time before the certificate. The later idle
+    // mtime stamp must not move APFS birth (a replaced object) after sealing.
+    let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_542_400))
+        .unwrap();
+    file.set_modified(written).unwrap();
+    drop(file);
     let source = SnapshotSource::ClaudeCode;
     let key = local_index_key(&path);
     let namespace = Scope("b4-structural".into());
@@ -7257,6 +7277,10 @@ fn b4_structural_transition(near_cap: bool) {
         format!("b4/near-cap-{near_cap}/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"),
         (modes.0, modes.1, unchanged_files.get()), &caught, &cache, selector,
     );
+    assert!(
+        !birth_changed,
+        "native_restore structural_birth_stable {context:?}"
+    );
     assert_eq!(
         modes,
         (1, 0, end),
@@ -7296,7 +7320,7 @@ fn b4_structural_transition(near_cap: bool) {
         1,
         "native_restore structural_cold_emitted {context:?}"
     );
-    native_restore_compare_wire(actual, a0h_batch(&root, &mut oracle_index, &mut oracle),
+    native_restore_compare_wire(actual, a0h_batch(&root, &mut oracle_index, &mut oracle), true,
         native_restore_context(format!("b4/near-cap-{near_cap}/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"), (actual_modes, (oracle_modes.0, oracle_modes.1, unchanged_files.get())), &caught, &cache, selector));
     next.record_accepted_snapshot_fingerprints(
         &caught
@@ -9706,9 +9730,12 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 );
                 context["emitted_actual_cold"][1] = serde_json::json!(cold_scan.snapshots.len());
                 assert_eq!(cold_modes.0, 1, "native_restore cold_modes {context:?}");
+                // An inert append adds no money: the accepted body is a
+                // semantic no-op on both sides, never uploaded twice.
                 native_restore_compare_wire(
                     a1a_batch(&root, &mut restored_index, &mut restored),
                     a1a_batch(&root, &mut cold_index, &mut cold_scan),
+                    grow,
                     context,
                 );
                 // The first Tail receipted its successor before the lost index
@@ -9746,6 +9773,22 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
             }
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+}
+
+// A grown file behind a no-match record first probes the old certificate for
+// an independent edit: its head and boundary samples of the sealed extent.
+fn assert_no_match_edit_probe(samples: &[crate::transcript_acquisition::SampleRead], sealed: u64) {
+    let window = sealed.min(4096);
+    for (read, offset) in samples
+        .chunks_exact(2)
+        .flat_map(|pair| pair.iter().zip([0, sealed - window]))
+    {
+        assert_eq!(read.offset, Ok(offset));
+        assert_eq!(
+            (read.requested, read.result),
+            (window as usize, Ok(window as usize))
+        );
     }
 }
 
@@ -9930,10 +9973,11 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     let length = std::fs::metadata(&path).unwrap().len();
     assert!(length > prior.files[&key].size_bytes);
     // A higher selector reason must not mask growth into a hold. A due audit
-    // reaches the no-match restore and takes the counted Full; owed adoption
-    // is refused before the record is read ("history_owed"), so it takes the
-    // ordinary uncounted Miss Full. Neither drops the appended usage: each
-    // arm emits the same wire as a cold Full under the same index.
+    // reaches the no-match restore; its refused stale record cannot hold the
+    // due audit, so it takes the owed uncounted Full. Owed adoption is refused
+    // before the record is read ("history_owed"), so it takes the ordinary
+    // uncounted Miss Full. Neither drops the appended usage: each arm emits
+    // the same wire as a cold Full under the same index.
     for arm in ["audit", "adoption"] {
         let mut selected = ScanIndex::load(&index_path).unwrap();
         let entry = selected.files.get_mut(&key).unwrap();
@@ -9982,17 +10026,19 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             body, length,
             "native_restore no_match_growth_bytes {context:?}"
         );
-        assert!(samples.is_empty(), "native_restore no_match_growth_samples {context:?} sample_reads={} sample_requested_bytes={} sample_successful_bytes={}",
-            samples.len(), samples.iter().map(|read| read.requested).sum::<usize>(), samples.iter().filter_map(|read| read.result.ok()).sum::<usize>());
+        assert_eq!(
+            samples.len(),
+            if arm == "audit" { 2 } else { 0 },
+            "native_restore no_match_growth_samples {context:?}"
+        );
+        assert_no_match_edit_probe(&samples, prior.files[&key].size_bytes);
         assert_eq!(scan.unreadable_path_count, 0, "{arm}");
         let counts = owner.cache.durable_counters(source).unwrap().0;
-        let transitional = if arm == "audit" {
+        if arm == "audit" {
             assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
-            1
         } else {
             assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
-            0
-        };
+        }
         let ((), alarms) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
         let alarms = alarms
@@ -10003,8 +10049,8 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             alarms
                 .first()
                 .map(|a| a["counts"]["old_binding_no_match"].clone()),
-            (transitional == 1).then(|| serde_json::json!([1, 1])),
-            "{arm}"
+            None,
+            "native_restore no_match_growth_alarm {context:?}"
         );
         assert!(alarms
             .iter()
@@ -10093,10 +10139,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             body, length,
             "complete fresh accumulator, not old reduction plus Full"
         );
-        assert!(
-            samples.is_empty(),
-            "no restored checkpoint silently supplies a prefix"
-        );
+        // Only the old certificate's bounded edit probe; no restored
+        // checkpoint silently supplies a prefix (body == length above).
+        assert_eq!(samples.len(), 2);
+        assert_no_match_edit_probe(&samples, prior.files[&key].size_bytes);
         assert_eq!(scan.unreadable_path_count, 0);
         let counts = owner.cache.durable_counters(source).unwrap().0;
         assert_eq!((counts.restore_attempts, counts.restored), (1, 0));
@@ -10585,16 +10631,36 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     let cold = E2ScanFixture::default();
     let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, before, "2026-08-02T14:03:00Z");
     assert_eq!(restarted_body, a1a_wire(&root, &mut ci, &mut cs));
+    // The released Full verified an accepted extent past the survivor's seal.
+    // Restore refuses that older record before its binding (entry_changed):
+    // an ordinary Full from byte zero, not a counted no-match Full.
+    let context = native_restore_context(
+        "a1t-shared/restart".into(),
+        modes,
+        &scan,
+        &restarted.cache,
+        None,
+    );
+    assert_eq!(
+        restarted
+            .cache
+            .durable_counters(source)
+            .unwrap()
+            .0
+            .ineligible
+            .get("entry_changed"),
+        Some(&1),
+        "native_restore no_match_restart_entry_changed {context:?}"
+    );
     let ((), alarms) =
         crate::local_resource_diagnostics::capture(|| restarted.cache.durable_alarm(source));
     let alarms = alarms
         .into_iter()
         .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
         .collect::<Vec<_>>();
-    assert_eq!(alarms.len(), 1);
-    assert_eq!(
-        alarms[0]["counts"]["old_binding_no_match"],
-        serde_json::json!([1, 1])
+    assert!(
+        alarms.is_empty(),
+        "native_restore no_match_restart_alarm {context:?}"
     );
     assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
     let _ = std::fs::remove_dir_all(root);
@@ -10763,9 +10829,11 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             .write_all(suffix.as_bytes())
             .unwrap();
         // Freeze creation before the certificate. A later fixed-time mtime
-        // edit must not also change creation time on APFS.
+        // edit must not also change creation time on APFS. Use a real birth:
+        // one at or before 2020 is a placeholder, so the census would hold no
+        // object identity and could never prove the truncate's shrink.
         let file = File::options().write(true).open(&path).unwrap();
-        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_542_400))
             .unwrap();
         file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_200))
             .unwrap();
