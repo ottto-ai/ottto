@@ -328,6 +328,31 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     }
 }
 
+/// [regress] an over-budget path diff commits and requires erasure instead of
+/// refusing the save: the budget bounds memory, never ingestion.
+#[test]
+fn over_budget_path_diff_commits_and_requires_erasure() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = file("synthetic-progress".into());
+    let kept = serde_json::to_vec(&["kept-string"]).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, &kept);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // Within budget this string-keeping replacement marks no erasure (c1).
+    // Over budget it commits and assumes a removed string.
+    sqlite::set_path_diff_budget(&mut db, 1);
+    let grown = serde_json::to_vec(&["kept-string", "added-string"]).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, &grown);
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(db.save_failure(), None);
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    let alarm = telemetry::latest_for_test("path_diff_conservative").unwrap();
+    assert!(alarm["bytes"].as_u64().unwrap() > 1);
+    assert_eq!(alarm["rows"], 1);
+}
+
 /// [format] f6 passive complete can leave allocated wal and allows next write.
 #[test]
 fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {

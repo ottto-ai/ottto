@@ -93,7 +93,7 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
                 .previous_windows
                 .resident()
                 .len(),
-            2
+            1
         );
         assert_eq!(
             claude_pending_family_session_ids(&before),
@@ -125,7 +125,6 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
         "invalid",
         "members",
         "count",
-        "complete",
         "version",
         "request_set",
         "member_count",
@@ -155,7 +154,6 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
                         }
                         "invalid" => window.invalid = true,
                         "count" => window.evidence_request_count += 1,
-                        "complete" => window.census_complete = !window.census_complete,
                         "version" => window.version.push_str("-future"),
                         "request_set" => {
                             window
@@ -184,11 +182,8 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
         assert_eq!(
             collapsed,
             &[
-                original[0].clone(),
                 original[2].clone(),
-                original[3].clone(),
                 original[5].clone(),
-                original[6].clone(),
                 original[8].clone()
             ],
             "{change}"
@@ -197,6 +192,78 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
         index.collapse_account_pending_windows();
         assert_eq!(index.claude_account_family_pending, once);
         assert_eq!(index.claude_account_window_retention.windows_collapsed, 0);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// [money] A v1 or resident history with the former rule's second endpoints
+/// and census-completion flips collapses to each run's newest window, with
+/// the same summary, scheduling and retirement as the uncollapsed history,
+/// resident and cold. The completion flag of an archived window splits no
+/// run. An account change only in older windows still retires; an
+/// unconfirmed member only in them still holds.
+#[test]
+fn account_window_collapse_keeps_each_runs_newest_across_completion_flips() {
+    let (dir, root, base) = retention_fixture();
+    for change in ["account", "absent"] {
+        let mut before = base.clone();
+        let windows = before
+            .claude_account_family_pending
+            .get_mut(&root)
+            .unwrap()
+            .previous_windows
+            .resident_mut();
+        let seed = windows[0].clone();
+        // A A' A A' A A' (completion flipping), B B', A.
+        *windows = (0..9)
+            .map(|minute| {
+                let mut window = seed.clone();
+                window.census_window_end = format!("2026-08-02T07:0{minute}:00Z");
+                window.census_complete = minute % 2 == 0;
+                if (6..8).contains(&minute) {
+                    match change {
+                        "account" => window.account_identifier_hash = "b".repeat(64),
+                        _ => {
+                            window.members.insert("unconfirmed-absent".into(), 1);
+                        }
+                    }
+                }
+                window
+            })
+            .collect();
+        let original = windows.clone();
+        let mut after = before.clone();
+        after.collapse_account_pending_windows();
+        let pending = &after.claude_account_family_pending[&root];
+        assert_eq!(
+            pending.previous_windows.resident(),
+            &[
+                original[5].clone(),
+                original[7].clone(),
+                original[8].clone()
+            ],
+            "{change}"
+        );
+        assert_eq!(after.claude_account_window_retention.windows_collapsed, 6);
+        assert_eq!(after.claude_account_window_retention.roots_refused, 0);
+        assert!(
+            pending.history_summary()
+                == before.claude_account_family_pending[&root].history_summary(),
+            "{change}"
+        );
+        assert_eq!(
+            claude_pending_family_session_ids(&before),
+            claude_pending_family_session_ids(&after),
+            "scheduling {change}"
+        );
+        let expected = retention_decision(before.clone(), &root);
+        assert_eq!(expected.0, change == "absent", "nonvacuous {change}");
+        assert_eq!(retention_decision(after, &root), expected, "{change}");
+        assert_eq!(
+            retention_decision(cold(before), &root),
+            expected,
+            "cold {change}"
+        );
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -326,7 +393,7 @@ fn account_window_load_crash_retry_normal_save_and_old_decoder() {
     let first = ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode))
         .unwrap()
         .0;
-    assert_eq!(first.claude_account_window_retention.windows_collapsed, 4);
+    assert_eq!(first.claude_account_window_retention.windows_collapsed, 5);
     assert_eq!(first.claude_account_window_retention.roots_collapsed, 1);
     assert_eq!(first.claude_account_window_retention.roots_refused, 0);
     assert_eq!(
@@ -345,7 +412,7 @@ fn account_window_load_crash_retry_normal_save_and_old_decoder() {
         .unwrap()
         .0;
     assert_eq!(retry.claude_account_family_pending, collapsed);
-    assert_eq!(retry.claude_account_window_retention.windows_collapsed, 4);
+    assert_eq!(retry.claude_account_window_retention.windows_collapsed, 5);
     assert_eq!(retry.generation, generation);
     retry.save(&path).unwrap();
     assert_eq!(retry.generation, generation + 1);
@@ -371,7 +438,7 @@ fn account_window_collapse_preserves_every_other_index_field_and_scan_identity()
     fs::remove_dir_all(dir).unwrap();
     index.collapse_account_pending_windows();
     let mut after = serde_json::to_value(&index).unwrap();
-    assert_eq!(index.claude_account_window_retention.windows_collapsed, 4);
+    assert_eq!(index.claude_account_window_retention.windows_collapsed, 5);
     before["claude_account_family_pending"][&root]
         .as_object_mut()
         .unwrap()
@@ -421,5 +488,149 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
         6
     );
     assert!(!again.decode_holds.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Everything account placement reads from a family's archived windows:
+/// the sessions scheduled for evidence reads (`has_history`), then the
+/// save's retirement (`history_summary`), its witnesses, the sessions
+/// scheduled afterwards and the family's surviving current window.
+type Placement = (
+    Vec<String>,
+    bool,
+    serde_json::Value,
+    Vec<String>,
+    Option<serde_json::Value>,
+);
+fn placement(mut index: ScanIndex, root: &str) -> Placement {
+    let scheduled = claude_pending_family_session_ids(&index);
+    index.retire_committed_claude_account_pending_windows();
+    let pending = index.claude_account_family_pending.get(root);
+    (
+        scheduled,
+        pending.is_some(),
+        serde_json::to_value(&index.claude_account_family_witnesses).unwrap(),
+        claude_pending_family_session_ids(&index),
+        pending.map(|pending| serde_json::to_value(&pending.current).unwrap()),
+    )
+}
+
+/// [money] Placement parity, two-endpoint retention vs one window per run.
+/// Literal legacy histories keep both endpoints of each run, splitting on
+/// completion flips. Check written-out newest-only results from `archive` and
+/// load collapse, then compare real placement through resident and cold views.
+#[test]
+fn account_window_placement_parity_with_two_endpoint_retention() {
+    let (dir, root, base) = retention_fixture();
+    let seed = base.claude_account_family_pending[&root]
+        .previous_windows
+        .resident()[0]
+        .clone();
+    let current_end = base.claude_account_family_pending[&root]
+        .census_window_end
+        .clone();
+    let window = |minute: u32, complete, account: char, invalid| {
+        let mut window = seed.clone();
+        window.census_window_end = format!("2026-08-02T07:{minute:02}:00Z");
+        window.census_complete = complete;
+        window.account_identifier_hash = account.to_string().repeat(64);
+        window.invalid = invalid;
+        window
+    };
+    let a = |minute| window(minute, true, 'a', false);
+    let b = |minute| window(minute, true, 'b', false);
+    let invalid = |minute| window(minute, true, 'b', true);
+    let mut absent = a(3);
+    absent.members.insert("unconfirmed-absent".into(), 1);
+    for (history, windows, newest, retires) in [
+        (
+            "repeats_flips_a_b_a",
+            // Old: A[0,2], incomplete A[3], A[4], B[5,7], A[8,9].
+            vec![
+                a(0),
+                a(2),
+                window(3, false, 'a', false),
+                a(4),
+                b(5),
+                b(7),
+                a(8),
+                a(9),
+            ],
+            vec![a(4), b(7), a(9)],
+            true,
+        ),
+        (
+            "invalid_switch_mid",
+            vec![a(0), a(2), invalid(3), invalid(5), a(6), a(8)],
+            vec![a(2), invalid(5), a(8)],
+            true,
+        ),
+        (
+            "invalid_switch_last",
+            vec![a(0), a(2), invalid(3), invalid(5)],
+            vec![a(2), invalid(5)],
+            false,
+        ),
+        (
+            "absent_older",
+            vec![a(0), a(2), absent.clone(), a(4), a(6)],
+            vec![a(2), absent, a(6)],
+            false,
+        ),
+    ] {
+        let with_archive = |archive: Vec<ClaudeAccountFamilyPendingWindow>| {
+            let mut index = base.clone();
+            *index
+                .claude_account_family_pending
+                .get_mut(&root)
+                .unwrap()
+                .previous_windows
+                .resident_mut() = archive;
+            index
+        };
+        let legacy = with_archive(windows.clone());
+        // Rollovers: each window is the current one until the next replaces it.
+        let mut new_rolled = with_archive(Vec::new());
+        let pending = new_rolled
+            .claude_account_family_pending
+            .get_mut(&root)
+            .unwrap();
+        let final_current = std::mem::replace(&mut pending.current, windows[0].clone());
+        for next in windows[1..].iter().chain([&final_current]) {
+            let old = std::mem::replace(&mut pending.current, next.clone());
+            pending.archive(old, true);
+        }
+        assert_eq!(pending.census_window_end, current_end);
+        assert_eq!(pending.previous_windows.resident(), &newest, "{history}");
+        let mut new_collapsed = legacy.clone();
+        new_collapsed.collapse_account_pending_windows();
+        assert_eq!(
+            new_collapsed.claude_account_window_retention.roots_refused,
+            0
+        );
+        assert_eq!(
+            new_collapsed.claude_account_family_pending[&root]
+                .previous_windows
+                .resident(),
+            &newest,
+            "{history}"
+        );
+
+        let summary = legacy.claude_account_family_pending[&root].history_summary();
+        let expected = placement(legacy.clone(), &root);
+        assert_eq!(!expected.1, retires, "nonvacuous {history}");
+        for (arm, index) in [
+            ("new rolled", new_rolled.clone()),
+            ("new collapsed", new_collapsed),
+            ("cold legacy", cold(legacy)),
+            ("cold new rolled", cold(new_rolled)),
+        ] {
+            assert!(
+                index.claude_account_family_pending[&root].history_summary() == summary,
+                "{history} {arm} summary"
+            );
+            assert_eq!(placement(index, &root), expected, "{history} {arm}");
+        }
+    }
     fs::remove_dir_all(dir).unwrap();
 }

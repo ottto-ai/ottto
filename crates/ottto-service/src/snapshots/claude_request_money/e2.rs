@@ -108,10 +108,6 @@ pub(in crate::snapshots) fn fixture_birth() -> Option<u64> {
 thread_local! {
     static STAGES: RefCell<BTreeMap<&'static str, Duration>> = const { RefCell::new(BTreeMap::new()) };
 }
-#[cfg(test)]
-pub(crate) fn take_stages() -> BTreeMap<&'static str, Duration> {
-    STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
-}
 #[inline(always)]
 pub(in crate::snapshots) fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
     #[cfg(test)]
@@ -138,7 +134,8 @@ pub(crate) fn take_diag() -> BTreeMap<&'static str, u64> {
 /// before it: a comparison run that observes and leaves no count behind.
 #[cfg(test)]
 pub(crate) fn without_diag<T>(f: impl FnOnce() -> T) -> T {
-    let (diag, stages) = (take_diag(), take_stages());
+    let diag = take_diag();
+    let stages = STAGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     let value = f();
     DIAG.with(|slot| *slot.borrow_mut() = diag);
     STAGES.with(|slot| *slot.borrow_mut() = stages);

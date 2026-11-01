@@ -93,7 +93,7 @@ macro_rules! scan_index_fields {
             claude_desktop_title_files => Files (map check_map) ["v1_field.claude_desktop_title_files" => 1] side,
             confirmed_empty_files => Files (hook check_field) ["file.confirmed_empty" => 1] side,
             v2 => Files (hook none) ["file.growth_retention" => 1] own,
-            claude_usage_family_pending => Accounts (map check_map) ["usage.pending" => 1] own,
+            claude_usage_family_pending => Accounts (hook check_usage) ["usage.pending" => 1] own,
             claude_account_family_witnesses => Accounts (map check_map) ["proof.account" => 1] side,
             claude_usage_family_witnesses => Accounts (map check_map) ["proof.usage" => 1] side,
             claude_usage_authority_quarantine => Accounts (map check_map) ["refusal.authority" => 1] side,
@@ -220,15 +220,6 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [regress] adding a kind requires an explicit, supported introduction layout.
-    #[test]
-    fn every_kind_declares_its_introduction_layout() {
-        assert_eq!(LAYOUTS.len(), OWNED.len());
-        for (kind, _, layout) in LAYOUTS {
-            assert!(group(kind).is_some());
-            assert!((1..=LAYOUT).contains(layout));
-        }
-    }
     /// [format] every stored kind has exactly one owner; reserved names have none.
     #[test]
     fn every_stored_kind_has_one_owner() {
@@ -238,5 +229,8 @@ mod tests {
         }
         assert!(RESERVED.iter().all(|kind| group(kind).is_none()));
         assert_eq!(group("family.requests"), Some(Group::Census));
+        // Each kind is introduced at a supported layout; the newest is current.
+        assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
+        assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
     }
 }

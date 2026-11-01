@@ -1,6 +1,9 @@
 //! Account families share the generic mapper; only window positions need policy.
-use super::super::account_pending_retention::{ArchivedWindows, ColdFold, ColdWindows};
-use super::super::{ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow};
+use super::super::account_pending_retention::{Archived, ArchivedWindows, ColdFold, ColdWindows};
+use super::super::usage_pending::{ColdUsage, UsagePending};
+use super::super::{
+    ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow, ClaudeUsageFamilyPending,
+};
 use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::{ensure, Context};
@@ -27,6 +30,7 @@ pub(super) fn rows(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
+    usage_rows(next, rows)?;
     let manifest = mapper::key("account.current", "", 0)?;
     let mut controls = cx.account_controls;
     let mut pending = std::collections::BTreeMap::new();
@@ -46,8 +50,15 @@ pub(super) fn rows(
         let (kept, tail) = match wanted.map(|p| &p.previous_windows) {
             Some(ArchivedWindows::Cold(cold)) => {
                 let committed = cold.committed(cx.cold_rolled.get(family).copied());
-                let archive =
-                    cold_archive(rows, family, cold, previous, seeded.as_deref(), committed)?;
+                let archive = cold_archive(
+                    rows,
+                    family,
+                    cold,
+                    previous,
+                    seeded.as_deref(),
+                    committed,
+                    &mut cx.archived,
+                )?;
                 if let Some(last) = cold.last_roll() {
                     cx.cold_rolled.insert(family.clone(), last);
                 }
@@ -183,11 +194,65 @@ pub(super) fn rows(
     cx.account_controls = controls;
     Ok(pending)
 }
+/// Usage pending, one row per family. A cold family not loaded this pass is
+/// carried by its head's digest (`keep` refuses anything it cannot prove); a
+/// loaded one is rewritten through `put`, where an equal digest writes
+/// nothing; a removed one is absent, so `finish` deletes its row.
+fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
+    let usage = &next.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        let families = usage.resident().context("state_v2_usage_pending")?;
+        return rows.map("usage.pending", families);
+    };
+    let mut families = 0_usize;
+    for (root, _) in usage.views() {
+        families += 1;
+        let key = mapper::key("usage.pending", root, 1)?;
+        match cold.loaded().get(root) {
+            Some(family) => rows.put(key, family)?,
+            None => rows.keep(key, cold.head(root).context("state_v2_usage_head")?.digest)?,
+        }
+    }
+    rows.put(mapper::key("usage.pending", "", 0)?, &families)
+}
+/// A complete hydrate folds each usage row into its head, seeds its digest
+/// and drops the value: one decoded family at a time.
+fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<UsagePending> {
+    let manifest = tx
+        .get(&mapper::key("usage.pending", "", 0)?)?
+        .context("state_v2_missing_manifest")?;
+    let expected: usize = mapper::read(tx, &manifest, Some(&mut *seed))?;
+    let mut cold = ColdUsage::default();
+    let mut count = 0_usize;
+    mapper::rows(tx, "usage.pending", |tx, h| {
+        let RowKey::Record {
+            key_bytes,
+            position,
+            ..
+        } = &h.key
+        else {
+            anyhow::bail!("state_v2_record_key")
+        };
+        if *position == 0 {
+            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+            return Ok(());
+        }
+        ensure!(*position == 1, "state_v2_member_position");
+        count += 1;
+        let family: ClaudeUsageFamilyPending = mapper::read(tx, &h, Some(&mut *seed))?;
+        let digest = *seed.get(&h.key).context("state_v2_row_digest")?;
+        cold.fold(&dependency_family(key_bytes)?, &family, digest);
+        Ok(())
+    })?;
+    ensure!(count == expected, "state_v2_missing_member");
+    Ok(UsagePending::Cold(Box::new(cold)))
+}
 /// A cold family's stored archive as (digests of the rows the replay keeps,
 /// replayed tail). Its ids and digests come from the baseline, or from the
-/// hydrate that built it. Only rows the endpoint rule may replace are read:
-/// at most the last two, by key, and only when windows rolled. Anything that
-/// does not match the baseline is Unknown and refuses the save.
+/// hydrate that built it. Only the row the run rule may replace is read: the
+/// last, by key, and only when windows rolled. Anything that does not match
+/// the baseline is Unknown and refuses the save. `outcomes` counts the
+/// replayed rollovers.
 ///
 /// `committed` counts this graph's queued rollovers a sibling's committed
 /// save already wrote (a clone shares them): the stored archive is then that
@@ -199,6 +264,7 @@ fn cold_archive(
     previous: Option<&WindowBaseline>,
     seeded: Option<&[u64]>,
     committed: Option<usize>,
+    outcomes: &mut Archived,
 ) -> Result<(Vec<[u8; 32]>, Vec<ClaudeAccountFamilyPendingWindow>)> {
     let unknown = || {
         telemetry::count("cold_row_unknown", 1);
@@ -230,7 +296,7 @@ fn cold_archive(
     if !cold.rolls_after(skip) {
         return Ok((digests, Vec::new()));
     }
-    let from = archived.len().saturating_sub(2);
+    let from = archived.len().saturating_sub(1);
     let tx = rows.tx.as_deref_mut().ok_or_else(unknown)?;
     let mut tail = Vec::new();
     for (id, digest) in archived[from..].iter().zip(&digests[from..]) {
@@ -247,7 +313,7 @@ fn cold_archive(
         tail.push(window);
     }
     digests.truncate(from);
-    Ok((digests, cold.replay(tail, skip)))
+    Ok((digests, cold.replay(tail, skip, outcomes)))
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
@@ -270,6 +336,16 @@ pub(super) fn materialize(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Re
     hydrate_filtered(tx, &mut resident, &mut KindCx::default(), Some(&roots))?;
     for (root, family) in resident.claude_account_family_pending {
         index.claude_account_family_pending.insert(root, family);
+    }
+    if let Some(cold) = index.claude_usage_family_pending.cold() {
+        // The graph's own view: its loaded values, the stored rows of heads
+        // it has not loaded, and none of the families it removed.
+        let usage = &index.claude_usage_family_pending;
+        let mut families =
+            mapper::read_map::<ClaudeUsageFamilyPending>(tx, "usage.pending", None, None)?;
+        families.retain(|root, _| usage.contains_key(root));
+        families.extend(cold.loaded().clone());
+        index.claude_usage_family_pending = families.into();
     }
     Ok(())
 }
@@ -305,6 +381,19 @@ pub(super) fn hydrate_filtered(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
+    // Custody views read their usage families resident; a complete hydrate
+    // without raw holds keeps heads only.
+    index.claude_usage_family_pending = if cold {
+        cold_usage(tx, seed.as_deref_mut().context("state_v2_seed")?)?
+    } else {
+        mapper::read_map::<ClaudeUsageFamilyPending>(
+            tx,
+            "usage.pending",
+            roots,
+            seed.as_deref_mut(),
+        )?
+        .into()
+    };
     let h = tx
         .get(&mapper::key("account.current", "", 0)?)?
         .context("accounts_missing_manifest")?;

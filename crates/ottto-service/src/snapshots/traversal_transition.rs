@@ -167,8 +167,8 @@ impl Starting {
             contract_unproven_families: if owed {
                 index
                     .claude_usage_family_pending
-                    .values()
-                    .filter(|pending| pending.contract_unproven)
+                    .views()
+                    .filter(|(_, pending)| pending.contract_unproven())
                     .count()
             } else {
                 0
@@ -176,9 +176,9 @@ impl Starting {
             stale_pending_occurrences: if owed {
                 index
                     .claude_usage_family_pending
-                    .values()
-                    .filter(|pending| pending.census_window_end != now)
-                    .map(super::ClaudeUsageFamilyPending::occurrences)
+                    .views()
+                    .filter(|(_, pending)| pending.window() != now)
+                    .map(|(_, pending)| pending.occurrences())
                     .fold(0, usize::saturating_add)
             } else {
                 0

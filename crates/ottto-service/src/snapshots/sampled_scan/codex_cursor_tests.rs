@@ -7360,6 +7360,213 @@ fn released(
     released
 }
 
+/// [regress] Residue ownership survives a page checkpoint: both absence paths
+/// keep its entries and block inclusive publication; departed join provenance
+/// is retained for that owner while unrelated work completes normally.
+#[test]
+fn plain_codex_residue_keeps_owner_custody_across_reload() {
+    use crate::snapshots::disappearance_diagnostics::tests::finish;
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
+
+    let fixture = ScanRoot::with_sessions(&[]);
+    write_account_rollout(&fixture, SESSION, "a", 1);
+    let (prior_index, prior_scan) = page(&fixture, ScanIndex::default(), None);
+    let mut prior = scan_money(SnapshotSource::Codex, &prior_index, &prior_scan);
+    prior.accepted = prior_scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                Accepted {
+                    body: prior.snapshots[&item.source_session_id].clone(),
+                    witness: snapshot_upload_body_witness(item),
+                },
+            )
+        })
+        .collect();
+    assert!(prior.accepted.contains_key(SESSION));
+    fs::remove_file(fixture.file(SESSION)).unwrap();
+    let held_key = local_index_key(&fixture.file(SESSION));
+    let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
+    let last = fixture.root.join("last-page.jsonl");
+    fs::write(&last, b"").unwrap();
+    let new_scan = |index| {
+        OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            index,
+            NOW,
+            365,
+            10,
+            false,
+            None,
+            &[],
+            false,
+        )
+    };
+    let mut seed = ScanIndex::default();
+    for key in [&held_key, &retired_key] {
+        seed.files.insert(
+            key.clone(),
+            crate::snapshots::tests::manifest_index_entry(None),
+        );
+    }
+    let healthy_thread = CodexStateThread {
+        tokens_used: 10,
+        ..Default::default()
+    };
+
+    // Independent cold control: the observed held entry cannot be retired, and
+    // only the healthy state thread exists. No residue guard is needed here.
+    let mut cold = new_scan(seed.clone());
+    cold.codex_join_prepared = true;
+    cold.index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .observed_index_keys
+        .insert(held_key.clone());
+    cold.codex_title_metadata
+        .state_threads
+        .insert(SESSION_B.into(), healthy_thread.clone());
+    let (cold_index, cold_scan) = finish(cold);
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+
+    for removal_hint in [false, true] {
+        let mut first = new_scan(seed.clone());
+        first.codex_join_prepared = true;
+        // A plain ownership refusal, after its transient read failure clears.
+        // No per-file block or accepted file body may mask the restored block.
+        first.census.ownership_incomplete_file_count = 1;
+        first.census.causes.add(ownership::GROUP, 1);
+        first.residue_index_keys.insert(held_key.clone());
+        first.residue_blocked_session_ids.insert(SESSION.into());
+        first
+            .codex_state_only_blocked_session_ids
+            .insert(SESSION.into());
+        first
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .push_back(ScanTraversalPath {
+                scan_root: fixture.root.clone(),
+                path: last.clone(),
+                census_member: true,
+                watcher_hint: false,
+            });
+        let (mut index, page_one) = finish(first);
+        assert!(!page_one.census_complete);
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .blocked_session_ids
+            .contains(SESSION));
+        assert!(index.codex_state_only_blocked_session_ids.is_empty());
+        let checkpoint = fixture
+            ._dir
+            .0
+            .join(format!("residue-index-{removal_hint}.json"));
+        index.save(&checkpoint).unwrap();
+        let restored = ScanIndex::load(&checkpoint).unwrap();
+        let mut final_page = new_scan(restored);
+        final_page.codex_join_prepared = true;
+        final_page.codex_join_inventory = None;
+        final_page.identified_candidates.clear();
+        assert!(final_page
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .is_empty());
+        for id in [SESSION, SESSION_B] {
+            final_page
+                .codex_title_metadata
+                .state_threads
+                .insert(id.into(), healthy_thread.clone());
+        }
+        if removal_hint {
+            final_page
+                .census
+                .removed_index_keys
+                .extend([held_key.clone(), retired_key.clone()]);
+        }
+        let (index, result) = finish(final_page);
+        assert!(result.census_complete);
+        assert!(
+            index.files.contains_key(&held_key),
+            "filename owner is retained"
+        );
+        assert!(
+            !index.files.contains_key(&retired_key),
+            "unrelated entry retires"
+        );
+        let mut route = scan_money(SnapshotSource::Codex, &index, &result);
+        route.accepted = prior.accepted.clone();
+        money_oracle::assert_held(SESSION, &prior, &route, &cold);
+        money_oracle::assert_equivalent(&cold, &route);
+    }
+
+    // Join release needs a clean completed inventory. Seed only optional RAM
+    // provenance here so this also exercises release on unsupported layouts.
+    let cache = Arc::new(SharedCache::default());
+    let mut departing = new_scan(ScanIndex::default())
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("plain-residue-custody".into()));
+    departing.codex_join_prepared = true;
+    departing.codex_join_inventory = Some(codex_file_join::HeaderInventory::new(
+        &[],
+        &BTreeSet::new(),
+        Some(&codex_file_join::DirectoryCensus::new()),
+    ));
+    assert!(departing.codex_join_inventory.as_ref().unwrap().complete);
+    departing
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .residue
+        .blocked_session_ids
+        .insert(SESSION.into());
+    for (id, key) in [(SESSION, &held_key), (SESSION_B, &retired_key)] {
+        cache
+            .with_cursor(|cursor| {
+                let used = cursor.tick();
+                cursor.join_owners.insert(id.into(), (used, key.clone()));
+            })
+            .unwrap();
+        departing
+            .index
+            .codex_state_only_blocked_by_file
+            .insert(key.clone(), BTreeSet::from([id.into()]));
+        departing
+            .index
+            .codex_state_only_blocked_session_ids
+            .insert(id.into());
+    }
+    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
+    assert_eq!(join_entry(&cache, SESSION_B), Some(retired_key.clone()));
+    let (index, result) = finish(departing);
+    assert!(result.census_complete);
+    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
+    assert_eq!(join_entry(&cache, SESSION_B), None);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file.get(&held_key),
+        Some(&BTreeSet::from([SESSION.into()]))
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
+    assert!(!index
+        .codex_state_only_blocked_by_file
+        .contains_key(&retired_key));
+    assert!(!index
+        .codex_state_only_blocked_session_ids
+        .contains(SESSION_B));
+}
+
 /// J-T4 (c): `keep` holds a queued or paused owner; without it the owner is
 /// released exactly once with its exact member keys, and only when every
 /// member left the census. Another owner's provenance survives.

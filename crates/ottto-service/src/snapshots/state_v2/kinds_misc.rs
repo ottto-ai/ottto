@@ -138,7 +138,7 @@ fn read_holds(
     index.decode_holds = holds;
     Ok(())
 }
-fn read_control<T: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     name: &str,
     txn: &mut dyn Transaction,
 ) -> Result<T> {
