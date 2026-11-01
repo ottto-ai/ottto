@@ -506,7 +506,7 @@ mod ops_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [off=main] Claude passes with no route preserve even stale active v2 telemetry state.
+    /// [behaviour] Claude passes with no route preserve even stale active v2 telemetry state.
     #[test]
     fn off_claude_passes_do_not_touch_v2_telemetry() {
         let root = crate::test_scratch::private_dir("off-v2-pass");

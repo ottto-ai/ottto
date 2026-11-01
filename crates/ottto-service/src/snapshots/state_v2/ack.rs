@@ -34,7 +34,8 @@ fn require(ok: bool, reason: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Runtime-only. Clones retain the authenticated source scope. A companion from another DB or a newer recovery set holds.
+/// Runtime-only. Clones retain the authenticated source scope. A companion from
+/// another DB or a newer recovery set holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgressRecovery {
     scope: Scope,

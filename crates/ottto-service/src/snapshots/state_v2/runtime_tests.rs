@@ -114,7 +114,7 @@ impl Drop for Fixture {
     }
 }
 
-/// [off=main] Unbound v1 loads ignore growth fields for every source and never
+/// [behaviour] Unbound v1 loads ignore growth fields for every source and never
 /// consult the v2 registry, even when another route owns it.
 #[test]
 fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
@@ -1449,7 +1449,7 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
     );
 }
 
-/// [off=main] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
+/// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
 #[test]
 fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
     let f = Fixture::new();
