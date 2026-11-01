@@ -257,6 +257,31 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
+/// The record map a field's codec reads or writes. A cold usage map keeps its
+/// families in the store only, so no codec may see it.
+trait Records {
+    type Value: Serialize;
+    fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
+    fn records_mut(&mut self) -> Option<&mut BTreeMap<String, Self::Value>>;
+}
+impl<T: Serialize> Records for BTreeMap<String, T> {
+    type Value = T;
+    fn records(&self) -> Option<&Self> {
+        Some(self)
+    }
+    fn records_mut(&mut self) -> Option<&mut Self> {
+        Some(self)
+    }
+}
+impl Records for UsagePending {
+    type Value = ClaudeUsageFamilyPending;
+    fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
+        self.resident()
+    }
+    fn records_mut(&mut self) -> Option<&mut BTreeMap<String, ClaudeUsageFamilyPending>> {
+        self.resident_mut()
+    }
+}
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
 impl<T: Serialize> Serialize for WireMap<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -292,9 +317,11 @@ impl Serialize for ScanIndex {
             };
             (held $name:ident) => {
                 if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
+                    let records = Records::records(&self.$name)
+                        .ok_or_else(|| serde::ser::Error::custom("usage_pending_cold"))?;
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(&self.$name, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(records, self.decode_holds.0.get(stringify!($name))),
                     )?;
                 }
             };
@@ -1214,7 +1241,8 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
                 let view = FamilyView {
-                    typed: &index.$field,
+                    typed: Records::records(&index.$field)
+                        .ok_or(Error::Refused("usage pending cold"))?,
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
@@ -1289,12 +1317,12 @@ pub(super) fn post_decode_hydrated(
     macro_rules! records {
         ($field:ident) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                let records = Records::records_mut(&mut index.$field)
+                    .ok_or(Error::Refused("usage pending cold"))?;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
-                    index.$field.remove(key);
+                    records.remove(key);
                 }
-                index
-                    .$field
-                    .extend(decoder.records(stringify!($field), span, true)?);
+                records.extend(decoder.records(stringify!($field), span, true)?);
             }
         };
     }
@@ -2176,7 +2204,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_family_pending" => {
                             index.claude_usage_family_pending =
-                                self.records("claude_usage_family_pending", value, true)?
+                                UsagePending::from(self.records::<ClaudeUsageFamilyPending>(
+                                    "claude_usage_family_pending",
+                                    value,
+                                    true,
+                                )?)
                         }
                         "claude_request_census" => {
                             index.claude_request_census = self
@@ -2584,7 +2616,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
                         "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending.remove(&key);
+                            index.claude_usage_family_pending.discard(&key);
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
