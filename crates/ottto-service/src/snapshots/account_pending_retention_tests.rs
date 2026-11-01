@@ -551,6 +551,22 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
     let invalid = |minute| window(minute, true, 'b', true);
     let mut absent = a(3);
     absent.members.insert("unconfirmed-absent".into(), 1);
+    // Keep this historical-only member's evidence canonical for the v2 store;
+    // its absence remains unconfirmed and must independently prevent retirement.
+    let mut requests =
+        ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from(["f".repeat(64)])).unwrap();
+    requests.identity_revision = seed
+        .member_requests
+        .values()
+        .next()
+        .unwrap()
+        .identity_revision
+        .clone();
+    absent
+        .member_requests
+        .insert("unconfirmed-absent".into(), requests);
+    absent.evidence_request_count += 1;
+    assert!(claude_family_request_ids_are_disjoint(&absent));
     for (history, windows, newest, retires) in [
         (
             "repeats_flips_a_b_a",
