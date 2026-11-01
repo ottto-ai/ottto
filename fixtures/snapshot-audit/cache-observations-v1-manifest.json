@@ -24,9 +24,9 @@
     "codex": {
       "body_witness_digest": "5e11f7452f676acfd64afbd47ac1f0cdb66b9f8e01cf069a2eacd5a0044c6ccd",
       "body_witness_version": 16,
-      "fixture_canonical_sha256": "68dfcae4c51b3516c567cdb34245e6cd1d572953f0eba353519c91e32b72ecd2",
+      "fixture_canonical_sha256": "b32a207505ecb972cb2823baa5f3c95e6703cc132050e790b4c5e6f625f6a902",
       "fixture_file": "cache_observation_codex_v1.json",
-      "fixture_wire_bytes": 7757,
+      "fixture_wire_bytes": 6415,
       "normalized_public_body_witness_version": 14,
       "parser_revision": "codex_jsonl:v40",
       "scan_identity_revision": "codex_jsonl:v34"

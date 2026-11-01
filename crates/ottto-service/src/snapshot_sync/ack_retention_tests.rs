@@ -370,8 +370,7 @@ fn changed_body_replaces_only_its_own_ack() {
     let sibling = "d".repeat(64);
     progress.record_body(&sibling, &"e".repeat(64));
     progress.save(&f.progress_path).unwrap();
-    let mut changed = f.item.clone();
-    changed.context_curve = None;
+    let changed = f.item.clone();
     // Use an explicit body witness to isolate replacement from source identity.
     let changed_body = "f".repeat(64);
     assert_ne!(changed_body, snapshot_upload_body_witness(&f.item));

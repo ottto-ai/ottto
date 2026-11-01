@@ -13386,8 +13386,7 @@ mod tests {
     }
 
     fn pending_head_index_item() -> (ScanIndex, SnapshotItem) {
-        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let mut index = ScanIndex::default();
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
@@ -13981,10 +13980,8 @@ mod tests {
                         source_session_id: item.source_session_id.clone(),
                         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                         occurrence_count: 1,
-                        body_witness_version: Some(6),
-                        body_witness_digest: Some(snapshot_upload_body_witness(
-                            &request.snapshots[0],
-                        )),
+                        body_witness_version: None,
+                        body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
@@ -14061,14 +14058,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw.snapshots.len(), 1);
-        let mut prior = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        prior.context_curve = None;
+        let prior = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         assert_eq!(prior.source_session_id, raw.snapshots[0].source_session_id);
         let key = cache_session_key(&prior.source_session_id);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         upload_resumable_batches_with_body_witness(
-            &[prior.clone()],
+            std::slice::from_ref(&prior),
             &unique_poison_scope(),
             &mut progress,
             &mut accepted,
@@ -14231,7 +14227,7 @@ mod tests {
     fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         let root = cache_effective_wire_fixture_root();
         let scan = |index: &mut ScanIndex| {
-            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -14240,10 +14236,7 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap();
-            // The parser no longer builds curves; restore a retained one.
-            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots);
-            scan
+            .unwrap()
         };
         let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
             let request = SnapshotBatchRequest {
@@ -14514,7 +14507,7 @@ mod tests {
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
-            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -14523,10 +14516,7 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap();
-            // The parser no longer builds curves; restore a retained one.
-            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots);
-            scan
+            .unwrap()
         };
         let mut off = scan(&mut index);
         assert_eq!(off.snapshots.len(), 1);
@@ -14584,8 +14574,8 @@ mod tests {
                         source_session_id: item.source_session_id.clone(),
                         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                         occurrence_count: 1,
-                        body_witness_version: Some(6),
-                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        body_witness_version: None,
+                        body_witness_digest: None,
                         head_etag: None,
                         head_challenge: None,
                         unchanged_basis: None,
@@ -14659,8 +14649,8 @@ mod tests {
                         source_session_id: item.source_session_id.clone(),
                         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                         occurrence_count: 1,
-                        body_witness_version: Some(6),
-                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        body_witness_version: None,
+                        body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
@@ -14757,7 +14747,6 @@ mod tests {
     #[test]
     fn cache_bootstrap_grown_existing_usage_settles_before_exact_head_probe() {
         let mut current = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        current.context_curve = None;
         current.cache_observations = None;
         current.cache_observations_state = None;
         let mut old = current.clone();
@@ -14871,7 +14860,6 @@ mod tests {
     fn unchanged_ack_with_usage_identical_does_not_mark_emitted() {
         for basis in [Some("usage_identical"), Some("dominated_by_head"), None] {
             let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-            item.context_curve = None;
             item.cache_observations = None;
             item.cache_observations_state = None;
             let fingerprint = item.snapshot_fingerprint.clone();
@@ -14954,7 +14942,6 @@ mod tests {
         ] {
             let case = format!("{basis} next_cycle={next_cycle}");
             let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-            item.context_curve = None;
             item.cache_observations = None;
             item.cache_observations_state = None;
             let held = item.snapshot_fingerprint.clone();
@@ -15055,7 +15042,6 @@ mod tests {
     fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
         for outcome in ["accepted", "unchanged", "legacy"] {
             let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-            item.context_curve = None;
             item.cache_observations = None;
             item.cache_observations_state = None;
             let key = cache_session_key(&item.source_session_id);
@@ -15306,7 +15292,7 @@ mod tests {
             .unwrap();
             let mut projection = json!({"session_account_evidence":wire["snapshots"][0]["session_account_evidence"],
                 "cache_observations_state":item.cache_observations_state});
-            for leaf in ["context_curve", "tool_usage", "tool_usage_truncated"] {
+            for leaf in ["tool_usage", "tool_usage_truncated"] {
                 if let Some(value) = wire["snapshots"][0].get(leaf) {
                     projection[leaf] = value.clone();
                 }
@@ -15346,7 +15332,6 @@ mod tests {
         let (patch, prior) =
             crate::snapshots::cache_overcap_tests::large_prior_and_replacement_fixture();
         let mut raw = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        raw.context_curve = None;
         raw.cache_observations = Some(patch);
         raw.cache_observations_state = None;
         let key = cache_session_key(&raw.source_session_id);
@@ -15400,8 +15385,7 @@ mod tests {
 
     #[test]
     fn cache_event_ack_restart_correction_and_missing_proof() {
-        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".into(),
@@ -15444,7 +15428,7 @@ mod tests {
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         upload_resumable_batches_with_body_witness(
-            &[item.clone()],
+            std::slice::from_ref(&item),
             &unique_poison_scope(),
             &mut progress,
             &mut accepted,
@@ -15467,7 +15451,7 @@ mod tests {
         let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
         restored.active_quarantine_witness = progress.active_quarantine_witness.clone();
         upload_resumable_batches_with_body_witness(
-            &[item.clone()],
+            std::slice::from_ref(&item),
             &unique_poison_scope(),
             &mut restored,
             &mut accepted,
@@ -15726,6 +15710,9 @@ mod tests {
         )
     }
 
+    /// [money] A lost ACK response leaves no checkpoint; only the exact
+    /// creator-domain proof (public v7) settles the retry, after which the
+    /// settled body is a no-op.
     #[test]
     fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
         let root = test_dir("account-ack-retry-checkpoint");
@@ -15764,7 +15751,6 @@ mod tests {
             (item.input_tokens, item.output_tokens, item.request_count),
             (42, 1, 1)
         );
-        let (public_version, wrong_version) = (7, 13);
         let items = vec![item];
         let digest = snapshot_upload_body_witness(&items[0]);
         let mut progress = test_upload_progress();
@@ -15813,13 +15799,8 @@ mod tests {
             response.validate_entity_ack(&request)?;
             Ok(response)
         };
-        checked_response(
-            items.clone(),
-            Some(public_version),
-            Some(digest.clone()),
-            false,
-        )
-        .expect("exact first-admission ACK validates in its declared domain");
+        checked_response(items.clone(), Some(7), Some(digest.clone()), false)
+            .expect("exact first-admission ACK validates in its declared domain");
         let first = upload_resumable_batches_with_body_witness(
             &items,
             &unique_poison_scope(),
@@ -15835,8 +15816,9 @@ mod tests {
         for unchanged in [false, true] {
             for (version, proof) in [
                 (None, None),
-                (Some(public_version), Some("0".repeat(64))),
-                (Some(wrong_version), Some(digest.clone())),
+                (Some(7), Some("0".repeat(64))),
+                // The cache-declared neighbour domain cannot settle it.
+                (Some(13), Some(digest.clone())),
             ] {
                 upload_resumable_batches_with_body_witness(
                     &items,
@@ -15864,7 +15846,7 @@ mod tests {
             snapshot_upload_body_witness,
             |batch| {
                 retry_calls += 1;
-                checked_response(batch, Some(public_version), Some(digest.clone()), true)
+                checked_response(batch, Some(7), Some(digest.clone()), true)
             },
             |_| Ok(()),
         )

@@ -54469,18 +54469,6 @@ pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> Snapsho
         .expect("curve fixture decodes")
 }
 
-/// Test-only vehicle for the retained curve-bearing body path: attaches the
-/// stored Codex cache golden curve. Curves are hash- and witness-neutral, so
-/// only the wire bytes carry it.
-#[cfg(test)]
-pub(crate) fn attach_retained_context_curve(items: &mut [SnapshotItem]) {
-    let curve =
-        context_curve_golden_fixture("cache_observation_codex_v1.json", "/snapshot/context_curve");
-    for item in items {
-        item.context_curve = Some(curve.clone());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     mod claude_file_cap_tests {
@@ -83839,8 +83827,6 @@ pub(crate) mod cache_adapter_tests {
                 None,
             )
             .remove(0);
-        // The parser no longer builds curves; restore the stored golden curve.
-        super::attach_retained_context_curve(std::slice::from_mut(&mut item));
         prepare_cache_observations(&mut item, None);
         item
     }

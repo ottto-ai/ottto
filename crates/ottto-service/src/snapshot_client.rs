@@ -4638,7 +4638,6 @@ mod tests {
         use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
         let support = crate::test_scratch::private_dir("composition-ack-verdict");
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
         item.cache_observations = None;
         item.session_account_evidence = None;
         item.session_start = Some(Box::new(SnapshotSessionStart {
@@ -4704,8 +4703,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let ack = entity_ack(
             1,
             vec![SnapshotEntityRef {
