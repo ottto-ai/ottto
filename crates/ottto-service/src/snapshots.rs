@@ -27737,6 +27737,7 @@ impl OwnedSourceScan {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
                     if !inventory.step_with_archives(
                         &codex_title_metadata,
+                        &claude_title_metadata,
                         index,
                         sampling.as_ref().map(|context| &context.cache),
                     ) {
@@ -28223,7 +28224,10 @@ impl OwnedSourceScan {
                 }
                 codex_join_prepared = true;
                 if let Some(inventory) = codex_join_inventory.as_ref() {
-                    if !inventory.archive_headers.is_empty() && !index.archive_pass.prepared {
+                    if sampling.is_some()
+                        && !inventory.archive_headers.is_empty()
+                        && !index.archive_pass.prepared
+                    {
                         index.prepare_archive_reservations(
                             &identified_candidates,
                             inventory,
@@ -79448,8 +79452,9 @@ mod tests {
         let _ = fs::remove_file(same_id);
     }
 
-    /// [off=main] An unrelated held archive cannot change the native fork
-    /// child's exact upload body or invalidate its complete parent census.
+    /// [regress] Unfunded archive inventory finishes within a bounded number
+    /// of steps even with power allowed, preserving the plain fork child's
+    /// exact body and complete parent census through paged restart.
     #[test]
     fn codex_parent_prefix_ledger_survives_paged_scan_and_index_restart() {
         let root = temp_dir("codex-parent-ledger-paged");
@@ -79519,16 +79524,40 @@ mod tests {
             let mut index = ScanIndex::default();
             let mut child_snapshot = None;
             for cycle in 0..8 {
-                let mut scan = scan_source_roots_with_test_limit(
+                let mut state = OwnedSourceScan::new(
                     SnapshotSource::Codex,
                     std::slice::from_ref(&root),
-                    &mut index,
+                    std::mem::take(&mut index),
                     &format!("2026-08-02T09:{cycle:02}:00Z"),
                     BACKFILL_WINDOW_DAYS,
                     1,
                     true,
-                )
-                .expect("paged parent-ledger scan");
+                    None,
+                    &[],
+                    false,
+                );
+                let mut completed = None;
+                for _ in 0..256 {
+                    // Reproduce the permitting macOS gate on every platform;
+                    // no cache or reservation-save owner exists on this route.
+                    state.index.archive_pass.power = true;
+                    state.index.archive_pass.cpu = 0;
+                    match state.step(None) {
+                        OwnedSourceScanStep::Pending(next) => state = next,
+                        OwnedSourceScanStep::Complete {
+                            index: next, scan, ..
+                        } => {
+                            index = next;
+                            completed = Some(scan);
+                            break;
+                        }
+                    }
+                }
+                let mut scan = completed.expect("paged parent-ledger scan makes bounded progress");
+                assert!(
+                    !index.archive_pass.dirty,
+                    "unfunded work cannot await a save"
+                );
                 child_snapshot = scan
                     .snapshots
                     .iter()

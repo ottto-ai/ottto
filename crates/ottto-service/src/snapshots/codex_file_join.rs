@@ -499,6 +499,7 @@ impl HeaderInventory {
     pub(super) fn step_with_archives(
         &mut self,
         metadata: &CodexTitleMetadata,
+        claude_metadata: &ClaudeTitleMetadata,
         index: &mut ScanIndex,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> bool {
@@ -512,7 +513,7 @@ impl HeaderInventory {
         if !index.archive_pass.headers_prepared {
             index.archive_pass.headers_prepared = true;
             // One durable batch for bounded inventory work, independent from Full.
-            if index.archive_pass.ready(1) {
+            if cache.is_some() && index.archive_pass.ready(1) {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
                     if let Ok(meta) = fs::symlink_metadata(path) {
@@ -554,9 +555,11 @@ impl HeaderInventory {
                     }
                 }
             }
-            if index.archive_pass.dirty {
-                return false;
-            }
+        }
+        // Only the funded caller can save a reservation. While it is pending,
+        // yield before preparing the same candidate or touching its metadata.
+        if index.archive_pass.dirty {
+            return false;
         }
         loop {
             let Some(path) = self.archive_pending.front().cloned() else {
@@ -614,7 +617,7 @@ impl HeaderInventory {
                     SnapshotSource::Codex,
                     &mut candidate,
                     metadata,
-                    &ClaudeTitleMetadata::default(),
+                    claude_metadata,
                     None,
                 );
                 let (owner, created_unix_ms) =
