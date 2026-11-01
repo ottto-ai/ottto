@@ -220,6 +220,10 @@ impl std::fmt::Display for ClaudeContextNotStarted {
 #[cfg(unix)]
 impl std::error::Error for ClaudeContextNotStarted {}
 
+/// The login `/context` runs on: the default home, so it never starts
+/// (follow-up: run it on a registered slot, or retire the Claude harvest).
+const CONTEXT_LOGIN: ottto_core::ClaudeConfigDirSlot = ottto_core::ClaudeConfigDirSlot::Default;
+
 /// After a refusal the next cycle starts sooner, once the login is refreshed.
 const CONTEXT_REFUSED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -277,6 +281,11 @@ fn harvest_all_once(
     projection: &CwdProjection,
 ) -> Result<ContextHarvestOutcome> {
     if local_harvest_disabled(support_dir) {
+        return Ok(ContextHarvestOutcome::default());
+    }
+    // `/context` runs only on the default home, where Ottto starts no
+    // background Claude run: no relay token, no workspace walk, no retry.
+    if crate::claude_spawn_gate::require_explicit_claude_home(&CONTEXT_LOGIN).is_err() {
         return Ok(ContextHarvestOutcome::default());
     }
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -541,7 +550,7 @@ fn run_claude_context(
 ) -> Result<String> {
     // A background run never starts on the default home (other Claude
     // writers share it), and never inside a login's quiet window.
-    let login = ottto_core::ClaudeConfigDirSlot::Default;
+    let login = CONTEXT_LOGIN;
     crate::claude_spawn_gate::check_background_claude_run(&login)
         .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
     let mut command = env.claude_command()?;

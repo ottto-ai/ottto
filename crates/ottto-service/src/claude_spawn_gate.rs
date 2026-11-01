@@ -142,13 +142,13 @@ pub(crate) fn check_short_claude_run(slot: &ClaudeConfigDirSlot) -> Result<(), C
 }
 
 /// Every Claude Code run Ottto starts on its own (refresh, `/context`, MCP
-/// inventory) needs an explicit, non-empty registered config dir. The default
+/// inventory) needs an explicit registered config dir (never empty). The default
 /// home is refused, counted, and never used as a fallback; a person's own
 /// action on the default home (Verify) does not ask this.
 pub(crate) fn require_explicit_claude_home(
     slot: &ClaudeConfigDirSlot,
 ) -> Result<(), ClaudeSpawnRefusal> {
-    if slot.config_dir().is_some_and(|dir| !dir.is_empty()) {
+    if slot.config_dir().is_some() {
         return Ok(());
     }
     static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1341,6 +1341,7 @@ mod tests {
         {
             assert!(!registered.contains(&format!("{name}=")), "{name}");
         }
+        assert!(crate::session_launch::CLAUDE_UNSET.contains(&"CLAUDE_CODE_ACCOUNT_UUID"));
     }
 
     #[test]

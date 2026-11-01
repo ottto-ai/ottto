@@ -4734,17 +4734,28 @@ fn collect_claude_status_snapshots(
     if settings_failure_outlasted {
         eprintln!("claude_status registered_slots=unavailable_past_bound saved_slot_states=stale");
     }
+    // Each slot's own `.claude.json`, read once for this pass: the usage
+    // bindings below and the accounts the default home's owner may be.
+    let slot_accounts: BTreeMap<String, ClaudeCliOauthAccount> = settings
+        .as_ref()
+        .map(ordered_claude_slot_descriptors)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|descriptor| {
+            let slot = claude_config_slot_for_descriptor(&descriptor)?;
+            let account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()))?;
+            Some((descriptor.slot_id, account))
+        })
+        .collect();
     let slot_owned_bindings = settings
         .as_ref()
         .map(|status| {
             claude_slot_owned_usage_bindings(
                 status,
                 |descriptor| {
-                    let slot = claude_config_slot_for_descriptor(descriptor)?;
-                    let (account, organization) =
-                        read_claude_cli_oauth_account(&slot.identity_path(&home_dir()))
-                            .as_ref()
-                            .and_then(claude_strong_oauth_identity_hashes)?;
+                    let (account, organization) = slot_accounts
+                        .get(&descriptor.slot_id)
+                        .and_then(claude_strong_oauth_identity_hashes)?;
                     ClaudeStrongBinding::new(&account, &organization)
                 },
                 |slot_id| crate::claude_browser_auth::collection_suppression(slot_id).is_some(),
@@ -4771,17 +4782,7 @@ fn collect_claude_status_snapshots(
     let upkeep_consent = settings.as_ref().is_ok_and(|status| {
         status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
     });
-    // Accounts Ottto already knows: each registered slot's own `.claude.json`.
-    let known_identities: Vec<ClaudeCliOauthAccount> = settings
-        .as_ref()
-        .map(ordered_claude_slot_descriptors)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(claude_config_slot_for_descriptor)
-        .filter(|slot| slot.config_dir().is_some())
-        .filter_map(|slot| read_claude_cli_oauth_account(&slot.identity_path(&home_dir())))
-        .filter(|account| claude_strong_oauth_identity_hashes(account).is_some())
-        .collect();
+    let known_identities: Vec<ClaudeCliOauthAccount> = slot_accounts.into_values().collect();
     let (mut default_snapshot, desktop_pairs, default_owner) = collect_claude_status(
         captured_at.clone(),
         expires_at.clone(),
@@ -27258,6 +27259,19 @@ for line in sys.stdin:
         ));
     }
 
+    /// A signed-in Max login's stored credential.
+    fn max_login_credential(access_token: &str) -> ClaudeOAuthCredential {
+        ClaudeOAuthCredential {
+            access_token: Some(access_token.to_string()),
+            has_refresh_token: true,
+            access_expires_at: None,
+            relogin_required_at: None,
+            has_inference_scope: Some(true),
+            has_profile_scope: true,
+            subscription_type: Some("max".to_string()),
+        }
+    }
+
     /// [behaviour] A credential and `.claude.json` from different logins get
     /// their own sign-in-again code; a file that changes between the two reads
     /// keeps the race code. Neither yields an identity.
@@ -27284,15 +27298,7 @@ for line in sys.stdin:
                 "claude_slot_concurrent_mutation",
             ),
         ] {
-            let credential = ClaudeOAuthCredential {
-                access_token: Some("fixture".to_string()),
-                has_refresh_token: true,
-                access_expires_at: None,
-                relogin_required_at: None,
-                has_inference_scope: Some(true),
-                has_profile_scope: true,
-                subscription_type: Some("max".to_string()),
-            };
+            let credential = max_login_credential("fixture");
             let failure = stable_claude_slot_credential(
                 Some(oauth(initial)),
                 Some(credential),
@@ -27361,15 +27367,7 @@ for line in sys.stdin:
         let terminal = oauth("terminal-account", "terminal-org", "claude_max");
         let stable = |token: &str| StableClaudeSlotCredential {
             oauth_account: desktop.clone(),
-            credential: ClaudeOAuthCredential {
-                access_token: Some(token.to_string()),
-                has_refresh_token: true,
-                access_expires_at: None,
-                relogin_required_at: None,
-                has_inference_scope: Some(true),
-                has_profile_scope: true,
-                subscription_type: Some("max".to_string()),
-            },
+            credential: max_login_credential(token),
         };
         let known = std::slice::from_ref(&terminal);
         let calls = || CALLS.load(Ordering::SeqCst);
