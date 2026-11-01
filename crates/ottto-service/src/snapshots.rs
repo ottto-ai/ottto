@@ -51375,6 +51375,22 @@ impl ScanIndex {
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        self.committable_subset_with_refusals(previous, accepted, quarantined, locally_held, None)
+    }
+
+    /// With `isolated_refusals`, the upload sent every batch and refused only
+    /// those items: every other entity not locally held settled exactly as
+    /// on a clean page, including unchanged ones this pass did not resend.
+    /// Refused and held entities keep their committed revision and stay owed.
+    /// Without it, only this pass's ACKs and quarantines settle.
+    pub(crate) fn committable_subset_with_refusals(
+        &self,
+        previous: &ScanIndex,
+        accepted: &BTreeSet<String>,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
+        locally_held: &BTreeSet<String>,
+        isolated_refusals: Option<&BTreeSet<String>>,
+    ) -> ScanIndex {
         if !self.persistence_available() || !previous.persistence_available() {
             let mut held = self.clone();
             held.retain_persistence_baseline_from(previous);
@@ -51384,7 +51400,11 @@ impl ScanIndex {
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
-                && (accepted.contains(fingerprint) || quarantined.contains_key(fingerprint))
+                && (accepted.contains(fingerprint)
+                    || quarantined.contains_key(fingerprint)
+                    || isolated_refusals.is_some_and(|refused| {
+                        !refused.contains(fingerprint) && !locally_held.contains(fingerprint)
+                    }))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.decode_holds_file(key) {
@@ -82402,6 +82422,117 @@ mod tests {
         let committable =
             fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
         assert!(committable.files.is_empty());
+    }
+
+    /// One upload page that ended in a refused item: a re-read sibling whose
+    /// unchanged entity was not resent (its committed witness was cleared),
+    /// a sibling accepted this pass, and the refused item's file.
+    fn refused_item_page() -> (ScanIndex, ScanIndex, BTreeSet<String>, BTreeSet<String>) {
+        let mut committed = ScanIndex::default();
+        let mut cleared = manifest_index_entry(Some("unchanged"));
+        cleared.source_file_fingerprint.clear();
+        committed.files.insert("reread.jsonl".into(), cleared);
+        committed
+            .files
+            .insert("refused.jsonl".into(), manifest_index_entry(Some("old")));
+        for (key, fingerprint) in [("reread.jsonl", "unchanged"), ("refused.jsonl", "old")] {
+            committed
+                .file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::from([fingerprint.to_string()]));
+            committed
+                .accepted_snapshot_fingerprints
+                .insert(fingerprint.to_string());
+        }
+        let mut scanned = committed.clone();
+        for (key, fingerprint) in [
+            ("reread.jsonl", "unchanged"),
+            ("accepted.jsonl", "accepted"),
+            ("refused.jsonl", "refused"),
+        ] {
+            scanned
+                .files
+                .insert(key.into(), manifest_index_entry(Some(fingerprint)));
+            scanned
+                .file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::from([fingerprint.to_string()]));
+        }
+        (
+            committed,
+            scanned,
+            BTreeSet::from(["accepted".to_string()]),
+            BTreeSet::from(["refused".to_string()]),
+        )
+    }
+
+    /// [regress] A page ending in one refused item kept only this pass's
+    /// ACKs, so its re-read siblings returned to their cleared witnesses and
+    /// were read again next pass. Only the refused file stays owed now.
+    #[test]
+    fn refused_item_keeps_only_its_own_file_owed() {
+        let (committed, scanned, accepted, refused) = refused_item_page();
+        let no_holds = BTreeSet::new();
+        let ack_only = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &no_holds,
+            None,
+        );
+        assert!(ack_only.files["reread.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+
+        let scoped = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &no_holds,
+            Some(&refused),
+        );
+        assert_eq!(
+            scoped.files["reread.jsonl"].source_file_fingerprint,
+            "source"
+        );
+        assert_eq!(
+            scoped.files["refused.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old"),
+            "the refused item keeps its committed entry, so the next scan retries it"
+        );
+    }
+
+    /// [money] Siblings of a refused item commit exactly as on a clean page;
+    /// the refused entity gets no credit and its file keeps its prior debt.
+    #[test]
+    fn refused_item_siblings_commit_as_a_clean_page() {
+        let (committed, scanned, accepted, refused) = refused_item_page();
+        let mut clean = scanned.clone();
+        clean.record_accepted_snapshot_fingerprints(&accepted);
+        let scoped = scanned.committable_subset_with_refusals(
+            &committed,
+            &accepted,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(&refused),
+        );
+        let entry = |index: &ScanIndex, key: &str| {
+            (
+                serde_json::to_value(&index.files[key]).unwrap(),
+                index.file_snapshot_fingerprints[key].clone(),
+            )
+        };
+        for key in ["reread.jsonl", "accepted.jsonl"] {
+            assert_eq!(entry(&scoped, key), entry(&clean, key), "{key}");
+        }
+        assert_eq!(
+            entry(&scoped, "refused.jsonl"),
+            entry(&committed, "refused.jsonl")
+        );
+        let mut credited = scoped.accepted_snapshot_fingerprints.clone();
+        assert!(credited.remove("old"), "the prior acceptance stays");
+        assert!(!credited.contains("refused"));
+        assert_eq!(credited, clean.accepted_snapshot_fingerprints);
     }
 
     #[test]

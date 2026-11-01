@@ -3544,6 +3544,46 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_refusals(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        fallback,
+        cause,
+        audit_release,
+        body_drains,
+        None,
+    )
+}
+
+/// `isolated_refusals`: the upload sent every batch and only these items were
+/// refused (`IsolatedItemRefusals`). Every other entity then settles as on a
+/// clean page; without it only this pass's ACKs settle.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_refusals(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
+    audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    isolated_refusals: Option<&BTreeSet<String>>,
+) -> Result<ScanIndex> {
     let progress_owner =
         SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
@@ -3625,11 +3665,12 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset_with_local_holds(
+    let mut committable = index.committable_subset_with_refusals(
         committed_index,
         &accepted,
         &quarantined,
         locally_held,
+        isolated_refusals,
     );
     if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);
@@ -6221,6 +6262,27 @@ fn collect_unparkable_preparation_with_rotation(
         .expect("ordinary serial owned source completion")
 }
 #[cfg(test)]
+thread_local! {
+    static WAKE_FRAME_VISIT_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+/// A test's own visit ceiling, below the walk's 4096 cap, checked on every
+/// measured wake frame while the guard lives.
+#[cfg(test)]
+pub(crate) struct WakeFrameVisitLimitForTest(Option<usize>);
+#[cfg(test)]
+impl WakeFrameVisitLimitForTest {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self(WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.replace(Some(limit))))
+    }
+}
+#[cfg(test)]
+impl Drop for WakeFrameVisitLimitForTest {
+    fn drop(&mut self) {
+        WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+#[cfg(test)]
 fn try_collect_native_preparation_with_rotation_observed(
     frame: SourcePreparation,
     require_frame_bound: bool,
@@ -6287,6 +6349,14 @@ fn try_collect_native_preparation_with_rotation_observed(
                     receipt.visits_for_test(),
                     measured.is_some()
                 );
+                if let Some(limit) = WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+                    assert!(
+                        receipt.visits_for_test() <= limit,
+                        "codex_wake_frame step {} used {} visits; this test keeps them at or under {limit}",
+                        self.steps,
+                        receipt.visits_for_test()
+                    );
+                }
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
                     "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {
@@ -8710,7 +8780,14 @@ fn finish_sync_source(
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
                 let side_mark = codex_side_save_mark(daemon, source, &index_path);
-                match checkpoint_partial_snapshot_index_with_audit_release(
+                // Refused items alone stay owed; an admission-limited page
+                // omitted bodies, so it keeps the ACK-only subset as a
+                // Completed one would.
+                let isolated_refusals = error
+                    .downcast_ref::<IsolatedItemRefusals>()
+                    .filter(|_| ack_admission_limited.is_none())
+                    .map(|refusals| &refusals.fingerprints);
+                match checkpoint_partial_snapshot_index_with_refusals(
                     &index,
                     &committed_index,
                     &upload_progress,
@@ -8735,6 +8812,7 @@ fn finish_sync_source(
                         backfill_window_days: receipt_window_days,
                     }),
                     std::mem::take(&mut claude_proof_body_drains),
+                    isolated_refusals,
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -10509,6 +10587,23 @@ impl std::fmt::Display for SnapshotBatchPreflightRejected {
 
 impl std::error::Error for SnapshotBatchPreflightRejected {}
 
+/// The upload sent every batch and backend validation refused only these
+/// items, each alone; every other item settled as on a clean page.
+#[derive(Debug)]
+struct IsolatedItemRefusals {
+    fingerprints: BTreeSet<String>,
+}
+
+impl std::fmt::Display for IsolatedItemRefusals {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} refused snapshot item(s) isolated from settled siblings",
+            self.fingerprints.len()
+        )
+    }
+}
+
 #[derive(Debug)]
 struct SnapshotLocalStateRejected {
     operation: &'static str,
@@ -11453,6 +11548,7 @@ where
         }
     }
     let mut deferred_validation_error = None;
+    let mut isolated_refusals = BTreeSet::new();
     let mut batches = VecDeque::new();
     // Request-owned literal bodies travel with their Claude family (early-t7
     // Q1). A family that fits one batch is packed whole; a larger one is cut
@@ -11710,10 +11806,11 @@ where
             Err(error) if is_item_specific_validation_failure(&error) => {
                 // Preserve the first poison-item diagnostic, but continue so
                 // every valid sibling is accepted and checkpointed exactly
-                // once. The caller still reports the cycle as failed and does
-                // not commit the final scan index.
+                // once. The caller still reports the cycle as failed; only
+                // the refused items stay owed in its checkpoint.
                 for index in &indices {
                     record_poison_loss_once(poison_scope, fingerprint(&items[*index]));
+                    isolated_refusals.insert(fingerprint(&items[*index]).to_string());
                 }
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
@@ -11798,7 +11895,9 @@ where
         })
         .count();
     if let Some(error) = deferred_validation_error {
-        Err(error)
+        Err(error.context(IsolatedItemRefusals {
+            fingerprints: isolated_refusals,
+        }))
     } else if conflicted_entities > 0 || context_budget_deferred > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities.saturating_add(context_budget_deferred),
@@ -17501,6 +17600,13 @@ mod tests {
         .expect_err("poison snapshot keeps the cycle failed");
 
         assert!(is_item_specific_validation_failure(&error));
+        assert_eq!(
+            error
+                .downcast_ref::<IsolatedItemRefusals>()
+                .map(|refusals| &refusals.fingerprints),
+            Some(&BTreeSet::from([items[19].clone()])),
+            "the checkpoint keeps only the refused item owed"
+        );
         assert_eq!(accepted, 24);
         assert_eq!(progress.accepted_fingerprints.len(), 24);
         assert!(progress.quarantined_fingerprints.is_empty());
@@ -17574,6 +17680,10 @@ mod tests {
         );
         assert!(is_item_specific_validation_failure(&error));
         assert!(error.downcast_ref::<BatchRejected>().is_some());
+        assert!(
+            error.downcast_ref::<IsolatedItemRefusals>().is_none(),
+            "a pass stopped early settles only its ACKs"
+        );
         assert_eq!(accepted, 0);
         assert!(
             attempts
