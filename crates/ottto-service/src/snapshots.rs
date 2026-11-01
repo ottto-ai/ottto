@@ -29294,8 +29294,8 @@ impl OwnedSourceScan {
                 // and an unsampled read keep the step-start budget. Any other
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
-                // A Tail/Unchanged singleton, or a Full with an owned finish
-                // bound (`prove_release` refuses a legacy one), also decides,
+                // A Tail/Unchanged singleton, or a grown Full with an owned
+                // finish bound (`prove_release` refuses a legacy one), also decides,
                 // under blocking locks, whether a release of lower-ranked
                 // residents would make its copy fit; that release is deferred
                 // into its retention, after
@@ -29321,7 +29321,18 @@ impl OwnedSourceScan {
                         None,
                     )
                 } else if active.sampling.is_some() {
-                    if sampled_scan::releases_at_completion(&active) {
+                    let full = active.sampling.as_ref().is_some_and(|sampling| {
+                        matches!(
+                            sampling.mode,
+                            crate::transcript_acquisition::ReadMode::Full(_)
+                        )
+                    });
+                    let legacy_full = full
+                        && matches!(
+                            sampled_scan::x_out_for(source, || None),
+                            sampled_scan::XOut::Legacy
+                        );
+                    if sampled_scan::releases_at_completion(&active, index) && !legacy_full {
                         sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
                     } else {
                         let (budget, measure) = sampled_scan::copy_budget_step(

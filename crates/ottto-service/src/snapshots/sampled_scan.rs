@@ -726,10 +726,19 @@ pub(super) fn borrows_only_retained_reduction(active: &OwnedActiveFile) -> bool 
 }
 
 /// A completion that may release lower-ranked residents for its copy
-/// (`tail_completion_budget`): shape F only. A Full's copy is never admitted by
-/// evicting residents: each evicted file then misses and reads Full in turn.
-pub(super) fn releases_at_completion(active: &OwnedActiveFile) -> bool {
+/// (`tail_completion_budget`): shape F, or a sampled Full singleton whose file
+/// grew since its last read. The index still holds the pre-read size here;
+/// a first read, shrink or same-size re-read cannot displace residents.
+pub(super) fn releases_at_completion(active: &OwnedActiveFile, index: &ScanIndex) -> bool {
     borrows_only_retained_reduction(active)
+        || (active.sampling.as_ref().is_some_and(|sampling| {
+            matches!(sampling.mode, ReadMode::Full(_))
+                && index
+                    .files
+                    .get(&sampling.key)
+                    .is_some_and(|entry| active.candidate.size_bytes > entry.size_bytes)
+        }) && active.side_origin.is_none()
+            && sampled_singleton(active))
 }
 
 /// One file on its own plan: no comparison, cursor job, group, alias, receipt
@@ -1445,7 +1454,7 @@ pub(super) struct DeferredRelease {
     /// limit, so the insert's entry and key bounds cannot refuse it (e).
     pub(super) entry_limit: usize,
     /// M-a's churn bound: at most `|P_C|` victims (`prove_release`); `None`
-    /// on the legacy path.
+    /// on the legacy path and for a grown Full (`proven_release`).
     max_victims: Option<usize>,
 }
 impl DeferredRelease {
@@ -1506,9 +1515,9 @@ impl DeferredRelease {
 /// active) grants nothing and proves nothing. The insert's own slot
 /// (`ins_extra`) and `A` are never held at once (`finish` consumes the
 /// parser first), so they combine by `max`. No proof is carried for a copy
-/// in the insert's entry/key band or one without a plan. A Full has no
-/// previous finalization charge or taken usage; its first copy is ranked like
-/// any other, so a newer file displaces only older idle residents.
+/// in the insert's entry/key band or one without a plan. Only a Full that
+/// passed the pre-read size-growth gate reaches here; it has no previous
+/// finalization charge or taken usage and can displace only older residents.
 pub(super) fn tail_completion_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
@@ -1530,6 +1539,7 @@ pub(super) fn tail_completion_budget(
         return measured;
     };
     let continued = file.retained_hint.is_some();
+    let full = matches!(file.mode, ReadMode::Full(_));
     let finalization_prev = file.retained_finalization_charge;
     let taken_usage = file.retained_usage;
     let key_len = file.key.len();
@@ -1597,8 +1607,8 @@ pub(super) fn tail_completion_budget(
     if clone > entry_limit {
         return (granted, step, None);
     }
-    // 3. The re-admission rank, once; only a continued copy with a plan.
-    if !continued {
+    // 3. The re-admission rank, once; a continued copy or grown Full, with a plan.
+    if !continued && !full {
         return (granted, step, None);
     }
     let Some(modified) = active.parser.planned_modified_hint() else {
@@ -1622,6 +1632,7 @@ pub(super) fn tail_completion_budget(
             clone,
             finalization_prev,
             usage_grew,
+            full,
             rank,
             modified,
             entry_limit,
@@ -1646,6 +1657,8 @@ pub(super) struct ReleaseProof {
     finalization_prev: usize,
     /// This read added usage since the take (Q-PR15 (b)).
     usage_grew: bool,
+    /// A Full completion that passed the file-growth gate.
+    full: bool,
     rank: (i64, i64),
     modified: (i64, i64),
     entry_limit: usize,
@@ -1691,14 +1704,13 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
 /// `K' >= C`, exactly when the copy-only prefix suffices), capped at
 /// `|P_C|` at execution. Anything unknown, overflowing, infeasible or over
 /// the bound releases nothing. A Full on the legacy decision releases nothing:
-/// with neither X_out nor `F_prev`, nothing proves its finished output fits, so
-/// it could evict residents and then lose its own copy on every page.
-/// A Full with X_out has no churn bound. This release is its file's only way
-/// back into RAM, and among many small residents X_out's margin over `C` keeps
-/// `|P*|` above `|P_C|`, so the bound would leave a growing file Full on every
-/// page. It stays fit-or-nothing over strictly older residents, and stops at the
-/// first fit. A Tail or Unchanged read keeps the bound: its refusal costs one
-/// read, since its next growth is a Full that reaches this release.
+/// with neither X_out nor `F_prev`, nothing proves its finished output fits.
+/// A Full reaches this proof only after file growth against the pre-read index
+/// size. With X_out it has no churn bound: the margin over `C` can keep `|P*|`
+/// above `|P_C|` among small residents and lock a growing file out of RAM.
+/// It stays fit-or-nothing over strictly older residents and stops at the first
+/// fit. Same-size re-reads, shrinks and first reads release nothing. Tail and
+/// Unchanged reads keep the churn bound.
 pub(super) fn prove_release(
     granted: RetainBudget,
     proof: Option<ReleaseProof>,
@@ -1715,6 +1727,7 @@ pub(super) fn prove_release(
         return granted;
     };
     match x_out {
+        XOut::Legacy if proof.full => granted,
         XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget, decode_peak),
         XOut::Refused => granted,
         XOut::Bound(x_out) => {
@@ -1857,7 +1870,7 @@ fn proven_release(
     };
     #[cfg(test)]
     test_hooks::probe(|probe| probe.prefixes = Some((victims, copy_only)));
-    if victims > copy_only {
+    if !proof.full && victims > copy_only {
         return None;
     }
     // The copy is admitted against its share, its decode peak reserved
@@ -1872,7 +1885,7 @@ fn proven_release(
             rank: proof.rank,
             modified: proof.modified,
             entry_limit: proof.entry_limit,
-            max_victims: Some(copy_only),
+            max_victims: (!proof.full).then_some(copy_only),
         },
     })
 }
