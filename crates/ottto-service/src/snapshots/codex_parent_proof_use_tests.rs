@@ -485,6 +485,7 @@ impl Scene {
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
                 listing_started_unix_seconds: None,
+                listing_owed_requeued_unix_seconds: Default::default(),
             }),
             ..ScanIndex::default()
         };

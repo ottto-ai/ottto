@@ -930,8 +930,15 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         let index = ScanIndex::load(&path).unwrap();
         f.cache = Arc::new(sampled_scan::SharedCache::default());
         let opens = all_transcript_opens_for_test();
-        let ((_, scan, reads, _), consumed) =
+        let ((quiet_index, scan, reads, rows), consumed) =
             sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+        // The reloaded generation ran its due pass; no first walk replaced it.
+        assert!(!rows.iter().any(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        }));
+        if let Some(traversal) = quiet_index.traversal.as_ref() {
+            assert!(traversal.counts.listing_generations >= 1, "{source:?}");
+        }
         assert!(scan.snapshots.is_empty(), "{source:?}");
         assert_eq!(scan.scanned_file_count, 0, "{source:?}");
         // Zero opens measures zero identity, cheap and other reads.
@@ -1018,6 +1025,68 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
                 "{source:?} hinted {hinted}: the owed work resolved"
             );
         }
+    }
+}
+
+/// [regress] An owed file whose stamp stays unchanged (a held revert keeps
+/// clearing its fingerprint) is queued by the re-listing pass at most once
+/// per file per six hours, counted apart from changed files; a pass inside
+/// the interval leaves it alone, and the queued offer reads Full once.
+#[test]
+fn owed_unchanged_file_is_requeued_once_per_six_hours() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let rearmed = f.root.join(format!("{REARMED}.jsonl"));
+        let key = local_index_key(&rearmed);
+        let queued = |index: &ScanIndex| {
+            let traversal = index.traversal.as_ref().unwrap();
+            (
+                traversal
+                    .pending_candidates
+                    .iter()
+                    .filter(|pending| pending.path == rearmed)
+                    .count(),
+                traversal.counts.listing_owed_requeued,
+                traversal.counts.listing_changes_without_hint,
+            )
+        };
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 1, 0), "{source:?}: first offer");
+        let offer = index.clone();
+        // Its read is out of scope here; the fingerprint stays cleared.
+        for _ in 0..3 {
+            index.traversal.as_mut().unwrap().pending_candidates.clear();
+            relist(source, &mut index);
+            assert_eq!(queued(&index), (0, 1, 0), "{source:?}: paced");
+        }
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_candidates.clear();
+        *traversal
+            .listing_owed_requeued_unix_seconds
+            .get_mut(&key)
+            .unwrap() -= LISTING_OWED_PACE_SECONDS;
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 2, 0), "{source:?}: after six hours");
+
+        f.cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, scan, reads, _) = f.page(source, offer);
+        assert_eq!(
+            modes(&reads),
+            vec![format!("{:?}", DeliveryMode::Full)],
+            "{source:?}"
+        );
+        assert_eq!(scan.scanned_file_count, 1, "{source:?}");
     }
 }
 

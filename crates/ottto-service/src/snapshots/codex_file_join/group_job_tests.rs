@@ -2169,6 +2169,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         counts: crate::snapshots::ScanTraversalCounts::default(),
         residue: crate::snapshots::ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
     }
 }
 

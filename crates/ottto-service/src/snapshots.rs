@@ -920,6 +920,9 @@ pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 /// The gap between metadata-only re-listing passes of one kept generation
 /// (the cold cadence tier).
 pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
+/// A re-listing pass queues an owed file whose stamp is unchanged at most
+/// once per this interval.
+const LISTING_OWED_PACE_SECONDS: u64 = 6 * 60 * 60;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2600,6 +2603,10 @@ struct ScanTraversalCounts {
     /// had already queued: what the watcher missed.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_changes_without_hint: u64,
+    /// Owed files with an unchanged stamp a re-listing pass queued, at most
+    /// once per file per `LISTING_OWED_PACE_SECONDS`.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    listing_owed_requeued: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -2750,6 +2757,11 @@ struct ScanTraversalCheckpoint {
     /// without it starts the re-listing clock at its next page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listing_started_unix_seconds: Option<u64>,
+    /// Owed files with an unchanged stamp that a re-listing pass queued,
+    /// with that pass's start. Bounded: past the bound the oldest stamp is
+    /// dropped, so the bound can only bring a re-queue forward.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
 
 // A candidate's scan root is not only where its no-follow open starts: it is
@@ -4624,20 +4636,43 @@ impl ScanIndexEntry {
         birth_nanos: Option<u64>,
         fragment: Option<codex_fragment::Stamp>,
     ) -> bool {
+        self.same_stamp_with_mtime(
+            self.modified_unix_nanos,
+            len,
+            modified_nanos,
+            birth_nanos,
+            fragment,
+        )
+    }
+
+    fn same_stamp_with_mtime(
+        &self,
+        stored_modified_nanos: Option<u64>,
+        len: u64,
+        modified_nanos: Option<u64>,
+        birth_nanos: Option<u64>,
+        fragment: Option<codex_fragment::Stamp>,
+    ) -> bool {
         (self.size_bytes == len
             || self
                 .codex_fragment
                 .as_ref()
                 .is_some_and(|bound| bound.matches(self.size_bytes, len, fragment)))
             && modified_nanos.is_some()
-            && self.modified_unix_nanos == modified_nanos
+            && stored_modified_nanos == modified_nanos
             && (self.opened_birth_nanos == 0 || birth_nanos == Some(self.opened_birth_nanos))
     }
 
     fn same_listing_stamp_as(&self, metadata: &fs::Metadata) -> bool {
-        self.same_listing_stamp(
+        let modified = metadata.modified().ok().and_then(unix_nanos);
+        // An entry stored without mtime nanos compares at whole seconds.
+        let stored = self.modified_unix_nanos.or_else(|| {
+            modified.filter(|nanos| nanos / 1_000_000_000 == self.modified_unix_seconds)
+        });
+        self.same_stamp_with_mtime(
+            stored,
             metadata.len(),
-            metadata.modified().ok().and_then(unix_nanos),
+            modified,
             metadata.created().ok().and_then(unix_nanos),
             codex_fragment::Stamp::metadata(metadata),
         )
@@ -43534,6 +43569,7 @@ fn ensure_bounded_traversal(
         counts,
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
+        listing_owed_requeued_unix_seconds: Default::default(),
     });
     if source == SnapshotSource::ClaudeCode
         && index
@@ -43639,6 +43675,32 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
             census_member: false,
             watcher_hint: false,
         }));
+}
+
+/// Whether this re-listing pass may queue an owed file whose stamp is
+/// unchanged: once per file per `LISTING_OWED_PACE_SECONDS`. A stamp from a
+/// clock that moved backwards expires rather than holds.
+fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool {
+    let Some(now) = traversal.listing_started_unix_seconds else {
+        return true;
+    };
+    let fresh = |at: &u64| *at <= now && now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
+    let paced = &mut traversal.listing_owed_requeued_unix_seconds;
+    if paced.get(key).is_some_and(&fresh) {
+        return false;
+    }
+    paced.retain(|_, at| fresh(at));
+    if paced.len() >= MAX_BACKFILL_FILES_PER_SOURCE {
+        let oldest = paced
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            paced.remove(&oldest);
+        }
+    }
+    paced.insert(key.to_owned(), now);
+    true
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -44235,6 +44297,7 @@ fn advance_bounded_directory_traversal_with_budget(
     let restore = |counts: &mut ScanTraversalCounts, saved: Option<ScanTraversalCounts>| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
+            saved.listing_owed_requeued = counts.listing_owed_requeued;
             *counts = saved;
         }
     };
@@ -44412,6 +44475,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
                 continue;
             }
+            let mut owed_unchanged = false;
             if relisting {
                 let key = local_index_key(&path);
                 // Unchanged and not owed: seen, never queued. A file this
@@ -44438,6 +44502,17 @@ fn advance_bounded_directory_traversal_with_budget(
                 // the first walk only. An unrecorded file stays unobserved, so
                 // a later pass lists it again once it is readable.
                 if metadata.len() > max_jsonl_file_bytes(source) {
+                    continue;
+                }
+                owed_unchanged = index
+                    .files
+                    .get(&key)
+                    .is_some_and(|entry| entry.same_listing_stamp_as(&metadata));
+                if owed_unchanged
+                    && !pending.contains_key(&path)
+                    && !pace_listing_owed(&mut traversal, &key)
+                {
+                    traversal.observed_index_keys.insert(key);
                     continue;
                 }
             }
@@ -44494,7 +44569,9 @@ fn advance_bounded_directory_traversal_with_budget(
             } else {
                 // A re-listed change is fresh data and joins the census by
                 // the watcher-hint rule.
-                traversal.counts.listing_changes_without_hint += u64::from(relisting);
+                traversal.counts.listing_changes_without_hint +=
+                    u64::from(relisting && !owed_unchanged);
+                traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
@@ -49118,6 +49195,7 @@ impl ScanIndex {
             },
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         });
     }
 
@@ -54282,6 +54360,7 @@ mod tests {
             },
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         }
     }
 
@@ -57297,6 +57376,7 @@ mod tests {
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         });
 
         let scan = scan_source_roots(
@@ -57817,6 +57897,7 @@ mod tests {
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
                 listing_started_unix_seconds: None,
+                listing_owed_requeued_unix_seconds: Default::default(),
             }),
             ..ScanIndex::default()
         };
@@ -58914,6 +58995,7 @@ mod tests {
                 },
                 residue: ScanTraversalResidue::default(),
                 listing_started_unix_seconds: None,
+                listing_owed_requeued_unix_seconds: Default::default(),
             };
 
         index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
@@ -67355,6 +67437,7 @@ mod tests {
                     counts: ScanTraversalCounts::default(),
                     residue: ScanTraversalResidue::default(),
                     listing_started_unix_seconds: None,
+                    listing_owed_requeued_unix_seconds: Default::default(),
                 });
                 assert!(reconcile_missing_index_entries_with_limit(
                     &mut working,
@@ -83825,6 +83908,7 @@ mod tests {
             counts,
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
+            listing_owed_requeued_unix_seconds: Default::default(),
         }
     }
 
@@ -84414,8 +84498,8 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

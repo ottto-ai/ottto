@@ -8,7 +8,10 @@ fingerprint, unverified sampled generation). Other reasons to read an unchanged
 file were weighed by the generation's walk and keep their own schedulers and
 the next walk, as on main; re-offering them every pass would re-read the same
 files every 30 minutes. The check is stat-only; no file is opened. Acquisition
-still chooses Tail or Full.
+still chooses Tail or Full. An owed file whose stamp is unchanged is queued at
+most once per file per 6 hours (a bounded per-generation map; past the bound
+the oldest stamp is dropped, so a re-queue can only come sooner). An entry
+stored without mtime nanos compares at whole seconds.
 
 A queued file joins the census by the watcher-hint rule: always for Claude and
 Pi, and for Codex only if this generation has not observed it yet. A hint that
@@ -46,8 +49,12 @@ placeholders). Known Codex growth is now queued by the pass for all sources
 alike; an mtime change is a stamp change, a ctime change never is. The
 moved-directory roster refresh is unchanged.
 
-Counters: `listing_generations` and `listing_changes_without_hint` in the
-traversal counts. The 6-hour full sweep timer is removed: every successful
+Counters: `listing_generations`, `listing_changes_without_hint` (changed
+files) and `listing_owed_requeued` (owed files with an unchanged stamp) in
+the traversal counts. Codex growth the pass queues outside the census is not
+added to the page's next-generation hint count, which counts watcher hints
+only. Hint-less growth of a known Codex rollout is now found within 30 minutes
+rather than on the next tick; watcher hints are unchanged. The 6-hour full sweep timer is removed: every successful
 scan reset it and the 30-minute cold tier always came due first.
 
 Out of scope: the first walk still enqueues every in-window file as a census
