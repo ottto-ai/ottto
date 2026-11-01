@@ -1632,6 +1632,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 !matches!(
                     *name,
                     "reread_guard"
+                        | "upload_context_fingerprint"
                         | "claude_desktop_store_inventory"
                         | "context_curve_capability_enabled"
                         | "context_curve_replay_epoch"
@@ -4484,7 +4485,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
         &[
             "schema_version",
             "generation",
-            "upload_context_fingerprint",
+            "upload_context_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "files",
             "session_account_bindings",
             "terminal_jsonl_dispositions",
