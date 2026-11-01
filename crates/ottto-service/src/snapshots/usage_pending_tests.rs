@@ -171,8 +171,9 @@ fn cold_pages_accumulate_only_into_loaded_families() {
 }
 
 /// [behaviour] a cold family's retained heap does not grow with its stored
-/// evidence: one family or two hundred history families plus the same page
-/// family keep equal heap per head once only the page family is loaded.
+/// evidence: a history family of one member or of twenty (kept under the
+/// counter's 4096-visit cap when resident) plus the same page family keep
+/// near-equal heap once only the page family is loaded.
 #[test]
 fn cold_usage_heap_does_not_grow_with_stored_evidence() {
     use crate::heap_layout_bound::HeapLayoutBound;
@@ -191,14 +192,14 @@ fn cold_usage_heap_does_not_grow_with_stored_evidence() {
         UsagePending::Cold(Box::new(cold))
     };
     let small = with(1);
-    let large = with(200);
+    let large = with(20);
     // Heads keep member names and counts only: no request hash or
     // occurrence of the history family is resident.
     if crate::heap_layout_bound::layout_supported() {
         let (small, large) = (heap(&small).unwrap(), heap(&large).unwrap());
         let resident = heap(&UsagePending::from(Families::from([(
             "history".to_owned(),
-            family("w0", 200, false),
+            family("w0", 20, false),
         )])))
         .unwrap();
         assert!(large - small < resident / 4, "{small} {large} {resident}");
