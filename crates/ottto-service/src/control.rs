@@ -27927,20 +27927,36 @@ X-API-Key = "otel_redacted"
     #[serial]
     #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
+        use crate::otlp_relay::tests::with_bind_plan;
+
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
-        let port = ports[1];
         write_startup_relay_settings(
             &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(port),
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
         );
-        let _busy_preferred = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let default_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(default_listener.local_addr().unwrap().port(), ports[0]);
-        // Keep default occupied too; the first fallback is the preferred busy
-        // port, so the next candidate must be selected.
-        let fallback_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(fallback_listener.local_addr().unwrap().port(), ports[2]);
+        // Plan the candidate binds: any real candidate number can be held by a
+        // parallel test's ephemeral port, so the free one is a held listener.
+        let busy = || -> std::io::Result<std::net::TcpListener> {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        };
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let default_listener = with_bind_plan([(ports[1], busy()), (ports[0], Ok(held))], || {
+            crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+        });
+        assert_eq!(default_listener.local_addr().unwrap(), addr);
+        // Default busy too: the preferred port is not retried as a fallback,
+        // so the next candidate is selected.
+        let fallback_listener = with_bind_plan(
+            [
+                (ports[1], busy()),
+                (ports[0], busy()),
+                (ports[2], Ok(default_listener)),
+            ],
+            || crate::otlp_relay::bind_startup_local_relay_listener().unwrap(),
+        );
+        assert_eq!(fallback_listener.local_addr().unwrap(), addr);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27950,17 +27966,24 @@ X-API-Key = "otel_redacted"
     fn startup_relay_ignores_unapproved_hosts_ports_and_settings() {
         let (root, _guards) = managed_claude_relay_fixture();
         let port = startup_relay_candidates()[1];
+        // The default port is the first bind attempted; a held listener stands
+        // in for it, since a parallel test's ephemeral port can hold 43119.
+        let binds_default_first = || {
+            let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = held.local_addr().unwrap();
+            let default = crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT;
+            let listener = crate::otlp_relay::tests::with_bind_plan([(default, Ok(held))], || {
+                crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+            });
+            assert_eq!(listener.local_addr().unwrap(), addr);
+        };
         for base in [
             format!("http://192.0.2.1:{port}"),
             format!("http://localhost:{port}"),
             "http://127.0.0.1:48123".to_string(),
         ] {
             write_startup_relay_settings(&root, &base);
-            let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-            assert_eq!(
-                listener.local_addr().unwrap().port(),
-                crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-            );
+            binds_default_first();
         }
         write_startup_relay_settings(
             &root,
@@ -27973,11 +27996,7 @@ X-API-Key = "otel_redacted"
                 sources: vec!["codex".into()],
             })
             .unwrap();
-        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().port(),
-            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-        );
+        binds_default_first();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27998,23 +28017,34 @@ X-API-Key = "otel_redacted"
         let settings = root.join(".claude/settings.json");
         let before = fs::read(&settings).unwrap();
         let _busy = std::net::TcpListener::bind(("127.0.0.1", approved)).unwrap();
+        // The approved binds hit the held busy listener. The old port is
+        // planned: a parallel test's ephemeral port can hold that number.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
         let mut attempts = 0;
-        let listener = crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
-            attempts += 1;
-            assert!(attempt <= 3, "approved retry must be bounded");
-            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
-            if attempt < 3 {
-                assert!(result.is_err(), "approved port gets its retry budget first");
-            }
-            result
+        let listener = crate::otlp_relay::tests::with_bind_plan([(old, Ok(held))], || {
+            crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
+                attempts += 1;
+                assert!(attempt <= 3, "approved retry must be bounded");
+                let result =
+                    crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+                if attempt < 3 {
+                    assert!(result.is_err(), "approved port gets its retry budget first");
+                }
+                result
+            })
         });
         assert_eq!(attempts, 3);
-        let addr = listener.local_addr().unwrap();
-        assert_eq!(addr.port(), old, "old port precedes the free default port");
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            addr,
+            "old port precedes the free default port"
+        );
         let daemon = daemon().with_account(connected_account());
+        let endpoint = format!("http://127.0.0.1:{old}");
         let connected = ottto_protocol::RelayState {
             state: ottto_protocol::RelayRuntimeState::Connected,
-            endpoint: Some(format!("http://{addr}")),
+            endpoint: Some(endpoint.clone()),
             last_connected_at: None,
             last_error: None,
         };
@@ -28032,7 +28062,7 @@ X-API-Key = "otel_redacted"
         daemon
             .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
                 state: ottto_protocol::RelayRuntimeState::Failed,
-                endpoint: Some(format!("http://{addr}")),
+                endpoint: Some(endpoint),
                 last_connected_at: None,
                 last_error: Some(StableMessage {
                     code: "relay_listener_failed".into(),
