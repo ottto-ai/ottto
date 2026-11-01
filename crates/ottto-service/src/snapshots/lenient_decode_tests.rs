@@ -1473,7 +1473,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             }),
             "archives" => serde_json::json!({"archive": {
                 "stamp":{"length":1,"device":1,"inode":2,"modified":[3,4],"changed":[0,0]},
-                "disposition":{"Held":{"cause":CodexZstCause::OwnerUnproven}}
+                "disposition":{"Held":{"cause":CodexZstCause::OwnerUnproven,"quiet":true}}
             }}),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})

@@ -1714,6 +1714,7 @@ pub(in crate::snapshots) mod tests {
                 c.size_bytes = fs::metadata(&path).unwrap().len();
                 candidates.push_front(c);
             }
+            let retry_candidates = candidates.clone();
             let mut scan = selector_scan(
                 &f,
                 ScanIndex::default(),
@@ -1756,11 +1757,24 @@ pub(in crate::snapshots) mod tests {
                     result.archive_owed_count > 0,
                     "archive debt stays disclosed"
                 );
-                let (_, _, quiet) = run_archive(
+                let mut retry = selector_scan(
                     &f,
                     saved(&index),
                     Arc::new(sampled_scan::SharedCache::default()),
+                    retry_candidates,
+                    true,
                 );
+                if case == "root" {
+                    retry
+                        .index
+                        .legacy_unresolved_root_file_witnesses
+                        .insert("unresolved-root".into());
+                }
+                let checkpoint = fixture(b"", ".json");
+                fs::remove_file(&checkpoint.0).unwrap();
+                let (_, quiet) = crate::local_resource_diagnostics::capture(|| {
+                    finish_selector(retry, &checkpoint.0)
+                });
                 assert_eq!(full_decodes(&quiet), 0, "{case}");
             } else {
                 assert_eq!(result.snapshots.len(), 1);
@@ -2136,8 +2150,11 @@ pub(in crate::snapshots) mod tests {
         inventory.complete = false;
         let checkpoint = fixture(b"", ".json");
         fs::remove_file(&checkpoint.0).unwrap();
-        let (index, _) = finish_selector(scan, &checkpoint.0);
+        let (mut index, _) = finish_selector(scan, &checkpoint.0);
         assert!(!index.archives.contains_key(&local_index_key(&f.0)));
+        // A complete follow-up is a new census, not the failed generation's
+        // accumulated traversal errors paired with a synthetic complete header list.
+        index.traversal = None;
         let (working, result, logs) = run_archive(
             &f,
             saved(&index),
@@ -2198,9 +2215,15 @@ pub(in crate::snapshots) mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for case in ["acquired", "empty", "structural", "correction", "pending"] {
-            let f = ArchiveFixture::new(
-                &zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap(),
-            );
+            let bytes = match case {
+                "empty" => {
+                    b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n"
+                        .to_vec()
+                }
+                "structural" => b"invalid session header\n".to_vec(),
+                _ => synthetic_rollout(),
+            };
+            let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
             let (mut index, _, _) = run_archive(
                 &f,
                 ScanIndex::default(),
@@ -2208,15 +2231,16 @@ pub(in crate::snapshots) mod tests {
             );
             let key = local_index_key(&f.0);
             let a = index.archives.get_mut(&key).unwrap();
-            if matches!(case, "empty" | "structural") {
-                a.work.as_mut().unwrap().body_witness = None;
-            }
             match case {
                 "acquired" => a.transition(ArchiveTransition::Acquired),
-                "empty" => a.transition(ArchiveTransition::Empty),
-                "structural" => {
-                    a.transition(ArchiveTransition::Structural(CodexZstCause::DecodeFailed))
-                }
+                "empty" => assert!(matches!(a.disposition, ArchiveDisposition::Empty)),
+                "structural" => assert!(matches!(
+                    a.disposition,
+                    ArchiveDisposition::Held {
+                        cause: CodexZstCause::HeaderInvalid,
+                        quiet: true
+                    }
+                )),
                 "correction" => a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 )),
@@ -2343,7 +2367,7 @@ pub(in crate::snapshots) mod tests {
                         .archives
                         .get(&local_index_key(&f.0))
                         .and_then(|a| a.work.as_ref())
-                        .is_some_and(|w| w.body_witness.is_some())
+                        .is_some_and(|w| w.decoded && w.reservation == ArchiveReservation::None)
                 {
                     fs::write(f.0.parent().unwrap().join("rollout-claimant.jsonl"), &bytes)
                         .unwrap();

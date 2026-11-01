@@ -754,6 +754,12 @@ mod hydrate_parity {
         );
     }
     fn compare(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
+        // Both readers normalize an out-of-range deadline against one instant.
+        s::sampled_scan::transition_fixture::with_scan_clock(s::sampled_scan::now_seconds(), || {
+            compare_at_clock(bytes, mapped)
+        })
+    }
+    fn compare_at_clock(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
         // Exercise the shared API with the stage used by both ordinary and
         // claim-only CAS. SAVE owns installing its current-snapshot caller.
         for bounded in [false, true] {

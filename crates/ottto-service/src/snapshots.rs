@@ -48913,12 +48913,15 @@ impl ScanIndex {
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints
             .retain(|key, _| self.archives.contains_key(key));
-        self.snapshot_activity_at.clear();
-        self.accepted_snapshot_fingerprints.retain(|fp| {
-            self.file_snapshot_fingerprints
-                .values()
-                .any(|set| set.contains(fp))
-        });
+        let retained = self
+            .file_snapshot_fingerprints
+            .values()
+            .flat_map(|set| set.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        self.snapshot_activity_at
+            .retain(|fp, _| retained.contains(fp.as_str()));
+        self.accepted_snapshot_fingerprints
+            .retain(|fp| retained.contains(fp.as_str()));
         self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.accepted_incidence_pending_census = false;
         self.accepted_rebuild_incidence.clear();
