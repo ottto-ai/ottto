@@ -10,8 +10,9 @@
 //! file controls pass through; writes, truncates, syncs, write locks,
 //! deletes, `-shm` growth, exclusive `-shm` locks and a writable `-shm`
 //! mapping are refused, and anything else is refused by default. Temporary
-//! storage stays in memory. A refused operation fails the read closed; the
-//! caller's retry routes it again.
+//! storage stays in memory. Locking is always POSIX advisory locking, never
+//! a lock file beside the database. A refused operation fails the read
+//! closed; the caller's retry routes it again.
 //!
 //! The path is resolved once, so a symlinked database is read, checked and
 //! verified through its target, beside which SQLite keeps the `-wal`. A
@@ -202,7 +203,11 @@ struct GuardFile {
 
 const _: () = assert!(std::mem::size_of::<GuardFile>() <= INNER_OFFSET);
 
-/// The default "unix" VFS, which the guard delegates allowed calls to.
+/// The base VFS the guard delegates allowed calls to: "unix-posix" where
+/// SQLite registers it (macOS, whose default "unix" picks dot-file or proxy
+/// locking, with lock files, on filesystems without POSIX locks), else
+/// "unix", which always locks with POSIX locks. A filesystem without them
+/// fails the lock, and so the read, closed.
 static BASE_VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Register the guard VFS once per process and return its name.
@@ -211,7 +216,11 @@ fn guard_vfs() -> Result<&'static str> {
     let registered = *REGISTERED.get_or_init(|| {
         // SAFETY: `sqlite3_vfs_find` initialises SQLite if needed and returns
         // a registered VFS or null. Built-in VFS objects are static.
-        let base = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
+        let base = [c"unix-posix", c"unix"]
+            .into_iter()
+            .map(|name| unsafe { ffi::sqlite3_vfs_find(name.as_ptr()) })
+            .find(|base| !base.is_null())
+            .unwrap_or(std::ptr::null_mut());
         if base.is_null() {
             return false;
         }
@@ -299,8 +308,11 @@ fn sidecar_open_changes_nothing(main: &Path, sidecar: &Path, missing_ok: bool) -
 /// # Safety
 /// `name` must be null or point to a NUL-terminated string.
 unsafe fn allowed_open(name: *const c_char, flags: c_int) -> Option<c_int> {
-    const REFUSED: c_int =
-        ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_DELETEONCLOSE | ffi::SQLITE_OPEN_EXCLUSIVE;
+    // Auto-proxy would let the base pick proxy locking, with lock files.
+    const REFUSED: c_int = ffi::SQLITE_OPEN_CREATE
+        | ffi::SQLITE_OPEN_DELETEONCLOSE
+        | ffi::SQLITE_OPEN_EXCLUSIVE
+        | ffi::SQLITE_OPEN_AUTOPROXY;
     // SAFETY: the caller's guarantee.
     let path = unsafe { name_path(name) }?;
     match flags & 0x000F_FF00 {
