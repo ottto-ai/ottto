@@ -76,27 +76,27 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
         T::deserialize(deserializer).map(Self::new)
     }
 }
+/// The `Arc` allocation around one `T`: its two counts, plus alignment slack.
+fn charge_header<T>(c: &mut Counter) -> Option<()> {
+    c.charge(
+        size_of::<T>()
+            .checked_add(align_of::<T>())?
+            .checked_add(2 * size_of::<usize>())?,
+    )
+}
 impl<T: HeapLayoutBound> HeapLayoutBound for Shared<T> {
     fn stable_heap(&self) -> bool {
         (**self).stable_heap()
     }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         // The shared allocation's header, then the value's own walk: one visit.
-        c.charge(
-            size_of::<T>()
-                .checked_add(align_of::<T>())?
-                .checked_add(2 * size_of::<usize>())?,
-        )?;
+        charge_header::<T>(c)?;
         (**self).heap_bound(c)
     }
     // Unlike a plain `Arc`, a large collection in here keeps its per-element
     // completion counters: this owner is the only one the walk ever charges.
     fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.charge(
-            size_of::<T>()
-                .checked_add(align_of::<T>())?
-                .checked_add(2 * size_of::<usize>())?,
-        )?;
+        charge_header::<T>(c)?;
         (**self).completed_heap_bound(c)
     }
 }
