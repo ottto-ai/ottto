@@ -139,9 +139,6 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_raw(scanner, index, limit, sampled, hints);
-        }
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
@@ -168,46 +165,6 @@ impl Corpus {
         }
     }
 
-    fn terminal_off_on_raw(
-        &self,
-        scanner: &E2ScanFixture,
-        mut index: ScanIndex,
-        limit: usize,
-        sampled: bool,
-        hints: &[PathBuf],
-    ) -> Page {
-        assert!(
-            crate::snapshots::claude_terminal_off(),
-            "money pipeline requires production policy"
-        );
-        index.activate_file_upload_context(
-            SnapshotSource::ClaudeCode,
-            "e2-synthetic-destination".into(),
-        );
-        index.activate_effective_upload_body_witness_revision(3);
-        index.adopt_effective_upload_body_witness_revision_monotonically();
-        index.load_claude_reemission_exclusions(&self.support);
-        let committed = index.clone();
-        let (index, scan, modes) = scanner.scan(
-            std::slice::from_ref(&self.root),
-            &self.support,
-            index,
-            limit,
-            sampled,
-            &self.births,
-            hints,
-        );
-        Page {
-            cache: scanner.cache.clone(),
-            committed,
-            index,
-            scan,
-            modes,
-            disposition: Default::default(),
-            released: Default::default(),
-            unhealthy: Default::default(),
-        }
-    }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
         self.reload_in(index, "scan-index.json")
     }
@@ -319,39 +276,6 @@ impl Page {
         self.index
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
         holds
-    }
-    // Same context/ACK capture and whole-file receipt ordering as finish.
-    // Captured before POST; restored/stale/count-only ACKs cannot adopt.
-    fn upload_context(
-        &mut self,
-        progress: &mut SnapshotUploadProgress,
-        respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
-    ) -> (
-        Result<ResumableUploadResult>,
-        Vec<Vec<u8>>,
-        Vec<Vec<String>>,
-    ) {
-        let context =
-            crate::snapshots::e2_pipeline_scan_fixture::active_upload_context(&self.index)
-                .expect("active fixture upload context")
-                .to_owned();
-        activate_source_upload_context(
-            SnapshotSource::ClaudeCode,
-            context,
-            &mut self.index,
-            progress,
-        );
-        progress.prepare_context_receipt_candidates(
-            &self.index,
-            &self.committed,
-            &self.scan.snapshots,
-        );
-        let result = upload(&self.scan.snapshots, progress, respond);
-        self.index.accept_file_upload_context_acks(
-            &progress.context_receipt_candidates,
-            &progress.fresh_context_body_acks,
-        );
-        result
     }
 
     fn receipt(&self) -> Vec<(String, String, String)> {
@@ -582,9 +506,6 @@ fn ready(
     limit: usize,
     sampled: bool,
 ) -> Page {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_ready(corpus, scanner, index, limit, sampled);
-    }
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
     let mut send = Page {
@@ -607,34 +528,6 @@ fn ready(
     p
 }
 
-fn terminal_off_on_ready(
-    corpus: &Corpus,
-    scanner: &E2ScanFixture,
-    index: ScanIndex,
-    limit: usize,
-    sampled: bool,
-) -> Page {
-    let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
-    p.enrich(corpus);
-    let mut send = Page {
-        cache: p.cache.clone(),
-        committed: p.committed.clone(),
-        index: p.index.clone(),
-        scan: p.scan.clone(),
-        modes: p.modes,
-        disposition: p.disposition.clone(),
-        released: p.released,
-        unhealthy: p.unhealthy,
-    };
-    send.finish();
-    let (result, _, _) = send.upload_context(&mut e2_progress(), ack);
-    assert_eq!(
-        result.unwrap(),
-        ResumableUploadResult::Completed,
-        "real finalized bodies pass batching and entity ACK"
-    );
-    p
-}
 
 /// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.
 #[test]
@@ -3024,7 +2917,7 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 }
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
-mod money_equivalence_tests {
+pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
@@ -5056,136 +4949,5 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
         );
         let settled = settle(&c, &prior, page, &mut progress);
         assert_eq!(settled.claude_copy_removals.get(key), recorded.as_slice());
-    });
-}
-
-/// [money] Containment retains token, cost, account and exact ACK custody.
-#[test]
-fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_account() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("terminal-off-unproven-full-money");
-        c.root(ROOT, &line(ROOT, "X", AT, 37));
-        c.evidence(&[api("X", 37, 123)], &[trace("X", "")]);
-        let mut page = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        assert!(!page.scan.census_complete);
-        assert_eq!(total(&page), 1);
-        assert_eq!(
-            page.scan
-                .snapshots
-                .iter()
-                .map(|s| s.input_tokens)
-                .sum::<u64>(),
-            37
-        );
-        assert_eq!(
-            page.scan
-                .snapshots
-                .iter()
-                .map(|s| s.output_tokens)
-                .sum::<u64>(),
-            37
-        );
-        let item = &page.scan.snapshots[0];
-        assert_eq!(
-            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-            Some("0.000123")
-        );
-        assert!(!item.model_usage.is_empty());
-        assert!(item
-            .model_usage
-            .iter()
-            .chain(
-                item.usage_buckets
-                    .iter()
-                    .flat_map(|bucket| &bucket.model_usage)
-            )
-            .all(|row| row.account_identifier_hash.is_none()));
-        // E2 publishes the request-identity collector before the legacy
-        // account classifier. Unknown is the absence of account attribution,
-        // not the legacy collector's name (which E2 intentionally preserves).
-        assert_eq!(
-            item.provenance.collector,
-            crate::snapshots::claude_request_identity::COLLECTOR
-        );
-        let display = item
-            .claude_account_display
-            .as_ref()
-            .expect("request-owned account display");
-        assert_eq!(
-            display.current.status,
-            crate::snapshots::claude_request_identity::CURRENT_UNKNOWN
-        );
-        assert!(display.current.account_identifier_hash.is_none());
-        page.finish();
-        let mut progress = e2_progress();
-        let (result, sent, _) = page.upload_context(&mut progress, ack);
-        assert!(matches!(result.unwrap(), ResumableUploadResult::Completed));
-        assert_eq!(sent.len(), 1);
-        for item in &page.scan.snapshots {
-            assert!(progress.contains_body(
-                &item.snapshot_fingerprint,
-                &snapshot_upload_body_witness(item)
-            ));
-        }
-    });
-}
-
-/// [money] Containment retains token, cost, account and exact ACK custody.
-#[test]
-fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("terminal-off-new-copy-shared-request");
-        c.root(ROOT, &line(ROOT, "X", AT, 37));
-        let mut copy: serde_json::Value = serde_json::from_str(&line(ROOT, "X", AT, 37)).unwrap();
-        copy["sessionId"] = json!(COPY);
-        copy["forkedFrom"] = json!({"sessionId":ROOT,"messageUuid":"msg-X"});
-        c.root(COPY, &(copy.to_string() + "\n"));
-        c.evidence(&[api("X", 37, 123)], &[trace("X", "")]);
-        let page = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        assert!(!page.scan.census_complete);
-        assert_eq!(
-            total(&page),
-            1,
-            "new /resume or /branch cannot duplicate shared request X"
-        );
-        assert_eq!(
-            page.scan
-                .snapshots
-                .iter()
-                .map(|s| s.input_tokens)
-                .sum::<u64>(),
-            37
-        );
-        assert_eq!(
-            page.scan
-                .snapshots
-                .iter()
-                .map(|s| s.output_tokens)
-                .sum::<u64>(),
-            37
-        );
-        assert!(
-            page.scan
-                .snapshots
-                .iter()
-                .all(|s| s.source_session_id != COPY),
-            "copied prefix is held or excluded instead of minted as new money"
-        );
     });
 }

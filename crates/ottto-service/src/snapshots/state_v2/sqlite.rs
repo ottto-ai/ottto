@@ -427,12 +427,12 @@ pub(super) fn private_parent(path: &Path) -> Result<()> {
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(in crate::snapshots) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
 }
-fn sqlite_uri(path: &Path) -> Result<String> {
+pub(in crate::snapshots) fn sqlite_uri(path: &Path, query: &str) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     ensure!(path.is_absolute(), "state_v2_absolute_path_required");
     let mut uri = String::from("file:");
@@ -444,7 +444,8 @@ fn sqlite_uri(path: &Path) -> Result<String> {
             write!(uri, "%{byte:02X}")?;
         }
     }
-    uri.push_str("?mode=ro&immutable=1");
+    uri.push('?');
+    uri.push_str(query);
     Ok(uri)
 }
 fn settings(conn: &Connection, import: bool) -> Result<()> {
@@ -650,7 +651,7 @@ impl Sqlite {
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
-            sqlite_uri(path)?,
+            sqlite_uri(path, "mode=ro&immutable=1")?,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -854,6 +855,7 @@ impl Store for Sqlite {
     type Txn<'a> = Txn<'a>;
     fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
+            telemetry::row_cap_reset();
             self.save_failure = None;
             self.mark_dirty()?;
             self.stats.erasure_pending_marks = 0;
@@ -1017,6 +1019,32 @@ fn scan_record_range(
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
+        projection(Table::Records),
+        values.len()
+    ))?;
+    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+fn scan_record_key(
+    conn: &Connection,
+    kind: &RecordKind,
+    key_bytes: &[u8],
+    after_position: Option<u64>,
+    limit: usize,
+) -> Result<Vec<Header>> {
+    ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
+    let mut values = vec![
+        SqlValue::Text(kind.name().into()),
+        SqlValue::Blob(key_bytes.to_vec()),
+    ];
+    let mut filter = String::from("kind=?1 AND key_bytes=?2");
+    if let Some(position) = after_position {
+        values.push(SqlValue::Integer(i64::try_from(position)?));
+        filter.push_str(" AND position>?3");
+    }
+    values.push(SqlValue::Integer(limit as i64));
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
         projection(Table::Records),
         values.len()
     ))?;
@@ -1506,6 +1534,15 @@ impl Transaction for Txn<'_> {
     ) -> Result<Vec<Header>> {
         scan_record_range(self.store.conn()?, kind, after, limit)
     }
+    fn scan_record_key(
+        &mut self,
+        kind: &RecordKind,
+        key_bytes: &[u8],
+        after_position: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        scan_record_key(self.store.conn()?, kind, key_bytes, after_position, limit)
+    }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
         self.commit_inner(expected, next)
     }
@@ -1736,10 +1773,7 @@ impl Sqlite {
         let before = fs::symlink_metadata(path)?;
         // Identity probes use immutable mode on the frozen base pages. ACK
         // settlement must instead see the live WAL's committed generation.
-        let uri = sqlite_uri(path)?;
-        let uri = uri
-            .strip_suffix("&immutable=1")
-            .context("state_v2_ack_live_uri")?;
+        let uri = sqlite_uri(path, "mode=ro")?;
         let conn = Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY
