@@ -2114,7 +2114,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     }
 }
 
-/// [regress] P1: an overdue restored checkpoint must finish through the real cursor
+/// [regress] An overdue restored checkpoint must finish through the real cursor
 /// seal, publish, replace its disk record, then restore without rereading.
 /// At 57ffaa32 Codex increments jobs_audit_restarted, never jobs_certified.
 /// Claude is the already-working ordinary-Tail negative regression control.

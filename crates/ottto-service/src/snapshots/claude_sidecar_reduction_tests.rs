@@ -1061,7 +1061,7 @@ mod durable_restart {
 
     /// A native write-ahead acquisition may be ahead of the saved selection.
     /// It restores Unchanged and still emits the cold Full's exact body.
-    /// A cleared selection also permits an independently proved acquisition (#865).
+    /// A cleared selection also permits an independently proved acquisition (audit).
     fn assert_fresh_restart_matches_full(f: &Fixture, state: &State, settled: ScanIndex) {
         let fresh = Arc::new(SharedCache::default());
         state.begin(&fresh);
@@ -1108,7 +1108,7 @@ mod durable_restart {
 
     /// [format] F2, the cleared-fingerprint reparse case: settlement clears the held
     /// entry's fingerprint (reparse debt). Post-save refuses that selection;
-    /// #865 still permits acquisition proof independent of the cleared entry.
+    /// audit still permits acquisition proof independent of the cleared entry.
     #[test]
     fn a_cleared_fingerprint_reuses_only_a_proved_native_acquisition() {
         let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1153,7 +1153,7 @@ mod durable_restart {
             .into_test_option()
             .is_none());
         let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
-        // #865 selection-clear permits acquisition proof; it is no longer an
+        // audit selection-clear permits acquisition proof; it is no longer an
         // early refusal. Unsupported layouts wrote no predecessor at all.
         assert!(!counters.ineligible.contains_key("selection_cleared"));
         let present = u64::from(crate::heap_layout_bound::layout_supported());
@@ -1188,7 +1188,7 @@ mod durable_restart {
         f.append_transcript(2);
         f.evidence(3);
         state.begin(&second);
-        // Round4 approved absent-upgrade growth pacing. This row requires a
+        // Absent-upgrade recovery paces growth. This row requires a
         // second acquisition (ahead of the saved selection), not a paced hold.
         crate::snapshots::sampled_scan::durable_tail::tests::expire_full_pace(&second, &key);
         let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});

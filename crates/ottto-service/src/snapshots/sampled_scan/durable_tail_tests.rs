@@ -2021,7 +2021,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             .into_test_option()
             .is_none());
         let (counts, disk) = cache.durable_counters(source).unwrap();
-        // #865's finite original-binding classifier owns Claude scope misses.
+        // The finite original-binding classifier owns Claude scope misses.
         assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
         assert_eq!(counts.restored, 0);
         assert_eq!(disk.records_read, 1);
@@ -2396,7 +2396,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
 
 /// C1: a store this process does not own is disabled for the process with
 /// ONE store-level alarm on the `local_resources` carrier; a newer-format
-/// record in it is neither held nor rebuilt (memory-only, pre-#806).
+/// record in it is neither held nor rebuilt in memory-only mode.
 #[test]
 fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -3127,7 +3127,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
             .unwrap()
             <= 1));
     assert_eq!(std::fs::read(&record).unwrap(), corrupt);
-    // P2 review: preserve size/mtime while replacing the object. The healthy
+    // Preserve size/mtime while replacing the object. The healthy
     // production exit must still invalidate stale request-hash authority.
     let mut index = index;
     assert!(index.claude_request_census.get(&key).is_some());
@@ -3177,7 +3177,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Lead B (#829): a production post-save that skipped the per-pass setup
+/// A production post-save that skipped the per-pass setup
 /// never wipes valid records, even for keys the index does not hold. With
 /// the setup, ordinary GC keeps an indexed but undecided key and collects
 /// unadjudicable absent records; the GC counters prove the walk ran.
@@ -3310,7 +3310,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
             .unwrap()
             .source_file_fingerprint
             .clear();
-        // #865 removed Claude's selection-clear veto ON. OFF retains main's
+        // Claude's selection-clear veto is disabled ON. OFF retains main's
         // pre-I/O reparse-debt label without opening a store.
         assert_eq!(
             label(attempt(&index)),
@@ -3591,7 +3591,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         ));
     });
     lease.release();
-    // #830's wrapper rechecks holds on a restore miss. The compressed
+    // The wrapper rechecks holds on a restore miss. The compressed
     // refusal must precede that record IO too, not just restore_known.
     let lock = test_locks::hold(&root);
     let index_path = root.join("index.json");
@@ -3640,8 +3640,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Contract-5 cutover (Lead B, byte-stable keys): a record a permit-era
-/// permitted Claude cycle wrote (capture on, the E2 contract recorded)
+/// A record written by a permitted Claude cycle with identity capture on
 /// keeps its identity interpretation byte for byte under the always-on
 /// capture, so it binds and restores; nothing is refused. Codex never
 /// captured and still does not.
@@ -4049,7 +4048,7 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         None
     );
     index = held;
-    // Preserve genuine sampled debt for discovery past W. Since #870,
+    // Preserve genuine sampled debt for discovery past W;
     // overdue ordinary checkpoints still Tail: age cannot authorize a Full.
     // Use the existing independent head-edit cause for the counted Full below;
     // leading JSON whitespace preserves every native money/body field.
@@ -4328,7 +4327,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
                 }
                 if refusal == "eligibility" {
-                    // #870 removed audit age/cap as reuse gates. A RAM copy
+                    // Audit age/cap do not gate reuse. A RAM copy
                     // without its committed index binding is still ineligible.
                     scan.index.files.remove(&key);
                 }
@@ -4504,7 +4503,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
             if reason == "prepare_incompatible" {
                 let mut original = cache.take(&key).expect("real original");
                 // Real source/counting graph incompatibility; capture-only
-                // equality is pre-cutover and disappears with main #840.
+                // equality alone does not establish compatible reduction state.
                 let other_path = root.join("other-source.jsonl");
                 let other_source = if source == SnapshotSource::Codex {
                     SnapshotSource::ClaudeCode
@@ -6070,7 +6069,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     ));
     assert!(
         sampled_audit::path_requires_recovery(source, &index.files, &path, 7),
-        "retain partial safeguard until E3 #876 supplies old-directory rescue"
+        "retain partial growth safeguard until bounded old-directory rescue is available"
     );
     assert!(!sampled_audit::path_requires_recovery(
         source,
@@ -6664,7 +6663,7 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
     assert_eq!(modes, (0, 0, 0), "changed body acquired exactly once");
 }
 
-/// Every retained #865 probe needs input credit even on a memo hit. The
+/// Every retained audit probe needs input credit even on a memo hit. The
 /// settlement probe remains read-only and missing membership recovers due.
 /// [format] member settlement and final full probes reserve before any classifier io.
 #[test]
@@ -7902,7 +7901,7 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
     let root = crate::test_scratch::ScratchDir::new("bounded-quiet");
     let path = root.join("source.jsonl");
     let scope = Scope("quiet-content".into());
-    // Pi's durable registration is E5's responsibility; its metadata gate is
+    // Pi is not registered in the durable source table; its metadata gate is
     // exercised with the same scoped restore entry before source decode.
     for source in [
         SnapshotSource::ClaudeCode,
@@ -8870,8 +8869,8 @@ fn off_publication_invalidates_outgrown_v1() {
 }
 
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
-// acknowledged successor -> second process loss. Move this row to the shared
-// transition fixture when #882 lands; retain these production scanner/wire calls.
+// acknowledged successor -> second process loss, through production
+// scanner and wire calls.
 /// [money] p2 restart restore tail persists successor and restarts again.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
@@ -8976,7 +8975,7 @@ fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// [money] Claude-only #859/active-carry restore: Tail with zero Full; Codex retains one Full before restart Tail.
+/// [money] Claude active-carry restore uses Tail with zero Full; Codex retains one Full before restart Tail.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
@@ -10720,7 +10719,7 @@ fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_p
     }
 }
 
-/// [regress] P2-1 (review r10): a resident deferred by the per-save byte budget
+/// [regress] A resident deferred by the per-save byte budget
 /// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
 /// save, with no rescan or admission of the key in between, writes its
 /// record: no selection refusal, no invalidation of the key's existing

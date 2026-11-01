@@ -212,7 +212,7 @@ pub(super) fn receipt_with_output(
 
 /// The disk arm's state directory (#806): the committed scan index and,
 /// beside it, the real durable store, under a test-held single-writer lock
-/// (#801). Every arm loads the SAME committed index. A restart forks those
+/// for each fixture. Every arm loads the SAME committed index. A restart forks those
 /// committed bytes before the retained arm can replace its write-ahead record.
 /// Each arm keeps the production single-writer ownership of its own store.
 struct Disk {
@@ -1160,7 +1160,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
         let text = std::iter::once(header).chain(lines).map(|v| v.to_string()+"\n").collect::<String>();
         let path = c.root.join("rollout.jsonl");
         if name == "dropped-staging" {
-            // Lead B: main quarantines the whole entity, including its valid
+            // The existing policy quarantines the whole entity, including its valid
             // sibling usage. Exercise that policy after a genuine disk restore
             // and Tail, as well as from RAM and a cold byte-zero read.
             let source = SnapshotSource::Codex;

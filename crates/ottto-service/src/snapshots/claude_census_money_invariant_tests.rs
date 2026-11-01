@@ -760,7 +760,7 @@ fn census_admission_releases_kept_records_oldest_first() {
     );
 }
 
-/// M3 with #920: a paced residue still owns unread growth, so admission may
+/// M3 with census admission: a paced residue still owns unread growth, so admission may
 /// not spend a record the terminal would keep. Each source of the held set
 /// spares the oldest record; the next kept record pays instead. The negative
 /// control is `census_admission_releases_kept_records_oldest_first`.

@@ -495,7 +495,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
-    "reread_guard", // Retired positional slot: drained and never serialized.
+    "reread_guard", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
     "held_audit_progress",
@@ -2044,7 +2044,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name != "claude_desktop_store_inventory" && name != "reread_guard" {
+                    } else if !matches!(name, "reread_guard" | "claude_desktop_store_inventory") {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -2058,7 +2058,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "reread_guard" => {}
+                        "reread_guard" => {} // TOMBSTONE: decode-and-drop.
                         "claude_desktop_store_inventory" => {
                             // No new refusal: this key was unknown to the last
                             // release. A digest is 64 bytes plus its quotes, so

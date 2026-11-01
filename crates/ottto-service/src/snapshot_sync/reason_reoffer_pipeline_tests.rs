@@ -1711,7 +1711,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// [regress] SOURCE B1: the cooldown test's twin with the durable store present.
+/// [regress] The cooldown test's twin with the durable store present.
 /// Both arms hold the state-directory lock, so their earlier cycles write
 /// the retained copy; the cold arm then drops the store, the warm arm keeps
 /// it. Across restarts that could restore the file, the quiet cycles still

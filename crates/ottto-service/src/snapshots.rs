@@ -7854,8 +7854,8 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
-/// E1 disposition-table note4 / E2-1: the native caller's five publishing
-/// classes and three held classes. RAM-only transport, never persisted authority.
+/// The native caller's five publishing classes and three held classes.
+/// RAM-only transport, never persisted authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativePublication {
     Receipted,
@@ -7883,7 +7883,7 @@ impl NativePublication {
 
     #[cfg(unix)]
     fn strict_rebind(source: SnapshotSource) -> Self {
-        // E1 r20 D2: only Codex has D3's strict rebind + degraded publication.
+        // Only Codex permits strict rebind with degraded publication.
         // Every non-Codex source keeps the caller's existing owed/hold conversion.
         match source {
             SnapshotSource::Codex => Self::FailedPublishedWithoutRecord,
@@ -29746,7 +29746,7 @@ impl OwnedSourceScan {
                     }
                 }
                 let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
-                // R1 funding admission precedes finish_job/rotation.complete.
+                // Funding admission precedes finish_job/rotation.complete.
                 // A busy probe parks the exact EOF job with its cursor lease;
                 // retry cannot be fenced out before settlement exists.
                 #[cfg(unix)]
@@ -31897,7 +31897,7 @@ impl OwnedSourceScan {
                             }
                         }
                     }
-                    // D3 Codex: after every #865 staging above (staging
+                    // D3 Codex: after every audit staging above (staging
                     // matches the fingerprint), before this entry's save
                     // settles the degraded publication.
                     #[cfg(unix)]
@@ -34647,7 +34647,7 @@ impl OwnedSourceScan {
                                         active_bound_degraded = true;
                                         (None, taken_admission, debt)
                                     }
-                                    // #870 retired debt as a reason to skip a reusable
+                                    // Audit debt alone cannot skip a reusable
                                     // record. A stale one still cannot hold a due audit.
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(_)
                                     | sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(..)
@@ -37710,9 +37710,9 @@ fn unprepared_disposition(
     }
 }
 
-/// D3 Codex (SOURCE conditions 1, 2 and 4): make a surviving record A
+/// For Codex, make a surviving record A
 /// unbindable in the same working index whose save settles the degraded
-/// publication, without deleting anything. The entry, its #865 marker and
+/// publication, without deleting anything. The entry, its audit marker and
 /// deadline (`scan_identity_version`), key, membership and accepted body
 /// facts stay; only the selection witness is cleared, the existing reparse
 /// debt that settlement preserves. Both readers refuse A afterward: this
@@ -37738,7 +37738,7 @@ fn codex_strict_rebind(index: &mut ScanIndex, source: SnapshotSource, key: &str)
 
 /// D3's crash boundary is before the upload request can be acknowledged.
 /// Persist the binding change on the previously committed PRE entry, never on
-/// a newly parsed body/revision/extent. Carry #865 only toward more audit debt.
+/// a newly parsed body/revision/extent. Retain or increase existing audit debt.
 #[cfg(unix)]
 pub(crate) fn commit_store_fault_barrier(
     cache: &sampled_scan::SharedCache,
@@ -87213,7 +87213,7 @@ pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
 const _: () = {
     assert!(size_of::<OwnedJsonlParser>() == 5312);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
-    // #876 adds CandidateFile.withheld_content_stamp (Option<String>, 24 B)
+    // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
     // to M3's 856-byte active frame; parser/custody boxing is unchanged.
     assert!(size_of::<OwnedActiveFile>() == 880);
     assert!(

@@ -2174,7 +2174,7 @@ impl DurableTailStore {
                     };
                     // Class exclusion is an explicit owner decision, not restore
                     // or overwrite authority. Retire only a verified native v3
-                    // record, after its #865 debt is carried by the index.
+                    // record, after its audit debt is carried by the index.
                     if header.audit_debt.is_some_and(|due| {
                         !audit_debt.is_some_and(|carrier| carrier > 0 && carrier <= due)
                     }) {

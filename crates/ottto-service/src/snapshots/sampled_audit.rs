@@ -255,8 +255,8 @@ pub(super) fn path_requires_verification(
     })
 }
 
-/// Retain the existing partial growth safeguard and S2 shorter/future floors
-/// until E3 #876 joins through main with its bounded old-directory rescue.
+/// Retain the existing partial growth safeguard and shorter/future floors
+/// until bounded old-directory rescue keeps all held growth discoverable.
 /// This predicate alone does NOT implement or qualify that dependency.
 /// Discovery grants no ACK, census proof or independent read permission.
 pub(super) fn path_requires_recovery(

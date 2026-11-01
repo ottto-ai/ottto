@@ -251,8 +251,8 @@ impl SharedCache {
 }
 
 // Qualified 64-bit main root: Stores 18,272 B, complete SharedCache 40,784 B.
-// #876's memo handle fits the root's existing padding; its owned header is
-// charged separately above. #962 changes visits only; #963's touched-family
+// The memo handle fits the root's existing padding; its owned header is
+// charged separately above. The touched-family
 // view remains behind the already boxed cursor job.
 // Keep its reservation while OFF, even though optional M3 owners now allocate
 // only for ON or the approved erasure/invalidation actions.
@@ -2037,10 +2037,10 @@ pub(super) mod test_hooks {
         BeforeStampGate,
         /// After `retain_reduction` returns, before `finish`.
         AfterRetain,
-        /// M3 E5: the prepared native finish returned (any staged temp still
+        /// The prepared native finish returned (any staged temp still
         /// private), before the commit fences or any store decision.
         BeforeNativeSettle,
-        /// M3 E12: the completion is settled (receipt, owed hold or degraded
+        /// The completion is settled (receipt, owed hold or degraded
         /// disposition), before cursor publication, birth or any effect.
         BeforeNativeEffects,
         /// Before the retained PRE binding changes on disk; no POST is allowed.
