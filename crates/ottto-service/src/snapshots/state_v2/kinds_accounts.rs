@@ -271,7 +271,8 @@ fn compact(
             windows.push(w);
         }
         // Authenticate the stored current separately; it never enters the plan.
-        window(tx, family, *current_id, Some(&mut digests), &mut seen)?;
+        let current = window(tx, family, *current_id, Some(&mut digests), &mut seen)?;
+        bytes += window_bytes(std::slice::from_ref(&current));
         for (id, digest) in ids.iter().zip(&previous.digests) {
             ensure!(
                 digests.get(&mapper::key("account_window", family, *id)?) == Some(digest),

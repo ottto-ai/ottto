@@ -1,4 +1,5 @@
 //! Integration fixtures; compiled locally, executed only in later CI.
+use super::super::import::Mapper;
 use super::*;
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 use std::collections::BTreeSet;
@@ -809,7 +810,7 @@ pub(in crate::snapshots) fn compact_reopened_for_test(
     let (scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, index);
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (mut cold, mut cx) = super::super::Mapper.hydrate_context(&mut db).unwrap();
+    let (mut cold, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
     // Hydration normally keeps held archives resident. Force the cold view to
     // exercise the global hold exclusion, including an unrelated opaque row.
     for (root, pending) in &mut cold.claude_account_family_pending {
@@ -844,6 +845,7 @@ pub(in crate::snapshots) fn compact_reopened_for_test(
 /// [money] Whole-family work can exceed the allowance, but a save stops before
 /// the next family. Rollback grants no progress; restart rediscovers the rest.
 #[test]
+#[serial_test::serial]
 fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
     let (scratch, mut db) = Scratch::live_store();
     let mut original = fixture();
@@ -866,7 +868,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         .insert("z-family".into(), second);
     commit_populate(&mut db, &original);
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (mut graph, mut cx) = super::super::Mapper.hydrate_context(&mut db).unwrap();
+    let (mut graph, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
     let previous = baseline(&graph, &mut cx).unwrap();
     let before = previous.rows.clone();
     let positions = |db: &mut sqlite::Sqlite, family: &str| {
@@ -880,7 +882,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
     let inventory = positions(&mut db, "synthetic-family");
     let counters = telemetry::latest_for_test("account_windows_compacted");
     sqlite::fence_commit_writing(&db, "generation");
-    assert!(super::super::Mapper
+    assert!(Mapper
         .save(&mut db, &identity, previous, &mut graph, &mut cx, false)
         .is_err());
     assert_eq!(
@@ -894,10 +896,10 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         counters
     );
     assert_eq!(positions(&mut db, "synthetic-family"), inventory);
-    let (mut graph, mut cx) = super::super::Mapper.hydrate_context(&mut db).unwrap();
+    let (mut graph, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
     let previous = baseline(&graph, &mut cx).unwrap();
     let stale = graph.clone();
-    let first = super::super::Mapper
+    let first = Mapper
         .save(&mut db, &identity, previous, &mut graph, &mut cx, false)
         .unwrap();
     assert_eq!(
@@ -934,7 +936,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
     db.path_extractor(private_paths);
     db.reference_extractor(references);
-    let (mut graph, mut cx) = super::super::Mapper.hydrate_context(&mut db).unwrap();
+    let (mut graph, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
     assert_eq!(
         graph.claude_account_family_pending["synthetic-family"]
             .previous_windows
@@ -942,7 +944,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         0
     );
     let previous = baseline(&graph, &mut cx).unwrap();
-    let final_rows = super::super::Mapper
+    let final_rows = Mapper
         .save(&mut db, &identity, previous, &mut graph, &mut cx, false)
         .unwrap();
     assert_eq!(
@@ -962,7 +964,7 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
         assert_eq!(before.get(key), Some(digest), "{key:?}");
     }
     let attempts = db.save_row_attempts();
-    super::super::Mapper
+    Mapper
         .save(&mut db, &identity, final_rows, &mut graph, &mut cx, false)
         .unwrap();
     assert_eq!(db.save_row_attempts().1, attempts.1);
