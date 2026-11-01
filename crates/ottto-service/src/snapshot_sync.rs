@@ -23784,6 +23784,7 @@ mod tests {
     /// bound; the route takes an alarmed paced hold, nothing is posted and
     /// custody bytes are unchanged.
     #[test]
+    #[serial]
     fn v2_custody_prunes_settled_cache_evidence_and_holds_live_overflow_without_post() {
         let counter = |rows: &[serde_json::Value], name: &str| {
             rows.iter()
