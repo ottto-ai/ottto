@@ -408,15 +408,20 @@ impl PipelineFixture {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
             PipelineUpload::ServerDeferred => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
             }
             PipelineUpload::ServerRejected => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true, None)
             }
             PipelineUpload::EntityAckRejected { .. } => match &result {
-                ResumableUploadResult::Rejected { .. } => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
-                }
+                ResumableUploadResult::Rejected { .. } => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    true,
+                    None,
+                ),
                 ResumableUploadResult::Completed => {
                     settle_completed_upload(index, &committed_index, &progress, &holds)
                 }

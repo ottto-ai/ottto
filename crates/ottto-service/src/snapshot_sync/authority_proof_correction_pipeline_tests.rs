@@ -839,10 +839,10 @@ impl ApcFixture {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
             ResumableUploadResult::Rejected { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true, None)
             }
             ResumableUploadResult::Deferred { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
             }
             other => panic!("unexpected synthetic upload {other:?}"),
         };
@@ -2283,6 +2283,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                     &progress,
                     &holds,
                     outcome == "permanent",
+                    None,
                 )
             };
             assert_eq!(selected.fully_settled, expected_transport);

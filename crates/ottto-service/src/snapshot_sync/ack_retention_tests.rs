@@ -1925,6 +1925,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &progress,
                 &holds,
                 other == "rejected",
+                None,
             ),
         };
         assert!(!settlement.fully_settled, "{outcome}");
