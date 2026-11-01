@@ -1069,6 +1069,15 @@ fn handle_command(
             status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
+            // Doctor only: ordinary status polls must not walk the store.
+            #[cfg(unix)]
+            if retry_relay_authorization {
+                if let Ok((files, bytes)) =
+                    crate::claude_local_otel::support_health::store_size(&default_support_dir())
+                {
+                    value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
+            }
             Ok(value)
         }
         LocalControlCommand::Receipts {
