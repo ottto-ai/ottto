@@ -77,7 +77,6 @@ impl PiBound {
             &[],
             false,
             true,
-            true,
         )
         .with_sampled_acquisition(cache, self.namespace.clone());
         let mut modes = (0, 0, 0);
