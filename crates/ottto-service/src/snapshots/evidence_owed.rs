@@ -547,6 +547,16 @@ pub(super) fn resolve(
     }
 }
 
+/// ON, a traversal started under the recorded identity contract: its census
+/// window is the first whose records that contract wrote, unless an earlier
+/// one already is (a contract change clears it).
+pub(super) fn start_contract_window(index: &mut ScanIndex, census_window_end: &str) {
+    let progress = &mut index.claude_full_rearm_progress;
+    if enabled() && progress.identity_contract_window.is_none() {
+        progress.identity_contract_window = rfc3339_unix_seconds(census_window_end);
+    }
+}
+
 /// ON, identity-contract latch set: the walk's queue length at a page's
 /// start, summed per page, so the paced owed reads can be seen draining.
 pub(super) fn note_page_start(index: &ScanIndex, source: SnapshotSource) {

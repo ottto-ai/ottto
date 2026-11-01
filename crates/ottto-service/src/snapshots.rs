@@ -2397,6 +2397,13 @@ struct ClaudeFullRearmProgress {
     /// The `""` cutover's latch re-arms at one terminal.
     #[serde(skip_serializing_if = "is_zero_u8")]
     contract_cutover: u8,
+    /// Evidence owed ON: census window (unix seconds) of the first traversal
+    /// started under the recorded identity contract. A change inside a
+    /// window records a placeholder, so this is the next window: a census
+    /// record of this window or later was parsed under the recorded contract.
+    /// Cleared by a contract change; absent, only this window's records count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_contract_window: Option<u64>,
 }
 
 impl ClaudeFullRearmProgress {
@@ -10592,6 +10599,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let mut preserved = 0;
         let guard = evidence_owed::enabled();
         let census_window = rfc3339_unix_seconds(census_window_end);
+        let contract_window = index.claude_full_rearm_progress.identity_contract_window;
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -10622,20 +10630,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     .is_some_and(|request_hashes| {
                         !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                     });
-            // Evidence owed ON: a revision read in this window was read under
-            // the recorded contract (a change within the walk leaves it
+            // Evidence owed ON: a revision read in this window, or in any
+            // window from the first one started under the recorded contract,
+            // was read under that contract (a change within a walk leaves it
             // unrecorded and this re-arm off). The identity-contract re-arm
             // does not owe it again, so one read clears that debt even when
             // its family stays cap-invalid.
+            let record = index.claude_request_census.get(index_key);
             let identity_contract_rearm = identity_contract_rearm
                 && !(guard
                     && census_window.is_some_and(|window| {
-                        index
-                            .claude_request_census
-                            .get(index_key)
-                            .is_some_and(|record| {
-                                record.reproduces(&entry.source_file_fingerprint, window)
-                            })
+                        record.is_some_and(|record| {
+                            record.reproduces_since(
+                                &entry.source_file_fingerprint,
+                                window,
+                                contract_window,
+                            )
+                        })
                     }));
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
@@ -10693,8 +10704,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     entry.source_file_fingerprint.clear();
                 } else {
                     if identity_contract_rearm && !entry.rearmed() {
+                        let reowed =
+                            record.is_some_and(|record| record.written_since(contract_window));
                         claude_contract::note(|counts| {
-                            counts.evidence_owed.identity_contract_owed += 1
+                            let owed = &mut counts.evidence_owed;
+                            owed.identity_contract_owed += 1;
+                            owed.reowed_after_current_contract_read += u64::from(reowed);
                         });
                     }
                     evidence_owed::clear(entry);
@@ -26874,6 +26889,7 @@ impl OwnedSourceScan {
             ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
+            evidence_owed::start_contract_window(index, collected_at);
         }
         let growth_active =
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
@@ -47465,6 +47481,7 @@ impl ScanIndex {
             }
             (state, _) => state,
         };
+        self.claude_full_rearm_progress.identity_contract_window = None;
         claude_contract::note(|counts| {
             counts.identity_contract_latch.set +=
                 u64::from(!self.claude_request_identity_contract_changed);
@@ -84267,7 +84284,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover, identity_contract_window);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);

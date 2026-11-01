@@ -66,6 +66,7 @@ counters!(EvidenceOwed {
     age_gt_7d,
     age_unknown,
     identity_contract_owed,
+    reowed_after_current_contract_read,
     identity_owed_read_under_latch,
     queue_at_page_start_under_latch
 });

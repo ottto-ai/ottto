@@ -146,6 +146,23 @@ impl Rearm {
         census_complete: bool,
         max_pending_occurrences: usize,
     ) -> ClaudeUsageAuthorityDisposition {
+        self.fold_in(
+            index,
+            items,
+            census_complete,
+            max_pending_occurrences,
+            WINDOW,
+        )
+    }
+
+    fn fold_in(
+        &self,
+        index: &mut ScanIndex,
+        items: &[SnapshotItem],
+        census_complete: bool,
+        max_pending_occurrences: usize,
+        window: &str,
+    ) -> ClaudeUsageAuthorityDisposition {
         let mut items = items.to_vec();
         apply_claude_reported_usage_with_index_and_limits(
             &mut items,
@@ -156,7 +173,7 @@ impl Rearm {
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             index,
             census_complete,
-            WINDOW,
+            window,
             max_pending_occurrences,
             MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
             None,
@@ -616,16 +633,13 @@ fn record_read(index: &mut ScanIndex, key: &str, source: &str) {
     entry.evidence_owed = false;
 }
 
-/// [money] Evidence owed ON, the identity-contract re-arm owes and paces:
+/// [behaviour] Evidence owed ON, the identity-contract re-arm owes and paces:
 /// every family file keeps its revision, owed and counted, instead of main's
 /// clear, and older-contract pending never re-stamps. Here one owed read
 /// fits a page, so the family files drain one per page, each read once,
 /// with the latch cleared at that completion and with it held (an
 /// unsettled sweep, the family cap-invalid: never kept waiting for cap
-/// room). The bodies the drain emits equal a cold Full's, which reads every
-/// family file once (emitted-money oracle, placement included). One account
-/// with untagged rows: the e2 pipeline fixture keeps its duplicate fence
-/// open, and this re-arm runs only behind a closed one.
+/// room). Every family file is read exactly once, as a cold Full reads it.
 #[test]
 fn identity_contract_rearm_owes_and_drains_to_a_full() {
     let _on = evidence_owed::EvidenceOwedForTest::on();
@@ -713,26 +727,52 @@ fn identity_contract_rearm_owes_and_drains_to_a_full() {
     }
 }
 
-/// [regress] While the identity-contract latch holds (an unsettled sweep),
-/// main clears and re-reads every family file at each complete census.
-/// Owed instead, a member read in this window was read under the recorded
-/// contract, so the next completion does not owe it again: one read clears
-/// that debt, also for a cap-invalid family. Members not yet read stay owed
-/// and are not counted twice.
-#[test]
-fn identity_owed_member_is_read_once_under_the_latch() {
-    let _on = evidence_owed::EvidenceOwedForTest::on();
-    let mut rearm = Rearm::new();
-    let mut index = rearm.index();
-    rearm.establish(&mut index, &rearm.items);
-    let mut index = latched_with_older_evidence(&mut rearm, index);
-    // Census records bind sha256-shaped revisions.
+/// A census record of `source` at `key`, parsed in `window`.
+fn record_census(index: &mut ScanIndex, key: &str, source: &str, window: &str) {
+    let window = rfc3339_unix_seconds(window).unwrap();
+    index.claude_request_census.insert(
+        key.to_string(),
+        super::stale_family_carry_tests::scoped_retry_record(
+            key,
+            serde_json::json!({
+                "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+                "fp": source,
+                "w": window,
+                "s": "empty",
+                "bi": window,
+                "bd": 1, "bn": 1,
+            }),
+        ),
+    );
+}
+
+/// Family files with sha256-shaped revisions (census records bind them).
+fn hex_sources(rearm: &mut Rearm, index: &mut ScanIndex) {
     for (n, source) in rearm.sources.values_mut().enumerate() {
         *source = n.to_string().repeat(64);
     }
     for (key, source) in &rearm.sources {
         index.files.get_mut(key).unwrap().source_file_fingerprint = source.clone();
     }
+}
+
+/// [regress] While the identity-contract latch holds (an unsettled sweep),
+/// main clears and re-reads every family file at each complete census.
+/// Owed instead, a member read under the recorded contract is not owed again
+/// at any later completion: one read clears that debt, also for a
+/// cap-invalid family. Three completions in three windows: the member read
+/// in the walk after the first is owed neither at the second nor at the
+/// third. Members not yet read stay owed and are not counted twice.
+#[test]
+fn identity_owed_member_is_read_once_under_the_latch() {
+    const NEXT: &str = "2026-08-02T07:11:00Z";
+    const LATER: &str = "2026-08-02T07:12:00Z";
+    let _on = evidence_owed::EvidenceOwedForTest::on();
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut index = latched_with_older_evidence(&mut rearm, index);
+    hex_sources(&mut rearm, &mut index);
     index.bounded_sweep_had_unsettled_upload = true;
     rearm.fold(&mut index, &rearm.items, true, 1);
     assert!(index.claude_request_identity_contract_changed);
@@ -740,6 +780,8 @@ fn identity_owed_member_is_read_once_under_the_latch() {
         .sources
         .keys()
         .all(|key| index.files[key].evidence_owed));
+    // The next walk starts under the recorded contract and reads the parent.
+    evidence_owed::start_contract_window(&mut index, NEXT);
     let parent = local_index_key(&rearm.root.join(format!("{}.jsonl", rearm.parent)));
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     assert_eq!(
@@ -752,36 +794,123 @@ fn identity_owed_member_is_read_once_under_the_latch() {
     let owed = scope.finish().contract.evidence_owed;
     assert_eq!((owed.read, owed.identity_owed_read_under_latch), (1, 1));
     record_read(&mut index, &parent, &rearm.sources[&parent]);
-    index.claude_request_census.insert(
-        parent.clone(),
-        super::stale_family_carry_tests::scoped_retry_record(
-            &parent,
-            serde_json::json!({
-                "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
-                "fp": rearm.sources[&parent],
-                "w": rfc3339_unix_seconds(WINDOW).unwrap(),
-                "s": "empty",
-                "bi": rfc3339_unix_seconds(WINDOW).unwrap(),
-                "bd": 1, "bn": 1,
-            }),
-        ),
+    record_census(&mut index, &parent, &rearm.sources[&parent], NEXT);
+
+    for window in [NEXT, LATER] {
+        evidence_owed::start_contract_window(&mut index, window);
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let disposition = rearm.fold_in(&mut index, &rearm.items, true, 1, window);
+        assert!(
+            !disposition.duplicate_census.full_rearm,
+            "only the latch re-arms"
+        );
+        assert!(index.claude_request_identity_contract_changed);
+        let entry = &index.files[&parent];
+        assert!(
+            !entry.evidence_owed,
+            "read once: not owed again in {window}"
+        );
+        assert_eq!(entry.source_file_fingerprint, rearm.sources[&parent]);
+        assert!(rearm
+            .sources
+            .keys()
+            .filter(|key| **key != parent)
+            .all(|key| index.files[key].evidence_owed));
+        let owed = scope.finish().contract.evidence_owed;
+        assert_eq!(
+            (
+                owed.identity_contract_owed,
+                owed.reowed_after_current_contract_read
+            ),
+            (0, 0),
+            "{window}"
+        );
+    }
+}
+
+/// [money] A contract change inside window W leaves W's census records
+/// untrusted: they were parsed under the old contract. The next walk starts
+/// under the recorded contract, so the identity-contract re-arm at its
+/// completion owes every family file whose record is from W; each is read
+/// once, the drained bodies equal a cold Full's, and the completion after
+/// owes none of them again.
+#[test]
+fn contract_change_inside_a_window_reads_its_records_once() {
+    const W: &str = "2026-08-02T07:09:00Z";
+    const NEXT: &str = "2026-08-02T07:11:00Z";
+    const LATER: &str = "2026-08-02T07:12:00Z";
+    let _on = evidence_owed::EvidenceOwedForTest::on();
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut index = latched_with_older_evidence(&mut rearm, index);
+    hex_sources(&mut rearm, &mut index);
+    index.bounded_sweep_had_unsettled_upload = true;
+    // W reads every family file under the old contract, which changes
+    // within W's walk.
+    index.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_string());
+    evidence_owed::start_contract_window(&mut index, W);
+    for (key, source) in &rearm.sources {
+        record_census(&mut index, key, source, W);
+    }
+    index.traversal = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+    index.observe_claude_request_identity_contract(false);
+    assert_eq!(
+        index.claude_full_rearm_progress.identity_contract_window,
+        None
     );
+    // The next walk starts under the recorded contract.
+    index.traversal = None;
+    index.record_started_claude_request_identity_contract(false);
+    evidence_owed::start_contract_window(&mut index, NEXT);
 
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let disposition = rearm.fold(&mut index, &rearm.items, true, 1);
-    assert!(
-        !disposition.duplicate_census.full_rearm,
-        "only the latch re-arms"
+    rearm.fold_in(&mut index, &rearm.items, true, 1, NEXT);
+    let owed = scope.finish().contract.evidence_owed;
+    assert_eq!(
+        (
+            owed.identity_contract_owed,
+            owed.reowed_after_current_contract_read
+        ),
+        (rearm.sources.len() as u64, 0)
     );
+    let body = |key: &str| {
+        if key == rearm.other_key() {
+            vec![rearm.other_family(false)]
+        } else {
+            parse_claude_code_jsonl_file(
+                Path::new(key),
+                "2026-08-02T07:01:00Z",
+                rearm.sources[key].clone(),
+            )
+            .unwrap()
+        }
+    };
+    let mut emitted = Vec::new();
+    for (key, source) in &rearm.sources {
+        assert!(index.files[key].evidence_owed, "{key}");
+        assert_eq!(
+            select_owed(&mut index, &mut evidence_owed::Page::default(), key).0,
+            CandidateDecision::Parse
+        );
+        emitted.extend(body(key));
+        record_read(&mut index, key, source);
+        record_census(&mut index, key, source, NEXT);
+    }
+    let full = rearm
+        .sources
+        .keys()
+        .flat_map(|key| body(key))
+        .collect::<Vec<_>>();
+    super::stale_family_carry_tests::assert_bodies_equal_a_full(&full, &emitted);
+
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    rearm.fold_in(&mut index, &rearm.items, true, 1, LATER);
     assert!(index.claude_request_identity_contract_changed);
-    let entry = &index.files[&parent];
-    assert!(!entry.evidence_owed, "read once: not owed again");
-    assert_eq!(entry.source_file_fingerprint, rearm.sources[&parent]);
     assert!(rearm
         .sources
         .keys()
-        .filter(|key| **key != parent)
-        .all(|key| index.files[key].evidence_owed));
+        .all(|key| !index.files[key].evidence_owed));
     assert_eq!(
         scope.finish().contract.evidence_owed.identity_contract_owed,
         0
