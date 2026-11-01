@@ -51247,6 +51247,7 @@ impl ScanIndex {
         self.committable_subset_with_local_holds(previous, accepted, quarantined, &BTreeSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn committable_subset_with_local_holds(
         &self,
         previous: &ScanIndex,
@@ -51254,21 +51255,23 @@ impl ScanIndex {
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        self.committable_subset_with_refusals(previous, accepted, quarantined, locally_held, None)
+        self.committable_subset_for_upload(previous, accepted, quarantined, locally_held, false)
     }
 
-    /// With `isolated_refusals`, the upload sent every batch and refused only
-    /// those items: every other entity not locally held settled exactly as
-    /// on a clean page, including unchanged ones this pass did not resend.
-    /// Refused and held entities keep their committed revision and stay owed.
-    /// Without it, only this pass's ACKs and quarantines settle.
-    pub(crate) fn committable_subset_with_refusals(
+    /// What a save after an upload may commit. Exact ACKs and quarantines
+    /// settle; locally held and decode-held entities never do and keep their
+    /// committed revision. With `every_batch_sent` (Completed, Deferred and
+    /// Rejected: refusals already have quarantine custody) every other entity
+    /// settles exactly as on a clean page, including unchanged ones this pass
+    /// did not resend. Without it (a shed, interrupted or failed upload) only
+    /// this pass's ACKs and quarantines settle.
+    pub(crate) fn committable_subset_for_upload(
         &self,
         previous: &ScanIndex,
         accepted: &BTreeSet<String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
-        isolated_refusals: Option<&BTreeSet<String>>,
+        every_batch_sent: bool,
     ) -> ScanIndex {
         if !self.persistence_available() || !previous.persistence_available() {
             let mut held = self.clone();
@@ -51276,14 +51279,22 @@ impl ScanIndex {
             return held;
         }
 
+        let accepted = accepted
+            .iter()
+            .filter(|fingerprint| !locally_held.contains(*fingerprint))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let quarantined = quarantined
+            .iter()
+            .filter(|(fingerprint, _)| !locally_held.contains(*fingerprint))
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
                 && (accepted.contains(fingerprint)
                     || quarantined.contains_key(fingerprint)
-                    || isolated_refusals.is_some_and(|refused| {
-                        !refused.contains(fingerprint) && !locally_held.contains(fingerprint)
-                    }))
+                    || (every_batch_sent && !locally_held.contains(fingerprint)))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.decode_holds_file(key) {
@@ -51728,7 +51739,7 @@ impl ScanIndex {
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
-        result.reconcile_codex_recovery_settlement(previous, accepted);
+        result.reconcile_codex_recovery_settlement(previous, &accepted);
         result
     }
 
@@ -81572,23 +81583,23 @@ mod tests {
     fn refused_item_keeps_only_its_own_file_owed() {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let no_holds = BTreeSet::new();
-        let ack_only = scanned.committable_subset_with_refusals(
+        let ack_only = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
             &no_holds,
-            None,
+            false,
         );
         assert!(ack_only.files["reread.jsonl"]
             .source_file_fingerprint
             .is_empty());
 
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &no_holds,
-            Some(&refused),
+            &refused,
+            true,
         );
         assert_eq!(
             scoped.files["reread.jsonl"].source_file_fingerprint,
@@ -81610,12 +81621,12 @@ mod tests {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let mut clean = scanned.clone();
         clean.record_accepted_snapshot_fingerprints(&accepted);
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &BTreeSet::new(),
-            Some(&refused),
+            &refused,
+            true,
         );
         let entry = |index: &ScanIndex, key: &str| {
             (
