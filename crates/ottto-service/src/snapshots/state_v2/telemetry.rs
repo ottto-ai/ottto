@@ -568,6 +568,8 @@ mod ops_tests {
                 member_occurrences: BTreeMap::new(),
                 invalid: false,
                 idless_revision: None,
+                identity_contract: None,
+                contract_unproven: false,
             },
         );
         let observation = retained_heap(&index);
