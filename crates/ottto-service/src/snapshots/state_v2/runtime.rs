@@ -1250,6 +1250,15 @@ pub(in super::super) fn load_usage(
                 Ok(())
             },
         )?;
+        // Every wanted row must have been read before any is installed.
+        if let Some(wanted) = &wanted {
+            let read: std::collections::BTreeSet<&String> =
+                read.iter().map(|(root, _, _)| root).collect();
+            ensure!(
+                wanted.iter().all(|root| read.contains(root)),
+                super::super::usage_pending::Unknown
+            );
+        }
         let cold = index
             .claude_usage_family_pending
             .cold_mut()
@@ -1257,12 +1266,8 @@ pub(in super::super) fn load_usage(
         for (root, value, digest) in read {
             cold.install(root, value, digest)?;
         }
-        match &wanted {
-            Some(wanted) => ensure!(
-                wanted.iter().all(|root| cold.loaded().contains_key(root)),
-                super::super::usage_pending::Unknown
-            ),
-            None => cold.complete()?,
+        if wanted.is_none() {
+            cold.complete()?;
         }
         Ok(())
     })();
@@ -1287,7 +1292,9 @@ pub(in super::super) fn settle_usage(
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::{erase_published, materialized};
+pub(in super::super) use tests::{
+    delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
+};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]
