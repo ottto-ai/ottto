@@ -108,10 +108,6 @@ pub(in crate::snapshots) fn fixture_birth() -> Option<u64> {
 thread_local! {
     static STAGES: RefCell<BTreeMap<&'static str, Duration>> = const { RefCell::new(BTreeMap::new()) };
 }
-#[cfg(test)]
-pub(crate) fn take_stages() -> BTreeMap<&'static str, Duration> {
-    STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
-}
 #[inline(always)]
 pub(in crate::snapshots) fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
     #[cfg(test)]
@@ -450,6 +446,33 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     store.set_money_rule_version(current);
 }
 
+/// Fixed count-only causes of the existing certificate veto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CertificateFailure {
+    UnplaceableUsage,
+    CopyRestoration,
+    IdlessRestoration,
+    HeldPrefixRemoval,
+    AmbiguousDuplicate,
+    IdentityGrain,
+    IdentityCost,
+    IdentityUsage,
+}
+impl CertificateFailure {
+    fn hold_reason(self) -> &'static str {
+        match self {
+            Self::UnplaceableUsage => "uncertified_by=unplaceable_usage",
+            Self::CopyRestoration => "uncertified_by=copy_restoration",
+            Self::IdlessRestoration => "uncertified_by=idless_restoration",
+            Self::HeldPrefixRemoval => "uncertified_by=held_prefix_removal",
+            Self::AmbiguousDuplicate => "uncertified_by=ambiguous_duplicate",
+            Self::IdentityGrain => "uncertified_by=identity_grain",
+            Self::IdentityCost => "uncertified_by=identity_cost",
+            Self::IdentityUsage => "uncertified_by=identity_usage",
+        }
+    }
+}
+
 /// Pure accumulation consumed by the request-owned literal emitter. No census, claims,
 /// custody, maturity or alternate response classifier participates here.
 #[derive(Debug, Clone)]
@@ -471,6 +494,7 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) resolver_conflicts: u64,
     pub(crate) held: bool,
     pub(crate) certificate_ok: bool,
+    pub(super) certificate_failure: Option<CertificateFailure>,
     /// Local-only uncertainty from every counted path twin.
     pub(crate) clock_incomplete: bool,
     /// Exact telemetry exceeded the identity owner's bounded key pool.
@@ -492,6 +516,7 @@ impl Default for ClaudeEntityBody {
             resolver_conflicts: 0,
             held: false,
             certificate_ok: true,
+            certificate_failure: None,
             clock_incomplete: false,
             identity_over_cap: false,
             live_maps_initialized: false,
@@ -505,6 +530,11 @@ fn mark_copy_key(key: &mut ClaudeLiveKey) {
     key.2.insert(COPY_UNPROVEN_KEY.into(), "true".into());
 }
 impl ClaudeEntityBody {
+    fn fail_certificate(&mut self, reason: CertificateFailure) {
+        self.certificate_ok = false;
+        self.certificate_failure.get_or_insert(reason);
+    }
+
     fn mark_copy_unproven(&mut self) {
         self.grains = std::mem::take(&mut self.grains)
             .into_iter()
@@ -625,6 +655,7 @@ impl ClaudeEntityBody {
             .saturating_add(other.resolver_conflicts);
         self.held |= other.held;
         self.certificate_ok &= other.certificate_ok;
+        self.certificate_failure = self.certificate_failure.or(other.certificate_failure);
         self.clock_incomplete |= other.clock_incomplete;
         self.identity_over_cap |= other.identity_over_cap;
         self.activity_unix = self.activity_unix.max(other.activity_unix);
@@ -703,6 +734,7 @@ macro_rules! entity_heap_method {
                 resolver_conflicts: _,
                 held: _,
                 certificate_ok: _,
+                certificate_failure: _,
                 clock_incomplete: _,
                 identity_over_cap: _,
                 activity_unix: _,
@@ -1196,7 +1228,8 @@ impl FileFold {
         }
         let Some(placement) = placed.placement.as_ref() else {
             // Native drops it as unplaceable usage; never publish over it.
-            self.entity.certificate_ok = false;
+            self.entity
+                .fail_certificate(CertificateFailure::UnplaceableUsage);
             self.disclose("unplaceable", 1);
             return;
         };
@@ -1502,7 +1535,8 @@ impl FileFold {
             self.entity.removed_requests.checked_sub(requests),
         ) else {
             // Cannot give it back exactly: never publish over it.
-            self.entity.certificate_ok = false;
+            self.entity
+                .fail_certificate(CertificateFailure::CopyRestoration);
             return;
         };
         self.entity.removed = removed;
@@ -1557,7 +1591,9 @@ impl FileFold {
                 self.prefix.unproven_idless += requests;
                 self.disclose("copy_idless", responses);
             }
-            _ => self.entity.certificate_ok = false,
+            _ => self
+                .entity
+                .fail_certificate(CertificateFailure::IdlessRestoration),
         }
     }
 
@@ -2641,7 +2677,8 @@ fn defer_prefix(
             fold.copied = fold.copied.saturating_sub(1);
             fold.prefix.held_requests += o.usage.request_count;
         } else {
-            fold.entity.certificate_ok = false;
+            fold.entity
+                .fail_certificate(CertificateFailure::HeldPrefixRemoval);
         }
     }
     if fold.first_own.is_none() || accepted_prefix {
@@ -2712,7 +2749,8 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     for id in uncovered {
         if fold.is_ambiguous(id) {
             // Two responses claim it: no single grain to give back.
-            fold.entity.certificate_ok = false;
+            fold.entity
+                .fail_certificate(CertificateFailure::AmbiguousDuplicate);
         } else if let Some(occurrence) = claude_usage_occurrences.get(id) {
             fold.restore_one(occurrence);
         }
@@ -2997,16 +3035,19 @@ pub(crate) fn place_request_identity(
     // take_estimated owns exact token/request removal; reported contributions
     // differ only in the cost and unpriced counters removed alongside them.
     let Some(grain) = fold.entity.grains.get(&slot) else {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityGrain);
         return;
     };
     let Some(left_cost) = grain.cost_micros.checked_sub(cost.unwrap_or(0)) else {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityCost);
         return;
     };
     let unpriced = grain.unpriced;
     if !fold.entity.take_estimated(&slot, &tokens, requests) {
-        fold.entity.certificate_ok = false;
+        fold.entity
+            .fail_certificate(CertificateFailure::IdentityUsage);
         return;
     }
     if let Some(grain) = fold.entity.grains.get_mut(&slot) {
@@ -3813,6 +3854,11 @@ pub(crate) fn finish_page(
                 "emission_rejected"
             };
             *hold_reasons.entry(reason).or_default() += 1;
+            if reason == "uncertified" {
+                if let Some(failure) = entity.certificate_failure {
+                    *hold_reasons.entry(failure.hold_reason()).or_default() += 1;
+                }
+            }
             withheld.insert(item.source_session_id.clone());
         }
         if let Some(accounts) = item

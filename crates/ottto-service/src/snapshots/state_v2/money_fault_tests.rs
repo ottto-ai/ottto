@@ -35,7 +35,7 @@ impl Value for Bytes {
         Ok(())
     }
 }
-fn headers(tx: &mut impl Transaction, table: Table) -> Vec<Header> {
+pub(super) fn headers(tx: &mut impl Transaction, table: Table) -> Vec<Header> {
     let mut all = Vec::new();
     let mut after = None;
     loop {

@@ -336,6 +336,7 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
+                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -841,6 +842,7 @@ impl Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
+            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -1156,6 +1158,10 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
+    /// Charged bytes of the last refused save, for its ceiling alarm.
+    pub(super) fn refused_save_bytes(&self) -> u64 {
+        self.stats.refused_save_bytes
+    }
     fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
@@ -1163,13 +1169,6 @@ impl Sqlite {
         if disk_full(error) {
             self.save_failure = Some(Hold::SaveFull);
             telemetry::event("sqlite_full", &1);
-        } else if error.chain().any(|e| {
-            matches!(
-                e.to_string().as_str(),
-                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
-            )
-        }) {
-            self.save_failure = Some(Hold::SaveCeiling);
         }
     }
 }
@@ -1185,6 +1184,7 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
@@ -1201,7 +1201,6 @@ impl Txn<'_> {
         // exceed them. Only the hard charged-work ceiling refuses publication.
         if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
             anyhow::bail!(Hold::SaveCeiling);
         }
         Ok(())
@@ -1248,31 +1247,49 @@ impl Txn<'_> {
             self.shared_erasure = true;
             return Ok(());
         }
-        if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
+        // Once erasure is required, a remembered set cannot change the outcome.
+        if self.shared_erasure || !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
-        let mut bytes = self.path_bytes;
-        bytes = bytes
-            .checked_add(owner_key_bytes(&old.key)?.len() * 2 + 512)
-            .context("state_v2_path_diff_admission")?;
+        let budget = self.store.purge_policy.path_diff_budget;
+        let mut bytes = self
+            .path_bytes
+            .saturating_add(owner_key_bytes(&old.key)?.len().saturating_mul(2))
+            .saturating_add(512);
+        let mut over = bytes > budget;
         let mut paths = BTreeSet::new();
-        (self.store.paths)(
-            old,
-            &StoredValue {
-                conn: self.store.conn()?,
-                header: old,
-            },
-            &mut |path| {
-                if !paths.contains(path) {
-                    bytes = bytes
-                        .checked_add(path.len() + 64)
-                        .context("state_v2_path_diff_admission")?;
-                    ensure!(bytes <= 32 * 1024 * 1024, "state_v2_path_diff_admission");
-                    paths.insert(path.to_owned());
-                }
-                Ok(())
-            },
-        )?;
+        if !over {
+            (self.store.paths)(
+                old,
+                &StoredValue {
+                    conn: self.store.conn()?,
+                    header: old,
+                },
+                &mut |path| {
+                    if !over && !paths.contains(path) {
+                        bytes = bytes.saturating_add(path.len()).saturating_add(64);
+                        over = bytes > budget;
+                        if !over {
+                            paths.insert(path.to_owned());
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if over {
+            // The diff budget bounds memory, never the save. Stop buffering and
+            // require erasure as a detected removal would: over-erasing is safe.
+            let rows = self.original_paths.len().saturating_add(1);
+            self.shared_erasure = true;
+            self.original_paths = BTreeMap::new();
+            self.path_bytes = 0;
+            telemetry::event(
+                "path_diff_conservative",
+                &serde_json::json!({ "bytes": bytes, "rows": rows }),
+            );
+            return Ok(());
+        }
         // Remember empty sets too, so repeated changes extract at most once.
         self.path_bytes = bytes;
         self.original_paths.insert(old.key.clone(), paths);
@@ -1641,6 +1658,7 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
+            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;
