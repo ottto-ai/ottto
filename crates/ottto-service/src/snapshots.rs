@@ -49611,7 +49611,6 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded(opened)));
         }
-        let v1_gauge = state_v2::telemetry::Stage::v1(path, sample_v1);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -49669,9 +49668,6 @@ impl ScanIndex {
                         now,
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
-                }
-                if let Some(gauge) = v1_gauge {
-                    gauge.finish();
                 }
                 if sample_v1 {
                     state_v2::after_v1_locked(path, &mut index)?;
