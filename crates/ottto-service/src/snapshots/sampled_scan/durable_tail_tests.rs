@@ -7803,7 +7803,10 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                 } else {
                     codec::store_fixture_body(source, 0, 0)
                 };
-                assert_eq!(codec::body_has_skill_labels(source, &body).unwrap(), labelled);
+                assert_eq!(
+                    codec::body_has_skill_labels(source, &body).unwrap(),
+                    labelled
+                );
                 let mut pending = Vec::new();
                 let mut live = BTreeSet::new();
                 for n in 0..257 {

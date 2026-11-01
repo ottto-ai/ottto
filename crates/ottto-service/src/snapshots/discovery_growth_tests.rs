@@ -884,15 +884,9 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         let index = kept_generation(&f, source, false);
         change(&f);
         let without_pass = run_pages(&f, source, index);
-        // Acquisition keeps the read mode: Pi re-reads a grown session in
-        // Full; only what is queued is under test here.
-        let grown_mode = match source {
-            SnapshotSource::Pi => DeliveryMode::Full,
-            _ => growth_mode(),
-        };
         let mut expected = vec![
             format!("{:?}", DeliveryMode::Full),
-            format!("{grown_mode:?}"),
+            format!("{:?}", growth_mode()),
         ];
         expected.sort();
         for budget in [MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK, ROOT_ENTRIES] {
