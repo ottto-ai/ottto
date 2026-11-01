@@ -477,8 +477,11 @@ impl ScanIndex {
         let opaque_holds = !self.decode_holds.is_empty();
         for pending in self.claude_account_family_pending.values_mut() {
             // A cold archive is not loaded: v2 replays the endpoint rule at
-            // save.
+            // save. One the walk would have collapsed counts as refused.
             let ArchivedWindows::Resident(windows) = &pending.previous_windows else {
+                if pending.previous_windows.uncollapsed() != 0 {
+                    counts.roots_refused = counts.roots_refused.saturating_add(1);
+                }
                 continue;
             };
             let empty = windows.is_empty();
