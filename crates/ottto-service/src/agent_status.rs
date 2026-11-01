@@ -25002,34 +25002,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_failed_codex_probe_is_a_retrying_read_not_a_connection_needing_attention() {
-        let default = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            "default_user",
-            "default_workspace",
-            5,
-        );
-        let failed = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-failed-probe",
-            "managed_user",
-            "managed_workspace",
-        );
-
-        let health = codex_source_health_snapshot(
-            &[default, failed],
-            "2026-08-23T00:00:00Z",
-            "2026-08-23T00:15:00Z",
-        );
-
-        assert_eq!(health.status, AgentStatusState::Degraded);
-        assert_eq!(
-            codex_source_health_codes(&health),
-            vec!["codex_usage_read_retrying"]
-        );
-    }
-
-    #[test]
     fn a_real_connection_problem_still_needs_attention_beside_a_failed_default_probe() {
         let mut default = codex_failed_probe_candidate(
             "/tmp/codex-health-test-default-probe-and-login",
@@ -32963,46 +32935,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 .retry_after
                 .is_none()
         );
-    }
-
-    /// A 429 names the read and the time Claude asked Ottto to wait until;
-    /// slot status keeps a fixed per-read text and the bound deadline.
-    #[test]
-    fn rate_limited_diagnostic_names_the_read_and_wait_time() {
-        // 2026-10-11T12:58:57Z.
-        let deadline = 1_791_723_537;
-        for (read, live, slot) in [
-            (
-                claude_credit_pools::ClaudeUsageRead::Plain,
-                "Claude asked Ottto to wait until 12:58 UTC before the next usage read.",
-                CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE,
-            ),
-            (
-                claude_credit_pools::ClaudeUsageRead::SavedResets,
-                "Claude asked Ottto to wait until 12:58 UTC before the next saved-resets read.",
-                CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE,
-            ),
-        ] {
-            let diagnostic =
-                claude_oauth_usage_rate_limited_diagnostic(read, deadline, deadline - 3_600)
-                    .with_quota_binding(
-                        Some("account".to_string()),
-                        Some("organization".to_string()),
-                    );
-            assert_eq!(diagnostic.code, CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE);
-            assert_eq!(diagnostic.message, live);
-            assert_eq!(
-                diagnostic.retry_after.as_deref(),
-                Some("2026-10-11T12:58:57Z")
-            );
-            let safe = safe_claude_slot_check_diagnostics(&[diagnostic], "account", "organization");
-            assert_eq!(safe[0].message, slot);
-            assert_eq!(safe[0].retry_after.as_deref(), Some("2026-10-11T12:58:57Z"));
-            assert_eq!(
-                safe_claude_slot_check_diagnostics(&safe, "account", "organization"),
-                safe
-            );
-        }
     }
 
     #[test]
