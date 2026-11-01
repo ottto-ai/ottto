@@ -491,70 +491,6 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// A test copy of the retention before one-window runs: run equality includes
-/// `census_complete`, a rollover pushes the second endpoint of an equal run,
-/// and the load collapse keeps both endpoints of every run.
-mod two_endpoint_retention {
-    use super::*;
-
-    fn same_run(
-        a: &ClaudeAccountFamilyPendingWindow,
-        b: &ClaudeAccountFamilyPendingWindow,
-    ) -> bool {
-        a.version == b.version
-            && a.account_identifier_hash == b.account_identifier_hash
-            && a.evidence_request_count == b.evidence_request_count
-            && a.census_complete == b.census_complete
-            && a.members == b.members
-            && a.member_requests == b.member_requests
-            && a.invalid == b.invalid
-    }
-
-    pub(super) fn retain_run_endpoint(
-        windows: &mut Vec<ClaudeAccountFamilyPendingWindow>,
-        old: ClaudeAccountFamilyPendingWindow,
-        current_end: &str,
-    ) {
-        let len = windows.len();
-        if len >= 2 {
-            let first = &windows[len - 2];
-            let last = &windows[len - 1];
-            if let (Some(a), Some(b), Some(c), Some(current)) = (
-                rfc3339_unix_seconds(&first.census_window_end),
-                rfc3339_unix_seconds(&last.census_window_end),
-                rfc3339_unix_seconds(&old.census_window_end),
-                rfc3339_unix_seconds(current_end),
-            ) {
-                if a < b && b < c && c < current && same_run(first, last) && same_run(last, &old) {
-                    windows[len - 1] = old;
-                    return;
-                }
-            }
-        }
-        windows.push(old);
-    }
-
-    /// The plan the load collapse applied; callers check its summary.
-    pub(super) fn collapse(
-        windows: &[ClaudeAccountFamilyPendingWindow],
-    ) -> Vec<ClaudeAccountFamilyPendingWindow> {
-        let mut retained = Vec::new();
-        let mut read = 0;
-        while read < windows.len() {
-            let start = read;
-            read += 1;
-            while read < windows.len() && same_run(&windows[start], &windows[read]) {
-                read += 1;
-            }
-            retained.push(windows[start].clone());
-            if read - start > 1 {
-                retained.push(windows[read - 1].clone());
-            }
-        }
-        retained
-    }
-}
-
 /// Everything account placement reads from a family's archived windows:
 /// the sessions scheduled for evidence reads (`has_history`), then the
 /// save's retirement (`history_summary`), its witnesses, the sessions
@@ -580,12 +516,9 @@ fn placement(mut index: ScanIndex, root: &str) -> Placement {
 }
 
 /// [money] Placement parity, two-endpoint retention vs one window per run.
-/// Each history rolls window by window through both rollover rules (the new
-/// one through the production `archive`, resident and cold) and loads through
-/// both collapses; every archive must give the placement of the history with
-/// every window kept. Histories: identical repeats, completion flips, a real
-/// A -> B -> A account change, an account switch marked invalid in the middle
-/// and at the end, and an unconfirmed member only in older windows.
+/// Literal legacy histories keep both endpoints of each run, splitting on
+/// completion flips. Check written-out newest-only results from `archive` and
+/// load collapse, then compare real placement through resident and cold views.
 #[test]
 fn account_window_placement_parity_with_two_endpoint_retention() {
     let (dir, root, base) = retention_fixture();
@@ -596,39 +529,55 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
     let current_end = base.claude_account_family_pending[&root]
         .census_window_end
         .clone();
-    for (history, retires) in [
-        ("repeats", true),
-        ("completion_flips", true),
-        ("a_b_a", true),
-        ("invalid_switch_mid", true),
-        ("invalid_switch_last", false),
-        ("absent_older", false),
+    let window = |minute: u32, complete, account: char, invalid| {
+        let mut window = seed.clone();
+        window.census_window_end = format!("2026-08-02T07:{minute:02}:00Z");
+        window.census_complete = complete;
+        window.account_identifier_hash = account.to_string().repeat(64);
+        window.invalid = invalid;
+        window
+    };
+    let a = |minute| window(minute, true, 'a', false);
+    let b = |minute| window(minute, true, 'b', false);
+    let invalid = |minute| window(minute, true, 'b', true);
+    let mut absent = a(3);
+    absent.members.insert("unconfirmed-absent".into(), 1);
+    for (history, windows, newest, retires) in [
+        (
+            "repeats_flips_a_b_a",
+            // Old: A[0,2], incomplete A[3], A[4], B[5,7], A[8,9].
+            vec![
+                a(0),
+                a(2),
+                window(3, false, 'a', false),
+                a(4),
+                b(5),
+                b(7),
+                a(8),
+                a(9),
+            ],
+            vec![a(4), b(7), a(9)],
+            true,
+        ),
+        (
+            "invalid_switch_mid",
+            vec![a(0), a(2), invalid(3), invalid(5), a(6), a(8)],
+            vec![a(2), invalid(5), a(8)],
+            true,
+        ),
+        (
+            "invalid_switch_last",
+            vec![a(0), a(2), invalid(3), invalid(5)],
+            vec![a(2), invalid(5)],
+            false,
+        ),
+        (
+            "absent_older",
+            vec![a(0), a(2), absent.clone(), a(4), a(6)],
+            vec![a(2), absent, a(6)],
+            false,
+        ),
     ] {
-        let windows: Vec<_> = (0..8)
-            .map(|minute| {
-                let mut window = seed.clone();
-                window.census_window_end = format!("2026-08-02T07:0{minute}:00Z");
-                window.census_complete = history == "repeats" || minute % 2 == 0;
-                let changed = match history {
-                    "a_b_a" | "invalid_switch_mid" => (3..5).contains(&minute),
-                    "invalid_switch_last" => minute >= 6,
-                    "absent_older" => minute == 2,
-                    _ => false,
-                };
-                if changed {
-                    match history {
-                        "absent_older" => {
-                            window.members.insert("unconfirmed-absent".into(), 1);
-                        }
-                        _ => {
-                            window.account_identifier_hash = "b".repeat(64);
-                            window.invalid = history != "a_b_a";
-                        }
-                    }
-                }
-                window
-            })
-            .collect();
         let with_archive = |archive: Vec<ClaudeAccountFamilyPendingWindow>| {
             let mut index = base.clone();
             *index
@@ -639,7 +588,7 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
                 .resident_mut() = archive;
             index
         };
-        let full = with_archive(windows.clone());
+        let legacy = with_archive(windows.clone());
         // Rollovers: each window is the current one until the next replaces it.
         let mut new_rolled = with_archive(Vec::new());
         let pending = new_rolled
@@ -647,22 +596,13 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
             .get_mut(&root)
             .unwrap();
         let final_current = std::mem::replace(&mut pending.current, windows[0].clone());
-        let mut old_rolled = Vec::new();
         for next in windows[1..].iter().chain([&final_current]) {
             let old = std::mem::replace(&mut pending.current, next.clone());
-            two_endpoint_retention::retain_run_endpoint(
-                &mut old_rolled,
-                old.clone(),
-                &next.census_window_end,
-            );
             pending.archive(old, true);
         }
         assert_eq!(pending.census_window_end, current_end);
-        let new_len = pending.previous_windows.resident().len();
-        assert!(new_len <= old_rolled.len(), "{history}");
-        let old_rolled = with_archive(old_rolled);
-        let old_collapsed = with_archive(two_endpoint_retention::collapse(&windows));
-        let mut new_collapsed = full.clone();
+        assert_eq!(pending.previous_windows.resident(), &newest, "{history}");
+        let mut new_collapsed = legacy.clone();
         new_collapsed.collapse_account_pending_windows();
         assert_eq!(
             new_collapsed.claude_account_window_retention.roots_refused,
@@ -672,23 +612,18 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
             new_collapsed.claude_account_family_pending[&root]
                 .previous_windows
                 .resident(),
-            new_rolled.claude_account_family_pending[&root]
-                .previous_windows
-                .resident(),
+            &newest,
             "{history}"
         );
 
-        let summary = full.claude_account_family_pending[&root].history_summary();
-        let expected = placement(full.clone(), &root);
+        let summary = legacy.claude_account_family_pending[&root].history_summary();
+        let expected = placement(legacy.clone(), &root);
         assert_eq!(!expected.1, retires, "nonvacuous {history}");
         for (arm, index) in [
-            ("old rolled", old_rolled.clone()),
-            ("old collapsed", old_collapsed),
             ("new rolled", new_rolled.clone()),
             ("new collapsed", new_collapsed),
-            ("cold full", cold(full.clone())),
+            ("cold legacy", cold(legacy)),
             ("cold new rolled", cold(new_rolled)),
-            ("cold old rolled", cold(old_rolled)),
         ] {
             assert!(
                 index.claude_account_family_pending[&root].history_summary() == summary,
