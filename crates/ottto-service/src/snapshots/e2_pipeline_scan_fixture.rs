@@ -98,7 +98,6 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
-            true,
             self.capture_claude_identity,
         );
         if sampled {
@@ -138,7 +137,6 @@ impl E2ScanFixture {
             Some(support),
             &[],
             false,
-            true,
         );
         if sampled {
             let (scope, _) = durable_binding(source);
@@ -276,7 +274,6 @@ pub(super) fn parse_ordinary_with_metadata(
         None,
         None,
         artifacts,
-        true,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

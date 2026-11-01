@@ -89,7 +89,6 @@ fn native_parser_with(
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     (parser, expected, scope)
@@ -1161,7 +1160,6 @@ fn production_scan_page_at_with_setup(
         None,
         &[],
         false,
-        true,
     );
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
@@ -2919,7 +2917,6 @@ fn cached_scan(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("mixed-files".into()));
     setup(&mut scan);

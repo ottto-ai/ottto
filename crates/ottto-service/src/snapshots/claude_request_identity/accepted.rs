@@ -10,6 +10,15 @@ use zeroize::Zeroizing;
 pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
+/// Receiver's dense identity-parts bound: serialized item bytes / 320.
+/// Keep the released ledger limit when the receiver has not raised the cap.
+pub(super) const fn max_shares(item_cap: usize) -> usize {
+    if item_cap > MAX_ITEM_BYTES {
+        item_cap / 320
+    } else {
+        MAX_SHARES
+    }
+}
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
@@ -27,12 +36,15 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// Third field: epoch changed this pass; fourth: per-cycle retained capability.
+/// Third field: epoch changed this pass; fourth: per-cycle retained capability;
+/// fifth: receiver item cap; sixth: per-cycle account-source capability.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
     Option<FingerprintKey>,
     bool,
+    bool,
+    usize,
     bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
@@ -327,12 +339,17 @@ fn row_proof(key: &FingerprintKey, row: &Value, evidence: &Value) -> Option<[u8;
             None => None,
             Some(reference) => {
                 let entry = evidence.get(usize::try_from(reference.as_u64()?).ok()?)?;
+                // A row holding a carried share is never proof.
+                if entry.get("account_source").is_some() {
+                    return None;
+                }
                 Some(authority_hash(
                     key,
                     &AuthorityKey {
                         login: part["account_identifier_hash"].as_str().map(str::to_owned),
                         org: entry["provider_workspace_hash"].as_str().map(str::to_owned),
                         basis: entry["identity_basis"].as_str().and_then(basis_token)?,
+                        account_source: None,
                     },
                 ))
             }
@@ -356,6 +373,96 @@ pub(super) fn bucket_key(start: &str) -> Option<i64> {
         .map(|at| at.unix_timestamp())
 }
 impl AcceptedSession {
+    /// Predict exactly the share set an ACK would retain, without changing proof.
+    fn shares_after(
+        &self,
+        body: &Value,
+        shares: impl Iterator<Item = AcceptedShare>,
+    ) -> BTreeSet<AcceptedShare> {
+        let fingerprint_key = self.bound_key();
+        let mut shares = shares.collect::<BTreeSet<_>>();
+        let mut present = BTreeSet::new();
+        for bucket in body["usage_buckets"].as_array().into_iter().flatten() {
+            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
+                continue;
+            };
+            present.insert(start);
+            for row in bucket["model_usage"].as_array().into_iter().flatten() {
+                let Some(row_key) = wire_row_key(row) else {
+                    continue;
+                };
+                let row_hash = row_hash(fingerprint_key, &row_key);
+                // Freeze a row's first accepted tagged share set. A refused
+                // later ACK must not bless its new untagged presence or key.
+                if shares
+                    .iter()
+                    .any(|share| share.bucket == start && share.row == row_hash)
+                {
+                    continue;
+                }
+                let parts = row["identity_parts"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(std::slice::from_ref(row));
+                let mut row_shares = BTreeSet::new();
+                for part in parts {
+                    let authority = match part["evidence_ref"]
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                    {
+                        None => None,
+                        Some(reference) => {
+                            let evidence = &body["request_evidence"][reference];
+                            let Some(basis) =
+                                evidence["identity_basis"].as_str().and_then(basis_token)
+                            else {
+                                continue;
+                            };
+                            // A carried share is placement, never a proven authority.
+                            evidence.get("account_source").is_none().then(|| {
+                                authority_hash(
+                                    fingerprint_key,
+                                    &AuthorityKey {
+                                        login: part["account_identifier_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        org: evidence["provider_workspace_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        basis,
+                                        account_source: None,
+                                    },
+                                )
+                            })
+                        }
+                    };
+                    row_shares.insert(AcceptedShare {
+                        bucket: start,
+                        row: row_hash,
+                        authority,
+                    });
+                }
+                if row_shares.iter().any(|share| share.authority.is_some()) {
+                    shares.extend(row_shares);
+                }
+            }
+        }
+        shares.retain(|share| present.contains(&share.bucket));
+        shares
+    }
+    pub(super) fn exceeds_share_bound(
+        &self,
+        item: &SnapshotItem,
+        item_cap: usize,
+        new_shares: usize,
+    ) -> bool {
+        // The union cannot exceed prior + new shares; avoid building a wire
+        // Value on the ordinary path well below the negotiated bound.
+        self.shares.len().saturating_add(new_shares) > max_shares(item_cap)
+            && serde_json::to_value(item).map_or(true, |body| {
+                self.shares_after(&body, self.shares.iter().cloned()).len() > max_shares(item_cap)
+            })
+    }
     pub(super) fn authority_hash(&self, authority: &AuthorityKey) -> [u8; 32] {
         authority_hash(self.key.as_ref().expect("bound accepted epoch"), authority)
     }
@@ -489,7 +596,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                         continue;
                     };
                     if state.starts.len() > MAX_BUCKETS
-                        || state.shares.len() > MAX_SHARES
+                        || state.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
                         || state.proved.len() > MAX_PROVED_ROWS
                         || state.missing.len() > MAX_PENDING_MISSING
                     {
@@ -516,7 +623,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     state.missing = state.missing.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None, false, false))
+                Ok(AcceptedBuckets(states, None, false, false, 0, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -547,7 +654,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false)
+        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -594,6 +701,8 @@ impl AcceptedBuckets {
             Some(key),
             false,
             false,
+            0,
+            false,
         )
     }
     #[cfg(test)]
@@ -632,6 +741,12 @@ impl AcceptedBuckets {
         self.bind_key(live.1.clone());
         self.2 = live.2;
         self.3 = live.3;
+        self.4 = live.4;
+        self.5 = live.5;
+    }
+    /// Runtime-only receiver cap; never serialized as accepted proof.
+    pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
+        self.4 = item_cap;
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -651,6 +766,14 @@ impl AcceptedBuckets {
     }
     pub(crate) fn retained_enabled(&self) -> bool {
         self.3
+    }
+    /// Account carry marking for this cycle: only the server's exact
+    /// capability token emits `account_source`; absent keeps main's bytes.
+    pub(crate) fn set_account_source_enabled(&mut self, enabled: bool) {
+        self.5 = enabled;
+    }
+    pub(crate) fn account_source_enabled(&self) -> bool {
+        self.5
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -945,9 +1068,9 @@ impl AcceptedBuckets {
         self.record_with_diagnostics(body, false);
     }
     fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
-        let Some(fingerprint_key) = self.1.as_ref() else {
+        if self.1.is_none() {
             return;
-        };
+        }
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
             return;
         }
@@ -960,80 +1083,26 @@ impl AcceptedBuckets {
         if buckets.len() > MAX_BUCKETS {
             return;
         }
-        let fingerprint_key = fingerprint_key.clone();
-        let fingerprint_key = &fingerprint_key;
+        let item_cap = self.4;
+        let limit = max_shares(item_cap);
         let entry = self
             .session_entry(session, report)
             .expect("bound fingerprint key");
-        let mut shares = std::mem::take(&mut entry.shares)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut present = BTreeSet::new();
-        for bucket in buckets {
-            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
-                continue;
-            };
-            present.insert(start);
-            for row in bucket["model_usage"].as_array().into_iter().flatten() {
-                let Some(row_key) = wire_row_key(row) else {
-                    continue;
-                };
-                let row_hash = row_hash(fingerprint_key, &row_key);
-                // Freeze a row's first accepted tagged share set. A refused
-                // later ACK must not bless its new untagged presence or key.
-                if shares
-                    .iter()
-                    .any(|share| share.bucket == start && share.row == row_hash)
-                {
-                    continue;
-                }
-                let parts = row["identity_parts"]
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or(std::slice::from_ref(row));
-                let mut row_shares = BTreeSet::new();
-                for part in parts {
-                    let authority = match part["evidence_ref"]
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                    {
-                        None => None,
-                        Some(reference) => {
-                            let evidence = &body["request_evidence"][reference];
-                            let Some(basis) =
-                                evidence["identity_basis"].as_str().and_then(basis_token)
-                            else {
-                                continue;
-                            };
-                            Some(authority_hash(
-                                fingerprint_key,
-                                &AuthorityKey {
-                                    login: part["account_identifier_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    org: evidence["provider_workspace_hash"]
-                                        .as_str()
-                                        .map(str::to_owned),
-                                    basis,
-                                },
-                            ))
-                        }
-                    };
-                    row_shares.insert(AcceptedShare {
-                        bucket: start,
-                        row: row_hash,
-                        authority,
-                    });
-                }
-                if row_shares.iter().any(|share| share.authority.is_some()) {
-                    shares.extend(row_shares);
-                }
-            }
+        let mut shares = if item_cap > MAX_ITEM_BYTES {
+            entry.shares_after(body, entry.shares.iter().cloned())
+        } else {
+            let prior = std::mem::take(&mut entry.shares);
+            entry.shares_after(body, prior.into_iter())
+        };
+        // An increased-cap upload is preflighted before POST. Preserve prior
+        // proof defensively if an unexpected ACK would exceed its bound.
+        if item_cap > MAX_ITEM_BYTES && shares.len() > limit {
+            entry.incomplete = true;
+            return;
         }
-        shares.retain(|share| present.contains(&share.bucket));
         // Evict whole buckets, never a partial share set masquerading as a
         // complete accepted fingerprint. Loss takes the counted unknown path.
-        while shares.len() > MAX_SHARES {
+        while shares.len() > limit {
             let oldest = shares.first().expect("nonempty").bucket;
             shares.retain(|share| share.bucket != oldest);
             entry.incomplete = true;
@@ -1173,6 +1242,8 @@ mod heap_tests {
             None,
             false,
             false,
+            0,
+            false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
@@ -1235,6 +1306,46 @@ mod share_bound_tests {
         let restored: AcceptedBuckets =
             AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
         assert_eq!(restored, state);
+
+        // [money] The receiver's 2 MiB formula admits exactly 6,553 shares.
+        // Existing OFF assertions above retain the released 1,536 behavior.
+        let mut enlarged = body.clone();
+        enlarged["usage_buckets"] = json!((0..2_185)
+            .map(|hour| json!({
+                "bucket_start":(start+time::Duration::hours(hour)).format(&Rfc3339).unwrap(),
+                "model_usage":[{"model":"claude-synthetic","identity_parts":
+                    (0..if hour == 2_184 { 1 } else { 3 }).map(|key| json!({
+                        "evidence_ref":0,"account_identifier_hash":format!("{key:064x}")
+                    })).collect::<Vec<_>>()}]
+            }))
+            .collect::<Vec<_>>());
+        let mut state = AcceptedBuckets::for_test();
+        state.set_item_cap(2 * 1024 * 1024);
+        assert_eq!(max_shares(2 * 1024 * 1024), 6_553);
+        state.record(&enlarged);
+        let known = state.get("bounded-shares").unwrap();
+        assert_eq!(known.shares.len(), 6_553);
+        assert!(!known.incomplete);
+        assert_eq!(known.starts.len(), 2_185);
+        assert_eq!(
+            known
+                .row_shares(
+                    start.unix_timestamp(),
+                    &wire_row_key(&enlarged["usage_buckets"][0]["model_usage"][0]).unwrap()
+                )
+                .len(),
+            3
+        );
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restored = AcceptedBuckets::restore_for_test(&bytes);
+        restored.set_item_cap(2 * 1024 * 1024);
+        restored.record(&enlarged);
+        assert_eq!(restored.get("bounded-shares").unwrap().shares, known.shares);
+        assert!(!restored.get("bounded-shares").unwrap().incomplete);
+        if crate::heap_layout_bound::layout_supported() {
+            assert!(crate::heap_layout_bound::bound(&restored, 100_000).is_none());
+            assert!(crate::heap_layout_bound::bound(&restored, usize::MAX).unwrap() > 500_000);
+        }
     }
 }
 
@@ -1248,6 +1359,7 @@ mod keyed_tests {
             login: Some("low-entropy-login".into()),
             org: Some("low-entropy-org".into()),
             basis: TELEMETRY_LOGIN,
+            account_source: None,
         };
         let material = json!([
             "claude_accepted_authority:v2",
@@ -1617,6 +1729,8 @@ mod retained_heap_tests {
                 .collect(),
             None,
             false,
+            false,
+            0,
             false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);

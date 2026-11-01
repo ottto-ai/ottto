@@ -121,7 +121,6 @@ fn new_scan(root: &Path, index: ScanIndex) -> OwnedSourceScan {
         None,
         &[],
         false,
-        true,
     )
 }
 
@@ -575,7 +574,6 @@ fn codex_group_member_reads_call_no_observer() {
         None,
         &[],
         false,
-        false,
     )
     .with_line_observer("test", Box::new(recorder.clone()));
     scan = step_until(scan, |s| {
@@ -855,7 +853,6 @@ fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             cache.clone(),
@@ -1616,7 +1613,6 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(
                     cache.clone(),
@@ -1678,7 +1674,6 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         None,
         &[],
         false,
-        true,
     ));
     assert_eq!(
         serde_json::to_value(&result.snapshots).unwrap(),
@@ -1796,7 +1791,6 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
                 None,
                 &[],
                 false,
-                true,
             ))
         });
         releases.extend(
@@ -1945,7 +1939,6 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(
                     cache.clone(),
@@ -2078,7 +2071,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(
                 cache.clone(),
@@ -2130,7 +2122,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             None,
             &[],
             false,
-            true,
         ));
         if !known_generation {
             // Real legacy/unknown owner state, using its existing observation API.
@@ -2417,7 +2408,6 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
                     Some(support.as_path()),
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(
                     cache.clone(),
@@ -2777,7 +2767,6 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_sampled_acquisition(
                     cache,
@@ -2877,7 +2866,6 @@ fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
         None,
         &[],
         false,
-        true,
     )
     .with_line_observer(
         "codex_prelude",
@@ -2930,7 +2918,6 @@ fn codex_cursor_yield_drops_prefix_before_late_token_record() {
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(
                 Arc::clone(&cache),
@@ -2990,7 +2977,6 @@ fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             Arc::clone(&cache),
@@ -3044,7 +3030,6 @@ fn codex_symlinked_root_leaf_resolves_home_and_delivers_lines() {
         None,
         &[],
         false,
-        true,
     )
     .with_line_observer(
         "codex_prelude",
@@ -3285,7 +3270,6 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
                         None,
                         hints,
                         false,
-                        true,
                     )
                     .with_sampled_acquisition(
                         cache.clone(),
@@ -3522,7 +3506,6 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
                     None,
                     &hints,
                     false,
-                    true,
                 )
                 .with_line_observer("test", Box::new(recorder.clone())),
             )
@@ -3605,7 +3588,6 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
                         None,
                         &[],
                         false,
-                        true,
                     )
                     .with_sampled_acquisition(
                         self.cache.clone(),
@@ -3664,7 +3646,6 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             cache.clone(),
@@ -3752,7 +3733,6 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
                     None,
                     &[],
                     false,
-                    true,
                 )
                 .with_line_observer("test", Box::new(recorder.clone())),
             )
@@ -3831,7 +3811,6 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
                 None,
                 std::slice::from_ref(&path),
                 false,
-                true,
             )
             .with_line_observer("test", Box::new(recorder.clone())),
         )

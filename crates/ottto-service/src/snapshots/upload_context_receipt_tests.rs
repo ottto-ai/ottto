@@ -84,7 +84,6 @@ impl Fixture {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(
             self.cache.clone(),
@@ -203,7 +202,7 @@ impl Fixture {
                             self.index.active_upload_context_fingerprint.as_ref()
                                 == Some(&receipt.context_fingerprint)
                                 && receipt.replay_generation
-                                    == self.index.context_curve_replay_epoch
+                                    == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
                                 && receipt.source_witness == entry.source_file_fingerprint
                                 && entry.last_upload_body_witness.as_ref()
                                     == Some(&receipt.body_witness)
@@ -503,9 +502,20 @@ fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
         assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
     }
     // A context alias grants no body/source/replay authority of its own.
-    f.index.context_curve_replay_epoch += 1;
+    let key = f.key();
+    let receipt_generation = |index: &mut ScanIndex, delta: i64| {
+        let receipt = index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .upload_context_receipt
+            .as_mut()
+            .unwrap();
+        receipt.replay_generation = receipt.replay_generation.wrapping_add_signed(delta);
+    };
+    receipt_generation(&mut f.index, 1);
     assert!(f.index.file_upload_context_requires_adoption(&f.key()));
-    f.index.context_curve_replay_epoch -= 1;
+    receipt_generation(&mut f.index, -1);
     let witness = f.entry().source_file_fingerprint.clone();
     f.index
         .files
@@ -619,19 +629,6 @@ fn upload_context_receipt_stale_body_witness_refused() {
     );
 }
 #[test]
-fn upload_context_receipt_stale_generation_refused() {
-    let mut f = Fixture::new(SnapshotSource::Codex);
-    let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
-    f.index.context_curve_replay_epoch += 1;
-    assert_eq!(
-        f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
-            .files,
-        0
-    );
-}
-#[test]
 fn upload_context_receipt_partial_entity_ack_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, _) = f.pending();
@@ -666,7 +663,7 @@ fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
     assert!(f.entry().upload_context_receipt.is_none());
 }
 #[test]
-fn upload_context_receipt_restart_and_generation_rearm_once() {
+fn upload_context_receipt_survives_restart() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let size = fs::metadata(&f.path).unwrap().len();
     let counts = f.adopt();
@@ -688,24 +685,6 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
     f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
-    f.assert_quiet();
-    f.index.context_curve_replay_epoch += 1;
-    // The real prepare resets both index and upload progress for a new replay.
-    f.uploader.replay("synthetic-curve-epoch-1");
-    let counts = f.adopt();
-    assert_eq!(counts.files, 1);
-    assert_eq!(
-        counts.bytes,
-        f.uploader
-            .posts
-            .last()
-            .unwrap()
-            .iter()
-            .map(|item| serde_json::to_vec(item).unwrap().len() as u64)
-            .sum::<u64>(),
-        "wire item bytes, not native file length"
-    );
-    assert!(counts.local_bytes <= size);
     f.assert_quiet();
 }
 #[test]

@@ -359,8 +359,7 @@ impl RearmFixture {
             true, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
             &self.hinted_paths,
-            false,
-            true, // Match its context-curve setting; byte parity includes it.
+            false, // Match its context-curve setting; byte parity includes it.
             self.request_identity,
         );
         if crate::snapshots::claude_native_comparison::enabled() {
@@ -399,7 +398,6 @@ impl RearmFixture {
             scan_started_at: collected_at.to_owned(),
             activity_hint: hint,
             receipt_window_days: 183,
-            context_curve_enabled: true,
             cache_observations_enabled: false,
             scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
@@ -852,12 +850,6 @@ impl RearmFixture {
             }
         }
         let census_complete = scan.census_complete;
-        settle_context_curve_replay_state(
-            &mut index,
-            true,
-            census_complete && fully_settled,
-            "replay-generation-rearm",
-        );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
         if checkpoint {

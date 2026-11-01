@@ -981,10 +981,6 @@ enum ContextBasisOutcome {
 pub struct ClaudeContextFileBirthCounts {
     #[serde(flatten)]
     pub total: ClaudeContextBasisCounts,
-    /// Final advertised curve coverage after the ownership fold. Local only;
-    /// these bodies may still be held by the existing upload quarantine.
-    pub curve_scalars_file_birth_only_session_count: usize,
-    pub curve_ownership_unresolved_session_count: usize,
     pub by_claude_code_version: BTreeMap<String, ClaudeContextBasisCounts>,
     /// Sessions the family demotion quarantine held back this fold (R7): the
     /// hold is unchanged, so their scalars wait with the rest of the body.

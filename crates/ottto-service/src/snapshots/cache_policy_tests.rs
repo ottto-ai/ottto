@@ -188,7 +188,6 @@ fn retained_reduction(fixture: &ScanFixture) -> Retained<sampled_jsonl::CachedJs
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     let scope = Scope("cache-policy-filler".into());
@@ -249,7 +248,6 @@ fn cached_scan(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(cache.clone(), Scope(NAMESPACE.into()))
 }

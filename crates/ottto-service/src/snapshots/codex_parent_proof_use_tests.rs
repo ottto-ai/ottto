@@ -220,7 +220,6 @@ fn parse_forged(
         None,
         Some(Arc::new(Mutex::new(ledgers))),
         true,
-        true,
     )
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
@@ -484,6 +483,8 @@ impl Scene {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
+                listing_started_unix_seconds: None,
+                listing_owed_requeued_unix_seconds: Default::default(),
             }),
             ..ScanIndex::default()
         };
@@ -553,7 +554,6 @@ impl Scene {
             None,
             None,
             None,
-            true,
             true,
         )
         .unwrap();
