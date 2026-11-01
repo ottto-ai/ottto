@@ -674,7 +674,7 @@ mod hydrate_parity {
     use s::lenient_decode;
     use serde_json::value::RawValue;
     use std::collections::BTreeSet;
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn seed() -> ScanIndex {
         let mut index = ScanIndex::default();
@@ -758,13 +758,26 @@ mod hydrate_parity {
             expected.codex_parent_proof_parents_live
         );
     }
-    fn compare(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
-        // Both readers normalize an out-of-range deadline against one instant.
-        s::sampled_scan::transition_fixture::with_scan_clock(s::sampled_scan::now_seconds(), || {
-            compare_at_clock(bytes, mapped)
-        })
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
-    fn compare_at_clock(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
+    /// Every decode and load clamps an out-of-range quarantine deadline to
+    /// its own wall-clock read, so two of them can land a second apart. Pin
+    /// deadlines clamped since `since` to `since`; anything else is untouched.
+    fn settled(mut index: ScanIndex, since: u64) -> ScanIndex {
+        let now = unix_now();
+        for record in index.quarantined_snapshot_fingerprints.values_mut() {
+            if (since..=now).contains(&record.retry_after_unix_seconds) {
+                record.retry_after_unix_seconds = since;
+            }
+        }
+        index
+    }
+    fn compare(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
+        let since = unix_now();
         // Exercise the shared API with the stage used by both ordinary and
         // claim-only CAS. SAVE owns installing its current-snapshot caller.
         for bounded in [false, true] {
@@ -775,13 +788,12 @@ mod hydrate_parity {
             };
             let mut current = mapped.clone();
             lenient_decode::post_decode_hydrated(&mut current, "cas", "claude_code").unwrap();
-            assert_graph(&expected, &current);
+            assert_graph(&settled(expected, since), &settled(current, since));
         }
         let f = Fixture::new();
         let v1 = f.support.join("v1-index.json");
         fs::write(&v1, bytes).unwrap();
-        // One clock for every load: load-time clamps (e.g. a quarantine
-        // deadline) must not straddle a second boundary between them.
+        // One clock for every load's own time checks.
         let now = SystemTime::now();
         let (mut expected, _) =
             ScanIndex::load_inner_with_support(&v1, Some(s::SnapshotSource::ClaudeCode), None, now)
@@ -824,8 +836,9 @@ mod hydrate_parity {
             }
         }
 
-        assert_graph(&expected, &actual);
-        assert_graph(&expected, &load()); // hydrate again on the same connection
+        let expected = settled(expected, since);
+        assert_graph(&expected, &settled(actual.clone(), since));
+        assert_graph(&expected, &settled(load(), since)); // hydrate again on the same connection
         assert_eq!(fs::read(&v1).unwrap(), bytes);
         assert_eq!(fs::read(&f.path).unwrap(), fence_bytes);
         assert!(!fence::sibling(&f.path, ".v1-readonly").exists());

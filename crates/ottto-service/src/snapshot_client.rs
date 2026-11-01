@@ -667,11 +667,6 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
-    /// Durable accepted-log capability for content-free request-index curves.
-    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
-    /// emits curves that the server cannot durably acknowledge.
-    #[serde(default)]
-    pub session_context_curve_contract: Option<String>,
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
@@ -683,6 +678,9 @@ pub struct ActivityHintResponse {
     /// the field off, so older servers never receive it.
     #[serde(default)]
     pub session_request_identity_retained_contract: Option<String>,
+    /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
+    #[serde(skip)]
+    pub max_snapshot_item_bytes: Option<u64>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -697,6 +695,9 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
+    /// Exact backend admission for non-terminal census progress/block status.
+    #[serde(default)]
+    pub census_status_contract: Option<String>,
     /// Retired per-account cohort token for contract-5 request identity rows.
     /// Contract 5 is always on for Claude Code, so this daemon decodes the
     /// field for compatibility and never reads it; the server keeps sending
@@ -711,6 +712,7 @@ pub struct ActivityHintResponse {
 pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
     let mut hint = ActivityHintResponse::deserialize(&value)
         .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.max_snapshot_item_bytes = value.get("max_snapshot_item_bytes").and_then(Value::as_u64);
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
@@ -1262,6 +1264,22 @@ pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
 /// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
 pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
 
+/// Activity-hint admission; unknown or absent tokens preserve legacy bytes.
+pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
+
+/// Content-free first failed census gate, in the shared receipt builder's order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusBlockCause {
+    UnreadableEvents,
+    DisappearedFiles,
+    CarryAdmission,
+    StateLoader,
+    TransportReservation,
+    OwnershipIncomplete,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
@@ -1358,6 +1376,11 @@ pub struct SnapshotStatusRequest {
     pub last_census_residue_archived_rollout_count: u64,
     #[serde(default)]
     pub last_census_residue_blocked_session_count: u64,
+    /// Census-member queue plus carry replay, only under census_status:v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_pending_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_block_cause: Option<CensusBlockCause>,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
@@ -1440,6 +1463,8 @@ impl SnapshotStatusRequest {
             last_census_residue_index_key_count,
             last_census_residue_archived_rollout_count,
             last_census_residue_blocked_session_count,
+            last_census_pending_file_count,
+            last_census_block_cause,
             consecutive_failures,
             next_retry_at,
             // Build identity, unrelated to any scan.
@@ -1474,6 +1499,12 @@ impl SnapshotStatusRequest {
         }
         if last_error_message.is_some() {
             return Some("last_error_message");
+        }
+        if last_census_pending_file_count.is_some() {
+            return Some("last_census_pending_file_count");
+        }
+        if last_census_block_cause.is_some() {
+            return Some("last_census_block_cause");
         }
         if next_retry_at.is_some() {
             return Some("next_retry_at");
@@ -4027,6 +4058,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.123".to_string()),
@@ -4209,6 +4242,14 @@ mod tests {
                 Box::new(|r| r.last_terminal_over_line_cap_count = 1),
             ),
             (
+                "last_census_pending_file_count",
+                Box::new(|r| r.last_census_pending_file_count = Some(0)),
+            ),
+            (
+                "last_census_block_cause",
+                Box::new(|r| r.last_census_block_cause = Some(CensusBlockCause::Other)),
+            ),
+            (
                 "last_census_residue_settled",
                 Box::new(|r| r.last_census_residue_settled = true),
             ),
@@ -4321,6 +4362,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
@@ -4393,6 +4436,8 @@ mod tests {
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
             last_census_residue_blocked_session_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.120".to_string()),
@@ -5074,7 +5119,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

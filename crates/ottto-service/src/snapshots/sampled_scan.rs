@@ -554,7 +554,6 @@ impl Context {
         candidate: &CandidateFile,
         sidecar: &str,
         artifacts: bool,
-        context_curve: bool,
         index: &ScanIndex,
     ) -> Scope {
         Scope(sha256_hex(&[
@@ -571,7 +570,8 @@ impl Context {
             } else {
                 "no_artifacts"
             },
-            if context_curve { "curve" } else { "no_curve" },
+            // Retired full context-curve upload: keeps the scope bytes.
+            "no_curve",
             index
                 .active_upload_context_fingerprint
                 .as_deref()
@@ -2145,7 +2145,6 @@ pub(super) struct ParserOptions<'a> {
     pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     pub(super) artifacts: bool,
-    pub(super) curve: bool,
     pub(super) identity_capture: bool,
     pub(super) cache: Option<&'a Arc<SharedCache>>,
 }
@@ -2153,7 +2152,7 @@ pub(super) struct ParserOptions<'a> {
 pub(super) fn new_source_parser(
     file: File,
     candidate: &CandidateFile,
-    index: &mut ScanIndex,
+    index: &ScanIndex,
     options: ParserOptions<'_>,
 ) -> Result<OwnedJsonlParser> {
     let ParserOptions {
@@ -2162,7 +2161,6 @@ pub(super) fn new_source_parser(
         traces,
         parents,
         artifacts,
-        curve,
         identity_capture,
         cache,
     } = options;
@@ -2210,7 +2208,6 @@ pub(super) fn new_source_parser(
         traces,
         parents,
         artifacts,
-        curve,
     )?;
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {

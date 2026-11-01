@@ -138,7 +138,7 @@ impl ScanIndex {
         ] {
             update_length_prefixed(&mut h, value.as_bytes());
         }
-        h.update(self.context_curve_replay_epoch.to_be_bytes());
+        h.update(crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH.to_be_bytes());
         for entity in self.file_snapshot_fingerprints.get(key)? {
             update_length_prefixed(&mut h, entity.as_bytes());
             if let Some(record) = self.quarantined_snapshot_fingerprints.get(entity) {
@@ -354,7 +354,8 @@ impl ScanIndex {
                 .as_ref()
                 .is_some_and(|receipt| {
                     self.same_copy_prefix_base(&receipt.context_fingerprint)
-                        && receipt.replay_generation == self.context_curve_replay_epoch
+                        && receipt.replay_generation
+                            == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
                         && receipt.source_witness == entry.source_file_fingerprint
                         && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
                 })
@@ -380,7 +381,8 @@ impl ScanIndex {
                     // receipts. Do not turn them into unrelated read debt.
                     || (self.unaffected_file(key)
                         && self.same_copy_prefix_base(&receipt.context_fingerprint)))
-                    && receipt.replay_generation == self.context_curve_replay_epoch
+                    && receipt.replay_generation
+                        == crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
                     && receipt.source_witness == entry.source_file_fingerprint
                     && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
             })
@@ -563,7 +565,7 @@ impl ScanIndex {
                         .then(|| mode_context.clone()),
                     receipt: Receipt {
                         context_fingerprint: context_fingerprint.clone(),
-                        replay_generation: self.context_curve_replay_epoch,
+                        replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
                         source_witness: entry.source_file_fingerprint.clone(),
                         body_witness,
                     },
@@ -604,7 +606,8 @@ impl ScanIndex {
             if self.active_upload_context_fingerprint.as_ref() != Some(mode_context)
                 || self.file_expected_context(&candidate.key)
                     != Some(&candidate.receipt.context_fingerprint)
-                || self.context_curve_replay_epoch != candidate.receipt.replay_generation
+                || crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH
+                    != candidate.receipt.replay_generation
                 || self.historical_replay_generation != candidate.historical_replay_generation
                 || self.decode_holds_file(&candidate.key)
                 || self

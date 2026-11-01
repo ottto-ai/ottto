@@ -2022,7 +2022,6 @@ pub(super) mod tests {
             traces,
             ledgers: None,
             artifacts: false,
-            context_curve: false,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
@@ -2030,7 +2029,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: None,
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         for _ in 0..10_000 {
@@ -2281,7 +2279,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         for _ in 0..1000 {
@@ -2651,7 +2648,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         loop {
             match owned.step(None) {
@@ -2830,7 +2826,6 @@ pub(super) mod tests {
             None,
             &[],
             false,
-            false,
         );
         loop {
             match owned.step(None) {
@@ -2863,7 +2858,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let changed = "ffffffff-1111-4111-8111-ffffffffffff";
@@ -2959,7 +2953,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         let mut added = false;
@@ -3063,7 +3056,6 @@ pub(super) mod tests {
             false,
             None,
             hints,
-            false,
             false,
         );
         for _ in 0..1000 {
@@ -3434,7 +3426,6 @@ pub(super) mod tests {
             false,
             None,
             &[],
-            false,
             false,
         );
         assert!(
@@ -4017,7 +4008,6 @@ pub(super) mod tests {
                 None,
                 false,
                 None,
-                false,
             )
             .unwrap();
             assert!(parsed.complete());
@@ -4092,7 +4082,6 @@ pub(super) mod tests {
                 traces: None,
                 ledgers: None,
                 artifacts: false,
-                context_curve: false,
                 index: &previous,
             })
             .unwrap();
@@ -4101,7 +4090,6 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,
-            context_curve: false,
             live_scope: &no_scope,
         };
         let (mut steps, mut yields) = (0, 0);
