@@ -1389,27 +1389,6 @@ fn attach_head_conflict_answers(
     attached
 }
 
-/// Answer framing must not turn an otherwise retryable conflict into a local
-/// oversized-body poison verdict. Keep the stale-base offer and recovery debt.
-fn hold_oversized_head_conflict_answers(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-) -> usize {
-    let mut held = 0;
-    for item in snapshots {
-        if item.cache_conflict_answer.is_some()
-            && crate::snapshots::snapshot_item_wire_size(source, item, policy)
-                > crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
-        {
-            item.cache_conflict_answer = None;
-            head_conflict::note("wire_capacity_hold");
-            held += 1;
-        }
-    }
-    held
-}
-
 fn effective_snapshot_upload_body_witness(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -8393,13 +8372,10 @@ fn finish_sync_source(
         upload_progress.save(&upload_progress_path)?;
     }
     // After bootstrap set each base, so an answer never borrows a fresh head.
-    let mut head_conflict_answers = attach_head_conflict_answers(
+    let head_conflict_answers = attach_head_conflict_answers(
         &mut scan_result.snapshots,
         &upload_progress,
         current_unix_seconds(),
-    );
-    head_conflict_answers = head_conflict_answers.saturating_sub(
-        hold_oversized_head_conflict_answers(source, &mut scan_result.snapshots, upload_policy),
     );
     if head_conflict_answers > 0 {
         eprintln!(
