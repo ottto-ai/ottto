@@ -760,8 +760,6 @@ const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
     ("gpt-5-4-pro", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-5", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-5-pro", 272_000, ProviderPriceLineKind::Tiered),
-    // GPT-5.6 Luna/Terra publish long rates; the catalog's missing threshold
-    // for them is a known catalog gap (COST, 2026-10-18), not a flat price.
     ("gpt-5-6-luna", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-6-sol", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-6-terra", 272_000, ProviderPriceLineKind::Tiered),
@@ -20615,26 +20613,38 @@ impl SnapshotAccumulator {
     }
 
     /// Replace the running requested tier from one in-epoch thread-settings
-    /// snapshot. A snapshot without an explicit known tier clears it, so an
-    /// earlier Fast never outlives its replacement. Pre-epoch and undated
-    /// events are ignored: a record saved before the release holds no tier, so
-    /// counting them would make a Full differ from its restored Tail.
+    /// snapshot. Only an explicit non-default tier sets it; anything else
+    /// clears it, adds no `service_tier` and prices as standard, so an earlier
+    /// Fast never outlives its replacement. Pre-epoch and undated events change
+    /// nothing: a record saved before the release holds no tier, so counting
+    /// them would make a Full differ from its restored Tail.
     fn note_codex_thread_settings(&mut self, value: &Value, timestamp: Option<&str>) {
         if !string_eq_at(value, &["type"], "event_msg")
             || !string_eq_at(value, &["payload", "type"], "thread_settings_applied")
-            || !in_codex_forward_evidence_epoch(timestamp)
         {
             return;
         }
-        let context = &mut self.current_selector.context;
-        match string_at(value, &["payload", "thread_settings", "service_tier"]).as_deref() {
-            Some("default") => context.insert(CODEX_THREAD_TIER.into(), "standard".into()),
-            Some("fast" | "priority") => {
-                context.insert(CODEX_THREAD_TIER.into(), "priority".into())
-            }
-            Some("flex") => context.insert(CODEX_THREAD_TIER.into(), "flex".into()),
-            _ => context.remove(CODEX_THREAD_TIER),
+        let requested = string_at(value, &["payload", "thread_settings", "service_tier"]);
+        let tier = match requested.as_deref() {
+            Some("fast" | "priority") => Some("priority"),
+            Some("flex") => Some("flex"),
+            _ => None,
         };
+        if tier.is_some() {
+            crate::local_resource_diagnostics::codex_non_default_thread_tier();
+        }
+        if !in_codex_forward_evidence_epoch(timestamp) {
+            return;
+        }
+        let context = &mut self.current_selector.context;
+        match tier {
+            Some(tier) => {
+                context.insert(CODEX_THREAD_TIER.into(), tier.into());
+            }
+            None => {
+                context.remove(CODEX_THREAD_TIER);
+            }
+        }
     }
 
     /// Stamp one in-epoch request with its requested-tier estimate. Runs after

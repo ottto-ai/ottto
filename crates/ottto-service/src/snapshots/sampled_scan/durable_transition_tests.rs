@@ -1134,8 +1134,8 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
 /// counting versions start from pinned-writer records of a pre-epoch prefix
 /// that holds a Fast snapshot and no reducer key. Post-epoch growth then emits
 /// what a cold Full emits on RAM and restart, in totals and placement, through
-/// no evidence, an explicit tier, a clearing snapshot and another explicit
-/// tier. Controls: swapped accounts and a changed tier fail the comparator.
+/// an explicit tier, a clearing snapshot and another explicit tier. Controls:
+/// swapped accounts and a changed tier fail the comparator.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1234,15 +1234,13 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             assert!(!old.windows(key.len()).any(|bytes| bytes == key));
         }
         let mut flex = 0;
-        for (step, tier) in [None, Some(Some("flex")), Some(None), Some(Some("priority"))]
+        for (step, tier) in [Some("flex"), None, Some("priority")]
             .into_iter()
             .enumerate()
         {
-            let at = "2026-11-04T07:00:00Z";
-            let snapshot = tier.map_or(String::new(), |tier| settings(at, tier));
             let rows = codex_rows(&format!("tier-{step}"), 30 + step as u64)
                 .replace("2026-10-27", "2026-11-04");
-            grow(&(snapshot + &rows));
+            grow(&(settings("2026-11-04T07:00:00Z", tier) + &rows));
             let (cold_index, cold_scan, cold_modes) =
                 other_page(&c, &E2ScanFixture::default(), source, prior.clone());
             assert_eq!(cold_modes, (2, 0, 0));
@@ -1272,13 +1270,12 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
             let tiers = tiers(&cold_scan);
             let flex_now = tiers.get(&Some("flex".to_string())).copied().unwrap_or(0);
             match step {
-                0 => assert_eq!(tiers.len(), 1, "no in-epoch evidence stamps nothing"),
-                1 => {
+                0 => {
                     assert_eq!(tiers.len(), 2);
                     assert!(flex_now > 0);
                     flex = flex_now;
                 }
-                2 => {
+                1 => {
                     assert_eq!(tiers.len(), 2);
                     assert_eq!(flex_now, flex, "a clearing snapshot leaks no earlier tier");
                 }

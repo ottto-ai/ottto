@@ -501,9 +501,9 @@ const THREAD_TIER_SOURCE: &str = "derived_from_thread_settings";
 const AT_EPOCH: &str = "2026-11-04T00:00:00Z";
 
 /// [money] Requested tier for both counting versions: an in-epoch snapshot
-/// replaces the running tier, anything but an explicit known tier clears it
-/// and adds no `service_tier`, and pre-epoch or undated evidence and requests
-/// keep exactly today's untiered row.
+/// replaces the running tier, anything but an explicit `fast`, `priority` or
+/// `flex` clears it and adds no `service_tier`, and pre-epoch or undated
+/// evidence and requests keep exactly today's untiered row.
 #[test]
 fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
     let in_epoch = |minute: u64| format!("2026-11-04T00:{minute:02}:00Z");
@@ -521,7 +521,7 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
         1,
     );
     tier_turn(&mut values, &mut total, "t2", AT_EPOCH, true, 2);
-    for (index, (tier, input)) in [("default", 4), ("fast", 8), ("priority", 16), ("flex", 32)]
+    for (index, (tier, input)) in [("fast", 8), ("priority", 16), ("flex", 32)]
         .into_iter()
         .enumerate()
     {
@@ -529,8 +529,9 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
         values.push(thread_settings(Some(&at), Some(json!(tier))));
         tier_turn(&mut values, &mut total, tier, &at, true, input);
     }
-    // Omitted, null and unrecognized replacements each clear an earlier Fast.
+    // Default, omitted, null and unrecognized each clear an earlier Fast.
     for (index, (tier, input)) in [
+        (Some(json!("default")), 4),
         (None, 64),
         (Some(Value::Null), 128),
         (Some(json!("auto")), 256),
@@ -558,8 +559,7 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
     tier_turn(&mut values, &mut total, "undated", &at, false, 1024);
     let source = Some(THREAD_TIER_SOURCE.to_string());
     let expected = BTreeMap::from([
-        (None, (1 + 2 + 64 + 128 + 256 + 1024, None)),
-        (Some("standard".to_string()), (4, source.clone())),
+        (None, (1 + 2 + 4 + 64 + 128 + 256 + 1024, None)),
         (Some("priority".to_string()), (8 + 16 + 512, source.clone())),
         (Some("flex".to_string()), (32, source)),
     ]);
@@ -571,6 +571,13 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
             "{active}"
         );
     }
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        for value in &values {
+            apply_codex_line(value, &mut accumulator);
+        }
+    });
+    assert_eq!(counts.codex_non_default_thread_tier, 9);
 }
 
 /// [money] `logs_2` and the protected replay win over the running thread tier,

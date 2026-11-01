@@ -1612,6 +1612,14 @@ rereads count again. Shape probes do not count. These are observations rather
 than retention failures.
 
 
+## Codex non-default thread tier
+
+`codex_non_default_thread_tier` in `process_retained_cache_lifecycle_totals`
+counts each `thread_settings_applied` line whose `service_tier` is `fast`,
+`priority` or `flex`, whether or not its date makes it count for pricing; rereads
+count again. It is a cumulative saturating process total with no labelled log
+line and no path or session id, and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
