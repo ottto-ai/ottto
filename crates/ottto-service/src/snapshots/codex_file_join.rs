@@ -457,8 +457,10 @@ impl HeaderInventory {
         {
             return Err(CodexZstCause::OwnerUnproven);
         }
-        let valid = self.archive_complete
-            && self.content_unchanged()
+        if !self.archive_complete {
+            return Err(CodexZstCause::OwnerUnproven);
+        }
+        let valid = self.content_unchanged()
             && self.archives_unchanged()
             && self
                 .headers
@@ -509,48 +511,41 @@ impl HeaderInventory {
         index.archive_pass.started |= !self.archive_pending.is_empty();
         if !index.archive_pass.headers_prepared {
             index.archive_pass.headers_prepared = true;
-            let gone: Vec<_> = index
-                .archives
-                .keys()
-                .filter(|key| {
-                    Path::new(key).is_absolute()
-                        && fs::symlink_metadata(key)
-                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                })
-                .cloned()
-                .collect();
-            for key in gone {
-                index.archive_transition(Path::new(&key), ArchiveTransition::Gone);
-            }
             // One durable batch for bounded inventory work, independent from Full.
             if index.archive_pass.ready(1) {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
                     if let Ok(meta) = fs::symlink_metadata(path) {
-                        if let Ok(a) = codex_compressed_input::ArchiveEvidence::from_metadata(meta)
-                        {
-                            if index
-                                .archives
-                                .get(&key)
-                                .map_or(true, |old| old.stamp != a.stamp)
-                            {
-                                index.archives.insert(key.clone(), a);
+                        if let Ok(stamp) = FileStamp::capture(meta.clone()) {
+                            if index.archives.get(&key).map_or(true, |old| {
+                                old.stamp
+                                    .as_ref()
+                                    .map_or(true, |old| !old.same_content(&stamp))
+                            }) {
+                                if let Ok(a) =
+                                    codex_compressed_input::ArchiveEvidence::from_metadata(meta)
+                                {
+                                    index.archives.insert(key.clone(), a);
+                                }
                             }
-                            if index.archive_quiet(&key) {
+                            let Some(a) = index.archives.get_mut(&key) else {
+                                continue;
+                            };
+                            if a.owner.is_none() {
+                                a.owner = a.header().map(|h| h.owner.clone());
+                            }
+                            if a.quiet_disposition() && a.owner.is_some() {
                                 continue;
                             }
-                            if let Some(w) =
-                                index.archives.get_mut(&key).and_then(|a| a.work.as_mut())
+                            let w = a.work.get_or_insert_with(Box::default);
+                            if w.header.is_none()
+                                && sampled_scan::now_seconds() >= w.header_retry_after
                             {
-                                if w.header.is_none()
-                                    && sampled_scan::now_seconds() >= w.header_retry_after
-                                {
-                                    w.header_attempts = w.header_attempts.saturating_add(1);
-                                    w.header_retry_after =
-                                        sampled_scan::now_seconds().saturating_add(21600);
-                                    w.reservation = ArchiveReservation::HeaderSave;
-                                    index.archive_pass.dirty = true;
-                                }
+                                w.header_attempts = w.header_attempts.saturating_add(1);
+                                w.header_retry_after =
+                                    sampled_scan::now_seconds().saturating_add(21600);
+                                w.reservation = ArchiveReservation::HeaderSave;
+                                index.archive_pass.dirty = true;
                             }
                         }
                     }
@@ -567,14 +562,12 @@ impl HeaderInventory {
             if self.archive_headers.len() >= MAX_HEADER_FILES {
                 // Separate bounded archive share: ordinary joins remain complete.
                 self.archive_complete = false;
-                index.archive_pass.deferred = self
-                    .archive_pending
-                    .iter()
-                    .filter(|p| {
-                        let key = local_index_key(p);
-                        !index.archives.contains_key(&key)
-                    })
-                    .count();
+                index.archive_pass.deferred.extend(
+                    self.archive_pending
+                        .iter()
+                        .map(|p| local_index_key(p))
+                        .filter(|key| !index.archives.contains_key(key)),
+                );
                 self.archive_pending.clear();
                 return true;
             }

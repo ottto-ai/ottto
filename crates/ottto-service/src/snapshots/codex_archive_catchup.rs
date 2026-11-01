@@ -13,18 +13,32 @@ impl ScanIndex {
         if matches!(change, ArchiveTransition::Gone) {
             self.archives.remove(&key);
         } else {
-            if !self.archives.contains_key(&key)
-                && matches!(change, ArchiveTransition::Transient(_))
-            {
-                let mut a = ArchiveEvidence::unknown();
-                a.transition(ArchiveTransition::Transient(
-                    CodexZstCause::AdmissionRefused,
-                ));
-                self.archives.insert(key, a);
+            if !self.archives.contains_key(&key) {
+                self.archive_pass.deferred.insert(key.clone());
+                if let Some(walk) = self.traversal.as_mut() {
+                    walk.codex_rollout_paths.insert(key);
+                }
                 return;
             }
             if let Some(a) = self.archives.get_mut(&key) {
                 a.transition(change);
+            }
+        }
+    }
+    pub(super) fn revert_archive_witness(&mut self, key: &str, previous: &ScanIndex) {
+        if self
+            .archives
+            .get(key)
+            .and_then(|a| a.work.as_ref())
+            .is_some_and(|w| w.body_witness.is_some())
+        {
+            match previous.archives.get(key) {
+                Some(a) => {
+                    self.archives.insert(key.to_owned(), a.clone());
+                }
+                None => {
+                    self.archives.remove(key);
+                }
             }
         }
     }
@@ -61,7 +75,7 @@ impl ScanIndex {
             .values()
             .filter(|a| a.owed_cause().is_some())
             .count()
-            + self.archive_pass.deferred
+            + self.archive_pass.deferred.len()
     }
     pub(super) fn disclose_archive_debt(&mut self) {
         let mut counts = BTreeMap::<CodexZstCause, usize>::new();
@@ -77,20 +91,21 @@ impl ScanIndex {
                 }
             }
         }
-        if self.archive_pass.deferred > 0 {
+        if !self.archive_pass.deferred.is_empty() {
             *counts.entry(CodexZstCause::AdmissionRefused).or_default() +=
-                self.archive_pass.deferred;
+                self.archive_pass.deferred.len();
         }
-        if self.archive_pass.deferred != self.archive_pass.last_deferred {
-            alarm += self.archive_pass.deferred;
+        if self.archive_pass.deferred.len() != self.archive_pass.last_deferred {
+            alarm += self.archive_pass.deferred.len();
         }
-        self.archive_pass.last_deferred = self.archive_pass.deferred;
+        self.archive_pass.last_deferred = self.archive_pass.deferred.len();
         for (cause, count) in counts {
             crate::local_resource_diagnostics::codex_zst_held(cause, count);
         }
         archive_alarm(alarm);
     }
     pub(super) fn hold_archive_corrections(&mut self) {
+        let mut count = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
@@ -99,8 +114,10 @@ impl ScanIndex {
                 a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 ));
+                count += 1;
             }
         }
+        archive_alarm(count);
     }
     /// Reuse the ordinary absence owner; uncertainty in any configured root
     /// or inventoried home prevents publishing a uniqueness-dependent body.
@@ -188,7 +205,7 @@ impl ScanIndex {
                     let a = self.archives.get_mut(&key).unwrap();
                     if a.work
                         .as_ref()
-                        .is_some_and(|w| w.decoded && sampled_scan::now_seconds() < w.retry_after)
+                        .is_some_and(|w| sampled_scan::now_seconds() < w.retry_after)
                     {
                         continue;
                     }
@@ -208,6 +225,10 @@ impl ScanIndex {
     ) -> Admission {
         let key = local_index_key(&c.path);
         let Some(a) = self.archives.get(&key).filter(|a| a.matches(file)) else {
+            self.archive_transition(
+                &c.path,
+                ArchiveTransition::Correctness(CodexZstCause::OwnerUnproven),
+            );
             return Admission::Held;
         };
         if !a.ready_full() {

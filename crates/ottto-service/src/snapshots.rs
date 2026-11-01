@@ -26826,7 +26826,7 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
-        index.archive_pass.deferred = 0;
+        index.archive_pass.deferred.clear();
         let growth_active =
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
@@ -28978,14 +28978,7 @@ impl OwnedSourceScan {
                         .get(&local_index_key(&active.candidate.path))
                         .map_or(true, |a| !a.ready_full())
                 {
-                    if index
-                        .archives
-                        .contains_key(&local_index_key(&active.candidate.path))
-                    {
-                        active_file = Some(active);
-                    } else {
-                        active.parser.reader.reader.close();
-                    }
+                    active.parser.reader.reader.close();
                     pending!();
                 }
                 if active.parser.reader.reader.is_compressed()
@@ -43840,7 +43833,14 @@ fn ensure_bounded_traversal(
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
             .then(codex_file_join::DirectoryCensus::new),
-        reconciliation_upper_bound: index.files.keys().next_back().cloned(),
+        reconciliation_upper_bound: index
+            .files
+            .keys()
+            .next_back()
+            .into_iter()
+            .chain(index.archives.keys().next_back())
+            .max()
+            .cloned(),
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
@@ -45063,13 +45063,26 @@ fn reconcile_missing_index_entries_with_side(
         Vec::new()
     };
     let residue_count = page.len();
-    let regular = index
+    let mut regular = index
         .files
-        .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
+        .range((
+            lower_bound.clone(),
+            std::ops::Bound::Included(upper_bound.clone()),
+        ))
         .filter(|(key, _)| page.binary_search(key).is_err())
         .take(limit.saturating_sub(residue_count))
         .map(|(key, _)| key.clone())
+        .chain(
+            index
+                .archives
+                .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
+                .take(limit)
+                .map(|(key, _)| key.clone()),
+        )
         .collect::<Vec<_>>();
+    regular.sort();
+    regular.dedup();
+    regular.truncate(limit.saturating_sub(residue_count));
     let regular_after = regular.last().cloned().or(after.clone());
     let regular_done =
         regular.last() == Some(&upper_bound) || regular.len() < limit.saturating_sub(residue_count);
@@ -45085,6 +45098,14 @@ fn reconcile_missing_index_entries_with_side(
     let mut growth_queued = false;
     let account_members = index.observed_account_members();
     for key in &page {
+        if index.archives.contains_key(key)
+            && index
+                .traversal
+                .as_ref()
+                .is_some_and(|walk| sampled_audit::proven_absent(Path::new(key), &walk.scan_roots))
+        {
+            index.archive_transition(Path::new(key), ArchiveTransition::Gone);
+        }
         let observed = index
             .traversal
             .as_ref()
@@ -46898,7 +46919,7 @@ impl ScanIndex {
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
         if self
-            .active_upload_context_fingerprint
+            .upload_context_fingerprint
             .as_ref()
             .is_some_and(|old| old != &fingerprint)
         {
@@ -51326,6 +51347,7 @@ impl ScanIndex {
             .preserve_missing_from(&previous.claude_money_birth_store);
         self.note_claude_history_not_accepted(previous, &held_keys);
         for key in &held_keys {
+            result.revert_archive_witness(key, previous);
             let reparse = self
                 .files
                 .get(key)
@@ -51616,6 +51638,7 @@ impl ScanIndex {
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         for key in &held_keys {
+            self.revert_archive_witness(key, previous);
             let reparse = self
                 .files
                 .get(key)
@@ -52242,11 +52265,7 @@ impl ScanIndex {
         self.retain_terminal_off_page_retries(previous, &safe_keys, &mut result);
         result.archives.clone_from(&self.archives);
         for key in self.archives.keys().filter(|key| !safe_keys.contains(*key)) {
-            if let Some(prior) = previous.archives.get(key) {
-                result.archives.insert(key.clone(), prior.clone());
-            } else {
-                result.archives.remove(key);
-            }
+            result.revert_archive_witness(key, previous);
         }
         result
     }

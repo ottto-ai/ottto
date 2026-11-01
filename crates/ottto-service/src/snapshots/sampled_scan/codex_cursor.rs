@@ -283,7 +283,7 @@ pub(crate) struct ArchivePass {
     pub(crate) dirty: bool,
     pub(crate) prepared: bool,
     pub(crate) headers_prepared: bool,
-    pub(crate) deferred: usize,
+    pub(crate) deferred: std::collections::BTreeSet<String>,
     pub(crate) last_deferred: usize,
 }
 crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, dirty, prepared, headers_prepared, deferred, last_deferred; shared gates);
@@ -365,11 +365,12 @@ impl PageBudget {
             .is_some_and(|InlineInstant(deadline)| pace_now() >= deadline)
     }
 
-    /// Singleton-budget bytes this page may still read (group probes, R2-N2).
+    /// Continue a paid archive without resetting the page's other claims.
     pub(in crate::snapshots) fn continue_singleton(&mut self) {
         self.singleton_decoded = 0;
     }
 
+    /// Singleton-budget bytes this page may still read (group probes, R2-N2).
     pub(in crate::snapshots) fn singleton_remaining(&self, limits: Limits) -> u64 {
         limits.singleton.saturating_sub(self.singleton_decoded)
     }
