@@ -1064,6 +1064,56 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
     }
 }
 
+/// [money] A family the checked summary refuses keeps every row and is
+/// settled for the session, so it cannot hold the allowance on every save.
+#[test]
+#[serial_test::serial]
+fn cold_compaction_settles_a_refused_family_for_the_session() {
+    let (_scratch, mut db) = Scratch::live_store();
+    let mut original = fixture();
+    let pending = original
+        .claude_account_family_pending
+        .get_mut("synthetic-family")
+        .unwrap();
+    pending.current.census_complete = false;
+    pending.current.census_window_end = "2026-08-02T07:20:00Z".into();
+    // Equal evidence, but the last boundary is not before the current's.
+    *pending.previous_windows.resident_mut() = ["07:00", "07:01", "07:20"]
+        .map(|at| {
+            let mut w = pending.current.clone();
+            w.census_window_end = format!("2026-08-02T{at}:00Z");
+            w
+        })
+        .into();
+    commit_populate(&mut db, &original);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut graph, mut cx) = Mapper.hydrate_context(&mut db).unwrap();
+    let uncollapsed = |graph: &ScanIndex| {
+        graph.claude_account_family_pending["synthetic-family"]
+            .previous_windows
+            .uncollapsed()
+    };
+    assert_eq!(uncollapsed(&graph), 2);
+    let previous = baseline(&graph, &mut cx).unwrap();
+    let before = previous.rows.clone();
+    let saved = Mapper
+        .save(&mut db, &identity, previous, &mut graph, &mut cx, false)
+        .unwrap();
+    assert_eq!(
+        (
+            cx.compaction.counts.families_refused,
+            cx.compaction.counts.windows_removed
+        ),
+        (1, 0)
+    );
+    assert_eq!(saved.rows, before);
+    assert_eq!(uncollapsed(&graph), 0);
+    Mapper
+        .save(&mut db, &identity, saved, &mut graph, &mut cx, false)
+        .unwrap();
+    assert_eq!(cx.compaction.counts.families_refused, 0);
+}
+
 /// [format] stale generation or future writer refuses before saving.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {

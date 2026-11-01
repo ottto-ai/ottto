@@ -210,6 +210,8 @@ pub(super) struct CompactionCounts {
 #[derive(Default)]
 pub(super) struct Compaction {
     pub(super) counts: CompactionCounts,
+    /// Families this save settled. A refused one keeps every row and waits
+    /// for the next hydrate, so it cannot spend the allowance on every save.
     pub(super) done: BTreeSet<String>,
 }
 
@@ -254,12 +256,12 @@ fn compact(
             windows.push(authenticated_window(tx, family, *id, digest)?);
             reads += 1;
         }
+        cx.compaction.done.insert(family.clone());
         match checked_collapse(&mut windows, &pending.current.census_window_end) {
             None => cx.compaction.counts.families_refused += 1,
             Some(retained) => {
                 cx.compaction.counts.windows_removed += archived.len() - retained.len();
                 cx.compaction.counts.families_done += 1;
-                cx.compaction.done.insert(family.clone());
                 kept.insert(family.clone(), retained);
             }
         }
