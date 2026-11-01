@@ -345,6 +345,11 @@ fn load_with_custody<M: Mapper>(
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
                         state.save_digests = Some(digests);
+                        // Same session and stamp: rollovers its commits wrote
+                        // stay committed for graphs that outlive this load.
+                        if !session.cx.ambiguous {
+                            cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
+                        }
                         session.cx = cx;
                         index.v2_mut().persistence_v2 = Some(runtime.clone());
                         telemetry::event("route", &"v2");
