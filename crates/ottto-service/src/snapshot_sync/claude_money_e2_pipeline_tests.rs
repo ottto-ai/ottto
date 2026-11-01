@@ -3026,7 +3026,7 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 }
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
-mod money_equivalence_tests {
+pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
     #[cfg(unix)]
     mod durable_transition_tests {
