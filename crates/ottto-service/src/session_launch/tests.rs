@@ -773,3 +773,43 @@ fn claude_remote_settings_are_validated_not_presence_refused() {
         Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
     );
 }
+
+#[test]
+fn codex_app_preferences_are_read_for_managed_keys_only() {
+    let scratch = crate::test_scratch::ScratchDir::new("codex-user-preferences");
+    let home = scratch.as_ref().join("home");
+    let cwd = scratch.as_ref().join("project");
+    let system = scratch.as_ref().join("system-codex");
+    let preferences = home.join("Library/Preferences");
+    for path in [&preferences, &cwd, &system] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut binding = fixture_binding(&home);
+    binding.provider = Provider::Codex;
+    binding.claude_slot = None;
+    binding.root = home.join(".codex");
+    let path = preferences.join("com.openai.codex.plist");
+    // The Codex desktop app writes ordinary preferences to this domain.
+    let mut app = plist::Dictionary::new();
+    app.insert("SUHasLaunchedBefore".into(), plist::Value::Boolean(true));
+    plist::Value::Dictionary(app.clone())
+        .to_file_binary(&path)
+        .unwrap();
+    assert!(preflight::codex(&binding, &cwd, &system).is_ok());
+    for key in ["config_toml_base64", "requirements_toml_base64"] {
+        let mut managed = app.clone();
+        managed.insert(key.into(), plist::Value::String("synthetic".into()));
+        plist::Value::Dictionary(managed)
+            .to_file_xml(&path)
+            .unwrap();
+        let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+        assert_eq!(error.reason, Reason::ConfigUnsupported, "{key}");
+        assert_eq!(
+            error.setting_layer,
+            Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
+        );
+    }
+    fs::write(&path, "not a plist").unwrap();
+    let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+    assert_eq!(error.reason, Reason::SettingsMalformed);
+}
