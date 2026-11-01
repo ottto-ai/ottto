@@ -1058,6 +1058,24 @@ fn settle_checkpointed_upload(
             &server_quarantine,
             &holds.held_fingerprints,
         )
+    } else if !resolved_permanent_rejections {
+        // Retryable refusals already have quarantine custody. Settle every
+        // other scanned entity, including semantic no-ops not resent here,
+        // through the same rule used by partial checkpoints.
+        let refused = upload_progress
+            .quarantined_fingerprints
+            .keys()
+            .cloned()
+            .collect();
+        let mut committable = index.committable_subset_with_refusals(
+            committed_index,
+            &upload_progress.accepted_fingerprints,
+            &upload_progress.quarantined_fingerprints,
+            &holds.held_fingerprints,
+            Some(&refused),
+        );
+        committable.preserve_scanned_upload_context_from(&index);
+        committable
     } else {
         index
     };
@@ -3543,6 +3561,46 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_refusals(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        fallback,
+        cause,
+        audit_release,
+        body_drains,
+        None,
+    )
+}
+
+/// `isolated_refusals`: the upload sent every batch and only these items were
+/// refused. Every other entity then settles as on a
+/// clean page; without it only this pass's ACKs settle.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_refusals(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
+    audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    isolated_refusals: Option<&BTreeSet<String>>,
+) -> Result<ScanIndex> {
     let progress_owner =
         SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
@@ -3624,11 +3682,12 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset_with_local_holds(
+    let mut committable = index.committable_subset_with_refusals(
         committed_index,
         &accepted,
         &quarantined,
         locally_held,
+        isolated_refusals,
     );
     if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);

@@ -472,7 +472,10 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
         .unwrap()
     };
     let [unchanged, sibling, refused, old] = [1, 2, 3, 4].map(|n| format!("{n:064x}"));
-    let mut committed = ScanIndex::default();
+    let mut committed: ScanIndex = serde_json::from_value(json!({
+        "upload_context_fingerprint": "prior-context"
+    }))
+    .unwrap();
     for (key, fingerprint, source) in [("reread", &unchanged, ""), ("refused", &old, "source")] {
         committed
             .files
@@ -482,7 +485,10 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
             .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
         committed.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
     }
-    let mut scanned = committed.clone();
+    let mut scanned_state = serde_json::to_value(&committed).unwrap();
+    scanned_state["upload_context_fingerprint"] = json!("scanned-context");
+    let mut scanned: ScanIndex = serde_json::from_value(scanned_state).unwrap();
+    scanned.activate_upload_context("scanned-context".into());
     for (key, fingerprint) in [
         ("reread", &unchanged),
         ("sibling", &sibling),
@@ -550,6 +556,11 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
     );
     let mut settled = settlement.index;
     settle_index_after_upload(&mut settled, &committed, &progress);
+    assert_eq!(
+        serde_json::to_value(&settled).unwrap()["upload_context_fingerprint"],
+        "scanned-context",
+        "the settled census context must not force healthy siblings to reparse"
+    );
     for key in ["reread", "sibling"] {
         assert_eq!(
             serde_json::to_value(&settled.files[key]).unwrap(),
