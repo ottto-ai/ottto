@@ -80541,8 +80541,8 @@ mod tests {
             8192,
             "physical-read seam observes head and tail"
         );
-        let checkpoint = root.join("unfunded-index.json");
         for validated in [false, true] {
+            let checkpoint = root.join(format!("unfunded-index-{validated}.json"));
             let key = local_index_key(&archive);
             let mut index = ScanIndex::default();
             if validated {
@@ -80560,6 +80560,8 @@ mod tests {
                 index.save(&checkpoint).unwrap();
                 index = ScanIndex::load(&checkpoint).unwrap();
                 index.traversal = None; // A fresh ordinary census, not a paced re-list.
+                let saved_generation = index.generation;
+                let saved_bytes = fs::read(&checkpoint).unwrap();
                 let before = samples();
                 let mut state = OwnedSourceScan::new(
                     SnapshotSource::Codex,
@@ -80586,6 +80588,11 @@ mod tests {
                     }
                 }
                 index = completed.expect("unfunded archive census completes");
+                assert_eq!(
+                    index.generation, saved_generation,
+                    "no unowned archive save"
+                );
+                assert_eq!(fs::read(&checkpoint).unwrap(), saved_bytes);
                 assert_eq!(samples(), before, "no physical head/tail archive reads");
                 assert!(index.archive_owed_count() > 0);
                 assert!(!index.archive_pass.dirty);
