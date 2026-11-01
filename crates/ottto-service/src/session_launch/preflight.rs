@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub(super) const CLAUDE_UNSET: &[&str] = &[
+pub(crate) const CLAUDE_UNSET: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "ANTHROPIC_API_KEY",

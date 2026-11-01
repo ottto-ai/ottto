@@ -11,6 +11,7 @@
 //! memory, keyed by a fingerprint of the token itself: one call per token,
 //! with back-off after a failure.
 
+#[cfg(not(test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,29 @@ enum Verdict {
 }
 
 /// The latest default-home token and its verdict. One entry: the default home
-/// holds one token at a time.
+/// holds one token at a time. Tests keep one per test thread.
+#[cfg(not(test))]
 static LAST: Mutex<Option<(String, Verdict)>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
+    use_last(
+        &mut LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST: std::cell::RefCell<Option<(String, Verdict)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
+    LAST.with(|last| use_last(&mut last.borrow_mut()))
+}
 
 /// A content fingerprint of the stored token (never a file time).
 fn credential_fingerprint(access_token: &str) -> String {
@@ -49,39 +71,22 @@ fn credential_fingerprint(access_token: &str) -> String {
 /// The proven owner of `access_token`, or `None` while unproven. The provider
 /// is asked at most once per token, and again after a failure only once its
 /// back-off has passed; `may_call` false serves the remembered verdict only.
-/// `cached` is the `.claude.json` binding, read only by tests.
-pub(super) fn proven_owner(
-    access_token: &str,
-    may_call: bool,
-    cached: Option<&(String, String)>,
-) -> Option<ProvenOwner> {
-    // Tests that install no profile responder keep today's pairing: the token
-    // belongs to the cached account, and nothing is remembered.
-    #[cfg(test)]
-    if PROFILE_TEST_RESPONSE.with(std::cell::Cell::get).is_none() {
-        return cached.map(|(account_hash, organization_hash)| ProvenOwner {
-            account_hash: account_hash.clone(),
-            organization_hash: organization_hash.clone(),
-            proven_at: crate::current_rfc3339_timestamp(),
-        });
-    }
-    #[cfg(not(test))]
-    let _ = cached;
+/// No lock is held during the call.
+pub(super) fn proven_owner(access_token: &str, may_call: bool) -> Option<ProvenOwner> {
     let fingerprint = credential_fingerprint(access_token);
-    let mut last = LAST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let failures = match last.as_ref() {
+    let failures = with_last(|last| match last.as_ref() {
         Some((known, verdict)) if *known == fingerprint => match verdict {
-            Verdict::Proven(owner) => return Some(owner.clone()),
-            Verdict::Failed { retry_at, .. } if Instant::now() < *retry_at => return None,
-            Verdict::Failed { failures, .. } => *failures,
+            Verdict::Proven(owner) => Err(Some(owner.clone())),
+            Verdict::Failed { retry_at, .. } if Instant::now() < *retry_at => Err(None),
+            Verdict::Failed { failures, .. } => Ok(*failures),
         },
-        _ => 0,
+        _ => Ok(0),
+    });
+    let failures = match failures {
+        Ok(failures) if may_call => failures,
+        Ok(_) => return None,
+        Err(remembered) => return remembered,
     };
-    if !may_call {
-        return None;
-    }
     let verdict = match fetch_owner(access_token) {
         Some(owner) => Verdict::Proven(owner),
         None => {
@@ -99,15 +104,15 @@ pub(super) fn proven_owner(
         Verdict::Proven(owner) => Some(owner.clone()),
         Verdict::Failed { .. } => None,
     };
-    *last = Some((fingerprint, verdict));
+    with_last(|last| *last = Some((fingerprint, verdict)));
     owner
 }
 
 fn fetch_owner(access_token: &str) -> Option<ProvenOwner> {
     #[cfg(test)]
-    let injected = PROFILE_TEST_RESPONSE
+    let injected = Some(PROFILE_TEST_RESPONSE
         .with(std::cell::Cell::get)
-        .map(|respond| respond());
+        .unwrap_or(default_home_profile)());
     #[cfg(not(test))]
     let injected: Option<Result<Value, u16>> = None;
     let started = Instant::now();
@@ -172,4 +177,16 @@ thread_local! {
     /// 200 body (`Ok`) or an HTTP status (`Err`).
     pub(super) static PROFILE_TEST_RESPONSE: std::cell::Cell<Option<fn() -> Result<Value, u16>>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Tests without a responder: the token belongs to the account the test
+/// home's default `.claude.json` names.
+#[cfg(test)]
+fn default_home_profile() -> Result<Value, u16> {
+    let path = ottto_core::ClaudeConfigDirSlot::Default.identity_path(&super::home_dir());
+    let account = super::read_claude_cli_oauth_account(&path).ok_or(404_u16)?;
+    Ok(serde_json::json!({
+        "account": {"uuid": account.account_uuid},
+        "organization": {"uuid": account.organization_uuid},
+    }))
 }

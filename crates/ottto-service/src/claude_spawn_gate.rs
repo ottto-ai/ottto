@@ -271,31 +271,16 @@ pub(crate) fn stop_claude_child(
     true
 }
 
-/// Environment that points Claude Code at another credential store or login
-/// than the pinned config dir: the secure-storage selector, and the
-/// host-owned token and account a Claude Desktop session passes its children.
-const CLAUDE_LOGIN_REDIRECT_ENV: &[&str] = &[
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
-    "CLAUDE_CODE_ACCOUNT_UUID",
-    "CLAUDE_CODE_ORGANIZATION_UUID",
-    "CLAUDE_CODE_USER_EMAIL",
-];
-
-/// Pin a short Claude run to the login the gate evaluated: `CLAUDE_CONFIG_DIR`
-/// set to that login's config dir (unset for the default login), and none of
-/// [`CLAUDE_LOGIN_REDIRECT_ENV`], which would select another keychain item or
-/// login.
+/// Pin a short Claude run to the login the gate evaluated: none of the
+/// session launcher's Claude routing variables (secure-storage selector,
+/// host-provided tokens and accounts, API routes), then `CLAUDE_CONFIG_DIR`
+/// set to that login's config dir (unset for the default login).
 pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &ClaudeConfigDirSlot) {
-    match slot.config_dir() {
-        Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),
-        None => command.env_remove("CLAUDE_CONFIG_DIR"),
-    };
-    for name in CLAUDE_LOGIN_REDIRECT_ENV {
+    for name in crate::session_launch::CLAUDE_UNSET {
         command.env_remove(name);
+    }
+    if let Some(config_dir) = slot.config_dir() {
+        command.env("CLAUDE_CONFIG_DIR", config_dir);
     }
 }
 
@@ -1336,7 +1321,7 @@ mod tests {
         let run = |slot: &ClaudeConfigDirSlot| {
             let mut command = std::process::Command::new("/usr/bin/env");
             command.env("CLAUDE_CONFIG_DIR", "/tmp/ottto-ambient-slot");
-            for name in CLAUDE_LOGIN_REDIRECT_ENV {
+            for name in crate::session_launch::CLAUDE_UNSET {
                 command.env(name, "/tmp/ottto-ambient-store");
             }
             pin_claude_login(&mut command, slot);
@@ -1350,7 +1335,10 @@ mod tests {
         assert!(registered
             .lines()
             .any(|line| line == "CLAUDE_CONFIG_DIR=/tmp/ottto-evaluated-slot"));
-        for name in CLAUDE_LOGIN_REDIRECT_ENV {
+        for name in crate::session_launch::CLAUDE_UNSET
+            .iter()
+            .filter(|name| **name != "CLAUDE_CONFIG_DIR")
+        {
             assert!(!registered.contains(&format!("{name}=")), "{name}");
         }
     }

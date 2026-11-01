@@ -1407,8 +1407,13 @@ fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput,
                         return (unreachable_server(server), true);
                     }
                     Some(Ok(slot)) => {
-                        if crate::claude_spawn_gate::check_background_claude_run(&slot).is_err() {
-                            eprintln!("mcp_harvest claude_server=deferred reason=quiet_window");
+                        if let Err(refusal) =
+                            crate::claude_spawn_gate::check_background_claude_run(&slot)
+                        {
+                            eprintln!(
+                                "mcp_harvest claude_server=deferred reason={}",
+                                refusal.code()
+                            );
                             return (unreachable_server(server), true);
                         }
                         Some(slot)
@@ -3683,8 +3688,9 @@ done
         );
     }
 
-    /// Fake `claude` and fake keychain only: a Claude Code server on the
-    /// default home is never started, inside its quiet window or outside it.
+    /// [behaviour] Fake `claude` and fake keychain only: a Claude Code server
+    /// on the default home is never started, inside its quiet window or
+    /// outside it.
     #[test]
     #[serial_test::serial]
     fn a_claude_code_server_is_never_started_on_the_default_home() {

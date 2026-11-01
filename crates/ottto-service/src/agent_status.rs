@@ -4107,7 +4107,7 @@ fn resolve_claude_default_home_owner(
         .credential
         .access_token
         .as_deref()
-        .and_then(|token| claude_token_owner::proven_owner(token, may_call, cached.as_ref()));
+        .and_then(|token| claude_token_owner::proven_owner(token, may_call));
     let mut resolved = ClaudeDefaultHomeOwner {
         cached,
         proven: owner,
