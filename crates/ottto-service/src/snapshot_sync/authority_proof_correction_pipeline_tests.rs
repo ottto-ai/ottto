@@ -3269,12 +3269,14 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
 /// [regress] R2 on main, held seam, at the production E2 gate (ON) on an owed
 /// pre-flip correction (`ApcFixture::pre_flip_grant`): the same sidecar-only
 /// revision move, then a Deferred page that holds an account-deferred owed
-/// member. The finish selection keeps the committed entries of the unsettled
-/// keys, so the no-op-drained members stay owed with their pre-page pairs;
-/// the next clean generation re-drains them at their current revisions.
-/// Fails on main (no `restore_unselected_claude_proof_body_drains`): the
-/// finish saves the drain beside the kept entry, so `apc_r2_drained_pairs`
-/// panics "drained at a revision its saved entry ... does not have".
+/// member. Only the held key keeps its committed entry; every other no-op
+/// member settles as on a page without the hold, so it drains at the
+/// revision its saved entry has (`apc_r2_drained_pairs` checks every page)
+/// and none is left owed at a kept entry. The held member stays owed and
+/// the next clean generation reads the family at most once.
+/// Failed on main (no `restore_unselected_claude_proof_body_drains`): the
+/// finish saved the drain beside a kept entry, so `apc_r2_drained_pairs`
+/// panicked "drained at a revision its saved entry ... does not have".
 #[test]
 #[serial(source_manifests)]
 #[serial(client_report)]
@@ -3303,12 +3305,8 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     );
     let reverted = apc_r2_reverted(&pages, "held");
     assert!(
-        !reverted.is_empty(),
-        "a no-op drain at a moved revision met a kept committed entry"
-    );
-    assert!(
-        !reverted.contains(&held_member),
-        "a held member never drains"
+        reverted.is_empty(),
+        "no unheld no-op member is kept at its committed entry: {reverted:?}"
     );
     let restarted = ScanIndex::load(&fixture.index_path).expect("restart after the held page");
     let (proof, owed) = restarted
@@ -3316,7 +3314,7 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
         .and_then(|record| record.correction)
         .expect("the correction is owed");
     assert_eq!(proof, grant.proof);
-    assert!(reverted.is_subset(&owed), "the correction is not lost");
+    assert!(owed.contains(&held_member), "a held member never drains");
     fixture.withheld_owners.borrow_mut().clear();
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }
