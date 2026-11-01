@@ -31675,6 +31675,12 @@ impl OwnedSourceScan {
                     .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 let account_members = index.observed_account_members();
+                let unacked = index.unacked_bodies(
+                    census
+                        .removed_index_keys
+                        .iter()
+                        .filter(|_| terminal_effects_allowed),
+                );
                 for index_key in census
                     .removed_index_keys
                     .iter()
@@ -31741,6 +31747,11 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                index.count_unacked_retired(
+                    source,
+                    unacked,
+                    sampling.as_ref().map(|context| &*context.cache),
+                );
                 // G1: only census members hold discovery. A pending re-read
                 // (growth after this generation processed its path) is
                 // next-generation evidence; retiring drops it and the next
@@ -31862,7 +31873,12 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(index, codex_side_drop, source)
+                    reconcile_missing_index_entries_bounded(
+                        index,
+                        codex_side_drop,
+                        sampling.as_ref().map(|context| &*context.cache),
+                        source,
+                    )
                 } else {
                     false
                 };
@@ -44727,25 +44743,28 @@ fn candidate_from_traversal_path_at(
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
     reconcile_missing_index_entries_with_side(
         index,
         MAX_BACKFILL_FILES_PER_SOURCE,
         codex_side_drop,
+        cache,
         source,
     )
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, SnapshotSource::ClaudeCode)
+    reconcile_missing_index_entries_with_side(index, limit, None, None, SnapshotSource::ClaudeCode)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
@@ -44804,6 +44823,7 @@ fn reconcile_missing_index_entries_with_side(
     }
     let mut growth_queued = false;
     let account_members = index.observed_account_members();
+    let unacked = index.unacked_bodies(&page);
     for key in &page {
         let observed = index
             .traversal
@@ -44874,6 +44894,7 @@ fn reconcile_missing_index_entries_with_side(
             index.drop_codex_proof_items(key, codex_side_drop);
         }
     }
+    index.count_unacked_retired(source, unacked, cache);
     let done = regular_done && residue_count < limit;
     if let Some(traversal) = index.traversal.as_mut() {
         traversal.reconciliation_started = true;
@@ -52175,6 +52196,43 @@ impl ScanIndex {
 
     fn remove_file_entry(&mut self, key: &str) {
         self.remove_file_entry_unless_held(key, false);
+    }
+
+    /// Of `keys`, those whose entry holds a parsed, nonempty body witness that
+    /// is not ACKed: deleting the file now loses that usage. Withheld-account
+    /// keys keep their own deletion count. Taken before a vanished-key retirement.
+    fn unacked_bodies<'a>(&self, keys: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+        keys.into_iter()
+            .filter(|key| {
+                !self.claude_account_deferred_holds.contains_key(*key)
+                    && self
+                        .file_snapshot_fingerprints
+                        .get(*key)
+                        .is_some_and(|entities| !entities.is_empty())
+                    && self.files.get(*key).is_some_and(|entry| {
+                        entry.last_upload_body_witness.is_some()
+                            && !claude_index_file_body_accepted(self, key, entry)
+                    })
+            })
+            .collect()
+    }
+
+    /// Counts each of `unacked` the retirement removed; it holds or resends nothing.
+    fn count_unacked_retired(
+        &self,
+        source: SnapshotSource,
+        unacked: Vec<&String>,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) {
+        for key in unacked
+            .into_iter()
+            .filter(|key| !self.files.contains_key(*key))
+        {
+            crate::local_resource_diagnostics::unacked_usage_lost_to_deletion(
+                source.api_slug(),
+                cache.and_then(|cache| cache.resident_usage(source, key)),
+            );
+        }
     }
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {

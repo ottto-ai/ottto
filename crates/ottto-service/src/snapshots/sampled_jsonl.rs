@@ -53,6 +53,11 @@ impl CachedJsonlReduction {
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
+    /// The copy's accepted `(requests, tokens)` when it belongs to `source`.
+    pub(super) fn accepted_usage(&self, source: SnapshotSource) -> Option<(u64, u64)> {
+        let totals = &self.accumulator.accepted_usage_totals;
+        (self.accumulator.source == source).then(|| (totals.request_count, totals.total_tokens()))
+    }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {

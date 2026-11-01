@@ -11,6 +11,8 @@ struct Fixture {
     root: PathBuf,
     path: PathBuf,
     cache: Arc<sampled_scan::SharedCache>,
+    /// Pages record no entity ACK, as when every upload failed.
+    unacked: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -21,6 +23,7 @@ impl Fixture {
             path: root.join(format!("{SESSION}.jsonl")),
             root,
             cache: Arc::new(sampled_scan::SharedCache::default()),
+            unacked: false,
         }
     }
     fn append(&self, uuid: &str) {
@@ -165,7 +168,9 @@ impl Fixture {
                             .iter()
                             .map(|item| item.snapshot_fingerprint.clone())
                             .collect();
-                        index.record_accepted_snapshot_fingerprints(&accepted);
+                        if !self.unacked {
+                            index.record_accepted_snapshot_fingerprints(&accepted);
+                        }
                         return (index, scan);
                     }
                 }
@@ -1289,5 +1294,46 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
             vec![unchanged],
             "{source:?}: the leased hint is kept"
         );
+    }
+}
+
+/// [behaviour] A parsed file deleted before its body is ACKed is counted once
+/// on the retiring page with the resident copy's requests and tokens; Pi keeps
+/// no resident copy, so its totals are unknown. The same file deleted after
+/// its ACK counts nothing. Count only: the entry retires exactly as before.
+#[test]
+fn deleted_before_ack_counts_unacked_usage_lost() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for unacked in [true, false] {
+            let mut f = Fixture::new();
+            f.unacked = unacked;
+            let index = kept_generation(&f, source, false);
+            let grown = f.root.join(format!("{GROWN}.jsonl"));
+            let key = local_index_key(&grown);
+            assert!(index.files[&key].last_upload_body_witness.is_some());
+            fs::remove_file(&grown).unwrap();
+            let (index, _, _, rows) = f.page_hinted(source, index, &[grown]);
+            assert!(!index.files.contains_key(&key), "{source:?}: retired");
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            let expected = match (unacked, source) {
+                (false, _) => Value::Null,
+                (true, SnapshotSource::ClaudeCode) => {
+                    json!({"files": 1, "requests": 1, "tokens": 30})
+                }
+                (true, SnapshotSource::Codex) => json!({"files": 1, "requests": 1, "tokens": 20}),
+                (true, SnapshotSource::Pi) => json!({"files": 1, "totals_unknown_files": 1}),
+            };
+            assert_eq!(
+                page["counts"]["unacked_usage_lost_to_deletion"], expected,
+                "{source:?} unacked {unacked}"
+            );
+        }
     }
 }

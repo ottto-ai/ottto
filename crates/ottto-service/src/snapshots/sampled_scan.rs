@@ -244,6 +244,14 @@ impl SharedCache {
             ))),
         }
     }
+    /// The resident copy's accepted `(requests, tokens)` for `key`; `None`
+    /// without one or under a poisoned lock. Diagnostics only.
+    pub(super) fn resident_usage(&self, source: SnapshotSource, key: &str) -> Option<(u64, u64)> {
+        self.retained()
+            .ok()?
+            .peek(key)
+            .and_then(|copy| copy.state.accepted_usage(source))
+    }
     /// Copy-refusal release: evicts retained copies and optional header facts.
     /// The paused cursor job, held-singleton memo, parked records and rotation
     /// state are charged and bounded in `heap_bound`, and survive (K6).
