@@ -88,7 +88,7 @@ pub(in crate::snapshots) struct CollectionMeta {
     pub(in crate::snapshots) elements_per_page: u32,
     pub(in crate::snapshots) elements: u64,
 }
-/// One collection's stored membership: the sum (mod 2^256) of a term per row.
+/// One collection's stored membership: the XOR of a term per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::snapshots) struct Membership {
     pub(in crate::snapshots) meta: CollectionMeta,
@@ -399,20 +399,10 @@ fn set_aside_key(key: &[u8]) -> Result<RowKey> {
     row(SET_ASIDE, &digest, 0)
 }
 
-fn add(sum: &mut [u8; 32], term: &[u8; 32]) {
-    let mut carry = 0_u16;
-    for (a, b) in sum.iter_mut().rev().zip(term.iter().rev()) {
-        let next = u16::from(*a) + u16::from(*b) + carry;
-        *a = next as u8;
-        carry = next >> 8;
-    }
-}
-fn subtract(sum: &mut [u8; 32], term: &[u8; 32]) {
-    let mut borrow = 0_i16;
-    for (a, b) in sum.iter_mut().rev().zip(term.iter().rev()) {
-        let next = i16::from(*a) - i16::from(*b) - borrow;
-        *a = next as u8;
-        borrow = i16::from(next < 0);
+/// A row entering or leaving a membership: XOR is its own inverse.
+fn toggle(commit: &mut [u8; 32], term: &[u8; 32]) {
+    for (a, b) in commit.iter_mut().zip(term) {
+        *a ^= b;
     }
 }
 fn term(kind: &str, position: u64, digest: &[u8; 16]) -> [u8; 32] {
@@ -559,7 +549,6 @@ pub(in crate::snapshots) struct TailHead {
     /// census or Full credit. Acquire as for a missing checkpoint.
     pub(in crate::snapshots) metadata_only: bool,
     generation: u64,
-    row_digest: [u8; 16],
 }
 pub(super) struct Decoded {
     revision: u32,
@@ -639,12 +628,11 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         reduction,
     })
 }
-fn read_head(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<(Header, Decoded)>> {
+fn read_head(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<Decoded>> {
     let Some(header) = tx.get(&row(HEAD, file, 0)?)? else {
         return Ok(None);
     };
-    let head = decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?)?;
-    Ok(Some((header, head)))
+    decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?).map(Some)
 }
 
 /// The file's committed head and nothing else; no page is visited. A future
@@ -656,7 +644,7 @@ pub(super) fn load_head(
     revision: u32,
     generation: u64,
 ) -> Result<Option<TailHead>> {
-    let Some((header, head)) = read_head(tx, file)? else {
+    let Some(head) = read_head(tx, file)? else {
         return Ok(None);
     };
     ensure!(head.revision <= revision, Hold::Future);
@@ -667,14 +655,13 @@ pub(super) fn load_head(
         body: head.reduction.unwrap_or_default(),
         common: head.common,
         generation,
-        row_digest: header.digest,
     }))
 }
 /// `head`'s reduction pages in one read snapshot, one page at a time: `visit`
 /// owns each page's bytes as it goes and must discard them all on `Err`. A
 /// metadata-only head refuses before any page. A later generation is
-/// `Hold::ReloadRequired`, before any page; a changed head, or missing, swapped
-/// or leftover rows, are any other error, the row staying until replaced.
+/// `Hold::ReloadRequired`, before any page; missing, swapped or leftover rows
+/// are any other error, the row staying until replaced.
 pub(super) fn load_pages(
     tx: &mut dyn Transaction,
     file: &[u8],
@@ -710,11 +697,6 @@ fn stream(
     visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     ensure!(head.generation == generation, Hold::ReloadRequired);
-    let stored = tx.get(&row(HEAD, file, 0)?)?;
-    ensure!(
-        stored.is_some_and(|header| header.digest == head.row_digest),
-        "state_v2_tail_membership"
-    );
     for collection in collections {
         let kind = RecordKind::parse(collection.kind())?;
         let (mut pages, mut commit) = (0_u64, [0_u8; 32]);
@@ -727,7 +709,7 @@ fn stream(
             after = Some(position(last)?);
             for header in &rows {
                 let page = position(header)?;
-                add(&mut commit, &term(kind.name(), page, &header.digest));
+                toggle(&mut commit, &term(kind.name(), page, &header.digest));
                 pages += 1;
                 visit(
                     collection,
@@ -902,12 +884,12 @@ fn observe(
         let Some(old) = tx.get(&key)? else {
             continue;
         };
-        subtract(&mut entry.commit, &term(REVISION, id, &old.digest));
+        toggle(&mut entry.commit, &term(REVISION, id, &old.digest));
         tx.mark_erasure()?;
         match value {
             Some(value) => {
                 let written = write_value(tx, file, owner, id, &key, value)?;
-                add(&mut entry.commit, &term(REVISION, id, &written.digest));
+                toggle(&mut entry.commit, &term(REVISION, id, &written.digest));
             }
             None => {
                 entry.pages = entry.pages.wrapping_sub(1);
@@ -920,7 +902,7 @@ fn observe(
         let id = common.next_revision_id;
         common.next_revision_id += 1;
         let written = write_value(tx, file, owner, id, &row(REVISION, file, id)?, value)?;
-        add(&mut entry.commit, &term(REVISION, id, &written.digest));
+        toggle(&mut entry.commit, &term(REVISION, id, &written.digest));
         entry.pages += 1;
     }
     entry.meta.elements = entry.pages;
@@ -947,7 +929,7 @@ fn write_file(
         (revision, table, common, None)
     } else {
         match read_head(tx, file)? {
-            Some((_, head)) => (head.revision, head.table, head.common, head.reduction),
+            Some(head) => (head.revision, head.table, head.common, head.reduction),
             None => Default::default(),
         }
     };
@@ -984,7 +966,7 @@ fn write_file(
             let page_key = row(collection.kind(), file, page)?;
             if let Some(old) = tx.get(&page_key)? {
                 let entry = member(&mut table, collection)?;
-                subtract(
+                toggle(
                     &mut entry.commit,
                     &term(collection.kind(), page, &old.digest),
                 );
@@ -1000,7 +982,7 @@ fn write_file(
             let entry = member(&mut table, collection)?;
             let page_key = row(collection.kind(), file, page)?;
             if let Some(old) = tx.get(&page_key)? {
-                subtract(
+                toggle(
                     &mut entry.commit,
                     &term(collection.kind(), page, &old.digest),
                 );
@@ -1009,7 +991,7 @@ fn write_file(
                 entry.pages += 1;
             }
             let written = write_value(tx, file, collection.owner(), page, &page_key, value)?;
-            add(
+            toggle(
                 &mut entry.commit,
                 &term(collection.kind(), page, &written.digest),
             );
@@ -1058,14 +1040,13 @@ fn write_file(
 /// no stored value has to decode: a damaged head never blocks a reset or retire.
 fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, MembershipTable, Common)> {
     let prior = read_head(tx, file).ok().flatten();
-    let (revision, mut common) = prior.map_or((0, Common::default()), |(_, head)| {
-        (head.revision, head.common)
-    });
+    let (revision, mut common) =
+        prior.map_or((0, Common::default()), |head| (head.revision, head.common));
     let mut table = MembershipTable::new();
     for header in revision_rows(tx, file)? {
         let id = position(&header)?;
         let entry = debt_member(&mut table);
-        add(&mut entry.commit, &term(REVISION, id, &header.digest));
+        toggle(&mut entry.commit, &term(REVISION, id, &header.digest));
         entry.pages += 1;
         entry.meta.elements = entry.pages;
         common.next_revision_id = common.next_revision_id.max(id + 1);
