@@ -1160,16 +1160,21 @@ fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
         Some(serde_json::json!("charged_work"))
     );
     // A second large save stays above; a small save re-arms the next crossing.
-    for (generation, above, alarm) in [(2, true, false), (3, false, false), (4, true, true)] {
+    let changed_bytes = serde_json::to_vec(&"y".repeat(8192)).unwrap();
+    for (generation, payload, alarm) in [
+        (2, Some(changed_bytes.as_slice()), false),
+        (3, None, false),
+        (4, Some(bytes.as_slice()), true),
+    ] {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        if above {
-            put(&mut tx, &large, &bytes);
+        if let Some(payload) = payload {
+            put(&mut tx, &large, payload);
         }
         assert_eq!(
             tx.commit(generation, generation + 1),
             DurableCommitOutcome::Committed(generation + 1)
         );
-        assert_eq!(db.refused_save_bytes() >= 4096, above);
+        assert_eq!(db.refused_save_bytes() >= 4096, payload.is_some());
         assert_eq!(
             telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some(),
             alarm
