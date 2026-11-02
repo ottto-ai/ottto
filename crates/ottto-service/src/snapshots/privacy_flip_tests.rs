@@ -364,7 +364,10 @@ fn partial_upload_under_flip_rolls_back_and_still_selects() {
     f.flip(all(false));
     let walked = f.flip_walk(all(false), None);
     assert_eq!(walked.scan.scanned_file_count, 1);
-    assert!(!walked.scan.snapshots.is_empty(), "the grown body is offered");
+    assert!(
+        !walked.scan.snapshots.is_empty(),
+        "the grown body is offered"
+    );
 }
 
 /// [behaviour] T4: this file's entity was sent since under another context, by a
