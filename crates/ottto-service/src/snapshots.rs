@@ -27402,7 +27402,7 @@ impl OwnedSourceScan {
                 file_limit,
             );
         }
-        let growth_wake = sampled_audit::expired_growth_claims(index, audit_now);
+        let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
