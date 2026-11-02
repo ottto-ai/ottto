@@ -4406,7 +4406,7 @@ fn repair_source(
     Ok(plan)
 }
 
-/// User Repair override of the seven-day scan-index rebuild-loop guard.
+/// User Repair override of the 24-hour scan-index rebuild-loop guard.
 ///
 /// Origin: only the companion's Repair button counts. It sends a token-less
 /// `repair` (`dry_run: false`) as `client_kind: companion_app`, which
@@ -29289,7 +29289,7 @@ X-API-Key = "otel_redacted"
         damage["files"]["excess-held"] =
             serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
         let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
-        // A second whole-index incident inside seven days pauses the source.
+        // A second whole-index incident inside 24 hours pauses the source.
         let pause = |source: SnapshotSource| {
             let path = root.join(format!("{}-scan-index.json", source.api_slug()));
             fs::write(&path, b"{").expect("first damage");
@@ -29403,7 +29403,7 @@ X-API-Key = "otel_redacted"
         // Codex was never armed: Verify spent nothing.
         refused(&codex, SnapshotSource::Codex);
 
-        // A fresh failure inside seven days of the override refuses again,
+        // A fresh failure inside 24 hours of the override refuses again,
         // and a press inside 24 hours names the cooldown and the retry time.
         fs::write(&pi, &damage).expect("third damage");
         refused(&pi, SnapshotSource::Pi);

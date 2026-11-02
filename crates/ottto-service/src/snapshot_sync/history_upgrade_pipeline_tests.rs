@@ -1199,7 +1199,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     .unwrap_err();
     assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
     assert_eq!(std::fs::read(&fixture.index_path).unwrap(), current_bytes);
-    // This second incident occurs after the seven-day cooldown. Model elapsed
+    // This second incident occurs after the 24-hour cooldown. Model elapsed
     // time in the fixture's rename stamp, retaining the exact prior witness.
     let backups = std::fs::read_dir(&fixture.base)
         .unwrap()
