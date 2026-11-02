@@ -1,13 +1,15 @@
-//! The one per-pass read byte budget and its oldest-first waiting queue, shared
-//! by every cause of a deferred read. No clock takes part: a burst defers by
-//! passes, and each source and pass reads a bounded number of bytes.
+//! The one per-pass allowance for deferrable re-reads and its oldest-first
+//! waiting queue, shared by every cause of a deferred read. No clock takes part:
+//! a burst defers by passes. Nondeferrable reads are charged and reported as
+//! overshoot, so the limit is an allowance, not a bound on bytes read.
 // Later causes read the stats and take from the budget directly.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
 
-/// One source's read bytes for one pass.
-#[derive(Clone, Copy, Debug)]
+/// One source's per-pass allowance for deferrable re-reads. Nondeferrable reads
+/// are charged too and reported as overshoot; it never refuses them.
+#[derive(Debug)]
 pub(crate) struct ReadBudget {
     limit: u64,
     spent: u64,
@@ -52,6 +54,9 @@ pub(crate) struct ReadBudgetStats {
     pub(crate) deferred: u64,
     /// The longest wait from enrolment to a started read.
     pub(crate) max_wait_passes: u32,
+    /// Started bytes past what the pass had left: bypasses, the pass's first
+    /// read and its front waiter are never refused.
+    pub(crate) overshoot_bytes: u64,
     /// Front waiters that did not return during their reserved pass.
     pub(crate) dropped_waiters: u64,
 }
@@ -129,8 +134,8 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
     /// waiter always reads, so the queue cannot stall; any other reserved waiter
     /// that grew since its refusal must still fit.
     ///
-    /// `bypass` reads now and a started bypass is still charged, so the pass's
-    /// total stays bounded. Its causes stay few: growth near the source file
+    /// `bypass` reads now; a started bypass is charged and reported as overshoot
+    /// past what the pass had left. Its causes stay few: growth near the source file
     /// cap, where rotation can remove discovery, and the members of a group
     /// whose probes already admitted it as one read.
     pub(crate) fn admit(
@@ -178,6 +183,10 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
                 self.stats.max_wait_passes = self.stats.max_wait_passes.max(wait);
                 self.waiting.remove(position);
             }
+            self.stats.overshoot_bytes = self
+                .stats
+                .overshoot_bytes
+                .saturating_add(bytes.saturating_sub(budget.remaining()));
             budget.charge(bytes);
             self.stats.admitted_bytes = self.stats.admitted_bytes.saturating_add(bytes);
             return true;
@@ -290,6 +299,7 @@ mod tests {
         assert_eq!(stats.max_wait_passes, 2);
         assert_eq!(stats.admitted_bytes, 25 + 4 + 6 + 6 + 100);
         assert_eq!(stats.deferred, 5);
+        assert_eq!(stats.overshoot_bytes, 15 + 96);
     }
 
     /// [money] Growth since a refusal cannot break the bound: only the pass's
