@@ -49,12 +49,19 @@ fn result(page: &Page, mode: Mode) -> RouteResult {
 }
 
 fn page(c: &Corpus, index: ScanIndex, limit: usize, sampled: bool) -> Page {
+    hinted(c, index, limit, sampled, &[])
+}
+
+/// A page that also receives the watcher's exact path hints. Re-listing is
+/// paced (`LISTING_INTERVAL_SECONDS`), so within one test second an append is
+/// seen through the hint the daemon's watcher gives it.
+fn hinted(c: &Corpus, index: ScanIndex, limit: usize, sampled: bool, hints: &[PathBuf]) -> Page {
     let mut page = c.raw(
         &E2ScanFixture::capturing_identity(),
         index,
         limit,
         sampled,
-        &[],
+        hints,
     );
     page.enrich(c);
     page
@@ -435,18 +442,14 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
         held.accepted = previous.accepted.clone();
         money_oracle::assert_held(ROOT, &previous, &held, &cold);
         let prior = commit(&session, current);
-        // A lossy completion sets no marker and records the grown length, so
-        // equal stamps rightly skip: the same bytes reproduce the same hold.
-        // New bytes after the lossy point re-select the file on Tail.
+        // The lossy completion set no marker and kept the pre-append entry,
+        // so unchanged bytes would rightly skip: they reproduce the same hold.
+        // New bytes after the lossy point, seen through the watcher hint,
+        // re-select the file; the Tail continues from the retained head.
         append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = page(&c, prior, 100, true);
+        let replay = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
         diag += &lossy_diag("replay", &replay, &key);
-        if replay.modes.1 == 0 {
-            // Context only: do later walks pick the file up?
-            let later = page(&c, replay.index.clone(), 100, true);
-            diag += &lossy_diag("later", &later, &key);
-        }
         assert_eq!(
             replay.modes.0, 0,
             "lossy completion must leave the old head{diag}"
