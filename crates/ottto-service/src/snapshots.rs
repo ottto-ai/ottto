@@ -37267,7 +37267,7 @@ impl OwnedJsonlParser {
     /// The one native finish. `pre` runs exactly once, only on the path that
     /// reached the PRE-finalization seam; every earlier error returns first.
     fn finish_native(
-        mut self,
+        self,
         request: FinishRequest<'_>,
         pre: Option<&mut dyn FnMut(PreFinalization<'_>)>,
     ) -> Result<ParsedJsonlFile> {
@@ -37562,7 +37562,7 @@ impl OwnedJsonlParser {
             && recognized_usage_drop_count == 0
             && accumulator_dropped_usage_record_count == 0
             && !positive_usage_evidence;
-        let mut snapshots = claude_request_money::e2::timed("native.into_items", || {
+        let snapshots = claude_request_money::e2::timed("native.into_items", || {
             accumulator.into_items_with_repository_identity(
                 path,
                 collected_at,

@@ -4979,7 +4979,7 @@ pub(crate) fn classify_ref<'k>(
             if facts.duplicated_elsewhere {
                 return Refused(Refusal::ConflictingDuplicate);
             }
-            return match transcript_identity(evidence, facts) {
+            return match transcript_identity(facts) {
                 // A carried or missing clock cannot establish attribution.
                 Some(_) if facts.terminal_unix_seconds.is_none() || !facts.event_clock_complete => {
                     Refused(Refusal::BadClock)
@@ -5058,10 +5058,7 @@ fn owner_is_foreign(owner: &ClaudeTraceOwnershipEvidence, facts: &RequestFacts<'
 }
 
 /// Transcript bases for a request with no telemetry row or trace owner.
-fn transcript_identity<'k>(
-    evidence: &'k ScanEvidence<'_>,
-    facts: &RequestFacts<'k>,
-) -> Option<IdentityRef<'k>> {
+fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
         MarkerVerdict::None => return None,
         MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
