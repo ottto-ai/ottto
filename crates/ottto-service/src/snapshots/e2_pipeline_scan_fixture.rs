@@ -86,15 +86,29 @@ pub(crate) fn routed_for_test(
     carry(cold)
 }
 
-/// A scan fixture's Claude page continues from its owner's route. Other
-/// sources, and scans with no cache to own one, are left alone.
+/// A scan fixture's Claude page continues from its owner's route; with no
+/// cache it reads a fixture route unrouted. Other sources are left alone.
 pub(crate) fn route_claude_for_test(
     source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    let Some(cache) = cache.filter(|_| source == SnapshotSource::ClaudeCode) else {
+    if source != SnapshotSource::ClaudeCode {
         return index;
+    }
+    let Some(cache) = cache else {
+        // A scan with no cache to own a route is the cold oracle: it reads a
+        // fixture route's graph unrouted, as before Claude kept its Tail there,
+        // so another arm's commits on that route never stale it.
+        let fixture_route =
+            route_of(&index).is_some_and(|path| fixture_routes().lock().unwrap().contains(&path));
+        if !fixture_route {
+            return index;
+        }
+        let mut copy = state_v2::money_test_support::resident(&index);
+        copy.v2_mut().persistence_v2 = None;
+        copy.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+        return copy;
     };
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -120,6 +134,21 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
     let _ = fs::remove_file(path);
     copy.generation = 0;
     copy.save(path).unwrap();
+}
+
+/// The same owner's save and reload between passes, as the daemon's: a
+/// routed index commits on its route and continues from it (the RAM-era
+/// fixture kept its cache across this reload); an unrouted one round-trips
+/// through `path`.
+pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
+    let Some(route) = route_of(index) else {
+        index.save(path).unwrap();
+        return ScanIndex::load(path).unwrap();
+    };
+    index.save(&route).unwrap();
+    let mut loaded = ScanIndex::load(&route).unwrap();
+    loaded.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+    loaded
 }
 
 #[derive(Default)]

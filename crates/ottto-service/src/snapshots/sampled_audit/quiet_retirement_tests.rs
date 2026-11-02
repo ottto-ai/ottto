@@ -918,8 +918,10 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         );
         assert!(selected.claude_account_deferred_holds.contains_key(&key));
         assert_eq!(selected.files[&key].unverified_deadline(), Some(due));
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
-        index = ScanIndex::load(&index_path).unwrap();
+        index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            &mut selected,
+            &index_path,
+        );
         assert_eq!(
             index
                 .files
@@ -951,8 +953,8 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     assert_eq!(modes, (0, 0, 1));
     assert_held_audit_diagnostics(&diagnostics, 1);
     assert!(!retired.files[&key].has_unverified_source());
-    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut retired, &index_path);
-    let loaded = ScanIndex::load(&index_path).unwrap();
+    let loaded =
+        crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(&mut retired, &index_path);
     let (_, _, modes, _) = production_scan_at_with_setup(
         &fixture,
         source,

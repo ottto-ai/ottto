@@ -649,6 +649,7 @@ fn append_growth(tailed: &ScanFixture) {
 /// Was `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
 /// which pinned two evictions: a release without benefit.
 #[test]
+#[ignore = "Claude-only: only a Claude Tail grows its borrowed state per response, and Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
     if unexecuted("M1_tail_growth_refusal") {
         return;
@@ -1241,6 +1242,7 @@ fn assert_no_victims(run: &MaRun, label: &str) {
 /// one whose checked arithmetic overflows, releases nothing: the copy is
 /// refused at its pre-release budget and every resident stays.
 #[test]
+#[ignore = "Claude-only X_out release proof: Claude keeps no RAM resident since its Tail lives in the state database (S2); Codex has no X_out"]
 fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
     if unexecuted("M_a_T2") {
         return;
@@ -1402,6 +1404,7 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
 /// `x_out_for` measures (no `set_x_out`), as production does. Its X_out
 /// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
 #[test]
+#[ignore = "Claude-only X_out release proof: Claude keeps no RAM resident since its Tail lives in the state database (S2); Codex has no X_out"]
 fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
     if unexecuted("M_a_T8_measured") {
         return;
@@ -1646,6 +1649,7 @@ pub(super) fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIden
 /// the release proof refuses: zero victims, no copy retained, every filler
 /// at its rank, the refusal counted.
 #[test]
+#[ignore = "Claude-only X_out repository identity: Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
     if unexecuted("M_a_U3_cold") {
         return;
@@ -1712,6 +1716,7 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
 /// (`Point::AfterRetain`), and the item still carries the peeked identity,
 /// not a re-resolved or re-read one.
 #[test]
+#[ignore = "Claude-only X_out repository identity: Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
     if unexecuted("M_a_U3_warm") {
         return;

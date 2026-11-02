@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 
 from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
-                               require_base_scan_fixture)
+                               require_base_harness, require_base_scan_fixture)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -362,6 +362,10 @@ class TransplantTests(unittest.TestCase):
             fixture.write_bytes(original)
             require_base_scan_fixture(base)
             self.assertEqual(fixture.read_bytes(), original)
+            # A base after the record store's removal begins its pass by name.
+            fixture.write_bytes(original.replace(b"fn begin_durable(", b"fn begin_pass("))
+            require_base_scan_fixture(base)
+            fixture.write_bytes(original)
             for method in ("scan", "scan_other", "begin_durable"):
                 with self.subTest(missing=method):
                     fixture.write_bytes(original.replace(f"fn {method}(".encode(), b"fn missing("))
@@ -370,6 +374,17 @@ class TransplantTests(unittest.TestCase):
             fixture.unlink()
             with self.assertRaises(FileNotFoundError):
                 require_base_scan_fixture(base)
+
+    def test_base_without_the_in_tree_harness_fails_closed(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch)
+            tests = base / "crates/ottto-service/src/snapshot_sync/claude_money_e2_pipeline_tests.rs"
+            tests.parent.mkdir(parents=True)
+            tests.write_text("pub(in crate::snapshot_sync) mod money_equivalence_tests {}\n")
+            require_base_harness(base)
+            tests.write_text("mod other_tests {}\n")
+            with self.assertRaisesRegex(RuntimeError, "base compat"):
+                require_base_harness(base)
 
 
 if __name__ == "__main__":
