@@ -97,7 +97,9 @@ impl Fixture {
             &CodexTitleMetadata::default(),
             metadata,
             Some(&self.support),
-        );
+            &mut Default::default(),
+        )
+        .unwrap();
         let reduction = reduction_dependencies(
             SOURCE,
             &candidate,

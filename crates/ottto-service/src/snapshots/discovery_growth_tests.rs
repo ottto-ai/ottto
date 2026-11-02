@@ -408,7 +408,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &CodexTitleMetadata::default(),
         &ClaudeTitleMetadata::default(),
         None,
-    );
+        &mut Default::default(),
+    )
+    .unwrap();
     // Reopening starts at the prepared-sidecar boundary. The opened result's
     // fingerprint already includes transcript identity and is not a sidecar.
     let prepared_candidate = candidate.clone();

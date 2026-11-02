@@ -6337,12 +6337,15 @@ pub(in crate::snapshots) fn sidecar_wakes(accumulator: &SnapshotAccumulator) -> 
 /// `rollout_path`/`created_at`, title, decoration, family) and which of the
 /// path's candidate ids are identity conflicts. Its census flags are in the
 /// memo digest.
-pub(in crate::snapshots) fn sidecar_fingerprint(codex: &CodexTitleMetadata, path: &Path) -> String {
-    sha256_hex(&[
+pub(in crate::snapshots) fn sidecar_fingerprint(
+    codex: &CodexTitleMetadata,
+    path: &Path,
+) -> Result<String> {
+    Ok(sha256_hex(&[
         "codex_memo_sidecar:v2",
-        &codex.path_sidecar_fingerprint(path),
+        &codex.path_sidecar_fingerprint(path)?,
         &conflicted_identities(codex, path),
-    ])
+    ]))
 }
 
 /// The path's candidate ids that are identity conflicts, resolved, sorted

@@ -3,7 +3,7 @@ use super::*;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct RootSidecar {
-    pub threads: BTreeMap<String, CodexStateThread>,
+    pub threads: BTreeMap<String, Arc<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
 }
 
@@ -42,18 +42,22 @@ fn compatible_copy(
     left: &CodexStateThread,
     right_root: &Path,
     right: &CodexStateThread,
-) -> bool {
-    if left == right {
-        return true;
+    reads: &mut codex_thread_rows::TitleReads,
+) -> Result<bool> {
+    if left.same_row(right, reads)? {
+        return Ok(true);
     }
-    if left.title != right.title || left.model != right.model || left.archived != right.archived {
-        return false;
+    if !left.same_title(right, reads)?
+        || left.model != right.model
+        || left.archived != right.archived
+    {
+        return Ok(false);
     }
     let Some(locator) = copy_locator(left_root, id, left) else {
-        return false;
+        return Ok(false);
     };
     if copy_locator(right_root, id, right) != Some(locator) {
-        return false;
+        return Ok(false);
     }
     let Some((left_created, right_created)) = left
         .created_at
@@ -61,10 +65,10 @@ fn compatible_copy(
         .and_then(rfc3339_unix_nanos)
         .zip(right.created_at.as_deref().and_then(rfc3339_unix_nanos))
     else {
-        return false;
+        return Ok(false);
     };
     if (left_created - right_created).abs() >= COPY_CREATION_PRECISION_NANOS {
-        return false;
+        return Ok(false);
     }
     let Some((left_updated, right_updated)) = left
         .updated_at
@@ -72,42 +76,45 @@ fn compatible_copy(
         .and_then(rfc3339_unix_nanos)
         .zip(right.updated_at.as_deref().and_then(rfc3339_unix_nanos))
     else {
-        return false;
+        return Ok(false);
     };
-    match left_updated.cmp(&right_updated) {
+    Ok(match left_updated.cmp(&right_updated) {
         Ordering::Less => left.tokens_used <= right.tokens_used,
         Ordering::Equal => left.tokens_used == right.tokens_used,
         Ordering::Greater => left.tokens_used >= right.tokens_used,
-    }
+    })
 }
 
 pub(super) fn merge_threads(
     metadata: &mut CodexTitleMetadata,
     root: &Path,
-    incoming: &BTreeMap<String, CodexStateThread>,
-) {
+    incoming: &BTreeMap<String, Arc<CodexStateThread>>,
+) -> Result<()> {
+    let mut title_reads = codex_thread_rows::TitleReads::default();
+    let mut updates = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    let mut taxonomy = metadata.local_diagnostics.identity_conflict_taxonomy;
     for (id, row) in incoming {
         if metadata.identity_conflicts.contains(id) {
-            metadata.state_threads.remove(id);
             continue;
         }
-        // Compare every physical copy, not just the selected row: tolerances
-        // must not chain across three or more roots. A third root cannot clear
-        // an identity conflict discovered by the first two.
-        let incompatible = metadata
-            .root_sidecars
-            .iter()
-            .find_map(|(prior_root, sidecar)| {
-                let prior = sidecar.threads.get(id)?;
-                (!compatible_copy(id, prior_root, prior, root, row)).then_some(prior)
-            });
+        // Check every physical copy; tolerances must not chain across homes.
+        let mut incompatible = None;
+        for (prior_root, sidecar) in &metadata.root_sidecars {
+            if let Some(prior) = sidecar.threads.get(id) {
+                if !compatible_copy(id, prior_root, prior, root, row, &mut title_reads)? {
+                    incompatible = Some(prior);
+                    break;
+                }
+            }
+        }
         if let Some(prior) = incompatible {
-            metadata
-                .local_diagnostics
-                .identity_conflict_taxonomy
-                .observe_state_cross_root(codex_state_thread_field_diffs(prior, row));
-            metadata.identity_conflicts.insert(id.clone());
-            metadata.state_threads.remove(id);
+            taxonomy.observe_state_cross_root(codex_state_thread_field_diffs(
+                prior,
+                row,
+                &mut title_reads,
+            )?);
+            conflicts.insert(id.clone());
             continue;
         }
         let replace = metadata.state_threads.get(id).map_or(true, |prior| {
@@ -122,9 +129,16 @@ pub(super) fn merge_threads(
             )
         });
         if replace {
-            metadata.state_threads.insert(id.clone(), row.clone());
+            updates.insert(id.clone(), Arc::clone(row));
         }
     }
+    metadata.state_threads.extend(updates);
+    metadata.identity_conflicts.extend(conflicts);
+    metadata
+        .state_threads
+        .retain(|id, _| !metadata.identity_conflicts.contains(id));
+    metadata.local_diagnostics.identity_conflict_taxonomy = taxonomy;
+    Ok(())
 }
 
 pub(super) fn merge_extents(

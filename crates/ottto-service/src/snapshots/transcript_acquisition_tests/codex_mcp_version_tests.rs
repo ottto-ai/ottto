@@ -48,7 +48,9 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &CodexTitleMetadata::default(),
         &ClaudeTitleMetadata::default(),
         None,
-    );
+        &mut Default::default(),
+    )
+    .unwrap();
     open_and_identify_scan_candidate(
         source,
         candidate,

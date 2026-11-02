@@ -1402,11 +1402,11 @@ pub(in crate::snapshots) mod tests {
         let mut metadata = CodexTitleMetadata::default();
         metadata.state_threads.insert(
             owner.into(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 825,
                 model: Some("gpt-synthetic".into()),
                 ..Default::default()
-            },
+            }),
         );
         let mut index = ScanIndex::default();
         let mut earlier = Vec::new();
@@ -1416,7 +1416,8 @@ pub(in crate::snapshots) mod tests {
             NOW,
             &mut index,
             &BTreeSet::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(earlier.len(), 1);
         assert_eq!(earlier[0].unattributed_total_tokens, 825);
         assert!(earlier[0].usage_accounting_contract.is_none());
@@ -1464,7 +1465,8 @@ pub(in crate::snapshots) mod tests {
             NOW,
             &mut index,
             &BTreeSet::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             parsed.snapshots.len(),
             1,

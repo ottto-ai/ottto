@@ -760,7 +760,9 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &CodexTitleMetadata::default(),
             &ClaudeTitleMetadata::default(),
             Some(&root.join("support")),
-        );
+            &mut Default::default(),
+        )
+        .unwrap();
         let (candidate, _) = open_and_identify_scan_candidate(
             SnapshotSource::ClaudeCode,
             candidate,

@@ -2437,7 +2437,15 @@ pub(super) fn reduction_dependencies(
         } else {
             support
         };
-        prepare_owned_scan_candidate(source, &mut scoped, codex, claude, reduction_support);
+        prepare_owned_scan_candidate(
+            source,
+            &mut scoped,
+            codex,
+            claude,
+            reduction_support,
+            &mut Default::default(),
+        )
+        .ok()?;
         if source == SnapshotSource::ClaudeCode {
             Some(sha256_hex(&[
                 "claude_reduction_dependencies:v1",

@@ -628,7 +628,8 @@ impl HeaderInventory {
                     metadata,
                     claude_metadata,
                     None,
-                );
+                    &mut Default::default(),
+                )?;
                 let (owner, created_unix_ms) =
                     match index.inventory_archive_header(&candidate, cache)? {
                         codex_compressed_input::HeaderRead::Validated(h) => {
@@ -720,7 +721,8 @@ impl HeaderInventory {
                 metadata,
                 &ClaudeTitleMetadata::default(),
                 None,
-            );
+                &mut Default::default(),
+            )?;
             let mut reused = None;
             if let Some(cached) = cache.and_then(|cache| {
                 cache
@@ -3465,10 +3467,10 @@ pub(super) mod tests {
         for id in [owner, healthy] {
             metadata.state_threads.insert(
                 id.to_owned(),
-                CodexStateThread {
+                Arc::new(CodexStateThread {
                     tokens_used: 300,
                     ..CodexStateThread::default()
-                },
+                }),
             );
         }
         let mut items = Vec::new();
@@ -3479,7 +3481,8 @@ pub(super) mod tests {
                 "2026-10-06T23:00:00Z",
                 &mut index,
                 &BTreeSet::new()
-            ),
+            )
+            .unwrap(),
             (1, 0)
         );
         assert_eq!(items[0].source_session_id, healthy);
@@ -3498,7 +3501,8 @@ pub(super) mod tests {
                 "2026-10-06T23:00:00Z",
                 &mut malformed,
                 &BTreeSet::new()
-            ),
+            )
+            .unwrap(),
             (0, 0)
         );
         assert!(items.is_empty());

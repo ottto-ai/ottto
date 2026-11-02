@@ -161,6 +161,9 @@ pub(crate) use claude_context_file_birth::{
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
 mod codex_root_copies;
+mod codex_thread_rows;
+#[cfg(test)]
+mod codex_thread_rows_tests;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
@@ -16905,7 +16908,7 @@ struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     /// Merged maximum for state-only fallback; never use for file binding.
     /// Registered files must use `thread_extent_for_path` and their own home.
-    state_threads: BTreeMap<String, CodexStateThread>,
+    state_threads: BTreeMap<String, Arc<CodexStateThread>>,
     /// Merged maximum for metadata summaries; never use for file binding.
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
@@ -16967,11 +16970,13 @@ struct CodexPathSidecarCandidate {
 struct CodexTitleCandidate {
     title: String,
     source: String,
+    lookup: Option<codex_thread_rows::TitleLookup>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 struct CodexStateThread {
     title: Option<String>,
+    title_lookup: Option<codex_thread_rows::TitleLookup>,
     tokens_used: u64,
     archived: bool,
     created_at: Option<String>,
@@ -20477,13 +20482,17 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn apply_codex_title_metadata(&mut self, path: &Path, metadata: &CodexTitleMetadata) {
+    fn apply_codex_title_metadata(
+        &mut self,
+        path: &Path,
+        metadata: &CodexTitleMetadata,
+    ) -> Result<()> {
         let session_id = self
             .source_session_id
             .clone()
             .or_else(|| metadata.identity_from_path_evidence(path));
         let Some(session_id) = session_id else {
-            return;
+            return Ok(());
         };
         let session_id = resolve_codex_identity(session_id.as_str());
         if let Some((parent, root, depth)) = metadata.family_position(session_id.as_str()) {
@@ -20494,11 +20503,12 @@ impl SnapshotAccumulator {
             self.codex_spawn_depth = Some(depth);
         }
         if self.title.is_some() {
-            return;
+            return Ok(());
         }
         if let Some(title) = metadata.titles.get(session_id.as_str()) {
-            self.set_title_if_absent(Some(title.title.clone()), title.source.as_str());
+            self.set_title_if_absent(Some(title.display_title()?), title.source.as_str());
         }
+        Ok(())
     }
 
     fn apply_claude_title_metadata(&mut self, path: &Path, metadata: &ClaudeTitleMetadata) {
@@ -26504,7 +26514,8 @@ fn prepare_owned_scan_candidate(
     codex_title_metadata: &CodexTitleMetadata,
     claude_title_metadata: &ClaudeTitleMetadata,
     claude_effort_support_dir: Option<&Path>,
-) {
+    title_reads: &mut codex_thread_rows::TitleReads,
+) -> Result<()> {
     // Sidecar contribution is path-derived and can be computed before the
     // transcript opens. Transcript identity itself is filled from the
     // exact opened object below, never from discovery metadata.
@@ -26523,7 +26534,9 @@ fn prepare_owned_scan_candidate(
     candidate.legacy_config_reconciliation_required =
         source == SnapshotSource::Codex && codex_title_metadata.legacy_config_file_present;
     let sidecar_fingerprint = match source {
-        SnapshotSource::Codex => codex_title_metadata.path_sidecar_fingerprint(&candidate.path),
+        SnapshotSource::Codex => {
+            codex_title_metadata.path_sidecar_fingerprint_with(&candidate.path, title_reads)?
+        }
         SnapshotSource::ClaudeCode => {
             // A subagent transcript at any depth under `subagents/` has no
             // desktop-store entry of its own: its file stem is an agent id,
@@ -26577,6 +26590,7 @@ fn prepare_owned_scan_candidate(
     // the exact opened-object fingerprint replaces it immediately before
     // candidate comparison and parsing.
     candidate.source_file_fingerprint = sidecar_fingerprint;
+    Ok(())
 }
 
 pub(crate) mod claude_native_comparison;
@@ -27684,18 +27698,25 @@ impl OwnedSourceScan {
         for candidate in &files {
             sampled_audit::retain_candidate_growth(source, index, candidate);
         }
-        let prepare_candidate_context = |candidate: &mut CandidateFile| {
-            prepare_owned_scan_candidate(
+        let mut title_reads = codex_thread_rows::TitleReads::default();
+        files.retain_mut(|candidate| {
+            if prepare_owned_scan_candidate(
                 source,
                 candidate,
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir,
-            );
-        };
-        for candidate in &mut files {
-            prepare_candidate_context(candidate);
-        }
+                &mut title_reads,
+            )
+            .is_err()
+            {
+                census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                false
+            } else {
+                true
+            }
+        });
+        drop(title_reads);
         let snapshots = Vec::new();
         let scanned_file_count = 0;
         let scanned_session_count = 0;
@@ -28216,8 +28237,8 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
-            state_census_complete,
-            sidecar_census_complete,
+            mut state_census_complete,
+            mut sidecar_census_complete,
             codex_turn_traces,
             mut codex_parent_identities,
             codex_parent_ownership_ledgers,
@@ -30409,15 +30430,16 @@ impl OwnedSourceScan {
                         ),
                         &sampled_scan::codex_cursor::counting_view(&active.candidate, index),
                     )?;
-                    let sidecar = sampled_scan::codex_cursor::sidecar_wakes(
-                        &active.parser.accumulator,
-                    )
-                    .then(|| {
-                        sampled_scan::codex_cursor::sidecar_fingerprint(
-                            &codex_title_metadata,
-                            &active.candidate.path,
-                        )
-                    });
+                    let sidecar =
+                        sampled_scan::codex_cursor::sidecar_wakes(&active.parser.accumulator)
+                            .then(|| {
+                                sampled_scan::codex_cursor::sidecar_fingerprint(
+                                    &codex_title_metadata,
+                                    &active.candidate.path,
+                                )
+                            })
+                            .transpose()
+                            .ok()?;
                     Some((digest, live, stamp, sidecar))
                 });
                 let OwnedActiveFile {
@@ -33002,15 +33024,24 @@ impl OwnedSourceScan {
                     // remains "covered" for this whole generation, the state-only fallback
                     // is delayed one cycle, and a complete terminal manifest can briefly
                     // omit a thread the local state database still proves exists.
-                    let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
+                    let state_only = append_codex_state_only_snapshots(
                         &mut snapshots,
                         &codex_title_metadata,
                         collected_at.as_str(),
                         index,
                         &codex_state_only_blocked_session_ids,
                     );
-                    scanned_session_count += state_only_scanned;
-                    semantic_noop_count += state_only_noops;
+                    match state_only {
+                        Ok((scanned, noops)) => {
+                            scanned_session_count += scanned;
+                            semantic_noop_count += noops;
+                        }
+                        Err(_) => {
+                            state_census_complete = false;
+                            sidecar_census_complete = false;
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                        }
+                    }
                 }
                 // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
@@ -33697,13 +33728,19 @@ impl OwnedSourceScan {
             }
             // Keep the prepass physical identity intact while lookup yields. Only
             // replace it with sidecar inputs immediately before the second open.
-            prepare_owned_scan_candidate(
+            if prepare_owned_scan_candidate(
                 source,
                 &mut candidate,
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
-            );
+                &mut Default::default(),
+            )
+            .is_err()
+            {
+                census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                pending!();
+            }
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
@@ -34276,10 +34313,13 @@ impl OwnedSourceScan {
                 if let Some(entry) = entry.filter(|_| !bypass) {
                     // The match re-reads two samples of the held file.
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
-                    let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
+                    let Ok(sidecar_now) = sampled_scan::codex_cursor::sidecar_fingerprint(
                         &codex_title_metadata,
                         &candidate.path,
-                    );
+                    ) else {
+                        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                        pending!();
+                    };
                     // L4 (PR-1): the parent's index ledger identity, and its
                     // current opened identity (L-5 probe; charged when it opens).
                     let parent_now = entry.parent_ref().map(|parent| {
@@ -36205,7 +36245,7 @@ fn append_codex_state_only_snapshots(
     collected_at: &str,
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
-) -> (usize, usize) {
+) -> Result<(usize, usize)> {
     let snapshots_before = snapshots.len();
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
@@ -36282,6 +36322,7 @@ fn append_codex_state_only_snapshots(
                 .filter_map(|(_, entry)| entry.codex_counting_owner.as_deref()),
         )
         .collect::<BTreeSet<_>>();
+    let mut title_reads = codex_thread_rows::TitleReads::default();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
             || unknown_protected_owner
@@ -36295,7 +36336,8 @@ fn append_codex_state_only_snapshots(
         {
             continue;
         }
-        let snapshot = codex_state_only_snapshot(source_session_id, thread, collected_at);
+        let snapshot =
+            codex_state_only_snapshot(source_session_id, thread, collected_at, &mut title_reads)?;
         scanned_session_count += 1;
         // The final fingerprint can still change during enrichment, privacy
         // policy application, or account-cutoff filtering. Always carry the
@@ -36308,22 +36350,22 @@ fn append_codex_state_only_snapshots(
         snapshots.len().saturating_sub(snapshots_before),
         0, // Semantic no-op suppression remains in finalize_scan_after_policy.
     );
-    (scanned_session_count, 0)
+    Ok((scanned_session_count, 0))
 }
 
 fn codex_state_only_snapshot(
     source_session_id: &str,
     thread: &CodexStateThread,
     collected_at: &str,
-) -> SnapshotItem {
+    reads: &mut codex_thread_rows::TitleReads,
+) -> Result<SnapshotItem> {
     let model = thread
         .model
         .clone()
         .and_then(normalize_title)
         .unwrap_or_else(|| "unknown".to_string());
     let display_name = thread
-        .title
-        .clone()
+        .raw_title(reads)?
         .and_then(|title| normalize_display_title(title, "session_index"));
     let row = SnapshotModelUsage {
         evidence_ref: None,
@@ -36474,7 +36516,7 @@ fn codex_state_only_snapshot(
         attribution_facts: Vec::new(),
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
-    item
+    Ok(item)
 }
 
 #[cfg(test)]
@@ -37391,7 +37433,7 @@ impl OwnedJsonlParser {
         }
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
-                accumulator.apply_codex_title_metadata(path, metadata);
+                accumulator.apply_codex_title_metadata(path, metadata)?;
             }
             accumulator.apply_first_prompt_fallback();
         }
@@ -43386,38 +43428,47 @@ impl CodexTitleMetadata {
         (supported.len() == 1).then(|| supported[0].clone())
     }
 
-    fn path_sidecar_fingerprint(&self, path: &Path) -> String {
-        self.path_sidecar_fingerprint_for(path, false)
+    fn path_sidecar_fingerprint(&self, path: &Path) -> Result<String> {
+        self.path_sidecar_fingerprint_with(path, &mut Default::default())
+    }
+    fn path_sidecar_fingerprint_with(
+        &self,
+        path: &Path,
+        reads: &mut codex_thread_rows::TitleReads,
+    ) -> Result<String> {
+        self.path_sidecar_fingerprint_for(path, false, reads)
     }
 
     fn path_reduction_fingerprint(&self, path: &Path) -> String {
-        self.path_sidecar_fingerprint_for(path, true)
+        self.path_sidecar_fingerprint_for(path, true, &mut Default::default())
+            .expect("reduction does not read titles")
     }
 
-    fn path_sidecar_fingerprint_for(&self, path: &Path, reduction_only: bool) -> String {
+    fn path_sidecar_fingerprint_for(
+        &self,
+        path: &Path,
+        reduction_only: bool,
+        reads: &mut codex_thread_rows::TitleReads,
+    ) -> Result<String> {
         if let Some(identity) = self.identity_from_path_evidence(path) {
             return self.session_sidecar_fingerprint_in(
                 identity.as_str(),
                 reduction_only,
                 Some(path),
+                reads,
             );
         }
-        let parts = codex_session_id_candidates_from_path(path)
-            .into_iter()
-            .flat_map(|identity| {
-                let fingerprint = self.session_sidecar_fingerprint_in(
-                    identity.as_str(),
-                    reduction_only,
-                    Some(path),
-                );
-                [identity, fingerprint]
-            })
-            .collect::<Vec<_>>();
-        if parts.is_empty() {
+        let mut parts = Vec::new();
+        for identity in codex_session_id_candidates_from_path(path) {
+            let fingerprint =
+                self.session_sidecar_fingerprint_in(&identity, reduction_only, Some(path), reads)?;
+            parts.extend([identity, fingerprint]);
+        }
+        Ok(if parts.is_empty() {
             String::new()
         } else {
             sha256_hex_owned(&parts)
-        }
+        })
     }
 
     fn family_position(&self, child: &str) -> Option<(String, String, u64)> {
@@ -43524,7 +43575,8 @@ impl CodexTitleMetadata {
 
     #[cfg(test)]
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
-        self.session_sidecar_fingerprint_in(source_session_id, false, None)
+        self.session_sidecar_fingerprint_in(source_session_id, false, None, &mut Default::default())
+            .unwrap()
     }
 
     fn thread_extent_for_path(
@@ -43539,12 +43591,12 @@ impl CodexTitleMetadata {
             .max_by_key(|(root, _)| root.components().count())
         {
             return (
-                sidecar.threads.get(identity),
+                sidecar.threads.get(identity).map(AsRef::as_ref),
                 sidecar.extents.get(identity).copied(),
             );
         }
         (
-            self.state_threads.get(identity),
+            self.state_threads.get(identity).map(AsRef::as_ref),
             self.rollout_extents.get(identity).copied(),
         )
     }
@@ -43554,7 +43606,8 @@ impl CodexTitleMetadata {
         source_session_id: &str,
         reduction_only: bool,
         path: Option<&Path>,
-    ) -> String {
+        reads: &mut codex_thread_rows::TitleReads,
+    ) -> Result<String> {
         let source_session_id = resolve_codex_identity(source_session_id);
         let title = (!reduction_only)
             .then(|| self.titles.get(source_session_id.as_str()))
@@ -43562,7 +43615,9 @@ impl CodexTitleMetadata {
         let (thread, extent) = path.map_or_else(
             || {
                 (
-                    self.state_threads.get(source_session_id.as_str()),
+                    self.state_threads
+                        .get(source_session_id.as_str())
+                        .map(AsRef::as_ref),
                     self.rollout_extents
                         .get(source_session_id.as_str())
                         .copied(),
@@ -43571,6 +43626,13 @@ impl CodexTitleMetadata {
             |path| self.thread_extent_for_path(source_session_id.as_str(), path),
         );
         let decoration = (!reduction_only).then_some(thread).flatten();
+        let display_title = title
+            .map(|title| title.display_title_with(reads))
+            .transpose()?;
+        let raw_title = decoration
+            .map(|thread| thread.raw_title(reads))
+            .transpose()?
+            .flatten();
         let extent = (!reduction_only).then_some(extent).flatten();
         let family = self.family_position(source_session_id.as_str());
         let fingerprint = sha256_hex(&[
@@ -43584,11 +43646,9 @@ impl CodexTitleMetadata {
             } else {
                 ""
             },
-            title.map(|value| value.title.as_str()).unwrap_or(""),
+            display_title.as_deref().unwrap_or(""),
             title.map(|value| value.source.as_str()).unwrap_or(""),
-            decoration
-                .and_then(|value| value.title.as_deref())
-                .unwrap_or(""),
+            raw_title.as_deref().unwrap_or(""),
             &decoration
                 .map(|value| value.tokens_used)
                 .unwrap_or_default()
@@ -43651,9 +43711,9 @@ impl CodexTitleMetadata {
         // creates a collision. Invalidate paused ownership decisions as well
         // as fresh parsing; census flags alone are not cursor dependencies.
         if self.identity_conflicts.contains(source_session_id.as_str()) {
-            sha256_hex(&["codex_identity_conflict:v1", &fingerprint])
+            Ok(sha256_hex(&["codex_identity_conflict:v1", &fingerprint]))
         } else {
-            fingerprint
+            Ok(fingerprint)
         }
     }
 
@@ -43692,14 +43752,20 @@ impl CodexTitleMetadata {
             let thread_conflicts_before = metadata.identity_conflicts.len();
             let mut root_sidecar = codex_root_copies::RootSidecar::default();
             let mut open = SidecarOpenCounts::default();
-            let state_census = load_codex_sqlite_state_threads(
+            let mut state_census = load_codex_sqlite_state_threads(
                 &state_path,
                 &mut open,
                 &mut root_sidecar.threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
-            codex_root_copies::merge_threads(&mut metadata, &codex_dir, &root_sidecar.threads);
+            if state_census.is_ok() {
+                state_census = codex_root_copies::merge_threads(
+                    &mut metadata,
+                    &codex_dir,
+                    &root_sidecar.threads,
+                );
+            }
             metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
                 open,
@@ -44175,23 +44241,51 @@ fn load_codex_sqlite_titles(
     }
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex title database")?;
-    let loaded = connection.read(|connection| {
-        census_rows(
+    let database = Arc::new(path.to_path_buf());
+    let (loaded, conflicts) = connection.read(|connection| {
+        let mut loaded = BTreeMap::new();
+        let mut raw_ids_by_key = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        census_fold(
             connection,
             "SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''",
             "Codex title census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
+            |row| {
+                let raw_id: String = row.get(0)?;
+                let title = row.get_ref(1)?.as_str()?;
+                let id = record_codex_identity_key(&mut raw_ids_by_key, &mut conflicts, &raw_id);
+                if conflicts.contains(&id) || identity_conflicts.contains(&id) {
+                    loaded.remove(&id);
+                    conflicts.insert(id);
+                } else {
+                    if id.is_empty() {
+                        return Ok(());
+                    }
+                    if let Some(_display) =
+                        codex_thread_rows::normalize_display_title_ref(title, "session_index")
+                    {
+                        loaded.entry(id).or_insert_with(|| CodexTitleCandidate {
+                            title: String::new(),
+                            source: "session_index".into(),
+                            lookup: Some(codex_thread_rows::TitleLookup {
+                                database: Arc::clone(&database),
+                                raw_id,
+                                digest: codex_thread_rows::digest(Some(title)),
+                            }),
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok((loaded, conflicts))
     })?;
-    let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_id, title) in loaded {
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
-        if identity_conflicts.contains(id.as_str()) {
-            titles.remove(id.as_str());
-            continue;
-        }
-        insert_codex_sidecar_title(titles, id, Some(title), "session_index", false);
+    for id in &conflicts {
+        titles.remove(id);
+    }
+    identity_conflicts.extend(conflicts);
+    for (id, title) in loaded {
+        titles.entry(id).or_insert(title);
     }
     Ok(())
 }
@@ -44199,7 +44293,7 @@ fn load_codex_sqlite_titles(
 fn load_codex_sqlite_state_threads(
     path: &Path,
     open: &mut SidecarOpenCounts,
-    state_threads: &mut BTreeMap<String, CodexStateThread>,
+    state_threads: &mut BTreeMap<String, Arc<CodexStateThread>>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
 ) -> Result<()> {
@@ -44208,7 +44302,9 @@ fn load_codex_sqlite_state_threads(
     }
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex state database")?;
-    let rows = connection.read(|connection| {
+    let database = Arc::new(path.to_path_buf());
+    let mut title_reads = codex_thread_rows::TitleReads::default();
+    let (loaded, conflicts, staged_taxonomy) = connection.read(|connection| {
         let columns = sqlite_table_columns(connection, "threads")?;
         if !columns.contains("id") || !columns.contains("tokens_used") {
             return Err(anyhow::Error::new(IncompleteShape)
@@ -44227,64 +44323,81 @@ fn load_codex_sqlite_state_threads(
             sqlite_select_expr(&columns, "model", "NULL"),
             sqlite_select_expr(&columns, "rollout_path", "NULL"),
         );
-        census_rows(connection, &sql, "Codex state thread census", |row| {
-            let id: String = row.get(0)?;
-            let title: Option<String> = row.get(1)?;
-            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-            let archived = row.get::<_, i64>(3)? != 0;
-            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-            let model: Option<String> = row.get(8)?;
-            let rollout_path: Option<String> = row.get(9)?;
-            Ok((
-                id,
-                CodexStateThread {
-                    title,
-                    tokens_used,
-                    archived,
-                    created_at,
-                    updated_at,
-                    model,
-                    rollout_path,
-                },
-            ))
-        })
+        let mut loaded = BTreeMap::new();
+        let mut raw_ids_by_key = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        let mut staged_taxonomy = *taxonomy;
+        census_fold(connection, &sql, "Codex state thread census", |row| {
+            let raw_id: String = row.get(0)?;
+            let thread = Arc::new(CodexStateThread {
+                title: None,
+                title_lookup: Some(codex_thread_rows::TitleLookup {
+                    database: Arc::clone(&database),
+                    raw_id: raw_id.clone(),
+                    digest: codex_thread_rows::digest(row.get_ref(1)?.as_str_or_null()?),
+                }),
+                tokens_used: non_negative_i64_to_u64(row.get::<_, i64>(2)?),
+                archived: row.get::<_, i64>(3)? != 0,
+                created_at: codex_state_timestamp(row.get(6)?, row.get(4)?),
+                updated_at: codex_state_timestamp(row.get(7)?, row.get(5)?),
+                model: row.get(8)?,
+                rollout_path: row.get(9)?,
+            });
+            let conflicts_before = conflicts.len();
+            let id = record_codex_identity_key(&mut raw_ids_by_key, &mut conflicts, &raw_id);
+            if conflicts.len() != conflicts_before && !identity_conflicts.contains(&id) {
+                staged_taxonomy.state_alias_keys =
+                    staged_taxonomy.state_alias_keys.saturating_add(1);
+            }
+            if conflicts.contains(&id) || identity_conflicts.contains(&id) {
+                loaded.remove(&id);
+                conflicts.insert(id);
+                return Ok(());
+            }
+            match loaded.entry(id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(thread);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if !entry.get().same_row(&thread, &mut title_reads)? =>
+                {
+                    conflicts.insert(entry.key().clone());
+                    entry.remove();
+                    staged_taxonomy.state_intra_root_row_keys =
+                        staged_taxonomy.state_intra_root_row_keys.saturating_add(1);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        let mut merged = state_threads.clone();
+        for id in &conflicts {
+            merged.remove(id);
+        }
+        for (id, thread) in loaded {
+            match merged.entry(id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(thread);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if !entry.get().same_row(&thread, &mut title_reads)? =>
+                {
+                    staged_taxonomy.observe_state_cross_root(codex_state_thread_field_diffs(
+                        entry.get(),
+                        &thread,
+                        &mut title_reads,
+                    )?);
+                    conflicts.insert(entry.key().clone());
+                    entry.remove();
+                }
+                _ => {}
+            }
+        }
+        Ok((merged, conflicts, staged_taxonomy))
     })?;
-    let mut loaded = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_id, thread) in rows {
-        let conflicts_before = identity_conflicts.len();
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
-        if identity_conflicts.len() != conflicts_before {
-            taxonomy.state_alias_keys = taxonomy.state_alias_keys.saturating_add(1);
-        }
-        if identity_conflicts.contains(id.as_str()) {
-            loaded.remove(id.as_str());
-            state_threads.remove(id.as_str());
-            continue;
-        }
-        if loaded
-            .insert(id.clone(), thread.clone())
-            .is_some_and(|existing| existing != thread)
-        {
-            loaded.remove(id.as_str());
-            state_threads.remove(id.as_str());
-            identity_conflicts.insert(id);
-            taxonomy.state_intra_root_row_keys =
-                taxonomy.state_intra_root_row_keys.saturating_add(1);
-        }
-    }
-    for (id, thread) in loaded {
-        if let Some(existing) = state_threads
-            .insert(id.clone(), thread.clone())
-            .filter(|existing| *existing != thread)
-        {
-            taxonomy.observe_state_cross_root(codex_state_thread_field_diffs(&existing, &thread));
-            state_threads.remove(id.as_str());
-            identity_conflicts.insert(id);
-        }
-    }
+    *state_threads = loaded;
+    *taxonomy = staged_taxonomy;
+    identity_conflicts.extend(conflicts);
     Ok(())
 }
 
@@ -44293,9 +44406,11 @@ fn load_codex_sqlite_state_threads(
 fn codex_state_thread_field_diffs(
     existing: &CodexStateThread,
     incoming: &CodexStateThread,
-) -> StateRowFieldDiffs {
+    reads: &mut codex_thread_rows::TitleReads,
+) -> Result<StateRowFieldDiffs> {
     let CodexStateThread {
-        title,
+        title: _,
+        title_lookup: _,
         tokens_used,
         archived,
         created_at,
@@ -44303,15 +44418,15 @@ fn codex_state_thread_field_diffs(
         model,
         rollout_path,
     } = existing;
-    StateRowFieldDiffs {
-        title: u32::from(*title != incoming.title),
+    Ok(StateRowFieldDiffs {
+        title: u32::from(!existing.same_title(incoming, reads)?),
         tokens_used: u32::from(*tokens_used != incoming.tokens_used),
         archived: u32::from(*archived != incoming.archived),
         created_at: u32::from(*created_at != incoming.created_at),
         updated_at: u32::from(*updated_at != incoming.updated_at),
         model: u32::from(*model != incoming.model),
         rollout_path: u32::from(*rollout_path != incoming.rollout_path),
-    }
+    })
 }
 
 fn saturating_count_u32(count: usize) -> u32 {
@@ -44669,23 +44784,41 @@ fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTr
     Ok(columns.into_iter().collect())
 }
 
-/// Every row of one census query. Failures carry their loader stage and
-/// "prepare {label}" or "read {label} row".
-fn census_rows<T>(
+/// Fold while each SQLite row is borrowed; publish only after the caller's read verifies.
+fn census_fold(
     connection: &Connection,
     sql: &str,
     label: &str,
-    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-) -> Result<Vec<T>> {
+    mut fold: impl FnMut(&rusqlite::Row<'_>) -> Result<()>,
+) -> Result<()> {
     use crate::codex_scan_diagnostics::LoaderStage;
     let mut statement = connection
         .prepare(sql)
         .context(LoaderStage::Prepare)
         .with_context(|| format!("prepare {label}"))?;
-    let rows = statement.query_map([], map).context(LoaderStage::Query)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context(LoaderStage::Row)
-        .with_context(|| format!("read {label} row"))
+    let mut rows = statement.query([]).context(LoaderStage::Query)?;
+    (|| -> Result<()> {
+        while let Some(row) = rows.next()? {
+            fold(row)?;
+        }
+        Ok(())
+    })()
+    .context(LoaderStage::Row)
+    .with_context(|| format!("read {label} row"))
+}
+
+fn census_rows<T>(
+    connection: &Connection,
+    sql: &str,
+    label: &str,
+    mut map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let mut rows = Vec::new();
+    census_fold(connection, sql, label, |row| {
+        rows.push(map(row)?);
+        Ok(())
+    })?;
+    Ok(rows)
 }
 
 fn sqlite_select_expr(columns: &BTreeSet<String>, column: &str, fallback: &str) -> String {
@@ -45423,6 +45556,7 @@ fn insert_codex_sidecar_title(
         id,
         CodexTitleCandidate {
             title,
+            lookup: None,
             source: source.to_string(),
         },
     );
@@ -56029,12 +56163,7 @@ fn local_index_key(path: &Path) -> String {
 }
 
 fn normalize_title(value: String) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized.chars().take(255).collect())
-    }
+    codex_thread_rows::normalize_title_ref(&value)
 }
 
 fn normalize_display_title(value: String, source: &str) -> Option<String> {
@@ -57784,21 +57913,18 @@ mod tests {
 
         let without_edge = CodexTitleMetadata::default().session_sidecar_fingerprint(child);
         let mut metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        metadata
-            .state_threads
-            .get_mut(all_local_child)
-            .expect("all-local child state row")
-            .created_at = Some("2026-08-26T15:02:00Z".to_string());
-        // File binding reads the home's row; keep this fixture override in sync
-        // with its merged row without changing the expected ownership proof.
-        metadata
-            .root_sidecars
-            .get_mut(&codex_dir)
-            .expect("loaded Codex home")
-            .threads
-            .get_mut(all_local_child)
-            .expect("all-local child home row")
-            .created_at = Some("2026-08-26T15:02:00Z".to_string());
+        Arc::make_mut(metadata.state_threads.get_mut(all_local_child).unwrap()).created_at =
+            Some("2026-08-26T15:02:00Z".to_string());
+        Arc::make_mut(
+            metadata
+                .root_sidecars
+                .get_mut(&codex_dir)
+                .unwrap()
+                .threads
+                .get_mut(all_local_child)
+                .unwrap(),
+        )
+        .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert!(metadata.state_created_threads.contains(child));
         assert!(metadata.state_created_threads.contains(all_local_child));
@@ -63354,11 +63480,11 @@ mod tests {
         for identity in [legacy, modern.to_string()] {
             metadata.state_threads.insert(
                 identity,
-                CodexStateThread {
+                Arc::new(CodexStateThread {
                     tokens_used: 900,
                     model: Some("state-model".into()),
                     ..Default::default()
-                },
+                }),
             );
         }
         assert!(metadata.identity_from_path_evidence(&path).is_none());
@@ -63396,6 +63522,7 @@ mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     )
+                    .unwrap()
                 });
                 assert!(!replacements
                     .iter()
@@ -63429,7 +63556,7 @@ mod tests {
                 let (mut metadata, mut index, _) =
                     ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
                 for (thread, tokens_used) in metadata.state_threads.values_mut().zip(tokens) {
-                    thread.tokens_used = tokens_used;
+                    Arc::make_mut(thread).tokens_used = tokens_used;
                 }
                 index
                     .files
@@ -63446,6 +63573,7 @@ mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     )
+                    .unwrap()
                 });
                 assert_eq!(count, 0);
                 assert!(replacements.is_empty());
@@ -63478,6 +63606,7 @@ mod tests {
                 &mut index,
                 &BTreeSet::new(),
             )
+            .unwrap()
         });
         assert_eq!(
             replacements.len(),
@@ -63512,10 +63641,10 @@ mod tests {
                 let mut metadata = CodexTitleMetadata::default();
                 metadata.state_threads.insert(
                     owner.clone(),
-                    CodexStateThread {
+                    Arc::new(CodexStateThread {
                         tokens_used: 900,
                         ..Default::default()
-                    },
+                    }),
                 );
                 assert_eq!(
                     metadata.identity_from_path_evidence(Path::new(&name)),
@@ -63530,6 +63659,7 @@ mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     )
+                    .unwrap()
                 });
                 assert_eq!(count, usize::from(!accepted));
                 assert_eq!(replacements.len(), usize::from(!accepted));
@@ -63574,7 +63704,8 @@ mod tests {
                 "2026-05-14T11:04:00Z",
                 &mut index,
                 &BTreeSet::new(),
-            );
+            )
+            .unwrap();
             assert!(replacements.iter().any(
                 |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
             ));
@@ -77795,7 +77926,7 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: child_values.first().and_then(|value| {
                     codex_session_meta_payload(value)
@@ -77803,7 +77934,7 @@ mod tests {
                         .or_else(|| string_at(value, &["timestamp"]))
                 }),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         if let Some(next_ordinal) = projected_next_ordinal {
             metadata.rollout_extents.insert(
@@ -78356,11 +78487,11 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some("2026-08-02T08:20:00Z".to_string()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
         assert!(!parsed.report.complete());
@@ -79711,12 +79842,12 @@ mod tests {
         metadata.state_created_threads.insert(key.clone());
         metadata.state_threads.insert(
             key.clone(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some(clock.at(0)),
                 rollout_path: Some(path.to_string_lossy().into_owned()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         metadata.rollout_extents.insert(
             key,
@@ -79966,11 +80097,11 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some("2026-08-02T08:20:00Z".to_string()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         let created = reduced(&path, &metadata, ledger_for(parent_id, &parent));
         assert_eq!(
@@ -85682,8 +85813,8 @@ crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
     N projected_next_ordinal: Option<u64>,
 });
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
-crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
-crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
+crate::heap_layout_bound::fields!(CodexStateThread; title, title_lookup, tokens_used, archived, created_at, updated_at, model, rollout_path);
+crate::heap_layout_bound::fields!(CodexTitleCandidate; title, lookup, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,

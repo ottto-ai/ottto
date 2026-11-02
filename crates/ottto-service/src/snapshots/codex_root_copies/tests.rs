@@ -127,7 +127,7 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
             let row = &metadata.root_sidecars[root.parent().unwrap()].threads[id];
             let path = Path::new(row.rollout_path.as_deref().unwrap());
             let (bound, extent) = metadata.thread_extent_for_path(id, path);
-            assert_eq!(bound.unwrap(), row);
+            assert_eq!(bound.unwrap(), row.as_ref());
             assert!(extent.unwrap().next_byte_offset > 0);
             assert!(path.starts_with(root));
             if root == &fixture.roots[1] {
@@ -379,10 +379,10 @@ fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
     ] {
         let root = fixture.roots[root_index].parent().unwrap();
         let mut row = loaded.root_sidecars[root].threads[&fixture.ids[0]].clone();
-        row.tokens_used = 400;
-        row.updated_at = Some(updated.to_string());
+        Arc::make_mut(&mut row).tokens_used = 400;
+        Arc::make_mut(&mut row).updated_at = Some(updated.to_string());
         let threads = BTreeMap::from([(fixture.ids[0].clone(), row)]);
-        merge_threads(&mut metadata, root, &threads);
+        merge_threads(&mut metadata, root, &threads).unwrap();
         metadata.root_sidecars.insert(
             root.to_path_buf(),
             RootSidecar {

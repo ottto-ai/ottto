@@ -3952,7 +3952,9 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
         &scan.codex_title_metadata,
         &scan.claude_title_metadata,
         None,
-    );
+        &mut Default::default(),
+    )
+    .unwrap();
     open_and_identify_scan_candidate(
         SnapshotSource::ClaudeCode,
         candidate,
