@@ -8,7 +8,6 @@
 //! where in the file each was last assigned. Growth-only M3 restore prepays a
 //! bounded native content replay and fences every X field before adoption.
 //! Empty obligations move the paid decoded graph.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::File;
 

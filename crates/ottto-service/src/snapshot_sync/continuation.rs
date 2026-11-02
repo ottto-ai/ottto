@@ -154,7 +154,6 @@ pub(super) enum PageEnd {
     Deferred,
     /// The lease was lost, the page was dropped, or the process is stopping.
     /// Nothing was saved.
-    #[allow(dead_code)] // No stop signal reaches a page yet; the fakes use it.
     Cancelled,
     /// A local error (a failed load, a worker that panicked or could not
     /// keep its invariants). Nothing was saved.

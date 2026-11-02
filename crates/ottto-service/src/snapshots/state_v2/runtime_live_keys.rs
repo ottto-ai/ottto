@@ -3,13 +3,6 @@ use super::*;
 use crate::durable_tail_store::DurableSource;
 use std::collections::BTreeSet;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the restart-record sweep consumes these staged result fields"
-    )
-)]
 #[derive(Debug)]
 pub(crate) struct LiveKeys {
     pub complete: bool,
@@ -39,13 +32,6 @@ impl LiveKeys {
 /// Caller retains the source owner/CheckpointLock, as on save/erasure, and
 /// rechecks generation before each unlink batch. Do not acquire it recursively.
 /// WAL readers see one committed snapshot; never consult the cached graph.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the restart-record sweep uses this store for committed membership"
-    )
-)]
 pub(crate) fn live_key_digests(index_path: &Path) -> Result<LiveKeys> {
     // Like every public v2 entry point: no path-bearing error context escapes.
     held(live_keys(index_path))

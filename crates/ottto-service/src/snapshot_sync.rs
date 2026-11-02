@@ -5093,7 +5093,6 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<Sna
         .with_receipt_context(device_label, account_binding))
 }
 
-#[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
 fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
     if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
         return None;
@@ -5203,7 +5202,6 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
     })
 }
 
-#[allow(dead_code)] // Compiled preparation is exercised by native integration before activation.
 #[path = "bounded_snapshot_retry.rs"]
 mod bounded_snapshot_retry;
 #[path = "live_snapshot_retry.rs"]

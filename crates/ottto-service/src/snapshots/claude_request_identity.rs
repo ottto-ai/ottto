@@ -1892,7 +1892,6 @@ fn cap_counts(
 
 /// Pure measurement over a request-owned item's currently held native proof.
 /// It never reads accounts/transcripts, emits diagnostics or uploads a body.
-#[allow(dead_code)] // Side-run/debug hook; deliberately not a runtime decision input.
 pub(crate) fn measure_identity_cap(
     item: &SnapshotItem,
     accepted: &AcceptedBuckets,

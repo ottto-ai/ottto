@@ -3627,7 +3627,6 @@ fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
 /// Per-key answer for Context 2c and D2's posture seam. D1 computes it only in
 /// tests; nothing in production reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ClaudeCensusMemberStatus {
     /// The predicate holds, the own record is Exact or Empty from a verified
     /// parse, the own family is not census-unknown, and no hash of the record
@@ -3981,7 +3980,6 @@ impl ClaudeRequestCensusJoin {
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn member_status(
         &self,
         index: &ScanIndex,

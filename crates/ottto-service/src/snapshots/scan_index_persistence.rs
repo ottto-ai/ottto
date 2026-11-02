@@ -265,7 +265,6 @@ pub(crate) struct LegacyRecovery {
     spent: std::sync::atomic::AtomicBool,
 }
 impl LegacyRecovery {
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn retained_bytes(&self) -> usize {
         self.binding.namespace_hash.capacity()
             + self.root.capacity()
@@ -275,7 +274,6 @@ impl LegacyRecovery {
 }
 
 impl LoadedRoot {
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn observed_missing() -> Self {
         Self(Arc::new(Root::Missing))
     }
@@ -287,7 +285,6 @@ impl LoadedRoot {
             _ => None,
         }
     }
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn unavailable(&self) -> Self {
         Self(Arc::new(Root::Unavailable {
             generation: self.generation().unwrap_or(0),
@@ -295,7 +292,6 @@ impl LoadedRoot {
     }
     /// Conservative retained allocation charge, including shared Arc custody.
     /// At most 769 descriptors; never walks logical payload entries.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn retained_bytes(&self) -> Option<usize> {
         let mut n = std::mem::size_of::<Root>()
             + std::mem::align_of::<Root>()
@@ -397,7 +393,6 @@ pub(crate) struct PartialIndex {
 impl PartialIndex {
     /// Internal typed partial view: retain schema 3 and explicit availability.
     /// All known siblings share one decoder pass with metadata/held scopes.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn into_reader(self) -> Result<(LogicalReader, [Option<MapUnavailable>; 3])> {
         let mut reader = self.metadata;
         reader.spans.pop(); // final root brace
@@ -1256,7 +1251,6 @@ impl LockedStore {
         Ok(())
     }
 
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn legacy_recovery(&self, quarantine: &str) -> Result<Arc<LegacyRecovery>> {
         ensure!(
             quarantine.len() <= MAX_KEY_BYTES
@@ -1277,7 +1271,6 @@ impl LockedStore {
             spent: std::sync::atomic::AtomicBool::new(false),
         }))
     }
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn write_recovered_legacy(
         &self,
         recovery: &LegacyRecovery,

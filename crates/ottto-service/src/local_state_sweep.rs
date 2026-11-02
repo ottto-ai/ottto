@@ -303,7 +303,6 @@ mod process_table {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    #[allow(dead_code)] // Mirrors the C layout; only some fields are read.
     pub(super) struct ShortBsdInfo {
         pub(super) pid: u32,
         pub(super) ppid: u32,
