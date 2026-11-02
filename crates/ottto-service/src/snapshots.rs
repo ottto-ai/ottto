@@ -39945,8 +39945,10 @@ fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
 }
 
 /// The referenced parent history is external: local ordinals begin exactly
-/// where that parent's paginated base ends. This proves only this header's own
-/// creation claim; the caller must still prove first-record/file/stream ownership.
+/// where that parent's paginated base ends. `history_base.thread_id` may name
+/// the parent's physical segment file rather than its logical id, so it must
+/// only differ from this session. This proves only this header's own creation
+/// claim; the caller must still prove first-record/file/stream ownership.
 fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
     if !string_eq_at(meta, &["history_mode"], "paginated")
         || string_eq_at(meta, &["thread_source"], "subagent")
@@ -39964,9 +39966,10 @@ fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
         return false;
     };
     id != parent
-        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) == Some(id)
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])).as_ref()
+            == Some(&id)
         && resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]))
-            == Some(parent)
+            .is_some_and(|base| base != id)
         && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
             u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
         })
@@ -82588,6 +82591,83 @@ mod tests {
         header
     }
 
+    /// Observed shape: `history_base.thread_id` names the parent's physical
+    /// segment file, not `forked_from_id`. The session's own pair names it;
+    /// usage totals are the same with or without that pair.
+    #[test]
+    fn codex_paginated_fork_names_itself_when_base_is_a_parent_segment() {
+        let mut header = codex_paginated_creator_fixture();
+        header["payload"]["history_base"]["thread_id"] =
+            json!("019e253c-4444-7000-9000-dddddddddddd");
+        let id = header["payload"]["id"].as_str().unwrap().to_string();
+        let parent_id = header["payload"]["forked_from_id"].clone();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+
+        let items = codex_fork_creator_items(&[header.clone(), usage(1362)], &id);
+        assert_eq!(items.len(), 1);
+        let evidence = items[0].session_account_evidence.as_ref().unwrap();
+        assert_eq!(evidence.evidence_source, "codex_creator_header:v1");
+        assert_eq!(
+            evidence.account_identifier_hash,
+            ottto_core::billing_identity_hash("openai", "account", "synthetic-user")
+        );
+
+        // Placement only: every other wire field, totals included, matches the
+        // same transcript without a creator pair.
+        let mut creator_free = header.clone();
+        let meta = creator_free["payload"].as_object_mut().unwrap();
+        meta.remove("creator_user_id");
+        meta.remove("creator_account_id");
+        let creator_free = codex_fork_creator_items(&[creator_free, usage(1362)], &id);
+        assert!(creator_free[0].session_account_evidence.is_none());
+        let mut named = serde_json::to_value(&items).unwrap();
+        named[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("session_account_evidence");
+        assert_eq!(named, serde_json::to_value(&creator_free).unwrap());
+        assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
+
+        // A parent header in this file never names the session: not as the
+        // first record, and not later (with this session's header first).
+        let mut foreign = header.clone();
+        foreign["payload"]["id"] = parent_id.clone();
+        foreign["payload"]["session_id"] = parent_id;
+        foreign["payload"]["forked_from_id"] = json!("019e253c-5555-7000-9000-eeeeeeeeeeee");
+        foreign["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        let foreign_first = codex_fork_creator_items(&[foreign.clone(), usage(1362)], &id);
+        assert!(foreign_first
+            .iter()
+            .all(|item| item.session_account_evidence.is_none()));
+        foreign["ordinal"] = json!(1362);
+        foreign["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        let foreign_later = codex_fork_creator_items(&[header.clone(), foreign, usage(1363)], &id);
+        assert!(foreign_later[0].session_account_evidence.is_none());
+        assert_eq!(
+            (
+                foreign_later[0].input_tokens,
+                foreign_later[0].output_tokens
+            ),
+            (100, 5)
+        );
+
+        // Conflicting own headers still refuse the pair and keep the usage.
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        let conflicted = codex_fork_creator_items(&[header, conflict, usage(1363)], &id);
+        assert!(conflicted[0].session_account_evidence.is_none());
+        assert_eq!(
+            (conflicted[0].input_tokens, conflicted[0].output_tokens),
+            (100, 5)
+        );
+    }
+
     #[test]
     fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
         let header = codex_paginated_creator_fixture();
@@ -82604,9 +82684,9 @@ mod tests {
             ("partial_pair", "/payload/creator_user_id", Value::Null),
             ("missing_pair", "/payload/creator_account_id", json!(" ")),
             (
-                "wrong_parent",
+                "missing_base_thread",
                 "/payload/history_base/thread_id",
-                json!("other-parent"),
+                Value::Null,
             ),
             (
                 "internal_parent",
