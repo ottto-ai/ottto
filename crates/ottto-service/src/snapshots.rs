@@ -168,7 +168,8 @@ pub(crate) use claude_history_upgrade::{
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use ownership_diagnostics as ownership;
-mod admission_reoffer_window;
+#[cfg(test)]
+mod admission_reoffer_window_tests;
 mod claude_family_census_shadow;
 #[cfg(test)]
 mod claude_family_census_shadow_tests;
@@ -313,7 +314,14 @@ pub(crate) fn verify_durable_body(
     let mut d = crate::durable_tail_codec::Dec::new(body);
     let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
-        && (source.properties().verify)(body).is_ok()
+        && (source.properties().verify)(&mut crate::durable_tail_codec::Dec::new(body)).is_ok()
+}
+#[cfg(all(test, unix))]
+pub(crate) fn durable_body_has_skill_labels_for_test(
+    source: SnapshotSource,
+    body: &[u8],
+) -> Result<bool, crate::durable_tail_codec::Corrupt> {
+    sampled_jsonl::durable::body_has_skill_labels(source, body)
 }
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body_with_skill() -> Vec<u8> {
@@ -4799,7 +4807,7 @@ pub struct ScanIndexEntry {
     )]
     pub codex_counting_owner: Option<Box<str>>,
     /// The ctime (unix nanos) in the opened-object identity that produced
-    /// `source_file_fingerprint` (Claude and Codex only). With size, mtime
+    /// `source_file_fingerprint` (all three sources). With size, mtime
     /// and file birth unchanged the next scan rebuilds the identity from it,
     /// so a ctime-only change never triggers a re-read. Older binaries drop
     /// it; zero keeps the live-identity comparison once.
@@ -10031,6 +10039,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // A witnessed family rebuilt from the reports; one the reports name but
+    // cannot rebuild is an ignored veto.
+    let reconstruct =
+        |root_session_id: &String, witness: &ClaudeUsageFamilyWitness, ignored_vetoes: &mut u16| {
+            let family = reconstruct_claude_usage_family(
+                root_session_id,
+                witness,
+                api_report,
+                trace_report,
+                legacy_request_owners,
+            );
+            if family.is_none()
+                && (api_report.evidence.contains_key(root_session_id)
+                    || trace_report.evidence.contains_key(root_session_id))
+            {
+                *ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
+            }
+            family.map(|family| (root_session_id.clone(), family))
+        };
     if let Some(join) = terminal.as_mut().filter(|_| reports_healthy) {
         // Owed evidence (a terminal-retry re-arm) proves nothing until it
         // resolves (the sweep skipped owed and uncertified roots).
@@ -10045,20 +10072,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !proven.contains_key(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
         // Path-(a) tombstone: a retired family keeps its witness
@@ -10108,20 +10122,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !uncertified_roots.contains(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
     }
@@ -18634,7 +18635,7 @@ struct SnapshotAccumulator {
     // repeated same-shape occurrences remain distinct. Keeping the multiset is
     // required because transitional writers may reuse one response id for more
     // than one paired occurrence.
-    seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+    seen_pi_usage_keys: PiLedger,
     // Positive usage observations deliberately refused because their activity
     // timestamp could not produce a truthful hourly bucket.
     dropped_usage_record_count: u64,
@@ -18850,7 +18851,7 @@ impl SnapshotAccumulator {
             claude_money: None,
             tool_usage_counts: BTreeMap::new(),
             tool_usage_truncated: false,
-            seen_pi_usage_keys: BTreeMap::new(),
+            seen_pi_usage_keys: PiLedger::default(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
@@ -21205,16 +21206,17 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
-    /// Admission only. The native caller owns publication; bounded replay
-    /// uses the same ordered state transition without constructing money rows.
-    fn decide_codex_legacy_usage(
+    /// Admission steps shared by the legacy and v2 decisions, in their
+    /// order: the model carries forward, an exact repeated usage event is
+    /// skipped (`None`), a cumulative reset is counted and `usage` becomes
+    /// the cumulative total. Returns the resolved model, the previous
+    /// cumulative total and whether `usage` reset it.
+    fn admit_codex_cumulative_usage(
         &mut self,
         model: Option<String>,
-        usage: UsageTotals,
-        last_usage: Option<UsageTotals>,
+        usage: &UsageTotals,
         usage_event_identity: Option<String>,
-        implicit_request_count: Option<u64>,
-    ) -> Option<(String, UsageTotals)> {
+    ) -> Option<(String, Option<UsageTotals>, bool)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -21233,24 +21235,40 @@ impl SnapshotAccumulator {
         if usage_event_identity.is_some() {
             self.codex_last_usage_event_identity = usage_event_identity;
         }
+        let reset = self
+            .session_cumulative_usage
+            .as_ref()
+            .is_some_and(|previous| !usage.is_monotonic_after(previous));
+        if reset {
+            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
+        }
+        let previous = self.session_cumulative_usage.replace(usage.clone());
+        Some((resolved_model, previous, reset))
+    }
 
+    /// Admission only. The native caller owns publication; bounded replay
+    /// uses the same ordered state transition without constructing money rows.
+    fn decide_codex_legacy_usage(
+        &mut self,
+        model: Option<String>,
+        usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
+        implicit_request_count: Option<u64>,
+    ) -> Option<(String, UsageTotals)> {
+        let (resolved_model, previous, reset) =
+            self.admit_codex_cumulative_usage(model, &usage, usage_event_identity)?;
         // `last_token_usage` is Codex's exact current-response usage and stays
         // correct across compaction/restart resets. Older rollouts lack it; in
         // that case use a cumulative delta, beginning a new additive epoch on
         // a reset. Never erase usage already accepted from the same rollout.
-        let previous = self.session_cumulative_usage.as_ref();
-        let reset = previous.is_some_and(|previous| !usage.is_monotonic_after(previous));
-        if reset {
-            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
-        }
         let mut delta = match last_usage {
             Some(last) => last,
-            None => match previous {
+            None => match &previous {
                 Some(previous) if !reset => usage.delta_from(previous),
                 Some(_) | None => usage.clone(),
             },
         };
-        self.session_cumulative_usage = Some(usage.clone());
         if !delta.is_zero() {
             if let Some(count) = implicit_request_count {
                 delta.request_count = count;
@@ -21277,6 +21295,7 @@ impl SnapshotAccumulator {
             source_file_fingerprint,
             attribution_context,
             None,
+            false,
         )
     }
 
@@ -21287,6 +21306,7 @@ impl SnapshotAccumulator {
         source_file_fingerprint: String,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+        emit_empty_pi_fork: bool,
     ) -> Vec<SnapshotItem> {
         // Defence in depth: the scan already refuses to collect the Workflow
         // journal, but the parse entry points are public, so nothing downstream
@@ -21604,7 +21624,7 @@ impl SnapshotAccumulator {
                 .claude_money
                 .as_deref()
                 .is_some_and(|money| money.entity.resolver_conflicts > 0);
-        if session_rows.is_empty() && !conflict_carrier {
+        if session_rows.is_empty() && !conflict_carrier && !emit_empty_pi_fork {
             return Vec::new();
         }
         let mut model_usage: Vec<SnapshotModelUsage> = session_rows
@@ -30952,7 +30972,7 @@ impl OwnedSourceScan {
                     }),
                 };
                 // Ordinary plain singleton completions stage
-                // before publication for both durable sources. Codex must
+                // before publication for all durable sources. Codex must
                 // observe a store failure before ACK to enforce strict rebind.
                 // Group/member, proof, side and comparison keep their owners. The held descriptor is
                 // duplicated, never read, before the parser is consumed: the
@@ -30975,7 +30995,7 @@ impl OwnedSourceScan {
                     .zip(file_sampling.as_ref())
                     .filter(|(_, active)| {
                         restart_restore::enabled()
-                            && matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+                            && sampled_scan::durable_tail::durable_source(source).is_some()
                             // No new acquisition is written for an ordinary
                             // Unchanged read. Receipt-owed retries retain their
                             // exact native owner; quiet debt changes settle only
@@ -33640,7 +33660,7 @@ impl OwnedSourceScan {
             // S2: preserve accepted facts before candidate/working-entry changes.
             #[cfg(unix)]
             let accepted_floor = (restart_restore::enabled()
-                && source == SnapshotSource::ClaudeCode)
+                && durable_sources::below_accepted(source) == durable_sources::BelowAccepted::Held)
                 .then(|| {
                     sampled_scan::durable_tail::AcceptedFloor::of(
                         index,
@@ -35136,9 +35156,9 @@ impl OwnedSourceScan {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
                                             }
-                                            stale_selection_pending = matches!(class,
-                                                sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
+                                        stale_selection_pending = matches!(class,
+                                            sampled_scan::durable_tail::MissClass::StaleSelection);
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
@@ -35486,6 +35506,8 @@ impl OwnedSourceScan {
                         let continued = taken_admission.filter(|_| {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
+                        // Per `durable_sources::BelowAccepted`, this read may
+                        // publish below the extent the entry still holds.
                         #[cfg(unix)]
                         let restored_behind_accepted =
                             sampled_scan::durable_tail::restored_tail_below_accepted(
@@ -35870,14 +35892,13 @@ impl OwnedSourceScan {
                 }
             }
             // There is one shared admission for this actual Full. Earlier
-            // grants and later structural/stale-selection owners take priority.
+            // grants and the later structural owner take priority.
             #[cfg(unix)]
-            let resource_full_pending =
-                if paced_full_granted || active_bound_degraded || stale_selection_pending {
-                    None
-                } else {
-                    resource_full_pending
-                };
+            let resource_full_pending = if paced_full_granted || active_bound_degraded {
+                None
+            } else {
+                resource_full_pending
+            };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -35922,15 +35943,19 @@ impl OwnedSourceScan {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
                 {
-                    let key = local_index_key(&active.candidate.path);
-                    if !context.cache.start_stale_selection_full(
-                        source,
-                        &key,
-                        active.parser.reader.reader.get_ref(),
-                    ) {
-                        residue_index_keys.insert(key);
-                        drop(codex_cursor_lease.take());
-                        pending!();
+                    if source == SnapshotSource::Codex {
+                        let key = local_index_key(&active.candidate.path);
+                        if !context.cache.start_stale_selection_full(
+                            source,
+                            &key,
+                            active.parser.reader.reader.get_ref(),
+                        ) {
+                            residue_index_keys.insert(key);
+                            drop(codex_cursor_lease.take());
+                            pending!();
+                        }
+                    } else {
+                        context.cache.note_stale_selection_full();
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {
@@ -37095,8 +37120,11 @@ impl OwnedJsonlParser {
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.observe(value);
             }
-            let inherited = source == SnapshotSource::ClaudeCode
-                && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited;
+            let inherited = (source == SnapshotSource::ClaudeCode
+                && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited)
+                || (source == SnapshotSource::Pi
+                    && pi_usage_event(value)
+                    && accumulator.seen_pi_usage_keys.is_fork_copy(value));
             if !inherited && recognized_usage_shape_was_dropped(source, value) {
                 *recognized_usage_drop_count += 1;
             }
@@ -37388,6 +37416,7 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
             recognized_usage_drop_count += accumulator
                 .seen_pi_usage_keys
+                .usage_keys()
                 .values()
                 .filter(|state| state.has_cross_shape_conflict())
                 .count();
@@ -37539,6 +37568,15 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
+        // A fully read Pi fork whose positive usage was all copied must
+        // publish zero too: an earlier accepted revision can be inflated.
+        let (has_parent, header_nanos) = accumulator.seen_pi_usage_keys.fork_parts();
+        let emit_empty_pi_fork = has_parent
+            && header_nanos.is_some()
+            && report.complete()
+            && recognized_usage_drop_count == 0
+            && accumulator_dropped_usage_record_count == 0
+            && !positive_usage_evidence;
         let snapshots = claude_request_money::e2::timed("native.into_items", || {
             accumulator.into_items_with_repository_identity(
                 path,
@@ -37546,6 +37584,7 @@ impl OwnedJsonlParser {
                 source_file_fingerprint,
                 attribution_context,
                 repository_identity,
+                emit_empty_pi_fork,
             )
         });
         // A syntactically valid, positive provider usage record that yields no
@@ -42024,6 +42063,16 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
         .is_some()
 }
 
+/// The content projection of one Pi line; `role` is the message role. Usage
+/// and timing stay with the native caller.
+fn pi_content_line(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
+    match string_at(value, &["type"]).as_deref() {
+        Some("session") => pi_workspace_content(value, accumulator),
+        Some("message") => pi_prompt_content(value, role, accumulator),
+        _ => {}
+    }
+}
+
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     // Count per observed usage line, before response deduplication and timestamp
     // drops; rereads count again. Usage-shape probes remain side-effect-free.
@@ -42046,11 +42095,12 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
+                accumulator.seen_pi_usage_keys.note_header(value);
                 accumulator.source_session_id = string_at(value, &["id"])
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            pi_workspace_content(value, accumulator);
+            pi_content_line(value, None, accumulator);
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -42058,9 +42108,13 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            pi_prompt_content(value, role.as_deref(), accumulator);
+            pi_content_line(value, role.as_deref(), accumulator);
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
+                && accumulator.seen_pi_usage_keys.skip_fork_copy(value)
+            {
+                accumulator.set_model(string_at(value, &["message", "model"]));
+            } else if role.as_deref() == Some("assistant")
                 && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
             {
                 apply_pi_usage_line(
@@ -42078,7 +42132,9 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
-            if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+            if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+                accumulator.set_model(string_at(value, &["message", "model"]));
+            } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
                 apply_pi_usage_line(
                     value,
                     accumulator,
@@ -42111,6 +42167,12 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 /// `usage` entries name their model; summaries run on the session's current
 /// model, which `place_usage` falls back to when `model` is None.
 fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+        // Copied spend is excluded, but its model remains the context for
+        // owned summary entries that do not repeat a model name.
+        accumulator.set_model(string_at(value, &["model"]));
+        return;
+    }
     let Some(usage) = pi_message_usage(value) else {
         return;
     };
@@ -42163,6 +42225,7 @@ fn pi_usage_dedup_key(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["message", "response_id"]))
         .or_else(|| string_at(value, &["responseId"]))
         .or_else(|| string_at(value, &["response_id"]))
+        .map(|id| pi_usage_hash("ottto-pi-usage-key:v1", &[&id]))
 }
 
 fn apply_pi_usage_line(
@@ -42181,6 +42244,7 @@ fn apply_pi_usage_line(
         let is_new_occurrence = match pi_usage_dedup_key(value) {
             Some(key) => accumulator
                 .seen_pi_usage_keys
+                .usage_keys_mut()
                 .entry(key)
                 .or_default()
                 .record(shape, occurrence_digest),
@@ -42196,6 +42260,15 @@ fn apply_pi_usage_line(
     }
 }
 
+/// Domain and parts share the length-prefixed snapshot hash convention.
+fn pi_usage_hash(domain: &str, parts: &[&str]) -> String {
+    let mut hash = Sha256::new();
+    for part in std::iter::once(domain).chain(parts.iter().copied()) {
+        update_length_prefixed(&mut hash, part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 fn pi_usage_occurrence_digest(
     model: Option<&str>,
     usage: &UsageTotals,
@@ -42203,28 +42276,31 @@ fn pi_usage_occurrence_digest(
     timestamp: Option<&str>,
 ) -> String {
     let selector_context = serde_json::to_string(&selector.context).unwrap_or_default();
-    sha256_hex(&[
-        model.unwrap_or(""),
-        &timestamp
-            .and_then(pi_usage_timestamp_identity)
-            .unwrap_or_default(),
-        &usage.input_tokens.to_string(),
-        &usage.output_tokens.to_string(),
-        &usage.cache_read_tokens.to_string(),
-        &usage.cache_creation_5m_tokens.to_string(),
-        &usage.cache_creation_1h_tokens.to_string(),
-        &usage.reasoning_output_tokens.to_string(),
-        &usage.unattributed_total_tokens.to_string(),
-        &usage.request_count.to_string(),
-        &usage.costs.observed.to_string(),
-        &usage.costs.reported.to_string(),
-        &format!("{:?}", usage.costs.total),
-        &format!("{:?}", usage.costs.input),
-        &format!("{:?}", usage.costs.output),
-        &format!("{:?}", usage.costs.cache_read),
-        &format!("{:?}", usage.costs.cache_creation),
-        &selector_context,
-    ])
+    pi_usage_hash(
+        "ottto-pi-usage-occurrence:v1",
+        &[
+            model.unwrap_or(""),
+            &timestamp
+                .and_then(pi_usage_timestamp_identity)
+                .unwrap_or_default(),
+            &usage.input_tokens.to_string(),
+            &usage.output_tokens.to_string(),
+            &usage.cache_read_tokens.to_string(),
+            &usage.cache_creation_5m_tokens.to_string(),
+            &usage.cache_creation_1h_tokens.to_string(),
+            &usage.reasoning_output_tokens.to_string(),
+            &usage.unattributed_total_tokens.to_string(),
+            &usage.request_count.to_string(),
+            &usage.costs.observed.to_string(),
+            &usage.costs.reported.to_string(),
+            &format!("{:?}", usage.costs.total),
+            &format!("{:?}", usage.costs.input),
+            &format!("{:?}", usage.costs.output),
+            &format!("{:?}", usage.costs.cache_read),
+            &format!("{:?}", usage.costs.cache_creation),
+            &selector_context,
+        ],
+    )
 }
 
 fn pi_message_text(value: &Value) -> Option<String> {
@@ -42279,10 +42355,14 @@ fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
     pi_ms_timestamp(Some(value))
 }
 
-fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
+fn pi_timestamp_nanos(value: &str) -> Option<i128> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
-        .map(|timestamp| timestamp.unix_timestamp_nanos().to_string())
+        .map(OffsetDateTime::unix_timestamp_nanos)
+}
+
+fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
+    pi_timestamp_nanos(value).map(|n| n.to_string())
 }
 
 fn timestamp_is_before(candidate: &str, current: &str) -> bool {
@@ -42315,12 +42395,29 @@ enum PiUsageRecordShape {
     MessageEnd,
 }
 
-#[derive(Debug, Clone, Default)]
-struct PiUsageDedupState {
+#[derive(Clone, Default)]
+pub(crate) struct PiUsageDedupState {
     message: BTreeMap<String, usize>,
     message_end: BTreeMap<String, usize>,
     paired_digests: BTreeSet<String>,
 }
+
+/// Counts only: the occurrence digests are unkeyed hashes.
+impl std::fmt::Debug for PiUsageDedupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiUsageDedupState")
+            .field("message", &self.message.len())
+            .field("message_end", &self.message_end.len())
+            .field("paired_digests", &self.paired_digests.len())
+            .finish()
+    }
+}
+
+crate::durable_tail_codec::durable_struct!(PiUsageDedupState {
+    H message: BTreeMap<String, usize>,
+    H message_end: BTreeMap<String, usize>,
+    H paired_digests: BTreeSet<String>,
+});
 
 impl PiUsageDedupState {
     /// Returns true when this record is a new billable occurrence. An exact
@@ -42352,6 +42449,152 @@ impl PiUsageDedupState {
                     .chain(self.message_end.keys())
                     .any(|digest| !self.paired_digests.contains(digest)))
     }
+}
+
+/// The accumulator's Pi-only state: the usage dedup ledger and the fork
+/// state. A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
+/// Claude and Codex leave it empty and never persist it; Pi persists it only
+/// in the Pi record section.
+#[derive(Clone, Default)]
+pub(crate) struct PiLedger {
+    usage_keys: BTreeMap<String, PiUsageDedupState>,
+    /// Set only for a file whose header names a parent; boxed so other
+    /// accumulators pay one pointer.
+    fork: Option<Box<PiFork>>,
+}
+
+/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
+/// their ids and timestamps, after a header that names `parentSession` at the
+/// fork time. The fork owns only what happened at or after its header time.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct PiFork {
+    /// Persisted (N): the header named a parent.
+    has_parent: bool,
+    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
+    /// time is missing or invalid, which counts every entry.
+    header_nanos: Option<i128>,
+}
+
+/// Never prints the local header time or `parentSession`.
+/// Counts only: the usage keys are unkeyed hashes.
+impl std::fmt::Debug for PiLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiLedger")
+            .field("usage_keys", &self.usage_keys.len())
+            .field("has_parent", &self.fork_parts().0)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PiFork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiFork")
+            .field("has_parent", &self.has_parent)
+            .finish()
+    }
+}
+
+impl PiFork {
+    /// Usage on an entry stamped strictly before the fork header time is the
+    /// parent's copied spend: skip it, counted. An entry without a valid
+    /// time counts normally. The envelope time comes first, as Pi copies it.
+    fn copied_usage(&self, value: &Value) -> Option<UsageTotals> {
+        let header = self.header_nanos?;
+        // A present invalid envelope is not evidence for skipping. Only an
+        // absent envelope falls back to the provider clock.
+        let at = pi_timestamp_value(
+            value
+                .get("timestamp")
+                .or_else(|| value.pointer("/message/timestamp")),
+        )
+        .as_deref()
+        .and_then(pi_timestamp_nanos)?;
+        if at < header {
+            pi_message_usage(value)
+        } else {
+            None
+        }
+    }
+}
+
+impl PiLedger {
+    pub(crate) fn usage_keys(&self) -> &BTreeMap<String, PiUsageDedupState> {
+        &self.usage_keys
+    }
+
+    pub(crate) fn usage_keys_mut(&mut self) -> &mut BTreeMap<String, PiUsageDedupState> {
+        &mut self.usage_keys
+    }
+
+    /// The persisted fork values: (`has_parent`, header time).
+    pub(crate) fn fork_parts(&self) -> (bool, Option<i128>) {
+        self.fork
+            .as_deref()
+            .map_or((false, None), |fork| (fork.has_parent, fork.header_nanos))
+    }
+
+    /// Refills the ledger from a Pi record section.
+    pub(crate) fn from_parts(
+        usage_keys: BTreeMap<String, PiUsageDedupState>,
+        has_parent: bool,
+        header_nanos: Option<i128>,
+    ) -> Self {
+        Self {
+            usage_keys,
+            fork: has_parent.then(|| {
+                Box::new(PiFork {
+                    has_parent,
+                    header_nanos,
+                })
+            }),
+        }
+    }
+
+    /// The first header that names a parent marks the file a fork. Pi writes
+    /// one header, as the first line.
+    fn note_header(&mut self, value: &Value) {
+        if !string_at(value, &["parentSession"]).is_some_and(|p| !p.is_empty()) {
+            return;
+        }
+        self.fork = Some(Box::new(PiFork {
+            has_parent: true,
+            header_nanos: pi_timestamp_value(value.get("timestamp"))
+                .as_deref()
+                .and_then(pi_timestamp_nanos),
+        }));
+    }
+
+    fn is_fork_copy(&self, value: &Value) -> bool {
+        self.fork
+            .as_deref()
+            .is_some_and(|fork| fork.copied_usage(value).is_some())
+    }
+
+    fn skip_fork_copy(&mut self, value: &Value) -> bool {
+        let Some(fork) = self.fork.as_deref_mut() else {
+            return false;
+        };
+        let Some(usage) = fork.copied_usage(value) else {
+            return false;
+        };
+        use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
+        add(Event::PiForkCopiesSkippedEntries, 1);
+        add(Event::PiForkCopiesSkippedTokens, usage.total_tokens());
+        true
+    }
+}
+
+impl crate::durable_tail_codec::DurableEmpty for PiLedger {
+    /// Claude and Codex: a fork state is as non-empty as a ledger key, so a
+    /// present one refuses the record (counted), never drops silently.
+    fn durable_empty(&self) -> bool {
+        self.usage_keys.is_empty() && self.fork.is_none()
+    }
+}
+
+impl crate::durable_tail_codec::PiOnlyDurable for PiLedger {
+    const FIELD: &'static str = "SnapshotAccumulator.seen_pi_usage_keys";
+    type Label = BTreeMap<String, PiUsageDedupState>;
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -42819,7 +43062,7 @@ struct CandidateFile {
     opened_object_identity: String,
     /// The ctime (unix nanos) in the opened-object identity that
     /// `source_file_fingerprint` used: the live one, or the entry's stored
-    /// one when size, mtime and birth are unchanged (Claude and Codex only).
+    /// one when size, mtime and birth are unchanged.
     fingerprint_changed_nanos: u64,
     /// The live file birth (unix nanos) of that open; zero if unavailable.
     fingerprint_birth_nanos: u64,
@@ -48169,12 +48412,8 @@ fn open_candidate_file_stat_retained(
     )?;
     candidate.opened_object_identity = identity;
     candidate.withheld_content_stamp = content;
-    let tracked =
-        stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
-    candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
-    candidate.fingerprint_birth_nanos = tracked
-        .and_then(|stat| stat.birth_nanos)
-        .unwrap_or_default();
+    candidate.fingerprint_changed_nanos = stat.map_or(0, |stat| stat.changed_unix_nanos());
+    candidate.fingerprint_birth_nanos = stat.and_then(|stat| stat.birth_nanos).unwrap_or_default();
     let metadata = file.metadata()?;
     candidate.physical_identity = physical_identity(&metadata);
     let modified = metadata.modified().ok();
@@ -48319,13 +48558,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
     }
     // `opened_object_identity` stays the live identity: the parse-time TOCTOU
     // check compares against it. Only the re-read trigger uses the adoption.
-    let Ok(adopted_identity) = adopt_stored_changed_time(
-        source,
-        &mut candidate,
-        retention.files,
-        live,
-        &mut opened_file,
-    ) else {
+    let Ok(adopted_identity) =
+        adopt_stored_changed_time(&mut candidate, retention.files, live, &mut opened_file)
+    else {
         census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
         return None;
     };
@@ -48602,15 +48837,11 @@ fn opened_object_identity_and_stat_retained(
 /// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_stored_changed_time(
-    source: SnapshotSource,
     candidate: &mut CandidateFile,
     files: &SharedMap<String, ScanIndexEntry>,
     live: Option<OpenedObjectStat>,
     file: &mut File,
 ) -> std::io::Result<Option<String>> {
-    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
-        return Ok(None);
-    }
     let (Some(entry), Some(live)) = (files.get(&local_index_key(&candidate.path)), live) else {
         return Ok(None);
     };
@@ -51999,7 +52230,7 @@ impl ScanIndex {
         source: SnapshotSource,
         window_days: u64,
     ) -> bool {
-        if source != SnapshotSource::ClaudeCode || !admission_reoffer_window::enabled() {
+        if source != SnapshotSource::ClaudeCode {
             return self.snapshot_admission_reoffer_pending();
         }
         let Some(now) = unix_seconds(SystemTime::now()) else {
@@ -76237,7 +76468,7 @@ mod tests {
         for line in fixture.lines() {
             apply_pi_line(&serde_json::from_str(line).unwrap(), &mut accumulator);
         }
-        assert!(accumulator.seen_pi_usage_keys.is_empty());
+        assert!(accumulator.seen_pi_usage_keys.usage_keys().is_empty());
         let _ = fs::remove_file(path);
     }
 
@@ -85463,6 +85694,36 @@ crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, 
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision; inline restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
+// Hand-written so an absent fork costs no visit: every Claude and Codex
+// accumulator carries an empty ledger, and their frames must keep the visit
+// count they had before the ledger gained its fork. A present fork is charged
+// exactly as `Option<Box<PiFork>>`, including the box's allocation.
+impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
+    fn stable_heap(&self) -> bool {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::stable_heap(usage_keys) && fork.as_ref().map_or(true, B::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::completed_heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::completed_heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+}
+crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,
@@ -85703,7 +85964,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     E claude_money: Option<Box<claude_request_money::e2::FileFold>>,
     U tool_usage_counts: BTreeMap<String, u64>,
     N tool_usage_truncated: bool,
-    E seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+    E seen_pi_usage_keys: PiLedger as BTreeMap<String, PiUsageDedupState>,
     N dropped_usage_record_count: u64,
     N claude_last_user_ts: Option<String>,
     N peak_context_fill_tokens: u64,

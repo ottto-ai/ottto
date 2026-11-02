@@ -2860,9 +2860,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi fields add 97 bytes at u64::MAX, the Codex tier field 53,
-        // the five refusal causes 267.
-        assert!(serde_json::to_string(record).unwrap().len() < 2624);
+        // The four Pi fields and the Codex tier field stay bounded at u64::MAX;
+        // the five refusal causes add 267 bytes.
+        assert!(serde_json::to_string(record).unwrap().len() < 2688);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
