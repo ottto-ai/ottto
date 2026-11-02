@@ -1492,6 +1492,8 @@ fn with_test_line_cap<T>(cap: usize, run: impl FnOnce() -> T) -> T {
 // content-free ordered turn/usage proof required by a referenced parent, and
 // fail closed when either bound is exceeded.
 const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
+/// Past this a Codex file's cache observations are incomplete; usage is unaffected.
+const MAX_CODEX_CACHE_REQUESTS_PER_FILE: usize = 65_536;
 const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16518,12 +16520,11 @@ struct ClaudeResponseRecord {
     tool_uses: BTreeMap<String, String>,
 }
 
-// Response-local buffering exists only to repair provider-time ordering. Bound
-// both its pathological single-key amplification and its aggregate per-file
-// heap. Normal local evidence is far below these ceilings (the 91-file Fable
-// canary's affected root has 9,768 usage-bearing physical records total).
-const MAX_CLAUDE_RECORDS_PER_RESPONSE: usize = 4_096;
-const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
+// Response-local buffering repairs provider-time ordering, so it grows with the
+// file's usage-bearing lines and never refuses one. Above these sizes the
+// finalizer only raises an alarm: they gate nothing.
+const CLAUDE_RECORDS_PER_RESPONSE_ALARM: usize = 4_096;
+const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
 
 /// One Claude provider response assembled from its content-block transcript
 /// records. Usage is withheld from the session projection until this response
@@ -16533,6 +16534,9 @@ struct ClaudeResponseObservation {
     sequence: u64,
     preceding_user_timestamp: Option<String>,
     records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    /// Never set any more. A book saved while the record caps existed may
+    /// carry it: that book lost records, so it stays retryable until a cold
+    /// read, which now keeps them all.
     record_limit_exceeded: bool,
     desktop_request: bool,
 }
@@ -16577,9 +16581,8 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
 /// Why a retained Claude response has no resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeResolveFailure {
-    /// The per-file record cap dropped some of its records.
-    Capped,
-    /// A compact record no longer decodes against the file's selector table.
+    /// A compact record no longer decodes against the file's selector table,
+    /// or a restored book already lost records.
     Decode,
     /// Incompatible observations: the native resolver's conflict.
     Conflict,
@@ -16634,18 +16637,10 @@ impl ClaudeResponseObservation {
         computed_effective_input_context: Option<u64>,
         tool_uses: BTreeMap<String, String>,
         cache_slot: RequestSlot,
-    ) -> bool {
-        if self.records.len() >= MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            self.record_limit_exceeded = true;
-            return false;
-        }
-        let Ok(physical_sequence) = u16::try_from(self.records.len()) else {
-            self.record_limit_exceeded = true;
-            return false;
-        };
+    ) {
         let record = CompactClaudeResponseRecord::encode(
             self.records.first(),
-            physical_sequence,
+            self.records.len(),
             usage,
             model,
             selector.into(),
@@ -16657,7 +16652,6 @@ impl ClaudeResponseObservation {
             cache_slot,
         );
         self.records.push(record);
-        true
     }
 
     /// Test shim for an observation built without a file's selector table:
@@ -16679,7 +16673,7 @@ impl ClaudeResponseObservation {
         selectors: &ClaudeSelectorTable,
     ) -> Result<ResolvedClaudeResponse, ClaudeResolveFailure> {
         if self.record_limit_exceeded {
-            return Err(ClaudeResolveFailure::Capped);
+            return Err(ClaudeResolveFailure::Decode);
         }
         let mut records =
             claude_response_records::decode_records(self.records.into_vec(), selectors)
@@ -20052,21 +20046,7 @@ impl SnapshotAccumulator {
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
         let key = claude_response_key(value, self.claude_response_sequence);
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
-            crate::local_resource_diagnostics::claude_record_cap_hit();
-            if self.claude_responses.contains_key(&key) {
-                self.claude_responses
-                    .get_mut(&key)
-                    .expect("response exists")
-                    .record_limit_exceeded = true;
-            } else {
-                // No response object exists to carry the one-time overflow
-                // marker into finalization. Account for this refused positive
-                // usage row immediately so the enclosing file stays retryable.
-                self.note_dropped_usage();
-            }
-            return;
-        }
+        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let selector = self.claude_responses.selectors.intern(selector);
         // The request's own usage records carry entrypoint. Missing or mixed
         // records fail closed; session-first origin is deliberately irrelevant.
@@ -20074,7 +20054,7 @@ impl SnapshotAccumulator {
             value.get("entrypoint").and_then(Value::as_str) == Some("claude-desktop");
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             existing.desktop_request &= desktop_request;
-            if existing.push(
+            existing.push(
                 usage,
                 model,
                 selector,
@@ -20084,15 +20064,11 @@ impl SnapshotAccumulator {
                 computed_effective_input_context,
                 tool_uses,
                 cache_slot,
-            ) {
-                self.claude_response_record_count =
-                    self.claude_response_record_count.saturating_add(1);
-            }
+            );
             return;
         }
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
-        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let mut response = ClaudeResponseObservation::new(
             sequence,
             usage,
@@ -20151,9 +20127,16 @@ impl SnapshotAccumulator {
                 responses.first().map(|response| response.sequence),
             );
         }
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
-            crate::local_resource_diagnostics::claude_record_cap_half_file();
-        }
+        crate::local_resource_diagnostics::claude_record_counts(
+            self.claude_response_record_count,
+            responses
+                .iter()
+                .map(|response| response.records.len())
+                .max()
+                .unwrap_or(0),
+            CLAUDE_RECORDS_PER_FILE_ALARM,
+            CLAUDE_RECORDS_PER_RESPONSE_ALARM,
+        );
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
             let mut response = match response.resolve_classified(&selectors) {
@@ -20171,9 +20154,9 @@ impl SnapshotAccumulator {
                     }
                     continue;
                 }
-                // The record cap and an undecodable compact record are loss
-                // held for retry, never a resolver conflict.
-                Err(ClaudeResolveFailure::Capped | ClaudeResolveFailure::Decode) => {
+                // An undecodable compact record is loss held for retry, never
+                // a resolver conflict.
+                Err(ClaudeResolveFailure::Decode) => {
                     self.note_dropped_usage();
                     continue;
                 }
@@ -20729,11 +20712,7 @@ impl SnapshotAccumulator {
         // R: the book, and what each resolved response's rows take from here.
         let book_bounds = self.claude_responses.completion_bounds(limit)?;
         let responses = book_bounds.output?;
-        let resolved = self
-            .claude_responses
-            .values()
-            .filter(|response| !response.record_limit_exceeded)
-            .count();
+        let resolved = self.claude_responses.values().count();
         // Charged for every Claude file: whether it is itemless (no positive
         // usage evidence) is the parser's to know, not this accumulator's.
         let buffered_records = self
@@ -40656,7 +40635,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             });
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
-        if accumulator.cache_requests.len() < MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
+        if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
             accumulator.cache_requests.push(request);
         } else {
             accumulator.cache_requests_complete = false;
@@ -70442,11 +70421,19 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// [regress] A response far past the old 4,096 and u16 record limits still
+    /// resolves, in physical order when no provider time orders it. The whole
+    /// file's case runs through a real scan in `claude_file_cap_tests`.
     #[test]
-    fn claude_response_record_caps_fail_closed_without_unbounded_buffering() {
+    fn claude_response_keeps_every_record_past_the_old_limits() {
+        let usage = |output_tokens| UsageTotals {
+            output_tokens,
+            request_count: 1,
+            ..UsageTotals::default()
+        };
         let mut response = ClaudeResponseObservation::new(
             0,
-            UsageTotals::default(),
+            usage(0),
             None,
             SelectorCapture::default(),
             None,
@@ -70457,9 +70444,10 @@ mod tests {
             BTreeMap::new(),
             RequestSlot::default(),
         );
-        for _ in 1..MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            assert!(response.push(
-                UsageTotals::default(),
+        let last = u64::from(u16::MAX) + 2;
+        for output_tokens in 1..=last {
+            response.push(
+                usage(output_tokens),
                 None,
                 SelectorCapture::default(),
                 None,
@@ -70468,50 +70456,12 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 RequestSlot::default(),
-            ));
+            );
         }
-        assert!(!response.push(
-            UsageTotals::default(),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        ));
-        assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
-        // A capped response is loss held for retry, never a resolver conflict.
-        assert_eq!(
-            response
-                .clone()
-                .resolve_classified(&ClaudeSelectorTable::default())
-                .err(),
-            Some(ClaudeResolveFailure::Capped)
-        );
-        assert!(response.resolve().is_none());
-
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        accumulator.claude_response_record_count = MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE;
-        accumulator.observe_claude_response(
-            &json!({
-                "requestId": "request-at-total-cap",
-                "message": {"id": "message-at-total-cap"},
-            }),
-            UsageTotals {
-                input_tokens: 1,
-                request_count: 1,
-                ..UsageTotals::default()
-            },
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            Some(1),
-        );
-        assert!(accumulator.claude_responses.is_empty());
-        assert_eq!(accumulator.dropped_usage_record_count, 1);
+        assert_eq!(response.records.len() as u64, last + 1);
+        let resolved = response.resolve().expect("every record resolves");
+        assert_eq!(resolved.usage.output_tokens, last);
+        assert!(!resolved.event_clock_complete);
     }
 
     #[test]
