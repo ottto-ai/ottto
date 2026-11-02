@@ -186,6 +186,7 @@ mod shared_value;
 #[cfg(test)]
 mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
+pub(crate) mod claude_folder_login;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
@@ -2881,6 +2882,23 @@ struct TerminalJsonlDisposition {
     loss: TerminalJsonlLoss,
 }
 
+/// Debt facts kept across traversals and per-file erasure; a traversal
+/// checkpoint is dropped when its walk ends, so they cannot live there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TailDiscovery {
+    /// Unix milliseconds when a discovery walk last covered every root.
+    pub(crate) last_complete_discovery_at: Option<u64>,
+    /// Cumulative files erased while they still held unaccepted usage.
+    pub(crate) deleted_unaccepted_files: u64,
+}
+crate::heap_layout_bound::fields!(TailDiscovery; last_complete_discovery_at, deleted_unaccepted_files);
+impl TailDiscovery {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScanTraversalCheckpoint {
     context_fingerprint: String,
@@ -4276,6 +4294,12 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
+    /// Per-folder login evidence (state layout 5); filled by ID1.
+    #[serde(default)]
+    pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
+    /// Durable debt facts that outlive any one traversal (state layout 5).
+    #[serde(default)]
+    pub(crate) tail_discovery: TailDiscovery,
     /// Accepted intent members still owing revision debt; rebuilt each prepare.
     #[serde(skip)]
     pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
@@ -4495,6 +4519,8 @@ impl Default for ScanIndex {
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
             copy_prefix_last_accepted_nonce: None,
+            claude_folder_login_ledger: BTreeMap::new(),
+            tail_discovery: TailDiscovery::default(),
             copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
@@ -54482,6 +54508,8 @@ impl ScanIndex {
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
+            claude_folder_login_ledger: self.claude_folder_login_ledger.clone(),
+            tail_discovery: self.tail_discovery,
             copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),

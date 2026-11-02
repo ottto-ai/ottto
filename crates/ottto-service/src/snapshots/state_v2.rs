@@ -53,12 +53,14 @@ mod tail;
 use kinds::KindCx;
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
-    load_head, load_tail, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
+    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, NoUploadRequired,
+    Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's

@@ -28,7 +28,9 @@ pub(super) fn owned(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name().starts_with("tail."))
 }
 
-/// Paged collections, in `catalogue::TAIL_KINDS` order.
+/// Paged collections, in `catalogue::TAIL_KINDS` order. `Revisions` is the
+/// file's debt (`tail.revision`, layout 5, position = revision id): it shares
+/// membership, checksums and fragments, but no reduction stage may name it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::snapshots) enum Collection {
     Responses,
@@ -44,9 +46,10 @@ pub(in crate::snapshots) enum Collection {
     CodexActiveTurns,
     CodexOpenCalls,
     CodexNameCounts,
+    Revisions,
 }
 impl Collection {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Responses,
         Self::ToolUses,
         Self::ChangedFiles,
@@ -60,6 +63,7 @@ impl Collection {
         Self::CodexActiveTurns,
         Self::CodexOpenCalls,
         Self::CodexNameCounts,
+        Self::Revisions,
     ];
     fn kind(self) -> &'static str {
         catalogue::TAIL_KINDS[self as usize]
@@ -157,6 +161,87 @@ pub(in crate::snapshots) struct SetAside {
     pub(in crate::snapshots) attempts: u32,
     pub(in crate::snapshots) first_seen_unix_seconds: u64,
 }
+/// What a head stands for. Archives and non-Tail files carry common metadata
+/// only, never a reduction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) enum Representation {
+    #[default]
+    Tail = 1,
+    Archive = 2,
+    NonTail = 3,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum NoUploadRequired {
+    ZeroUsageLines = 1,
+    ZeroTokens = 2,
+}
+/// The file's debt summary, derived by its owner from the revisions; it is never
+/// acceptance. Unix milliseconds; `reason_bits` are stored opaque.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct DebtSummary {
+    pub(in crate::snapshots) earliest_unacked_change_at: Option<u64>,
+    pub(in crate::snapshots) lower_bound: bool,
+    pub(in crate::snapshots) reason_bits: u32,
+    pub(in crate::snapshots) disposition: Option<NoUploadRequired>,
+}
+/// The versioned common head body; the source's reduction follows it, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct Common {
+    pub(in crate::snapshots) representation: Representation,
+    pub(in crate::snapshots) debt: DebtSummary,
+    /// The next revision id; ids are never reused, even after deletion.
+    pub(in crate::snapshots) next_revision_id: u64,
+}
+/// A debt-only mutation: never touches the file's reduction, its graph rows
+/// (so no PRE or progress publishes) or its set-aside marker. Revision values
+/// are opaque to the store; their owner keeps D131 out of them.
+#[derive(Default)]
+pub(in crate::snapshots) struct Observation {
+    pub(in crate::snapshots) representation: Representation,
+    pub(in crate::snapshots) summary: DebtSummary,
+    /// New revisions; the store allocates their ids at commit, in order.
+    pub(in crate::snapshots) added: Vec<Vec<u8>>,
+    /// Committed revisions overwritten in place; an unknown id is ignored.
+    pub(in crate::snapshots) replaced: BTreeMap<u64, Vec<u8>>,
+    /// Committed revisions settled by their owner; an unknown id is ignored.
+    pub(in crate::snapshots) resolved: BTreeSet<u64>,
+}
+impl Observation {
+    fn absorb(&mut self, later: Self) {
+        self.representation = later.representation;
+        self.summary = later.summary;
+        self.added.extend(later.added);
+        for id in later.resolved {
+            self.replaced.remove(&id);
+            self.resolved.insert(id);
+        }
+        for (id, value) in later.replaced {
+            self.resolved.remove(&id);
+            self.replaced.insert(id, value);
+        }
+    }
+    fn bytes(&self) -> u64 {
+        self.added
+            .iter()
+            .chain(self.replaced.values())
+            .fold(0, |sum, value| sum + value.len() as u64)
+    }
+}
+/// An authorised final disposition of a file's whole debt: recorded (counted),
+/// and never reported as an ACK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the G7 cutover
+pub(in crate::snapshots) enum Disposition {
+    /// A complete census proved the file absent.
+    Absence,
+    /// Policy settled the remaining debt.
+    Settled,
+}
+#[derive(Default)]
+struct Debt {
+    disposal: Option<Disposition>,
+    observation: Option<Observation>,
+}
 enum Entry {
     File(StagedFile),
     Failed(SetAsideCause),
@@ -166,12 +251,52 @@ enum Entry {
 #[derive(Default)]
 pub(super) struct TailStage {
     files: BTreeMap<Vec<u8>, Entry>,
+    debt: BTreeMap<Vec<u8>, Debt>,
     retire: BTreeSet<Vec<u8>>,
+    erase: BTreeSet<Vec<u8>>,
     peak_bytes: u64,
 }
 impl TailStage {
     pub(super) fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.retire.is_empty()
+        self.files.is_empty()
+            && self.debt.is_empty()
+            && self.retire.is_empty()
+            && self.erase.is_empty()
+    }
+    pub(super) fn observe(&mut self, key: &str, observation: Observation) {
+        let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
+        let merged = match debt.observation.take() {
+            Some(mut prior) => {
+                prior.absorb(observation);
+                prior
+            }
+            None => observation,
+        };
+        debt.observation = Some(merged);
+        self.report();
+    }
+    /// Staged observations of the key are superseded; later ones apply after.
+    pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {
+        self.debt.insert(
+            key.as_bytes().to_vec(),
+            Debt {
+                disposal: Some(disposition),
+                observation: None,
+            },
+        );
+    }
+    /// Erasure of the key's whole scope; anything staged for it goes. `true`:
+    /// newly erased while it held unaccepted revisions, committed or staged.
+    pub(super) fn erase(&mut self, key: &str, committed_debt: bool) -> bool {
+        let key = key.as_bytes().to_vec();
+        let staged_debt = self
+            .debt
+            .remove(&key)
+            .and_then(|debt| debt.observation)
+            .is_some_and(|observation| !observation.added.is_empty());
+        self.files.remove(&key);
+        self.retire.remove(&key);
+        self.erase.insert(key) && (committed_debt || staged_debt)
     }
     pub(super) fn stage(&mut self, key: &str, mut file: StagedFile) {
         let key = key.as_bytes().to_vec();
@@ -206,13 +331,18 @@ impl TailStage {
             .filter_map(|(key, entry)| matches!(entry, Entry::File(_)).then_some(key))
     }
     pub(super) fn bytes(&self) -> u64 {
-        self.files.values().fold(0, |sum, entry| match entry {
+        let debt = self
+            .debt
+            .values()
+            .filter_map(|debt| debt.observation.as_ref())
+            .fold(0, |sum, observation| sum + observation.bytes());
+        self.files.values().fold(debt, |sum, entry| match entry {
             Entry::File(file) => sum + file.bytes(),
             Entry::Failed(_) => sum,
         })
     }
     pub(super) fn files(&self) -> usize {
-        self.files.len()
+        self.files.len() + self.debt.len()
     }
     fn report(&mut self) {
         let bytes = self.bytes();
@@ -382,8 +512,17 @@ fn delete_fragments(
     }
 }
 
-fn encode_head(revision: u32, table: &MembershipTable, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + table.len() * 54 + body.len());
+/// The common body's own version, separate from the source's (`revision`) and
+/// from the store's physical and DB generations.
+const ENVELOPE: u8 = 1;
+pub(super) fn encode_head(
+    revision: u32,
+    table: &MembershipTable,
+    common: &Common,
+    reduction: Option<&[u8]>,
+) -> Vec<u8> {
+    let body = reduction.unwrap_or_default();
+    let mut out = Vec::with_capacity(31 + table.len() * 54 + body.len());
     out.extend_from_slice(&revision.to_be_bytes());
     out.push(table.len() as u8);
     for (collection, entry) in table {
@@ -394,6 +533,15 @@ fn encode_head(revision: u32, table: &MembershipTable, body: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&entry.pages.to_be_bytes());
         out.extend_from_slice(&entry.commit);
     }
+    let debt = &common.debt;
+    out.extend_from_slice(&[ENVELOPE, common.representation as u8]);
+    out.extend_from_slice(&common.next_revision_id.to_be_bytes());
+    out.push(u8::from(debt.earliest_unacked_change_at.is_some()));
+    out.extend_from_slice(&debt.earliest_unacked_change_at.unwrap_or(0).to_be_bytes());
+    out.push(u8::from(debt.lower_bound));
+    out.extend_from_slice(&debt.reason_bits.to_be_bytes());
+    out.push(debt.disposition.map_or(0, |d| d as u8));
+    out.push(u8::from(reduction.is_some()));
     out.extend_from_slice(body);
     out
 }
@@ -404,11 +552,28 @@ fn encode_head(revision: u32, table: &MembershipTable, body: &[u8]) -> Vec<u8> {
 pub(in crate::snapshots) struct TailHead {
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) table: MembershipTable,
+    /// The source's reduction; empty when `metadata_only`.
     pub(in crate::snapshots) body: Vec<u8>,
+    pub(in crate::snapshots) common: Common,
+    /// No reduction: never loadable, no parser restore, and no Skip, floor,
+    /// census or Full credit. Acquire as for a missing checkpoint.
+    pub(in crate::snapshots) metadata_only: bool,
     generation: u64,
     row_digest: [u8; 16],
 }
-fn decode_head(bytes: &[u8]) -> Result<TailHead> {
+pub(super) struct Decoded {
+    revision: u32,
+    table: MembershipTable,
+    common: Common,
+    reduction: Option<Vec<u8>>,
+}
+/// A code above `max` was written by a newer build: hold, never default.
+fn code(input: &mut Reader<'_>, max: u8) -> Result<u8> {
+    let [value] = input.take::<1>()?;
+    ensure!(value <= max, Hold::Future);
+    Ok(value)
+}
+pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
     let mut input = Reader(bytes);
     let revision = u32::from_be_bytes(input.take()?);
     let [entries] = input.take::<1>()?;
@@ -435,38 +600,80 @@ fn decode_head(bytes: &[u8]) -> Result<TailHead> {
         };
         table.insert(collection, entry);
     }
-    Ok(TailHead {
+    ensure!(
+        code(&mut input, ENVELOPE)? == ENVELOPE,
+        "state_v2_tail_value_shape"
+    );
+    let representation = match code(&mut input, 3)? {
+        1 => Representation::Tail,
+        2 => Representation::Archive,
+        3 => Representation::NonTail,
+        _ => bail!("state_v2_tail_value_shape"),
+    };
+    let next_revision_id = u64::from_be_bytes(input.take()?);
+    let earliest = code(&mut input, 1)? == 1;
+    let at = u64::from_be_bytes(input.take()?);
+    let debt = DebtSummary {
+        earliest_unacked_change_at: earliest.then_some(at),
+        lower_bound: code(&mut input, 1)? == 1,
+        reason_bits: u32::from_be_bytes(input.take()?),
+        disposition: match code(&mut input, 2)? {
+            0 => None,
+            1 => Some(NoUploadRequired::ZeroUsageLines),
+            _ => Some(NoUploadRequired::ZeroTokens),
+        },
+    };
+    let reduction = (code(&mut input, 1)? == 1).then(|| input.0.to_vec());
+    ensure!(
+        reduction.is_some() || input.0.is_empty(),
+        "state_v2_tail_value_shape"
+    );
+    Ok(Decoded {
         revision,
         table,
-        body: input.0.to_vec(),
-        generation: 0,
-        row_digest: [0; 16],
+        common: Common {
+            representation,
+            debt,
+            next_revision_id,
+        },
+        reduction,
     })
+}
+fn read_head(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<(Header, Decoded)>> {
+    let Some(header) = tx.get(&row(HEAD, file, 0)?)? else {
+        return Ok(None);
+    };
+    let head = decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?)?;
+    Ok(Some((header, head)))
 }
 
 /// The file's committed head and nothing else; no page is visited. A future
-/// revision is `Hold::Future`, never a Full. `generation` is the authenticated
-/// generation of this read transaction.
+/// revision, envelope or code is `Hold::Future`, never a Full. `generation` is
+/// the authenticated generation of this read transaction.
 pub(super) fn load_head(
     tx: &mut dyn Transaction,
     file: &[u8],
     revision: u32,
     generation: u64,
 ) -> Result<Option<TailHead>> {
-    let Some(header) = tx.get(&row(HEAD, file, 0)?)? else {
+    let Some((header, head)) = read_head(tx, file)? else {
         return Ok(None);
     };
-    let head = decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?)?;
     ensure!(head.revision <= revision, Hold::Future);
     Ok(Some(TailHead {
+        revision: head.revision,
+        table: head.table,
+        metadata_only: head.reduction.is_none(),
+        body: head.reduction.unwrap_or_default(),
+        common: head.common,
         generation,
         row_digest: header.digest,
-        ..head
     }))
 }
-/// `head`'s pages in one read snapshot, one page at a time: `visit` owns each
-/// page's bytes as it goes and must discard them all on `Err`. A later generation
-/// is `Hold::ReloadRequired`, before any page; a changed head, or missing, swapped
+/// `head`'s reduction pages in one read snapshot, one page at a time: `visit`
+/// owns each page's bytes as it goes and must discard them all on `Err`. A
+/// metadata-only head refuses before any page. A later generation is
+/// `Hold::ReloadRequired`, before any page; a changed head, or missing, swapped
 /// or leftover rows, are any other error, the row staying until replaced.
 pub(super) fn load_pages(
     tx: &mut dyn Transaction,
@@ -475,13 +682,40 @@ pub(super) fn load_pages(
     generation: u64,
     visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
+    ensure!(!head.metadata_only, "state_v2_tail_metadata_only");
+    let pages = Collection::ALL
+        .into_iter()
+        .filter(|c| *c != Collection::Revisions);
+    stream(tx, file, head, generation, pages, visit)
+}
+/// `head`'s revisions (debt), by revision id, under the same checks.
+pub(super) fn load_revisions(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    head: &TailHead,
+    generation: u64,
+    visit: &mut dyn FnMut(u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let only = [Collection::Revisions].into_iter();
+    stream(tx, file, head, generation, only, &mut |_, id, value| {
+        visit(id, value)
+    })
+}
+fn stream(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    head: &TailHead,
+    generation: u64,
+    collections: impl Iterator<Item = Collection>,
+    visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
     ensure!(head.generation == generation, Hold::ReloadRequired);
     let stored = tx.get(&row(HEAD, file, 0)?)?;
     ensure!(
         stored.is_some_and(|header| header.digest == head.row_digest),
         "state_v2_tail_membership"
     );
-    for collection in Collection::ALL {
+    for collection in collections {
         let kind = RecordKind::parse(collection.kind())?;
         let (mut pages, mut commit) = (0_u64, [0_u8; 32]);
         let mut after = None;
@@ -550,11 +784,13 @@ fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
     }
     Ok(true)
 }
-/// Every row of the file except its marker.
-fn delete_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
+const REVISION: &str = "tail.revision";
+/// Every row of the file except its marker; with `keep_debt`, its revisions and
+/// their fragments stay too.
+fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result<()> {
     for name in catalogue::TAIL_KINDS
         .iter()
-        .filter(|k| !matches!(**k, SET_ASIDE | FRAG))
+        .filter(|k| !matches!(**k, SET_ASIDE | FRAG) && !(keep_debt && **k == REVISION))
     {
         let kind = RecordKind::parse(name)?;
         loop {
@@ -566,17 +802,39 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
     }
     let kind = RecordKind::parse(FRAG)?;
     let digest = frag_file(file);
-    // The bare digest sorts before every fragment key that starts with it.
+    // The bare digest sorts before every fragment key that starts with it, and
+    // the revisions' owner id sorts after every other owner's.
+    let mut stop = digest.to_vec();
+    stop.extend_from_slice(&Collection::Revisions.owner().to_be_bytes());
     let before = row(FRAG, &digest, 0)?;
     loop {
         let rows = tx.scan_kind(&kind, Some(&before), HEADER_PAGE)?;
         let own = rows.into_iter().take_while(|header| {
-            matches!(&header.key, RowKey::Record { key_bytes, .. } if key_bytes.starts_with(&digest))
+            matches!(&header.key, RowKey::Record { key_bytes, .. }
+                if key_bytes.starts_with(&digest) && !(keep_debt && key_bytes.starts_with(&stop)))
         });
         if !purge(tx, own.collect())? {
             return Ok(());
         }
     }
+}
+/// The file's committed revision rows, from headers alone.
+fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
+    let kind = RecordKind::parse(REVISION)?;
+    let (mut found, mut after) = (Vec::new(), None);
+    loop {
+        let rows = tx.scan_record_key(&kind, file, after, HEADER_PAGE)?;
+        let Some(last) = rows.last() else {
+            return Ok(found);
+        };
+        after = Some(position(last)?);
+        found.extend(rows);
+    }
+}
+/// Whether the file holds unresolved debt; erasure must not decode what it removes.
+pub(super) fn has_revisions(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+    let kind = RecordKind::parse(REVISION)?;
+    Ok(!tx.scan_record_key(&kind, file, None, 1)?.is_empty())
 }
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 struct Applied {
@@ -588,83 +846,243 @@ struct Applied {
     set_aside: u64,
     rolled_back: u64,
     retired: u64,
+    /// Retired or reset without a disposition, keeping debt in a metadata head.
+    kept_debt: u64,
+    revisions_added: u64,
+    disposed_absence: u64,
+    disposed_settled: u64,
+    erased: u64,
+}
+impl Applied {
+    fn absorb(&mut self, one: Self) {
+        self.files += one.files;
+        self.head_bytes += one.head_bytes;
+        self.page_bytes += one.page_bytes;
+        self.dirty_pages += one.dirty_pages;
+        self.old_page_touches += one.old_page_touches;
+        self.revisions_added += one.revisions_added;
+        self.disposed_absence += one.disposed_absence;
+        self.disposed_settled += one.disposed_settled;
+    }
 }
 fn member(table: &mut MembershipTable, collection: Collection) -> Result<&mut Membership> {
     table
         .get_mut(&collection)
         .context("state_v2_tail_membership")
 }
-/// Replace one file's head and changed rows, adjusting membership from row
-/// headers alone: no other page is read.
-fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result<Applied> {
-    let head_key = row(HEAD, file, 0)?;
-    let mut table = if staged.change == Change::Reset {
-        delete_rows(tx, file)?;
-        MembershipTable::new()
+fn debt_member(table: &mut MembershipTable) -> &mut Membership {
+    table.entry(Collection::Revisions).or_insert(Membership {
+        meta: CollectionMeta {
+            shape: Shape::Slot,
+            elements_per_page: 1,
+            elements: 0,
+        },
+        pages: 0,
+        commit: [0; 32],
+    })
+}
+/// Debt-only changes: overwrites and settlements mark erasure; new ids come from
+/// the head under this write transaction.
+fn observe(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    table: &mut MembershipTable,
+    common: &mut Common,
+    observation: &Observation,
+) -> Result<u64> {
+    let owner = Collection::Revisions.owner();
+    let entry = debt_member(table);
+    let changed = observation
+        .replaced
+        .iter()
+        .map(|(id, value)| (*id, Some(value)))
+        .chain(observation.resolved.iter().map(|id| (*id, None)));
+    for (id, value) in changed {
+        let key = row(REVISION, file, id)?;
+        let Some(old) = tx.get(&key)? else {
+            continue;
+        };
+        subtract(&mut entry.commit, &term(REVISION, id, &old.digest));
+        tx.mark_erasure()?;
+        match value {
+            Some(value) => {
+                let written = write_value(tx, file, owner, id, &key, value)?;
+                add(&mut entry.commit, &term(REVISION, id, &written.digest));
+            }
+            None => {
+                entry.pages = entry.pages.wrapping_sub(1);
+                tx.delete(&key)?;
+                delete_fragments(tx, file, owner, id, 0)?;
+            }
+        }
+    }
+    for value in &observation.added {
+        let id = common.next_revision_id;
+        common.next_revision_id += 1;
+        let written = write_value(tx, file, owner, id, &row(REVISION, file, id)?, value)?;
+        add(&mut entry.commit, &term(REVISION, id, &written.digest));
+        entry.pages += 1;
+    }
+    entry.meta.elements = entry.pages;
+    common.representation = observation.representation;
+    common.debt = observation.summary;
+    Ok(observation.added.len() as u64)
+}
+/// Replace one file's reduction and apply its debt changes, adjusting membership
+/// from row headers alone: no other page is read. A head with neither a
+/// reduction nor debt goes. Only a reduction replacement or a disposal clears
+/// the set-aside marker.
+fn write_file(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    staged: Option<&StagedFile>,
+    debt: Option<&Debt>,
+) -> Result<Applied> {
+    let reset = staged.is_some_and(|staged| staged.change == Change::Reset);
+    let (mut revision, mut table, mut common, mut reduction) = if reset {
+        // Acquisition state only: committed debt stays and merges, and a
+        // damaged head never blocks the reset that replaces it.
+        let (revision, table, common) = committed_debt(tx, file)?;
+        delete_rows(tx, file, true)?;
+        (revision, table, common, None)
     } else {
-        match tx.get(&head_key)? {
-            Some(header) => decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?)?.table,
-            None => MembershipTable::new(),
+        match read_head(tx, file)? {
+            Some((_, head)) => (head.revision, head.table, head.common, head.reduction),
+            None => Default::default(),
         }
     };
-    // A reset's purge of actual prior rows marks itself; a bootstrap owes nothing.
-    if staged.change == Change::DropsPrivate {
-        tx.mark_erasure()?;
-    }
-    for (collection, meta) in &staged.collections {
-        table
-            .entry(*collection)
-            .or_insert(Membership {
-                meta: *meta,
-                pages: 0,
-                commit: [0; 32],
-            })
-            .meta = *meta;
-    }
-    for &(collection, page) in &staged.obsolete {
-        let page_key = row(collection.kind(), file, page)?;
-        if let Some(old) = tx.get(&page_key)? {
-            let entry = member(&mut table, collection)?;
-            subtract(
-                &mut entry.commit,
-                &term(collection.kind(), page, &old.digest),
-            );
-            // A wrong stored count fails `load_pages`' one membership check.
-            entry.pages = entry.pages.wrapping_sub(1);
-            tx.delete(&page_key)?;
-            delete_fragments(tx, file, collection.owner(), page, 0)?;
-            tx.mark_erasure()?;
-        }
-    }
     let mut applied = Applied {
         files: 1,
-        dirty_pages: staged.pages.len() as u64,
         ..Default::default()
     };
-    for (&(collection, page), value) in &staged.pages {
-        let entry = member(&mut table, collection)?;
-        let page_key = row(collection.kind(), file, page)?;
-        if let Some(old) = tx.get(&page_key)? {
-            subtract(
-                &mut entry.commit,
-                &term(collection.kind(), page, &old.digest),
-            );
-            applied.old_page_touches += 1;
-        } else {
-            entry.pages += 1;
-        }
-        let written = write_value(tx, file, collection.owner(), page, &page_key, value)?;
-        add(
-            &mut entry.commit,
-            &term(collection.kind(), page, &written.digest),
+    if let Some(staged) = staged {
+        let named = staged
+            .collections
+            .keys()
+            .chain(staged.pages.keys().map(|(c, _)| c));
+        ensure!(
+            !named
+                .chain(staged.obsolete.iter().map(|(c, _)| c))
+                .any(|c| *c == Collection::Revisions),
+            "state_v2_tail_membership"
         );
-        applied.page_bytes += value.len() as u64;
+        // A reset's purge of actual prior rows marks itself; a bootstrap owes nothing.
+        if staged.change == Change::DropsPrivate {
+            tx.mark_erasure()?;
+        }
+        for (collection, meta) in &staged.collections {
+            table
+                .entry(*collection)
+                .or_insert(Membership {
+                    meta: *meta,
+                    pages: 0,
+                    commit: [0; 32],
+                })
+                .meta = *meta;
+        }
+        for &(collection, page) in &staged.obsolete {
+            let page_key = row(collection.kind(), file, page)?;
+            if let Some(old) = tx.get(&page_key)? {
+                let entry = member(&mut table, collection)?;
+                subtract(
+                    &mut entry.commit,
+                    &term(collection.kind(), page, &old.digest),
+                );
+                // A wrong stored count fails `load_pages`' one membership check.
+                entry.pages = entry.pages.wrapping_sub(1);
+                tx.delete(&page_key)?;
+                delete_fragments(tx, file, collection.owner(), page, 0)?;
+                tx.mark_erasure()?;
+            }
+        }
+        applied.dirty_pages = staged.pages.len() as u64;
+        for (&(collection, page), value) in &staged.pages {
+            let entry = member(&mut table, collection)?;
+            let page_key = row(collection.kind(), file, page)?;
+            if let Some(old) = tx.get(&page_key)? {
+                subtract(
+                    &mut entry.commit,
+                    &term(collection.kind(), page, &old.digest),
+                );
+                applied.old_page_touches += 1;
+            } else {
+                entry.pages += 1;
+            }
+            let written = write_value(tx, file, collection.owner(), page, &page_key, value)?;
+            add(
+                &mut entry.commit,
+                &term(collection.kind(), page, &written.digest),
+            );
+            applied.page_bytes += value.len() as u64;
+        }
+        revision = staged.revision;
+        reduction = Some(staged.head.clone());
+        common.representation = Representation::Tail;
     }
-    let head = encode_head(staged.revision, &table, &staged.head);
-    write_value(tx, file, HEAD_OWNER, 0, &head_key, &head)?;
+    let disposal = debt.and_then(|debt| debt.disposal);
+    if let Some(disposition) = disposal {
+        for header in revision_rows(tx, file)? {
+            let id = position(&header)?;
+            purge(tx, vec![header])?;
+            delete_fragments(tx, file, Collection::Revisions.owner(), id, 0)?;
+        }
+        table.remove(&Collection::Revisions);
+        common.debt = DebtSummary::default();
+        match disposition {
+            Disposition::Absence => applied.disposed_absence += 1,
+            Disposition::Settled => applied.disposed_settled += 1,
+        }
+    }
+    if let Some(observation) = debt.and_then(|debt| debt.observation.as_ref()) {
+        applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
+    }
+    if staged.is_some() || disposal.is_some() {
+        tx.delete(&set_aside_key(file)?)?;
+    }
+    if table
+        .get(&Collection::Revisions)
+        .is_some_and(|m| m.pages == 0)
+    {
+        table.remove(&Collection::Revisions);
+    }
+    if reduction.is_none() && !table.contains_key(&Collection::Revisions) {
+        delete_rows(tx, file, false)?;
+        return Ok(applied);
+    }
+    let head = encode_head(revision, &table, &common, reduction.as_deref());
+    write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     applied.head_bytes = head.len() as u64;
-    tx.delete(&set_aside_key(file)?)?;
     Ok(applied)
+}
+/// The file's debt alone, its membership rebuilt from revision row headers so
+/// no stored value has to decode: a damaged head never blocks a reset or retire.
+fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, MembershipTable, Common)> {
+    let prior = read_head(tx, file).ok().flatten();
+    let (revision, mut common) = prior.map_or((0, Common::default()), |(_, head)| {
+        (head.revision, head.common)
+    });
+    let mut table = MembershipTable::new();
+    for header in revision_rows(tx, file)? {
+        let id = position(&header)?;
+        let entry = debt_member(&mut table);
+        add(&mut entry.commit, &term(REVISION, id, &header.digest));
+        entry.pages += 1;
+        entry.meta.elements = entry.pages;
+        common.next_revision_id = common.next_revision_id.max(id + 1);
+    }
+    Ok((revision, table, common))
+}
+/// Retirement or progress removal without a disposition: the reduction goes;
+/// unresolved revisions stay under one metadata-only head. `true`: debt kept.
+fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+    let (revision, table, common) = committed_debt(tx, file)?;
+    let keep = !table.is_empty();
+    delete_rows(tx, file, keep)?;
+    if keep {
+        let head = encode_head(revision, &table, &common, None);
+        write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
+    }
+    Ok(keep)
 }
 /// Written outside the file's rolled-back boundary, in the same transaction.
 /// Only `attempts` changes; there is no next-try time and no parking threshold.
@@ -711,45 +1129,55 @@ pub(super) fn removed_files(old: &mapper::Digests) -> Vec<Vec<u8>> {
         })
         .collect()
 }
-/// Every staged file, each alone, with its own graph rows (`Rows::take_closure`):
-/// a failure rolls back only that file and sets it aside, so siblings and shared
-/// rows commit. A systemic failure abandons the save. `true`: a file rolled back.
+/// Every staged file, each alone, with its own graph rows (`Rows::take_closure`)
+/// and its debt changes: a failure rolls back only that file and sets it aside,
+/// so siblings and shared rows commit. Debt-only changes take no graph rows. A
+/// systemic failure abandons the save. `true`: a file's graph rows rolled back.
 pub(super) fn apply(
     rows: &mut mapper::Rows<'_>,
     stage: Option<&TailStage>,
     removed: &[Vec<u8>],
 ) -> Result<bool> {
     let mut applied = Applied::default();
-    for (file, entry) in stage.into_iter().flat_map(|stage| &stage.files) {
-        let failed = match entry {
-            Entry::Failed(cause) => Some(*cause),
-            Entry::File(staged) => {
-                let closure = rows.take_closure(file)?;
-                // The file's closure boundary: its graph rows, then its Tail rows.
-                let result = rows.tx()?.isolated(&mut |tx| {
-                    for row in &closure {
-                        match &row.value {
-                            Some(value) => {
-                                mapper::put(tx, &row.key, &**value)?;
-                            }
-                            None => mapper::remove(tx, &row.key)?,
-                        }
-                    }
-                    let one = replace(tx, file, staged)?;
-                    applied.files += one.files;
-                    applied.head_bytes += one.head_bytes;
-                    applied.page_bytes += one.page_bytes;
-                    applied.dirty_pages += one.dirty_pages;
-                    applied.old_page_touches += one.old_page_touches;
-                    Ok(())
-                })?;
-                if result.is_err() {
-                    rows.revert(closure);
-                    applied.rolled_back += 1;
-                }
-                result.err().map(|_| SetAsideCause::Row)
-            }
+    let keys: BTreeSet<&Vec<u8>> = stage
+        .into_iter()
+        .flat_map(|stage| stage.files.keys().chain(stage.debt.keys()))
+        .collect();
+    for file in keys {
+        let entry = stage.and_then(|stage| stage.files.get(file));
+        let debt = stage.and_then(|stage| stage.debt.get(file));
+        let staged = match entry {
+            Some(Entry::File(staged)) => Some(staged),
+            _ => None,
         };
+        let mut failed = match entry {
+            Some(Entry::Failed(cause)) => Some(*cause),
+            _ => None,
+        };
+        if staged.is_some() || debt.is_some() {
+            let closure = match staged {
+                Some(_) => rows.take_closure(file)?,
+                None => Vec::new(),
+            };
+            // The file's closure boundary: its graph rows, then its Tail rows.
+            let result = rows.tx()?.isolated(&mut |tx| {
+                for row in &closure {
+                    match &row.value {
+                        Some(value) => {
+                            mapper::put(tx, &row.key, &**value)?;
+                        }
+                        None => mapper::remove(tx, &row.key)?,
+                    }
+                }
+                applied.absorb(write_file(tx, file, staged, debt)?);
+                Ok(())
+            })?;
+            if result.is_err() {
+                applied.rolled_back += u64::from(staged.is_some());
+                rows.revert(closure);
+                failed = Some(SetAsideCause::Row);
+            }
+        }
         if let Some(cause) = failed {
             mark_set_aside(rows.tx()?, file, cause)?;
             applied.set_aside += 1;
@@ -758,9 +1186,15 @@ pub(super) fn apply(
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
     for file in removed.iter().chain(authorised) {
-        delete_rows(tx, file)?;
+        applied.kept_debt += u64::from(retire(tx, file)?);
         tx.delete(&set_aside_key(file)?)?;
         applied.retired += 1;
+    }
+    // Scope erasure is not a reset: debt goes too, and nothing vetoes it.
+    for file in stage.into_iter().flat_map(|stage| &stage.erase) {
+        delete_rows(tx, file, false)?;
+        tx.delete(&set_aside_key(file)?)?;
+        applied.erased += 1;
     }
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);
@@ -780,14 +1214,15 @@ pub(super) fn commit_exit(
     let mut span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
     let mut tx = db.begin(TxnMode::Write)?;
-    // Only the layout before Tail: an older store still lacks graph roots its
-    // next full save fills in, and recording this layout would refuse them.
-    if mapper::layout(&mut tx)?.checked_add(1) == Some(catalogue::LAYOUT) {
+    // Only the layout before Tail, and only up to Tail's: an older store still
+    // lacks graph roots its next full save fills in, and recording a later layout
+    // would refuse them. Never a later layout from a Tail-only write.
+    if mapper::layout(&mut tx)? + 1 == catalogue::TAIL_LAYOUT {
         put(
             &mut tx,
             &RowKey::Meta("catalogue_layout".into()),
             1,
-            &serde_json::to_vec(&catalogue::LAYOUT)?,
+            &serde_json::to_vec(&catalogue::TAIL_LAYOUT)?,
         )?;
     }
     // No graph rows here: a rolled-back file leaves nothing in RAM ahead.
