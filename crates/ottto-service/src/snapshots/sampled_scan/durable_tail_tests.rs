@@ -5052,11 +5052,11 @@ fn a1a_scan_at(
 #[test]
 #[cfg(target_os = "macos")]
 fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
-    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::local_resource_diagnostics::rearm_cause;
+    use crate::snapshots::evidence_owed::EvidenceContract;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
 
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _owed = EvidenceOwedForTest::on();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -5156,10 +5156,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         assert_eq!(initial.snapshots[0].input_tokens, 100);
         let stamped = EvidenceContract::current(&index);
         assert!(stamped.is_some());
-        assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            stamped
-        );
+        // The complete census retires the family pending (main's completion;
+        // the removed switch kept unproven pending). The stamp written on
+        // accumulation is pinned by
+        // `evidence_owed::tests::contract_stamp_is_written_on_accumulation_and_never_laundered`.
+        assert!(index.claude_usage_family_pending.get(SESSION).is_none());
         finalize_scan_after_policy(source, &mut initial, &mut index);
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -5177,7 +5178,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         // Keep the physical file and its revision unchanged across the re-arm.
         prior.claude_usage_family_pending.clear();
         prior.traversal = None;
-        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        // The terminal-retry re-arm owes it.
+        rearm_cause::clear(
+            &key,
+            prior.files.get_mut(&key).unwrap(),
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+        );
         assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
         assert!(prior.files[&key].observed_fingerprint().is_empty());
         prior.save(&disk.index_path).unwrap();
@@ -5218,9 +5224,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             &scan_money(source, &index, &restored),
         );
         let current = EvidenceContract::current(&index);
+        // The owed route's family pending (and its contract stamp) is the
+        // cold Full's.
         assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            current
+            index.claude_usage_family_pending.get(SESSION),
+            cold_index.claude_usage_family_pending.get(SESSION)
         );
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
