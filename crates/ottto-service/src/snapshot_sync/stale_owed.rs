@@ -1,4 +1,4 @@
-//! Exact refusal revisions and an explicit, receipt-bound operator trigger.
+//! Exact refusal revisions and counts-only owed observations.
 use super::*;
 use crate::upload_receipts::RejectedUsageReason;
 
@@ -11,11 +11,6 @@ pub(super) struct Exposure {
     first_held_unix: Option<u64>,
     requests: Option<u64>,
     tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(super) covered: bool,
-    /// Pending explicit acquisition scope, consumed only with its saved lease.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reopen_file: Option<String>,
 }
 impl Exposure {
     pub(super) fn new(now: u64) -> Self {
@@ -23,14 +18,6 @@ impl Exposure {
             first_held_unix: Some(now),
             requests: None,
             tokens: None,
-            covered: false,
-            reopen_file: None,
-        }
-    }
-    fn legacy() -> Self {
-        Self {
-            first_held_unix: None,
-            ..Self::new(0)
         }
     }
 }
@@ -41,17 +28,20 @@ pub(super) fn decode_exposure<'de, D: serde::Deserializer<'de>>(
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).ok())
 }
-crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens, covered, reopen_file);
+crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens);
 
 impl PermanentSnapshotRejection {
     pub(super) fn is_stale(&self) -> bool {
         self.reason == RejectedUsageReason::AcceptedLogStaleOlderUpload
     }
+    pub(super) fn has_stale_debt(&self) -> bool {
+        self.is_stale() || self.revisions.values().any(Self::is_stale)
+    }
     pub(super) fn refused_body(&self, body: &str) -> bool {
         self.body_witness == body || self.revisions.contains_key(body)
     }
     pub(super) fn owed(&self) -> bool {
-        self.is_stale() && !self.exposure.as_ref().is_some_and(|e| e.covered)
+        self.is_stale()
     }
 }
 impl SnapshotUploadProgress {
@@ -82,17 +72,6 @@ impl SnapshotUploadProgress {
         }
         revisions.remove(next);
         revisions
-    }
-    pub(super) fn stale_reopen_file(&self, fp: &str) -> Option<&String> {
-        self.permanent_rejections
-            .get(fp)?
-            .exposure
-            .as_ref()?
-            .reopen_file
-            .as_ref()
-    }
-    pub(super) fn stale_reopen_pending(&self, fp: &str) -> bool {
-        self.stale_reopen_file(fp).is_some()
     }
     pub(super) fn note_refused_exposure<T: Serialize>(&mut self, fp: &str, item: &T) {
         let Some(e) = self
@@ -129,161 +108,6 @@ impl SnapshotUploadProgress {
             }),
             _ => None,
         };
-    }
-
-    /// The explicit list binds the server comparison to the exact local revision.
-    /// No timestamp, activity order or transcript read can establish coverage.
-    pub(super) fn reopen_stale_once(
-        &mut self,
-        path: &Path,
-        source: SnapshotSource,
-        machine: &str,
-        index: &mut ScanIndex,
-    ) -> Result<bool> {
-        let marker = path.with_extension("stale-older-reopen-once");
-        match std::fs::symlink_metadata(&marker) {
-            Ok(m) if m.is_file() && !m.file_type().is_symlink() => (),
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e).context("read local one-shot input"),
-        }
-        let request: Request = serde_json::from_slice(&std::fs::read(marker)?)
-            .context("decode local one-shot input")?;
-        anyhow::ensure!(!request.nonce.is_empty(), "one-shot requires a nonce");
-        if self.stale_reopen_nonce.as_ref() == Some(&request.nonce) {
-            return Ok(false);
-        }
-        // Validate the entire list before changing either existing owner.
-        let mut seen = BTreeSet::new();
-        for e in &request.entities {
-            anyhow::ensure!(
-                e.entity_hash == entity_hash(source.api_slug(), machine, &e.source_session_id)
-                    && is_snapshot_fingerprint(&e.snapshot_fingerprint)
-                    && is_snapshot_fingerprint(&e.body_witness)
-                    && seen.insert(&e.snapshot_fingerprint),
-                "invalid or duplicate one-shot entity binding"
-            );
-            if e.verdict == Verdict::Owed {
-                let acquisition = e
-                    .acquisition_path
-                    .as_ref()
-                    .context("owed verdict requires an acquisition path")?;
-                anyhow::ensure!(
-                    acquisition.is_absolute()
-                        && acquisition
-                            .to_str()
-                            .is_some_and(|key| index.files.contains_key(key)),
-                    "one-shot acquisition path is not indexed"
-                );
-            }
-            let body_matches = self.refused_body(&e.snapshot_fingerprint, &e.body_witness)
-                || index
-                    .quarantined_snapshot_fingerprints
-                    .get(&e.snapshot_fingerprint)
-                    .is_some_and(|r| r.upload_body_witness.as_ref() == Some(&e.body_witness));
-            anyhow::ensure!(
-                body_matches
-                    && self
-                        .quarantined_fingerprints
-                        .get(&e.snapshot_fingerprint)
-                        .or_else(|| index
-                            .quarantined_snapshot_fingerprints
-                            .get(&e.snapshot_fingerprint))
-                        .map_or(true, |r| r.upload_body_witness.as_ref()
-                            == Some(&e.body_witness)),
-                "one-shot revision is no longer current"
-            );
-        }
-        for e in request.entities {
-            let active = self
-                .active_quarantine_witness
-                .clone()
-                .expect("active upload witness");
-            let record = self
-                .quarantined_fingerprints
-                .entry(e.snapshot_fingerprint.clone())
-                .or_insert_with(|| {
-                    index
-                        .quarantined_snapshot_fingerprints
-                        .get(&e.snapshot_fingerprint)
-                        .cloned()
-                        .unwrap_or(SnapshotQuarantineRecord {
-                            contract_retry_claims: None,
-                            reconstruction_contract:
-                                crate::snapshots::terminal_contract_retry::current_contract(),
-                            witness: active.clone(),
-                            retry_after_unix_seconds: 0,
-                            upload_body_witness: None,
-                            failed_reconstruction_count: 1,
-                            disposition: SnapshotQuarantineDisposition::RetryPending,
-                        })
-                });
-            // A supplied verdict cannot be borrowed by another local body.
-            record.upload_body_witness = Some(e.body_witness.clone());
-            record.disposition = match e.verdict {
-                Verdict::Covered => SnapshotQuarantineDisposition::SupersededTerminal,
-                Verdict::Owed => SnapshotQuarantineDisposition::RetryPending,
-            };
-            record.contract_retry_claims = None;
-            record.failed_reconstruction_count = 1;
-            record.retry_after_unix_seconds = if e.verdict == Verdict::Owed {
-                quarantine_retry_after(&e.snapshot_fingerprint)
-            } else {
-                0
-            };
-            record.witness = self
-                .active_quarantine_witness
-                .clone()
-                .expect("active upload witness");
-            let refusal = self
-                .permanent_rejections
-                .entry(e.snapshot_fingerprint.clone())
-                .or_insert_with(|| PermanentSnapshotRejection {
-                    body_witness: e.body_witness.clone(),
-                    reason: RejectedUsageReason::AcceptedLogStaleOlderUpload,
-                    reoffer: None,
-                    exposure: None,
-                    revisions: BTreeMap::new(),
-                });
-            let refusal = if refusal.body_witness == e.body_witness {
-                refusal
-            } else {
-                refusal
-                    .revisions
-                    .get_mut(&e.body_witness)
-                    .expect("validated retained revision")
-            };
-            let exposure = refusal.exposure.get_or_insert_with(Exposure::legacy);
-            exposure.covered = e.verdict == Verdict::Covered;
-            exposure.reopen_file = if e.verdict == Verdict::Owed {
-                e.acquisition_path.map(|p| p.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            index
-                .quarantined_snapshot_fingerprints
-                .insert(e.snapshot_fingerprint, record.clone());
-        }
-        // This records the trigger, not a lifetime retry limit. Pending work is
-        // consumed only after the existing lease acquires an owning file.
-        self.stale_reopen_nonce = Some(request.nonce);
-        Ok(true)
-    }
-
-    pub(super) fn record_stale_acquisitions(&mut self, index: &ScanIndex) -> bool {
-        let mut changed = false;
-        for fp in &self.active_quarantine_retries {
-            if index.quarantine_retry_has_owner(fp) {
-                if let Some(e) = self
-                    .permanent_rejections
-                    .get_mut(fp)
-                    .and_then(|r| r.exposure.as_mut())
-                {
-                    changed |= e.reopen_file.take().is_some();
-                }
-            }
-        }
-        changed
     }
 
     pub(super) fn refusal_exposure(
@@ -325,35 +149,6 @@ impl SnapshotUploadProgress {
         }
         counts
     }
-}
-
-#[derive(Deserialize)]
-struct Request {
-    nonce: String,
-    entities: Vec<Entity>,
-}
-#[derive(Deserialize)]
-struct Entity {
-    entity_hash: String,
-    source_session_id: String,
-    snapshot_fingerprint: String,
-    body_witness: String,
-    verdict: Verdict,
-    #[serde(default)]
-    acquisition_path: Option<PathBuf>,
-}
-#[derive(Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Verdict {
-    Covered,
-    Owed,
-}
-fn entity_hash(source: &str, machine: &str, session: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{source}\x1f{machine}\x1f{session}"))
-    )[..8]
-        .into()
 }
 
 #[cfg(test)]

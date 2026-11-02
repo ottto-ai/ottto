@@ -64,7 +64,6 @@ fn offer(
     .unwrap();
     calls
 }
-
 /// [regress] The observed timestamp refusal remains owed through exhaustion;
 /// exact revisions stay suppressed, while a changed body receives one offer.
 #[test]
@@ -119,7 +118,6 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
         SnapshotQuarantineDisposition::RetryPending
     );
 }
-
 /// [format] Old exact JSON is unchanged; an invalid optional observation is
 /// isolated from the refusal, just like the existing re-offer extension.
 #[test]
@@ -136,152 +134,119 @@ fn old_state_decode_keeps_canonical_bytes_and_legacy_unknowns() {
     invalid["exposure"] = serde_json::json!({"requests": "invalid"});
     let decoded: PermanentSnapshotRejection = serde_json::from_value(invalid).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), old);
-    assert_eq!(
-        entity_hash("claude_code", "machine-example", "session-example"),
-        "2fe67006"
-    );
 }
 
-/// [regress] Receipt-covered entities supersede without acquisition. Only the
-/// explicitly owed entities get one paced Full; native results use the shared
-/// money oracle. No input, unlisted input, restart and a later trigger conserve debt.
+/// [regress] Unchanged stale debt never acquires a retry lease or reads the
+/// transcript across passes, even after a contract change or legacy terminal
+/// disposition. Real appended input remains ordinary acquisition authority.
 #[test]
 #[serial_test::serial(client_report)]
-fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
+fn unchanged_stale_debt_never_reads_on_automatic_retry_passes() {
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
-    let scratch = crate::test_scratch::ScratchDir::new("stale-head-compare");
-    let path = scratch.join("progress.json");
+    use std::io::Write;
+    let scratch = crate::test_scratch::ScratchDir::new("stale-unchanged-input");
     let root = scratch.join("sources");
     std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("session-example.jsonl");
+    let line = |n| {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp":"2026-10-25T07:00:00Z", "type":"assistant", "sessionId":"session-example",
+                "requestId":format!("req-{n}"), "message":{"id":format!("msg-{n}"), "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}
+            })
+        )
+    };
+    std::fs::write(&path, line(1)).unwrap();
     let source = SnapshotSource::ClaudeCode;
     let collected = "2026-10-25T07:01:00Z";
-    for n in 0..67 {
-        let session = format!("session-{n:02}");
-        let filename = if n == 64 {
-            "copied-physical-file.jsonl".into()
-        } else {
-            format!("{session}.jsonl")
-        };
-        std::fs::write(root.join(filename), format!("{}\n", serde_json::json!({
-            "timestamp":"2026-10-25T07:00:00Z", "type":"assistant", "sessionId":session,
-            "requestId":format!("req-{n}"), "message":{"id":format!("msg-{n}"), "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}
-        }))).unwrap();
-    }
-    let mut index = ScanIndex::default();
-    let mut first = crate::snapshots::scan_source_roots(
-        source,
-        std::slice::from_ref(&root),
-        &mut index,
-        collected,
-        crate::snapshots::BACKFILL_WINDOW_DAYS,
-    )
-    .unwrap();
-    crate::snapshots::finalize_scan_after_policy(source, &mut first, &mut index);
-    assert_eq!(first.snapshots.len(), 67);
-    let mut progress = ledger(source);
-    let mut entries = Vec::new();
-    let mut owed_items = Vec::new();
-    for item in &first.snapshots {
-        let n: usize = item
-            .source_session_id
-            .strip_prefix("session-")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let fp = &item.snapshot_fingerprint;
-        let body = snapshot_upload_body_witness(item);
-        progress.quarantine_permanent_body(fp, &body, STALE);
-        progress.permanent_rejections.get_mut(fp).unwrap().exposure = None;
-        let legacy = progress.quarantined_fingerprints.get_mut(fp).unwrap();
-        legacy.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-        legacy.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-        legacy.retry_after_unix_seconds = 0;
-        if n == 66 {
-            continue;
-        }
-        if n >= 63 {
-            owed_items.push(item.clone());
-        }
-        entries.push(serde_json::json!({"entity_hash":entity_hash(source.api_slug(), "synthetic", &item.source_session_id),
-            "source_session_id":item.source_session_id, "snapshot_fingerprint":fp, "body_witness":body,
-            "verdict":if n < 63 {"covered"} else {"owed"},
-            "acquisition_path":if n >= 63 { Some(root.join(if n == 64 { "copied-physical-file.jsonl".into() } else { format!("session-{n:02}.jsonl") })) } else { None }
-        }));
-    }
-    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-    // Observed legacy custody: the refusal survives after current incidence
-    // moves on. Explicit scope must still grant one acquisition of this file.
-    index.file_snapshot_fingerprints.insert(
-        root.join("session-63.jsonl").to_string_lossy().into_owned(),
-        BTreeSet::from([fp(9999)]),
-    );
-    index
-        .snapshot_activity_at
-        .insert(fp(9999), Some(collected.into()));
-    let before = serde_json::to_value(&progress).unwrap();
-    assert!(!progress
-        .reopen_stale_once(&path, source, "synthetic", &mut index)
-        .unwrap());
-    assert_eq!(serde_json::to_value(&progress).unwrap(), before);
-    assert_eq!(
-        progress
-            .refusal_exposure(current_unix_seconds())
-            .owed_entities,
-        67
-    );
-    let marker = path.with_extension("stale-older-reopen-once");
-    let mut request = serde_json::json!({"nonce":"first", "entities":entries});
-    std::fs::write(&marker, serde_json::to_vec(&request).unwrap()).unwrap();
-    assert!(progress
-        .reopen_stale_once(&path, source, "synthetic", &mut index)
-        .unwrap());
-    assert_eq!(index.snapshot_superseded_terminal_count(), 63);
-    assert_eq!(
-        progress
-            .refusal_exposure(current_unix_seconds())
-            .owed_entities,
-        4
-    );
-    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-    assert!(
-        progress.active_quarantine_retries.is_empty(),
-        "ordinary pacing"
-    );
-    for r in progress.quarantined_fingerprints.values_mut() {
-        r.retry_after_unix_seconds = 0;
-    }
-    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-    assert_eq!(progress.active_quarantine_retries.len(), 3);
-    let hints =
-        save_terminal_contract_claims_for_scan(&mut index, &progress, &scratch.join("index.json"))
-            .unwrap();
-    assert_eq!(hints.len(), 3);
-    assert!(progress.record_stale_acquisitions(&index));
-    progress.save(&path).unwrap();
-    let (mut fresh, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+    let scan = |index: &mut ScanIndex| {
         crate::snapshots::scan_source_roots_with_test_limit_and_hints(
             source,
             std::slice::from_ref(&root),
-            &mut index,
+            index,
             collected,
             crate::snapshots::BACKFILL_WINDOW_DAYS,
-            67,
+            8,
             true,
-            &hints,
+            std::slice::from_ref(&path),
         )
         .unwrap()
-    });
-    crate::snapshots::finalize_scan_after_policy(source, &mut fresh, &mut index);
-    assert_eq!(reads.len(), 3);
-    assert_eq!(reads.values().sum::<usize>(), 3);
-    assert_eq!(fresh.snapshots.len(), 3);
+    };
+    let mut index = ScanIndex::default();
+    let mut first = scan(&mut index);
+    crate::snapshots::finalize_scan_after_policy(source, &mut first, &mut index);
+    assert_eq!(first.snapshots.len(), 1);
+    let item = &first.snapshots[0];
+    let fp = item.snapshot_fingerprint.clone();
+    let body = snapshot_upload_body_witness(item);
+    let mut progress = ledger(source);
+    assert_eq!(offer(item, source, STALE, &mut progress), 1);
+    for pass in 0..3 {
+        let record = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
+        record.retry_after_unix_seconds = 0;
+        record.witness.contract.push_str("-older");
+        if pass == 2 {
+            record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+            record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        }
+        let disposition = record.disposition;
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        index.snapshot_activity_at.remove(&fp);
+        progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        assert!(progress.active_quarantine_retries.is_empty());
+        assert!(progress.active_reason_reoffers.is_empty());
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp].disposition,
+            disposition
+        );
+        assert!(save_terminal_contract_claims_for_scan(
+            &mut index,
+            &progress,
+            &scratch.join("index.json")
+        )
+        .unwrap()
+        .is_empty());
+        index.activate_reason_reoffer_cooldowns(
+            progress.reason_reoffer_cooldowns(current_unix_seconds()),
+        );
+        let (mut quiet, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| scan(&mut index));
+        crate::snapshots::finalize_scan_after_policy(source, &mut quiet, &mut index);
+        assert!(reads.is_empty(), "pass {pass} read an unchanged transcript");
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!(
+            progress
+                .refusal_exposure(current_unix_seconds())
+                .owed_entities,
+            1
+        );
+        assert!(progress.contains_body(&fp, &body));
+        assert_eq!(offer(item, source, STALE, &mut progress), 0);
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(line(2).as_bytes())
+        .unwrap();
+    index.activate_reason_reoffer_cooldowns(
+        progress.reason_reoffer_cooldowns(current_unix_seconds()),
+    );
+    let (mut changed, reads) =
+        crate::snapshots::terminal_contract_retry::source_acquisitions(|| scan(&mut index));
+    crate::snapshots::finalize_scan_after_policy(source, &mut changed, &mut index);
+    assert_eq!(reads.values().sum::<usize>(), 1);
+    assert_eq!(changed.snapshots.len(), 1);
+    assert_eq!(changed.snapshots[0].request_count, 2);
+    let mut cold_index = ScanIndex::default();
+    let mut cold = scan(&mut cold_index);
+    crate::snapshots::finalize_scan_after_policy(source, &mut cold, &mut cold_index);
     let route = |mode, items: &[SnapshotItem]| {
-        let mut ordered = items.to_vec();
-        ordered.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
         let request = snapshot_batch_request(
             source,
             "synthetic",
-            ordered,
+            items.to_vec(),
             SnapshotUploadPolicy::default(),
             crate::client_report::ClientReport::empty(),
         );
@@ -293,32 +258,15 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
         )
     };
     money_oracle::assert_equivalent(
-        &route(Mode::ColdFull, &owed_items),
-        &route(Mode::Restart, &fresh.snapshots),
+        &route(Mode::ColdFull, &cold.snapshots),
+        &route(Mode::Restart, &changed.snapshots),
     );
-    for item in &fresh.snapshots {
-        assert_eq!(offer(item, source, STALE, &mut progress), 0);
-    }
-    let mut restored =
-        SnapshotUploadProgress::load(&path, &"a".repeat(64), snapshot_quarantine_witness(source))
-            .unwrap();
-    assert!(!restored
-        .reopen_stale_once(&path, source, "synthetic", &mut index)
-        .unwrap());
-    restored.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-    assert!(
-        restored.active_quarantine_retries.is_empty(),
-        "recorded attempt cannot renew itself"
-    );
-    request["nonce"] = "later-explicit-action".into();
-    std::fs::write(&marker, serde_json::to_vec(&request).unwrap()).unwrap();
-    assert!(restored
-        .reopen_stale_once(&path, source, "synthetic", &mut index)
-        .unwrap());
     assert_eq!(
-        restored
-            .refusal_exposure(current_unix_seconds())
-            .owed_entities,
-        4
+        offer(&changed.snapshots[0], source, STALE, &mut progress),
+        1
+    );
+    assert_eq!(
+        offer(&changed.snapshots[0], source, STALE, &mut progress),
+        0
     );
 }

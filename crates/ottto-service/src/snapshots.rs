@@ -3711,15 +3711,24 @@ pub(crate) struct UploadAckRetirementHandoff {
     pub pending_bodies: BTreeMap<String, String>,
 }
 
+/// Runtime refusal custody; stale debt permits acquisition only after input changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasonReofferCooldown {
+    pub(crate) body_witness: String,
+    pub(crate) input_change_only: bool,
+}
+impl From<String> for ReasonReofferCooldown {
+    fn from(body_witness: String) -> Self {
+        Self {
+            body_witness,
+            input_change_only: false,
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ReasonReofferCooldown; body_witness, input_change_only);
+
 /// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
 /// each new field's save rule there (serde `skip_serializing*` keys here are inert).
-#[derive(Debug, Clone)]
-struct QuarantineRetryLease {
-    file: String,
-    fresh_full: bool,
-}
-crate::heap_layout_bound::fields!(QuarantineRetryLease; file, fresh_full);
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
     /// V2-only custody and growth debt; absent on ordinary v1 paths.
@@ -4148,7 +4157,7 @@ pub struct ScanIndex {
     /// Runtime file owners for this cycle's quarantine retries. Contract-origin
     /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
-    terminal_contract_retries: BTreeMap<String, QuarantineRetryLease>,
+    terminal_contract_retries: BTreeMap<String, String>,
     #[serde(skip)]
     pub(crate) refusal_exposure: crate::local_resource_diagnostics::RefusalExposure,
     /// Runtime-only: this index's path was loaded in this process with no
@@ -4163,13 +4172,12 @@ pub struct ScanIndex {
     /// that value's exact round-trip/default semantics.
     #[serde(skip)]
     claude_rebuild_read_load_eligible: bool,
-    /// Runtime-only exact-body cooldowns (fingerprint -> refused body
-    /// witness) from the upload ledger: a retained conflict whose refused
-    /// body waits for its reserved daily re-offer. Its ordinary retry timer
-    /// alone never re-reads an unchanged file. Never persisted; never
-    /// acceptance evidence. Bounded by the refusal ledger.
+    /// Runtime-only refusal cooldowns from the upload ledger: ordinary exact
+    /// bodies await their reserved re-offer; stale debt permits new input only.
+    /// Neither a timer nor a revision grants stale debt a read. Never persisted
+    /// or acceptance evidence; uses the existing refusal incidence.
     #[serde(skip)]
-    reason_reoffer_cooldowns: BTreeMap<String, String>,
+    reason_reoffer_cooldowns: BTreeMap<String, ReasonReofferCooldown>,
     /// Claude only: the last moment this destination is known to have
     /// received history, recorded when a Mac with prior history loads a fresh
     /// index, a replay drops its entries, or a pre-gate index is first loaded
@@ -27407,7 +27415,7 @@ impl OwnedSourceScan {
             let due_retries = index
                 .terminal_contract_retries
                 .values()
-                .map(|lease| Path::new(&lease.file))
+                .map(Path::new)
                 .collect::<BTreeSet<_>>();
             traversal.pending_candidates.retain(|candidate| {
                 let due = pending_paths.len() < selection_limit
@@ -34013,6 +34021,11 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            let stale_input_held = index.stale_refusal_holds_unchanged_input(&candidate);
+            if stale_input_held {
+                decision = CandidateDecision::Skip;
+                parse_reason = None;
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -34029,7 +34042,10 @@ impl OwnedSourceScan {
             // exit.
             let mut side_plan = None;
             let mut codex_selected_by = None;
-            if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
+            if source == SnapshotSource::Codex
+                && decision == CandidateDecision::Skip
+                && !stale_input_held
+            {
                 let shared = codex_parent_ownership_ledgers.as_ref();
                 let owed = codex_parent_reparse_owed_ids(index, shared, &candidate.path);
                 if owed.is_empty()
@@ -34161,7 +34177,7 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
-            let decision = if codex_archive_path(&candidate.path) {
+            let decision = if codex_archive_path(&candidate.path) && !stale_input_held {
                 CandidateDecision::Parse
             } else {
                 decision
@@ -34962,7 +34978,6 @@ impl OwnedSourceScan {
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
                             && !forced_family
-                            && !index.reason_reoffer_leased(&key, true)
                             && !comparison_target
                             && !parent_proof_required;
                         context
@@ -46490,7 +46505,7 @@ fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<Pat
     hinted_paths
         .iter()
         .filter(|path| {
-            index.reason_reoffer_leased(&local_index_key(path), false)
+            index.reason_reoffer_leased(&local_index_key(path))
                 || !fs::symlink_metadata(path)
                     .is_ok_and(|metadata| metadata.is_file() && index.hint_settled(path, &metadata))
         })
@@ -52337,62 +52352,28 @@ impl ScanIndex {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
     }
 
-    #[cfg(test)]
     pub(crate) fn activate_terminal_contract_retries(
         &mut self,
         leases: BTreeSet<String>,
-    ) -> Vec<PathBuf> {
-        self.activate_terminal_contract_retries_with_mode(leases, &BTreeMap::new())
-    }
-
-    pub(crate) fn activate_terminal_contract_retries_with_mode(
-        &mut self,
-        leases: BTreeSet<String>,
-        fresh_full: &BTreeMap<String, String>,
     ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
         // selects one owning file, never every duplicate incidence.
         for (key, fingerprints) in &self.file_snapshot_fingerprints {
             for fingerprint in fingerprints.intersection(&leases) {
-                if fresh_full.contains_key(fingerprint) {
-                    continue;
-                }
                 self.terminal_contract_retries
                     .entry(fingerprint.clone())
-                    .or_insert_with(|| QuarantineRetryLease {
-                        file: key.clone(),
-                        fresh_full: false,
-                    });
-            }
-        }
-        // An explicit operator scope can name an old refusal whose fingerprint
-        // has left current incidence. Its file comes from the trusted input,
-        // never from filename identity or activity order.
-        for (fp, file) in fresh_full {
-            if leases.contains(fp) && self.files.contains_key(file) {
-                self.terminal_contract_retries.insert(
-                    fp.clone(),
-                    QuarantineRetryLease {
-                        file: file.clone(),
-                        fresh_full: true,
-                    },
-                );
+                    .or_insert_with(|| key.clone());
             }
         }
         // Use the same revalidated candidate admission as exact refusal re-offers.
         // Distinct entities in one file and duplicate incidences own one hint.
         self.terminal_contract_retries
             .values()
-            .map(|lease| &lease.file)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .map(PathBuf::from)
             .collect()
-    }
-
-    pub(crate) fn quarantine_retry_has_owner(&self, fingerprint: &str) -> bool {
-        self.terminal_contract_retries.contains_key(fingerprint)
     }
 
     /// A leased file still queued for a bounded page has not reached a hold.
@@ -52404,7 +52385,7 @@ impl ScanIndex {
                     .iter()
                     .flat_map(|traversal| traversal.pending_candidates.iter())
                     .chain(self.claude_stale_family_carry.replay.iter())
-                    .any(|pending| pending.path == Path::new(&key.file))
+                    .any(|pending| pending.path == Path::new(key))
             })
     }
 
@@ -52423,23 +52404,14 @@ impl ScanIndex {
         }
         self.file_snapshot_fingerprints
             .keys()
-            .filter(|key| self.reason_reoffer_leased(key, false))
+            .filter(|key| self.reason_reoffer_leased(key))
             .map(PathBuf::from)
             .collect()
     }
 
     /// This cycle leased the file's snapshot for a reason re-offer.
-    fn reason_reoffer_leased(&self, key: &str, full_only: bool) -> bool {
-        if self
-            .terminal_contract_retries
-            .values()
-            .any(|lease| lease.fresh_full && lease.file == key)
-        {
-            return true;
-        }
-
-        !full_only
-            && !self.reason_reoffer_retries.is_empty()
+    fn reason_reoffer_leased(&self, key: &str) -> bool {
+        !self.reason_reoffer_retries.is_empty()
             && self
                 .file_snapshot_fingerprints
                 .get(key)
@@ -52523,11 +52495,14 @@ impl ScanIndex {
     /// Arm this cycle's exact-body cooldown view (fingerprint -> refused
     /// body witness), read from the prepared upload ledger after its leases
     /// and any clock re-clamp. Replaces the previous view and its counts.
-    pub(crate) fn activate_reason_reoffer_cooldowns(
+    pub(crate) fn activate_reason_reoffer_cooldowns<T: Into<ReasonReofferCooldown>>(
         &mut self,
-        cooldowns: BTreeMap<String, String>,
+        cooldowns: BTreeMap<String, T>,
     ) {
-        self.reason_reoffer_cooldowns = cooldowns;
+        self.reason_reoffer_cooldowns = cooldowns
+            .into_iter()
+            .map(|(fp, cooldown)| (fp, cooldown.into()))
+            .collect();
     }
 
     /// True when this entity's ordinary retry is only the retained conflict
@@ -52535,6 +52510,13 @@ impl ScanIndex {
     /// re-reading the unchanged file cannot send it. A lease, an acceptance,
     /// another body or a changed quarantine witness keeps the retry.
     fn reason_reoffer_cooldown_defers(&self, fingerprint: &str) -> bool {
+        if self
+            .reason_reoffer_cooldowns
+            .get(fingerprint)
+            .is_some_and(|c| c.input_change_only)
+        {
+            return true;
+        }
         !self.reason_reoffer_retries.contains_key(fingerprint)
             && !self.accepted_snapshot_fingerprint_recorded(fingerprint)
             && self
@@ -52543,7 +52525,8 @@ impl ScanIndex {
                 .zip(self.quarantined_snapshot_fingerprints.get(fingerprint))
                 .is_some_and(|(body_witness, record)| {
                     record.disposition == SnapshotQuarantineDisposition::RetryPending
-                        && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
+                        && record.upload_body_witness.as_deref()
+                            == Some(body_witness.body_witness.as_str())
                         && self
                             .active_quarantine_witness
                             .as_ref()
@@ -52558,7 +52541,7 @@ impl ScanIndex {
             && self
                 .terminal_contract_retries
                 .get(fingerprint)
-                .map_or(true, |owner| owner.file == key)
+                .map_or(true, |owner| owner == key)
             && !self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
@@ -52583,7 +52566,14 @@ impl ScanIndex {
         if !unchanged {
             if let Some(fingerprints) = self.file_snapshot_fingerprints.get(&key) {
                 for fingerprint in fingerprints {
-                    self.reason_reoffer_cooldowns.remove(fingerprint);
+                    if !skipped
+                        || !self
+                            .reason_reoffer_cooldowns
+                            .get(fingerprint)
+                            .is_some_and(|c| c.input_change_only)
+                    {
+                        self.reason_reoffer_cooldowns.remove(fingerprint);
+                    }
                 }
             }
         }
@@ -52599,7 +52589,7 @@ impl ScanIndex {
     ) -> bool {
         self.reason_reoffer_cooldowns
             .get(fingerprint)
-            .is_some_and(|witness| witness == body)
+            .is_some_and(|cooldown| cooldown.body_witness == body)
             && self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
@@ -55398,6 +55388,34 @@ impl ScanIndex {
             })
     }
 
+    /// Use the existing physical listing stamp, independent of parser, upload
+    /// context or retry revisions. A refusal grants no transcript read.
+    fn stale_refusal_holds_unchanged_input(&self, candidate: &CandidateFile) -> bool {
+        let key = local_index_key(&candidate.path);
+        self.file_snapshot_fingerprints
+            .get(&key)
+            .is_some_and(|fps| {
+                fps.iter().any(|fp| {
+                    self.reason_reoffer_cooldowns
+                        .get(fp)
+                        .is_some_and(|c| c.input_change_only)
+                })
+            })
+            && self.files.get(&key).is_some_and(|entry| {
+                let modified = Some(candidate.modified_unix_nanos);
+                let stored = entry.modified_unix_nanos.or_else(|| {
+                    modified.filter(|nanos| nanos / 1_000_000_000 == entry.modified_unix_seconds)
+                });
+                entry.same_stamp_with_mtime(
+                    stored,
+                    candidate.size_bytes,
+                    modified,
+                    Some(candidate.fingerprint_birth_nanos),
+                    codex_fragment::Stamp::candidate(candidate),
+                )
+            })
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         self.candidate_decision_with_reason(candidate).0
     }
@@ -55525,6 +55543,9 @@ impl ScanIndex {
         if self.decode_holds_file(&key) {
             return (CandidateDecision::Skip, None);
         }
+        if self.stale_refusal_holds_unchanged_input(candidate) {
+            return (CandidateDecision::Skip, None);
+        }
         if self
             .terminal_jsonl_dispositions
             .get(&key)
@@ -55627,23 +55648,22 @@ impl ScanIndex {
                 Some(CandidateParseReason::UploadContext),
             );
         }
-        if self.reason_reoffer_leased(&key, false)
-            || self
-                .file_snapshot_fingerprints
-                .get(&key)
-                .is_some_and(|fingerprints| {
-                    fingerprints.iter().any(|fingerprint| {
-                        // Missing activity on the restored tuple cannot settle an
-                        // account hold either. An actual quarantine retry remains
-                        // independent authority to re-read, even with CONTENT.
-                        (!withheld_unchanged
-                            && !self
-                                .snapshot_activity_at
-                                .get(fingerprint)
-                                .is_some_and(valid_snapshot_activity))
-                            || self.quarantine_retry_selects_file(fingerprint, &key)
-                    })
+        if self
+            .file_snapshot_fingerprints
+            .get(&key)
+            .is_some_and(|fingerprints| {
+                fingerprints.iter().any(|fingerprint| {
+                    // Missing activity on the restored tuple cannot settle an
+                    // account hold either. An actual quarantine retry remains
+                    // independent authority to re-read, even with CONTENT.
+                    (!withheld_unchanged
+                        && !self
+                            .snapshot_activity_at
+                            .get(fingerprint)
+                            .is_some_and(valid_snapshot_activity))
+                        || self.quarantine_retry_selects_file(fingerprint, &key)
                 })
+            })
         {
             return (
                 CandidateDecision::Parse,

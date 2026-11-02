@@ -1603,9 +1603,6 @@ struct SnapshotUploadProgress {
     /// parser/replay epochs and premature retry timers cannot erase this fact.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     permanent_rejections: BTreeMap<String, PermanentSnapshotRejection>,
-    /// Last explicit operator request; a new nonce is a new trigger.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stale_reopen_nonce: Option<String>,
     #[serde(skip)]
     active_quarantine_witness: Option<SnapshotQuarantineWitness>,
     /// Runtime leases for quarantine entries selected this cycle. The durable
@@ -1669,7 +1666,6 @@ impl SnapshotUploadProgress {
             head_conflict_challenges: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
             permanent_rejections: BTreeMap::new(),
-            stale_reopen_nonce: None,
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
             active_reason_reoffers: BTreeMap::new(),
@@ -1861,16 +1857,8 @@ impl SnapshotUploadProgress {
         // the index can retire its older quarantine. On crash/restart that ACK
         // is the stronger fact and must not be overwritten by restoring the
         // stale index-owned obligation.
-        let pending_stale_reopens = self
-            .permanent_rejections
-            .keys()
-            .filter(|fp| self.stale_reopen_pending(fp))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        self.quarantined_fingerprints.retain(|fingerprint, _| {
-            !self.accepted_fingerprints.contains(fingerprint)
-                || pending_stale_reopens.contains(fingerprint)
-        });
+        self.quarantined_fingerprints
+            .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
         let newer_retryable_refusals = self
             .quarantined_fingerprints
             .iter()
@@ -1887,9 +1875,7 @@ impl SnapshotUploadProgress {
             .map(|(fingerprint, _)| fingerprint.clone())
             .collect::<BTreeSet<_>>();
         for (fingerprint, record) in index_quarantine {
-            if !self.accepted_fingerprints.contains(fingerprint)
-                || pending_stale_reopens.contains(fingerprint)
-            {
+            if !self.accepted_fingerprints.contains(fingerprint) {
                 // The durable index claims a bounded admission re-offer before
                 // this disposable ledger leases it. A stale terminal upload
                 // record must not suppress that newer admission obligation.
@@ -1982,11 +1968,14 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .iter()
             .filter(|(fingerprint, record)| {
-                (!record
-                    .upload_body_witness
-                    .as_deref()
-                    .is_some_and(|body| self.refused_body(fingerprint, body))
-                    || self.stale_reopen_pending(fingerprint))
+                !self
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(PermanentSnapshotRejection::has_stale_debt)
+                    && !record
+                        .upload_body_witness
+                        .as_deref()
+                        .is_some_and(|body| self.refused_body(fingerprint, body))
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && ((record.contract_retry_claims.is_none()
                         && !record.witness.same_retry_contract(active)
@@ -2098,7 +2087,7 @@ impl SnapshotUploadProgress {
         for (fingerprint, refusal) in &mut self.permanent_rejections {
             // Known reasons are never re-offered; only the old `other`
             // vocabulary can carry this reason or a legacy record of it.
-            if refusal.is_stale()
+            if refusal.has_stale_debt()
                 || refusal.reason != crate::upload_receipts::RejectedUsageReason::Other
             {
                 continue;
@@ -2159,55 +2148,64 @@ impl SnapshotUploadProgress {
         changed
     }
 
-    /// Runtime-only exact-body cooldown view (fingerprint -> refused body
-    /// witness) of this prepared cycle: a retained exact-body RetryPending
-    /// conflict whose refusal holds a validated daily re-offer reservation
-    /// and no lease this cycle. Without that lease the exact body cannot be
-    /// sent, so its ordinary retry timer alone must not re-read an unchanged
-    /// file. Due records waiting for budget stay in the view. Missing,
-    /// malformed or classified extensions grant nothing. Bounded by the
-    /// refusal ledger; the reservation remains the sole durable schedule.
-    fn reason_reoffer_cooldowns(&self, now: u64) -> BTreeMap<String, String> {
+    /// Extend the existing cooldown view with stale debt. Its input-only hold
+    /// survives old terminal dispositions, witness revisions and later ACKs;
+    /// those facts do not prove that the retained refusal is covered.
+    fn reason_reoffer_cooldowns(
+        &self,
+        now: u64,
+    ) -> BTreeMap<String, crate::snapshots::ReasonReofferCooldown> {
         use reason_reoffer::RefusalReoffer;
         let latest = reason_reoffer::latest_valid_deadline(now);
         self.permanent_rejections
             .iter()
-            .flat_map(|(fp, r)| {
-                std::iter::once((fp, r)).chain(r.revisions.values().map(move |r| (fp, r)))
-            })
-            .filter(|(fingerprint, refusal)| {
-                (refusal.is_stale()
-                    || (refusal.reason == crate::upload_receipts::RejectedUsageReason::Other
+            .filter_map(|(fingerprint, owner)| {
+                let stale = std::iter::once(owner)
+                    .chain(owner.revisions.values())
+                    .find(|r| r.is_stale());
+                if let Some(refusal) = stale {
+                    return Some((
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown {
+                            body_witness: refusal.body_witness.clone(),
+                            input_change_only: true,
+                        },
+                    ));
+                }
+                let eligible =
+                    owner.reason == crate::upload_receipts::RejectedUsageReason::Other
                         && matches!(
-                            refusal.reoffer,
+                            owner.reoffer,
                             Some(
                                 RefusalReoffer::OriginalPair { .. }
                                     | RefusalReoffer::LegacyOther { .. }
                             )
                         )
-                        && refusal
+                        && owner
                             .reoffer
                             .and_then(RefusalReoffer::retry_after)
-                            .is_some_and(|retry_after| retry_after <= latest)))
-                    && !self.active_reason_reoffers.contains_key(*fingerprint)
-                    && !self.active_quarantine_retries.contains(*fingerprint)
-                    && !self.accepted_fingerprints.contains(*fingerprint)
-                    && self
-                        .quarantined_fingerprints
-                        .get(*fingerprint)
-                        .is_some_and(|record| {
-                            record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                && self
-                                    .active_quarantine_witness
-                                    .as_ref()
-                                    .is_some_and(|active| {
-                                        record.witness.same_retry_contract(active)
-                                    })
-                                && record.upload_body_witness.as_deref()
-                                    == Some(refusal.body_witness.as_str())
-                        })
+                            .is_some_and(|deadline| deadline <= latest)
+                        && !self.active_reason_reoffers.contains_key(fingerprint)
+                        && !self.active_quarantine_retries.contains(fingerprint)
+                        && !self.accepted_fingerprints.contains(fingerprint)
+                        && self
+                            .quarantined_fingerprints
+                            .get(fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && self.active_quarantine_witness.as_ref().is_some_and(
+                                        |active| record.witness.same_retry_contract(active),
+                                    )
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(owner.body_witness.as_str())
+                            });
+                eligible.then(|| {
+                    (
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown::from(owner.body_witness.clone()),
+                    )
+                })
             })
-            .map(|(fingerprint, refusal)| (fingerprint.clone(), refusal.body_witness.clone()))
             .collect()
     }
 
@@ -2426,11 +2424,12 @@ impl SnapshotUploadProgress {
             .is_some_and(|record| record.refused_body(body_witness))
         {
             // Only this exact body's own re-offer lease passes suppression.
-            return self
-                .active_reason_reoffers
-                .get(fingerprint)
-                .map(String::as_str)
-                != Some(body_witness);
+            return self.stale_body(fingerprint, body_witness)
+                || self
+                    .active_reason_reoffers
+                    .get(fingerprint)
+                    .map(String::as_str)
+                    != Some(body_witness);
         }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
@@ -3227,7 +3226,6 @@ impl SnapshotUploadProgress {
         if self.ack_recovery.is_none()
             && self.accepted_fingerprints.is_empty()
             && self.permanent_rejections.is_empty()
-            && self.stale_reopen_nonce.is_none()
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
@@ -4429,7 +4427,7 @@ impl PermanentRefusalCounts {
         fingerprint: &str,
         refusal: &PermanentSnapshotRejection,
     ) -> bool {
-        (refusal.reason.is_dominated() || refusal.exposure.as_ref().is_some_and(|e| e.covered))
+        refusal.reason.is_dominated()
             && !refusal
                 .revisions
                 .values()
@@ -6924,11 +6922,6 @@ fn prepare_sync_source_inner(
             }
         }
     }
-    if upload_progress.reopen_stale_once(&upload_progress_path, source, machine_id, &mut index)? {
-        // The refusal/proof owner is durable before its index-facing mirror.
-        upload_progress.save(&upload_progress_path)?;
-        index.save(&index_path)?;
-    }
     // Due exact refusal re-offers are reserved from the loaded, committed
     // index and saved below before any lease reaches the scan or uploader.
     let reoffer_now = reason_reoffer::now_unix_seconds();
@@ -6952,11 +6945,6 @@ fn prepare_sync_source_inner(
     }
     let quarantine_retry_paths =
         save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
-    // A mapped acquisition lease is recorded before its file is touched. A
-    // missing incidence keeps the pending trigger for a later ordinary page.
-    if upload_progress.record_stale_acquisitions(&index) {
-        upload_progress.save(&upload_progress_path)?;
-    }
     index.refusal_exposure = upload_progress.refusal_exposure(current_unix_seconds());
     index.refusal_exposure.held_terminal_entities = index.snapshot_unproven_terminal_count();
     if !quarantine_retry_paths.is_empty() {
@@ -7026,12 +7014,11 @@ fn prepare_sync_source_inner(
     let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
-    // A replay re-reads everything and neither re-offers nor defers.
-    index.activate_reason_reoffer_cooldowns(if backfill_pending {
-        BTreeMap::new()
-    } else {
-        upload_progress.reason_reoffer_cooldowns(reoffer_now)
-    });
+    let mut cooldowns = upload_progress.reason_reoffer_cooldowns(reoffer_now);
+    if backfill_pending {
+        cooldowns.retain(|_, cooldown| cooldown.input_change_only);
+    }
+    index.activate_reason_reoffer_cooldowns(cooldowns);
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -9310,19 +9297,8 @@ fn save_terminal_contract_claims_for_scan(
     if changed {
         index.save(index_path)?;
     }
-    let fresh_full = progress
-        .active_quarantine_retries
-        .iter()
-        .filter_map(|fp| {
-            progress
-                .stale_reopen_file(fp)
-                .map(|file| (fp.clone(), file.clone()))
-        })
-        .collect();
-    let paths = index.activate_terminal_contract_retries_with_mode(
-        progress.active_quarantine_retries.clone(),
-        &fresh_full,
-    );
+    let paths =
+        index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone());
     Ok(paths)
 }
 
@@ -24997,7 +24973,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, stale_reopen_nonce, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

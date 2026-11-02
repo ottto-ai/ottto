@@ -27,9 +27,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
   accepted, and parts the server did accept stay recorded.
 
-Timestamp-only refusals remain owed with exact-body suppression. A server head
-comparison can explicitly supersede a covered revision or trigger one paced Full
-for an owed revision; see [refusal reassessment](../../docs/development/refused-snapshot-reassessment.md).
+Timestamp-only refusals remain owed with exact-body suppression. Owed entities
+never grant an automatic rebuild or re-offer. Retries use retained bodies;
+transcripts are read again only for changed input. See
+[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
 
 ## Stores
 
