@@ -169,17 +169,41 @@ pub(super) enum Group {
     Misc,
     Accounts,
     Census,
+    Tail,
 }
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 3;
+pub(super) const LAYOUT: u32 = 4;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
+/// Tail state's closed kinds, each owned by `tail.rs`: no `ScanIndex` field, no
+/// hook, and never a row of `enumerate` or a baseline. Pages first, in
+/// `tail::Collection` order.
+pub(super) const TAIL_KINDS: &[&str] = &[
+    "tail.page.responses",
+    "tail.page.tool_uses",
+    "tail.page.changed_files",
+    "tail.page.cap_hours",
+    "tail.page.compactions",
+    "tail.page.signatures",
+    "tail.page.priority_turns",
+    "tail.page.usage_hours",
+    "tail.page.requests",
+    "tail.page.pi_usage_keys",
+    "tail.page.codex_active_turns",
+    "tail.page.codex_open_calls",
+    "tail.page.codex_name_counts",
+    "tail.head",
+    "tail.frag",
+    "tail.set_aside",
+];
+const TAIL_LAYOUT: u32 = 4;
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
         .iter()
         .find(|(name, _, _)| *name == kind)
         .map(|(_, _, layout)| *layout)
+        .or_else(|| TAIL_KINDS.contains(&kind).then_some(TAIL_LAYOUT))
         .ok_or_else(|| anyhow::anyhow!("state_v2_unmapped_kind"))
 }
 /// Before layout controls existed, this authenticated inventory contained every
@@ -200,6 +224,7 @@ pub(super) fn group(kind: &str) -> Option<Group> {
         .iter()
         .find(|(owned, _)| *owned == kind)
         .map(|(_, group)| *group)
+        .or_else(|| TAIL_KINDS.contains(&kind).then_some(Group::Tail))
 }
 pub(super) fn accepts(kind: &str) -> bool {
     group(kind).is_some() || RESERVED.contains(&kind)
@@ -242,6 +267,12 @@ mod tests {
         assert_eq!(group("family.requests"), Some(Group::Census));
         // Each kind is introduced at a supported layout; the newest is current.
         assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
-        assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
+        assert_eq!(TAIL_LAYOUT, LAYOUT);
+        // Tail kinds are a closed list too: no wildcard, and no graph owner.
+        assert_eq!(group("tail.head"), Some(Group::Tail));
+        assert_eq!(group("tail.page.future"), None);
+        assert!(TAIL_KINDS
+            .iter()
+            .all(|kind| !OWNED.iter().any(|o| o.0 == *kind)));
     }
 }
