@@ -123,9 +123,6 @@ pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut(
     BEFORE_CARRIER_PROBE.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// Pacing cause of a Codex refused stale record's Full.
-const STALE_SELECTION_CAUSE: usize = 5;
-
 const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
 const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 
@@ -3004,7 +3001,7 @@ impl SharedCache {
                 RestoreOutcome::Held,
             );
         }
-        let result = self.restore_known(
+        let result = match self.restore_known(
             snapshot_source,
             key,
             path,
@@ -3013,7 +3010,17 @@ impl SharedCache {
             index,
             interpretation,
             &mut lease,
-        );
+        ) {
+            // A re-armed entry (cleared selection) whose record cannot serve
+            // takes OFF's path for every source: OFF's immediate Full, never a
+            // pace or stale hold. The S2 floor below still holds first.
+            Err(RestoreOutcome::Stale(_) | RestoreOutcome::StaleUnregistered(..))
+                if selection_cleared(index, key) =>
+            {
+                Err(MissClass::StaleSelection.into())
+            }
+            result => result,
+        };
         // The common guard held U/T14 before acquisition; this sees class changes since.
         let outcome = match result {
             Ok(Ok(completed)) => {
@@ -3238,69 +3245,15 @@ impl SharedCache {
         true
     }
 
-    /// The refused stale record's Full is counted under its own cause and paced
-    /// once per file in the ONE pacing map; a delayed Full stays Pending.
-    /// This is eligibility only: a cursor/page can still defer before input.
-    fn stale_selection_full(
-        &self,
-        source: SnapshotSource,
-        key: &str,
-        held: &File,
-    ) -> RestoreOutcome {
-        let near_cap = held
-            .metadata()
-            .is_ok_and(|m| near_source_cap(source, m.len()));
-        let granted = self.paced_with_cause(
-            source,
-            key,
-            SystemTime::now(),
-            (false, near_cap, false),
-            Some(STALE_SELECTION_CAUSE),
-        );
-        if !granted {
-            if let Some(mut stores) = self.durable() {
-                Counters::bump(
-                    &mut stores.counters.ineligible,
-                    "selection_cleared.stale_record_full.paced",
-                );
-            }
-        }
-        if granted {
-            MissClass::StaleSelection.into()
-        } else {
-            RestoreOutcome::Pending
-        }
-    }
-
-    /// Enroll the source-fault cause only after native/page admission, at
-    /// the same input boundary as the real Full selection counter.
-    pub(in crate::snapshots) fn start_stale_selection_full(
-        &self,
-        source: SnapshotSource,
-        key: &str,
-        held: &File,
-    ) -> bool {
-        let near_cap = held
-            .metadata()
-            .is_ok_and(|m| near_source_cap(source, m.len()));
-        let granted = self.paced_with_cause(
-            source,
-            key,
-            SystemTime::now(),
-            (false, near_cap, true),
-            Some(STALE_SELECTION_CAUSE),
-        );
+    /// Count a re-armed entry's refused-record Full at the same input
+    /// boundary as the real Full selection counter. Never paced (OFF == ON).
+    pub(in crate::snapshots) fn note_stale_selection_full(&self) {
         if let Some(mut stores) = self.durable() {
             Counters::bump(
                 &mut stores.counters.ineligible,
-                if granted {
-                    "selection_cleared.stale_record_full"
-                } else {
-                    "selection_cleared.stale_record_full.paced"
-                },
+                "selection_cleared.stale_record_full",
             );
         }
-        granted
     }
 
     /// Missing authority preserves the predecessor and discoverability. The
@@ -3622,12 +3575,7 @@ impl SharedCache {
             stores.counters.restore_attempts += 1;
             stores.note_indexed(source, index);
             // Codex keeps its predecessor selection gate; Claude first proves the original binding.
-            if source == DurableSource::Codex
-                && index
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
-            {
+            if source == DurableSource::Codex && selection_cleared(index, key) {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
                 // A record surviving behind a cleared selection
                 // (the D3 strict rebind's carrier, no new persisted field) is a
@@ -3639,8 +3587,7 @@ impl SharedCache {
                     return Err(MissClass::SelectionCleared.into());
                 }
                 slot.store.note_stale_refusal();
-                drop(stores);
-                return Err(self.stale_selection_full(snapshot_source, key, held));
+                return Err(MissClass::StaleSelection.into());
             }
             // Revision adoption and money-rule replay both use this debt.
             // Check before disk I/O: an owed raw replay may never be served
@@ -5748,7 +5695,8 @@ pub(crate) enum MissClass {
     Unavailable,
     NoEntry,
     SelectionCleared,
-    /// A Codex record survived a cleared selection: refused, paced Full.
+    /// A record cannot serve a re-armed (selection-cleared) entry: refused,
+    /// OFF's immediate counted Full.
     StaleSelection,
     HistoryOwed,
     Missing,
@@ -5951,6 +5899,14 @@ mod restore_test {
             }
         }
     }
+}
+
+/// The index cleared this entry's selection (a re-arm): OFF reads it Full.
+fn selection_cleared(index: &ScanIndex, key: &str) -> bool {
+    index
+        .files
+        .get(key)
+        .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
 }
 
 /// Held-FD length past the committed end; metadata only, no read.

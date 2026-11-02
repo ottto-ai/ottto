@@ -35250,9 +35250,9 @@ impl OwnedSourceScan {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
                                             }
-                                            stale_selection_pending = matches!(class,
-                                                sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
+                                        stale_selection_pending = matches!(class,
+                                            sampled_scan::durable_tail::MissClass::StaleSelection);
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
@@ -36036,16 +36036,7 @@ impl OwnedSourceScan {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
                 {
-                    let key = local_index_key(&active.candidate.path);
-                    if !context.cache.start_stale_selection_full(
-                        source,
-                        &key,
-                        active.parser.reader.reader.get_ref(),
-                    ) {
-                        residue_index_keys.insert(key);
-                        drop(codex_cursor_lease.take());
-                        pending!();
-                    }
+                    context.cache.note_stale_selection_full();
                 }
                 if let Some((mode, audit_due)) = planned_mode {
                     context.record_mode(mode, audit_due);
