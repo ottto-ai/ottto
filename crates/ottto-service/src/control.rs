@@ -21825,7 +21825,6 @@ for line in sys.stdin:
     #[serial]
     /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
     fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
-        let _off = crate::snapshots::RestartRestoreForTest::disabled();
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
@@ -21837,7 +21836,7 @@ for line in sys.stdin:
                     .join("snapshots/destinations")
                     .join(destination)
                     .join(format!("{}-scan-index.json", source.snapshot.api_slug()));
-                let dir = crate::durable_tail_store::store_dir_for_index(&index);
+                let dir = crate::snapshots::state_v2::retired_record_dir(&index);
                 fs::create_dir_all(&dir).unwrap();
                 // Whole-tree forget cannot depend on inventory or body decoding.
                 fs::write(
@@ -21959,7 +21958,6 @@ for line in sys.stdin:
         );
         let _ = fs::remove_dir_all(root);
     }
-
     #[test]
     #[serial]
     fn local_reset_file_cleanup_clears_relay_device_binding() {
@@ -24563,16 +24561,9 @@ for line in sys.stdin:
     /// Seed the private record directory with codec bytes, so both diagnostic
     /// paths must exclude stored literals rather than merely redact a Debug.
     fn seed_private_literal_canary(support: &Path) -> &'static str {
-        use crate::durable_tail_codec::{Durable, Enc};
-        use crate::snapshots::PlText;
         const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
-        let literal = PlText::<96>::new(CANARY.into()).unwrap();
-        let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();
-        assert!(body
-            .windows(CANARY.len())
-            .any(|bytes| bytes == CANARY.as_bytes()));
         let dir =
-            crate::durable_tail_store::store_dir_for_index(&support.join("claude-scan-index.json"));
+            crate::snapshots::state_v2::retired_record_dir(&support.join("claude-scan-index.json"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let record = dir.join(format!("{}.rec", "0".repeat(64)));
@@ -24582,7 +24573,7 @@ for line in sys.stdin:
             .mode(0o600)
             .open(record)
             .unwrap();
-        file.write_all(&body).unwrap();
+        file.write_all(CANARY.as_bytes()).unwrap();
         // F8: the support collector must also omit transient replay input,
         // including raw-value magic keys and malformed-selector material.
         std::fs::write(support.join("bounded-replay-private.jsonl"), format!(

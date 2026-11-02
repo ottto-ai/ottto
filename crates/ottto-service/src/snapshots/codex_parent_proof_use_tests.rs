@@ -1972,7 +1972,6 @@ fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
 }
-
 /// Proof wakes compare raw path stamps exactly, ctime included,
 /// as before S3. A path stamp carries no birth witness, so ctime is the only
 /// signal of a same-inode replacement or an mtime-restored rewrite until a

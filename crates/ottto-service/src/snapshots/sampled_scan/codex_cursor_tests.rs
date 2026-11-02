@@ -1515,7 +1515,6 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
-        None,
     );
     let traversal = index.traversal.as_mut().unwrap();
 
@@ -2972,7 +2971,6 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
-        None,
     );
     let walked = index.traversal.as_mut().unwrap();
 
@@ -3248,7 +3246,6 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
-        None,
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3321,7 +3318,6 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         SnapshotSource::Codex,
         &mut index,
         BACKFILL_WINDOW_DAYS,
-        None,
         None,
     );
     // SESSION already finished its census read; growth must not re-enroll it.
@@ -3571,7 +3567,6 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
-        None,
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -3622,7 +3617,6 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         &mut index,
         BACKFILL_WINDOW_DAYS,
-        None,
         None,
     );
     assert!(index
@@ -5696,193 +5690,6 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
         counters(&cache)
     );
     assert_eq!(replayed_census(&hit), replayed_census(&reread));
-}
-
-/// The scan-level case for durable warm-cache reuse: restore +
-/// Tail beside a non-empty held-fork memo and a non-empty parent ledger. One
-/// sessions root holds P (a complete ledger of real signatures), its kind
-/// (iii) fork C (held, memoized with P's ledger as its dependency) and a
-/// plain singleton S. Process 1 settles, saves and writes S's record under
-/// the state-directory lock. S grows (an unchanged file never reaches the
-/// read path). Process 2 (a fresh `SharedCache`, the saved index loaded,
-/// P's persisted ledger re-validated and re-injected by the scan) restores
-/// and Tails S on its first page while C is re-read and memoized again. The
-/// RAM copies are then released (`clear`, which keeps the memo, K6) and S
-/// grows again: the next page restores S from the same record with the memo
-/// non-empty and Tails it while C hits its memo. Each page's body, census,
-/// ledgers and #660 maps equal a cold Full (no cache) of the same index and
-/// files.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_cold_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
-    let source = SnapshotSource::Codex;
-    let namespace = Scope("cursor-fixture".into());
-    let capture = true; // Outside a sync cycle every scan captures.
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    fs::write(
-        home.fixture.file(SINGLE),
-        jsonl(&[
-            json!({"timestamp": "2026-10-07T08:40:00Z", "type": "session_meta",
-                "payload": {"id": SINGLE, "thread_source": "user"}}),
-            turn_record("2026-10-07T08:40:01Z", "single-turn-1"),
-            usage_record("2026-10-07T08:40:02Z", (100, 50, 10, 0), (100, 50, 10, 0)),
-        ]),
-    )
-    .unwrap();
-    let page = |index: ScanIndex, cache: Option<Arc<SharedCache>>, n: u64| {
-        let mut index = index;
-        index.traversal = None;
-        page_selections(
-            &home.fixture,
-            index,
-            cache,
-            "cursor-fixture",
-            &collected_at(n),
-            |_| {},
-            usize::MAX,
-        )
-    };
-    let body = |scan: &SourceScanResult| {
-        let mut snapshots = scan.snapshots.clone();
-        apply_upload_policy(source, &mut snapshots, SnapshotUploadPolicy::default());
-        serde_json::to_value(snapshots).unwrap()
-    };
-    // P's indexed ledger: complete, with real signatures.
-    let ledger_signed = |index: &ScanIndex| {
-        let ledger = index
-            .codex_parent_ownership_ledgers
-            .get(PARENT)
-            .expect("indexed parent ledger");
-        assert!(
-            ledger.scan_complete && !ledger.signatures.is_empty(),
-            "a non-empty complete parent ledger"
-        );
-        ledger.opened_object_identity.clone()
-    };
-    let parent_records = |index: &ScanIndex| {
-        (
-            serde_json::to_vec(&index.codex_parent_ownership_ledgers).unwrap(),
-            serde_json::to_vec(&index.codex_parent_side).unwrap(),
-            serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
-            serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
-        )
-    };
-    let memo_depends_on = |cache: &SharedCache, identity: &str| {
-        let entry = home
-            .child_entry(cache)
-            .unwrap_or_else(|| panic!("C's hold is memoized: {}", counters(cache)));
-        let dep = entry.parent.as_ref().expect("parent dependency");
-        assert_eq!(
-            (dep.id.as_str(), dep.ledger.as_deref()),
-            (PARENT, Some(identity)),
-            "the memo used P's ledger"
-        );
-    };
-
-    // Process 1.
-    let state = home.fixture._dir.0.join("state");
-    fs::create_dir_all(&state).unwrap();
-    let index_path = state.join("index.json");
-    let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let first = Arc::new(SharedCache::default());
-    first.durable_begin_pass(source, &index_path, &namespace, capture);
-    let (mut index, settled, n) = home.settle(ScanIndex::default(), &first, 0);
-    let identity = ledger_signed(&index);
-    memo_depends_on(&first, &identity);
-    assert!(session_usage(&settled, CHILD).is_empty(), "C is held");
-    // S published on its first generation; the settled page is quiet for it.
-    let single_key = local_index_key(&home.fixture.file(SINGLE));
-    assert!(
-        index
-            .files
-            .get(&single_key)
-            .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some()),
-        "S is indexed and published"
-    );
-    index.save(&index_path).unwrap();
-    first.durable_write_after_save(lock, source, &index);
-    let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
-        .map_or(0, |entries| entries.count());
-    assert!(records >= 1, "S's record is written after the save");
-    drop(first);
-
-    // Process 2, first page: S restores and Tails (the restart) while C is
-    // re-read and memoized again against P's re-injected ledger.
-    let grow = |at: &str, total: (u64, u64, u64, u64)| {
-        home.fixture
-            .append(SINGLE, &jsonl(&[usage_record(at, total, (30, 20, 3, 0))]));
-    };
-    grow("2026-10-07T08:40:03Z", (130, 70, 13, 0));
-    let loaded = ScanIndex::load(&index_path).unwrap();
-    assert_eq!(ledger_signed(&loaded), identity, "the ledger persisted");
-    let second = Arc::new(SharedCache::default());
-    assert!(home.child_entry(&second).is_none(), "a restart has no memo");
-    second.durable_begin_pass(source, &index_path, &namespace, capture);
-    let (index_a, warm_a, selections_a) = page(loaded.clone(), Some(Arc::clone(&second)), n);
-    let (counters_a, store_a) = second.durable_counters(source).unwrap();
-    eprintln!(
-        "held-memo restart page: {}",
-        counters_a.summary(source, &store_a)
-    );
-    assert!(counters_a.restored >= 1, "S restores from its record");
-    assert!(selections_a.modes.1 >= 1, "S continues by Tail");
-    memo_depends_on(&second, &identity);
-    let (cold_index_a, cold_a, _) = page(loaded, None, n);
-    assert_eq!(body(&warm_a), body(&cold_a));
-    assert_eq!(census(&index_a, &warm_a), census(&cold_index_a, &cold_a));
-    assert_eq!(replayed_census(&warm_a), replayed_census(&cold_a));
-    assert_eq!(parent_records(&index_a), parent_records(&cold_index_a));
-
-    // Process 2 commits page A and rewrites S's record, which now binds the
-    // Tailed entry (a record never outlives its committed entry). Then the
-    // RAM copies are released (the memo survives) and S grows: the next page
-    // restores S again with the memo non-empty and Tails it; C hits.
-    let mut index_a = index_a;
-    index_a.save(&index_path).unwrap();
-    second.durable_write_after_save(lock, source, &index_a);
-    second.clear();
-    memo_depends_on(&second, &identity);
-    grow("2026-10-07T08:40:04Z", (160, 90, 16, 0));
-    assert_eq!(ledger_signed(&index_a), identity, "re-injected unchanged");
-    let hits = counter(&second, |c| c.memo_hits);
-    second.durable_begin_pass(source, &index_path, &namespace, capture);
-    let (warm_index, warm, selections) = page(index_a.clone(), Some(Arc::clone(&second)), n + 1);
-    let (counters_b, store_b) = second.durable_counters(source).unwrap();
-    eprintln!(
-        "held-memo tail page: {}",
-        counters_b.summary(source, &store_b)
-    );
-    assert_eq!(
-        counters_b.restored,
-        counters_a.restored + 1,
-        "S restores beside the memo"
-    );
-    assert_eq!(selections.modes.1, 1, "S continues by Tail");
-    assert_eq!(
-        counter(&second, |c| c.memo_hits),
-        hits + 1,
-        "C hits its memo: {}",
-        counters(&second)
-    );
-    let (cold_index, cold, _) = page(index_a, None, n + 1);
-    assert!(session_usage(&warm, CHILD).is_empty(), "C stays held");
-    assert!(session_usage(&cold, CHILD).is_empty(), "C stays held cold");
-    assert_ne!(
-        session_usage(&warm, SINGLE),
-        session_usage(&warm_a, SINGLE),
-        "S's second growth is published"
-    );
-    assert_eq!(session_usage(&warm, SINGLE), session_usage(&cold, SINGLE));
-    assert_eq!(body(&warm), body(&cold));
-    assert_eq!(census(&warm_index, &warm), census(&cold_index, &cold));
-    assert_eq!(replayed_census(&warm), replayed_census(&cold));
-    assert_eq!(ledger_signed(&warm_index), identity);
-    assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
 }
 
 /// T15 (PR-P §2.4): a created thread never consults a parent ledger, so it
@@ -12586,57 +12393,6 @@ fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_release_and_unwind_follow_the_production_stores_guard() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for unwind in [false, true] {
-        let cache = Arc::new(SharedCache::default());
-        let f = Temp::new(
-            "stores-owner",
-            &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
-        );
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
-                .unwrap()
-                .unwrap();
-            input.read_exact(&mut [0; 1]).unwrap();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let stores = cache.durable().unwrap();
-                assert!(super::super::durable_tail::stores_held());
-                if unwind {
-                    panic!("synthetic durable operation failure");
-                }
-                drop(stores);
-            }));
-            assert_eq!(result.is_err(), unwind);
-            assert!(!super::super::durable_tail::stores_held());
-            input.close();
-        });
-        assert_eq!(cache.cursor_reserved(), 0);
-        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
-    }
-    #[cfg(debug_assertions)]
-    {
-        let cache = Arc::new(SharedCache::default());
-        let guard = cache.durable().unwrap();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| DecoderOwner::acquire(
-                &cache, 1
-            )))
-            .is_err()
-        );
-        drop(guard);
-        DecoderOwner::acquire(&cache, 1).unwrap().release();
-    }
-}
-
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs validated heap layout"
-)]
 fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
@@ -12827,181 +12583,6 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
     });
 }
 
-/// Singleton case: a paged cursor job starts while its file is indexed, so it
-/// captures no missing-carrier due, then parks; the per-pass index loses the
-/// entry. On completion settlement re-probes the record read-only (live
-/// context, once-clamped) and stages the marker, counting the miss and the
-/// staged transition once each. The job is not invalidated.
-#[test]
-fn parked_singleton_across_fresh_index_reprobes_record_debt() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    use crate::durable_tail_store as store;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(40);
-    let path = fixture.file(SESSION);
-    let key = local_index_key(&path);
-    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
-    let (mut index, _, _) = page_with(
-        &fixture,
-        ScanIndex::default(),
-        None,
-        "cursor-fixture",
-        NOW,
-        incomplete,
-    );
-    assert!(index.files.contains_key(&key));
-    // A same-context debt record for the indexed file.
-    let state = fixture.root.parent().unwrap().to_path_buf();
-    let index_path = state.join("index.json");
-    let scope = Scope("cursor-fixture".into());
-    let now = crate::snapshots::sampled_scan::now_seconds();
-    let due = now - 90;
-    let mut file = fs::File::open(&path).unwrap();
-    let mut certificate = native_cold::checkpoint(&mut file, &scope, now)
-        .durable_certificate(0)
-        .unwrap();
-    certificate.audit_debt_unix_seconds = Some(due);
-    let ds = store::DurableSource::Codex;
-    let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let mut disk = native_cold::store(&index_path, ds);
-    let pending = store::PendingRecord {
-        acquisition: Some(store::AcquisitionFields {
-            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
-                SnapshotSource::Codex,
-            ),
-            protocol: crate::snapshots::AcquisitionProtocol::Legacy,
-        }),
-        binding: store::Binding {
-            source: ds,
-            key: store::key_digest(ds, &key),
-            context: store::context_digest(&scope.0, None),
-            scope: [0; 32],
-            entry: [0; 32],
-        },
-        certificate,
-        body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
-        allowlist: crate::snapshots::sampled_jsonl::durable::allowlist_digest(
-            SnapshotSource::Codex,
-        ),
-    };
-    assert_eq!(
-        disk.write_after_save(lock, 1, 0, vec![pending])
-            .unwrap()
-            .written,
-        1
-    );
-    drop(disk);
-    fixture.append(SESSION, &token_line(41));
-    index.traversal = None;
-    let cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
-    struct ResetProbe;
-    impl Drop for ResetProbe {
-        fn drop(&mut self) {
-            crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(None);
-            store::active::set_active_budget_for_test(None);
-        }
-    }
-    let _reset = ResetProbe;
-    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
-    let seen = probes.clone();
-    let observer = cache.clone();
-    let before = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let previous = before.clone();
-    crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(Some(Box::new(
-        move || {
-            seen.set(seen.get() + 1);
-            if seen.get() == 1 {
-                // Real resumed EOF, missing index membership. Refuse classifier
-                // credit ONCE, before the cursor can complete/fence this import.
-                assert_eq!(
-                    counter(&observer, |c| c.jobs_certified)
-                        + counter(&observer, |c| c.jobs_uncertified),
-                    0
-                );
-                *previous.borrow_mut() =
-                    Some(observer.durable_counters(SnapshotSource::Codex).unwrap().1);
-                store::active::set_active_budget_for_test(Some(0));
-            } else if seen.get() == 2 {
-                assert_eq!(
-                    counter(&observer, |c| c.jobs_certified)
-                        + counter(&observer, |c| c.jobs_uncertified),
-                    0,
-                    "failed settlement admission never fences the attempt"
-                );
-                assert_eq!(
-                    observer.durable_counters(SnapshotSource::Codex).unwrap().1,
-                    previous.borrow().as_ref().copied().unwrap(),
-                    "no classifier I/O before credit"
-                );
-                store::active::set_active_budget_for_test(None);
-            }
-        },
-    )));
-    let index = with_test_limits(2048, 1024, 64, || {
-        let mut index = index;
-        let mut cleared = false;
-        for _ in 0..64 {
-            let (next, _, _) = page_with(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                NOW,
-                incomplete,
-            );
-            index = next;
-            let done =
-                counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified);
-            if done > 0 {
-                break;
-            }
-            if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
-                // Retain the real Legacy ACK before the entry leaves the index.
-                assert!(codex_counting_version::tombstone_before_retire(
-                    &mut index, &key
-                ));
-                // The per-pass index loads without the parked file's entry.
-                index.files.remove(&key);
-                cleared = true;
-            }
-        }
-        assert!(cleared, "the job parked: {}", counters(&cache));
-        assert_eq!(
-            counter(&cache, |c| c.jobs_invalidated),
-            0,
-            "{}",
-            counters(&cache)
-        );
-        index
-    });
-    assert_eq!(
-        probes.get(),
-        2,
-        "exact EOF job retries funding and settles without reparse/fence loss"
-    );
-    crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(None);
-    assert_eq!(
-        index.files[&key].unverified_deadline(),
-        Some(due),
-        "staged from the record at settlement"
-    );
-    let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
-    // A start-time restore attempt on the then-indexed entry may count its
-    // own carrier miss (A's existing-entry rearm); the re-probe adds one.
-    assert!(durable
-        .ineligible
-        .get("audit_carrier")
-        .is_some_and(|n| *n >= 1));
-    assert_eq!(
-        durable.ineligible.get("audit_carrier_staged_unverified"),
-        Some(&1)
-    );
-    assert_eq!(durable.restored, 0);
-}
-
 /// [money] active bound no record cursor preserves scope resumes and publishes.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
@@ -13048,91 +12629,6 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
             assert!(scan.snapshots.is_empty());
         }
         panic!("no-record cursor never completed");
-    });
-}
-
-/// [money] structural restore page defer does not spend full pace.
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native durable layout")]
-fn structural_restore_page_defer_does_not_spend_full_pace() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    use crate::durable_tail_store as store;
-    struct ResetBudget;
-    impl Drop for ResetBudget {
-        fn drop(&mut self) {
-            store::active::set_active_budget_for_test(None);
-        }
-    }
-    let _reset = ResetBudget;
-    let fixture = ScanRoot::with_sessions(&[(SESSION, 8), (SESSION_B, 8)]);
-    let state = fixture._dir.0.join("state");
-    fs::create_dir(&state).unwrap();
-    let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let index_path = state.join("index.json");
-    let source = SnapshotSource::Codex;
-    let cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(source, &index_path, &Scope("cursor-fixture".into()), true);
-    let (mut index, prefix) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
-    assert_eq!(prefix.snapshots.len(), 2);
-    index.save(&index_path).unwrap();
-    cache
-        .durable_write_after_save(lock, source, &index)
-        .unwrap();
-    assert_eq!(
-        cache.durable_counters(source).unwrap().1.records_written,
-        2,
-        "native settlement wrote each record once before effects"
-    );
-    cache.retained().unwrap().clear();
-    for session in [SESSION, SESSION_B] {
-        fixture.append(session, &token_line(9));
-    }
-    let key_bytes = local_index_key(&fixture.file(SESSION)).len() as u64;
-    let limit = store::RESTORE_INPUT_BYTES
-        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-        + 4 * key_bytes;
-    store::active::set_active_budget_for_test(Some(limit));
-    let size = fixture.len(SESSION).max(fixture.len(SESSION_B));
-    with_test_limits(1 << 20, size + size / 2, 64, || {
-        let (index, first, modes) = page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
-        assert_eq!(modes, (1, 0));
-        assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(
-            counter(&cache, |c| c.deferred),
-            1,
-            "real planner budget Defer"
-        );
-        assert_eq!(
-            cache.durable_counters(source).unwrap().0.active_bound[1],
-            [1, 0],
-            "only the starting Full spends"
-        );
-        let deferred = [SESSION, SESSION_B]
-            .into_iter()
-            .find(|session| pending_hint(&index, &fixture.file(session)).is_some())
-            .expect("deferred growth");
-        let end = index.files[&local_index_key(&fixture.file(deferred))].size_bytes;
-        assert!(end < fixture.len(deferred));
-        let (caught, second, modes) =
-            page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
-        assert_eq!(
-            modes,
-            (1, 0),
-            "next page reads within the six-hour interval"
-        );
-        assert_eq!(second.snapshots.len(), 1);
-        assert_eq!(
-            cache.durable_counters(source).unwrap().0.active_bound[1],
-            [2, 0]
-        );
-        assert_eq!(
-            caught.files[&local_index_key(&fixture.file(deferred))].size_bytes,
-            fixture.len(deferred)
-        );
-        assert!(pending_hint(&caught, &fixture.file(deferred)).is_none());
     });
 }
 

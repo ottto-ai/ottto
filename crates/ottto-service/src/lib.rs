@@ -33,7 +33,6 @@ mod desktop_recent;
 pub mod detected_uses;
 mod durable_tail_codec;
 #[cfg(unix)]
-mod durable_tail_store;
 mod external_scheduler_attribution;
 mod hex;
 mod instruction_inventory;

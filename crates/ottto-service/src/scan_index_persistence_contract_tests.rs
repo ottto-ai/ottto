@@ -1,5 +1,4 @@
 //! Uses the real ScanIndex serializer and real #865 durable store in lib tests.
-use crate::durable_tail_store as durable;
 #[allow(dead_code)] // Remaining component APIs are exercised by the standalone target.
 use crate::snapshots::scan_index_persistence as persistence;
 use crate::snapshots::ScanIndex;
@@ -91,112 +90,9 @@ fn assert_same_wire(expected: &ScanIndex, actual: &ScanIndex) {
         );
     }
 }
-fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
-    use crate::transcript_acquisition::{ReadPlan, Scope};
-    let lock = crate::locked_state_dir::LockedStateDir::acquire(&s.0).unwrap();
-    let path = s.0.join("synthetic-input.jsonl");
-    fs::write(&path, b"{\"synthetic\":1}\n").unwrap();
-    let mut file = fs::File::open(&path).unwrap();
-    let scope = Scope("synthetic-durable-scope".into());
-    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 1_800_000_000).unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    let checkpoint = plan
-        .commit_after_native_completion(&file, &scope, 1_800_000_000)
-        .unwrap();
-    let certificate = checkpoint
-        .durable_certificate(crate::transcript_acquisition::birth_unix_nanos(
-            &file.metadata().unwrap(),
-        ))
-        .unwrap();
-    let source = durable::DurableSource::ClaudeCode;
-    let allowlist: [u8; 32] = "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2"
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    // The saved index carries no source-wide upload context (retired), and
-    // a freshly decoded index has no active one yet.
-    let logical = serde_json::to_value(index).unwrap();
-    assert!(logical.get("upload_context_fingerprint").is_none());
-    let context = None;
-    let binding = durable::Binding {
-        source,
-        key: durable::key_digest(source, "synthetic-file"),
-        context: durable::context_digest(&"a".repeat(64), context),
-        scope: durable::scope_digest("synthetic-scope", &allowlist, "identity:v1", "legacy"),
-        entry: [0; 32],
-    };
-    let record = durable::PendingRecord {
-        acquisition: Some(durable::AcquisitionFields {
-            acquired_revision: 3,
-            protocol: crate::snapshots::AcquisitionProtocol::Legacy,
-        }),
-        binding: binding.clone(),
-        certificate,
-        body: crate::snapshots::durable_store_fixture_body(
-            crate::snapshots::SnapshotSource::ClaudeCode,
-            3,
-            21,
-        ),
-        allowlist,
-    };
-    let dir = durable::store_dir_for_index(&s.root());
-    let mut store = durable::DurableTailStore::new(dir.clone(), source);
-    assert_eq!(
-        store
-            .write_after_save(
-                &lock,
-                generation,
-                fs::metadata(s.root()).unwrap().len(),
-                vec![record.clone()]
-            )
-            .unwrap()
-            .written,
-        1
-    );
-    drop(store);
-    // Restart BOTH representations: generation comes from the committed index,
-    // never a shard digest, a storage receipt, or a process-local counter.
-    let root: Value = serde_json::from_slice(&fs::read(s.root()).unwrap()).unwrap();
-    assert_eq!(root["generation"].as_u64(), Some(generation));
-    let mut restarted = durable::DurableTailStore::new(dir, source);
-    let durable::ReadOutcome::Found(restored) = restarted.read(&binding.key) else {
-        panic!("real durable record must restore")
-    };
-    assert_eq!(restored.index_generation, generation);
-    assert_eq!(restored.record, record);
-    // The actual admission seam: a write-ahead record may lead its index, so
-    // context and scope always refuse.
-    let expected = durable::Expected {
-        binding: binding.clone(),
-    };
-    assert!(restored.eligible(&expected).is_ok());
-    assert!(restored
-        .eligible(&durable::Expected {
-            binding: binding.clone(),
-        })
-        .is_ok());
-    assert!(restored
-        .eligible(&durable::Expected {
-            binding: durable::Binding {
-                scope: [9; 32],
-                ..binding.clone()
-            },
-        })
-        .is_err());
-    assert!(restored.eligible(&durable::Expected { binding }).is_ok());
-    assert!(restored.index_generation <= root["generation"].as_u64().unwrap());
-    assert!(crate::snapshots::verify_durable_body(
-        &restored.record.body,
-        source
-    ));
-}
+
 #[test]
-fn reader_loads_frozen_writer_bytes_and_preserves_logical2_and_durable_generation() {
+fn reader_loads_frozen_writer_bytes_and_preserves_logical2_generation() {
     let s = Scratch::new();
     let logical = s.install();
     let expected: ScanIndex = serde_json::from_value(logical.clone()).unwrap();
@@ -204,9 +100,7 @@ fn reader_loads_frozen_writer_bytes_and_preserves_logical2_and_durable_generatio
     let (actual, root) = decode(&store);
     assert_same_wire(&expected, &actual);
     assert_eq!(root.generation(), Some(7));
-    durable_round_trip(&s, &actual, root.generation().unwrap());
 }
-
 #[test]
 fn future_representation_version_is_classified_for_the_health_adapter() {
     let s = Scratch::new();

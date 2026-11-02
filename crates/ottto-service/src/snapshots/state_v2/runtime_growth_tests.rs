@@ -99,7 +99,7 @@ impl Fixture {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(

@@ -39,7 +39,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -258,131 +258,6 @@ fn shared_role_gate_excludes_comparison_side_and_other_sources() {
         assert!(open_candidate_file(SnapshotSource::Codex, &mut active.candidate.clone()).is_err());
         assert!(active.parser.step().is_err());
     });
-}
-
-/// [regress] Quiet private replay cannot strand an existing explicit reparse;
-/// the ordinary paced Full must still deliver the native MCP version consumer.
-#[test]
-#[cfg(unix)]
-fn current_writer_disk_restore_tail_and_paced_quiet_reparse() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let f = fixture();
-    let source = SnapshotSource::Codex;
-    let state = f.dir.join("state");
-    fs::create_dir_all(&state).unwrap();
-    let path = state.join("index.json");
-    let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let scope = Scope("mcp-current-writer".into());
-    let capture = true; // OwnedSourceScan::new captures identity outside a sync cycle.
-    let mut index = ScanIndex::default();
-    for (restart, expected_modes) in [(1, 0, 0), (0, 1, 0), (1, 0, 0)].into_iter().enumerate() {
-        if restart == 1 {
-            // No session_meta in either resumed suffix.
-            f.file.append(&usage(source, 140, 1, "fixture-model"));
-        }
-        if restart == 2 {
-            let candidate = current_candidate(&f, &index);
-            assert_eq!(
-                index.candidate_decision(&candidate),
-                CandidateDecision::Skip
-            );
-            // Missing activity is an existing re-emission obligation, independent
-            // of the new RAM cache. It changes no durable replay binding.
-            assert!(!index.file_snapshot_fingerprints[&local_index_key(&f.file.0)].is_empty());
-            index.snapshot_activity_at.clear();
-            assert_eq!(
-                index.candidate_decision_with_reason(&candidate),
-                (
-                    CandidateDecision::Parse,
-                    Some(CandidateParseReason::ActivityOrQuarantineRetry)
-                )
-            );
-        }
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        cache.durable_begin_pass(source, &path, &scope, capture);
-        let projection = feed(&f);
-        let (((next, _, modes, bytes), diagnostics), samples) =
-            crate::transcript_acquisition::capture_sample_reads(|| {
-                crate::local_resource_diagnostics::capture(|| {
-                    production_scan_at_with_setup(
-                        &f,
-                        source,
-                        index,
-                        Some(cache.clone()),
-                        &scope.0,
-                        NOW,
-                        |s| s.codex_versions = Some(projection.clone()),
-                    )
-                })
-            });
-        assert_eq!(modes, expected_modes);
-        if restart == 2 {
-            assert!(
-                samples.is_empty(),
-                "quiet restore reads no transcript windows"
-            );
-            assert_eq!(
-                bytes.0,
-                f.file.0.metadata().unwrap().len(),
-                "the existing explicit selection takes one native Full"
-            );
-            let page = diagnostics
-                .iter()
-                .find(|row| row["stage"] == "native_collection_page")
-                .unwrap();
-            assert_eq!(
-                page["counts"]["full_causes"]["restore_outcome"]["pending"],
-                1
-            );
-            // The same explicit cause cannot spend a second Full in this window.
-            cache.retained().unwrap().clear();
-            let mut owed = next.clone();
-            owed.snapshot_activity_at.clear();
-            let (_, _, modes, bytes) = production_scan_at_with_setup(
-                &f,
-                source,
-                owed,
-                Some(cache.clone()),
-                &scope.0,
-                NOW,
-                |_| {},
-            );
-            assert_eq!(modes, (0, 0, 0));
-            assert_eq!(bytes, (0, 0));
-        }
-        assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
-        assert_eq!(
-            cache.durable_counters(source).unwrap().0.restored,
-            u64::from(restart == 1)
-        );
-        index = next;
-        index.save(&path).unwrap();
-        cache.durable_write_after_save(lock, source, &index);
-        cache.durable_gc(lock, source, &index).unwrap();
-        drop(cache);
-        index = ScanIndex::load(&path).unwrap();
-    }
-    // Separate quiet restart: a cache miss grants no read permission and no
-    // restored EOF. The previous accepted activity makes this file unselected.
-    assert_eq!(
-        index.candidate_decision(&current_candidate(&f, &index)),
-        CandidateDecision::Skip
-    );
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    cache.durable_begin_pass(source, &path, &scope, capture);
-    let projection = feed(&f);
-    let (_, scan, modes, _) =
-        production_scan_at_with_setup(&f, source, index, Some(cache.clone()), &scope.0, NOW, |s| {
-            s.codex_versions = Some(projection.clone())
-        });
-    assert_eq!(scan.scanned_file_count, 0);
-    assert_eq!(modes, (0, 0, 0));
-    assert_eq!(cache.durable_counters(source).unwrap().0.restored, 0);
-    assert!(projection.snapshot().0.is_none());
-    assert_eq!(projection.snapshot().1, 0);
 }
 
 #[test]

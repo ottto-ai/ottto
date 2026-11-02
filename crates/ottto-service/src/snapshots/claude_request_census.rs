@@ -2987,16 +2987,15 @@ fn insert_transcript_record(
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
             let held = |key: &str| {
-                super::restart_restore::enabled()
-                    && (page_held.contains(key)
-                        || index
-                            .traversal
-                            .as_ref()
-                            .is_some_and(|walk| walk.residue.index_keys.contains(key))
-                        || index
-                            .scan_residue_witness
-                            .as_ref()
-                            .is_some_and(|witness| witness.index_keys.contains(key)))
+                (page_held.contains(key)
+                    || index
+                        .traversal
+                        .as_ref()
+                        .is_some_and(|walk| walk.residue.index_keys.contains(key))
+                    || index
+                        .scan_residue_witness
+                        .as_ref()
+                        .is_some_and(|witness| witness.index_keys.contains(key)))
             };
             let excluded = |key: &str| {
                 active
@@ -3323,9 +3322,7 @@ fn retire_claude_transcript_records_excluding(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
-    let held = |key: &str| {
-        super::restart_restore::enabled() && terminal_residue.is_some_and(|held| held.contains(key))
-    };
+    let held = |key: &str| terminal_residue.is_some_and(|held| held.contains(key));
     let growth_excluded = |key: &str| {
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
     };

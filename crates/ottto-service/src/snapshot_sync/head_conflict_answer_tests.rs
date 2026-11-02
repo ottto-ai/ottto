@@ -198,7 +198,6 @@ fn revision_v2(item: &SnapshotItem) -> String {
 #[test]
 fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     {
-        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         super::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::assert_head_conflict_account_placement();
     }
     let item = item();

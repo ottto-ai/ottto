@@ -101,11 +101,13 @@ impl PendingTail {
             return false; // PRE never ran: the read failed before it.
         };
         if self.unsealed || !finish_loss_free(native) {
+            super::counters::bump("tail_publish", "dropped");
             return false;
         }
         // Staging only fails on a poisoned route lock; the predecessor stays.
         match (encoded.staged, encoded.finish_field) {
             (Err(_), _) => {
+                super::counters::bump("tail_full_encode", "failed");
                 let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
                 false
             }

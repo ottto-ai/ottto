@@ -1,4 +1,4 @@
-//! A subdivision of the existing, prepaid ActiveLease credit. No child uses
+//! A subdivision of a line's prepaid decode credit. No child uses
 //! Value::deserialize (including serde_json's raw-value reparsing escape).
 use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};

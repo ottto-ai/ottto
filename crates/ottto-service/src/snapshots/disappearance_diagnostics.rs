@@ -430,11 +430,7 @@ pub(super) mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                        None,
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             assert!(candidate.is_none());
@@ -470,7 +466,6 @@ pub(super) mod tests {
                 SnapshotSource::Pi,
                 &mut index,
                 BACKFILL_WINDOW_DAYS,
-                None,
                 None,
             )
         });
@@ -578,11 +573,7 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &mut crate::snapshots::CandidateDiscovery::new(
-                    &mut ScanIndex::default(),
-                    None,
-                    None,
-                ),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             )
             .unwrap();
             assert!(census.observed_index_keys.contains(&key));
@@ -970,7 +961,7 @@ pub(super) mod tests {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(index, None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(index, None),
         )
         .is_none());
         let removed = census.removed_index_keys.contains(&local_index_key(member));
@@ -981,7 +972,7 @@ pub(super) mod tests {
             .counts
             .disappeared_file_count;
         if directory.is_some() {
-            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, 7, None, None);
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, 7, None);
         }
         let directory_lost = index
             .traversal
@@ -1460,11 +1451,7 @@ pub(super) mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                        None,
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             assert!(candidate.is_none());
@@ -1489,7 +1476,7 @@ pub(super) mod tests {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         fs::rename(&project, dir.join("project-renamed")).unwrap();
@@ -1540,11 +1527,7 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &mut crate::snapshots::CandidateDiscovery::new(
-                    &mut ScanIndex::default(),
-                    None,
-                    None,
-                ),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             )
         });
         fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1574,11 +1557,7 @@ pub(super) mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                        None
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
                 .is_none());
                 fs::write(&path, b"{}\n").unwrap();
@@ -1588,11 +1567,7 @@ pub(super) mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                        None,
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
                 .unwrap();
                 fs::remove_file(&path).unwrap();
@@ -1633,7 +1608,6 @@ pub(super) mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut index,
                 BACKFILL_WINDOW_DAYS,
-                None,
                 None,
             )
         });
@@ -1739,7 +1713,6 @@ mod absence_parent_counts_tests {
                         &mut crate::snapshots::CandidateDiscovery::new(
                             &mut ScanIndex::default(),
                             None,
-                            None,
                         ),
                     )
                 });
@@ -1807,7 +1780,6 @@ mod absence_parent_counts_tests {
                         &mut crate::snapshots::CandidateDiscovery::new(
                             &mut ScanIndex::default(),
                             None,
-                            None,
                         ),
                     )
                 });
@@ -1849,7 +1821,7 @@ mod absence_parent_counts_tests {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         fs::remove_file(&path).unwrap();
@@ -1924,11 +1896,7 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &mut crate::snapshots::CandidateDiscovery::new(
-                    &mut ScanIndex::default(),
-                    None,
-                    None,
-                ),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             );
             assert_eq!(counts(scope), serde_json::json!({}));
         }

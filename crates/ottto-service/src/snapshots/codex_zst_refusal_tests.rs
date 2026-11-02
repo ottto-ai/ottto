@@ -68,7 +68,6 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
 /// inventory excludes them without poisoning ordinary join completeness.
 #[test]
 fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("codex-zst-closure");
     let path = root.join("rollout-synthetic.jsonl.zst");
     // Valid JSON under the archive suffix catches accidental plain parsing too.
@@ -136,28 +135,8 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         )
         .is_err());
     });
-    let source = SnapshotSource::Codex;
-    let index = ScanIndex::default();
-    let scope = crate::transcript_acquisition::Scope("fixture".into());
-    let interpretation =
-        sampled_scan::durable_tail::Interpretation::of(source, "fixture", &index, false, &scope);
-    assert_refused(CodexZstCause::DurableTailUnsupported, || {
-        assert!(matches!(
-            sampled_scan::SharedCache::default().durable_restore(
-                source,
-                "fixture",
-                &path,
-                &scope,
-                &mut file(),
-                &index,
-                &interpretation
-            ),
-            sampled_scan::durable_tail::RestoreOutcome::Miss(_)
-        ));
-    });
     fs::remove_dir_all(root).unwrap();
 }
-
 #[test]
 fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal() {
     let root = crate::test_scratch::private_dir("codex-zst-opened-closure");

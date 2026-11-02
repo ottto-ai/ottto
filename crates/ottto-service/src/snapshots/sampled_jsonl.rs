@@ -63,9 +63,6 @@ pub(super) mod preparation_tests {
     pub(in crate::snapshots) fn set(hook: Option<Hook>) {
         FAULT.with(|fault| *fault.borrow_mut() = hook);
     }
-    pub(in crate::snapshots) fn refuse_heap(value: bool) {
-        HEAP_REFUSAL.with(|flag| flag.set(value));
-    }
     pub(in crate::snapshots) fn heap_refused() -> bool {
         HEAP_REFUSAL.with(|flag| flag.get())
     }
@@ -105,9 +102,8 @@ impl CachedJsonlReduction {
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
-    /// The borrowed PRE-finalization fields a durable record stages from, in the
-    /// body's field order; the live finish seam passes the same five.
-    #[cfg(unix)]
+    /// The borrowed PRE-finalization fields, for tests.
+    #[cfg(test)]
     pub(super) fn finish_view(
         &self,
     ) -> (&SnapshotAccumulator, &JsonlReadReport, (usize, usize, bool)) {
@@ -140,7 +136,6 @@ impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
 }
 
 pub(super) struct CompletedNativeAcquisition {
-    pub(super) durable: super::DurableCustody,
     pub(super) checkpoint: Checkpoint,
     pub(super) reduction: Option<CachedJsonlReduction>,
     /// `Some(rank)`: this completion's deferred release ran
@@ -155,7 +150,7 @@ pub(super) struct CompletedNativeAcquisition {
     /// its own bit is the job's `eof_applied` or `fragment`.
     pub(super) unsealed: bool,
 }
-crate::heap_layout_bound::fields!(CompletedNativeAcquisition; durable, checkpoint, reduction, released, unsealed);
+crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released, unsealed);
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
 #[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
@@ -178,31 +173,13 @@ pub(super) struct LiveReductionInputs {
     parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::snapshots) enum PreparationRefusal {
-    Transient,
-    NonTransient(&'static str),
-}
-
 pub(in crate::snapshots) struct PrepareRejected {
-    pub(in crate::snapshots) refusal: PreparationRefusal,
     pub(in crate::snapshots) error: anyhow::Error,
     pub(in crate::snapshots) taken:
         Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
 }
 
 impl OwnedJsonlParser {
-    /// The read's custody, retail attempt ended; also the uncertified restart-restore owner.
-    pub(super) fn completed_durable(&mut self) -> super::DurableCustody {
-        let durable = self.reader.reader.take_durable();
-        #[cfg(unix)]
-        let mut durable = durable;
-        #[cfg(unix)]
-        if let Some(attempt) = durable.take_retail() {
-            attempt.finish();
-        }
-        durable
-    }
     /// The source mtime this read's checkpoint will carry
     /// (`ReadPlan::modified_hint`); `None` without a plan.
     pub(super) fn planned_modified_hint(&self) -> Option<(i64, i64)> {
@@ -235,13 +212,12 @@ impl OwnedJsonlParser {
         let taken = old.map(|retained| {
             Box::new(crate::transcript_cache::Taken {
                 retained,
-                durable: Default::default(),
                 modified_hint: (0, 0),
                 finalization_charge: 0,
                 e2_held_new_file: false,
             })
         });
-        self.prepare_acquisition_inner(taken, scope, debt, now, (false, None), |_, _| Ok(true))
+        self.prepare_acquisition_inner(taken, scope, debt, now, |_, _| Ok(true))
             .map_err(|rejected| rejected.error)
     }
 
@@ -252,51 +228,13 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
-        self.prepare_acquisition_owned_planned(taken, scope, debt, now, None)
-    }
-
-    /// The restore caller may plan under its paid transfer lease before Q11.
-    /// Reuse that same held-FD/checkpoint/scope plan; never repeat sample I/O.
-    pub(in crate::snapshots) fn prepare_acquisition_owned_planned(
-        &mut self,
-        taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
-        scope: &Scope,
-        debt: Option<AuditDebt>,
-        now: u64,
-        planned: Option<ReadPlan>,
-    ) -> std::result::Result<ReadMode, PrepareRejected> {
         #[cfg(test)]
         if let Some(original) = taken.as_ref() {
             if let Err(error) = preparation_tests::check(original) {
-                return Err(PrepareRejected {
-                    error,
-                    taken,
-                    refusal: PreparationRefusal::Transient,
-                });
+                return Err(PrepareRejected { error, taken });
             }
         }
-        self.prepare_acquisition_inner(taken, scope, debt, now, (true, planned), |_, _| Ok(true))
-    }
-    #[cfg(test)]
-    pub(super) fn prepare_acquisition_with_reuse_gate(
-        &mut self,
-        old: Option<Retained<CachedJsonlReduction>>,
-        scope: &Scope,
-        debt: Option<AuditDebt>,
-        now: u64,
-        reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
-    ) -> Result<ReadMode> {
-        let taken = old.map(|retained| {
-            Box::new(crate::transcript_cache::Taken {
-                retained,
-                durable: Default::default(),
-                modified_hint: (0, 0),
-                finalization_charge: 0,
-                e2_held_new_file: false,
-            })
-        });
-        self.prepare_acquisition_inner(taken, scope, debt, now, (false, None), reuse)
-            .map_err(|rejected| rejected.error)
+        self.prepare_acquisition_inner(taken, scope, debt, now, |_, _| Ok(true))
     }
 
     fn prepare_acquisition_inner(
@@ -305,10 +243,8 @@ impl OwnedJsonlParser {
         scope: &Scope,
         debt: Option<AuditDebt>,
         now: u64,
-        (preserve, planned): (bool, Option<ReadPlan>),
         mut reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
-        let preserve = preserve && restart_restore::enabled();
         let checked = (|| -> Result<()> {
             // Checkpoints, samples and resume offsets are physical-file bytes. A
             // compressed stream has none, so it is never sampled or resumed.
@@ -325,24 +261,10 @@ impl OwnedJsonlParser {
                 self.reader.reader.buffer().is_empty() && !self.reader.finished,
                 "acquisition must begin before native parsing"
             );
-            anyhow::ensure!(
-                self.reader.reader.accepts_durable(),
-                "native custody occupied"
-            );
             Ok(())
         })();
         if let Err(error) = checked {
-            if restart_restore::enabled() {
-                crate::local_resource_diagnostics::durable_tail_alarm(
-                    self.source.api_slug(),
-                    &serde_json::json!({"prepare_invariant": 1}),
-                );
-            }
-            return Err(PrepareRejected {
-                error,
-                taken,
-                refusal: PreparationRefusal::Transient,
-            });
+            return Err(PrepareRejected { error, taken });
         }
         let reusable = taken
             .as_ref()
@@ -376,50 +298,20 @@ impl OwnedJsonlParser {
                         }))
             });
         if !reusable {
-            if preserve {
-                return Err(PrepareRejected {
-                    error: anyhow::anyhow!("incompatible acquisition"),
-                    refusal: PreparationRefusal::NonTransient("prepare_incompatible"),
-                    taken,
-                });
-            }
             taken = None;
         }
-        if preserve
-            && taken
-                .as_ref()
-                .is_some_and(|taken| taken.retained.checkpoint.scope() != scope)
-        {
-            return Err(PrepareRejected {
-                error: anyhow::anyhow!("incompatible acquisition scope"),
-                refusal: PreparationRefusal::NonTransient("prepare_scope"),
-                taken,
-            });
-        }
         let old = taken.as_ref().map(|taken| &taken.retained);
-        let mut plan = match planned.map_or_else(
-            || {
-                ReadPlan::prepare(
-                    self.reader.reader.get_mut(),
-                    old.as_ref().map(|old| &old.checkpoint),
-                    scope,
-                    debt,
-                    now,
-                )
-            },
-            Ok,
+        let mut plan = match ReadPlan::prepare(
+            self.reader.reader.get_mut(),
+            old.as_ref().map(|old| &old.checkpoint),
+            scope,
+            debt,
+            now,
         ) {
             Ok(plan) => plan,
             Err(error) => {
                 return Err(PrepareRejected {
                     error: error.into(),
-                    // An old checkpoint's metadata/sample/seek failure may
-                    // persist. Returning it must allow MAIN's zero-based Full.
-                    refusal: if old.is_some() {
-                        PreparationRefusal::NonTransient("prepare_io")
-                    } else {
-                        PreparationRefusal::Transient
-                    },
                     taken,
                 });
             }
@@ -447,18 +339,11 @@ impl OwnedJsonlParser {
                             return Err(PrepareRejected {
                                 error: error.into(),
                                 taken,
-                                refusal: PreparationRefusal::Transient,
                             })
                         }
                     };
                 }
-                Err(error) => {
-                    return Err(PrepareRejected {
-                        error,
-                        taken,
-                        refusal: PreparationRefusal::Transient,
-                    })
-                }
+                Err(error) => return Err(PrepareRejected { error, taken }),
             }
         }
         let mode = plan.mode();
@@ -477,18 +362,6 @@ impl OwnedJsonlParser {
         ) {
             taken = None;
         }
-        if preserve
-            && matches!(mode, ReadMode::Full(_))
-            && taken
-                .as_ref()
-                .is_some_and(|taken| !taken.durable.is_empty())
-        {
-            return Err(PrepareRejected {
-                error: anyhow::anyhow!("retained acquisition refused"),
-                refusal: PreparationRefusal::NonTransient("prepare_full"),
-                taken,
-            });
-        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }
@@ -501,7 +374,6 @@ impl OwnedJsonlParser {
                 positive_usage_evidence,
             } = {
                 let taken = taken.take().expect("continued acquisition");
-                self.reader.reader.put_durable(taken.durable);
                 taken.retained.state
             };
             // These are live native inputs, not immutable retained history.
@@ -626,7 +498,6 @@ impl OwnedJsonlParser {
         }
         if unsealed || !admitted_copy {
             return Ok(Some(CompletedNativeAcquisition {
-                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -652,7 +523,6 @@ impl OwnedJsonlParser {
             Event::RetentionCloneBoundRefused
         });
         Ok(Some(CompletedNativeAcquisition {
-            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: None,
@@ -726,11 +596,8 @@ impl OwnedJsonlParser {
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
-        let declined = |checkpoint: Checkpoint,
-                        durable: super::DurableCustody|
-         -> Result<Option<CompletedNativeAcquisition>> {
+        let declined = |checkpoint: Checkpoint| -> Result<Option<CompletedNativeAcquisition>> {
             Ok(Some(CompletedNativeAcquisition {
-                durable,
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -738,7 +605,7 @@ impl OwnedJsonlParser {
             }))
         };
         if unsealed || !compatible {
-            return declined(checkpoint, self.completed_durable());
+            return declined(checkpoint);
         }
         let limit = budget_after.min(release.entry_limit);
         if self.certified_charge(&checkpoint, limit).is_none() {
@@ -751,7 +618,7 @@ impl OwnedJsonlParser {
                     Refusal::Admission { charge },
                 ));
             }
-            return declined(checkpoint, self.completed_durable());
+            return declined(checkpoint);
         }
         #[cfg(test)]
         sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeStampGate);
@@ -762,7 +629,7 @@ impl OwnedJsonlParser {
             || checkpoint.modified_hint() != release.modified
         {
             record(Event::RetentionUnsealedEof);
-            return declined(checkpoint, self.completed_durable());
+            return declined(checkpoint);
         }
         #[cfg(test)]
         let entry_limit = release.entry_limit;
@@ -775,7 +642,7 @@ impl OwnedJsonlParser {
                 RefusalView::deferred(budget_after, entry_limit),
                 Refusal::Release(outcome),
             ));
-            return declined(checkpoint, self.completed_durable());
+            return declined(checkpoint);
         }
         let reduction = self.reduction_copy();
         let charge = crate::heap_layout_bound::bound(&reduction, limit);
@@ -797,7 +664,6 @@ impl OwnedJsonlParser {
             Event::RetentionCloneBoundRefused
         });
         Ok(Some(CompletedNativeAcquisition {
-            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: Some(rank),
@@ -833,7 +699,6 @@ impl OwnedJsonlParser {
         let len = self.reader.reader.get_ref().metadata()?.len();
         Ok(SideCertificate::Certified {
             completed: CompletedNativeAcquisition {
-                durable: self.completed_durable(),
                 unsealed: checkpoint.sealed_offset() != len,
                 checkpoint,
                 reduction: None,
@@ -879,7 +744,6 @@ impl OwnedJsonlParser {
             || !sampled_scan::compatible_reduction(&self.accumulator)
         {
             return CompletedNativeAcquisition {
-                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -906,7 +770,6 @@ impl OwnedJsonlParser {
         self.restore_live_reduction_inputs(inputs);
         let Some(accumulator) = accumulator else {
             return CompletedNativeAcquisition {
-                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -922,7 +785,6 @@ impl OwnedJsonlParser {
         };
         let reduction = crate::heap_layout_bound::bound(&reduction, budget).map(|_| reduction);
         CompletedNativeAcquisition {
-            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: None,

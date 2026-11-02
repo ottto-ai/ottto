@@ -172,28 +172,6 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
-/// Native label losses only, never label text. Twelve fixed u64 cells (96 B),
-/// no per-key state. Invalid activity signals count inputs, since the existing
-/// detector deliberately does not expose the unnamed/dropped labels.
-#[inline(never)]
-pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
-    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-    let source_slot = match source {
-        "claude_code" => 0,
-        "codex" => 1,
-        "pi" => 2,
-        _ => return,
-    };
-    let slot = source_slot * 4
-        + usize::from(set == "activity") * 2
-        + usize::from(reason == "invalid_signal");
-    let total = COUNTS[slot].fetch_add(1, Relaxed).saturating_add(1);
-    durable_tail_alarm(
-        source,
-        &serde_json::json!({"skill_label_native_dropped": {(set): {(reason): total}}}),
-    );
-}
-
 #[cfg(not(test))]
 static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
@@ -289,8 +267,6 @@ pub(crate) enum CodexZstCause {
     ProofChildUnsupported = 2,
     #[serde(rename = "CompressedParentSideUnsupported")]
     ParentSideUnsupported = 3,
-    #[serde(rename = "CompressedDurableTailUnsupported")]
-    DurableTailUnsupported = 4,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
     GroupProbeUnsupported = 5,
     #[serde(rename = "CompressedGroupReadUnsupported")]
@@ -1491,14 +1467,14 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 pub(crate) fn claude_state_v2(counts: &impl Serialize) {
     traversal_point("claude_state_v2", "claude_code", counts);
 }
-/// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
-/// disabled store, as [since last, total] counts. No path, id or wire event.
+/// The page's local counter line, as [since last, total] counts. No path, id or
+/// wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
 }
-/// At most once per 24 h while restart Fulls caused by a failed store write persist.
-pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
-    traversal_point("durable_tail_restart_full_alarm", source, counts);
+/// At most once per 24 h while reconstructions after a head persist.
+pub(crate) fn tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("tail_restart_full_alarm", source, counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
@@ -1634,60 +1610,21 @@ crate::heap_layout_bound::no_heap!(false; NativeDecision);
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) owed_full_after_lossy_shrink: u64,
-    /// Native Full read completed; does not imply verification or publication.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) owed_full_after_lossy_shrink_completed: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
-        self.restore_outcome.restored == 0
-            && self.restore_outcome.held == 0
-            && self.restore_outcome.pending == 0
-            && self.restore_outcome.miss.is_empty()
-            && self.restore_outcome.stale.is_empty()
-            && self.owed_full_after_lossy_shrink == 0
-            && self.owed_full_after_lossy_shrink_completed == 0
+        self.restore_outcome.miss.is_empty()
     }
 }
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct RestoreCounts {
-    #[serde(skip_serializing_if = "is_zero")]
-    restored: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    held: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pending: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    stale: BTreeMap<&'static str, u64>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
-    pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
-        use crate::snapshots::sampled_scan::RestoreOutcome;
-        let count = match outcome {
-            RestoreOutcome::Restored(..) => &mut self.restored,
-            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
-            RestoreOutcome::Pending | RestoreOutcome::QuietPending => &mut self.pending,
-            RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
-            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
-            RestoreOutcome::StaleUnregistered(reason, obligation) => {
-                let label =
-                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
-                let attribution = self.stale_attribution.entry(label).or_default();
-                *attribution = attribution.saturating_add(1);
-                self.stale.entry(reason).or_default()
-            }
-            RestoreOutcome::Degraded => self
-                .miss
-                .entry("degraded_no_record.active_bound")
-                .or_default(),
-        };
+    pub(crate) fn record(&mut self, class: crate::snapshots::sampled_scan::MissClass) {
+        let count = self.miss.entry(class.label()).or_default();
         *count = count.saturating_add(1);
     }
 }
@@ -2031,7 +1968,6 @@ mod tests {
             ProofParentUnsupported,
             ProofChildUnsupported,
             ParentSideUnsupported,
-            DurableTailUnsupported,
             GroupProbeUnsupported,
             GroupReadUnsupported,
             ParentLedgerUnbound,
@@ -2068,81 +2004,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn restore_counts_are_sparse_saturating_and_page_scoped() {
-        use crate::snapshots::sampled_scan::{MissClass, RestoreOutcome};
-        let mut probe = Probe::start();
-        let collection = |full_causes| CollectionCounts {
-            scanned_files: 0,
-            semantic_noops: 0,
-            sampled_acquisition: None,
-            full_causes,
-        };
-        let (_, rows) = capture(|| {
-            probe.collection("codex", collection(Default::default()));
-            probe
-                .full_causes
-                .restore_outcome
-                .record(&RestoreOutcome::Miss(MissClass::Missing));
-            probe
-                .full_causes
-                .restore_outcome
-                .record(&RestoreOutcome::Miss(MissClass::Missing));
-            probe
-                .full_causes
-                .restore_outcome
-                .record(&RestoreOutcome::Held(
-                    crate::durable_tail_store::Refusal::Unknown,
-                ));
-            let counts = std::mem::take(&mut probe.full_causes);
-            probe.collection("codex", collection(counts));
-            let counts = std::mem::take(&mut probe.full_causes);
-            probe.collection("codex", collection(counts));
-        });
-        assert!(rows[0]["counts"].get("full_causes").is_none());
-        let counts = &rows[1]["counts"]["full_causes"]["restore_outcome"];
-        assert_eq!(counts["miss"]["missing"], 2);
-        assert_eq!(counts["held"], 1);
-        assert!(counts.get("restored").is_none());
-        assert_eq!(rows[1]["schema_version"], 2);
-        assert!(rows[1]["counts"]["sampled_acquisition"].is_null());
-        assert!(rows[2]["counts"].get("full_causes").is_none());
-        let counts = &mut probe.full_causes.restore_outcome;
-        counts.held = u64::MAX;
-        counts.record(&RestoreOutcome::Held(
-            crate::durable_tail_store::Refusal::Unknown,
-        ));
-        assert_eq!(counts.held, u64::MAX);
-        counts.held = 0;
-        counts.record(&RestoreOutcome::Pending);
-        assert!(
-            !probe.full_causes.is_empty(),
-            "pending-only pages remain visible"
-        );
-        probe.full_causes.restore_outcome.restored = 1;
-        let json = serde_json::to_value(&probe.full_causes).unwrap();
-        assert_eq!(json["restore_outcome"]["restored"], 1);
-        assert_eq!(json["restore_outcome"]["pending"], 1);
-        let causes = FullCauses {
-            owed_full_after_lossy_shrink: 1,
-            ..Default::default()
-        };
-        assert!(!causes.is_empty());
-        assert_eq!(
-            serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
-            1
-        );
-        let completed = FullCauses {
-            owed_full_after_lossy_shrink_completed: 1,
-            ..Default::default()
-        };
-        assert!(!completed.is_empty(), "completion may fall on a later page");
-        let json = serde_json::to_value(completed).unwrap();
-        assert_eq!(json["owed_full_after_lossy_shrink_completed"], 1);
-        assert!(json.get("owed_full_after_lossy_shrink").is_none());
-    }
 
     #[test]
     fn connection_binding_failures_are_counted_without_sensitive_detail() {

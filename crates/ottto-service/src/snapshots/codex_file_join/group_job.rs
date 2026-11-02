@@ -660,7 +660,6 @@ impl GroupBoot {
         parser.accumulator.codex_tier_replay = Some(replay);
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
-            recovered_audit_due: None,
             comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
@@ -685,7 +684,6 @@ impl GroupBoot {
                 key,
                 owner: group.owner,
                 home: group.home,
-                recovered: vec![None; members.len()],
                 members,
                 stamps,
                 digests,

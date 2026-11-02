@@ -23,8 +23,7 @@ mod runtime;
         reason = "R1 consumes this staged crate-visible erasure seam"
     )
 )]
-pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
+pub(in super::super) use runtime::{remove_retired_record_dir, retired_record_dir};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
@@ -132,7 +131,7 @@ struct Identity {
 
 /// Sources whose index routes through this store: their durable_sources row.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    crate::durable_tail_store::DurableSource::from_snapshot(source.snapshot())
+    crate::snapshots::durable_sources::DurableSource::from_snapshot(source.snapshot())
         .is_some_and(|source| source.properties().state_v2)
 }
 const INLINE_BYTES: usize = 512;

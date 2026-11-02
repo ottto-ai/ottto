@@ -45,6 +45,20 @@ pub(in crate::snapshots) fn max(name: &'static str, label: &'static str, n: u64)
     });
 }
 
+/// At most once per 24 h while reconstructions after a head persist. RAM only:
+/// a restart alarms again.
+pub(in crate::snapshots) fn restart_full_alarm_due() -> bool {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < EVERY) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 #[cfg(not(test))]
 static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]

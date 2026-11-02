@@ -341,11 +341,6 @@ impl<'a> Dec<'a> {
         }
         Ok(len)
     }
-    /// The next length, not consumed: a caller's bound before the field's
-    /// own decode asks for any allowance.
-    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
-        Dec::new(&self.bytes[self.at..]).take_len()
-    }
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
@@ -365,9 +360,6 @@ impl<'a> Dec<'a> {
     }
     pub(crate) fn note_pl_labels(&mut self, len: usize) {
         self.pl_labels_nonempty |= len != 0;
-    }
-    pub(crate) fn has_pl_labels(&self) -> bool {
-        self.pl_labels_nonempty
     }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
@@ -1578,13 +1570,6 @@ macro_rules! durable_struct {
     (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
         $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
         impl $t {
-            fn put_borrowed(e: &mut $crate::durable_tail_codec::Enc, $($f: &$ty),*)
-                -> Result<(), $crate::durable_tail_codec::Refuse> {
-                $($crate::durable_tail_codec::durable_field!(
-                    put $c, e, $f, $ty, concat!(stringify!($t), ".", stringify!($f))
-                );)*
-                Ok(())
-            }
         }
     };
     (key $t:ident $body:tt) => {
@@ -1838,14 +1823,6 @@ fn note_verify_visit(at: usize, varint: bool) {
             visits.push((at, varint));
         }
     });
-}
-#[cfg(test)]
-pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
-    VERIFY_PRESENT_OPTIONS.with(|count| count.set(0));
-    VERIFY_VISITS.with(|visits| *visits.borrow_mut() = Some(Vec::new()));
-    f();
-    let visits = VERIFY_VISITS.with(|visits| visits.borrow_mut().take().unwrap());
-    (visits, VERIFY_PRESENT_OPTIONS.with(std::cell::Cell::get))
 }
 
 #[cfg(test)]

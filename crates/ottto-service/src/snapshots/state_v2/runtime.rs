@@ -1192,7 +1192,7 @@ fn erasure_inventory(path: &Path) -> Result<()> {
         .filter_map(|(suffix, _, class)| class.map(|class| (class, fence::sibling(path, suffix))))
         .chain(std::iter::once((
             "restart_record_inventory",
-            crate::durable_tail_store::store_dir_for_index(path),
+            retired_record_dir(path),
         )));
     for (class, artifact) in artifacts {
         let mut count = 0_u64;
@@ -1254,6 +1254,24 @@ pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     close_tree(support, false)
 }
 
+/// The retired restart-record directory beside a scan index.
+pub(in super::super) fn retired_record_dir(index_path: &Path) -> PathBuf {
+    index_path.with_extension("durable-tail")
+}
+
+/// Removes that directory, never following a link, and syncs its parent.
+/// `Ok(false)`: nothing was there.
+pub(in super::super) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
+    match fs::symlink_metadata(records) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
+        Ok(_) => fs::remove_file(records)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    super::super::sync_checkpoint_parent(records)?;
+    Ok(true)
+}
+
 /// Explicit erasure only. Close the shared session before unlinking all
 /// artifacts, and invalidate clones before releasing CheckpointLock.
 pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
@@ -1270,13 +1288,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
     }
     super::ack::erase_failed_imports(path)?;
     super::super::sync_checkpoint_parent(path)?;
-    let records = crate::durable_tail_store::store_dir_for_index(path);
-    match fs::symlink_metadata(&records) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(&records)?,
-        Ok(_) => fs::remove_file(&records)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    remove_retired_record_dir(&retired_record_dir(path))?;
     super::super::sync_checkpoint_parent(path)?;
     // Retain the invalidated route's custody latch: erased artifacts must not
     // let this process resume v1 or re-create v2 without an explicit new lineage.
@@ -1667,7 +1679,3 @@ mod tail_tests;
 pub(crate) use tail_tests::{
     seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
 };
-
-#[path = "runtime_live_keys.rs"]
-mod live_keys;
-pub(crate) use live_keys::{live_key_digests, IncompleteReason, LiveKeys};

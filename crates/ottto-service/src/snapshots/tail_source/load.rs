@@ -33,10 +33,9 @@ pub(in crate::snapshots) enum Load {
     Cold(Option<FullReason>),
 }
 
-/// The route Claude's Tail lives on: the state database, unless the record
-/// store's restart restore (fixtures only) keeps its own continuation.
+/// The route Claude's Tail lives on: the state database.
 pub(in crate::snapshots) fn route(source: SnapshotSource, index: &ScanIndex) -> Option<PathBuf> {
-    (source == SnapshotSource::ClaudeCode && !restart_restore::enabled())
+    (source == SnapshotSource::ClaudeCode)
         .then(|| state_v2::runtime_path(index).ok().flatten())
         .flatten()
 }
@@ -163,8 +162,25 @@ pub(super) fn load<S: TailSource>(
         }
     };
     if let Some(cause) = reconstruct {
-        point("tail_reconstruct", serde_json::json!({ "cause": cause }));
+        // A head was read and could not be reused; the release gate reads
+        // these apart from a file's first read.
+        let after_head = !matches!(cause, "no_head" | "unreadable");
+        let bytes = held.metadata().map_or(0, |metadata| metadata.len());
+        point(
+            "tail_reconstruct",
+            serde_json::json!({ "cause": cause, "after_head": after_head, "bytes": bytes }),
+        );
         counters::bump("tail_reconstruct", cause);
+        counters::add("tail_reconstruct_bytes", cause, bytes);
+        if after_head {
+            counters::bump("tail_reconstruct_after_head", cause);
+            if counters::restart_full_alarm_due() {
+                crate::local_resource_diagnostics::tail_restart_full_alarm(
+                    slug,
+                    &serde_json::json!({ "cause": cause }),
+                );
+            }
+        }
     }
     point(
         "tail_db_loads",
@@ -229,7 +245,6 @@ fn stored<S: TailSource>(
         .rederive_content_planned(held, &plan)
         .map_err(not_rederivable)?;
     let taken = Taken {
-        durable: Default::default(),
         modified_hint: checkpoint.modified_hint(),
         retained: Retained {
             checkpoint,

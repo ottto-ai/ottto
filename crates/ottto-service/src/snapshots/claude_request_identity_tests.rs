@@ -2535,7 +2535,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         record_claude_request_census(
             &mut index,
             ClaudeRequestCensusParse {
-                    held_index_keys: &BTreeSet::new(),
+                held_index_keys: &BTreeSet::new(),
                 path: &quiet_path,
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,
@@ -3393,6 +3393,43 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
     assert_eq!(identity::classify(&foreign, &request), tagged(None));
 }
 
+fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
+    parse_session_with_money(folder, lines, false)
+}
+
+fn parse_ordinary_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
+    parse_session_with_money(folder, lines, true)
+}
+
+fn parse_session_with_money(folder: &Path, lines: &[Value], ordinary: bool) -> Vec<SnapshotItem> {
+    let project = folder.join("projects").join("-synthetic-repo");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{ROOT}.jsonl"));
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    if ordinary {
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "fp".into(),
+        )
+        .unwrap()
+    } else {
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
+    }
+}
+
+// --- Cross-root ownership and settled transcript markers ----------------------
+
+const OTHER_ROOT: &str = "2448b91b-a47d-4dcd-b6cc-61ad77541cb6";
+const THIRD_ROOT: &str = "3558ca2c-b58e-4ede-87dd-72be88652dc7";
+
 /// One synthetic session in a slot folder: an arbitrary recorded email (before
 /// or after `req_1`, optionally switched), a credential org marker and `req_1`.
 fn email_session(email_first: bool, flip: bool) -> Vec<Value> {
@@ -3424,38 +3461,6 @@ fn email_session(email_first: bool, flip: bool) -> Vec<Value> {
         lines.push(context_line);
     }
     lines
-}
-
-fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
-    parse_session_with_money(folder, lines, false)
-}
-
-fn parse_ordinary_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
-    parse_session_with_money(folder, lines, true)
-}
-
-fn parse_session_with_money(folder: &Path, lines: &[Value], ordinary: bool) -> Vec<SnapshotItem> {
-    let project = folder.join("projects").join("-synthetic-repo");
-    fs::create_dir_all(&project).unwrap();
-    let path = project.join(format!("{ROOT}.jsonl"));
-    fs::write(
-        &path,
-        lines
-            .iter()
-            .map(|line| line.to_string() + "\n")
-            .collect::<String>(),
-    )
-    .unwrap();
-    if ordinary {
-        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-08-02T07:01:00Z",
-            "fp".into(),
-        )
-        .unwrap()
-    } else {
-        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
-    }
 }
 
 #[test]
@@ -3671,12 +3676,6 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     assert_eq!(identity::classify(&evidence, &desktop), org_only, "Desktop");
     let _ = fs::remove_dir_all(dir);
 }
-
-// --- Cross-root ownership and settled transcript markers ----------------------
-
-const OTHER_ROOT: &str = "2448b91b-a47d-4dcd-b6cc-61ad77541cb6";
-const THIRD_ROOT: &str = "3558ca2c-b58e-4ede-87dd-72be88652dc7";
-
 /// Telemetry and trace rows are keyed by trace root, so a fork or resume copy
 /// under another root holds a request whose rows sit under the original root.
 /// Those rows own the request: the copy never tags it from its own markers,

@@ -684,15 +684,6 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     view(evidence, cutover)
 }
 
-/// `singleton_view` by index key: the counting view a durable record
-/// binds to (written after a save and checked at restore, without a
-/// candidate).
-#[cfg(unix)]
-pub(super) fn singleton_view_of_key(key: &str, index: &ScanIndex) -> String {
-    let cutover = active_cutover_unix_ms();
-    view(key_evidence(key, index), cutover)
-}
-
 /// The counting view of a joined group (cursor K8): what
 /// `configure_group_once` would configure now from every member entry.
 pub(super) fn group_view<'a>(

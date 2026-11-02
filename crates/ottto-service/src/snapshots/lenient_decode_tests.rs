@@ -1591,7 +1591,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
-    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -1623,7 +1622,6 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 /// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
-    let _on = RestartRestoreForTest::enabled();
     // Main shipped audit progress first. The earlier `e2` writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
@@ -1753,7 +1751,6 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
-    let _on = RestartRestoreForTest::enabled();
     let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     current.as_object_mut().unwrap().remove("archives");
     current

@@ -1,6 +1,7 @@
-// Restart-restore emitted-body fixtures. Keep the active harness separate from
-// money_equivalence_tests.rs, which CI transplants unchanged onto the base.
-// The enclosing module name preserves the cross-build test and receipt catalog.
+// Emitted-body fixtures over Claude's Tail route and the other sources' RAM
+// path. Keep the active harness separate from money_equivalence_tests.rs, which
+// CI transplants unchanged onto the base. The enclosing module name preserves
+// the cross-build test and receipt catalog.
 use super::*;
 use serde_json::Value;
 
@@ -214,114 +215,72 @@ pub(super) fn receipt_with_output(
     );
 }
 
-/// The disk arm's state directory (#806): the committed scan index and,
-/// beside it, the real durable store, under a test-held single-writer lock
-/// for each fixture. Every arm loads the SAME committed index. A restart forks those
-/// committed bytes before the retained arm can replace its write-ahead record.
-/// Each arm keeps the production single-writer ownership of its own store.
+/// One restart owner's committed state: Claude's state database, or the
+/// other sources' saved index, under a test-held single-writer lock. Claude's
+/// retained and restart arms read the same committed heads; the cold arm owns
+/// an empty route. Only the restart arm's page commits.
 struct Disk {
     dir: PathBuf,
     index: PathBuf,
+    route: PathBuf,
 }
 impl Disk {
     fn new(c: &Corpus) -> Self {
-        let dir = c.base.join("durable-state");
+        let base = c.base.canonicalize().unwrap();
+        let dir = base.join("durable-state");
         std::fs::create_dir_all(&dir).unwrap();
         crate::locked_state_dir::test_locks::hold(&dir);
+        let (session, _) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
+            &ScanIndex::default(),
+            &dir,
+        );
+        let route = session.path().to_owned();
+        // The database outlives the session handle; the corpus owns the dir.
+        std::mem::forget(session);
+        E2ScanFixture::register_route_for_test(&route);
         Self {
             index: dir.join("scan-index.json"),
             dir,
+            route,
+        }
+    }
+    fn path(&self, source: SnapshotSource) -> &Path {
+        if source == SnapshotSource::ClaudeCode {
+            &self.route
+        } else {
+            &self.index
         }
     }
     fn begin(&self, owner: &E2ScanFixture, source: SnapshotSource) {
-        owner.begin_durable(source, &self.dir, &self.index);
+        owner.begin_pass(source, &self.dir, self.path(source));
+        if source == SnapshotSource::ClaudeCode {
+            owner.on_committed_route(&self.route);
+        }
     }
     /// A new owner: a restarted process with an empty RAM cache, whose pass
-    /// begins on the store as the daemon's does.
+    /// begins as the daemon's does.
     fn owner(&mut self, source: SnapshotSource) -> E2ScanFixture {
-        // Native acquisition writes ahead of the index save. Each
-        // counterfactual arm needs the committed predecessor, even after
-        // the retained arm advances its own store on the same transcript.
-        if !self.index.exists() {
-            let owner = E2ScanFixture::default();
-            self.begin(&owner, source);
-            return owner;
-        }
-        let dir = self.dir.join("restart");
-        std::fs::create_dir(&dir).unwrap();
-        crate::locked_state_dir::test_locks::hold(&dir);
-        let index = dir.join("scan-index.json");
-        std::fs::copy(&self.index, &index).unwrap();
-        let old_store = crate::durable_tail_store::store_dir_for_index(&self.index);
-        let new_store = crate::durable_tail_store::store_dir_for_index(&index);
-        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
-            .create(&new_store)
-            .unwrap();
-        if old_store.exists() {
-            for entry in std::fs::read_dir(old_store).unwrap() {
-                let entry = entry.unwrap();
-                std::fs::copy(entry.path(), new_store.join(entry.file_name())).unwrap();
-            }
-        }
-        self.dir = dir;
-        self.index = index;
         let owner = E2ScanFixture::default();
         self.begin(&owner, source);
         owner
     }
-    /// The daemon's commit: save the index, then the production post-save
-    /// record write and GC for this owner. Returns the index as the next
-    /// process loads it.
+    /// The daemon's commit: save the index, then the post-save reconcile for
+    /// this owner. Returns the index as the next process loads it.
     fn commit(
         &self,
         cache: &crate::snapshots::sampled_scan::SharedCache,
         source: SnapshotSource,
         index: &mut ScanIndex,
     ) -> ScanIndex {
-        index.save(&self.index).unwrap();
-        crate::snapshots::durable_after_save_and_retire(
-            cache,
-            &self.dir,
-            source,
-            index,
-            &self.index,
-        );
-        ScanIndex::load(&self.index).unwrap()
-    }
-    fn records(&self) -> usize {
-        std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&self.index))
-            .map_or(0, |entries| entries.count())
-    }
-    /// Every record file's bytes, generation stamp included.
-    fn record_bytes(&self) -> BTreeMap<PathBuf, Vec<u8>> {
-        std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&self.index))
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
-                let bytes = std::fs::read(&path).unwrap();
-                (path, bytes)
-            })
-            .collect()
+        let path = self.path(source);
+        index.save(path).unwrap();
+        crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
+        ScanIndex::load(path).unwrap()
     }
 }
 
-/// This owner's restore counters: (attempts, restored, ineligible classes).
-fn durable_restores(
-    cache: &crate::snapshots::sampled_scan::SharedCache,
-    source: SnapshotSource,
-) -> (u64, u64, BTreeMap<&'static str, u64>) {
-    let (counters, _) = cache
-        .durable_counters(source)
-        .expect("the owner began a durable pass");
-    (
-        counters.restore_attempts,
-        counters.restored,
-        counters.ineligible,
-    )
-}
-
-/// The warm owner reads Full and commits; its saved index is every arm's
-/// prior, and its records are the disk arm's restore source.
+/// The warm owner's first page, Full and committed.
 fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     let scanner = E2ScanFixture::default();
     disk.begin(&scanner, SnapshotSource::ClaudeCode);
@@ -329,13 +288,11 @@ fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     warm.enrich(c);
     warm.finish();
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
-    assert!(disk.records() > 0, "the warm owner persists its records");
     (scanner, prior)
 }
 
-/// Three arms over the SAME prior index and physical files: the retained
-/// RAM owner, a cold Full, and the disk arm (a new owner that restores the
-/// last commit's records from the real store, then Tails).
+/// Three arms over the SAME prior index and physical files: the warm owner, a
+/// cold Full, and a new owner, both continuing from the committed Tail heads.
 fn compare_claude(
     c: &Corpus,
     retained: &E2ScanFixture,
@@ -352,7 +309,6 @@ fn compare_claude(
             &restart,
             [prior.clone(), prior.clone(), prior],
             mode,
-            if mode.2 > 0 { (mode.2, 0, 0) } else { mode },
         ),
     )
 }
@@ -363,7 +319,6 @@ fn claude_pages(
     restart: &E2ScanFixture,
     [tail_prior, full_prior, disk_prior]: [ScanIndex; 3],
     mode: (usize, usize, usize),
-    disk_mode: (usize, usize, usize),
 ) -> [Page; 3] {
     save_inputs(c);
     let tail = c.raw(retained, tail_prior, 100, true, &[]);
@@ -379,24 +334,8 @@ fn claude_pages(
     );
     let disk = c.raw(restart, disk_prior, 100, true, &[]);
     assert_eq!(
-        disk.modes, disk_mode,
-        "disk arm must exercise the authorized cold acquisition"
-    );
-    if disk_mode.0 > 0 && mode.2 > 0 {
-        let counts = disk
-            .cache
-            .durable_counters(SnapshotSource::ClaudeCode)
-            .unwrap()
-            .0;
-        assert_eq!(
-            counts.resource_full.get("rederive_quiet"),
-            Some(&(disk_mode.0 as u64))
-        );
-    }
-    assert_eq!(
-        durable_restores(&disk.cache, SnapshotSource::ClaudeCode).1,
-        (disk_mode.1 + disk_mode.2) as u64,
-        "every reused disk-arm copy comes from the durable store"
+        disk.modes, mode,
+        "a new owner continues from the same committed heads"
     );
     [tail, full, disk]
 }
@@ -464,7 +403,6 @@ pub(super) fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
 }
 
 fn claude_case(name: &str) {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported(name) {
         return;
     }
@@ -589,16 +527,14 @@ fn claude_case(name: &str) {
                     &disk.owner(SnapshotSource::ClaudeCode),
                     [prior.clone(), prior.clone(), prior],
                     (0, 0, 1),
-                    (1, 0, 0),
                 );
                 finish_phase(&mut failed, false);
                 let failed_wire = compare_claude_uploads(&failed);
                 let failed_items = failed.each_ref().map(|page| page.scan.snapshots[0].clone());
-                // Continue each arm from its own finished failed-step index.
-                // The retained scanner survives; the Full scanner is fresh.
-                // The disk arm's owner commits its failed step, and another
-                // new owner restores that record, not the warm page's.
-                let [tail_failed, full_failed, mut disk_failed] = failed;
+                // The Full arm continues from its own finished index; the new
+                // owner commits its failed step, and both Tail arms continue
+                // from that commit.
+                let [_, full_failed, mut disk_failed] = failed;
                 let disk_prior = disk.commit(
                     &disk_failed.cache,
                     SnapshotSource::ClaudeCode,
@@ -609,9 +545,8 @@ fn claude_case(name: &str) {
                     &c,
                     &scanner,
                     &disk.owner(SnapshotSource::ClaudeCode),
-                    [tail_failed.index, full_failed.index, disk_prior],
+                    [disk_prior.clone(), full_failed.index, disk_prior],
                     (0, 0, 1),
-                    (1, 0, 0),
                 );
                 finish_phase(&mut healthy, true);
                 let healthy_wire = compare_claude_uploads(&healthy);
@@ -778,7 +713,6 @@ fn other_wire(source: SnapshotSource, scan: &SourceScanResult) -> Vec<u8> {
     canonical(&wire)
 }
 fn codex_case(legacy: bool, content: bool) {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = match (legacy, content) {
         (true, false) => "codex_legacy_acked_sticky",
         (false, false) => "codex_v2_sticky",
@@ -818,8 +752,6 @@ fn codex_case(legacy: bool, content: bool) {
         index.record_accepted_snapshot_fingerprints(&accepted);
         assert!(!index.files.is_empty());
         assert!(index.files.values().all(|e| e.codex_counting_v2 != legacy));
-        // Records bind the counting view, cutover included: this binary
-        // commits under its own cutover, as its daemon does after the save.
         disk.commit(&scanner.cache, source, &mut index)
     };
     append(&path, &codex_rows("turn-b", 30));
@@ -833,8 +765,6 @@ fn codex_case(legacy: bool, content: bool) {
         assert_eq!(modes, (1, 0, 0));
         assert!(!scan.snapshots.is_empty());
         assert!(upgraded.files.values().all(|e| !e.codex_counting_v2));
-        // Its commit writes the Legacy-ACKed record the disk arm restores:
-        // a dated header a fresh read would count as V2 (#806 r8 cond. 2).
         prior = disk.commit(&scanner.cache, source, &mut upgraded);
         append(&path, &codex_rows("turn-c", 40));
         input_clock(&path);
@@ -845,27 +775,18 @@ fn codex_case(legacy: bool, content: bool) {
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
     let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior.clone());
     assert_eq!(modes, (1, 0, 0));
-    // Disk arm (#806): a new owner restores the last commit's record from
-    // the real store and Tails, never flipping the counting choice.
-    let (disk_index, restored, modes) = other_page(&c, &restart, source, prior);
-    assert_eq!(modes, (0, 1, 0), "must restore the Codex record, then Tail");
-    assert_eq!(durable_restores(&restart.cache, source).1, 1);
+    // Codex keeps its RAM reduction until S2b: a new owner reads Full.
+    let (_, restored, modes) = other_page(&c, &restart, source, prior);
+    assert_eq!(modes, (1, 0, 0), "a restarted Codex owner reads Full");
     assert!(tail_index
         .files
         .values()
         .all(|e| e.codex_counting_v2 != legacy));
-    assert!(
-        disk_index
-            .files
-            .values()
-            .all(|e| e.codex_counting_v2 != legacy),
-        "restore never flips the counting choice"
-    );
     let (a, b) = (other_wire(source, &tail), other_wire(source, &full));
     let d = other_wire(source, &restored);
     assert_eq!(a, b);
-    assert_eq!(d, b, "disk-restored envelope differs from cold Full");
-    assert_eq!(d, a, "disk-restored envelope differs from the RAM arm");
+    assert_eq!(d, b, "restarted envelope differs from cold Full");
+    assert_eq!(d, a, "restarted envelope differs from the RAM arm");
     assert_eq!(Sha256::digest(&a), Sha256::digest(&b));
     assert_eq!(Sha256::digest(&d), Sha256::digest(&b));
     // The existing cross-build exporter has a fixed receipt catalog. This
@@ -884,12 +805,10 @@ fn codex_case(legacy: bool, content: bool) {
 }
 #[test]
 fn codex_v2_sticky() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_case(false, false);
 }
 #[test]
 fn codex_legacy_acked_sticky() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_case(true, false);
 }
 
@@ -939,13 +858,10 @@ pub(super) fn grow(path: &Path, request: &str, tokens: u64) {
     input_clock(path);
 }
 
-/// A restart between every page: each page's disk arm is a new owner that
-/// restores the record its predecessor committed (the warm page's, then a
-/// restored-and-Tailed owner's) and must emit the RAM owner's and a cold
-/// Full's bodies. Each arm continues from its own finished index.
+/// A restart between every page: each page's new owner continues from the Tail
+/// heads its predecessor committed and must emit a cold Full's bodies.
 #[test]
 fn restart_between_pages() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "restart_between_pages";
     if !supported(name) {
         return;
@@ -957,42 +873,36 @@ fn restart_between_pages() {
         for (request, tokens) in [("r2", 20), ("r3", 30)] {
             grow(&path, request, tokens);
             let restart = disk.owner(SnapshotSource::ClaudeCode);
-            let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0), (0, 1, 0));
+            let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
             finish_claude_pages(&c, &mut pages);
             bodies.push(compare_claude_uploads(&pages));
-            let [tail, full, mut disk_page] = pages;
+            let [_, full, mut disk_page] = pages;
             let next = disk.commit(
                 &disk_page.cache,
                 SnapshotSource::ClaudeCode,
                 &mut disk_page.index,
             );
-            priors = [tail.index, full.index, next];
+            priors = [next.clone(), full.index, next];
         }
         assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
         disk_verified(name, &bodies, 2);
-        off_disk_no_record_body(name);
     });
 }
 
-/// An upgraded binary that changes no record binding (codec, allowlist,
-/// scope, body-witness revision, money rule) restores the older binary's
-/// record. The older owner's next pass sees the file unchanged and commits
-/// again without rewriting its unchanged record, so the record's generation
-/// stamp is older than the committed index. The upgraded owner (a new
-/// process) must still restore it and Tail the growth. Every commit follows
-/// a real pass, as in the daemon. A real cross-binary upgrade is not
-/// buildable in one test binary.
+/// An upgraded binary that changes no head binding continues the older
+/// binary's head. The older owner's next pass sees the file unchanged and
+/// commits again without rewriting that head, so the head is older than the
+/// committed index. The upgraded owner (a new process) must still load it and
+/// Tail the growth. A real cross-binary upgrade is not buildable in one test
+/// binary.
 #[test]
 fn upgrade_without_semantic_revision() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "upgrade_without_semantic_revision";
     if !supported(name) {
         return;
     }
     with_e2(|| {
         let (c, mut disk, path, scanner, prior) = disk_corpus(name);
-        let written = disk.record_bytes();
-        assert_eq!(written.len(), 1);
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
         let mut quiet = c.raw(&scanner, prior.clone(), 100, true, &[]);
         assert_eq!(
@@ -1004,11 +914,6 @@ fn upgrade_without_semantic_revision() {
         quiet.finish();
         let committed = disk.commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
         assert!(committed.generation > prior.generation);
-        assert_eq!(
-            disk.record_bytes(),
-            written,
-            "an unchanged record keeps its older generation stamp"
-        );
         grow(&path, "r2", 20);
         let upgraded = disk.owner(SnapshotSource::ClaudeCode);
         let pages = claude_pages(
@@ -1017,71 +922,8 @@ fn upgrade_without_semantic_revision() {
             &upgraded,
             [committed.clone(), committed.clone(), committed],
             (0, 1, 0),
-            (0, 1, 0),
         );
         disk_verified(name, &[compare_claude_pages(&c, pages)], 1);
-        off_disk_no_record_body(name);
-    });
-}
-
-/// A downgraded binary without the store (main before #806) reads the grown
-/// file Full and commits a newer entry, leaving the newer binary's record on
-/// disk. On re-upgrade that record no longer binds the committed entry: the
-/// new owner must refuse it and read Full, never restore the pre-downgrade
-/// reduction. Its own commit then restores again on the next restart.
-#[test]
-fn downgrade_then_reupgrade() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let name = "downgrade_then_reupgrade";
-    if !supported(name) {
-        return;
-    }
-    with_e2(|| {
-        let (c, mut disk, path, _, prior) = disk_corpus(name);
-        let downgraded = E2ScanFixture::default();
-        grow(&path, "r2", 20);
-        let mut down = c.raw(&downgraded, prior, 100, true, &[]);
-        assert_eq!(down.modes, (1, 0, 0), "the downgraded binary has no copy");
-        down.enrich(&c);
-        down.finish();
-        down.index.save(&disk.index).unwrap(); // writes no record
-        let committed = ScanIndex::load(&disk.index).unwrap();
-        assert_eq!(disk.records(), 1, "the downgrade leaves the newer record");
-        grow(&path, "r3", 30);
-        let reupgraded = disk.owner(SnapshotSource::ClaudeCode);
-        let mut pages = claude_pages(
-            &c,
-            &downgraded,
-            &reupgraded,
-            [committed.clone(), committed.clone(), committed],
-            (0, 1, 0),
-            (1, 0, 0),
-        );
-        let (attempts, _, ineligible) =
-            durable_restores(&reupgraded.cache, SnapshotSource::ClaudeCode);
-        assert_eq!(attempts, 1);
-        assert_eq!(ineligible, BTreeMap::from([("entry_changed", 1)]));
-        finish_claude_pages(&c, &mut pages);
-        let refused = compare_claude_uploads(&pages);
-        let [tail, full, mut disk_page] = pages;
-        let next = disk.commit(
-            &disk_page.cache,
-            SnapshotSource::ClaudeCode,
-            &mut disk_page.index,
-        );
-        grow(&path, "r4", 40);
-        let restart = disk.owner(SnapshotSource::ClaudeCode);
-        let pages = claude_pages(
-            &c,
-            &downgraded,
-            &restart,
-            [tail.index, full.index, next],
-            (0, 1, 0),
-            (0, 1, 0),
-        );
-        let restored = compare_claude_pages(&c, pages);
-        disk_verified(name, &[refused, restored], 1);
-        off_disk_no_record_body(name);
     });
 }
 
@@ -1176,7 +1018,6 @@ fn pi_seed() -> String {
 
 struct PiProof {
     sampled: bool,
-    durable: bool,
     bodies: Vec<ReceiptBody>,
 }
 
@@ -1194,14 +1035,12 @@ impl PiProof {
     }
 
     /// Same-build proof only: the cross-build receipt catalog has no Pi rows,
-    /// so this checks the identity scope and the durable record, emitting nothing.
-    fn finish(self, disk: &Disk) {
+    /// so this checks the identity scope, emitting nothing.
+    fn finish(self) {
         assert!(!self.bodies.is_empty(), "zero emitted bodies is no proof");
         for body in &self.bodies {
             body.cross_build();
         }
-        assert!(self.durable, "head restores Pi durably");
-        assert!(disk.records() > 0, "native Pi receipt must survive");
     }
 }
 
@@ -1220,10 +1059,8 @@ fn pi_disk_corpus(
     assert_eq!(modes, (1, 0, 0), "head must exercise sampled Pi");
     assert!(!scan.snapshots.is_empty());
     let prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut index);
-    let durable = disk.records() > 0;
     let mut proof = PiProof {
         sampled: true,
-        durable,
         bodies: Vec::new(),
     };
     proof.capture(&scan);
@@ -1347,24 +1184,18 @@ impl PiLedgerCheck<'_> {
 }
 
 /// One Pi page's expectations: the retained and disk acquisition modes, the
-/// actual disk restores, and an optional ledger check on every arm.
+/// and an optional ledger check on every arm.
 struct PiPageExpect<'a> {
     ram_mode: (usize, usize, usize),
     disk_mode: (usize, usize, usize),
-    restores: u64,
     ledger: Option<&'a PiLedgerCheck<'a>>,
 }
 
 impl PiPageExpect<'_> {
-    fn modes(
-        ram_mode: (usize, usize, usize),
-        disk_mode: (usize, usize, usize),
-        restores: u64,
-    ) -> Self {
+    fn modes(ram_mode: (usize, usize, usize), disk_mode: (usize, usize, usize)) -> Self {
         Self {
             ram_mode,
             disk_mode,
-            restores,
             ledger: None,
         }
     }
@@ -1384,7 +1215,6 @@ fn pi_pages(
     let PiPageExpect {
         ram_mode,
         disk_mode,
-        restores,
         ledger,
     } = expect;
     save_inputs(c);
@@ -1402,31 +1232,16 @@ fn pi_pages(
     let (full_index, full, mode) = page(&E2ScanFixture::default(), full_prior);
     assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
     let (disk_index, restored, mode) = page(restart, disk_prior);
+    // Pi keeps its RAM reduction until S2c: a new owner reads what grew Full.
     assert_eq!(
         mode,
-        if proof.durable {
-            disk_mode
-        } else if proof.sampled {
+        if proof.sampled {
             (disk_mode.0 + disk_mode.1, 0, disk_mode.2)
         } else {
             (0, 0, 0)
         },
-        "Pi disk acquisition"
+        "Pi restarted acquisition"
     );
-    if proof.durable {
-        assert_eq!(
-            restart
-                .cache
-                .durable_counters(SnapshotSource::Pi)
-                .unwrap()
-                .0
-                .restored,
-            restores,
-            "actual Pi disk restores"
-        );
-    } else {
-        assert!(restart.cache.durable_counters(SnapshotSource::Pi).is_none());
-    }
     for scan in [&tail, &restored] {
         assert_eq!(
             scan.dropped_usage_record_count,
@@ -1445,7 +1260,7 @@ fn pi_pages(
         assert_eq!(
             other_wire(SnapshotSource::Pi, &restored),
             expected,
-            "Pi disk restore != Full"
+            "Pi restarted owner != Full"
         );
         for (a, b) in restored.snapshots.iter().zip(&full.snapshots) {
             assert_eq!(
@@ -1463,7 +1278,6 @@ fn pi_pages(
 
 macro_rules! pi_row {
     ($name:expr) => {
-        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         if !supported($name) {
             return;
         }
@@ -1483,7 +1297,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
             &scanner,
             &restart,
             priors,
-            PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
+            PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
         );
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
@@ -1495,7 +1309,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
         requests,
         "{name}"
     );
-    proof.finish(&disk);
+    proof.finish();
     scan
 }
 
@@ -1507,10 +1321,6 @@ fn pi_ledger_splits(
     final_totals: (u64, u64),
 ) {
     let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
-    let retained_disk = Disk {
-        dir: disk.dir.clone(),
-        index: disk.index.clone(),
-    };
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
@@ -1526,24 +1336,10 @@ fn pi_ledger_splits(
     }
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut ram_mode = (0, 1, 0);
-    // stage_preparation preserves the durable predecessor on an uncertified
-    // lossy Tail. Required: unchanged pre-conflict record bytes (including
-    // generation), exactly one restore on the next page, and Tail with zero Full.
     // pi_pages compares the replayed suffix's emitted wire to cold Full.
-    let mut pre_conflict_records = None;
     for (value, step) in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let restored_before = pre_conflict_records.take().map(|records| {
-            assert_eq!(retained_disk.record_bytes(), records, "pre-conflict record");
-            assert_eq!(ram_mode, (0, 1, 0), "durable conflict resume must Tail");
-            durable_restores(&scanner.cache, SnapshotSource::Pi).1
-        });
-        if proof.durable && matches!(step, PiLedgerStep::ConflictDrop(..)) {
-            let records = retained_disk.record_bytes();
-            assert_eq!(records.len(), 1, "one pre-conflict durable record");
-            pre_conflict_records = Some(records);
-        }
         let ([tail, full, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
@@ -1555,29 +1351,22 @@ fn pi_ledger_splits(
                     step,
                     accepted: &accepted,
                 }),
-                ..PiPageExpect::modes(ram_mode, (0, 1, 0), 1)
+                ..PiPageExpect::modes(ram_mode, (0, 1, 0))
             },
         );
-        if let Some(before) = restored_before {
-            assert_eq!(
-                durable_restores(&scanner.cache, SnapshotSource::Pi).1,
-                before + 1,
-                "exactly one retained restore after conflict"
-            );
-        }
         if matches!(step, PiLedgerStep::Emit(..)) {
             accepted = scan.snapshots;
         }
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
-        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) && !proof.durable {
+        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) {
             (1, 0, 0)
         } else {
             (0, 1, 0)
         };
     }
     assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
-    proof.finish(&disk);
+    proof.finish();
 }
 
 /// [money] A plain Pi session split at every line boundary emits cold Full's
@@ -1935,7 +1724,7 @@ fn pi_cli_fork_preserves_double_count() {
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        PiPageExpect::modes((1, 1, 0), (1, 1, 0), 1),
+        PiPageExpect::modes((1, 1, 0), (1, 1, 0)),
     );
     assert_eq!(scan.snapshots.len(), 2);
     assert_eq!(
@@ -1945,7 +1734,7 @@ fn pi_cli_fork_preserves_double_count() {
         ),
         EXPECTED_FORK_TOTALS
     );
-    proof.finish(&disk);
+    proof.finish();
 }
 
 fn pi_lifecycle_case(name: &str) {
@@ -2001,7 +1790,6 @@ fn pi_lifecycle_case(name: &str) {
         proof.capture(&scan);
         down.save(&disk.index).unwrap();
         let committed = ScanIndex::load(&disk.index).unwrap();
-        assert_eq!(disk.records(), usize::from(proof.durable), "{name}");
         [committed.clone(), committed.clone(), committed]
     } else if rewrite {
         [prior.clone(), prior.clone(), prior]
@@ -2044,18 +1832,14 @@ fn pi_lifecycle_case(name: &str) {
         }
         let restart = disk.owner(SnapshotSource::Pi);
         let ram_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
-        let (disk_mode, restores) = if migrating {
-            ((1, 0, 0), 0)
-        } else {
-            ((0, 1, 0), 1)
-        };
+        let disk_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
         let ([tail, full, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
             priors,
-            PiPageExpect::modes(ram_mode, disk_mode, restores),
+            PiPageExpect::modes(ram_mode, disk_mode),
         );
         if migrating {
             assert_eq!(scan.snapshots[0].request_count, 3, "{name}");
@@ -2066,7 +1850,7 @@ fn pi_lifecycle_case(name: &str) {
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
     }
-    proof.finish(&disk);
+    proof.finish();
 }
 
 /// [money] A version rewrite after Tail must reacquire Full without double billing.
@@ -2126,7 +1910,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        PiPageExpect::modes((0, 0, 0), (0, 0, 0), 0),
+        PiPageExpect::modes((0, 0, 0), (0, 0, 0)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     std::fs::File::options()
@@ -2142,7 +1926,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [tail, full, next],
-        PiPageExpect::modes((1, 0, 0), (1, 0, 0), 0),
+        PiPageExpect::modes((1, 0, 0), (1, 0, 0)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(
@@ -2161,16 +1945,15 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [tail, full, next],
-        PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
+        PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
     );
-    proof.finish(&disk);
+    proof.finish();
 }
 
 /// [money] Admission branches omitted by the native-authority sticky fixture. Check
 /// real scanner output against explicit additive totals, without a frozen parser.
 #[test]
 fn codex_admission_branches_preserve_emitted_totals() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("codex_admission_branches") {
         return;
     }
@@ -2328,8 +2111,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
             ];
             assert_eq!(arms[0].2, (0, 1, 0));
             assert_eq!(arms[1].2, (1, 0, 0));
-            assert_eq!(arms[2].2, (0, 1, 0));
-            assert_eq!(durable_restores(&restart.cache, source).1, 1);
+            assert_eq!(arms[2].2, (1, 0, 0));
             for (index, scan, _) in &arms {
                 assert_eq!(scan.dropped_usage_record_count, 1);
                 assert_eq!(scan.recognized_usage_drop_count, 1);
@@ -2383,39 +2165,6 @@ fn codex_admission_branches_preserve_emitted_totals() {
     }
 }
 
-// Reuse the three disk lifecycles' physical corpus and real uploader. This
-// additional cold owner has the store OFF; its complete envelopes must equal
-// the same prior's ordinary no-record Full, with no restore attempt.
-fn off_disk_no_record_body(name: &str) {
-    let (c, disk, path, _warm, prior) = disk_corpus(&format!("{name}-off"));
-    grow(&path, "off-growth", 20);
-    let before = disk.record_bytes();
-    let _off = crate::snapshots::RestartRestoreForTest::disabled();
-    let owner = E2ScanFixture::default();
-    disk.begin(&owner, SnapshotSource::ClaudeCode);
-    let full = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
-    let disk_page = c.raw(&owner, prior.clone(), 100, true, &[]);
-    assert_eq!(disk_page.modes, (1, 0, 0));
-    assert_eq!(
-        durable_restores(&owner.cache, SnapshotSource::ClaudeCode).0,
-        0
-    );
-    let tail = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
-    let mut pages = [tail, full, disk_page];
-    finish_claude_pages(&c, &mut pages);
-    compare_claude_uploads(&pages);
-    disk.commit(
-        &pages[2].cache,
-        SnapshotSource::ClaudeCode,
-        &mut pages[2].index.clone(),
-    );
-    assert_eq!(
-        disk.record_bytes(),
-        before,
-        "OFF never refreshes restore records"
-    );
-}
-
 /// [money] Rename-before-ACK restart reconstructs exactly the cold complete body.
 #[test]
 fn native_successor_rename_before_ack_cold_reopen_preserves_money() {
@@ -2431,7 +2180,6 @@ fn refused_or_not_stored_successor_cold_reopen_preserves_money() {
 }
 
 fn successor_cold_reopen(disposition: Option<&str>) {
-    let _on = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("successor-cold-reopen") {
         return;
     }
@@ -2492,7 +2240,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
             progress.save(&progress_path).unwrap();
         }
         // Lose acquisition memory without saving its new index or ACK. Keep
-        // the real renamed record, original index and durable upload progress.
+        // the committed heads, original index and durable upload progress.
         drop(successor);
         drop(warm);
         let reloaded = SnapshotUploadProgress::load(
@@ -2549,7 +2297,6 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         warm.enrich(&c);
         warm.finish();
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
-        assert!(disk.records() > 0);
         let switch = json!({"type":"attachment","sessionId":ROOT,
             "attachment":{"type":"session_context","context":{}}})
         .to_string()
@@ -2563,21 +2310,15 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let restart = E2ScanFixture::capturing_identity();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
         let cold = E2ScanFixture::capturing_identity();
-        // The restart reads first: the RAM page writes its successor record at
-        // native settlement, which a later restart would reuse as Unchanged.
         let restarted = c.raw(&restart, prior.clone(), 100, true, &[]);
         let mut pages = [
             c.raw(&retained, prior.clone(), 100, true, &[]),
             c.raw(&cold, prior, 100, true, &[]),
             restarted,
         ];
-        assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
+        assert_eq!(pages[0].modes, (0, 1, 0), "warm owner Tail");
         assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
-        assert_eq!(pages[2].modes, (0, 1, 0), "restored Tail");
-        assert_eq!(
-            durable_restores(&restart.cache, SnapshotSource::ClaudeCode).1,
-            1
-        );
+        assert_eq!(pages[2].modes, (0, 1, 0), "new owner Tail");
         finish_claude_pages(&c, &mut pages);
         let receipt = compare_claude_uploads(&pages);
         let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();

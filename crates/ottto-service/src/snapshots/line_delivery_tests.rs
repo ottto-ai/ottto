@@ -978,13 +978,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(
-                SnapshotSource::ClaudeCode,
-                &mut index,
-                30,
-                None,
-                None,
-            );
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, &mut index, 30, None);
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1028,7 +1022,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
     }
     unselected_page("codex");
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1086,7 +1080,7 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None);
     }
 }
 
@@ -1213,7 +1207,6 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                     ..ScanIndex::default()
                 },
                 None,
-                None,
             ),
         )
         .map(|candidate| {
@@ -1313,7 +1306,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(source, &mut index, 7, None, None);
+            advance_bounded_directory_traversal(source, &mut index, 7, None);
         }
         assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
         assert_eq!(
@@ -1365,7 +1358,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut census,
                 rfc3339_unix_seconds(NOW),
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             );
             assert_eq!(candidate.is_some(), retained, "candidate {name}");
             assert_eq!(
@@ -1394,7 +1387,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut ScanCensus::default(),
                 None,
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             )
             .unwrap();
             if recovery_overlap && name == "grown" {
@@ -1543,7 +1536,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
     }
     discovery_page("codex");
     // Match the existing roster fixture's directory-change granularity.
@@ -2302,7 +2295,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 &mut ScanCensus::default(),
                 rfc3339_unix_seconds(&at),
                 1_000,
-                &mut CandidateDiscovery::new(&mut active, None, None),
+                &mut CandidateDiscovery::new(&mut active, None),
             );
             assert!(
                 candidate.is_none(),

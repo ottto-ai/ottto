@@ -276,7 +276,7 @@ pub(super) fn path_requires_recovery(
     length: u64,
 ) -> bool {
     path_requires_verification(files, path)
-        || (super::restart_restore::enabled()
+        || (source == SnapshotSource::ClaudeCode
             && files.get(&local_index_key(path)).is_some_and(|entry| {
                 length != entry.size_bytes
                     || entry.effective_upload_body_witness_revision
@@ -2680,7 +2680,7 @@ mod growth_tests {
                 Some(now),
                 30,
                 // v2 growth follows the index (production derivation).
-                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None),
             )
             .unwrap();
             assert!(open_and_identify_scan_candidate_at(
@@ -2901,7 +2901,7 @@ mod growth_tests {
             Some(now),
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
         .is_some());
         assert!(reconcile_missing_index_entries_with_limit(&mut index, 1));
@@ -2999,7 +2999,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
         .unwrap();
         let (candidate, _) = open_and_identify_scan_candidate_at(
@@ -3078,7 +3078,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(

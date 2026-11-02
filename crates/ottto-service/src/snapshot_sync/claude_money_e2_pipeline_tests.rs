@@ -142,6 +142,9 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
+        if sampled {
+            index = scanner.routed(index, &self.base);
+        }
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
@@ -227,11 +230,13 @@ impl Page {
             unobserved(|| {
                 let mut whole = twin(self);
                 let mut accepted = accepted.as_deref().cloned();
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(true));
                 let reads = api_reads(|| {
                     whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
                 });
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(false));
                 (whole, accepted, reads)
             })
         });
@@ -374,12 +379,7 @@ impl StreamedChecks {
     /// without normalization for bodies (contract-5 tags included), the
     /// persisted index, stats, holds and the finalized wire; the money oracle
     /// for totals and account placement.
-    fn compare(
-        &mut self,
-        terminal: bool,
-        whole: ComparedSide<'_>,
-        streamed: ComparedSide<'_>,
-    ) {
+    fn compare(&mut self, terminal: bool, whole: ComparedSide<'_>, streamed: ComparedSide<'_>) {
         use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
         let ((whole, whole_accepted, whole_reads), (streamed, accepted, reads)) = (whole, streamed);
         assert_eq!(
@@ -448,17 +448,33 @@ fn api_reads(read: impl FnOnce()) -> usize {
 
 /// (session, login, org, requests) of every share placed by a carried-forward
 /// account.
-fn carried_forward(snapshots: &[SnapshotItem]) -> Vec<(String, Option<String>, Option<String>, u64)> {
+fn carried_forward(
+    snapshots: &[SnapshotItem],
+) -> Vec<(String, Option<String>, Option<String>, u64)> {
     let mut carried = Vec::new();
     for item in snapshots {
         let evidence = |at: Option<u16>| at.map(|at| &item.request_evidence[usize::from(at)]);
-        for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+        for row in item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+        {
             let shares = match &row.identity_parts {
                 Some(parts) => parts
                     .iter()
-                    .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                    .map(|part| {
+                        (
+                            &part.account_identifier_hash,
+                            part.evidence_ref,
+                            part.request_count,
+                        )
+                    })
                     .collect(),
-                None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+                None => vec![(
+                    &row.account_identifier_hash,
+                    row.evidence_ref,
+                    row.request_count,
+                )],
             };
             for (login, at, requests) in shares {
                 if let Some(evidence) = evidence(at).filter(|evidence| {
@@ -595,7 +611,10 @@ fn five_root_sweep(multi_root: bool) {
                 api_login(LOGINS, "d-own", 5, '1', Some('9')),
                 api_for(LOGINS, "resumed", 15, 150),
             ],
-            &[trace_for(LOGINS, "d-own", ""), trace_for(LOGINS, "resumed", "")],
+            &[
+                trace_for(LOGINS, "d-own", ""),
+                trace_for(LOGINS, "resumed", ""),
+            ],
         );
         c.write_at(
             &format!("{MALFORMED}.jsonl"),
@@ -3055,19 +3074,11 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 // Keep the CI test filter stable while its base-compatible transplant stays
-// independent of the restart-restore implementation used by this build.
+// independent of the Tail implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
-    include!("restart_restore_money_tests.rs");
+    include!("claude_tail_money_tests.rs");
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
-    }
-    #[cfg(unix)]
-    mod durable_transition_tests {
-        include!("../snapshots/sampled_scan/durable_transition_tests.rs");
-    }
-    #[cfg(unix)]
-    mod durable_transition_pi_tests {
-        include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
     }
 }
 

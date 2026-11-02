@@ -1820,7 +1820,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         &mut at_open,
         Some(due),
         BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
     )
     .expect("retained while recent");
     OpenOptions::new()
@@ -1852,7 +1852,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         &mut at_conversion,
         Some(due),
         BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
     )
     .is_none());
     for census in [&at_open, &at_conversion] {

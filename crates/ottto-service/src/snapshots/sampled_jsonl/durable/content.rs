@@ -23,22 +23,8 @@ fn scratch(source: SnapshotSource) -> Box<SnapshotAccumulator> {
 }
 
 impl Decoded {
-    pub(crate) fn content_classes(&self) -> [bool; 5] {
-        let r = &self.rederive;
-        [
-            r.first_prompt.is_some(),
-            r.title.is_some(),
-            r.agent_label.is_some(),
-            r.session_start.is_some(),
-            r.workspace.is_some(),
-        ]
-    }
     pub(crate) fn has_content(&self) -> bool {
         self.rederive != Rederive::default()
-    }
-
-    pub(crate) fn rederive_plan(&self) -> Result<RederivePlan, &'static str> {
-        self.rederive_plan_within(HEAD_BOUND, TITLE_LINE_BOUND)
     }
 
     /// The plan with marks within `head_bound` and a title line of at most
@@ -307,7 +293,6 @@ impl Decoded {
                 },
             )?;
         }
-        sampled_scan::durable_tail::record_rederive_line_peak(source, peak);
         let r = &self.rederive;
         let matches = [
             r.first_prompt
@@ -332,10 +317,7 @@ impl Decoded {
                 .transpose()?,
         ];
         if matches.contains(&Some(false)) {
-            sampled_scan::durable_tail::record_rederive_fence(
-                source,
-                matches.map(|m| m == Some(false)),
-            );
+            tail_source::counters::bump("tail_rederive_bytes", "mismatch");
             return Err(Refuse::NotRederivable("content_fence"));
         }
         let acc = &mut self.reduction.accumulator;
@@ -391,14 +373,12 @@ impl ClaudeResponseWindow {
 fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
     let mut offset = 0;
     while offset < bytes.len() {
-        #[cfg(test)]
-        sampled_scan::durable_tail::record_rederive_read_call();
         let n = match file.read_at(&mut bytes[offset..], at + offset as u64) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return Err(Refuse::NotRederivable("content_read")),
             Ok(n) => n,
         };
-        sampled_scan::durable_tail::record_rederive_input(source, n as u64);
+        tail_source::counters::add("tail_rederive_bytes", "ok", n as u64);
         offset += n;
     }
     Ok(())
@@ -426,7 +406,6 @@ fn replay_line(
         Ok(())
     };
     *peak = (*peak).max(meter.used());
-    sampled_scan::durable_tail::record_rederive_line_peak(source, *peak);
     folded?;
     if let Some(reason) = meter.stop {
         return Err(Refuse::NotRederivable(reason));
