@@ -9033,6 +9033,14 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
             .resource_full
             .get("repin")
             .is_some_and(|n| *n == 1));
+        // A spent pass refuses the group as one unit; the next pass reads it
+        // whole, past the budget, instead of reserving one member forever.
+        if source != SnapshotSource::Codex {
+            let mut group_page = HistoryPage::default();
+            assert!(!cache.upgrade_group_full_allowed(source, &members, &index, &mut group_page));
+            next_full_budget_pass(&cache);
+            assert!(cache.upgrade_group_full_allowed(source, &members, &index, &mut group_page));
+        }
         assert!(
             record_path.exists(),
             "admission cannot delete the predecessor"

@@ -2652,7 +2652,9 @@ impl SharedCache {
     }
 
     /// A group reads as one unit. Reserve its existing history page and probe
-    /// every member's budget admission before charging any member.
+    /// the group's whole size once, under its first member, before charging any
+    /// member: per-member probes could reserve one member and refuse the next
+    /// on every pass.
     pub(in crate::snapshots) fn upgrade_group_full_allowed(
         &self,
         source: SnapshotSource,
@@ -2683,6 +2685,19 @@ impl SharedCache {
                 .is_ok_and(|cause| cause == Some("repin"))
             {
                 retired.push((key, member.size_bytes));
+            }
+        }
+        if let Some((first, _)) = retired.first() {
+            let total: u64 = retired.iter().map(|(_, bytes)| *bytes).sum();
+            if !self.budgeted_with_cause(
+                source,
+                first,
+                total,
+                SystemTime::now(),
+                (false, false, false),
+                Some(4),
+            ) {
+                return false;
             }
         }
         let digests: Vec<_> = retired
@@ -2801,18 +2816,8 @@ impl SharedCache {
             {
                 return false;
             }
-            return if start {
-                self.start_missing_full(source, key, metadata.len(), false)
-            } else {
-                self.budgeted_with_cause(
-                    source,
-                    key,
-                    metadata.len(),
-                    SystemTime::now(),
-                    (false, false, false),
-                    Some(4),
-                )
-            };
+            // A group (the only non-starting caller) probes its whole size.
+            return !start || self.start_missing_full(source, key, metadata.len(), false);
         }
         if !start {
             return self.budgeted_with_cause(

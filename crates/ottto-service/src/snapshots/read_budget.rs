@@ -72,6 +72,8 @@ pub(crate) struct ReadWaitQueue<K: Copy + Eq> {
     /// The front entries covered by this pass's budget.
     reserved: usize,
     reserved_bytes: u64,
+    /// The queue's front already read this pass.
+    front_read: bool,
     waiting: VecDeque<ReadWait<K>>,
     stats: ReadBudgetStats,
 }
@@ -83,6 +85,7 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
             pass: 0,
             reserved: 0,
             reserved_bytes: 0,
+            front_read: false,
             waiting: VecDeque::new(),
             stats: ReadBudgetStats::default(),
         }
@@ -110,6 +113,7 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
         self.pass = pass.wrapping_add(1);
         self.reserved = 0;
         self.reserved_bytes = 0;
+        self.front_read = false;
         for wait in &self.waiting {
             if self.reserved > 0 && self.reserved_bytes.saturating_add(wait.bytes) > budget.limit {
                 break;
@@ -121,7 +125,9 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
 
     /// Whether `key` may read `bytes` now. Only `start` spends budget or leaves
     /// the queue; without it this is a free probe. A refused key waits in the
-    /// queue and is re-offered by its owner next pass.
+    /// queue and is re-offered by its owner next pass. The pass's first front
+    /// waiter always reads, so the queue cannot stall; any other reserved waiter
+    /// that grew since its refusal must still fit.
     ///
     /// `bypass` reads now and a started bypass is still charged, so the pass's
     /// total stays bounded. Its causes stay few: growth near the source file
@@ -138,7 +144,18 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
         let position = self.waiting.iter().position(|wait| wait.key == key);
         let admitted = bypass
             || match position {
-                Some(position) => position < self.reserved,
+                Some(0) if self.reserved > 0 && !self.front_read => true,
+                Some(position) if position < self.reserved => {
+                    budget
+                        .spent
+                        .saturating_add(
+                            self.reserved_bytes
+                                .saturating_sub(self.waiting[position].bytes),
+                        )
+                        .saturating_add(bytes)
+                        <= budget.limit
+                }
+                Some(_) => false,
                 None => {
                     (self.reserved == 0 && budget.spent == 0)
                         || budget
@@ -151,6 +168,7 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
         if admitted && start {
             if let Some(position) = position {
                 if position < self.reserved {
+                    self.front_read |= position == 0;
                     self.reserved -= 1;
                     self.reserved_bytes = self
                         .reserved_bytes
@@ -174,6 +192,12 @@ impl<K: Copy + Eq> ReadWaitQueue<K> {
                 let wait = &mut self.waiting[position];
                 wait.seen_pass = pass;
                 if !admitted {
+                    if position < self.reserved {
+                        self.reserved_bytes = self
+                            .reserved_bytes
+                            .saturating_sub(wait.bytes)
+                            .saturating_add(bytes);
+                    }
                     wait.bytes = bytes;
                 }
             }
@@ -266,6 +290,27 @@ mod tests {
         assert_eq!(stats.max_wait_passes, 2);
         assert_eq!(stats.admitted_bytes, 25 + 4 + 6 + 6 + 100);
         assert_eq!(stats.deferred, 5);
+    }
+
+    /// [money] Growth since a refusal cannot break the bound: only the pass's
+    /// first front waiter reads regardless, and the other stays first in line.
+    #[test]
+    fn a_reserved_waiter_that_grew_must_still_fit() {
+        let mut queue = ReadWaitQueue::new(256);
+        let mut budget = next_pass(&mut queue);
+        budget.charge(1);
+        assert!(!queue.admit(&mut budget, 1, 5, false, true));
+        assert!(!queue.admit(&mut budget, 2, 5, false, true));
+        let mut budget = next_pass(&mut queue);
+        assert_eq!(queue.reserved, 2);
+        assert!(queue.admit(&mut budget, 1, 8, false, true), "front reads");
+        assert!(
+            !queue.admit(&mut budget, 2, 8, false, true),
+            "no longer fits"
+        );
+        let mut budget = next_pass(&mut queue);
+        assert!(queue.admit(&mut budget, 2, 8, false, true));
+        assert!(queue.waiting.is_empty());
     }
 
     /// [behaviour] A key past capacity stays out of the bounded queue.
