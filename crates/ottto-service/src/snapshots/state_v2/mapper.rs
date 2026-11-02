@@ -139,7 +139,8 @@ impl KeyRows {
                     ensure!(position == 1, "state_v2_member_position");
                     let h = self.page.pop_front().context("state_v2_record_key")?;
                     ensure!(
-                        self.peek(tx)?.is_none_or(|(key, _)| key != name.as_bytes()),
+                        self.peek(tx)?
+                            .map_or(true, |(key, _)| key != name.as_bytes()),
                         "state_v2_member_position"
                     );
                     return Ok(Some(h));
