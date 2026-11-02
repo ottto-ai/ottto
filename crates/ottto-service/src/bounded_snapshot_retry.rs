@@ -434,7 +434,7 @@ impl PreparedRetry {
         // evidence back or adopts a competitor's disk generation.
         budget.remaining(Instant::now())?;
         validate()?;
-        let checkpoint = checkpoint_partial_snapshot_index_with_read_limit(
+        let checkpoint = checkpoint_partial_snapshot_index_with_audit_release(
             &self.working,
             &self.baseline,
             &self.progress,
@@ -447,6 +447,10 @@ impl PreparedRetry {
             &self.progress_path,
             validate,
             Some(crate::snapshot_retry::RESPONSE_BYTES),
+            None,
+            None,
+            None,
+            Default::default(),
         )?;
         self.working.generation = checkpoint.generation;
         self.working.mark_bounded_sweep_unsettled();

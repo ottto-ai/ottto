@@ -212,7 +212,7 @@ fn bootstrap_cache_heads_with_budget(
                 }
             }
             let mut accepted = 0;
-            let outcome = upload_resumable_batches_with_body_witness_partitioned(
+            let outcome = upload_resumable_batches_with_literal_families(
                 probes,
                 poison_scope,
                 progress,
@@ -221,6 +221,7 @@ fn bootstrap_cache_heads_with_budget(
                 snapshot_upload_body_witness,
                 |item| Some(item.source_session_id.as_str()),
                 |_| false,
+                |_| None,
                 inplace_retry,
                 |items| upload(items, enforce_head_cas),
                 |progress| persist(progress),
@@ -3409,7 +3410,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )?;
     progress.save(progress_path)?;
-    checkpoint_partial_snapshot_index_with_comparison(
+    checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed,
         &progress,
@@ -3422,6 +3423,8 @@ pub(crate) fn comparison_partial_fallback_for_test(
         None,
         Some(NativeSelectedRestore::Logical(fallback)),
         None,
+        None,
+        Default::default(),
     )
 }
 
@@ -3441,7 +3444,7 @@ fn checkpoint_partial_snapshot_index(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
 ) -> Result<ScanIndex> {
-    checkpoint_partial_snapshot_index_with_read_limit(
+    checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed_index,
         progress,
@@ -3452,35 +3455,10 @@ fn checkpoint_partial_snapshot_index(
         progress_path,
         validate_destination,
         None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_partial_snapshot_index_with_read_limit(
-    index: &ScanIndex,
-    committed_index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    snapshots: &[SnapshotItem],
-    correction_scan: Option<&SourceScanResult>,
-    locally_held: &BTreeSet<String>,
-    index_path: &Path,
-    progress_path: &Path,
-    validate_destination: impl FnOnce() -> Result<()>,
-    read_limit: Option<usize>,
-) -> Result<ScanIndex> {
-    checkpoint_partial_snapshot_index_with_comparison(
-        index,
-        committed_index,
-        progress,
-        snapshots,
-        correction_scan,
-        locally_held,
-        index_path,
-        progress_path,
-        validate_destination,
-        read_limit,
         None,
         None,
+        None,
+        Default::default(),
     )
 }
 
@@ -3503,39 +3481,6 @@ impl NativeSelectedRestore<'_> {
                 .map_err(|reason| anyhow!(reason)),
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_partial_snapshot_index_with_comparison(
-    index: &ScanIndex,
-    committed_index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    snapshots: &[SnapshotItem],
-    correction_scan: Option<&SourceScanResult>,
-    locally_held: &BTreeSet<String>,
-    index_path: &Path,
-    progress_path: &Path,
-    validate_destination: impl FnOnce() -> Result<()>,
-    read_limit: Option<usize>,
-    fallback: Option<NativeSelectedRestore<'_>>,
-    cause: Option<UnsettledUploadCause>,
-) -> Result<ScanIndex> {
-    checkpoint_partial_snapshot_index_with_audit_release(
-        index,
-        committed_index,
-        progress,
-        snapshots,
-        correction_scan,
-        locally_held,
-        index_path,
-        progress_path,
-        validate_destination,
-        read_limit,
-        fallback,
-        cause,
-        None,
-        Default::default(),
-    )
 }
 
 /// Fixed labels for the partial-checkpoint steps whose own error carries no
@@ -10878,7 +10823,7 @@ where
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
-    upload_resumable_batches_with_body_witness_partitioned(
+    upload_resumable_batches_with_literal_families(
         items,
         poison_scope,
         progress,
@@ -10887,6 +10832,7 @@ where
         body_witness,
         |_| None,
         |_| false,
+        |_| None,
         &mut InplaceRetryBudget::default(),
         upload,
         persist,
@@ -11331,53 +11277,6 @@ fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, 
         groups.push(group);
     }
     groups
-}
-
-#[allow(clippy::too_many_arguments)]
-fn upload_resumable_batches_with_body_witness_partitioned<
-    T,
-    Fingerprint,
-    BodyWitness,
-    SessionId,
-    BatchClass,
-    Upload,
-    Persist,
->(
-    items: &[T],
-    poison_scope: &str,
-    progress: &mut SnapshotUploadProgress,
-    accepted: &mut u64,
-    fingerprint: Fingerprint,
-    body_witness: BodyWitness,
-    session_id: SessionId,
-    batch_class: BatchClass,
-    inplace_retry: &mut InplaceRetryBudget,
-    upload: Upload,
-    persist: Persist,
-) -> Result<ResumableUploadResult>
-where
-    T: Clone + Serialize,
-    Fingerprint: Fn(&T) -> &str,
-    BodyWitness: Fn(&T) -> String,
-    SessionId: Fn(&T) -> Option<&str>,
-    BatchClass: Fn(&T) -> bool,
-    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
-    Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
-{
-    upload_resumable_batches_with_literal_families(
-        items,
-        poison_scope,
-        progress,
-        accepted,
-        fingerprint,
-        body_witness,
-        session_id,
-        batch_class,
-        |_| None,
-        inplace_retry,
-        upload,
-        persist,
-    )
 }
 
 /// `literal_family` names the family root of a request-owned literal body
@@ -18552,7 +18451,7 @@ mod tests {
 
         let mut accepted = 0;
         let mut observed_classes = Vec::new();
-        let result = upload_resumable_batches_with_body_witness_partitioned(
+        let result = upload_resumable_batches_with_literal_families(
             &[ordinary.clone(), divergent_reconcile.clone()],
             &unique_poison_scope(),
             &mut progress,
@@ -18561,6 +18460,7 @@ mod tests {
             |item| item.clone(),
             |_| None,
             |item| reconcile_class.contains(item),
+            |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
                 let is_reconcile = batch
