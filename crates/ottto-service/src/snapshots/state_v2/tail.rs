@@ -77,7 +77,7 @@ pub(in crate::snapshots) struct CollectionMeta {
     pub(in crate::snapshots) elements: u64,
 }
 /// One collection's stored membership: the sum (mod 2^256) of a term per row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::snapshots) struct Membership {
     pub(in crate::snapshots) meta: CollectionMeta,
     pub(in crate::snapshots) pages: u64,
@@ -98,7 +98,7 @@ pub(in crate::snapshots) enum Change {
     Reset,
 }
 /// One file's staged state: its complete new head and only its changed pages.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(in crate::snapshots) struct StagedFile {
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) head: Vec<u8>,
@@ -149,14 +149,13 @@ pub(in crate::snapshots) struct SetAside {
     pub(in crate::snapshots) attempts: u32,
     pub(in crate::snapshots) first_seen_unix_seconds: u64,
 }
-#[derive(Debug)]
 enum Entry {
     File(StagedFile),
     Failed(SetAsideCause),
 }
 /// This pass's unsaved Tail state for one route. It stays outside `ScanIndex`,
 /// so subset graphs and clones can neither drop nor duplicate it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct TailStage {
     files: BTreeMap<Vec<u8>, Entry>,
     retire: BTreeSet<Vec<u8>>,
@@ -221,21 +220,30 @@ fn position(header: &Header) -> Result<u64> {
         _ => bail!("state_v2_record_key"),
     }
 }
-/// A fragment's position: owner id, then the owner's position, then its number.
-fn frag_position(owner: u64, page: u64, number: u64) -> Result<u64> {
-    ensure!(
-        page < 1 << 39 && number < 1 << 16,
-        "state_v2_tail_frag_position"
-    );
-    Ok((owner << 55) | (page << 16) | number)
+fn file_digest(domain: &[u8], file: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(file);
+    hash.finalize().into()
+}
+/// The file's part of a fragment's key: a digest, so a key at the store's length
+/// limit still has room for the owner parts, and one file's fragments sort together.
+fn frag_file(file: &[u8]) -> [u8; 32] {
+    file_digest(b"ottto.scan-index.state-v2.tail-frag.v1\0", file)
+}
+/// One value's fragment key: file digest, owner id, the owner's position. The
+/// fragment's number is the row position, so each part has its full range.
+fn frag_key(file: &[u8], owner: u64, page: u64) -> Vec<u8> {
+    let mut key = frag_file(file).to_vec();
+    key.extend_from_slice(&owner.to_be_bytes());
+    key.extend_from_slice(&page.to_be_bytes());
+    key
 }
 
 /// The set-aside marker addresses the file by digest: it outlives no path.
 fn set_aside_key(key: &[u8]) -> Result<RowKey> {
-    let mut hash = Sha256::new();
-    hash.update(b"ottto.scan-index.state-v2.tail-set-aside.v1\0");
-    hash.update(key);
-    row(SET_ASIDE, hash.finalize().as_slice(), 0)
+    let digest = file_digest(b"ottto.scan-index.state-v2.tail-set-aside.v1\0", key);
+    row(SET_ASIDE, &digest, 0)
 }
 
 fn add(sum: &mut [u8; 32], term: &[u8; 32]) {
@@ -284,9 +292,9 @@ fn write_value(
 ) -> Result<Header> {
     let mut fragments = 0_u64;
     if value.len() > FRAG_BYTES {
+        let key = frag_key(file, owner, page);
         for part in value.chunks(FRAG_BYTES) {
-            let key = row(FRAG, file, frag_position(owner, page, fragments)?)?;
-            put(tx, &key, INLINE, part)?;
+            put(tx, &row(FRAG, &key, fragments)?, INLINE, part)?;
             fragments += 1;
         }
     }
@@ -294,9 +302,9 @@ fn write_value(
     if fragments == 0 {
         return put(tx, row_key, INLINE, value);
     }
-    let mut envelope = Vec::with_capacity(44);
+    let mut envelope = Vec::with_capacity(48);
     envelope.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    envelope.extend_from_slice(&(fragments as u32).to_be_bytes());
+    envelope.extend_from_slice(&fragments.to_be_bytes());
     envelope.extend_from_slice(Sha256::digest(value).as_slice());
     put(tx, row_key, FRAGMENTED, &envelope)
 }
@@ -314,12 +322,14 @@ fn read_value(
     }
     let mut envelope = Reader(&stored);
     let len = u64::from_be_bytes(envelope.take()?);
-    let fragments = u32::from_be_bytes(envelope.take()?);
+    let fragments = u64::from_be_bytes(envelope.take()?);
     let digest: [u8; 32] = envelope.take()?;
     let mut value = Vec::new();
-    for number in 0..u64::from(fragments) {
-        let key = row(FRAG, file, frag_position(owner, page, number)?)?;
-        let fragment = tx.get(&key)?.context("state_v2_tail_membership")?;
+    let key = frag_key(file, owner, page);
+    for number in 0..fragments {
+        let fragment = tx
+            .get(&row(FRAG, &key, number)?)?
+            .context("state_v2_tail_membership")?;
         tx.read_value(&fragment, &mut value)?;
     }
     ensure!(
@@ -336,20 +346,15 @@ fn delete_fragments(
     page: u64,
     from: u64,
 ) -> Result<()> {
-    let first = frag_position(owner, page, from)?;
     let kind = RecordKind::parse(FRAG)?;
+    let key = frag_key(file, owner, page);
     loop {
-        let rows = tx.scan_record_key(&kind, file, Some(first - 1), HEADER_PAGE)?;
-        let mut deleted = false;
-        for header in rows {
-            if position(&header)? >> 16 != first >> 16 {
-                break;
-            }
-            tx.delete(&header.key)?;
-            deleted = true;
-        }
-        if !deleted {
+        let rows = tx.scan_record_key(&kind, &key, from.checked_sub(1), HEADER_PAGE)?;
+        if rows.is_empty() {
             return Ok(());
+        }
+        for header in rows {
+            tx.delete(&header.key)?;
         }
     }
 }
@@ -371,7 +376,7 @@ fn encode_head(revision: u32, table: &MembershipTable, body: &[u8]) -> Vec<u8> {
 }
 /// A committed head, decoded. `revision` below the caller's is the caller's
 /// decision; above it, `load` holds.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(in crate::snapshots) struct TailHead {
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) table: MembershipTable,
@@ -465,22 +470,44 @@ pub(super) fn read_set_aside(tx: &mut dyn Transaction, file: &[u8]) -> Result<Op
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-/// Every row of the file except its marker. Their removal owes a physical purge.
+/// Whether there was anything to delete. Removal owes a physical purge.
+fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    tx.mark_erasure()?;
+    for header in rows {
+        tx.delete(&header.key)?;
+    }
+    Ok(true)
+}
+/// Every row of the file except its marker.
 fn delete_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
-    for name in catalogue::TAIL_KINDS.iter().filter(|k| **k != SET_ASIDE) {
+    for name in catalogue::TAIL_KINDS
+        .iter()
+        .filter(|k| !matches!(**k, SET_ASIDE | FRAG))
+    {
         let kind = RecordKind::parse(name)?;
         loop {
             let rows = tx.scan_record_key(&kind, file, None, HEADER_PAGE)?;
-            if rows.is_empty() {
+            if !purge(tx, rows)? {
                 break;
-            }
-            tx.mark_erasure()?;
-            for header in rows {
-                tx.delete(&header.key)?;
             }
         }
     }
-    Ok(())
+    let kind = RecordKind::parse(FRAG)?;
+    let digest = frag_file(file);
+    // The bare digest sorts before every fragment key that starts with it.
+    let before = row(FRAG, &digest, 0)?;
+    loop {
+        let rows = tx.scan_kind(&kind, Some(&before), HEADER_PAGE)?;
+        let own = rows.into_iter().take_while(|header| {
+            matches!(&header.key, RowKey::Record { key_bytes, .. } if key_bytes.starts_with(&digest))
+        });
+        if !purge(tx, own.collect())? {
+            return Ok(());
+        }
+    }
 }
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 struct Applied {

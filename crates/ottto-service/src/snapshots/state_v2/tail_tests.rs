@@ -61,6 +61,16 @@ fn all_tail_rows(index: &ScanIndex, key: &str) -> usize {
         .map(|kind| rows(index, kind, key).len())
         .sum()
 }
+/// Fragments are addressed by file digest: every one in the store.
+fn frag_rows(index: &ScanIndex) -> usize {
+    let mut found = 0;
+    with_session_db(index, |db| {
+        let kind = RecordKind::parse("tail.frag").unwrap();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        found = tx.scan_kind(&kind, None, 128).unwrap().len();
+    });
+    found
+}
 fn erasure_marks(index: &ScanIndex) -> u64 {
     let mut marks = 0;
     with_session_db(index, |db| marks = sqlite::erasure_marks_for_test(db));
@@ -111,7 +121,7 @@ fn head_pages_and_fragments_roundtrip_and_replace_only_changed_rows() {
     assert_eq!(pages[&(Collection::Responses, 0)], b"first");
     assert_eq!(pages[&(Collection::Responses, 1)], long);
     assert_eq!(pages[&(Collection::ToolUses, 0)], framed);
-    assert_eq!(rows(&index, "tail.frag", FILE).len(), 4);
+    assert_eq!(frag_rows(&index), 4);
 
     let untouched = rows(&index, "tail.page.responses", FILE)[0].clone();
     let mut change = staged(b"short", &[(Collection::Responses, 1, b"shrunk")]);
@@ -126,13 +136,36 @@ fn head_pages_and_fragments_roundtrip_and_replace_only_changed_rows() {
     assert_eq!(pages[&(Collection::Responses, 0)], b"first", "not restated");
     assert_eq!(pages[&(Collection::Responses, 1)], b"shrunk");
     assert_eq!(pages.len(), 2);
-    assert_eq!(rows(&index, "tail.frag", FILE).len(), 0);
+    assert_eq!(frag_rows(&index), 0);
     assert_eq!(rows(&index, "tail.page.responses", FILE)[0], untouched);
 
     with_session_db(&index, |db| sqlite::delete_row_for_test(db, &untouched.key));
-    let refused = read(&index, FILE).unwrap_err();
+    let refused = read(&index, FILE).err().unwrap();
     assert_eq!(refused.to_string(), "state_v2_tail_membership");
     assert!(refused.downcast_ref::<Hold>().is_none());
+
+    // Any page number addresses its fragments; a retired file takes only its own.
+    let far = 1_u64 << 40;
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"head", &[(Collection::Responses, 0, &long)])
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    stage_tail(
+        &f.path,
+        SIBLING,
+        staged(&long, &[(Collection::Requests, far, &long)]),
+    )
+    .unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(frag_rows(&index), 6);
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(frag_rows(&index), 4);
+    assert!(read(&index, FILE).unwrap().0.is_none());
+    let (head, pages) = read(&index, SIBLING).unwrap();
+    assert_eq!(head.unwrap().body, long);
+    assert_eq!(pages[&(Collection::Requests, far)], long);
 }
 
 /// [behaviour] Graph saves never touch Tail rows or list them; only a removed
@@ -443,7 +476,7 @@ fn future_revision_and_newer_writer_hold() {
     file.revision = REVISION + 1;
     stage_tail(&f.path, FILE, file).unwrap();
     save_with(&f.path, &mut index).unwrap();
-    let error = read(&index, FILE).unwrap_err();
+    let error = read(&index, FILE).err().unwrap();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
     let head = load_tail(&index, FILE, REVISION + 2, |_, _, _| Ok(()));
     assert_eq!(head.unwrap().unwrap().revision, REVISION + 1);
