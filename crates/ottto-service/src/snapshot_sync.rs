@@ -4986,6 +4986,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Before credentials: a removed source erases even with no live device.
+    erase_disabled_sources(support_dir, &daemon.transcript_cache);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5380,6 +5382,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     "local snapshot sync skipped for {}: {}",
                     source.api_slug(),
                     safe_error(&error)
+                );
+                crate::snapshots::money_freshness::report_failed_pass(
+                    source,
+                    crate::upload_receipts::newest_accepted_unix_seconds(
+                        self.support_dir,
+                        source_kind(source),
+                    ),
                 );
                 self.failed_sources.push(source.api_slug());
             }
@@ -9854,6 +9863,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// Test seam for the streamed-evidence equality arm: its reference keeps every
+// root's rows and folds them whole, as one pass over every root would.
+#[cfg(test)]
+thread_local! {
+    static WHOLE_CORPUS_EVIDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn whole_corpus_evidence() -> bool {
+    #[cfg(test)]
+    if WHOLE_CORPUS_EVIDENCE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
@@ -10038,9 +10062,20 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
+    // Only the page's own roots keep their rows (both root spellings, so a
+    // page family can never lose its own rows). Every root read adds its
+    // cross-root answers first, so the fold sees the whole corpus's answers.
+    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .chain(scan_result.snapshots.iter().filter_map(|item| {
+            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
+        }))
+        .collect::<BTreeSet<_>>();
+    let mut cross =
+        crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(support_dir);
+    let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
-    // veto (never prove) the file birth rule. Moved, not cloned.
-    let mut veto_api_rows = crate::snapshots::ClaudeVetoApiRows::new();
+    // veto (never prove) the file birth rule.
     let unpaired = api_read
         .evidence
         .keys()
@@ -10049,7 +10084,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     for root in unpaired {
         if let Some(rows) = api_read.evidence.remove(&root) {
-            veto_api_rows.insert(root, rows);
+            cross.add_vetoing_api(&root, &rows);
+            if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                veto_api_rows.insert(root, rows);
+            }
         }
     }
     api_read.retain_roots(&paired_roots);
@@ -10065,6 +10103,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
+        let generation =
+            crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
             Some(read) => read.take_trace(support_dir, &root_session_id),
@@ -10086,7 +10126,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         if !api.health.is_complete() || !trace.is_complete() {
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
-                veto_api_rows.insert(root_session_id.clone(), rows);
+                cross.add_vetoing_api(&root_session_id, &rows);
+                if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                    veto_api_rows.insert(root_session_id.clone(), rows);
+                }
             }
             if builds_evidence || request_owned(&root_session_id) {
                 use crate::snapshots::claude_request_identity::UnhealthyRootReason;
@@ -10141,15 +10184,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
         }
-        if let Some(rows) = api.evidence.remove(&root_session_id) {
-            stats.api_evidence_row_count += rows.len();
-            api_report.evidence.insert(root_session_id.clone(), rows);
+        let api_rows = api.evidence.remove(&root_session_id);
+        let trace_rows = trace.evidence.remove(&root_session_id);
+        cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref());
+        let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        if !keep && (api_rows.is_some() || trace_rows.is_some()) {
+            cross.note_unkept(&root_session_id, generation);
         }
-        if let Some(rows) = trace.evidence.remove(&root_session_id) {
+        if let Some(rows) = api_rows {
+            stats.api_evidence_row_count += rows.len();
+            if keep {
+                api_report.evidence.insert(root_session_id.clone(), rows);
+            }
+        }
+        if let Some(rows) = trace_rows {
             stats.trace_evidence_row_count += rows.len();
-            trace_report.evidence.insert(root_session_id, rows);
+            if keep {
+                trace_report.evidence.insert(root_session_id, rows);
+            }
         }
     }
+    cross.finish();
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
@@ -10187,17 +10242,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
-        crate::snapshots::claude_request_identity::ScanEvidence::new(
+        let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
-        )
-        .with_unhealthy_reasons(unhealthy_reasons)
-        .with_status_coverage(crate::claude_status_coverage::snapshot())
-        .with_native_originals(&originals)
-        .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_budget(wire_budget)
+        );
+        let evidence = match &whole_corpus {
+            Some(_) => evidence,
+            None => evidence.with_cross_root(&cross),
+        };
+        evidence
+            .with_unhealthy_reasons(unhealthy_reasons)
+            .with_status_coverage(crate::claude_status_coverage::snapshot())
+            .with_native_originals(&originals)
+            .with_accepted_buckets(accepted_identity_buckets)
+            .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -10215,9 +10275,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
-        &veto_api_rows,
+        match &whole_corpus {
+            Some(veto_api_rows) => crate::snapshots::ClaudeEvidenceRows::Whole(veto_api_rows),
+            None => crate::snapshots::ClaudeEvidenceRows::Streamed(&cross),
+        },
     );
-    drop(veto_api_rows);
+    drop(whole_corpus);
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -10349,6 +10412,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
+    drop(cross);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -11796,7 +11860,7 @@ fn update_detected_uses_cache(
     snapshots: &[SnapshotItem],
 ) -> Result<()> {
     let dir = support_dir.join("detected_uses");
-    let path = dir.join(format!("{}.json", source.api_slug()));
+    let path = detected_uses_cache_path(support_dir, source);
     let merged = merge_detected_uses(
         read_detected_uses_cache(&path),
         aggregate_detected_uses(snapshots),
@@ -11820,6 +11884,12 @@ fn update_detected_uses_cache(
 
 /// Read the persisted detected-uses cache, or an empty list when it is missing
 /// or unreadable (a fresh machine, or a malformed file we simply rebuild).
+pub(crate) fn detected_uses_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    support_dir
+        .join("detected_uses")
+        .join(format!("{}.json", source.api_slug()))
+}
+
 fn read_detected_uses_cache(path: &Path) -> Vec<DetectedUse> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -11848,6 +11918,14 @@ fn upload_agent_status(
     persist_machine_icon(&response);
     crate::net_resilience::note_upstream_upload_succeeded("agent_status");
     Ok(response.accepted as usize)
+}
+
+pub(crate) fn snapshot_source_of_kind(kind: &SourceKind) -> SnapshotSource {
+    match kind {
+        SourceKind::Codex => SnapshotSource::Codex,
+        SourceKind::ClaudeCode => SnapshotSource::ClaudeCode,
+        SourceKind::Pi => SnapshotSource::Pi,
+    }
 }
 
 fn source_kind(source: SnapshotSource) -> SourceKind {
@@ -12538,20 +12616,166 @@ fn collector_checkin_can_wait_quietly(error: &anyhow::Error) -> bool {
         .contains("registered device has no enabled sources")
 }
 
+const SNAPSHOT_SOURCES: [SnapshotSource; 3] = [
+    SnapshotSource::Codex,
+    SnapshotSource::ClaudeCode,
+    SnapshotSource::Pi,
+];
+
 pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
-    [
-        SnapshotSource::Codex,
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Pi,
+    enabled_snapshot_sources_in(device, &default_support_dir())
+}
+
+/// A source with a removal marker is off at every boundary, whatever its grant.
+pub(crate) fn enabled_snapshot_sources_in(
+    device: &LocalDeviceBinding,
+    support_dir: &Path,
+) -> Vec<SnapshotSource> {
+    SNAPSHOT_SOURCES
+        .into_iter()
+        .filter(|source| source_granted(device, *source))
+        .filter(|source| source_marker(support_dir, *source).is_none())
+        .collect()
+}
+
+fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
+    device.sources.iter().any(|slug| slug == source.api_slug())
+}
+
+/// Consecutive failures per marker. Held across each erase turn, so a concurrent
+/// control-thread marker change cannot be overwritten by that turn's completion.
+static SOURCE_ERASURE_TURN: Mutex<BTreeMap<PathBuf, u32>> = Mutex::new(BTreeMap::new());
+
+fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32>> {
+    SOURCE_ERASURE_TURN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Outside every erased file set: `pending`, `done` or `reconnect`.
+fn source_marker_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    snapshot_index_path(support_dir, source)
+        .with_file_name(format!("{}.source-disabled", source.api_slug()))
+}
+
+/// `None` only when clearly absent. An unreadable marker stays pending.
+pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Option<String> {
+    match std::fs::read_to_string(source_marker_path(support_dir, source)) {
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        marker => Some(marker.unwrap_or_default()),
+    }
+}
+
+fn write_source_marker(path: &Path, state: &str) -> Result<()> {
+    ottto_core::write_owner_only_file_atomic(path, state.as_bytes())?;
+    sync_progress_parent(path)
+}
+
+/// Stops collection now; the next sync cycle erases. Never erases on this thread.
+pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let _turn = source_erasure_turn();
+    write_source_marker(&source_marker_path(support_dir, source), "pending")
+}
+
+/// The explicit way back. A source that was never removed has nothing to erase.
+pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let _turn = source_erasure_turn();
+    match source_marker(support_dir, source) {
+        Some(_) => write_source_marker(&source_marker_path(support_dir, source), "reconnect"),
+        None => Ok(()),
+    }
+}
+
+/// A credential generation that drops a source removes it like an explicit disable.
+pub(crate) fn disable_sources_dropped_from_grant(
+    support_dir: &Path,
+    current: &LocalDeviceBinding,
+    next: &LocalDeviceBinding,
+) -> Result<()> {
+    SNAPSHOT_SOURCES
+        .into_iter()
+        .filter(|source| source_granted(current, *source) && !source_granted(next, *source))
+        .try_for_each(|source| disable_snapshot_source(support_dir, source))
+}
+
+/// One attempt per owed source, under the cycle lock. Errors can name paths, so
+/// only counts are logged.
+pub(crate) fn erase_disabled_sources(
+    support_dir: &Path,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+) {
+    for source in SNAPSHOT_SOURCES {
+        let mut turn = source_erasure_turn();
+        let state = source_marker(support_dir, source);
+        if matches!(state.as_deref(), None | Some("done")) {
+            continue;
+        }
+        // Transcript readers close before the first unlink.
+        if source == SnapshotSource::Codex {
+            cache.forget_codex_jobs();
+        }
+        let marker = source_marker_path(support_dir, source);
+        let erased = erase_source_files(support_dir, source, || {
+            cache.durable_forget_source(source);
+            // Reconnect is this source's first bootstrap again: a full replay.
+            update_backfill_state(support_dir, |backfill| {
+                let slug = source.api_slug();
+                backfill.completed_parser_versions.remove(slug);
+                backfill.completed_replay_revisions.remove(slug);
+                backfill.completed_destination_namespaces.remove(slug);
+            })?;
+            if state.as_deref() == Some("reconnect") {
+                std::fs::remove_file(&marker)?;
+                sync_progress_parent(&marker)
+            } else {
+                write_source_marker(&marker, "done")
+            }
+        });
+        let failures = turn.entry(marker).or_default();
+        *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+        if *failures > 3 {
+            crate::snapshots::state_v2::source_erasure_alarm(*failures);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
+    let marker = source_marker_path(support_dir, source);
+    source_erasure_turn().get(&marker).copied().unwrap_or(0)
+}
+
+fn erase_source_files(
+    support_dir: &Path,
+    source: SnapshotSource,
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let others: Vec<PathBuf> = [
+        crate::active_sessions::active_session_cache_path(support_dir, source),
+        detected_uses_cache_path(support_dir, source),
+        crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
-    .filter(|source| {
-        device
-            .sources
-            .iter()
-            .any(|configured| configured == source.api_slug())
-    })
-    .collect()
+    .flat_map(|path| [path.with_extension("json.tmp"), path])
+    .collect();
+    let stable = snapshot_index_path(support_dir, source);
+    let destinations = support_dir.join("snapshots/destinations");
+    // Every parent exists, so an fsync of it fails only on a real I/O error.
+    for dir in others.iter().filter_map(|path| path.parent()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(&destinations)?;
+    let mut indexes = vec![snapshot_v3_index_path(&stable)];
+    for namespace in std::fs::read_dir(&destinations)? {
+        let namespace = namespace?.file_name();
+        let namespace = namespace.to_string_lossy();
+        withdraw_source_manifest(&namespace, source);
+        let scoped = snapshot_destination_scoped_index_path(&stable, &namespace);
+        indexes.push(snapshot_v3_index_path(&scoped));
+    }
+    let family = stable.file_stem().and_then(|stem| stem.to_str());
+    let family = family.context("source_erasure_family")?;
+    crate::snapshots::state_v2::erase_source(&indexes, family, &others, complete)
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {

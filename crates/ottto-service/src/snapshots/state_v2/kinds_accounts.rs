@@ -1,5 +1,7 @@
 //! Account families share the generic mapper; only window positions need policy.
-use super::super::account_pending_retention::{Archived, ArchivedWindows, ColdFold, ColdWindows};
+use super::super::account_pending_retention::{
+    checked_collapse, Archived, ArchivedWindows, ColdFold, ColdWindows,
+};
 use super::super::usage_pending::{ColdUsage, UsagePending};
 use super::super::{
     ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow, ClaudeUsageFamilyPending,
@@ -38,6 +40,7 @@ pub(super) fn rows(
         .keys()
         .chain(next.claude_account_family_pending.keys())
         .collect();
+    let compacted = compact(next, rows, old, cx)?;
     for family in families {
         let previous = old.get(family);
         let wanted = next.claude_account_family_pending.get(family);
@@ -50,7 +53,7 @@ pub(super) fn rows(
         let (kept, tail) = match wanted.map(|p| &p.previous_windows) {
             Some(ArchivedWindows::Cold(cold)) => {
                 let committed = cold.committed(cx.cold_rolled.get(family).copied());
-                let archive = cold_archive(
+                let (mut kept, tail) = cold_archive(
                     rows,
                     family,
                     cold,
@@ -62,7 +65,10 @@ pub(super) fn rows(
                 if let Some(last) = cold.last_roll() {
                     cx.cold_rolled.insert(family.clone(), last);
                 }
-                archive
+                if let Some(retained) = compacted.get(family) {
+                    kept = retained.iter().map(|&at| kept[at]).collect();
+                }
+                (kept, tail)
             }
             Some(ArchivedWindows::Resident(_)) | None => {
                 // A resident or removed family's rows are not a cold lineage.
@@ -194,6 +200,75 @@ pub(super) fn rows(
     cx.account_controls = controls;
     Ok(pending)
 }
+/// Counts are pending until the enclosing ordinary save confirms COMMIT.
+#[derive(Default, Serialize)]
+pub(super) struct CompactionCounts {
+    pub(super) windows_removed: usize,
+    pub(super) families_refused: usize,
+    pub(super) families_done: usize,
+}
+#[derive(Default)]
+pub(super) struct Compaction {
+    pub(super) counts: CompactionCounts,
+    /// Families this save settled. A refused one keeps every row and waits
+    /// for the next hydrate, so it cannot spend the allowance on every save.
+    pub(super) done: BTreeSet<String>,
+}
+
+/// Whole families are indivisible: check the allowance between families, in
+/// key order. The save is stamp-guarded, so the baseline's ids are this
+/// store's; each archived row is still authenticated against its digest.
+fn compact(
+    next: &ScanIndex,
+    rows: &mut mapper::Rows<'_>,
+    old: &BTreeMap<String, WindowBaseline>,
+    cx: &mut KindCx,
+) -> Result<BTreeMap<String, Vec<usize>>> {
+    let mut kept = BTreeMap::new();
+    let Some(allowance) = cx.compact_allowance else {
+        return Ok(kept);
+    };
+    if rows.tx.is_none() || !next.decode_holds.is_empty() {
+        return Ok(kept);
+    }
+    let mut reads = 0;
+    for (family, previous) in old {
+        if reads >= allowance {
+            break;
+        }
+        let Some(pending) = next.claude_account_family_pending.get(family) else {
+            continue;
+        };
+        let ArchivedWindows::Cold(cold) = &pending.previous_windows else {
+            continue;
+        };
+        if pending.previous_windows.uncollapsed() == 0 || cold.has_rolled() {
+            continue;
+        }
+        let archived = previous.ids.split_last().map_or(&[][..], |(_, a)| a);
+        ensure!(
+            (archived.len(), archived.last().copied()) == cold.base(),
+            "state_v2_cold_lineage_miss"
+        );
+        let tx = rows.tx.as_deref_mut().context("state_v2_save_tx")?;
+        let mut windows = Vec::new();
+        for (id, digest) in archived.iter().zip(&previous.digests) {
+            windows.push(authenticated_window(tx, family, *id, digest)?);
+            reads += 1;
+        }
+        cx.compaction.done.insert(family.clone());
+        match checked_collapse(&mut windows, &pending.current.census_window_end) {
+            None => cx.compaction.counts.families_refused += 1,
+            Some(retained) => {
+                cx.compaction.counts.windows_removed += archived.len() - retained.len();
+                cx.compaction.counts.families_done += 1;
+                kept.insert(family.clone(), retained);
+            }
+        }
+    }
+    Ok(kept)
+}
+
 /// Usage pending, one row per family. A cold family not loaded this pass is
 /// carried by its head's digest (`keep` refuses anything it cannot prove); a
 /// loaded one is rewritten through `put`, where an equal digest writes
@@ -300,20 +375,34 @@ fn cold_archive(
     let tx = rows.tx.as_deref_mut().ok_or_else(unknown)?;
     let mut tail = Vec::new();
     for (id, digest) in archived[from..].iter().zip(&digests[from..]) {
-        let key = mapper::key("account_window", family, *id)?;
-        let header = tx.get(&key)?.ok_or_else(unknown)?;
-        let mut read = mapper::Digests::new();
-        let window = mapper::read(tx, &header, Some(&mut read)).map_err(|error| {
-            telemetry::count("cold_row_unknown", 1);
-            error.context("state_v2_cold_row_unknown")
-        })?;
-        if read.get(&key) != Some(digest) {
-            return Err(unknown());
-        }
-        tail.push(window);
+        tail.push(authenticated_window(tx, family, *id, digest)?);
     }
     digests.truncate(from);
     Ok((digests, cold.replay(tail, skip, outcomes)))
+}
+/// A stored archive row read back under its baseline digest. A missing,
+/// undecodable or changed row is Unknown and refuses the save.
+fn authenticated_window(
+    tx: &mut dyn Transaction,
+    family: &str,
+    id: u64,
+    digest: &[u8; 32],
+) -> Result<ClaudeAccountFamilyPendingWindow> {
+    let unknown = || {
+        telemetry::count("cold_row_unknown", 1);
+        anyhow::anyhow!("state_v2_cold_row_unknown")
+    };
+    let key = mapper::key("account_window", family, id)?;
+    let header = tx.get(&key)?.ok_or_else(unknown)?;
+    let mut read = mapper::Digests::new();
+    let window = mapper::read(tx, &header, Some(&mut read)).map_err(|error| {
+        telemetry::count("cold_row_unknown", 1);
+        error.context("state_v2_cold_row_unknown")
+    })?;
+    if read.get(&key) != Some(digest) {
+        return Err(unknown());
+    }
+    Ok(window)
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,

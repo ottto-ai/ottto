@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
+
 mod fence;
 mod import;
 mod runtime;
@@ -22,7 +24,7 @@ mod runtime;
     )
 )]
 pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{IncompleteReason, LiveKeys};
+pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
@@ -37,6 +39,8 @@ mod codec;
 mod ignored;
 mod interning;
 mod kinds;
+#[cfg(test)]
+pub(super) use kinds::tests::compact_reopened_for_test;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;

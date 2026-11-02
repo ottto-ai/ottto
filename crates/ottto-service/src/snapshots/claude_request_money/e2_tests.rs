@@ -987,13 +987,24 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
                 basis: claude_request_identity::TELEMETRY_LOGIN,
                 account_source: None,
             });
-            place_request_identity(fold, &occurrence, None, Some(missing), None);
+            // The grain stays under its parse-time account: an account near miss.
+            place_request_identity(
+                fold,
+                &occurrence,
+                None,
+                Some(missing),
+                None,
+                IdentityCaller::Request,
+            );
             assert_eq!(
                 fold.entity.certificate_failure,
-                Some(CertificateFailure::IdentityGrain)
+                Some(CertificateFailure::IdentityGrain(
+                    IdentityCaller::Request,
+                    GrainNearMiss::OtherAccount
+                ))
             );
             expected.insert("uncertified", 1);
-            expected.insert("uncertified_by=identity_grain", 1);
+            expected.insert("uncertified_by=identity_grain.request.other_account", 1);
         } else {
             items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
             expected.insert("request_owned_held", 1);

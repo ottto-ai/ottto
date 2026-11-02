@@ -130,6 +130,17 @@ thread_local! {
 pub(crate) fn take_diag() -> BTreeMap<&'static str, u64> {
     DIAG.with(|diag| std::mem::take(&mut *diag.borrow_mut()))
 }
+/// Runs `f`, then puts this thread's diag and stage timers back as they were
+/// before it: a comparison run that observes and leaves no count behind.
+#[cfg(test)]
+pub(crate) fn without_diag<T>(f: impl FnOnce() -> T) -> T {
+    let diag = take_diag();
+    let stages = STAGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let value = f();
+    DIAG.with(|slot| *slot.borrow_mut() = diag);
+    STAGES.with(|slot| *slot.borrow_mut() = stages);
+    value
+}
 #[inline(always)]
 fn diag(reason: &'static str, n: u64) {
     #[cfg(test)]
@@ -454,9 +465,23 @@ pub(super) enum CertificateFailure {
     IdlessRestoration,
     HeldPrefixRemoval,
     AmbiguousDuplicate,
-    IdentityGrain,
+    IdentityGrain(IdentityCaller, GrainNearMiss),
     IdentityCost,
     IdentityUsage,
+}
+/// Which re-placement asked for the missing identity grain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityCaller {
+    Request,
+    Carry,
+    UnprovenCopy,
+}
+/// Where the request's key or account was found instead of the exact slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GrainNearMiss {
+    OtherAccount,
+    OtherKey,
+    Absent,
 }
 impl CertificateFailure {
     fn hold_reason(self) -> &'static str {
@@ -466,7 +491,25 @@ impl CertificateFailure {
             Self::IdlessRestoration => "uncertified_by=idless_restoration",
             Self::HeldPrefixRemoval => "uncertified_by=held_prefix_removal",
             Self::AmbiguousDuplicate => "uncertified_by=ambiguous_duplicate",
-            Self::IdentityGrain => "uncertified_by=identity_grain",
+            Self::IdentityGrain(caller, near) => {
+                use GrainNearMiss::{Absent, OtherAccount, OtherKey};
+                use IdentityCaller::{Carry, Request, UnprovenCopy};
+                match (caller, near) {
+                    (Request, OtherAccount) => {
+                        "uncertified_by=identity_grain.request.other_account"
+                    }
+                    (Request, OtherKey) => "uncertified_by=identity_grain.request.other_key",
+                    (Request, Absent) => "uncertified_by=identity_grain.request.absent",
+                    (Carry, OtherAccount) => "uncertified_by=identity_grain.carry.other_account",
+                    (Carry, OtherKey) => "uncertified_by=identity_grain.carry.other_key",
+                    (Carry, Absent) => "uncertified_by=identity_grain.carry.absent",
+                    (UnprovenCopy, OtherAccount) => {
+                        "uncertified_by=identity_grain.copy.other_account"
+                    }
+                    (UnprovenCopy, OtherKey) => "uncertified_by=identity_grain.copy.other_key",
+                    (UnprovenCopy, Absent) => "uncertified_by=identity_grain.copy.absent",
+                }
+            }
             Self::IdentityCost => "uncertified_by=identity_cost",
             Self::IdentityUsage => "uncertified_by=identity_usage",
         }
@@ -1989,6 +2032,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
                 None,
                 accounts.account(occurrence.sequence),
                 own.account(occurrence.sequence),
+                IdentityCaller::UnprovenCopy,
             );
         }
     }
@@ -3000,11 +3044,12 @@ pub(crate) fn place_request_identity(
     telemetry: Option<&ClaudeLocalOtelEvidence>,
     from: AccountPartition,
     to: AccountPartition,
+    caller: IdentityCaller,
 ) {
     let Some(estimated) = fold.occurrence_key(occurrence) else {
         return;
     };
-    let reported = telemetry
+    let candidate = telemetry
         .filter(|_| occurrence.telemetry_attached)
         .and_then(|row| {
             let mut key = reported_key(row, Some(occurrence), &fold.base_selector)?;
@@ -3016,11 +3061,21 @@ pub(crate) fn place_request_identity(
             } else {
                 ClaudeRequestUsageOrigin::TelemetryUnpriced
             };
-            fold.entity
-                .grains
-                .contains_key(&(key.clone(), Some(origin), from.clone()))
-                .then_some((key, Some(origin), row.cost_usd_micros))
+            Some((key, Some(origin), row.cost_usd_micros))
         });
+    // A reported key without a grain under `from` is kept only for the
+    // count-only near-miss diagnostic below.
+    let (reported, unplaced) = match candidate {
+        Some(found)
+            if fold
+                .entity
+                .grains
+                .contains_key(&(found.0.clone(), found.1, from.clone())) =>
+        {
+            (Some(found), None)
+        }
+        other => (None, other.map(|(key, ..)| key)),
+    };
     let (key, origin, cost) = reported.unwrap_or((estimated, None, None));
     let slot = (key.clone(), origin, from);
     let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
@@ -3035,8 +3090,9 @@ pub(crate) fn place_request_identity(
     // take_estimated owns exact token/request removal; reported contributions
     // differ only in the cost and unpriced counters removed alongside them.
     let Some(grain) = fold.entity.grains.get(&slot) else {
+        let near = grain_near_miss(&fold.entity, &slot, unplaced.as_ref());
         fold.entity
-            .fail_certificate(CertificateFailure::IdentityGrain);
+            .fail_certificate(CertificateFailure::IdentityGrain(caller, near));
         return;
     };
     let Some(left_cost) = grain.cost_micros.checked_sub(cost.unwrap_or(0)) else {
@@ -3056,6 +3112,25 @@ pub(crate) fn place_request_identity(
     }
     fold.entity
         .add(key, &tokens, requests, cost, origin, at, to);
+}
+
+/// Count-only diagnostic: the request's key under another account, else under
+/// `from` with another origin or the unplaced reported key, else absent.
+fn grain_near_miss(
+    entity: &ClaudeEntityBody,
+    slot: &Slot,
+    unplaced: Option<&ClaudeLiveKey>,
+) -> GrainNearMiss {
+    let mut near = GrainNearMiss::Absent;
+    for (key, _, account) in entity.grains.keys() {
+        if *key == slot.0 || Some(key) == unplaced {
+            if *account != slot.2 {
+                return GrainNearMiss::OtherAccount;
+            }
+            near = GrainNearMiss::OtherKey;
+        }
+    }
+    near
 }
 
 /// Attach the page's already-decoded API rows (`ClaudeApiEvidenceRead`, the
