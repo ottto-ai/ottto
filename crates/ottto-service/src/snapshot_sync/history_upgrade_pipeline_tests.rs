@@ -12,6 +12,7 @@
 // policy other than `full`) holds history; elsewhere it is paced, so the
 // held-shape tests corrupt the backfill state.
 
+use super::pipeline_transcript_line as history_line;
 use super::*;
 
 const HISTORY_MACHINE_ID: &str = "machine-history-upgrade";
@@ -21,12 +22,6 @@ const HISTORY_SESSIONS: [&str; 3] = [
     "e5555555-5555-4555-8555-555555555555",
     "f6666666-6666-4666-8666-666666666666",
 ];
-
-fn history_line(session: &str, request: &str, second: u32) -> String {
-    format!(
-        "{{\"timestamp\":\"2026-08-02T07:00:{second:02}Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
-    )
-}
 
 fn history_digest(id: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
@@ -130,16 +125,6 @@ impl HistoryFixture {
             format!("# synthetic\n{lines}\n"),
         )
         .expect("install synthetic list");
-    }
-
-    fn key(index: &ScanIndex, session: &str) -> String {
-        let suffix = format!("{session}.jsonl");
-        index
-            .files
-            .keys()
-            .find(|key| key.ends_with(&suffix))
-            .cloned()
-            .expect("indexed synthetic transcript")
     }
 
     /// Corrupt the saved index, as the 0.1.188 daemon's whole-index check
@@ -455,7 +440,7 @@ impl HistoryFixture {
             .filter(|session| {
                 index
                     .claude_request_census_for_test()
-                    .get(&Self::key(index, session))
+                    .get(&PipelineFixture::key(index, session))
                     .is_some()
             })
             .count()
@@ -744,7 +729,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
             grown.uploaded,
             BTreeSet::from([HISTORY_SESSIONS[1].to_string()])
         );
-        let key = HistoryFixture::key(&grown.index, HISTORY_SESSIONS[1]);
+        let key = PipelineFixture::key(&grown.index, HISTORY_SESSIONS[1]);
         assert_eq!(
             grown.index.files[&key].effective_upload_body_witness_revision,
             3
@@ -1039,7 +1024,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
         );
         // A vanished held file releases only at a healthy complete terminal;
         // the other history-held files keep their original carried incidence.
-        let vanished_key = HistoryFixture::key(&again.index, HISTORY_SESSIONS[0]);
+        let vanished_key = PipelineFixture::key(&again.index, HISTORY_SESSIONS[0]);
         let vanished_acks = state["file_snapshot_fingerprints"][&vanished_key]
             .as_array()
             .unwrap()
@@ -1112,13 +1097,13 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
                 .collect::<BTreeSet<_>>(),
             "no literal item of the listed root; unlisted history carries it"
         );
-        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        let listed = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[0]);
         assert_eq!(
             changed.index.files[&listed].effective_upload_body_witness_revision, 1,
             "no revision-3 stamp on the listed root"
         );
         for session in &HISTORY_SESSIONS[1..] {
-            let key = HistoryFixture::key(&changed.index, session);
+            let key = PipelineFixture::key(&changed.index, session);
             assert_eq!(
                 changed.index.files[&key].effective_upload_body_witness_revision,
                 3
@@ -1158,7 +1143,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         index.activate_effective_upload_body_witness_revision(3);
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         for session in &HISTORY_SESSIONS[..2] {
-            let key = HistoryFixture::key(&index, session);
+            let key = PipelineFixture::key(&index, session);
             assert!(index.re_owe_effective_upload_body_witness_revision(&key, 2));
         }
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
@@ -1173,7 +1158,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
             "the listed re-owed root is held; the unlisted one upgrades"
         );
         for (session, revision) in HISTORY_SESSIONS.iter().zip([2, 3, 3]) {
-            let key = HistoryFixture::key(&again.index, session);
+            let key = PipelineFixture::key(&again.index, session);
             assert_eq!(
                 again.index.files[&key].effective_upload_body_witness_revision, revision,
                 "{session}"
@@ -1285,13 +1270,13 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
         assert!(!completed.uploaded.contains(HISTORY_SESSIONS[0]));
         assert!(!completed.uploaded.contains(HISTORY_SESSIONS[1]));
         for session in &HISTORY_SESSIONS[..2] {
-            let key = HistoryFixture::key(&completed.index, session);
+            let key = PipelineFixture::key(&completed.index, session);
             assert_eq!(
                 completed.index.files[&key].effective_upload_body_witness_revision,
                 1
             );
         }
-        let key = HistoryFixture::key(&completed.index, HISTORY_SESSIONS[2]);
+        let key = PipelineFixture::key(&completed.index, HISTORY_SESSIONS[2]);
         assert_eq!(
             completed.index.files[&key].effective_upload_body_witness_revision,
             3
@@ -1979,7 +1964,7 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
             uploaded_history.extend(outcome.uploaded.iter().cloned());
             for session in HISTORY_SESSIONS {
-                let key = HistoryFixture::key(&outcome.index, session);
+                let key = PipelineFixture::key(&outcome.index, session);
                 let revision = outcome.index.files[&key].effective_upload_body_witness_revision;
                 if uploaded_history.contains(session) {
                     assert_eq!(revision, 3, "uploaded history settles: {session}");
@@ -2279,7 +2264,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
                 assert!(!outcome.index.confirmed_empty_files.contains(key));
             }
             for sibling in &HISTORY_SESSIONS[1..] {
-                let key = HistoryFixture::key(&outcome.index, sibling);
+                let key = PipelineFixture::key(&outcome.index, sibling);
                 assert_eq!(
                     outcome.index.files[&key].effective_upload_body_witness_revision,
                     3
@@ -2302,7 +2287,7 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
         let fixture = HistoryFixture::new(&format!("e2-history-{failure}"));
         let baseline = fixture.baseline();
         let root = HISTORY_SESSIONS[0];
-        let held_key = HistoryFixture::key(&baseline, root);
+        let held_key = PipelineFixture::key(&baseline, root);
         for (number, session) in HISTORY_SESSIONS.iter().enumerate() {
             e2_history_reported(&fixture, session, number);
         }
@@ -2471,7 +2456,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
                     .iter()
                     .zip([money_mark::DISCLOSED, estimated, estimated])
             {
-                let key = HistoryFixture::key(index, session);
+                let key = PipelineFixture::key(index, session);
                 assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
                 // The retired permit mark is never set (contract 5 always on).
                 assert_eq!(store.money_marks(location_key(&key)), marks, "{session}");
@@ -2549,8 +2534,8 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
         assert!(!changed.uploaded_literal.contains(HISTORY_SESSIONS[0]));
         assert!(changed.uploaded_literal.contains(HISTORY_SESSIONS[1]));
         e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[0]);
-        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
-        let unlisted = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[1]);
+        let listed = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        let unlisted = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[1]);
         assert_eq!(
             changed.index.files[&listed].effective_upload_body_witness_revision, 2,
             "the listed file is never stamped 3"
@@ -2713,7 +2698,7 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
         e2_history_assert_prior_tuple(
             &baseline,
             &held.index,
-            &HistoryFixture::key(&baseline, root),
+            &PipelineFixture::key(&baseline, root),
         );
         let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(recovered.uploaded, BTreeSet::from([root.to_owned()]));
@@ -2736,7 +2721,7 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
     let fixture = HistoryFixture::new("e2-history-side-call-deadline");
     let baseline = fixture.baseline();
     let root = HISTORY_SESSIONS[0];
-    let held_key = HistoryFixture::key(&baseline, root);
+    let held_key = PipelineFixture::key(&baseline, root);
     for (number, session) in HISTORY_SESSIONS.iter().enumerate().skip(1) {
         e2_history_reported(&fixture, session, number);
     }
@@ -2870,7 +2855,7 @@ fn e2_unlisting_replays_the_legacy_money_mark_once() {
         fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         let listed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
-        let key = HistoryFixture::key(&listed.index, HISTORY_SESSIONS[0]);
+        let key = PipelineFixture::key(&listed.index, HISTORY_SESSIONS[0]);
         assert_ne!(
             listed
                 .index
@@ -2994,7 +2979,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
         // The permit-era record: contract `""`, and #825's bit on one file.
         let mut old = ScanIndex::load(&fixture.index_path).unwrap();
-        let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+        let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
         let kept = old
             .claude_money_birth_store
             .money_marks(location_key(&marked));
@@ -3079,7 +3064,7 @@ fn e2_restamp_carries_the_retired_permit_bit() {
                 fixture.cycle(&format!("2026-08-02T{at}:00Z"), cycle);
             }
             let mut old = ScanIndex::load(&fixture.index_path).unwrap();
-            let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+            let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
             assert_eq!(old.files[&marked].effective_upload_body_witness_revision, 3);
             let body_marks = old
                 .claude_money_birth_store

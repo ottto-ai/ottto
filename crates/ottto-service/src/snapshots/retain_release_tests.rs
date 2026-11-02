@@ -5,6 +5,7 @@
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
 use crate::session_attribution::SessionAttributionContext;
+use crate::snapshots::cache_policy_tests::u3_identity;
 use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
 use sampled_scan::test_hooks::{self, Decision, Point, Probe};
 use sampled_scan::{ReleaseOutcome, RetainBudget};
@@ -1187,16 +1188,6 @@ fn x_out_coverage_witness_names_every_finished_field() {
     };
 }
 
-fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
-    crate::context_footprint::RepositoryIdentity {
-        repository_hash: Some(format!("hash-{tag}")),
-        repository_label: Some(format!("label-{tag}")),
-        repository_label_source: Some("git_remote".to_string()),
-        repository_identity_source: Some("git".to_string()),
-        workspace_kind: Some("git_repo".to_string()),
-    }
-}
-
 /// X_out family U3 control (c22 amendment 2): a cold or expired cache entry
 /// is `None` (the proof releases nothing), and peeking neither inserts nor
 /// refreshes. Each workspace path is unique to this test: the cache is global.
@@ -1251,6 +1242,7 @@ fn u3_measured_repository_identity_is_the_finished_value() {
         "f".repeat(64),
         None,
         Some(u3_identity("measured")),
+        false,
     );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].repository_hash.as_deref(), Some("hash-measured"));

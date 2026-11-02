@@ -449,11 +449,7 @@ impl EnvelopeShedServer {
 
 impl Drop for EnvelopeShedServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        super::permanent_finish_pipeline_tests::stop_server(&self.stop, &mut self.worker);
     }
 }
 
@@ -696,11 +692,7 @@ impl InplaceRetryServer {
 
 impl Drop for InplaceRetryServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        super::permanent_finish_pipeline_tests::stop_server(&self.stop, &mut self.worker);
     }
 }
 

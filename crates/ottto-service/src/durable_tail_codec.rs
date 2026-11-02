@@ -89,11 +89,13 @@ enum Sink<'a> {
 /// be checked against the digest without storing it.
 pub(crate) struct Enc<'a> {
     sink: Sink<'a>,
+    moved_field: Option<&'static str>,
 }
 
 impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
+            moved_field: None,
             sink: Sink::Bytes {
                 out: Vec::with_capacity(limit),
                 limit,
@@ -102,6 +104,7 @@ impl<'a> Enc<'a> {
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
+    #[cfg(test)]
     pub(crate) fn count_write(
         limit: usize,
         put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
@@ -118,6 +121,7 @@ impl<'a> Enc<'a> {
     /// Borrow a sink after counting. Both overrun and underrun refuse the record.
     pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
         Self {
+            moved_field: None,
             sink: Sink::Write {
                 out,
                 len: 0,
@@ -134,6 +138,7 @@ impl<'a> Enc<'a> {
     }
     pub(crate) fn count(limit: usize) -> Self {
         Self {
+            moved_field: None,
             sink: Sink::Count { len: 0, limit },
         }
     }
@@ -148,8 +153,29 @@ impl<'a> Enc<'a> {
         hasher.update((domain.len() as u64).to_le_bytes());
         hasher.update(domain.as_bytes());
         Self {
+            moved_field: None,
             sink: Sink::Hash(Box::new(hasher)),
         }
+    }
+    /// One record body may move the named E field. Drop clears the
+    /// allowance on success, refusal and unwind, including a reused encoder.
+    pub(crate) fn with_moved_field<T>(
+        &mut self,
+        path: &'static str,
+        put: impl FnOnce(&mut Enc) -> Result<T, Refuse>,
+    ) -> Result<T, Refuse> {
+        struct Guard<'a, 'b>(&'a mut Enc<'b>);
+        impl Drop for Guard<'_, '_> {
+            fn drop(&mut self) {
+                self.0.moved_field = None;
+            }
+        }
+        self.moved_field = Some(path);
+        let guard = Guard(self);
+        put(guard.0)
+    }
+    pub(crate) fn field_moved(&self, path: &str) -> bool {
+        self.moved_field == Some(path)
     }
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
@@ -264,7 +290,8 @@ impl<'a> Dec<'a> {
         self.refused |= !granted;
         granted.then_some(()).ok_or(Corrupt)
     }
-    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+    // Typed Pi-section reconstruction also charges its RAM-only wrapper.
+    pub(crate) fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
     pub(crate) fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
@@ -314,6 +341,11 @@ impl<'a> Dec<'a> {
         }
         Ok(len)
     }
+    /// The next length, not consumed: a caller's bound before the field's
+    /// own decode asks for any allowance.
+    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
+        Dec::new(&self.bytes[self.at..]).take_len()
+    }
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
@@ -340,7 +372,8 @@ impl<'a> Dec<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
-    pub(crate) fn finish(self) -> Result<(), Corrupt> {
+    /// Every byte in the body must be consumed.
+    pub(crate) fn finish(&self) -> Result<(), Corrupt> {
         (self.at == self.bytes.len()).then_some(()).ok_or(Corrupt)
     }
 }
@@ -536,6 +569,46 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
 }
 
+/// H keys with N counts or D values; values retain their own field classes.
+/// Decode funds the whole tree before its first insert, like the shared maps.
+impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        e.varint(self.len() as u64)?;
+        for (key, value) in self {
+            key.put_h(e, path)?;
+            value.put(e)?;
+        }
+        Ok(())
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
+                return Err(Corrupt);
+            }
+        }
+        Ok(out)
+    }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_h_map::<K, V>(d, usize::MAX)
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("HKeyMap<");
+        K::shape_h(s);
+        V::shape(s);
+        s.push(">");
+    }
+}
+
+pub(crate) fn verify_h_map<K: HDigestKey + Ord, V: Durable>(
+    d: &mut Dec<'_>,
+    max: usize,
+) -> Result<(), Corrupt> {
+    verify_entries_bounded(d, max, K::key_h, V::verify)
+}
+
 fn verify_seq(
     d: &mut Dec<'_>,
     mut item: impl FnMut(&mut Dec<'_>) -> Result<(), Corrupt>,
@@ -663,7 +736,19 @@ fn verify_entries<'a, K: Ord>(
     key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
     value: impl Fn(&mut Dec<'a>) -> Result<(), Corrupt>,
 ) -> Result<(), Corrupt> {
+    verify_entries_bounded(d, usize::MAX, key, value)
+}
+
+fn verify_entries_bounded<'a, K: Ord>(
+    d: &mut Dec<'a>,
+    max: usize,
+    key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
+    value: impl Fn(&mut Dec<'a>) -> Result<(), Corrupt>,
+) -> Result<(), Corrupt> {
     let len = d.take_len()?;
+    if len > max {
+        return Err(Corrupt);
+    }
     let start = d.at;
     let mut previous = None;
     let mut sorted = true;
@@ -692,6 +777,72 @@ fn verify_entries<'a, K: Ord>(
 pub(crate) trait DurableEmpty {
     fn durable_empty(&self) -> bool;
 }
+
+mod pi_only_sealed {
+    pub trait Sealed {}
+}
+
+/// A Pi-only runtime type behind a labelled `E` field
+/// (`E f: Real as Label`). The shape keeps `Label`'s text, so the shared
+/// allowlist digests do not move when Pi-only state grows. Sealed: only the
+/// types next to `PI_ONLY_E_LABELS` implement it, and the labelled arm of
+/// `durable_struct!` refuses to compile for any other type, path or label.
+pub(crate) trait PiOnlyDurable: pi_only_sealed::Sealed + DurableEmpty + Default {
+    /// The `Type.field` path the label is allowed on.
+    const FIELD: &'static str;
+    /// The type whose text the shape keeps.
+    type Label: ?Sized;
+}
+
+/// The labelled `E` allowlist: (field path, label text). One entry per sealed
+/// type; anything else is a compile error in `durable_struct!`.
+pub(crate) const PI_ONLY_E_LABELS: &[(&str, &str)] = &[
+    // The Pi usage ledger plus the Pi fork state. An `E` field: Claude and
+    // Codex must leave it empty, and Pi moves it into the Pi section, whose
+    // allowlist binds its shape. The shape keeps the earlier type text, so
+    // the Claude and Codex allowlist digests stay byte-identical.
+    (
+        "SnapshotAccumulator.seen_pi_usage_keys",
+        "BTreeMap<String, PiUsageDedupState>",
+    ),
+];
+impl pi_only_sealed::Sealed for crate::snapshots::PiLedger {}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether `path` is allowlisted and is the path `field` (the sealed type's
+/// own `FIELD`) names. Evaluated in a const by the labelled arm.
+pub(crate) const fn pi_only_label_allowed(path: &str, field: &str, label: &str) -> bool {
+    if !str_eq(path, field) {
+        return false;
+    }
+    let mut i = 0;
+    while i < PI_ONLY_E_LABELS.len() {
+        if str_eq(PI_ONLY_E_LABELS[i].0, path) && str_eq(PI_ONLY_E_LABELS[i].1, label) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Compiles only when `A` and `B` are the same type.
+pub(crate) trait SameType<T: ?Sized> {}
+impl<T: ?Sized> SameType<T> for T {}
+pub(crate) fn same_type<A: ?Sized + SameType<B>, B: ?Sized>() {}
 
 // Scalar validation stays identical to decode, including ranges and labels.
 macro_rules! scalar_verify {
@@ -1321,7 +1472,7 @@ macro_rules! durable_field {
     }};
     (put E, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
-        if !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
+        if !$e.field_moved($path) && !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
             return Err($crate::durable_tail_codec::Refuse::NonEmpty($path));
         }
     }};
@@ -1390,6 +1541,26 @@ macro_rules! durable_field {
     (shape E, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("E ", stringify!($f), ": ", stringify!($ty)))
     };
+    // A labelled `E` field: the shape keeps the label's text, exactly as the
+    // unlabelled arm above would print it for that type.
+    (shape E, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {{
+        const _: () = assert!(
+            $crate::durable_tail_codec::pi_only_label_allowed(
+                $path,
+                <$ty as $crate::durable_tail_codec::PiOnlyDurable>::FIELD,
+                stringify!($label),
+            ),
+            "labelled E field is not in PI_ONLY_E_LABELS"
+        );
+        $crate::durable_tail_codec::same_type::<
+            $label,
+            <$ty as $crate::durable_tail_codec::PiOnlyDurable>::Label,
+        >();
+        $s.push(concat!("E ", stringify!($f), ": ", stringify!($label)))
+    }};
+    (shape $c:ident, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {
+        compile_error!("only E fields may carry a shape label")
+    };
     (shape I, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("I ", stringify!($f), ": ", stringify!($ty)))
     };
@@ -1404,6 +1575,18 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
+    (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+        $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
+        impl $t {
+            fn put_borrowed(e: &mut $crate::durable_tail_codec::Enc, $($f: &$ty),*)
+                -> Result<(), $crate::durable_tail_codec::Refuse> {
+                $($crate::durable_tail_codec::durable_field!(
+                    put $c, e, $f, $ty, concat!(stringify!($t), ".", stringify!($f))
+                );)*
+                Ok(())
+            }
+        }
+    };
     (key $t:ident $body:tt) => {
         $crate::durable_tail_codec::durable_struct!($t $body);
         $crate::durable_tail_codec::durable_struct!(@key $t $body);
@@ -1419,7 +1602,7 @@ macro_rules! durable_struct {
             }
         }
     };
-    ($t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+    ($t:ident { $($c:ident $f:ident : $ty:ty $(as $label:ty)?),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
             #[allow(unused_variables)]
             fn put(
@@ -1445,7 +1628,10 @@ macro_rules! durable_struct {
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
-                    $($crate::durable_tail_codec::durable_field!(shape $c, s, $f, $ty);)*
+                    $($crate::durable_tail_codec::durable_field!(
+                        shape $c, s, $f, $ty
+                        $(, as $label, concat!(stringify!($t), ".", stringify!($f)))?
+                    );)*
                     s.leave();
                 }
             }
@@ -1706,6 +1892,7 @@ mod tests {
         let mut out = Short(Vec::new());
         {
             let mut e = Enc {
+                moved_field: None,
                 sink: Sink::Write {
                     out: &mut out,
                     len: 0,
@@ -1719,6 +1906,7 @@ mod tests {
         assert_eq!(out.0, b"abc");
         let mut empty = &mut [][..];
         let mut e = Enc {
+            moved_field: None,
             sink: Sink::Write {
                 out: &mut empty,
                 len: 0,

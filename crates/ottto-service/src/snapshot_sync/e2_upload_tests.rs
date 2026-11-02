@@ -164,7 +164,7 @@ fn e2_gate_off_batches_equal_the_plain_packer() {
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     let mut plain = Vec::new();
     let mut accepted = 0;
-    upload_resumable_batches_with_body_witness_partitioned(
+    upload_resumable_batches_with_literal_families(
         &items,
         &unique_poison_scope(),
         &mut test_upload_progress(),
@@ -173,6 +173,7 @@ fn e2_gate_off_batches_equal_the_plain_packer() {
         |item| item.fingerprint.clone(),
         |item| Some(item.session.as_str()),
         |item| item.class,
+        |_| None,
         &mut InplaceRetryBudget::default(),
         |batch| {
             plain.push(

@@ -778,9 +778,6 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
-    /// Exact backend admission for non-terminal census progress/block status.
-    #[serde(default)]
-    pub census_status_contract: Option<String>,
     /// Retired per-account cohort token for contract-5 request identity rows.
     /// Contract 5 is always on for Claude Code, so this daemon decodes the
     /// field for compatibility and never reads it; the server keeps sending
@@ -1401,9 +1398,6 @@ pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
 /// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
 pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
 
-/// Activity-hint admission; unknown or absent tokens preserve legacy bytes.
-pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
-
 /// Content-free first failed census gate, in the shared receipt builder's order.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1513,7 +1507,7 @@ pub struct SnapshotStatusRequest {
     pub last_census_residue_archived_rollout_count: u64,
     #[serde(default)]
     pub last_census_residue_blocked_session_count: u64,
-    /// Census-member queue plus carry replay, only under census_status:v1.
+    /// Census-member queue plus carry replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_census_pending_file_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2921,6 +2915,7 @@ impl SnapshotApiClient {
     }
 
     /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
+    #[cfg(test)]
     pub fn upload_cloud_session_scan_chunk(
         &self,
         relay_token: &str,
@@ -5190,7 +5185,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; session_request_sole_login_witness_contract, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; session_request_sole_login_witness_contract, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

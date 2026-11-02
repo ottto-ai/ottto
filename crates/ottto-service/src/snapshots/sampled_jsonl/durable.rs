@@ -89,14 +89,21 @@ pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
     ));
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    if let Some(source) = crate::durable_tail_store::DurableSource::from_snapshot(source) {
+        (source.properties().shape_extension)(&mut shape);
+    }
     shape.digest()
 }
+
+/// Claude and Codex bodies add nothing after the shared shapes.
+pub(in crate::snapshots) fn no_shape_extension(_: &mut Shape) {}
 
 #[cfg(test)]
 pub(crate) fn shape_text() -> String {
     let mut shape = Shape::default();
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    pi::shape_extension(&mut shape);
     shape.text().to_string()
 }
 
@@ -177,8 +184,30 @@ pub(in crate::snapshots) fn encode_body(
     )
 }
 
+/// A registry row's body walk over the borrowed live parts.
+pub(in crate::snapshots) type PutBody = fn(
+    &mut Enc<'_>,
+    &SnapshotAccumulator,
+    &JsonlReadReport,
+    (usize, usize, bool),
+    &Rederive,
+) -> Result<(), Refuse>;
+
+/// The Claude and Codex body: the reduction, then the re-derivation digests.
+pub(in crate::snapshots) fn put_body(
+    e: &mut Enc<'_>,
+    acc: &SnapshotAccumulator,
+    report: &JsonlReadReport,
+    scalars: (usize, usize, bool),
+    rederive: &Rederive,
+) -> Result<(), Refuse> {
+    CachedJsonlReduction::put_borrowed(e, acc, report, &scalars.0, &scalars.1, &scalars.2)?;
+    rederive.put(e)
+}
+
 /// Borrowed PRE-finalization state. Rederivation is computed once for both walks.
 pub(in crate::snapshots) struct BodyEncoding<'a> {
+    put: PutBody,
     accumulator: &'a SnapshotAccumulator,
     report: &'a JsonlReadReport,
     scalars: (usize, usize, bool),
@@ -206,9 +235,10 @@ impl<'a> BodyEncoding<'a> {
             "SnapshotAccumulator.activity_skills",
         )?;
         // Reuse source registration; no additional Claude/Codex dispatch table.
-        super::super::sampled_scan::durable_tail::durable_source(accumulator.source)
+        let source = super::super::sampled_scan::durable_tail::durable_source(accumulator.source)
             .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
         Ok(Self {
+            put: source.properties().put,
             accumulator,
             report,
             scalars,
@@ -216,12 +246,13 @@ impl<'a> BodyEncoding<'a> {
         })
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
-        self.accumulator.put(e)?;
-        self.report.put(e)?;
-        self.scalars.0.put(e)?;
-        self.scalars.1.put(e)?;
-        self.scalars.2.put(e)?;
-        self.rederive.put(e)
+        (self.put)(
+            e,
+            self.accumulator,
+            self.report,
+            self.scalars,
+            &self.rederive,
+        )
     }
     pub(in crate::snapshots) fn count(&self, limit: usize) -> Result<usize, Refuse> {
         let mut e = Enc::count(limit);
@@ -271,23 +302,49 @@ pub(in crate::snapshots) fn encode_permitted(
 }
 
 /// No allocation or transcript input: locate literals in a verified record body.
-pub(in crate::snapshots) fn body_has_skill_labels(body: &[u8]) -> Result<bool, Corrupt> {
+pub(in crate::snapshots) fn body_has_skill_labels(
+    source: SnapshotSource,
+    body: &[u8],
+) -> Result<bool, Corrupt> {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .ok_or(Corrupt)?
+        .properties();
     let mut d = Dec::new(body);
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
-    let present = d.has_pl_labels();
-    d.finish()?;
-    Ok(present)
+    (row.verify)(&mut d)?;
+    Ok(d.has_pl_labels())
 }
 
 /// Structural body verification only: no reduction, re-derivation or live
 /// inputs. The caller separately checks source/binding and envelope integrity.
 /// Precondition: check size, mode and the envelope trailer before this walk.
-pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
-    let mut d = Dec::new(body);
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
+pub(in crate::snapshots) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+    CachedJsonlReduction::verify(d)?;
+    Rederive::verify(d)?;
     d.finish()
+}
+
+/// Decodes a Claude or Codex body, including the end check. The caller
+/// checks the decoded source against the row.
+pub(in crate::snapshots) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
+    let reduction = CachedJsonlReduction::take(d)?;
+    let rederive = Rederive::take(d)?;
+    d.finish()?;
+    Ok(Decoded {
+        reduction,
+        rederive,
+    })
+}
+
+/// The registry row's decode walk, then the source binding.
+fn take_registered(d: &mut Dec<'_>, source: SnapshotSource) -> Result<Decoded, Corrupt> {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .ok_or(Corrupt)?
+        .properties();
+    let decoded = (row.take)(d)?;
+    if decoded.reduction.accumulator.source != source {
+        return Err(Corrupt);
+    }
+    Ok(decoded)
 }
 
 /// A decoded record before re-derivation. Its content fields are empty.
@@ -307,17 +364,7 @@ pub(in crate::snapshots) fn decode_body(
     body: &[u8],
     source: SnapshotSource,
 ) -> Result<Decoded, Corrupt> {
-    let mut d = Dec::new(body);
-    let reduction = CachedJsonlReduction::take(&mut d)?;
-    let rederive = Rederive::take(&mut d)?;
-    d.finish()?;
-    if reduction.accumulator.source != source {
-        return Err(Corrupt);
-    }
-    Ok(Decoded {
-        reduction,
-        rederive,
-    })
+    take_registered(&mut Dec::new(body), source)
 }
 
 /// Funds typed decode only; re-derivation is a separate allocation boundary.
@@ -348,17 +395,7 @@ pub(in crate::snapshots) fn decode_body_bounded(
         .map_err(|_| DecodeFailure::Budget)?;
     let mut reserve = |bytes| lease.charge(bytes).is_ok();
     let mut d = Dec::bounded(body, &mut reserve);
-    let result = (|| {
-        let reduction = CachedJsonlReduction::take(&mut d)?;
-        let rederive = Rederive::take(&mut d)?;
-        if d.remaining() != 0 || reduction.accumulator.source != source {
-            return Err(Corrupt);
-        }
-        Ok(Decoded {
-            reduction,
-            rederive,
-        })
-    })();
+    let result = take_registered(&mut d, source);
     d.outcome(result)
 }
 
@@ -383,9 +420,15 @@ impl Decoded {
             _ => unreachable!(),
         };
         *digest = Some([0; 32]);
+        let put = crate::durable_tail_store::DurableSource::from_snapshot(
+            self.reduction.accumulator.source,
+        )
+        .unwrap()
+        .properties()
+        .put;
         Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            self.reduction.put(e)?;
-            self.rederive.put(e)
+            let (acc, report, scalars) = self.reduction.finish_view();
+            put(e, acc, report, scalars, &self.rederive)
         })
         .unwrap()
     }
@@ -415,6 +458,7 @@ mod content;
 
 /// Content obligations without a supported, pre-funded extractor.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct RederiveUnfunded;
 
 impl Decoded {
@@ -500,6 +544,9 @@ impl Decoded {
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
+
+#[path = "durable_pi.rs"]
+pub(in crate::snapshots) mod pi;
 
 #[cfg(test)]
 pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {

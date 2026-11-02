@@ -3173,6 +3173,7 @@ fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
     }
 }
 
+#[cfg(test)]
 pub fn parse_codex_status_fallback(
     text: &str,
     captured_at: String,
@@ -17842,6 +17843,7 @@ fn refine_claude_max_rate_limit_plan(
     Some(refined)
 }
 
+#[cfg(test)]
 fn parse_codex_text_model(text: &str) -> Option<AgentModelStatus> {
     let model = text.lines().find_map(|line| {
         let lower = line.to_ascii_lowercase();
@@ -17869,6 +17871,7 @@ fn parse_codex_text_model(text: &str) -> Option<AgentModelStatus> {
     })
 }
 
+#[cfg(test)]
 fn parse_codex_text_quota_windows(text: &str) -> Vec<AgentQuotaWindow> {
     let mut windows = Vec::new();
     for line in text.lines() {
@@ -17907,6 +17910,7 @@ fn parse_codex_text_quota_windows(text: &str) -> Vec<AgentQuotaWindow> {
     windows
 }
 
+#[cfg(test)]
 fn parse_codex_text_context(text: &str) -> Option<AgentContextStatus> {
     let context_line = text
         .lines()
@@ -19277,6 +19281,7 @@ fn extract_plan_type(text: &str, candidates: &[&str]) -> Option<String> {
         .map(|candidate| candidate.to_string())
 }
 
+#[cfg(test)]
 fn extract_percent_before(text: &str, markers: &[&str]) -> Option<u8> {
     let bytes = text.as_bytes();
     let mut index = 0;

@@ -35,7 +35,12 @@ const REARM_FAMILY_REQUESTS: [(Option<&str>, &str, u32); 4] = [
     (Some(REARM_AGENTS[1]), "req_agent_b_1", 3),
 ];
 
-fn rearm_transcript_line(session: &str, agent: Option<&str>, request: &str, second: u32) -> String {
+pub(super) fn rearm_transcript_line(
+    session: &str,
+    agent: Option<&str>,
+    request: &str,
+    second: u32,
+) -> String {
     let agent = agent
         .map(|agent| format!("\"agentId\":\"{agent}\",\"isSidechain\":true,"))
         .unwrap_or_default();
@@ -44,14 +49,14 @@ fn rearm_transcript_line(session: &str, agent: Option<&str>, request: &str, seco
     )
 }
 
-fn rearm_member_session(agent: Option<&str>) -> String {
+pub(super) fn rearm_member_session(agent: Option<&str>) -> String {
     match agent {
         Some(agent) => format!("{REARM_ROOT}_agent-{agent}"),
         None => REARM_ROOT.to_string(),
     }
 }
 
-fn rearm_family_sessions() -> BTreeSet<String> {
+pub(super) fn rearm_family_sessions() -> BTreeSet<String> {
     std::iter::once(rearm_member_session(None))
         .chain(
             REARM_AGENTS
@@ -63,7 +68,11 @@ fn rearm_family_sessions() -> BTreeSet<String> {
 
 /// Paired API and trace rows for one root-session request, as the local OTEL
 /// receiver writes them.
-fn rearm_evidence_lines(agent: Option<&str>, request: &str, sequence: u64) -> (String, String) {
+pub(super) fn rearm_evidence_lines(
+    agent: Option<&str>,
+    request: &str,
+    sequence: u64,
+) -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
         capture_revision: "claude_api_request:v2".to_string(),
@@ -786,7 +795,7 @@ impl RearmFixture {
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index_with_comparison(
+            checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
                 &progress,
@@ -801,6 +810,8 @@ impl RearmFixture {
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
                 Some(UnsettledUploadCause::Shed),
+                None,
+                Default::default(),
             )
             .expect("checkpoint shed page");
             return RearmPage {

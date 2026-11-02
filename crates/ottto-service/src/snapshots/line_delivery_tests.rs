@@ -4,6 +4,7 @@ use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, Ph
 use super::*;
 use crate::codex_prelude_footprint::tests::metric;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use crate::transcript_acquisition::FileObject;
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -134,19 +135,7 @@ fn finish(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(source, &scan, &mut index);
                 return (index, scan, steps);
             }
         }

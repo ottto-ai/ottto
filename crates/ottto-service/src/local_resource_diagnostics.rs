@@ -98,6 +98,70 @@ macro_rules! sparse_lifetime_counters {
         }
     };
 }
+/// The Codex cursor's logged event counters, in log key order: the one name
+/// list behind `CodexCursorEvents` (fields and keys) and the cursor's RAM
+/// `Counters` and their projection. Expands to `$callback! { fields }`.
+macro_rules! codex_cursor_events {
+    ($callback:ident) => {
+        $callback! {
+            jobs_started,
+            jobs_paused,
+            jobs_resumed,
+            /// Published with a sealed-prefix certificate (after `finish`).
+            jobs_certified,
+            /// Lossy with intact samples, finished uncertified (after `finish`).
+            /// Publication then follows main's completeness rule: retryable loss
+            /// (a malformed or invalid line) publishes nothing and is not indexed.
+            jobs_uncertified,
+            /// Restarted after a necessary invalidation; nothing committed.
+            jobs_invalidated,
+            /// Ended as strict `MemberChanged` debt after repeated invalidations.
+            jobs_member_changed,
+            /// Ended as strict `JoinStateBound` debt: the job did not fit the state
+            /// budget even after releasing retained copies.
+            jobs_state_bound,
+            jobs_lost,
+            /// Evidence unavailable at start, resume or emission (K9): deferred as
+            /// `InProgress`, never counted as a member change.
+            jobs_deferred_inputs,
+            /// Start refused because the held file's stamp could not be read.
+            jobs_start_unstartable,
+            /// A tail reached its audit deadline before commit: restarted as
+            /// the full audit, uncounted.
+            jobs_audit_restarted,
+            /// Committed, then the native finish refused publication.
+            jobs_finish_failed,
+            /// A dropped scan frame returned its intact job to the slot (K12).
+            jobs_frame_returned,
+            deferred,
+            /// A large file waited because another is ahead in rotation (K7).
+            deferred_rotation,
+            /// A large read after this generation's completed attempt, left for the
+            /// next generation (K7 fence).
+            deferred_next_generation,
+            /// A resume found a live job of another namespace in the slot (K10).
+            namespace_busy,
+            cursor_disabled_unsupported_layout,
+            /// Certified at or after its audit deadline: the debt stays staged.
+            audit_overdue,
+            /// A completion on a file that did not grow withheld an unterminated
+            /// final record (N2): debt staged, the record left to main's EOF path.
+            sealed_fragment_withheld,
+            /// A completion at genuine unchanged EOF applied its withheld final
+            /// record with main's trailing-line rule (strict finish identity).
+            /// Counted only once its `finish` succeeded.
+            eof_record_applied,
+            /// A paused job ended because its path no longer named the held
+            /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`
+            /// (3 consecutive resume pages).
+            jobs_unavailable_ended,
+            memo_hits,
+            memo_records,
+            parked_hits,
+        }
+    };
+}
+pub(crate) use codex_cursor_events;
 
 pub(crate) mod cache_lifecycle;
 pub(crate) mod claude_absence;
@@ -1670,40 +1734,22 @@ pub(crate) struct CodexCursorCounts {
     pub(crate) retained: CodexCursorRetained,
 }
 
-/// Process-global cursor events during a scan window (shared process scope,
-/// not attributed to one scan or namespace).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CodexCursorEvents {
-    pub(crate) jobs_started: u32,
-    pub(crate) jobs_paused: u32,
-    pub(crate) jobs_resumed: u32,
-    pub(crate) jobs_certified: u32,
-    pub(crate) jobs_uncertified: u32,
-    pub(crate) jobs_invalidated: u32,
-    pub(crate) jobs_member_changed: u32,
-    pub(crate) jobs_state_bound: u32,
-    pub(crate) jobs_lost: u32,
-    pub(crate) jobs_deferred_inputs: u32,
-    pub(crate) jobs_start_unstartable: u32,
-    pub(crate) jobs_audit_restarted: u32,
-    pub(crate) jobs_finish_failed: u32,
-    pub(crate) jobs_frame_returned: u32,
-    pub(crate) deferred: u32,
-    pub(crate) deferred_rotation: u32,
-    pub(crate) deferred_next_generation: u32,
-    pub(crate) namespace_busy: u32,
-    pub(crate) cursor_disabled_unsupported_layout: u32,
-    pub(crate) audit_overdue: u32,
-    pub(crate) sealed_fragment_withheld: u32,
-    /// A withheld final record applied at a genuine unchanged EOF.
-    pub(crate) eof_record_applied: u32,
-    /// A paused job ended: its path no longer named its object, or its
-    /// evidence stayed unavailable for 3 consecutive resume pages.
-    pub(crate) jobs_unavailable_ended: u32,
-    pub(crate) memo_hits: u32,
-    pub(crate) memo_records: u32,
-    pub(crate) parked_hits: u32,
+macro_rules! codex_cursor_events_struct {
+    ($($(#[$doc:meta])* $field:ident,)+) => {
+        /// Process-global cursor events during a scan window (shared process scope,
+        /// not attributed to one scan or namespace).
+        #[derive(Clone, Copy, Debug, Default)]
+        pub(crate) struct CodexCursorEvents { $($(#[$doc])* pub(crate) $field: u32,)+ }
+        impl Serialize for CodexCursorEvents {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.$field != 0 { map.serialize_entry(stringify!($field), &self.$field)?; })+
+                map.end()
+            }
+        }
+    };
 }
+codex_cursor_events!(codex_cursor_events_struct);
 
 /// Process-wide cursor state when the scan completed (gauges, not events).
 #[derive(Clone, Copy, Debug, Default)]
@@ -1718,47 +1764,6 @@ pub(crate) struct CodexCursorRetained {
     pub(crate) rotation_waiters: u32,
     /// Process-lifetime maximum `now - due` of an overdue certification.
     pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
-}
-impl Serialize for CodexCursorEvents {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        for (key, count) in [
-            ("jobs_started", self.jobs_started),
-            ("jobs_paused", self.jobs_paused),
-            ("jobs_resumed", self.jobs_resumed),
-            ("jobs_certified", self.jobs_certified),
-            ("jobs_uncertified", self.jobs_uncertified),
-            ("jobs_invalidated", self.jobs_invalidated),
-            ("jobs_member_changed", self.jobs_member_changed),
-            ("jobs_state_bound", self.jobs_state_bound),
-            ("jobs_lost", self.jobs_lost),
-            ("jobs_deferred_inputs", self.jobs_deferred_inputs),
-            ("jobs_start_unstartable", self.jobs_start_unstartable),
-            ("jobs_audit_restarted", self.jobs_audit_restarted),
-            ("jobs_finish_failed", self.jobs_finish_failed),
-            ("jobs_frame_returned", self.jobs_frame_returned),
-            ("deferred", self.deferred),
-            ("deferred_rotation", self.deferred_rotation),
-            ("deferred_next_generation", self.deferred_next_generation),
-            ("namespace_busy", self.namespace_busy),
-            (
-                "cursor_disabled_unsupported_layout",
-                self.cursor_disabled_unsupported_layout,
-            ),
-            ("audit_overdue", self.audit_overdue),
-            ("sealed_fragment_withheld", self.sealed_fragment_withheld),
-            ("eof_record_applied", self.eof_record_applied),
-            ("jobs_unavailable_ended", self.jobs_unavailable_ended),
-            ("memo_hits", self.memo_hits),
-            ("memo_records", self.memo_records),
-            ("parked_hits", self.parked_hits),
-        ] {
-            if count != 0 {
-                map.serialize_entry(key, &count)?;
-            }
-        }
-        map.end()
-    }
 }
 impl Serialize for CodexCursorRetained {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2342,35 +2347,13 @@ mod tests {
 
     fn max_codex_cursor_counts() -> CodexCursorCounts {
         let m = u32::MAX;
+        macro_rules! all_max {
+            ($($(#[$doc:meta])* $field:ident,)+) => {
+                CodexCursorEvents { $($field: m),+ }
+            };
+        }
         CodexCursorCounts {
-            during_scan_window: CodexCursorEvents {
-                jobs_started: m,
-                jobs_paused: m,
-                jobs_resumed: m,
-                jobs_certified: m,
-                jobs_uncertified: m,
-                jobs_invalidated: m,
-                jobs_member_changed: m,
-                jobs_state_bound: m,
-                jobs_lost: m,
-                jobs_deferred_inputs: m,
-                jobs_start_unstartable: m,
-                jobs_audit_restarted: m,
-                jobs_finish_failed: m,
-                jobs_frame_returned: m,
-                deferred: m,
-                deferred_rotation: m,
-                deferred_next_generation: m,
-                namespace_busy: m,
-                cursor_disabled_unsupported_layout: m,
-                audit_overdue: m,
-                sealed_fragment_withheld: m,
-                eof_record_applied: m,
-                jobs_unavailable_ended: m,
-                memo_hits: m,
-                memo_records: m,
-                parked_hits: m,
-            },
+            during_scan_window: codex_cursor_events!(all_max),
             retained: CodexCursorRetained {
                 paused_job: true,
                 paused_job_charged_bytes: m,
@@ -2877,8 +2860,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi fields add 97 bytes at u64::MAX, the Codex tier field 53.
-        assert!(serde_json::to_string(record).unwrap().len() < 2357);
+        // The four Pi fields and the Codex tier field stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2421);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

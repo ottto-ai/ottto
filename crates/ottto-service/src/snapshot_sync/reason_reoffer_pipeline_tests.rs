@@ -252,11 +252,7 @@ impl ReofferServer {
 
 impl Drop for ReofferServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        stop_server(&self.stop, &mut self.worker);
     }
 }
 
@@ -1296,7 +1292,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     let mut accepted = 0;
     let mut budget = InplaceRetryBudget::default();
     let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
-        upload_resumable_batches_with_body_witness_partitioned(
+        upload_resumable_batches_with_literal_families(
             std::slice::from_ref(&fingerprint),
             &unique_poison_scope(),
             &mut progress,
@@ -1305,6 +1301,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             |_| body.clone(),
             |_| Some("synthetic-session"),
             |_| false,
+            |_| None,
             &mut budget,
             |items| {
                 assert_eq!(items, vec![fingerprint.clone()]);
