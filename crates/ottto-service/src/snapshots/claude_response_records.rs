@@ -61,6 +61,22 @@ impl ClaudeResponseBook {
         key: &str,
     ) -> Option<ValueGuard<'_, ClaudeResponseObservation>> {
         let slot = *self.index.get(key)?;
+        #[cfg(test)]
+        if super::s0::is_suffix() {
+            use crate::durable_tail_codec::Durable;
+            let mut e = crate::durable_tail_codec::Enc::count(usize::MAX);
+            let encoded = self
+                .responses
+                .iter()
+                .skip(slot as usize + 1)
+                .try_for_each(|r| r.put(&mut e))
+                .ok()
+                .map(|_| e.counted() as u64);
+            super::s0::touch(
+                self.responses.len().saturating_sub(slot as usize + 1),
+                encoded,
+            );
+        }
         self.responses.get_mut(slot as usize)
     }
 

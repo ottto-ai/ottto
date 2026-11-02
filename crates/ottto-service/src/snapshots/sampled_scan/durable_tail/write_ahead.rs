@@ -720,6 +720,8 @@ impl SharedCache {
                     .mark_private_labels(writer, chain.binding().key)
                     .is_err()
             {
+                #[cfg(test)]
+                crate::snapshots::s0::leaf("private_label_inventory_io");
                 return PrepareOutcome::NotPersisted(NotPersisted::Codec);
             }
             match slot.store.prepare_stream(writer, header) {
@@ -1265,6 +1267,8 @@ fn unprepared_write(disposition: UnpreparedDisposition) -> WriteOutcome {
 /// The exact receipt is the next successful write for this key: it releases a
 /// per-key hold and consumes the P2 original witness through the exact ACK adapter.
 fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, receipt: &ReceiptProof) {
+    #[cfg(test)]
+    crate::snapshots::s0::written(key);
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
     stores.release_restore_pending(&digest, receipt.identity().certificate().length);

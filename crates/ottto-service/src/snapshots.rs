@@ -298,6 +298,8 @@ pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec
 
 #[cfg(test)]
 pub(crate) use restart_restore::RestartRestoreForTest;
+#[cfg(test)]
+pub(crate) mod s0;
 mod sampled_audit;
 mod sampled_jsonl;
 #[cfg(test)]
@@ -29934,6 +29936,18 @@ impl OwnedSourceScan {
                             plan.metrics().native_bytes,
                         );
                         #[cfg(test)]
+                        s0::context(
+                            &local_index_key(&active.candidate.path),
+                            &format!("{:?}", plan.mode()),
+                            &format!("{:?}", active.parse_reason),
+                            active.candidate.size_bytes,
+                            plan.metrics().native_bytes,
+                            index
+                                .files
+                                .get(&local_index_key(&active.candidate.path))
+                                .map_or(0, |e| e.size_bytes),
+                        );
+                        #[cfg(test)]
                         crate::on_proof::completed(
                             &local_index_key(&active.candidate.path),
                             &format!("{:?}", plan.mode()),
@@ -37093,6 +37107,11 @@ impl OwnedJsonlParser {
         mut observe: impl FnMut(&Value),
         drive: impl FnOnce(&mut ParserReader, LineSink<'_>) -> T,
     ) -> T {
+        #[cfg(test)]
+        let _s0_suffix =
+            s0::suffix(self.reader.acquisition.as_ref().is_some_and(|p| {
+                matches!(p.mode(), crate::transcript_acquisition::ReadMode::Tail)
+            }));
         let source = self.source;
         let accumulator = &mut self.accumulator;
         let recognized_usage_drop_count = &mut self.recognized_usage_drop_count;
@@ -37356,6 +37375,22 @@ impl OwnedJsonlParser {
         // PRE-finalization seam. The live scan-shared inputs are
         // detached exactly as a retained copy excludes them, then restored
         // before any finalization reads them; no early exit lies between.
+        #[cfg(test)]
+        {
+            let traces = accumulator.codex_turn_traces.take();
+            let parents = accumulator.codex_parent_ownership_ledgers.take();
+            s0::state(
+                path,
+                &accumulator,
+                &report,
+                reduction_drop_count as u64,
+                sealed_fragment,
+                bounded.consumed,
+                bounded.last_line_end,
+            );
+            accumulator.codex_turn_traces = traces;
+            accumulator.codex_parent_ownership_ledgers = parents;
+        }
         if let Some(pre) = pre {
             let traces = accumulator.codex_turn_traces.take();
             let parents = accumulator.codex_parent_ownership_ledgers.take();
@@ -37572,6 +37607,13 @@ impl OwnedJsonlParser {
                 recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(1);
             }
         }
+        #[cfg(test)]
+        s0::projection(
+            path,
+            &snapshots,
+            recognized_usage_drop_count as u64,
+            report.over_line_cap_count as u64,
+        );
         Ok(ParsedJsonlFile {
             snapshots,
             report,
@@ -38013,12 +38055,16 @@ fn settle_native_attempt(
                     }
                     PrepareOutcome::NotPersisted(reason) => {
                         #[cfg(test)]
+                        s0::not_persisted(fence.key, &format!("wa.{reason:?}"));
+                        #[cfg(test)]
                         crate::on_proof::hold(&format!("wa.{reason:?}"), fence.key);
                         let outcome =
                             cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
                         unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
                     }
                     PrepareOutcome::Degraded(reason) => {
+                        #[cfg(test)]
+                        s0::not_persisted(fence.key, &format!("wa.degraded.{reason:?}"));
                         #[cfg(test)]
                         crate::on_proof::hold(&format!("wa.degraded.{reason:?}"), fence.key);
                         let outcome =
@@ -45559,6 +45605,15 @@ fn ensure_bounded_traversal(
         retry_attempt,
     );
 
+    #[cfg(test)]
+    s0::event(
+        "starting",
+        serde_json::json!({
+            "reason":format!("{:?}",transition.rearm_cause()),
+            "identity_contract_latch":index.claude_request_identity_contract_changed,
+            "held_family_roots_some":index.claude_full_rearm_progress.held_family_roots.is_some(),
+        }),
+    );
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation
     // deliberately leaves this marker set and drops the traversal so the next
@@ -45936,6 +45991,17 @@ fn ensure_bounded_traversal(
                 carried_file_count
             );
         }
+        #[cfg(test)]
+        s0::event(
+            "rearm_start",
+            serde_json::json!({
+                "stale_pending_families": stale_pending_roots.len(),
+                "rearmed_index_files": rearmed_file_count, "carried_pending_families": carried_roots.len(),
+                "rejections": stale_carry_rejection_counts.json(),
+                "identity_contract_latch": index.claude_request_identity_contract_changed,
+                "held_family_roots_some": index.claude_full_rearm_progress.held_family_roots.is_some(),
+            }),
+        );
         transition.stale_pending_families = stale_pending_roots.len();
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
@@ -53631,6 +53697,8 @@ impl ScanIndex {
         }
         let needs_classification =
             self.files.contains_key(&key) && !self.claude_account_deferred_holds.contains_key(&key);
+        #[cfg(test)]
+        s0::probe("rehome_rekey_account_custody", self, old);
         self.rekey_account_custody(old, &key);
         // Custody is at the destination BEFORE the owner retires the source generation.
         if !self
@@ -53983,6 +54051,8 @@ impl ScanIndex {
                     } else if let Some(working) = self.files.get(key) {
                         evidence_owed::carry_debt(&mut committed, working);
                     }
+                    #[cfg(test)]
+                    s0::restored("held_page");
                     self.files.insert(key.clone(), committed);
                 }
                 None if placeholders.contains(key) => {
@@ -54248,6 +54318,12 @@ impl ScanIndex {
                         exact_only,
                     );
                 }
+                #[cfg(test)]
+                s0::restored(if every_batch_sent {
+                    "partial_checkpoint"
+                } else {
+                    "shed_failed"
+                });
                 files.insert(key.clone(), committed.clone());
             } else if fence_drained_here && !drops_exempted_member {
                 drops_exempted_member =
@@ -54680,6 +54756,8 @@ impl ScanIndex {
     /// Retire only obligations made unfulfillable by positively proven absence.
     /// Codex protection retains the entry and its own lineage/receipt state.
     fn retire_absent_account_hold(&mut self, key: &str, members: &AccountMoveObservations) -> bool {
+        #[cfg(test)]
+        s0::probe("retire_absent_account_hold", self, key);
         if !self.claude_account_deferred_holds.contains_key(key) {
             return false;
         }

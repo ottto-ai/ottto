@@ -2079,6 +2079,8 @@ impl SharedCache {
     }
     #[inline(never)]
     pub(in crate::snapshots) fn note_skill_label_refusal(&self, reason: Refuse) {
+        #[cfg(test)]
+        crate::snapshots::s0::leaf(refuse_class(reason));
         if let Refuse::NonEmpty(class) = reason {
             if class.starts_with("skill_label_") {
                 if let Some(mut stores) = self.durable() {
@@ -3701,6 +3703,8 @@ impl SharedCache {
             match outcome {
                 ReadOutcome::Found(record) => record,
                 ReadOutcome::Missing => {
+                    #[cfg(test)]
+                    crate::snapshots::s0::missing(key, held.metadata().map_or(0, |m| m.len()));
                     stores.counters.missing += 1;
                     return Err((if disabled {
                         MissClass::Unavailable
@@ -4952,12 +4956,16 @@ impl SharedCache {
                         if source == DurableSource::Codex {
                             invalidate.insert(store::key_digest(source, &key));
                         }
+                        #[cfg(test)]
+                        crate::snapshots::s0::not_persisted(&key, "selection");
                         not_persisted.push("selection");
                         continue;
                     }
                 }
                 if index.effective_upload_body_witness_revision_requires_adoption(&key) {
                     invalidate.insert(store::key_digest(source, &key));
+                    #[cfg(test)]
+                    crate::snapshots::s0::not_persisted(&key, "history_owed");
                     not_persisted.push("history_owed");
                     continue;
                 }
@@ -4984,11 +4992,15 @@ impl SharedCache {
                     if chain.acquired_revision() != effective_revision(snapshot_source)
                         || chain.file_scope() != retained.checkpoint.scope()
                     {
+                        #[cfg(test)]
+                        crate::snapshots::s0::not_persisted(&key, "acquisition");
                         not_persisted.push("acquisition");
                         continue;
                     }
                     let Ok(counting) = acquired::ImmutableCounting::from_reduction(&retained.state)
                     else {
+                        #[cfg(test)]
+                        crate::snapshots::s0::not_persisted(&key, "acquisition");
                         not_persisted.push("acquisition");
                         continue;
                     };
@@ -5006,6 +5018,8 @@ impl SharedCache {
                         protocol: chain.write_protocol(),
                     })
                 } else {
+                    #[cfg(test)]
+                    crate::snapshots::s0::not_persisted(&key, "acquisition");
                     not_persisted.push("acquisition");
                     continue;
                 };
@@ -5015,6 +5029,8 @@ impl SharedCache {
                     index,
                     unix_seconds(SystemTime::now()).unwrap_or(0),
                 ) else {
+                    #[cfg(test)]
+                    crate::snapshots::s0::not_persisted(&key, "certificate");
                     not_persisted.push("certificate");
                     continue;
                 };
@@ -5221,6 +5237,12 @@ impl SharedCache {
         if receipt.budget_refused == 0
             && receipt.written + receipt.clean + receipt.deferred_keys.len() == offered.len()
         {
+            #[cfg(test)]
+            for (digest, key) in &offered {
+                if !receipt.deferred_keys.contains(digest) {
+                    crate::snapshots::s0::written(key);
+                }
+            }
             for digest in retirement_offers {
                 if !receipt.deferred_keys.contains(&digest) {
                     if let Some(pending) = offered.get(&digest).and_then(|_| {

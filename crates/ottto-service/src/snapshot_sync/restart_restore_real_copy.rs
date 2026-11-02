@@ -126,7 +126,13 @@ impl Lane {
         let scope = crate::transcript_acquisition::Scope("on-proof".into());
         let capture = crate::snapshots::claude_request_identity::captures(source);
         let cache = self.owner.cache.clone();
+        crate::snapshots::s0::bind_cache(&cache);
         let policy = SnapshotUploadPolicy::default();
+        crate::snapshots::s0::event(
+            "policy",
+            json!({"attribution":policy.session_attribution_enabled,
+            "titles":policy.session_titles_enabled,"labels":policy.session_attribution_labels_enabled}),
+        );
         crate::snapshots::begin_durable_pass(
             &cache,
             &self.disk.dir,
@@ -195,9 +201,10 @@ impl Lane {
                         return (page.committed, page.scan, wires, rejected, true);
                     }
                     // The Completed settlement, then the upload ledger fold.
-                    let mut index =
-                        settle_completed_upload(page.index, &page.committed, &progress, &holds)
-                            .index;
+                    let settlement =
+                        settle_completed_upload(page.index, &page.committed, &progress, &holds);
+                    crate::snapshots::s0::settled(settlement.fully_settled);
+                    let mut index = settlement.index;
                     settle_index_after_upload(&mut index, &page.committed, &progress);
                     crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
                         &mut index,
@@ -260,6 +267,7 @@ impl Lane {
                 (index, scan, wires, rejected, false)
             })
         });
+        crate::snapshots::s0::pass_peak(high);
         // Bodies the fake server ACKed, keyed by entity as the money oracle
         // is. Production upload coalesces items that share a fingerprint
         // (first offer wins), so the wire, not the item list, is the emission.
@@ -288,12 +296,14 @@ impl Lane {
         for item in &wire_items {
             let entity = item["source_session_id"].as_str().unwrap_or_default();
             duplicate_entities += usize::from(!entities.insert(entity.to_owned()));
+            crate::snapshots::s0::wire(self.bodies.get(entity), item);
             self.bodies.insert(entity.to_owned(), item.clone());
         }
         let emitted = wire_items.len();
         drop(wire_items);
         self.index = self.disk.commit(&cache, source, &mut index);
         drop(index);
+        crate::snapshots::s0::audits(&self.index);
         if source == SnapshotSource::Codex {
             self.tier_replay = codex_evidence(&self.index, &scan)["TierReplay"].take();
         }
@@ -444,7 +454,9 @@ fn round(
     let mut quiet = true;
     crate::on_proof::next_pass();
     for (i, lane) in lanes.iter_mut().enumerate() {
+        crate::snapshots::s0::begin(phase, pass, lane.source.api_slug());
         let mut row = lane.pass(c, &c.base);
+        row["s0"] = crate::snapshots::s0::row();
         // Per-class holds/serves and completed-read buckets of this lane pass.
         row["proof"] = crate::on_proof::row();
         let (full, tail) = (row["full"].as_u64().unwrap(), row["tail"].as_u64().unwrap());
@@ -579,6 +591,7 @@ impl Growth {
                         Some(len) if len == end && is_prefix(&t0, &t1) => counts[3] += 1,
                         Some(len) if len < end && is_prefix(&t0, &t1) => {
                             counts[0] += 1;
+                            crate::snapshots::s0::grew(&run);
                             growth.appends.push((i, t1, run, len, end));
                         }
                         Some(_) => {
@@ -743,6 +756,7 @@ fn oracle(dir: &Path, lanes: &[Lane]) {
 
 fn run(arm: &str, dir: &Path) {
     crate::on_proof::enable();
+    crate::snapshots::s0::enable();
     let _switch = if arm == "on" {
         crate::snapshots::RestartRestoreForTest::enabled()
     } else {
@@ -856,7 +870,7 @@ fn run(arm: &str, dir: &Path) {
     }
     report(
         arm,
-        json!({"phase": "proof_end", "proof": crate::on_proof::end()}),
+        json!({"phase": "proof_end", "proof": crate::on_proof::end(), "s0":crate::snapshots::s0::end()}),
     );
     for lane in &lanes {
         let [passes, full, tail, read, appended, drain_full, drain_tail, drain_read] = lane.totals;
