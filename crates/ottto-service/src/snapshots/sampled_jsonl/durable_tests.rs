@@ -451,7 +451,19 @@ fn assert_cold_items(path: &Path, source: SnapshotSource, actual: &Value) {
 /// Every encoded class and every content field, for exact equality.
 fn full_digest(reduction: &CachedJsonlReduction) -> [u8; 32] {
     let mut e = Enc::hash("durable-codec-test:full");
-    reduction.put(&mut e).expect("hash");
+    if reduction.accumulator.source == SnapshotSource::Pi {
+        e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
+            reduction.put(e)
+        })
+        .expect("hash");
+        let ledger = &reduction.accumulator.seen_pi_usage_keys;
+        ledger.usage_keys().put(&mut e).unwrap();
+        let (parent, nanos) = ledger.fork_parts();
+        parent.put(&mut e).unwrap();
+        nanos.put(&mut e).unwrap();
+    } else {
+        reduction.put(&mut e).expect("hash");
+    }
     e.finish_hash()
 }
 
@@ -720,7 +732,7 @@ fn cases() -> Vec<Case> {
         "CANARY_OPEN_cx",
         "CANARY_MCPARGS_cx",
     ];
-    vec![
+    let mut corpus = vec![
         Case {
             source: SnapshotSource::ClaudeCode,
             lines: claude_lines(10, 10),
@@ -780,7 +792,16 @@ fn cases() -> Vec<Case> {
             provider_ids: &CLAUDE_IDS,
             survivors: &["req_CANARYL1dt"],
         },
-    ]
+    ];
+    corpus.extend([false, true].map(|cwd| Case {
+        source: SnapshotSource::Pi,
+        lines: pi_marked_lines(cwd),
+        appended: pi_tail_lines(),
+        content: &[PI_MARKER, "synthetic/pi-work", "Synthetic answer."],
+        provider_ids: &[],
+        survivors: &[],
+    }));
+    corpus
 }
 
 /// The leaf `L` fields each kind of provider id may sit in.
@@ -1129,7 +1150,9 @@ fn restore_rederives_the_exact_retained_copy() {
             "{:?}",
             case.source
         );
-        assert!(restored.accumulator.title.is_some(), "{:?}", case.source);
+        if case.source != SnapshotSource::Pi {
+            assert!(restored.accumulator.title.is_some(), "{:?}", case.source);
+        }
         assert!(
             restored.accumulator.first_prompt_title.is_some(),
             "{:?}",
@@ -1139,6 +1162,163 @@ fn restore_rederives_the_exact_retained_copy() {
         assert!(receipt.named_lines as usize <= NAMED_LINES);
         assert!(receipt.line_bytes <= line_cap());
     }
+}
+
+/// A Pi session: header `cwd`, optionally a first user prompt, one turn.
+fn pi_lines(first_prompt: bool) -> Vec<String> {
+    let mut lines = vec![
+        json!({"type":"session","version":3,"id":"synthetic-pi-restore",
+        "timestamp":"2026-10-27T06:00:00Z","cwd":"/synthetic/pi-work"})
+        .to_string(),
+    ];
+    if first_prompt {
+        lines.push(
+            json!({"type":"message","id":"a0000001","parentId":null,
+            "message":{"role":"user","timestamp":1793080800000u64,
+                "content":[{"type":"text","text":"Synthetic first prompt."}]}})
+            .to_string(),
+        );
+    }
+    lines.push(
+        json!({"type":"message","id":"a0000002","parentId":"a0000001",
+        "timestamp":"2026-10-27T07:00:01Z","message":{"role":"assistant",
+            "provider":"openai","model":"gpt-5.4","api":"openai-responses",
+            "timestamp":"2026-10-27T07:00:01Z","stopReason":"stop","responseId":"seed",
+            "content":[{"type":"text","text":"Synthetic answer."}],
+            "usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,
+                "totalTokens":12,"cost":{"total":0.001}}}})
+        .to_string(),
+    );
+    lines
+}
+
+const PI_MARKER: &str = "ZZsyntheticcanaryQQ";
+
+/// A Pi body with a slash skill and the marker in its first prompt.
+fn pi_marked_lines(cwd: bool) -> Vec<String> {
+    let prompt = format!("/synthetic-skill review {PI_MARKER} before the release");
+    pi_lines(true)
+        .into_iter()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(&line).unwrap();
+            if !cwd {
+                value.as_object_mut().unwrap().remove("cwd");
+            }
+            value
+                .to_string()
+                .replace("Synthetic first prompt.", &prompt)
+        })
+        .collect()
+}
+
+/// A later prompt and turn: a Tail that must not re-assign the first prompt.
+fn pi_tail_lines() -> Vec<String> {
+    pi_lines(true)[1..]
+        .iter()
+        .map(|line| {
+            line.replace("Synthetic first prompt.", "Synthetic later prompt.")
+                .replace("a0000002", "a0000022")
+                .replace("a0000001", "a0000021")
+                .replace("\"seed\"", "\"tail\"")
+        })
+        .collect()
+}
+
+/// A synthetic upload key: one repeated byte.
+fn pi_attribution(home: &Path) -> crate::session_attribution::SessionAttributionContext {
+    use base64::Engine;
+    crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::Pi,
+        home,
+        true,
+        Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32])),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap()
+}
+
+fn pi_all_on() -> SnapshotUploadPolicy {
+    SnapshotUploadPolicy {
+        session_titles_enabled: true,
+        session_attribution_enabled: true,
+        session_attribution_labels_enabled: true,
+        ..SnapshotUploadPolicy::default()
+    }
+}
+
+/// The finished upload items after every upload setting, as the wire carries them.
+fn pi_uploaded(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    context: &crate::session_attribution::SessionAttributionContext,
+) -> Value {
+    let identity = opened_object_identity(SnapshotSource::Pi, &mut File::open(path).unwrap());
+    let mut parsed = parser
+        .finish_native(
+            crate::snapshots::FinishRequest {
+                expected_opened_object_identity: &identity.unwrap(),
+                path,
+                collected_at: COLLECTED,
+                source_file_fingerprint: "fp".into(),
+                codex_title_metadata: None,
+                claude_title_metadata: None,
+                attribution_context: Some(context),
+                repository_identity: None,
+                money_context: None,
+            },
+            None,
+        )
+        .unwrap();
+    apply_upload_policy(SnapshotSource::Pi, &mut parsed.snapshots, pi_all_on());
+    serde_json::to_value(&parsed.snapshots).unwrap()
+}
+
+fn pi_cold_uploaded(
+    path: &Path,
+    context: &crate::session_attribution::SessionAttributionContext,
+) -> Value {
+    let mut parser = parser(path, SnapshotSource::Pi);
+    while !parser.step().unwrap() {}
+    pi_uploaded(parser, path, context)
+}
+
+/// Restore a real checkpoint and body, append a suffix and finish its Tail.
+fn restored_tail(
+    path: &Path,
+    source: SnapshotSource,
+    grow: &[String],
+) -> (OwnedJsonlParser, RederiveReceipt) {
+    let (native, checkpoint) = full_read(path, source);
+    let body = encode(&native, crate::durable_tail_store::RECORD_BYTES, line_cap()).unwrap();
+    let certificate = checkpoint
+        .durable_certificate(birth_unix_nanos(&fs::metadata(path).unwrap()))
+        .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    for line in grow {
+        writeln!(file, "{line}").unwrap();
+    }
+    drop(file);
+    let (checkpoint, _) = certificate
+        .restore(&mut File::open(path).unwrap(), scope())
+        .unwrap();
+    let (restored, receipt) = restore(path, &body, source).unwrap();
+    assert_eq!(full_digest(&restored), full_digest(&native));
+    let mut tail = parser(path, source);
+    assert_eq!(
+        tail.prepare_acquisition(
+            Some(Retained {
+                checkpoint,
+                state: restored
+            }),
+            &scope(),
+            None,
+            NOW
+        )
+        .unwrap(),
+        ReadMode::Tail
+    );
+    while !tail.step().unwrap() {}
+    (tail, receipt)
 }
 
 /// [money] Full-equivalence control per source: a restored copy continued by Tail
@@ -1159,38 +1339,7 @@ fn restore_then_tail_matches_cold_full() {
     for case in corpus {
         let scratch = Scratch::new("tail");
         let path = scratch.write("t.jsonl", &case.lines);
-        let (reduction, checkpoint) = full_read(&path, case.source);
-        let body = encode(
-            &reduction,
-            crate::durable_tail_store::RECORD_BYTES,
-            line_cap(),
-        )
-        .unwrap();
-        let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
-        let certificate = checkpoint.durable_certificate(birth).unwrap();
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        for line in &case.appended {
-            writeln!(file, "{line}").unwrap();
-        }
-        drop(file);
-        let mut held = File::open(&path).unwrap();
-        let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (restored, _) = restore(&path, &body, case.source).unwrap();
-        assert_eq!(full_digest(&restored), full_digest(&reduction));
-        let mut continued = parser(&path, case.source);
-        let mode = continued
-            .prepare_acquisition(
-                Some(Retained {
-                    checkpoint,
-                    state: restored,
-                }),
-                &scope(),
-                None,
-                NOW,
-            )
-            .unwrap();
-        assert_eq!(mode, ReadMode::Tail, "{:?}", case.source);
-        while !continued.step().unwrap() {}
+        let (continued, _) = restored_tail(&path, case.source, &case.appended);
         let (cold_reduction, _) = full_read(&path, case.source);
         assert_eq!(
             serde_json::to_vec(&continued.accumulator.activity_summary()).unwrap(),
@@ -1229,7 +1378,22 @@ fn restore_then_tail_matches_cold_full() {
                 grouping(&cold_reduction.accumulator)
             );
         }
-        assert_cold_items(&path, case.source, &items(continued, &path, case.source));
+        if case.source == SnapshotSource::Pi {
+            let context = pi_attribution(&scratch.0);
+            let actual = pi_uploaded(continued, &path, &context);
+            assert_eq!(actual, pi_cold_uploaded(&path, &context));
+            let text = actual.to_string();
+            for field in [
+                "template_group_id",
+                "skill_id",
+                "session_display_name\":\"",
+                PI_MARKER,
+            ] {
+                assert!(text.contains(field), "{field}");
+            }
+        } else {
+            assert_cold_items(&path, case.source, &items(continued, &path, case.source));
+        }
     }
 }
 
@@ -1380,7 +1544,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
 
 /// The allowlist digests, pinned: any field, class or type change in a
 /// persisted type moves them. Review the classes, then repin.
-const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
+const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
         "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
@@ -1389,12 +1553,18 @@ const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
         SnapshotSource::Codex,
         "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
     ),
+    (
+        SnapshotSource::Pi,
+        // The Pi allowlist pin, including the fork fields of PiSection.
+        "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
+    ),
 ];
 
 fn hex(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// [format] Each registered source retains its reviewed allowlist digest.
 #[test]
 fn allowlist_digests_are_pinned() {
     let actual = ALLOWLIST_PINS.map(|(source, _)| (source, hex(allowlist_digest(source))));
@@ -1498,6 +1668,22 @@ const H_AUDIT: &[(&str, &str)] = &[
         "SnapshotAccumulator.cache_configuration_witness, copied",
     ),
     (
+        "PiSection.usage_keys",
+        "H keys: pi_usage_hash(ottto-pi-usage-key:v1, response id); D values: PiUsageDedupState",
+    ),
+    (
+        "PiUsageDedupState.message",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.message_end",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.paired_digests",
+        "pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage), copied",
+    ),
+    (
         "Rederive.agent_label",
         "Enc::hash(\"ottto-dt-rederive:agent_label:v1\")",
     ),
@@ -1575,6 +1761,7 @@ fn h_paths(text: &str) -> BTreeSet<String> {
     out
 }
 
+/// [format] The persisted hash-field inventory matches its reviewed audit table.
 #[test]
 fn h_fields_are_audited() {
     let audited = H_AUDIT
@@ -1644,6 +1831,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
 }
 
 /// Budget receipt (static): the bounds every restore and write is held to.
+/// [format] Persisted bodies and decoded reductions obey the existing budget bounds.
 #[test]
 fn budget_bounds_hold() {
     use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
@@ -1661,7 +1849,7 @@ fn budget_bounds_hold() {
     // diagnostic set (512 full 440-byte nodes plus one retained root).
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        1_978_368 + (2 * MAX_RECORDS + 1) * 440
+        2_179_072 + (2 * MAX_RECORDS + 1) * 440
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1675,9 +1863,6 @@ fn codec_budget_receipt() {
         let scratch = Scratch::new("receipt");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, _) = full_read(&path, case.source);
-        let mut e = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
-        reduction.put(&mut e).unwrap();
-        let encode_buffer = e.into_bytes().capacity();
         let body = encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
@@ -1693,7 +1878,7 @@ fn codec_budget_receipt() {
             fs::metadata(&path).unwrap().len(),
             body.len(),
             body.len() + 356,
-            encode_buffer,
+            body.capacity(),
             receipt.head_bytes,
             receipt.named_lines,
             receipt.line_bytes,
@@ -1703,24 +1888,29 @@ fn codec_budget_receipt() {
     }
 }
 
-/// Decode all stored sections, excluding the caller's independent source
-/// binding check. This is the structural acceptance oracle for `verify`.
-fn structurally_decodes(body: &[u8]) -> bool {
-    [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ]
-    .into_iter()
-    .any(|source| decode_body(body, source).is_ok())
+/// Decode the selected registered layout without its independent source binding.
+fn structurally_decodes(body: &[u8], source: SnapshotSource) -> bool {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .unwrap()
+        .properties();
+    (row.take)(&mut Dec::new(body)).is_ok()
 }
 
-fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
-    let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| verify(body));
+fn verified_for(source: SnapshotSource, body: &[u8]) -> Result<(), Corrupt> {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .unwrap()
+        .properties();
+    let (result, stats) =
+        crate::retry_allocation_probe::measure_caller_thread(|| (row.verify)(&mut Dec::new(body)));
     assert_eq!(stats.allocations, 0, "{stats:?}");
     result
 }
 
+fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
+    verified_for(SnapshotSource::ClaudeCode, body)
+}
+
+/// [format] Structural verification rejects malformed records without decoding allocations.
 #[test]
 fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus() {
     let scratch = Scratch::new("structural-verifier");
@@ -1744,75 +1934,88 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
             codex_instruction_lines("verify-canary"),
             10,
         ),
+        (SnapshotSource::Pi, "pi.jsonl", pi_marked_lines(true), 0),
     ] {
         let path = scratch.write(name, &lines);
         let (reduction, _) = full_read(&path, source);
         let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
-        assert_eq!(verified_without_allocation(&body), Ok(()));
-        assert!(decode(&body, source).is_ok());
-        // Byte/hash stability: re-encoding the same retained value is exact.
-        assert_eq!(encode(&reduction, 1 << 20, line_cap()).unwrap(), body);
-        for end in 0..body.len() {
-            assert_eq!(
-                verified_without_allocation(&body[..end]),
-                Err(Corrupt),
-                "{name} prefix {end}"
-            );
-        }
-        let (mut visits, present_options) =
-            crate::durable_tail_codec::trace_verify(|| assert_eq!(verify(&body), Ok(())));
-        assert!(
-            present_options >= min_present_options,
-            "{name}: walked {present_options} populated optional sections, expected >= {min_present_options}"
+        assert_structural_body(source, name, &body, min_present_options);
+    }
+}
+
+pub(super) fn assert_structural_body(
+    source: SnapshotSource,
+    name: &str,
+    body: &[u8],
+    min_present_options: usize,
+) {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .unwrap()
+        .properties();
+    assert_eq!(verified_for(source, body), Ok(()));
+    assert!(decode(body, source).is_ok());
+    for end in 0..body.len() {
+        assert!(!structurally_decodes(&body[..end], source));
+        assert_eq!(
+            verified_for(source, &body[..end]),
+            Err(Corrupt),
+            "{name} prefix {end}"
         );
-        println!("verifier fixture {name}: {present_options} populated optional sections");
-        visits.sort_unstable();
-        visits.dedup();
-        assert!(visits.iter().any(|(_, varint)| *varint));
-        assert!(visits.iter().any(|(_, varint)| !varint));
-        for (at, varint) in visits {
-            let mut corrupt = body.clone();
-            if varint {
-                // Every visited length/scalar/enum/H-option varint overflows.
-                corrupt.splice(at..at, [0xff; 10]);
-            } else {
-                corrupt[at] = 2; // invalid bool / raw Option tag
-            }
-            assert!(
-                !structurally_decodes(&corrupt),
-                "{name} corrupt tag/length {at}"
-            );
+    }
+    let (mut visits, present_options) = crate::durable_tail_codec::trace_verify(|| {
+        assert_eq!((row.verify)(&mut Dec::new(body)), Ok(()))
+    });
+    assert!(
+        present_options >= min_present_options,
+        "{name}: walked {present_options} populated optional sections, expected >= {min_present_options}"
+    );
+    println!("verifier fixture {name}: {present_options} populated optional sections");
+    visits.sort_unstable();
+    visits.dedup();
+    assert!(visits.iter().any(|(_, varint)| *varint));
+    assert!(visits.iter().any(|(_, varint)| !varint));
+    for (at, varint) in visits {
+        let mut corrupt = body.to_vec();
+        if varint {
+            // Every visited length/scalar/enum/H-option varint overflows.
+            corrupt.splice(at..at, [0xff; 10]);
+        } else {
+            corrupt[at] = 2; // invalid bool / raw Option tag
+        }
+        assert!(
+            !structurally_decodes(&corrupt, source),
+            "{name} corrupt tag/length {at}"
+        );
+        assert_eq!(
+            verified_for(source, &corrupt),
+            Err(Corrupt),
+            "{name} offset {at}"
+        );
+    }
+    // Deterministic fuzz-style corpus, with a substitution/deletion at
+    // every byte and every appended byte value. Valid mutations stay valid.
+    for at in 0..body.len() {
+        for byte in [0, 1, 2, 0x7f, 0x80, 0xff] {
+            let mut mutated = body.to_vec();
+            mutated[at] = byte;
             assert_eq!(
-                verified_without_allocation(&corrupt),
-                Err(Corrupt),
-                "{name} offset {at}"
+                verified_for(source, &mutated).is_ok(),
+                structurally_decodes(&mutated, source),
+                "{name} mutation {at}/{byte}"
             );
         }
-        // Deterministic fuzz-style corpus, with a substitution/deletion at
-        // every byte and every appended byte value. Valid mutations stay valid.
-        for at in 0..body.len() {
-            for byte in [0, 1, 2, 0x7f, 0x80, 0xff] {
-                let mut mutated = body.clone();
-                mutated[at] = byte;
-                assert_eq!(
-                    verified_without_allocation(&mutated).is_ok(),
-                    structurally_decodes(&mutated),
-                    "{name} mutation {at}/{byte}"
-                );
-            }
-            let mut mutated = body.clone();
-            mutated.remove(at);
-            assert_eq!(
-                verified_without_allocation(&mutated).is_ok(),
-                structurally_decodes(&mutated),
-                "{name} deletion {at}"
-            );
-        }
-        for byte in 0..=255 {
-            let mut mutated = body.clone();
-            mutated.push(byte);
-            assert_eq!(verified_without_allocation(&mutated), Err(Corrupt));
-        }
+        let mut mutated = body.to_vec();
+        mutated.remove(at);
+        assert_eq!(
+            verified_for(source, &mutated).is_ok(),
+            structurally_decodes(&mutated, source),
+            "{name} deletion {at}"
+        );
+    }
+    for byte in 0..=255 {
+        let mut mutated = body.to_vec();
+        mutated.push(byte);
+        assert_eq!(verified_for(source, &mutated), Err(Corrupt));
     }
 }
 
@@ -1898,7 +2101,8 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
         encode(reduction, expected.len() - 1, line_cap()),
         Err(Refuse::TooLarge)
     );
-    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    let (_, options) =
+        crate::durable_tail_codec::trace_verify(|| verify_body(&mut Dec::new(&actual)).unwrap());
     assert!(options >= 5, "fixture must populate nested optional state");
     take_l_spans();
 }
@@ -1908,7 +2112,10 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
 fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
     let scratch = Scratch::new("borrowed-count-canaries");
     let mut covered = BTreeSet::new();
-    for case in cases() {
+    for case in cases()
+        .into_iter()
+        .filter(|case| case.source != SnapshotSource::Pi)
+    {
         let path = scratch.write("nested.jsonl", &case.lines);
         let (reduction, _) = full_read(&path, case.source);
         covered.insert(case.source.api_slug());
@@ -2129,7 +2336,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
         BTreeSet::from(["FirstSpelling".into()])
     );
     let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
-    assert!(body_has_skill_labels(&body).unwrap());
+    assert!(body_has_skill_labels(SnapshotSource::ClaudeCode, &body).unwrap());
     let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
     let _on = RestartRestoreForTest::enabled();
     let cache = sampled_scan::SharedCache::default();
@@ -2347,8 +2554,7 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     );
 }
 
-/// Pi is not registered in the durable source table. Exercise the decoded
-/// production content interface without granting Pi store/write authority.
+/// Exercise the registered Pi body through production decode and content replay.
 /// [money] bounded pi prompt workspace tail matches cold body in two cycles.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
@@ -2357,69 +2563,43 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     for cwd in [None, Some("/synthetic/pi-workspace")] {
         let lines = vec![
             json!({"type":"session","id":"synthetic-pi","cwd":cwd}).to_string(),
-            json!({"type":"message","role":"user","content":"Synthetic first prompt"}).to_string(),
+            json!({"type":"message","role":"user","content":format!("/synthetic-skill review {PI_MARKER} Synthetic first prompt")}).to_string(),
             json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
         ];
         let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
         for cycle in 0..2 {
-            let (native, checkpoint) = full_read(&path, source);
+            let (native, _) = full_read(&path, source);
             let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
             assert!(digests.first_prompt.is_some());
             assert!(digests.session_start.is_none());
             assert!(digests.agent_label.is_none());
-            let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-                native.put(e)?;
-                digests.put(e)
-            })
-            .unwrap();
-            let certificate = checkpoint
-                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
-                .unwrap();
-            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            writeln!(append, "{}", json!({"type":"message","message":{"role":"user","content":format!("later prompt {cycle}")}})).unwrap();
-            drop(append);
-            let (checkpoint, _) = certificate
-                .restore(&mut File::open(&path).unwrap(), scope())
-                .unwrap();
-            let decoded = decode_body(&body, source).unwrap();
-            let (restored, receipt) = {
-                decoded
-                    .rederive_plan()
-                    .map_err(Refuse::NotRederivable)
-                    .and_then(|plan| {
-                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
-                    })
-                    .map(|(reduction, receipt, _)| (reduction, receipt))
-            }
-            .unwrap();
+            let suffix = vec![json!({"type":"message","message":{"role":"user","content":format!("later prompt {cycle}")}}).to_string()];
+            let (tail, receipt) = restored_tail(&path, source, &suffix);
             assert!(receipt.head_bytes <= HEAD_BOUND);
             assert_eq!(
-                restored.accumulator.first_prompt_material,
+                tail.accumulator.first_prompt_material,
                 native.accumulator.first_prompt_material
             );
             assert_eq!(
-                restored.accumulator.first_prompt_title,
+                tail.accumulator.first_prompt_title,
                 native.accumulator.first_prompt_title
             );
-            assert_eq!(restored.accumulator.workspace_path, cwd.map(PathBuf::from));
-            let mut tail = parser(&path, source);
-            assert_eq!(
-                tail.prepare_acquisition(
-                    Some(Retained {
-                        checkpoint,
-                        state: restored
-                    }),
-                    &scope(),
-                    None,
-                    NOW
-                )
-                .unwrap(),
-                ReadMode::Tail
-            );
-            while !tail.step().unwrap() {}
+            assert_eq!(tail.accumulator.workspace_path, cwd.map(PathBuf::from));
             let actual = items(tail, &path, source);
             assert_cold_items(&path, source, &actual);
             assert!(actual.to_string().contains("Synthetic first prompt"));
+            let context = pi_attribution(&root.0);
+            let cold = pi_cold_uploaded(&path, &context);
+            let (mut titled, _) =
+                restored_tail(&path, source, &[json!({"type":"progress"}).to_string()]);
+            titled
+                .accumulator
+                .set_title(Some("Synthetic later title".into()), "transcript_title");
+            let titled = pi_uploaded(titled, &path, &context);
+            assert!(cold.to_string().contains("template_group_id"));
+            assert!(cold.to_string().contains("skill_id"));
+            assert_eq!(titled[0]["session_display_name"], "Synthetic later title");
+            assert_eq!(titled[0]["attribution_facts"], cold[0]["attribution_facts"]);
         }
     }
 }
@@ -2450,6 +2630,21 @@ fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without
     decoded.reduction.accumulator.durable_marks.title_line =
         Some((HEAD_BOUND + 1, TITLE_LINE_BOUND + 1));
     assert_eq!(decoded.rederive_plan().err(), Some("title"));
+    let scratch = Scratch::new("pi-head-bound");
+    let mut lines = pi_lines(true);
+    lines.insert(
+        1,
+        json!({"type":"progress", "padding":"x".repeat(HEAD_BOUND as usize)}).to_string(),
+    );
+    let path = scratch.write("pi.jsonl", &lines);
+    let (native, _) = full_read(&path, SnapshotSource::Pi);
+    assert!(native.accumulator.durable_marks.first_prompt.unwrap() > HEAD_BOUND);
+    assert!(matches!(
+        encode(&native, crate::durable_tail_store::RECORD_BYTES, line_cap()),
+        Err(Refuse::NotRederivable(
+            "SnapshotAccumulator.first_prompt_material"
+        ))
+    ));
 }
 
 // F4: each H class fails atomically, and diagnostics identify only the class.
@@ -2510,12 +2705,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         let path = root.join(format!("{}-private.jsonl", source.api_slug()));
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         for class in 0..5 {
             let bad = decode_body(&body, source).unwrap().test_fence_body(class);
             // A real caught panic is a failed test, with a content-free failure
@@ -2558,12 +2748,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             + "\n";
         fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let result = {
             let decoded = decode_body(&body, source).unwrap();
             decoded
@@ -2634,8 +2819,7 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
     );
 }
 
-/// Pi remains unregistered here. This is the production codec/acquisition/
-/// native-finish/finalizer interface without store registration, with
+/// Exercise the production codec/acquisition/native-finish/finalizer interface with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
 /// [money] codex pi restored tail race below accepted publishes complete native body.
 #[test]
@@ -2656,12 +2840,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let path = root.write("source.jsonl", &lines);
         let (native, checkpoint) = full_read(&path, source);
         let a = fs::metadata(&path).unwrap().len();
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let certificate = checkpoint
             .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
             .unwrap();
@@ -2807,6 +2986,252 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
     }
 }
 
+// The Pi ledger's labelled `E` field. The Claude and Codex side is the
+// unchanged pins in durable_tail_store_tests.rs and released_decoders_tests.rs.
+
+/// The label text the shape keeps for `SnapshotAccumulator.seen_pi_usage_keys`.
+const PI_LEDGER_LABEL: &str = "BTreeMap<String, PiUsageDedupState>";
+
+/// [format] The recorded label, the shape line it prints, and the real types
+/// behind it. Fails if the label changes or the ledger's type drifts.
+#[test]
+fn pi_only_e_label_is_recorded_and_names_the_real_ledger_type() {
+    use crate::durable_tail_codec::{PiOnlyDurable, PI_ONLY_E_LABELS};
+    assert_eq!(
+        PI_ONLY_E_LABELS,
+        &[("SnapshotAccumulator.seen_pi_usage_keys", PI_LEDGER_LABEL)]
+    );
+    assert_eq!(<PiLedger as PiOnlyDurable>::FIELD, PI_ONLY_E_LABELS[0].0);
+    assert!(
+        shape_text().contains(&format!("E seen_pi_usage_keys: {PI_LEDGER_LABEL};")),
+        "the shape keeps the recorded label text"
+    );
+    assert!(!crate::durable_tail_codec::pi_only_label_allowed(
+        PI_ONLY_E_LABELS[0].0,
+        PI_ONLY_E_LABELS[0].0,
+        "DifferentType",
+    ));
+    let label = std::any::type_name::<BTreeMap<String, PiUsageDedupState>>();
+    assert_eq!(
+        std::any::type_name_of_val(&PiLedger::default().usage_keys),
+        label
+    );
+    assert_eq!(
+        std::any::type_name::<<PiLedger as PiOnlyDurable>::Label>(),
+        label
+    );
+}
+
+/// Synthetic two-field twins compare the unlabelled and sealed labelled arms.
+mod labelled_e_twins {
+    use super::*;
+    pub(super) mod unlabelled {
+        use super::*;
+        #[derive(Default)]
+        pub(crate) struct SnapshotAccumulator {
+            pub(crate) n: u64,
+            pub(crate) seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+        }
+        crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
+            N n: u64,
+            E seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+        });
+    }
+    pub(super) mod labelled {
+        use super::*;
+        #[derive(Default)]
+        pub(crate) struct SnapshotAccumulator {
+            pub(crate) n: u64,
+            pub(crate) seen_pi_usage_keys: PiLedger,
+        }
+        crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
+            N n: u64,
+            E seen_pi_usage_keys: PiLedger as BTreeMap<String, PiUsageDedupState>,
+        });
+    }
+}
+
+fn twin_shape<T: Durable>() -> (String, [u8; 32]) {
+    let mut shape = Shape::default();
+    T::shape(&mut shape);
+    (shape.text().to_string(), shape.digest())
+}
+
+fn twin_bytes<T: Durable>(value: &T) -> Result<Vec<u8>, Refuse> {
+    let mut e = Enc::bytes(1 << 20);
+    value.put(&mut e)?;
+    Ok(e.into_bytes())
+}
+
+/// [format] A labelled and an unlabelled synthetic `E` arm have the same shape,
+/// bytes, decode and refusal.
+#[test]
+fn labelled_e_arm_is_wire_identical_to_the_unlabelled_arm() {
+    use labelled_e_twins::{labelled, unlabelled};
+    assert_eq!(
+        twin_shape::<unlabelled::SnapshotAccumulator>(),
+        twin_shape::<labelled::SnapshotAccumulator>()
+    );
+    let plain = unlabelled::SnapshotAccumulator {
+        n: 7,
+        ..Default::default()
+    };
+    let plain_bytes = twin_bytes(&plain).unwrap();
+    let new = labelled::SnapshotAccumulator {
+        n: 7,
+        ..Default::default()
+    };
+    assert_eq!(twin_bytes(&new).unwrap(), plain_bytes);
+    let mut d = Dec::new(&plain_bytes);
+    let decoded = <labelled::SnapshotAccumulator as Durable>::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(decoded.n, 7);
+    assert!(decoded.seen_pi_usage_keys.usage_keys().is_empty());
+    assert_eq!(twin_bytes(&decoded).unwrap(), plain_bytes);
+    let refused = Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"));
+    let mut plain = plain;
+    plain
+        .seen_pi_usage_keys
+        .insert("k".into(), PiUsageDedupState::default());
+    let mut new = new;
+    new.seen_pi_usage_keys
+        .usage_keys_mut()
+        .insert("k".into(), PiUsageDedupState::default());
+    assert_eq!(twin_bytes(&plain), refused);
+    assert_eq!(twin_bytes(&new), refused);
+}
+
+/// [format] Claude and Codex bodies with an empty ledger restore byte-identically.
+#[test]
+fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
+    let scratch = Scratch::new("pi-ledger-wire");
+    for (source, name, lines) in [
+        (
+            SnapshotSource::ClaudeCode,
+            "wire-claude.jsonl",
+            claude_lines(2, 2),
+        ),
+        (SnapshotSource::Codex, "wire-codex.jsonl", codex_lines()),
+    ] {
+        let path = scratch.write(name, &lines);
+        let (reduction, _) = full_read(&path, source);
+        assert!(crate::durable_tail_codec::DurableEmpty::durable_empty(
+            &reduction.accumulator.seen_pi_usage_keys
+        ));
+        let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+        let decoded = decode_body(&body, source).unwrap();
+        assert!(decoded
+            .reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .usage_keys()
+            .is_empty());
+        let (restored, _) = restore(&path, &body, source).unwrap();
+        assert_eq!(
+            encode(&restored, 1 << 20, line_cap()).unwrap(),
+            body,
+            "{name}"
+        );
+    }
+}
+
+/// [money] A Pi fork restored and Tailed at every physical line cut equals cold
+/// Full. The codec/Tail rule runs on Linux too; the transition matrix
+/// additionally checks native disk receipts, eviction and the shared money
+/// oracle on macOS.
+#[test]
+fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
+    let source = SnapshotSource::Pi;
+    let header = json!({"type":"session","id":"synthetic-pi-cut",
+        "timestamp":"2026-10-20T10:00:00Z","parentSession":"CANARY_PI_PARENT"})
+    .to_string();
+    let mut lines = vec![header];
+    for (id, at) in [
+        ("copied", "2026-10-20T09:59:59Z"),
+        ("at", "2026-10-20T10:00:00Z"),
+        ("after", "2026-10-20T10:00:01Z"),
+    ] {
+        for kind in ["message", "message_end"] {
+            lines.push(
+                json!({"type":kind,"timestamp":at,
+                "message":{"role":"assistant","responseId":id,"timestamp":at,"model":"gpt-5.4",
+                    "usage":{"input":100,"output":10}}})
+                .to_string(),
+            );
+        }
+        lines.push(
+            json!({"type":"usage","id":id,"timestamp":at,"model":"gpt-5.4",
+            "usage":{"input":20,"output":5}})
+            .to_string(),
+        );
+    }
+    for cut in 1..lines.len() {
+        let scratch = Scratch::new("pi-fork-cut");
+        let path = scratch.write("fork.jsonl", &lines[..cut]);
+        let (tail, _) = restored_tail(&path, source, &lines[cut..]);
+        assert!(tail.accumulator.seen_pi_usage_keys.fork_parts().0);
+        assert_eq!(tail.accumulator.accepted_usage_totals.input_tokens, 240);
+        assert_eq!(
+            items(tail, &path, source),
+            cold_items(&path, source),
+            "cut {cut}"
+        );
+    }
+}
+
+/// [behaviour] A fork whose usage is all copied is complete, publishes a zero
+/// revision and restores for a Tail.
+#[test]
+fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
+    let scratch = Scratch::new("pi-fork-only-copies");
+    let at = "2026-10-20T09:59:59Z";
+    let copy = json!({"type":"message","timestamp":at,"message":{"role":"assistant",
+        "responseId":"copy","timestamp":at,"model":"gpt-5.4","usage":{"input":100,"output":10}}})
+    .to_string();
+    let path = scratch.write(
+        "fork.jsonl",
+        &[
+            json!({"type":"session","id":"synthetic-copy-only","timestamp":"2026-10-20T10:00:00Z",
+            "parentSession":"CANARY_PI_PARENT"})
+            .to_string(),
+            copy.clone(),
+        ],
+    );
+    let source = SnapshotSource::Pi;
+    let (reduction, _) = full_read(&path, source);
+    assert_eq!(reduction.positive_recognized_usage_count, 0);
+    assert!(
+        !reduction.positive_usage_evidence,
+        "known copied usage is not unexplained loss"
+    );
+    let (mut tail, _) = restored_tail(&path, source, &[copy]);
+    let identity = opened_object_identity(source, tail.reader.reader.get_mut()).unwrap();
+    let parsed = tail
+        .finish(&identity, &path, COLLECTED, "fp".into(), None, None, None)
+        .unwrap();
+    assert!(parsed.complete(), "copied-only forks can be checkpointed");
+    assert_eq!(
+        parsed.snapshots.len(),
+        1,
+        "a zero correction must be publishable"
+    );
+    assert_eq!(parsed.snapshots[0].input_tokens, 0);
+    assert_eq!(parsed.snapshots[0].request_count, 0);
+    let cold = cold_items(&path, source);
+    assert_eq!(
+        serde_json::to_value(&parsed.snapshots).unwrap(),
+        cold["items"]
+    );
+    // Unknown positive evidence or malformed owned usage still fails closed.
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
+        b"{\"type\":\"message\",\"timestamp\":\"bad\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":50}}}\n"
+    ).unwrap();
+    let bad = cold_items(&path, source);
+    assert!(
+        bad["items"].as_array().unwrap().is_empty(),
+        "invalid owned evidence cannot manufacture a zero carrier"
+    );
+}
 /// [money] A certified PRE body cannot replace its predecessor after native
 /// finish reports loss. The Pi seal-boundaries fixture supplies the real
 /// cross-shape conflict; this unit seam covers the source-independent decision.

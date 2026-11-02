@@ -66,7 +66,7 @@ fn resign(bytes: &mut [u8]) {
 #[test]
 fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     let rows = crate::snapshots::durable_sources::SOURCES;
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     for (slot, row) in rows.iter().enumerate() {
         assert_eq!(row.source.slot(), slot);
         assert_eq!(row.tag as usize, slot + 1);
@@ -179,6 +179,46 @@ fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     );
 }
 
+/// [format] Pi round-trips format three with its tag and write-ahead protocol.
+/// Pi format 1 and 2 envelopes stay Unknown through GC in the all-source rows
+/// `on_current_pin_v1_is_refused_…` and `m3_p4a_v3_dispatch_…`.
+#[test]
+fn pi_format_three_store_row_round_trips() {
+    let root = crate::test_scratch::ScratchDir::new("pi-format-three");
+    let lock = test_locks::hold(&root);
+    let transcript = root.join("fixture.jsonl");
+    std::fs::write(&transcript, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let cert = certificate(&transcript);
+    let mut record = pending(DurableSource::Pi, "pi-format-three", &cert, true);
+    record.acquisition = Some(AcquisitionFields {
+        acquired_revision: 1,
+        protocol: AcquisitionProtocol::WriteAhead,
+    });
+    let key = record.binding.key;
+    let body = record.body.clone();
+    let dir = root.join("store");
+    let mut writer = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
+    assert_eq!(
+        writer
+            .write_after_save(lock, 1, 0, vec![record])
+            .unwrap()
+            .written,
+        1
+    );
+    drop(writer);
+    let file = path(&dir, &key);
+    let bytes = std::fs::read(&file).unwrap();
+    assert_eq!(bytes[42], 3);
+    assert_eq!(&bytes[8..10], &3u16.to_le_bytes());
+    let mut reader = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
+    let record = found(reader.read(&key));
+    assert_eq!(record.format, 3);
+    assert_eq!(record.record.body, body);
+    assert_eq!(
+        record.record.acquisition.unwrap().protocol,
+        AcquisitionProtocol::WriteAhead
+    );
+}
 /// [format] ON refuses current-pin v1 forgeries without write or restore authority.
 #[test]
 fn on_current_pin_v1_is_refused_and_cannot_be_written_or_restored() {
@@ -209,6 +249,7 @@ fn on_current_pin_v1_is_refused_and_cannot_be_written_or_restored() {
         assert_eq!(disk.read(&key), ReadOutcome::Refused(Refusal::Unknown));
         let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
         assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        cold.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
         assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
     }
 }
