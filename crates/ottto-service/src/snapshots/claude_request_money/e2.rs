@@ -3593,9 +3593,12 @@ pub(crate) fn side_calls_page(
 /// listed. A family's member transcripts live under `<root>/subagents/`; the
 /// root file being on a page means its own directory was listed, so the
 /// family's directory is still to be listed exactly when `<root>` is here.
-/// A re-listing pass's directories (not census members) are left out: that
-/// pass starts only after the walk listed every directory, so their members
-/// are already observed and their roots need not wait.
+/// A re-listing pass's directories (not census members) are left out, so
+/// their roots do not wait. That pass starts only once the walk's directory
+/// queue is empty, so the two never share it. Its members are NOT guaranteed
+/// observed: a directory or member created after the walk is unknown until
+/// listed. Once a member is listed, the observed-index (`unread_members`)
+/// and family-census guards still apply.
 fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
