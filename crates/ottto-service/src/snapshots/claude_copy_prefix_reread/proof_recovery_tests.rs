@@ -34,6 +34,10 @@ struct ProofChain {
 }
 impl ProofChain {
     fn new(name: &str) -> Self {
+        Self::with_counts(name, &[2, 3, 4, 5, 5, 6])
+    }
+
+    fn with_counts(name: &str, counts: &[usize]) -> Self {
         let home = crate::test_scratch::canonical_private_dir(name);
         let root = home.join("project");
         let support = home.join("support");
@@ -41,8 +45,7 @@ impl ProofChain {
         fixture::write_exclusions(&support, &[]);
         let mut paths = Vec::new();
         let mut births = BTreeMap::new();
-        let counts = [2, 3, 4, 5, 5, 6];
-        for (slot, count) in counts.into_iter().enumerate() {
+        for (slot, &count) in counts.iter().enumerate() {
             let session = format!("bbbbbbbb-cccc-4ddd-8eee-{slot:012x}");
             let path = root.join(format!("{session}.jsonl"));
             let mut text = String::new();
@@ -168,20 +171,8 @@ impl ProofChain {
         }
     }
 
-    fn raw(&self, mut index: ScanIndex) -> (ScanIndex, SourceScanResult) {
-        index.activate_effective_upload_body_witness_revision(3);
-        index.adopt_effective_upload_body_witness_revision_monotonically();
-        index.activate_upload_context("proof-recovery-context".into());
-        index.load_claude_reemission_exclusions(&self.support);
-        let (mut index, scan, _) = E2ScanFixture::capturing_identity().scan(
-            std::slice::from_ref(&self.root),
-            &self.support,
-            index,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            false,
-            &self.births,
-            &[],
-        );
+    fn raw(&self, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+        let (mut index, scan) = self.scan_files(index);
         // These tests are about census proof, so every origin's body is already
         // accepted; a file's real ACK replaces this in `accept`.
         for path in &self.paths {
@@ -191,6 +182,23 @@ impl ProofChain {
                 fixture::origin_accepted_for_test(&mut index, &key);
             }
         }
+        (index, scan)
+    }
+
+    fn scan_files(&self, mut index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+        index.activate_effective_upload_body_witness_revision(3);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.activate_upload_context("proof-recovery-context".into());
+        index.load_claude_reemission_exclusions(&self.support);
+        let (index, scan, _) = E2ScanFixture::capturing_identity().scan(
+            std::slice::from_ref(&self.root),
+            &self.support,
+            index,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            false,
+            &self.births,
+            &[],
+        );
         (index, scan)
     }
 
@@ -456,5 +464,41 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
             "six owned requests plus one side call"
         );
         assert!(chain.prepare(&mut index).is_empty());
+    });
+}
+
+/// [money] Origin with no accepted body -> copy A -> copy B. Acceptance is asked
+/// of the holder each decision used, not a resolved root: A keeps the prefix,
+/// flagged, and B removes against accepted A. The undelivered origin leaves the
+/// delivered money equal to A and B with no origin at all: each id counted once.
+#[test]
+fn chain_counts_shared_ids_once_in_the_accepted_copy() {
+    with_max_gated_claude_revision(3, || {
+        let chain = ProofChain::with_counts("copy-prefix-chain-once", &[2, 3, 4]);
+        fs::remove_dir_all(chain.support.join("local-otel")).unwrap();
+        let origin = chain.paths[0].file_stem().unwrap().to_str().unwrap();
+        let delivered = || {
+            let (mut index, raw) = chain.scan_files(ScanIndex::default());
+            let a = local_index_key(&chain.paths[1]);
+            fixture::origin_accepted_for_test(&mut index, &a);
+            let mut scan = raw.clone();
+            for _ in 0..3 {
+                scan = raw.clone();
+                chain.enrich(&mut index, &mut scan);
+            }
+            chain.accept(&mut index, &mut scan);
+            scan.snapshots.retain(|s| s.source_session_id != origin);
+            assert_eq!(scan.snapshots.len(), 2);
+            let counts = scan
+                .snapshots
+                .iter()
+                .map(|s| (s.request_count, s.removed_request_count.unwrap_or(0)))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(counts, BTreeSet::from([(3, 0), (1, 3)]));
+            scan_money(SnapshotSource::ClaudeCode, &index, &scan)
+        };
+        let with_origin = delivered();
+        fs::remove_file(&chain.paths[0]).unwrap();
+        money_oracle::assert_equivalent(&delivered(), &with_origin);
     });
 }
