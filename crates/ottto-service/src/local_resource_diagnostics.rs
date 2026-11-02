@@ -1187,6 +1187,7 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    first_read_bytes: Option<u64>,
 }
 impl StageWindow {
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
@@ -1195,7 +1196,20 @@ impl StageWindow {
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            first_read_bytes: None,
         }
+    }
+    pub(crate) fn first_read(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| {
+            let mut window = Self::begin(source.api_slug(), "first_read");
+            window.first_read_bytes = Some(bytes);
+            window
+        })
     }
 }
 impl Drop for StageWindow {
@@ -1203,107 +1217,43 @@ impl Drop for StageWindow {
         if std::thread::panicking() {
             return;
         }
+        let observation = self.probe.stage_observation(self.footprint.as_ref());
+        let counts = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
+            serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
+                "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
+        });
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
-            counts: EmptyCounts {},
+            observation,
+            counts,
         });
     }
 }
 /// Process high-water file sizes, without paths or read admission decisions.
-pub(crate) fn observe_file_size(source: &str, bytes: u64) {
+pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LARGEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
     let slot = match source {
-        "claude_code" => 0,
-        "codex" => 1,
-        "pi" => 2,
-        _ => return,
+        crate::snapshots::SnapshotSource::ClaudeCode => 0,
+        crate::snapshots::SnapshotSource::Codex => 1,
+        crate::snapshots::SnapshotSource::Pi => 2,
     };
     let previous = LARGEST[slot].fetch_max(bytes, Ordering::Relaxed);
     if bytes > previous {
         traversal_point(
             "file_size",
-            source,
-            &serde_json::json!({"largest_file_bytes": bytes}),
+            source.api_slug(),
+            &serde_json::json!({"largest_file_bytes": bytes, "file_over_1gib": bytes > 1024 * 1024 * 1024}),
         );
-        if slot == 0 && previous <= 1024 * 1024 * 1024 && bytes > 1024 * 1024 * 1024 {
-            traversal_point(
-                "large_file_alarm",
-                source,
-                &serde_json::json!({"claude_over_1gib": 1}),
-            );
-        }
     }
 }
 
-/// One first read, including its native finish, across cooperative pages.
-/// Reuses the source-stage footprint sampler; never holds transcript or index data.
-pub(crate) struct FirstRead {
-    source: Source,
-    bytes: u64,
-    started: Instant,
-    footprint: Option<footprint::Stage>,
-}
-impl FirstRead {
-    pub(crate) fn begin(source: &str, bytes: u64, first: bool) -> Option<Self> {
-        observe_file_size(source, bytes);
-        first.then(|| Self {
-            source: Source::from_slug(source),
-            bytes,
-            started: Instant::now(),
-            footprint: footprint::Stage::begin(),
-        })
-    }
-}
-impl Drop for FirstRead {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-        let elapsed = self.started.elapsed();
-        let size_bucket = match self.bytes {
-            0..=268_435_456 => "le_256mib",
-            268_435_457..=536_870_912 => "le_512mib",
-            536_870_913..=1_073_741_824 => "le_1gib",
-            1_073_741_825..=2_147_483_648 => "le_2gib",
-            _ => "gt_2gib",
-        };
-        let mut observation = Observation::between(
-            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-            None,
-            None,
-        );
-        observation.footprint = self
-            .footprint
-            .as_ref()
-            .map_or_else(footprint::unavailable, footprint::Stage::finish);
-        emit(&Record {
-            schema_version: SCHEMA_VERSION,
-            process_id: std::process::id(),
-            stage: "first_read",
-            source: self.source,
-            observation,
-            counts: serde_json::json!({"first_read_ms": elapsed.as_millis(), "size_bucket": size_bucket}),
-        });
-        if elapsed.as_secs() > 300 {
-            emit(&Record {
-                schema_version: SCHEMA_VERSION,
-                process_id: std::process::id(),
-                stage: "large_file_alarm",
-                source: self.source,
-                observation: Observation::point(),
-                counts: serde_json::json!({"first_read_over_300s": 1}),
-            });
-        }
-    }
-}
-
-impl crate::heap_layout_bound::HeapLayoutBound for FirstRead {
+impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }

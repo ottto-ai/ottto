@@ -469,7 +469,7 @@ impl Scene {
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: Default::default(),
 
-                retired_oversized_discovery: Default::default(),
+                oversized_discovery: Default::default(),
                 codex_rollout_paths: BTreeSet::from([
                     local_index_key(&parent),
                     local_index_key(&child_path),

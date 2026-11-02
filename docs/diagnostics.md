@@ -637,14 +637,19 @@ separate exemption.
 
 The former `oversized_discovery_alarm`, `size` and `withheld_oversized`
 observations are retired with whole-file refusal. `last_oversized_file_count`
-remains on the wire and emits zero; saved refusal debt is ignored.
+remains on the wire and emits zero. Saved refusal debt stays decodable and is
+cleared after load through the ordinary save path.
 
 The `local_resources` stage `file_size` reports the process high-water
-`largest_file_bytes` per source. `first_read` reports `first_read_ms`, a fixed
-`size_bucket` and existing footprint-sampler observations for a new file's first
-active read, including native finish. `large_file_alarm` records a Claude file
-crossing 1 GiB or a first read taking more than 300 seconds. Observations contain
-no paths or identities and never gate reads. Process-wide counters reset on restart.
+`largest_file_bytes` per source, with `file_over_1gib` on that same record.
+`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
+and existing footprint observations through native finish. `unread_extent`
+reports `max_unread_bytes` per traversal from disk length minus the last native
+checkpoint's size (zero if none); it conservatively includes uncommitted reads.
+It resets on restart/new traversal. No persisted fields or per-file clocks are
+added; unread age and its six-hour alert are deferred because existing metadata
+does not record when an extent first became owed. Observations contain no paths
+or identities and never gate reads.
 
 `counts.line_delivery_unselected.age` counts a discovery decision outside the
 window without an owed-growth, verification or unresolved-account exemption.

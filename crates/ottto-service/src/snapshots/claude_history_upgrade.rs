@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 /// Most history files one page may upgrade, for every revision (MONEY P2).
 pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
-/// Bytes of history one page may upgrade (1 GiB), for every revision. No
+/// Bytes of history one page may upgrade (1 GiB), for every revision. Every
 /// page admits its first file or native twin group even when it exceeds this budget.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
 /// Highest active Claude revision the gate is open for. Activating `e2` raised

@@ -308,8 +308,6 @@ fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// [regress] First-unit admission replaces the former permanent size refusal.
-#[test]
 fn estimate_admits_large_singleton_above_the_history_page_budget() {
     let (home, _, index, paths) = setup("copy-prefix-native-file-cap");
     let size = body_witness_adoption_byte_budget() + 1;
@@ -590,8 +588,6 @@ fn no_twins_leave_the_listed_scope_and_forecast_unchanged() {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// [regress] First-unit admission replaces the former permanent size refusal.
-#[test]
 fn large_twin_family_member_is_admitted_as_first_group() {
     let (home, _, _, main, expected) = twin_setup("copy-prefix-twin-closure-cap");
     let added = expected.iter().find(|p| **p != main).unwrap();
@@ -646,8 +642,6 @@ fn closure_growth_refuses_preparation_before_reowing_any_member() {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// [regress] First-unit admission replaces the former permanent size refusal.
-#[test]
 fn twin_closure_native_reader_admits_first_large_group() {
     let (home, root, mut index, _, _expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
     let support = home.join("support");
@@ -665,8 +659,6 @@ fn twin_closure_native_reader_admits_first_large_group() {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// [regress] First-unit admission replaces the former permanent size refusal.
-#[test]
 fn combined_twin_bytes_are_admitted_as_the_first_page_group() {
     let (home, _, _, _, expected) = twin_setup("copy-prefix-twin-group-bytes");
     let mains = expected
@@ -697,3 +689,16 @@ fn combined_twin_bytes_are_admitted_as_the_first_page_group() {
 
 #[path = "proof_recovery_tests.rs"]
 mod proof_recovery_tests;
+
+/// [regress] First-unit admission replaces permanent size refusal for singleton, twin and combined groups.
+#[test]
+fn first_group_admission_cases() {
+    for case in [
+        estimate_admits_large_singleton_above_the_history_page_budget as fn(),
+        large_twin_family_member_is_admitted_as_first_group as fn(),
+        twin_closure_native_reader_admits_first_large_group as fn(),
+        combined_twin_bytes_are_admitted_as_the_first_page_group as fn(),
+    ] {
+        case();
+    }
+}

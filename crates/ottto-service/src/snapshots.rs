@@ -286,6 +286,7 @@ mod held_audit_restore_tests;
 pub(crate) mod line_delivery;
 #[cfg(test)]
 mod line_delivery_tests;
+mod oversized_discovery;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod restart_restore;
@@ -2683,6 +2684,8 @@ struct ClaudeFullRearmWindow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ScanTraversalCounts {
+    #[serde(skip)]
+    max_unread_bytes: u64,
     discovered_file_count: usize,
     directory_entry_cap_exceeded_count: usize,
     symlink_rejected_count: usize,
@@ -2691,10 +2694,6 @@ struct ScanTraversalCounts {
     /// PR-P: held fork children per parent cause, traversal-cumulative.
     /// Additive: old checkpoints load as zero (struct-level `serde(default)`).
     parent_unresolvable: ParentUnresolvableCauses,
-    // Keep the legacy positional slot while accepting and ignoring its value.
-    #[serde(rename = "oversized_file_count", default, skip_serializing)]
-    retired_oversized_file_count: serde::de::IgnoredAny,
-    #[serde(skip)]
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -2903,9 +2902,9 @@ struct ScanTraversalCheckpoint {
     unhealthy_retry_attempt: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unhealthy_retry_not_before_unix_seconds: Option<u64>,
-    // Decode and discard the old map without shifting positional checkpoints.
-    #[serde(rename = "oversized_discovery", default, skip_serializing)]
-    retired_oversized_discovery: serde::de::IgnoredAny,
+    // Retained for exact v1/v2 decoding; ordinary post-load mutation retires it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    oversized_discovery: BTreeMap<String, oversized_discovery::Debt>,
     counts: ScanTraversalCounts,
     /// Files this generation parsed cleanly but could not checkpoint because
     /// their content yields non-progressing residue. Recorded so the settled
@@ -26614,7 +26613,7 @@ pub(crate) struct OwnedSourceScan {
     codex_versions: Option<Arc<codex_version::CodexVersionFeed>>,
 }
 struct OwnedActiveFile {
-    first_read: Option<crate::local_resource_diagnostics::FirstRead>,
+    first_read: Option<crate::local_resource_diagnostics::StageWindow>,
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
     // Survives paging and missing preparation; only source verification retires it.
@@ -29058,8 +29057,7 @@ impl OwnedSourceScan {
                 // No group byte or member cap: a group larger than
                 // the singleton budget pages through the cursor; without one
                 // (unsupported layout, uncached scan) it is read in one page
-                // like an ordinary unpaged read; group bytes are uncapped
-                // (R2-N7, disclosed).
+                // like an ordinary unpaged read; group bytes are uncapped.
                 let active_dependencies = boot.live().map(|(live, _)| {
                     sampled_scan::codex_cursor::group_dependencies(
                         &boot.group.members,
@@ -34760,8 +34758,8 @@ impl OwnedSourceScan {
                                     }
                                     active_file = Some(Box::new(OwnedActiveFile {
                                         first_read:
-                                            crate::local_resource_diagnostics::FirstRead::begin(
-                                                source.api_slug(),
+                                            crate::local_resource_diagnostics::StageWindow::first_read(
+                                                source,
                                                 candidate.size_bytes,
                                                 !index.files.contains_key(&local_index_key(
                                                     &candidate.path,
@@ -35630,8 +35628,8 @@ impl OwnedSourceScan {
                 pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
-                first_read: crate::local_resource_diagnostics::FirstRead::begin(
-                    source.api_slug(),
+                first_read: crate::local_resource_diagnostics::StageWindow::first_read(
+                    source,
                     candidate.size_bytes,
                     !index.files.contains_key(&local_index_key(&candidate.path)),
                 ),
@@ -46038,7 +46036,7 @@ fn ensure_bounded_traversal(
         pending_candidates: VecDeque::new(),
         observed_index_keys: Default::default(),
 
-        retired_oversized_discovery: Default::default(),
+        oversized_discovery: Default::default(),
 
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
@@ -46446,7 +46444,20 @@ fn refresh_retained_codex_roster(
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
-            crate::local_resource_diagnostics::observe_file_size(source.api_slug(), metadata.len());
+            crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
+            traversal.counts.max_unread_bytes = traversal.counts.max_unread_bytes.max(
+                metadata.len().saturating_sub(
+                    index
+                        .files
+                        .get(&local_index_key(&path))
+                        .map_or(0, |entry| entry.size_bytes),
+                ),
+            );
+            crate::local_resource_diagnostics::traversal_point(
+                "unread_extent",
+                source.api_slug(),
+                &serde_json::json!({"max_unread_bytes": traversal.counts.max_unread_bytes}),
+            );
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
 
@@ -47095,7 +47106,20 @@ fn advance_bounded_directory_traversal_with_budget(
             let census_member = !relisting || fresh_path_census_member(source, &traversal, &path);
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
-            crate::local_resource_diagnostics::observe_file_size(source.api_slug(), metadata.len());
+            crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
+            traversal.counts.max_unread_bytes = traversal.counts.max_unread_bytes.max(
+                metadata.len().saturating_sub(
+                    index
+                        .files
+                        .get(&local_index_key(&path))
+                        .map_or(0, |entry| entry.size_bytes),
+                ),
+            );
+            crate::local_resource_diagnostics::traversal_point(
+                "unread_extent",
+                source.api_slug(),
+                &serde_json::json!({"max_unread_bytes": traversal.counts.max_unread_bytes}),
+            );
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
 
@@ -47761,11 +47785,6 @@ struct DiscoveryRetention<'a> {
 }
 
 impl<'a> DiscoveryRetention<'a> {
-    /// Reuse an existing gate's metadata, including size refusals.
-    fn observe_growth(&self, path: &Path, len: u64, modified: u64) {
-        self.observe_stamped_growth(path, len, modified, None);
-    }
-
     fn observe_stamped_growth(
         &self,
         path: &Path,
@@ -48503,7 +48522,7 @@ fn unix_nanos(value: SystemTime) -> Option<u64> {
 const BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE: usize =
     claude_history_upgrade::HISTORY_UPGRADE_FILES_PER_PAGE;
 /// Bytes of history upgraded per page (1 GiB, one constant for every
-/// revision). No file is admitted past it, including a page's first file.
+/// revision). A page admits its first complete file even above this budget.
 const BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE: u64 =
     claude_history_upgrade::HISTORY_UPGRADE_BYTES_PER_PAGE;
 
@@ -51750,7 +51769,7 @@ impl ScanIndex {
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
 
-            retired_oversized_discovery: Default::default(),
+            oversized_discovery: Default::default(),
 
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -52276,6 +52295,13 @@ impl ScanIndex {
         Ok(index)
     }
 
+    fn clear_retired_file_size_debt(&mut self) {
+        if let Some(traversal) = &mut self.traversal {
+            traversal.oversized_discovery.clear();
+            traversal.counts.oversized_file_count = 0;
+        }
+    }
+
     /// Both load entry points repair tombstones and retain guard (b) from
     /// the history gate's load origin, before any replay or scan can save.
     fn settle_claude_index_load(&mut self, path: &Path, load_origin: ScanIndexLoadOrigin) {
@@ -52416,6 +52442,7 @@ impl ScanIndex {
                 if try_import {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
+                index.clear_retired_file_size_debt();
                 Ok((index, LoadOrigin::Loaded(opened)))
             }
             Err(error) if error.quarantines() => {
@@ -56878,7 +56905,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
 
-            retired_oversized_discovery: Default::default(),
+            oversized_discovery: Default::default(),
 
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -56949,23 +56976,6 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
-    }
-
-    /// [format] Retired file-size refusal debt and counts decode without a state migration.
-    #[test]
-    fn retired_file_size_debt_is_ignored_and_omitted_on_save() {
-        let mut old = serde_json::to_value(terminal_unhealthy_traversal(String::new())).unwrap();
-        old["oversized_discovery"] = json!({
-            "synthetic_path_hash": {"content_hash":"synthetic_content_hash", "observations":1}
-        });
-        old["counts"]["oversized_file_count"] = json!(1);
-        old["counts"]["disappeared_file_count"] = json!(0);
-        let decoded: ScanTraversalCheckpoint = serde_json::from_value(old).unwrap();
-        assert_eq!(decoded.counts.oversized_file_count, 0);
-        assert!(!decoded.counts.has_errors());
-        let saved = serde_json::to_value(decoded).unwrap();
-        assert!(saved.get("oversized_discovery").is_none());
-        assert!(saved["counts"].get("oversized_file_count").is_none());
     }
 
     #[test]
@@ -59638,7 +59648,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
 
-            retired_oversized_discovery: Default::default(),
+            oversized_discovery: Default::default(),
 
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -60153,7 +60163,7 @@ mod tests {
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: ["b".to_string(), "d".to_string()].into_iter().collect(),
 
-                retired_oversized_discovery: Default::default(),
+                oversized_discovery: Default::default(),
 
                 codex_rollout_paths: BTreeSet::new(),
                 codex_join_directory_census: None,
@@ -60966,7 +60976,7 @@ mod tests {
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: Default::default(),
 
-                retired_oversized_discovery: Default::default(),
+                oversized_discovery: Default::default(),
 
                 codex_rollout_paths: BTreeSet::new(),
                 codex_join_directory_census: None,
@@ -68620,7 +68630,7 @@ mod tests {
                         .cloned()
                         .collect(),
 
-                    retired_oversized_discovery: Default::default(),
+                    oversized_discovery: Default::default(),
 
                     codex_rollout_paths: BTreeSet::new(),
                     codex_join_directory_census: None,
@@ -84727,7 +84737,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
 
-            retired_oversized_discovery: Default::default(),
+            oversized_discovery: Default::default(),
 
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
@@ -85331,8 +85341,8 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; retired_oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; retired_oversized_file_count, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
@@ -86017,7 +86027,7 @@ const _: () = {
     // Parser/custody boxing is unchanged; sampling counters are charged separately.
     assert!(
         size_of::<OwnedActiveFile>()
-            == 880 + size_of::<Option<crate::local_resource_diagnostics::FirstRead>>()
+            == 880 + size_of::<Option<crate::local_resource_diagnostics::StageWindow>>()
     );
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
