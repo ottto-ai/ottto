@@ -1282,9 +1282,22 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
         let tail = f.grow(&[line]);
         requests += u64::from(counted);
         let cold = f.emit_bodies(Mode::ColdFull);
-        assert_eq!(cold.snapshots[&f.entity]["request_count"], json!(requests));
+        // An uncounted line can leave the accepted body unchanged: cold Full
+        // then uploads nothing, and neither may any route.
+        let unchanged = !cold.snapshots.contains_key(&f.entity);
+        if unchanged {
+            assert!(!counted);
+            assert_eq!(f.accepted[&f.entity].body["request_count"], json!(requests));
+        } else {
+            assert_eq!(cold.snapshots[&f.entity]["request_count"], json!(requests));
+        }
         for mode in [Mode::Ram, Mode::Restart, Mode::EvictRetry] {
             let route = f.emit_bodies(mode);
+            if unchanged {
+                assert!(route.snapshots.is_empty(), "{mode:?}: unchanged body uploaded");
+                assert_eq!(f.counters(mode).1, 0);
+                continue;
+            }
             if mode == Mode::EvictRetry && f.restarts > 0 {
                 // The restarted owner's Ram route already restored this record
                 // extent; head-once pacing makes its retry the paced Full.
