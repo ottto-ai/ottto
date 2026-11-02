@@ -61,6 +61,8 @@ pub(super) mod preparation_tests {
                 .map_or(Ok(()), |fault| fault(taken))
         })
     }
+    // Its only caller is the macOS-only nonresident restore regression.
+    #[cfg(target_os = "macos")]
     pub(in crate::snapshots) fn reject_once(refusal: PreparationRefusal) {
         REJECTION.with(|slot| slot.set(Some(refusal)));
     }
