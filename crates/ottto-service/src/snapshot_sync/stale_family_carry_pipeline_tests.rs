@@ -391,12 +391,13 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
     let [_, _, base_retry, base_repaired, _] = &base.windows;
-    // Preconditions on BASE: both retries re-arm and re-read the family, and
-    // the first one ends red again.
+    // Preconditions on BASE: both retries re-arm the family, and the first
+    // one ends red again. The terminal-retry re-arm owes, so BASE re-stamps
+    // the unchanged family instead of re-reading it.
     for window in [base_retry, base_repaired] {
         let start = window.start.as_ref().expect("a retry start");
         assert_eq!(start.reason, "terminal_unhealthy_retry");
-        assert_eq!(window.family_reads as u64, family);
+        assert_eq!(window.family_reads, 0);
     }
     assert!(base_retry.red && base_repaired.census_complete);
     for (window, base_window) in [(retry, base_retry), (repaired, base_repaired)] {
@@ -408,9 +409,9 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
             base_start.stale_pending_families
         );
         assert!(window.parsed.contains(REARM_TERMINAL), "unwitnessed: BASE");
-        // FLIPS: BASE re-reads the unchanged family at each retry.
+        // BASE re-stamps (no read) where the fix carries.
         assert_eq!(window.family_reads, 0, "the carried family is not read");
-        assert_eq!(window.reads, base_window.reads - family as usize);
+        assert_eq!(window.reads, base_window.reads);
         assert_eq!(start.carried_pending_families, Some(1));
         assert_eq!(start.carried_index_files, Some(family));
         assert_eq!(
@@ -635,7 +636,6 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     let (fix, base, cancelled, held) =
         c1b_recoverable_change_arms_listed("c1b-terminal-page-member-change", 64, true);
     assert_eq!((cancelled, held), (0, 1), "one hold, no cancel");
-    let family = rearm_family_sessions().len();
     let retry = &fix.windows[2];
     let base_retry = &base.windows[2];
     // The listed retry reads the family on ordinary money; the unlisted
@@ -653,9 +653,10 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
             "{arm}: no listed family body is request-owned"
         );
     }
-    // BASE: the healthy terminal page re-reads and re-proves the family.
+    // BASE: the healthy terminal page re-proves the family. Its terminal-retry
+    // re-arm owes, so only the changed member is read; the rest re-stamp.
     assert!(base_retry.census_complete && !base_retry.red);
-    assert_eq!(base_retry.family_reads, family);
+    assert_eq!(base_retry.family_reads, 1);
     assert!(base_retry.proven && !base_retry.retry_pending);
     let start = retry.start.as_ref().expect("a retry start");
     assert_eq!(start.carried_pending_families, Some(1), "carried at start");
@@ -704,8 +705,8 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
         let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
         run("c1b-member-removed-base", "base")
     };
-    let remaining = rearm_family_sessions().len() - 1;
-    assert_eq!(base_retry.family_reads, remaining, "BASE reads the rest");
+    // BASE's terminal-retry re-arm owes: the remaining members re-stamp.
+    assert_eq!(base_retry.family_reads, 0, "BASE re-stamps the rest");
     let start = retry.start.as_ref().expect("a retry start");
     assert_eq!(start.carried_pending_families, Some(1));
     assert_eq!(retry.family_reads, 0, "the carry stands in this window");
@@ -815,7 +816,6 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let fix = c1b_held_retry_chain("c1b-held-beside-witnessed", "fix", |_| {});
     let base = {
         let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
@@ -856,7 +856,8 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
         "the witnessed family"
     );
     assert_eq!(fix.retry.family_reads, 0, "the carried family is not read");
-    assert_eq!(base.retry.family_reads, family, "BASE re-reads it");
+    // BASE's terminal-retry re-arm owes: it re-stamps the unchanged family.
+    assert_eq!(base.retry.family_reads, 0, "BASE re-stamps it");
     assert_eq!(
         fix.retry.parsed.contains(REARM_TERMINAL),
         base.retry.parsed.contains(REARM_TERMINAL),
@@ -1002,7 +1003,8 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
         Some(0)
     );
     assert_eq!(fix.retry.family_reads, 0, "the unchanged family is carried");
-    assert_eq!(base.retry.family_reads, rearm_family_sessions().len());
+    // BASE's terminal-retry re-arm owes: it re-stamps the unchanged family.
+    assert_eq!(base.retry.family_reads, 0);
     for (arm, run) in [("fix", &fix), ("base", &base)] {
         assert!(
             !run.marked_after_red,
@@ -1518,13 +1520,14 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     let retry = latch_contract_generation(&fixture, 20);
                     let reads = rearm_parsed(&retry).contains(session);
                     if case == "accepted" {
-                        assert_eq!(reads, base, "exact-ACK unchanged {base}/e2");
-                        if !base {
-                            assert_eq!(
-                                fixture.body_trace.borrow().finalizer_bodies[session],
-                                accepted
-                            );
-                        }
+                        // BASE's terminal-retry re-arm owes; the member's own
+                        // record was read under the current contract, so it
+                        // re-stamps (E1) and neither arm reads.
+                        assert!(!reads, "exact-ACK unchanged {base}/e2");
+                        assert_eq!(
+                            fixture.body_trace.borrow().finalizer_bodies[session],
+                            accepted
+                        );
                     } else if case == "held" {
                         assert!(reads, "held keeps today's path {base}/e2");
                         assert!(retry.iter().all(|page| !page

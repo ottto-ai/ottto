@@ -65,8 +65,8 @@ pub(crate) fn clear(key: &str, entry: &mut ScanIndexEntry, cause: Cause) {
         crate::snapshots::evidence_owed::owes(cause),
     );
 }
-/// `owe`: evidence owed ON decided this re-arm owes evidence (keeps the
-/// fingerprint) instead of clearing it.
+/// `owe`: this re-arm owes evidence (keeps the fingerprint) instead of
+/// clearing it (`evidence_owed::owes`).
 pub(crate) fn clear_owed(key: &str, entry: &mut ScanIndexEntry, cause: Cause, owe: bool) {
     if !entry.rearmed() {
         with_tags(|tags| {
