@@ -3056,6 +3056,10 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 // independent of the restart-restore implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("restart_restore_money_tests.rs");
+    #[cfg(all(test, target_os = "macos"))]
+    mod restart_restore_real_copy {
+        include!("restart_restore_real_copy.rs");
+    }
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
     }
