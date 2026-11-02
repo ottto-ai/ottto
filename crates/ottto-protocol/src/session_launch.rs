@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION: u16 = 28;
-pub const ACCOUNT_NICKNAME_CONTROL_PROTOCOL_VERSION: u16 = 28;
 
 macro_rules! lenient_enum {
     ($name:ident { $($variant:ident),* $(,)? }) => {

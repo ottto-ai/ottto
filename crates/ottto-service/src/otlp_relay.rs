@@ -23,7 +23,6 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
-pub const CLAUDE_CODE_RELAY_PORT: u16 = LOCAL_RELAY_DEFAULT_PORT;
 pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
 pub const CODEX_RELAY_SOURCE: &str = "codex";
 pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
@@ -131,10 +130,6 @@ struct HttpRequest {
 
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
-}
-
-pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
-    spawn_local_otlp_relay(daemon)
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
@@ -696,23 +691,6 @@ pub fn local_relay_port_from_endpoint(endpoint: &str) -> Option<u16> {
         .next()
         .and_then(|value| value.parse::<u16>().ok())?;
     Some(port)
-}
-
-pub fn local_relay_base_url_from_state(relay: &RelayState) -> String {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .map(local_relay_base_url_for_port)
-        .unwrap_or_else(default_local_relay_base_url)
-}
-
-pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
 }
 
 pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {

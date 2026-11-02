@@ -282,7 +282,6 @@ pub struct LocalMachineHealthV1 {
     pub evidence: Vec<LocalHealthEvidenceRefV1>,
 }
 
-pub type LocalMachineHealth = LocalMachineHealthV1;
 pub type CanonicalLocalHealth = LocalMachineHealthV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

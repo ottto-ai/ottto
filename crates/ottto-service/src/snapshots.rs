@@ -28489,7 +28489,7 @@ impl OwnedSourceScan {
                         // §d.1.2 c: a paused or active cursor job owns a
                         // member. Its selected members stay pending (holding
                         // the census) and are not read again while it lives.
-                        if let Some(context) = sampling.as_ref().filter(|context| {
+                        if sampling.as_ref().is_some_and(|context| {
                             group.members.iter().any(|member| {
                                 context
                                     .cache
@@ -28501,9 +28501,6 @@ impl OwnedSourceScan {
                                 .iter()
                                 .filter(|member| selected.contains(&local_index_key(&member.path)))
                                 .collect::<Vec<_>>();
-                            for _ in &owned {
-                                context.cache.note_join_in_progress();
-                            }
                             sampled_scan::codex_cursor::requeue_members(
                                 index,
                                 &codex_selected_flags,
@@ -33694,7 +33691,6 @@ impl OwnedSourceScan {
                     // The paused or active cursor job owns this file (a group
                     // job owns every member); it stays pending (holding the
                     // census) until that job's attempt ends (§d.1.2 c).
-                    context.cache.note_join_in_progress();
                     sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
                     pending!();
                 }

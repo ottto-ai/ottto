@@ -1639,14 +1639,6 @@ pub fn collect_agent_status(
     collect_agent_status_collection(source, captured_at, expires_at).source_health_snapshot
 }
 
-pub fn collect_agent_status_snapshots(
-    source: &SourceKind,
-    captured_at: String,
-    expires_at: String,
-) -> Vec<AgentStatusSnapshot> {
-    collect_agent_status_collection(source, captured_at, expires_at).snapshots
-}
-
 pub(crate) fn collect_agent_status_collection(
     source: &SourceKind,
     captured_at: String,
