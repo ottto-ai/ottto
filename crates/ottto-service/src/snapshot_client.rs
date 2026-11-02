@@ -729,6 +729,9 @@ pub struct ActivityHintResponse {
     /// Exact additive composition detail contract; missing/null/unknown stays legacy.
     #[serde(default)]
     pub context_composition_details_contract: Option<String>,
+    /// Exact additive contract for withheld totals; missing/null/unknown sends none.
+    #[serde(default)]
+    pub names_withheld_contract: Option<String>,
     #[serde(default)]
     pub session_attribution_enabled: bool,
     /// Additive server capability for bounded private labels on opaque
@@ -793,13 +796,6 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
     Ok(hint)
-}
-
-/// Whether the context harvesters may upload workspace and repository labels.
-/// `None` is a failed hint fetch: the policy is unknown, so labels are
-/// withheld. A fetched hint keeps its `workspace_labels_enabled` as sent.
-pub(crate) fn workspace_labels_allowed(hint: Option<&ActivityHintResponse>) -> bool {
-    hint.is_some_and(|hint| hint.workspace_labels_enabled)
 }
 
 fn default_true() -> bool {
@@ -3782,12 +3778,13 @@ mod tests {
         ));
         let omitted =
             hint(activity_hint_json("").replace("\"workspace_labels_enabled\":true,", ""));
-        assert!(workspace_labels_allowed(Some(&on)));
-        assert!(!workspace_labels_allowed(Some(&off)));
+        use crate::snapshots::SnapshotUploadPolicy as Policy;
+        assert!(Policy::from_hint(&on).workspace());
+        assert!(!Policy::from_hint(&off).workspace());
         // A fetched hint from an older backend keeps the legacy default.
-        assert!(workspace_labels_allowed(Some(&omitted)));
+        assert!(Policy::from_hint(&omitted).workspace());
         // A failed fetch leaves the policy unknown: labels stay on the machine.
-        assert!(!workspace_labels_allowed(None));
+        assert!(!Policy::MOST_PRIVATE.workspace());
     }
 
     #[test]
@@ -5181,7 +5178,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

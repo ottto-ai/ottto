@@ -154,6 +154,8 @@ pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidat
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]
 mod upload_context_receipt_tests;
+#[cfg(test)]
+mod upload_policy_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -1794,11 +1796,7 @@ pub struct SnapshotActivityCount {
 /// One privacy-safe transcript-observed tool-name aggregate. Only the bounded
 /// name and count cross the wire; tool ids, arguments, results, and paths stay
 /// local to the parser.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotToolUsage {
-    pub name: String,
-    pub count: u64,
-}
+pub type SnapshotToolUsage = SnapshotActivityCount;
 
 /// One privacy-safe agent capability count. The identifiers are collector-owned
 /// constants; raw tool arguments, results, URLs, browser ids, and screenshots
@@ -8524,7 +8522,7 @@ struct PendingIndexFinalization {
     restored_behind_accepted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
@@ -8561,65 +8559,7 @@ impl Default for SnapshotUploadPolicy {
     }
 }
 
-pub fn apply_upload_policy(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-) {
-    for item in snapshots {
-        let mut fingerprint_needs_refresh = false;
-        if !policy.session_titles_enabled
-            && (item.session_display_name.is_some() || item.session_display_name_source.is_some())
-        {
-            item.session_display_name = None;
-            item.session_display_name_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.workspace_labels_enabled
-            && (item.workspace_display_label.is_some()
-                || item.workspace_label_source.is_some()
-                || item.repository_label.is_some()
-                || item.repository_label_source.is_some())
-        {
-            item.workspace_display_label = None;
-            item.workspace_label_source = None;
-            item.repository_label = None;
-            item.repository_label_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
-            item.session_artifacts.clear();
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
-            item.attribution_facts.clear();
-            fingerprint_needs_refresh = true;
-        } else if (!policy.session_titles_enabled || !policy.session_attribution_labels_enabled)
-            && crate::session_attribution::strip_display_labels(&mut item.attribution_facts)
-        {
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_labels_enabled {
-            if let Some(summary) = item.activity_summary.as_mut() {
-                if !summary.skills.is_empty() {
-                    summary.skills.clear();
-                    fingerprint_needs_refresh = true;
-                }
-            }
-        }
-        if let Some(start) = item.session_start.as_mut() {
-            // Outside the fingerprint: consent changes only which identity an
-            // opening file carries, never the session's content.
-            start.apply_upload_policy(
-                policy.workspace_labels_enabled,
-                policy.session_attribution_enabled,
-            );
-        }
-        if fingerprint_needs_refresh {
-            item.snapshot_fingerprint = snapshot_fingerprint(source, item);
-        }
-    }
-}
+pub use crate::upload_policy::apply_upload_policy;
 
 #[cfg(test)]
 pub(crate) fn snapshot_item_wire_size(
@@ -86038,7 +85978,6 @@ crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
 crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
-crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);
