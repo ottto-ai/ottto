@@ -3122,8 +3122,9 @@ pub(in crate::snapshots) mod tests {
             1
         );
         for replay in [false, true] {
+            // No source-wide context is adopted (retired): each archive
+            // marker's own context decides the correction hold below.
             let mut durable = index.clone();
-            durable.upload_context_fingerprint = Some("first".into());
             let checkpoint = fixture(b"", ".json");
             fs::remove_file(&checkpoint.0).unwrap();
             durable.generation = 0;
@@ -3454,13 +3455,26 @@ pub(in crate::snapshots) mod tests {
             let previous = scan.index.clone();
             let (working, result) = finish_selector(scan, &checkpoint.0);
             assert!(!result.census_complete);
-            assert!(working.upload_context_fingerprint.is_none());
+            // Per item, not source-wide: the still-pending plain census member
+            // earns no upload-context receipt before the census completes.
+            let plain_key = local_index_key(&plain);
+            assert!(working
+                .files
+                .get(&plain_key)
+                .map_or(true, |e| e.upload_context_receipt.is_none()));
             let accepted = crate::snapshot_sync::archive_upload_checkpoint(
                 working, &result, &previous, "accept",
             );
             let checkpoint = fixture(&serde_json::to_vec(&accepted).unwrap(), ".json");
             index = ScanIndex::load(&checkpoint.0).unwrap();
-            assert!(index.upload_context_fingerprint.is_none());
+            assert!(serde_json::to_value(&accepted)
+                .unwrap()
+                .get("upload_context_fingerprint")
+                .is_none());
+            assert!(index
+                .files
+                .get(&plain_key)
+                .map_or(true, |e| e.upload_context_receipt.is_none()));
             assert_eq!(
                 index.historical_replay_generation.as_deref(),
                 Some("unchanged")
