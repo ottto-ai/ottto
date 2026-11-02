@@ -11,7 +11,6 @@ use crate::snapshots::sampled_jsonl::durable::test_finish_items;
 use crate::snapshots::state_v2::{Collection, StagedFile};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
-use std::io::Write as _;
 
 /// A first completion of `responses` committed as `name`.
 fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, String) {
