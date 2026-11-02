@@ -21,7 +21,7 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
+    RelayTokenAuthorizationRejected, ShedSnapshotIndexes, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
 };
@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
-mod continuation;
+pub(crate) mod continuation;
 #[cfg(test)]
 mod identity_bucket_progress_tests;
 mod reason_reoffer;
@@ -1007,6 +1007,30 @@ pub(crate) fn checkpoint_account_release_for_test(
         Default::default(),
     )
 }
+
+/// The page items a server answer names: an indexed validation rejection
+/// (422) or an identity-deferral shed (503). `None` when nothing is named or
+/// a location falls outside this page; that failure keeps its own path (a
+/// shed stays a whole-pass shed).
+fn server_named_items(error: &anyhow::Error, indices: &[usize]) -> Option<BTreeSet<usize>> {
+    let named = match error.downcast_ref::<ShedSnapshotIndexes>() {
+        Some(named) => &named.0,
+        None => error
+            .downcast_ref::<BatchRejected>()?
+            .snapshot_indexes
+            .as_ref()?,
+    };
+    named
+        .iter()
+        .map(|index| indices.get(*index).copied())
+        .collect()
+}
+
+/// Process-local, content-free count of records the attempt-count ladder made
+/// `UnprovenTerminal` (all sources), apart from server verdicts, so a later
+/// `unproven_terminal` rise can be attributed.
+static UNPROVEN_TERMINAL_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Process-local, content-free count of `Rejected` pages whose local holds
 /// were all terminal-bound and settled through the `Completed` restore path.
@@ -2593,6 +2617,11 @@ impl SnapshotUploadProgress {
             .unwrap_or(1)
             .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
         let disposition = if failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            if existing.map_or(0, |record| record.failed_reconstruction_count)
+                < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+            {
+                UNPROVEN_TERMINAL_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             SnapshotQuarantineDisposition::UnprovenTerminal
         } else {
             SnapshotQuarantineDisposition::RetryPending
@@ -2714,7 +2743,14 @@ impl SnapshotUploadProgress {
         }
     }
 
-    fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+    /// `retry_after_unix_seconds`: `quarantine_retry_after` for a refusal or
+    /// conflict, the server's own `Retry-After` window for an identity deferral.
+    fn quarantine_retryable_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        retry_after_unix_seconds: u64,
+    ) {
         if self
             .active_reason_reoffers
             .get(fingerprint)
@@ -2736,7 +2772,7 @@ impl SnapshotUploadProgress {
             1
         };
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
-        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+        record.retry_after_unix_seconds = retry_after_unix_seconds;
         crate::snapshots::terminal_contract_retry::exhaust(record);
     }
 
@@ -2778,6 +2814,13 @@ impl SnapshotUploadProgress {
     fn save(&mut self, path: &Path) -> Result<()> {
         self.save_with_read_limit(path, None)
     }
+    /// The concurrent-writer stamp of every progress write: `on_disk` is this
+    /// owner's last save and nobody has saved since.
+    fn same_writer(&self, on_disk: &Self) -> bool {
+        on_disk.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && on_disk.generation == self.generation
+            && on_disk.destination_namespace_hash == self.destination_namespace_hash
+    }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
@@ -2797,10 +2840,7 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
             }
             .context("parse current snapshot upload progress for compare-and-swap")?;
-            if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-                || current.generation != self.generation
-                || current.destination_namespace_hash != self.destination_namespace_hash
-            {
+            if !self.same_writer(&current) {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));
             }
             crate::snapshots::terminal_contract_retry::merge_maps(
@@ -3150,10 +3190,7 @@ impl SnapshotUploadProgress {
             }
             Err(error) => return Err(error).context("read snapshot upload progress before clear"),
         };
-        if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            || current.generation != self.generation
-            || current.destination_namespace_hash != self.destination_namespace_hash
-        {
+        if !self.same_writer(&current) {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
         let tombstone = unique_progress_sibling(path, "cleared");
@@ -3551,7 +3588,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     } else {
         progress_owner
     };
-    let mut durable: SnapshotUploadProgress = match match read_limit {
+    let durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
     } {
@@ -3572,22 +3609,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         }
         Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
-    // These fields are runtime leases, not persisted settlement evidence.
-    durable.ack_recovery = progress.ack_recovery.clone();
-    durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
-    durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
-    durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
-    durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
-    durable.reason_reoffer_counts = progress.reason_reoffer_counts;
-    durable.ack_capacity = progress.ack_capacity;
-    durable.retained_stale_ack_count = progress.retained_stale_ack_count;
-    durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
-    durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
-    durable.context_resend = progress.context_resend.clone();
-    durable
-        .accepted_identity_buckets
-        .adopt_runtime_from(&progress.accepted_identity_buckets);
-    if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
+    // Refuse only a real concurrent writer, as `save()` does. The accepted
+    // and quarantined sets and the upload-context stamp read `durable`.
+    if !progress.same_writer(&durable) {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
         ));
@@ -3688,9 +3712,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &progress.fresh_context_body_acks,
     );
     committable.stamp_entity_upload_context_acks(
-        &progress.destination_namespace_hash,
-        &progress.accepted_body_witnesses,
-        &progress.accepted_body_contexts,
+        &durable.destination_namespace_hash,
+        &durable.accepted_body_witnesses,
+        &durable.accepted_body_contexts,
     );
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
@@ -4168,10 +4192,14 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
-            causes: scan_result
-                .causes
-                .summary(scan_result.ownership_incomplete_file_count),
+            ownership_incomplete_file_count: scan_result
+                .ownership_incomplete_file_count
+                .saturating_add(scan_result.archive_owed_count)
+                as u64,
+            causes: scan_result.causes.summary_with_archive(
+                scan_result.ownership_incomplete_file_count,
+                scan_result.archive_owed_count,
+            ),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -4201,13 +4229,14 @@ impl SyncCounts {
     fn terminal_census_line(&self, source: &str) -> String {
         let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
-             uploaded={} unproven_terminal={} superseded_terminal={} \
+             uploaded={} unproven_terminal={} unproven_terminal_attempt_count={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
              dropped_usage_records={} cooldown_conflict_deferred={} terminal_contract_retry={} terminal_contract_retry_exhausted={}",
             self.census_complete,
             self.scanned_file_count,
             self.uploaded_count,
             self.snapshot_unproven_terminal_count,
+            UNPROVEN_TERMINAL_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             self.snapshot_superseded_terminal_count,
             self.ownership_incomplete_file_count,
             self.zero_snapshot_usage_evidence_count,
@@ -4563,7 +4592,7 @@ fn delivery_wake<'a>(
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        retry.boundary(std::iter::empty(), home, support_dir, daemon);
+        retry.boundary(home, support_dir, daemon);
         retry.wake_before(ordinary)
     }
 }
@@ -4961,6 +4990,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Before credentials: a removed source erases even with no live device.
+    erase_disabled_sources(support_dir, &daemon.transcript_cache);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5041,10 +5072,7 @@ fn sync_once_with_retry(
     );
     crate::net_resilience::note_sync_cycle_transport(transport_cycle);
     if !failed_sources.is_empty() {
-        return Err(anyhow!(
-            "local snapshot sync failed for {} source(s)",
-            failed_sources.len()
-        ));
+        return Err(SourcesFailed(failed_sources).into());
     }
     continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
@@ -5235,12 +5263,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
-    fn serial_fallback(&mut self, source: SnapshotSource) {
-        crate::local_resource_diagnostics::source_rotation_serial_fallback(
-            source.api_slug(),
-            crate::heap_layout_bound::layout_supported(),
-        );
-    }
     fn prepare(
         &mut self,
         source: SnapshotSource,
@@ -5304,9 +5326,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             } => crate::source_rotation::Step::Complete((preparation, index, scan)),
         }
     }
-    fn bound(&self, frame: &SourcePreparation, limit: usize) -> Option<usize> {
-        crate::heap_layout_bound::bound(frame, limit)
-    }
     fn finish(&mut self, mut completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
         completed.0.accept_native_rotation_turn(remaining);
         let source = completed.0.source;
@@ -5365,6 +5384,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     source.api_slug(),
                     safe_error(&error)
                 );
+                crate::snapshots::money_freshness::report_failed_pass(
+                    source,
+                    crate::upload_receipts::newest_accepted_unix_seconds(
+                        self.support_dir,
+                        source_kind(source),
+                    ),
+                );
                 self.failed_sources.push(source.api_slug());
             }
         }
@@ -5408,9 +5434,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             .withheld_memo
             .discard_if_refused();
     }
-    fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
+    fn boundary(&mut self) {
         self.retry
-            .boundary(busy, self.home, self.support_dir, self.daemon);
+            .boundary(self.home, self.support_dir, self.daemon);
     }
 }
 
@@ -6185,7 +6211,17 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("read reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -6214,30 +6250,10 @@ fn collect_native_preparation_with_rotation(
 fn try_collect_native_preparation_with_rotation(
     frame: SourcePreparation,
 ) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
-    try_collect_native_preparation_with_rotation_observed(frame, false)
-}
-#[cfg(test)]
-fn collect_unparkable_preparation_with_rotation(
-    frame: SourcePreparation,
-) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-    // source_rotation.rs:186-188,293-315: parking is optional overlap; an
-    // unparkable ordinary active frame continues serially with the same owner.
-    // Only the large-history starvation regression selects this adapter.
-    try_collect_native_preparation_with_rotation_observed(frame, true)
-        .expect("ordinary serial owned source completion")
-}
-#[cfg(test)]
-fn try_collect_native_preparation_with_rotation_observed(
-    frame: SourcePreparation,
-    require_parking_refusal: bool,
-) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
     struct Collect {
         frame: Option<SourcePreparation>,
         completed: Option<(SourcePreparation, ScanIndex, SourceScanResult)>,
         failure: Option<anyhow::Error>,
-        require_parking_refusal: bool,
-        parking_refused: bool,
-        parked_frames: usize,
         started: Instant,
         steps: usize,
     }
@@ -6265,26 +6281,11 @@ fn try_collect_native_preparation_with_rotation_observed(
             remaining: Option<usize>,
         ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
             self.steps += 1;
-            // The large serial page visits up to the real 10k-file limit,
-            // including unchanged candidates that each yield a scan step.
-            // Keep the original small-fixture guard for every other caller.
-            let step_limit = if self.require_parking_refusal {
-                1024 + 4 * crate::snapshots::MAX_BACKFILL_FILES_PER_SOURCE
-            } else {
-                1024
-            };
             assert!(
-                self.steps <= step_limit,
+                self.steps <= 1024,
                 "same owned scanner must finish within existing fixture steps"
             );
             frame.accept_native_rotation_turn(remaining);
-            if self.require_parking_refusal && !self.parking_refused {
-                // Evaluate the real Owner::bound on the actual moving frame,
-                // including both indexes and the ordinary candidate queue.
-                self.parking_refused = self
-                    .bound(&frame, crate::source_rotation::PARKED_BUDGET)
-                    .is_none();
-            }
             match frame.step() {
                 SourcePreparationStep::Pending(frame) => {
                     crate::source_rotation::Step::Pending(frame)
@@ -6299,12 +6300,6 @@ fn try_collect_native_preparation_with_rotation_observed(
                     scan,
                 } => crate::source_rotation::Step::Complete((preparation, index, scan)),
             }
-        }
-        fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
-            crate::heap_layout_bound::bound(frame, limit)
-        }
-        fn parked(&mut self, _: usize) {
-            self.parked_frames += 1;
         }
         fn finish(
             &mut self,
@@ -6329,30 +6324,16 @@ fn try_collect_native_preparation_with_rotation_observed(
         frame: Some(frame),
         completed: None,
         failure: None,
-        require_parking_refusal,
-        parking_refused: false,
-        parked_frames: 0,
         started: Instant::now(),
         steps: 0,
     };
-    // The original rotation calculates queue/parked/retained deductions. No
+    // The original rotation calculates queue/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
     let budget =
         tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
     crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
-    }
-    if require_parking_refusal {
-        assert!(
-            owner.parking_refused,
-            "the real source-rotation bound must refuse parking this large frame"
-        );
-        assert_eq!(owner.parked_frames, 0, "the active frame runs serially");
-        eprintln!(
-            "large_history_serial_rotation: actual_bound_refused=true parked_frames=0 steps={}",
-            owner.steps
-        );
     }
     owner.completed.context("owned source completion")
 }
@@ -7048,25 +7029,26 @@ fn prepare_sync_source_inner(
         claude_index_loaded_fresh,
         &sampled_scope,
         request_identity_capture,
+        upload_policy.session_attribution_labels_enabled,
     );
-    let mut scan =
-        crate::snapshots::OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
-            source,
-            &roots,
-            index,
-            &scan_started_at,
-            scan_window_days,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            upload_policy.session_artifacts_enabled,
-            (source == SnapshotSource::ClaudeCode).then_some(support_dir),
-            &watcher_hints.paths,
-            watcher_hints.overflowed,
-            request_identity_capture,
-            &copy_prefix_scope,
-        )
-        .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-        .with_codex_side_pass(codex_side_pass)
-        .with_codex_versions(daemon.codex_versions.clone());
+    let mut scan = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
+        source,
+        &roots,
+        index,
+        &scan_started_at,
+        scan_window_days,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        upload_policy.session_artifacts_enabled,
+        (source == SnapshotSource::ClaudeCode).then_some(support_dir),
+        &watcher_hints.paths,
+        watcher_hints.overflowed,
+        request_identity_capture,
+        &copy_prefix_scope,
+        &daemon.transcript_cache,
+    )
+    .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
+    .with_codex_side_pass(codex_side_pass)
+    .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
@@ -7453,6 +7435,13 @@ fn prepare_continuation_source(
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
     let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
+    // K5: reuse the ordinary page's namespace and durable pass, including GC/breaker state.
+    let sampled_scope = cycle_sampled_scope(
+        &inputs.account_witness,
+        &inputs.upload_destination_namespace,
+        &inputs.index_path,
+        false,
+    );
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
@@ -7464,16 +7453,7 @@ fn prepare_continuation_source(
         inputs.evidence.take(),
     )
     .with_continuation_deadline(deadline)
-    .with_sampled_acquisition(
-        std::sync::Arc::clone(cache),
-        // K5: the ordinary Codex page's scope; Codex never captures.
-        cycle_sampled_scope(
-            &inputs.account_witness,
-            &inputs.upload_destination_namespace,
-            &inputs.index_path,
-            false,
-        ),
-    )
+    .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
     .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
@@ -7638,6 +7618,17 @@ fn finish_sync_source(
     } = preparation;
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
+    // D3: a source-fault fallback may not reach any POST until the retained
+    // Codex entry no longer binds stale A on disk. Save only committed PRE
+    // facts; a failed barrier returns before upload/ACK/settlement.
+    #[cfg(unix)]
+    crate::snapshots::commit_store_fault_barrier(
+        &daemon.transcript_cache,
+        source,
+        &mut index,
+        &mut committed_index,
+        &index_path,
+    )?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
         activity_hint.max_snapshot_item_bytes,
     );
@@ -8506,6 +8497,19 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
+    if !index.archives.is_empty() {
+        index.settle_archive_outcome(|fp| {
+            upload_progress
+                .accepted_body_witnesses
+                .get(fp)
+                .filter(|_| {
+                    !upload_progress
+                        .context_resend
+                        .requires_resend(fp, &upload_progress.accepted_body_contexts)
+                })
+                .map(String::as_str)
+        });
+    }
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -8634,6 +8638,7 @@ fn finish_sync_source(
                         live,
                         _home,
                         source,
+                        scan_result.native_publication,
                         machine_id,
                         upload_policy,
                         account_witness,
@@ -9882,6 +9887,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// Test seam for the streamed-evidence equality arm: its reference keeps every
+// root's rows and folds them whole, as one pass over every root would.
+#[cfg(test)]
+thread_local! {
+    static WHOLE_CORPUS_EVIDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn whole_corpus_evidence() -> bool {
+    #[cfg(test)]
+    if WHOLE_CORPUS_EVIDENCE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
@@ -10066,9 +10086,20 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
+    // Only the page's own roots keep their rows (both root spellings, so a
+    // page family can never lose its own rows). Every root read adds its
+    // cross-root answers first, so the fold sees the whole corpus's answers.
+    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .chain(scan_result.snapshots.iter().filter_map(|item| {
+            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
+        }))
+        .collect::<BTreeSet<_>>();
+    let mut cross =
+        crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(support_dir);
+    let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
-    // veto (never prove) the file birth rule. Moved, not cloned.
-    let mut veto_api_rows = crate::snapshots::ClaudeVetoApiRows::new();
+    // veto (never prove) the file birth rule.
     let unpaired = api_read
         .evidence
         .keys()
@@ -10077,7 +10108,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     for root in unpaired {
         if let Some(rows) = api_read.evidence.remove(&root) {
-            veto_api_rows.insert(root, rows);
+            cross.add_vetoing_api(&root, &rows);
+            if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                veto_api_rows.insert(root, rows);
+            }
         }
     }
     api_read.retain_roots(&paired_roots);
@@ -10093,6 +10127,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
+        let generation =
+            crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
             Some(read) => read.take_trace(support_dir, &root_session_id),
@@ -10114,7 +10150,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         if !api.health.is_complete() || !trace.is_complete() {
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
-                veto_api_rows.insert(root_session_id.clone(), rows);
+                cross.add_vetoing_api(&root_session_id, &rows);
+                if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                    veto_api_rows.insert(root_session_id.clone(), rows);
+                }
             }
             if builds_evidence || request_owned(&root_session_id) {
                 use crate::snapshots::claude_request_identity::UnhealthyRootReason;
@@ -10169,15 +10208,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
         }
-        if let Some(rows) = api.evidence.remove(&root_session_id) {
-            stats.api_evidence_row_count += rows.len();
-            api_report.evidence.insert(root_session_id.clone(), rows);
+        let api_rows = api.evidence.remove(&root_session_id);
+        let trace_rows = trace.evidence.remove(&root_session_id);
+        cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref());
+        let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        if !keep && (api_rows.is_some() || trace_rows.is_some()) {
+            cross.note_unkept(&root_session_id, generation);
         }
-        if let Some(rows) = trace.evidence.remove(&root_session_id) {
+        if let Some(rows) = api_rows {
+            stats.api_evidence_row_count += rows.len();
+            if keep {
+                api_report.evidence.insert(root_session_id.clone(), rows);
+            }
+        }
+        if let Some(rows) = trace_rows {
             stats.trace_evidence_row_count += rows.len();
-            trace_report.evidence.insert(root_session_id, rows);
+            if keep {
+                trace_report.evidence.insert(root_session_id, rows);
+            }
         }
     }
+    cross.finish();
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
@@ -10215,17 +10266,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
-        crate::snapshots::claude_request_identity::ScanEvidence::new(
+        let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
-        )
-        .with_unhealthy_reasons(unhealthy_reasons)
-        .with_status_coverage(crate::claude_status_coverage::snapshot())
-        .with_native_originals(&originals)
-        .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_budget(wire_budget)
+        );
+        let evidence = match &whole_corpus {
+            Some(_) => evidence,
+            None => evidence.with_cross_root(&cross),
+        };
+        evidence
+            .with_unhealthy_reasons(unhealthy_reasons)
+            .with_status_coverage(crate::claude_status_coverage::snapshot())
+            .with_native_originals(&originals)
+            .with_accepted_buckets(accepted_identity_buckets)
+            .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -10243,9 +10299,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
-        &veto_api_rows,
+        match &whole_corpus {
+            Some(veto_api_rows) => crate::snapshots::ClaudeEvidenceRows::Whole(veto_api_rows),
+            None => crate::snapshots::ClaudeEvidenceRows::Streamed(&cross),
+        },
     );
-    drop(veto_api_rows);
+    drop(whole_corpus);
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -10377,6 +10436,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
+    drop(cross);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -10565,6 +10625,22 @@ fn require_normal_write_ack_for_legacy_reconciliation(
     }
     Ok(())
 }
+
+/// A cycle's summary. Each source's cause is on its own "skipped for" line.
+#[derive(Debug)]
+struct SourcesFailed(Vec<&'static str>);
+
+impl std::fmt::Display for SourcesFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "local snapshot sync failed for {}",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for SourcesFailed {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityDeferred {
@@ -11106,10 +11182,18 @@ where
                 } else {
                     // A validated money-decrease hold: the backend kept the
                     // old head. Retry this or a newer body like a conflict.
-                    progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                    progress.quarantine_retryable_body(
+                        item_fingerprint,
+                        &body_witness(item),
+                        quarantine_retry_after(item_fingerprint),
+                    );
                 }
             } else if conflicted.contains(item_fingerprint) {
-                progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                progress.quarantine_retryable_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    quarantine_retry_after(item_fingerprint),
+                );
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
@@ -11644,46 +11728,55 @@ where
                     batches.push_front((remaining, false));
                 }
             }
-            Err(error)
-                if error
-                    .downcast_ref::<BatchRejected>()
-                    .is_some_and(|rejected| rejected.snapshot_indexes.is_some()) =>
-            {
-                let rejected = error
-                    .downcast_ref::<BatchRejected>()
-                    .expect("typed rejection");
-                let locations = rejected
-                    .snapshot_indexes
-                    .as_ref()
-                    .expect("validated locations");
-                let Some(held) = locations
-                    .iter()
-                    .map(|index| indices.get(*index).copied())
-                    .collect::<Option<BTreeSet<_>>>()
-                else {
-                    return Err(error);
-                };
-                if held.is_empty() {
-                    return Err(error);
-                }
+            Err(error) if server_named_items(&error, &indices).is_some() => {
+                let held = server_named_items(&error, &indices).expect("named items");
+                // The server named these items: a validation rejection, or an
+                // identity deferral that waits for its identity only. Hold
+                // them; their siblings and later batches continue this pass.
+                let (status, reason, identity_retry_at) =
+                    match error.downcast_ref::<UploadShed>().copied() {
+                        Some(shed) => (
+                            shed.status,
+                            "identity_deferred",
+                            Some(
+                                current_unix_seconds()
+                                    .saturating_add(shed_backoff(shed.retry_after).as_secs()),
+                            ),
+                        ),
+                        None => (
+                            error
+                                .downcast_ref::<BatchRejected>()
+                                .expect("typed rejection")
+                                .status,
+                            "validation_reject",
+                            None,
+                        ),
+                    };
                 let before = progress.clone();
                 for index in &held {
+                    let item_fingerprint = fingerprint(&items[*index]);
                     progress.quarantine_retryable_body(
-                        fingerprint(&items[*index]),
+                        item_fingerprint,
                         &body_witness(&items[*index]),
+                        identity_retry_at
+                            .unwrap_or_else(|| quarantine_retry_after(item_fingerprint)),
                     );
                 }
                 if persist(progress).is_err() {
                     *progress = before;
                     return Err(anyhow::Error::new(SnapshotLocalStateRejected {
-                        operation: "save validation rejection quarantine",
+                        operation: if identity_retry_at.is_some() {
+                            "save identity deferral quarantine"
+                        } else {
+                            "save validation rejection quarantine"
+                        },
                     }));
                 }
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
                 crate::local_resource_diagnostics::traversal_point(
                     "quarantine_retry",
                     poison_scope,
-                    &serde_json::json!({"reason": "validation_reject", "status": rejected.status,
+                    &serde_json::json!({"reason": reason, "status": status,
                         "count": held.len()}),
                 );
                 let remaining = indices
@@ -11807,7 +11900,7 @@ fn update_detected_uses_cache(
     snapshots: &[SnapshotItem],
 ) -> Result<()> {
     let dir = support_dir.join("detected_uses");
-    let path = dir.join(format!("{}.json", source.api_slug()));
+    let path = detected_uses_cache_path(support_dir, source);
     let merged = merge_detected_uses(
         read_detected_uses_cache(&path),
         aggregate_detected_uses(snapshots),
@@ -11831,6 +11924,12 @@ fn update_detected_uses_cache(
 
 /// Read the persisted detected-uses cache, or an empty list when it is missing
 /// or unreadable (a fresh machine, or a malformed file we simply rebuild).
+pub(crate) fn detected_uses_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    support_dir
+        .join("detected_uses")
+        .join(format!("{}.json", source.api_slug()))
+}
+
 fn read_detected_uses_cache(path: &Path) -> Vec<DetectedUse> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -11859,6 +11958,14 @@ fn upload_agent_status(
     persist_machine_icon(&response);
     crate::net_resilience::note_upstream_upload_succeeded("agent_status");
     Ok(response.accepted as usize)
+}
+
+pub(crate) fn snapshot_source_of_kind(kind: &SourceKind) -> SnapshotSource {
+    match kind {
+        SourceKind::Codex => SnapshotSource::Codex,
+        SourceKind::ClaudeCode => SnapshotSource::ClaudeCode,
+        SourceKind::Pi => SnapshotSource::Pi,
+    }
 }
 
 fn source_kind(source: SnapshotSource) -> SourceKind {
@@ -12549,20 +12656,166 @@ fn collector_checkin_can_wait_quietly(error: &anyhow::Error) -> bool {
         .contains("registered device has no enabled sources")
 }
 
+const SNAPSHOT_SOURCES: [SnapshotSource; 3] = [
+    SnapshotSource::Codex,
+    SnapshotSource::ClaudeCode,
+    SnapshotSource::Pi,
+];
+
 pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
-    [
-        SnapshotSource::Codex,
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Pi,
+    enabled_snapshot_sources_in(device, &default_support_dir())
+}
+
+/// A source with a removal marker is off at every boundary, whatever its grant.
+pub(crate) fn enabled_snapshot_sources_in(
+    device: &LocalDeviceBinding,
+    support_dir: &Path,
+) -> Vec<SnapshotSource> {
+    SNAPSHOT_SOURCES
+        .into_iter()
+        .filter(|source| source_granted(device, *source))
+        .filter(|source| source_marker(support_dir, *source).is_none())
+        .collect()
+}
+
+fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
+    device.sources.iter().any(|slug| slug == source.api_slug())
+}
+
+/// Consecutive failures per marker. Held across each erase turn, so a concurrent
+/// control-thread marker change cannot be overwritten by that turn's completion.
+static SOURCE_ERASURE_TURN: Mutex<BTreeMap<PathBuf, u32>> = Mutex::new(BTreeMap::new());
+
+fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32>> {
+    SOURCE_ERASURE_TURN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Outside every erased file set: `pending`, `done` or `reconnect`.
+fn source_marker_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    snapshot_index_path(support_dir, source)
+        .with_file_name(format!("{}.source-disabled", source.api_slug()))
+}
+
+/// `None` only when clearly absent. An unreadable marker stays pending.
+pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Option<String> {
+    match std::fs::read_to_string(source_marker_path(support_dir, source)) {
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        marker => Some(marker.unwrap_or_default()),
+    }
+}
+
+fn write_source_marker(path: &Path, state: &str) -> Result<()> {
+    ottto_core::write_owner_only_file_atomic(path, state.as_bytes())?;
+    sync_progress_parent(path)
+}
+
+/// Stops collection now; the next sync cycle erases. Never erases on this thread.
+pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let _turn = source_erasure_turn();
+    write_source_marker(&source_marker_path(support_dir, source), "pending")
+}
+
+/// The explicit way back. A source that was never removed has nothing to erase.
+pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let _turn = source_erasure_turn();
+    match source_marker(support_dir, source) {
+        Some(_) => write_source_marker(&source_marker_path(support_dir, source), "reconnect"),
+        None => Ok(()),
+    }
+}
+
+/// A credential generation that drops a source removes it like an explicit disable.
+pub(crate) fn disable_sources_dropped_from_grant(
+    support_dir: &Path,
+    current: &LocalDeviceBinding,
+    next: &LocalDeviceBinding,
+) -> Result<()> {
+    SNAPSHOT_SOURCES
+        .into_iter()
+        .filter(|source| source_granted(current, *source) && !source_granted(next, *source))
+        .try_for_each(|source| disable_snapshot_source(support_dir, source))
+}
+
+/// One attempt per owed source, under the cycle lock. Errors can name paths, so
+/// only counts are logged.
+pub(crate) fn erase_disabled_sources(
+    support_dir: &Path,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+) {
+    for source in SNAPSHOT_SOURCES {
+        let mut turn = source_erasure_turn();
+        let state = source_marker(support_dir, source);
+        if matches!(state.as_deref(), None | Some("done")) {
+            continue;
+        }
+        // Transcript readers close before the first unlink.
+        if source == SnapshotSource::Codex {
+            cache.forget_codex_jobs();
+        }
+        let marker = source_marker_path(support_dir, source);
+        let erased = erase_source_files(support_dir, source, || {
+            cache.durable_forget_source(source);
+            // Reconnect is this source's first bootstrap again: a full replay.
+            update_backfill_state(support_dir, |backfill| {
+                let slug = source.api_slug();
+                backfill.completed_parser_versions.remove(slug);
+                backfill.completed_replay_revisions.remove(slug);
+                backfill.completed_destination_namespaces.remove(slug);
+            })?;
+            if state.as_deref() == Some("reconnect") {
+                std::fs::remove_file(&marker)?;
+                sync_progress_parent(&marker)
+            } else {
+                write_source_marker(&marker, "done")
+            }
+        });
+        let failures = turn.entry(marker).or_default();
+        *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+        if *failures > 3 {
+            crate::snapshots::state_v2::source_erasure_alarm(*failures);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
+    let marker = source_marker_path(support_dir, source);
+    source_erasure_turn().get(&marker).copied().unwrap_or(0)
+}
+
+fn erase_source_files(
+    support_dir: &Path,
+    source: SnapshotSource,
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let others: Vec<PathBuf> = [
+        crate::active_sessions::active_session_cache_path(support_dir, source),
+        detected_uses_cache_path(support_dir, source),
+        crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
-    .filter(|source| {
-        device
-            .sources
-            .iter()
-            .any(|configured| configured == source.api_slug())
-    })
-    .collect()
+    .flat_map(|path| [path.with_extension("json.tmp"), path])
+    .collect();
+    let stable = snapshot_index_path(support_dir, source);
+    let destinations = support_dir.join("snapshots/destinations");
+    // Every parent exists, so an fsync of it fails only on a real I/O error.
+    for dir in others.iter().filter_map(|path| path.parent()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(&destinations)?;
+    let mut indexes = vec![snapshot_v3_index_path(&stable)];
+    for namespace in std::fs::read_dir(&destinations)? {
+        let namespace = namespace?.file_name();
+        let namespace = namespace.to_string_lossy();
+        withdraw_source_manifest(&namespace, source);
+        let scoped = snapshot_destination_scoped_index_path(&stable, &namespace);
+        indexes.push(snapshot_v3_index_path(&scoped));
+    }
+    let family = stable.file_stem().and_then(|stem| stem.to_str());
+    let family = family.context("source_erasure_family")?;
+    crate::snapshots::state_v2::erase_source(&indexes, family, &others, complete)
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {
@@ -13005,6 +13258,13 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
 }
 
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    // A state v2 hold is a fixed content-free code: no text, no paths.
+    if let Some(hold) = error.downcast_ref::<crate::snapshots::state_v2::Hold>() {
+        return format!("local state store held: {hold}");
+    }
+    if let Some(failed) = error.downcast_ref::<SourcesFailed>() {
+        return failed.to_string();
+    }
     if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
         return settlement.to_string();
     }
@@ -13102,6 +13362,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     mod terminal_contract_retry_tests {
@@ -13109,6 +13372,200 @@ mod tests {
     }
     mod ack_retention_tests {
         include!("snapshot_sync/ack_retention_tests.rs");
+    }
+    pub(crate) fn archive_upload_checkpoint(
+        mut index: ScanIndex,
+        scan: &SourceScanResult,
+        previous: &ScanIndex,
+        outcome: &str,
+    ) -> ScanIndex {
+        let root = crate::test_scratch::ScratchDir::new("archive-upload-checkpoint");
+        let index_path = root.join("index.json");
+        let progress_path = root.join("progress.json");
+        std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
+        let mut progress = test_upload_progress();
+        progress.save(&progress_path).unwrap();
+        if outcome != "partial" {
+            let result = upload_resumable_batches_with_body_witness(
+                &scan.snapshots,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut 0,
+                |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |items| {
+                    if outcome == "shed" {
+                        Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: None,
+                            code: None,
+                        }))
+                    } else {
+                        ack_retention_tests::exact_ack(items)
+                    }
+                },
+                |state| state.save(&progress_path),
+            )
+            .unwrap();
+            if outcome == "shed" {
+                assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+            } else {
+                assert_eq!(result, ResumableUploadResult::Completed);
+            }
+        }
+        index.generation = previous.generation;
+        if outcome == "accept" {
+            index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+            index.settle_archive_outcome(|fp| {
+                progress.accepted_body_witnesses.get(fp).map(String::as_str)
+            });
+        }
+        checkpoint_partial_snapshot_index(
+            &index,
+            previous,
+            &progress,
+            &scan.snapshots,
+            Some(scan),
+            &BTreeSet::new(),
+            &index_path,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        ScanIndex::load(&index_path).unwrap()
+    }
+    pub(crate) fn assert_archive_debt_preserves_replay_progress(
+        mut index: ScanIndex,
+        scan: SourceScanResult,
+        expected_markers: usize,
+    ) {
+        assert!(scan.census_complete);
+        let counts = SyncCounts::from_scan_result(&scan, 0, 7);
+        assert!(counts.has_disclosed_loss());
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+        let causes = crate::snapshots::ownership_diagnostics::line(counts.causes);
+        assert!(causes.contains("archive_owed"));
+        assert!(!causes.contains("unattributed"));
+        let root = crate::test_scratch::ScratchDir::new("archive-backfill-isolation");
+        let support = root.join("support");
+        let secrets = root.join("secrets");
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _manifests = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let url = snapshot_status_server(captured.clone());
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &url);
+        let client = SnapshotApiClient::new(url);
+        let device = LocalDeviceBinding {
+            device_id: "archive-fixture".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["codex".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .unwrap();
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        let daemon = test_daemon("otm_test");
+        let path = support.join("index.json");
+        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let progress_path = support.join("progress.json");
+        let mut progress = SnapshotUploadProgress::new(
+            destination.clone(),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        );
+        progress.save(&progress_path).unwrap();
+        let status = test_agent_status(SourceKind::Codex);
+        let preparation = SourcePreparation {
+            native_comparison_reservation: None, native_comparison_lease: None,
+            prepared_claude_evidence: None, terminal_native_traversal: None,
+            native_comparison_controller: None, retry_authority: None,
+            source: SnapshotSource::Codex, claude_scan_roots: None,
+            account_witness: daemon.snapshot_scan_account_witness().unwrap(),
+            scan_started_at: scan.census_window_end.clone(),
+            activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,
+                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
+                "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
+            receipt_window_days: 7, cache_observations_enabled: false,
+            scan_agent_status_collection: Some(Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() })),
+            attribution_context: None, upload_policy: SnapshotUploadPolicy::default(),
+            upload_destination_namespace: destination.clone(), receipt_client: client.clone(),
+            index_path: path.clone(), upload_progress_path: progress_path.clone(),
+            upload_progress: progress, committed_index: index.clone(),
+            backfill_state: load_backfill_state(&support), backfill_pending: true,
+            legacy_reconciliation_pending: BTreeSet::new(), active_legacy_reconciliation: BTreeSet::new(), scan: None,
+        };
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        finish_sync_source(
+            preparation,
+            index,
+            scan,
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            &root,
+            &support,
+            &daemon,
+            &mut transport,
+            &mut retry,
+        )
+        .unwrap();
+        let backfill = load_backfill_state(&support);
+        let pending = pending_backfill_sources_for_destination(&backfill, &destination)
+            .contains(&SnapshotSource::Codex);
+        assert!(
+            !pending,
+            "production finish persisted the completed backfill"
+        );
+        assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_some());
+        index = ScanIndex::load(&path).unwrap();
+        match serde_json::to_value(&index).unwrap().get("archives") {
+            Some(markers) => assert_eq!(markers.as_object().unwrap().len(), expected_markers),
+            None => assert_eq!(expected_markers, 0, "empty archive map is omitted"),
+        }
+        let fp = "a".repeat(64);
+        let mut progress =
+            SnapshotUploadProgress::load(&progress_path, &destination, test_quarantine_witness())
+                .unwrap();
+        progress.quarantine([fp.as_str()]);
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fp)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        prepare_upload_progress_for_cycle_with_reoffer(
+            &mut progress,
+            &index,
+            "replay",
+            pending,
+            None,
+        );
+        assert!(progress.active_quarantine_retries.contains(&fp));
+        let requests = captured.lock().unwrap();
+        let terminal = requests
+            .iter()
+            .map(|r| http_request_json(r))
+            .find(|v| v.get("last_ownership_incomplete_file_count").is_some())
+            .unwrap();
+        assert!(
+            terminal["last_ownership_incomplete_file_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(terminal.get("manifest").is_some());
     }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]
@@ -16552,7 +17009,11 @@ mod tests {
         let fingerprint = "f".repeat(64);
         let mut progress = test_upload_progress();
         for _ in 0..9 {
-            progress.quarantine_retryable_body(&fingerprint, &"a".repeat(64));
+            progress.quarantine_retryable_body(
+                &fingerprint,
+                &"a".repeat(64),
+                quarantine_retry_after(&fingerprint),
+            );
             let record = &progress.quarantined_fingerprints[&fingerprint];
             assert_eq!(record.failed_reconstruction_count, 1);
             assert_eq!(
@@ -19032,6 +19493,17 @@ mod tests {
                 status: 401
             })),
             "local health authorization rejected"
+        );
+        assert_eq!(
+            safe_error(
+                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
+                    .context("scan local snapshots /synthetic/private/path")
+            ),
+            "local state store held: state_v2_save_ceiling"
+        );
+        assert_eq!(
+            safe_error(&SourcesFailed(vec!["claude_code", "codex"]).into()),
+            "local snapshot sync failed for claude_code, codex"
         );
     }
 
@@ -22334,6 +22806,27 @@ mod tests {
         }
     }
 
+    /// Run a test body on a thread sized like a production scan worker. Debug
+    /// (opt-level 0) frames on the native scan path can exceed the default 2 MiB
+    /// test thread;
+    /// `scan_worker_stack_margin_receipt` remains the production stack guard.
+    pub(super) fn run_on_scan_worker_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("test-scan-worker")
+                        .to_string(),
+                )
+                .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
+                .spawn_scoped(scope, body)
+                .expect("spawn test scan worker")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
     fn test_daemon(machine_id: &str) -> LocalDaemon {
         LocalDaemon::new(
             MachineIdentity {
@@ -23223,6 +23716,165 @@ mod tests {
         assert_eq!(quiet.semantic_noop_count, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
+    // F9/F11: real restored+rederived+Tailed bodies enter the unchanged
+    // exact page/ACK machinery. Linux cannot qualify native decode layout.
+    #[cfg(target_os = "macos")]
+    /// [money] bounded restored tail exact ack and saved ack skip transport.
+    #[test]
+    fn bounded_restored_tail_exact_ack_and_saved_ack_skip_transport() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        run_on_scan_worker_stack(|| {
+            for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+                let items = crate::snapshots::bounded_restore_tail_items_for_test(source);
+                assert!(!items.is_empty());
+                let slots: Vec<usize> = (0..items.len()).collect();
+                let mut progress = test_upload_progress();
+                let mut accepted = 0;
+                let mut posts = 0;
+                let scope = unique_poison_scope();
+                attempt_snapshot_page(
+                    &items,
+                    &slots,
+                    &scope,
+                    &mut progress,
+                    &mut accepted,
+                    &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                    &snapshot_upload_body_witness,
+                    &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
+                    &mut |body| {
+                        posts += 1;
+                        head_cas_fixture_ack(body, true, &"e".repeat(64))
+                    },
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(posts, 1);
+                for item in &items {
+                    assert!(progress.contains_body(
+                        &item.snapshot_fingerprint,
+                        &snapshot_upload_body_witness(item)
+                    ));
+                }
+                // Crash after the saved ACK and before index settlement: loading
+                // that exact progress must suppress another POST for the same body.
+                let root = test_dir("bounded-ack-restart");
+                std::fs::create_dir_all(&root).unwrap();
+                let path = root.join("progress.json");
+                progress.save(&path).unwrap();
+                let mut loaded = SnapshotUploadProgress::load(
+                    &path,
+                    &progress.destination_namespace_hash,
+                    test_quarantine_witness(),
+                )
+                .unwrap();
+                // The page attempt assumes already-selected pending indices;
+                // saved-ACK suppression belongs to the canonical selector.
+                let resumed = upload_resumable_batches_with_body_witness(
+                    &items,
+                    &scope,
+                    &mut loaded,
+                    &mut accepted,
+                    |i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    |_| {
+                        posts += 1;
+                        Err(anyhow!("exact saved ACK must skip POST"))
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(resumed, ResumableUploadResult::Completed);
+                assert_eq!(posts, 1);
+                // An ordinary entity ACK for a different body cannot credit this
+                // revision. Keep fingerprint fixed to exercise body equality.
+                let mut changed = items.clone();
+                // The body witness covers additive evidence; usage is in the
+                // semantic fingerprint, which this row deliberately keeps fixed.
+                changed[0].tool_usage_truncated = !changed[0].tool_usage_truncated;
+                assert!(!loaded.contains_body(
+                    &changed[0].snapshot_fingerprint,
+                    &snapshot_upload_body_witness(&changed[0])
+                ));
+                // The same generated complete bodies receive no stored-body
+                // credit from not_stored, refusal or a rejected partial ACK.
+                for disposition in ["not_stored", "refused", "partial"] {
+                    let mut negative = test_upload_progress();
+                    let result = attempt_snapshot_page(
+                        &items,
+                        &slots,
+                        &unique_poison_scope(),
+                        &mut negative,
+                        &mut 0,
+                        &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                        &snapshot_upload_body_witness,
+                        &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
+                        &mut |body| {
+                            if disposition == "partial" {
+                                return Err(anyhow!("synthetic partial exact-ACK rejection"));
+                            }
+                            let mut ack = head_cas_fixture_ack(body, true, &"e".repeat(64))?;
+                            if disposition == "not_stored" {
+                                ack.unchanged_entities = std::mem::take(&mut ack.accepted_entities);
+                                for entity in &mut ack.unchanged_entities {
+                                    entity.unchanged_basis = Some("usage_identical".into());
+                                }
+                            } else {
+                                ack.rejected_entities = std::mem::take(&mut ack.accepted_entities)
+                                    .into_iter()
+                                    .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                                        source_session_id: entity.source_session_id,
+                                        snapshot_fingerprint: entity.snapshot_fingerprint,
+                                        occurrence_count: entity.occurrence_count,
+                                        reason: "usage_accounting_authority_downgrade".into(),
+                                        detail: "synthetic refusal".into(),
+                                        permanent: true,
+                                    })
+                                    .collect();
+                                ack.accepted = 0;
+                                ack.sessions_reconciled = 0;
+                            }
+                            Ok(ack)
+                        },
+                        &mut |_| Ok(()),
+                    );
+                    assert_eq!(result.is_err(), disposition == "partial");
+                    for item in &items {
+                        assert!(
+                            !negative
+                                .accepted_fingerprints
+                                .contains(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        assert!(
+                            !negative
+                                .accepted_body_witnesses
+                                .contains_key(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        assert!(
+                            !negative
+                                .fresh_context_body_acks
+                                .contains_key(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        // Held/refused bodies retain intentional resend
+                        // suppression, which is separate from stored ACK credit.
+                        assert_eq!(
+                            negative.contains_body(
+                                &item.snapshot_fingerprint,
+                                &snapshot_upload_body_witness(item)
+                            ),
+                            disposition != "partial"
+                        );
+                    }
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        });
+    }
+
     fn same_source_fixture_ack(
         items: Vec<SnapshotItem>,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
@@ -24618,3 +25270,47 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+/// Continuation's platform gates for archive work: the native signals unless
+/// a caller injects its own. A pass and its continuation pages share them.
+#[derive(Clone)]
+pub(crate) struct ArchiveGates(
+    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
+);
+impl Default for ArchiveGates {
+    fn default() -> Self {
+        Self::new(None::<continuation::MacPlatformSignals>)
+    }
+}
+impl std::fmt::Debug for ArchiveGates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArchiveGates")
+    }
+}
+impl ArchiveGates {
+    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
+        Self(gates.map(|g| {
+            std::sync::Arc::new(Mutex::new(g))
+                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
+        }))
+    }
+    /// Continuation's power policy: only `Allowed` permits archive work;
+    /// `Refused` and `Unknown` deny.
+    pub(crate) fn power_ready(&self) -> bool {
+        let Some(gates) = self.0.as_ref() else {
+            return continuation::PlatformGates::power(
+                &mut continuation::MacPlatformSignals::default(),
+            ) == continuation::PlatformState::Allowed;
+        };
+        gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .power()
+            == continuation::PlatformState::Allowed
+    }
+}
+
+/// Share continuation's work threshold with archive admission.
+pub(crate) fn archive_work_ready(micros: u64) -> bool {
+    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
+}

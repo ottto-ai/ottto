@@ -172,12 +172,12 @@ pub(super) struct AcceptedShare {
     #[serde(with = "optional_digest_hex")]
     authority: Option<[u8; 32]>,
 }
-mod digest_hex {
+pub(crate) mod digest_hex {
     use super::*;
-    pub(super) fn encode(value: &[u8; 32]) -> String {
+    pub(crate) fn encode(value: &[u8; 32]) -> String {
         value.iter().map(|byte| format!("{byte:02x}")).collect()
     }
-    pub(super) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
+    pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
         if !hash_is_valid(value) {
             return Err(E::custom("invalid fingerprint"));
         }
@@ -734,15 +734,6 @@ impl AcceptedBuckets {
             state.key = key.clone();
         }
         self.1 = key;
-    }
-    /// A copy reread from disk has no key, and may still hold hints this
-    /// cycle's bind discarded. Rebind it like the live ledger before comparing.
-    pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
-        self.bind_key(live.1.clone());
-        self.2 = live.2;
-        self.3 = live.3;
-        self.4 = live.4;
-        self.5 = live.5;
     }
     /// Runtime-only receiver cap; never serialized as accepted proof.
     pub(crate) fn set_item_cap(&mut self, item_cap: usize) {

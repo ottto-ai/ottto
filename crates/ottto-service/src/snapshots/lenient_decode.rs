@@ -257,6 +257,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
+/// The record map a field's codec writes. A cold usage map keeps its
+/// families in the store only, so no codec may see it.
+trait Records {
+    type Value: Serialize;
+    fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
+}
+impl<T: Serialize> Records for BTreeMap<String, T> {
+    type Value = T;
+    fn records(&self) -> Option<&Self> {
+        Some(self)
+    }
+}
+impl<T: Serialize> Records for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn records(&self) -> Option<&BTreeMap<String, Shared<T>>> {
+        Some(self)
+    }
+}
+impl Records for UsagePending {
+    type Value = ClaudeUsageFamilyPending;
+    fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
+        self.resident()
+    }
+}
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
 impl<T: Serialize> Serialize for WireMap<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -292,9 +316,11 @@ impl Serialize for ScanIndex {
             };
             (held $name:ident) => {
                 if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
+                    let records = Records::records(&self.$name)
+                        .ok_or_else(|| serde::ser::Error::custom("usage_pending_cold"))?;
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(&self.$name, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(records, self.decode_holds.0.get(stringify!($name))),
                     )?;
                 }
             };
@@ -305,6 +331,8 @@ impl Serialize for ScanIndex {
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
+        field!(archives, BTreeMap::is_empty);
+        field!(archive_deferred_alarm_count, is_zero_u64);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
@@ -511,6 +539,8 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
     "upload_context_proof",
+    "archives",
+    "archive_deferred_alarm_count",
     "copy_prefix_last_accepted_nonce",
 ];
 
@@ -1216,14 +1246,25 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
     }
     fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
         let roots = family_hold_roots(&self.holds.0);
+        // Only held roots are serialized. A cold usage map is refused only
+        // when a held root names one of its stored families; otherwise it
+        // contributes nothing, exactly as its resident entries would not.
+        if index.claude_usage_family_pending.cold().is_some()
+            && roots
+                .iter()
+                .any(|root| index.claude_usage_family_pending.contains_key(root))
+        {
+            return Err(Error::Refused("usage pending cold"));
+        }
         let mut input = HydrateInput(Vec::new());
         self.family_spans.clear();
         macro_rules! field {
             ($field:ident) => {{
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
+                let empty = BTreeMap::new();
                 let view = FamilyView {
-                    typed: &index.$field,
+                    typed: Records::records(&index.$field).unwrap_or(&empty),
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
@@ -1297,13 +1338,15 @@ pub(super) fn post_decode_hydrated(
     // records takes the field before the span and the debt flag after it.
     macro_rules! records {
         ($field:ident) => {
+            records!($field, index.$field)
+        };
+        ($field:ident, $records:expr) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                let records = &mut $records;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
-                    index.$field.remove(key);
+                    records.remove(key);
                 }
-                index
-                    .$field
-                    .extend(decoder.records(stringify!($field), span, true)?);
+                records.extend(decoder.records(stringify!($field), span, true)?);
             }
         };
     }
@@ -1321,7 +1364,14 @@ pub(super) fn post_decode_hydrated(
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
-    records!(claude_usage_family_pending);
+    // A cold usage map keeps its families in the store; no hold rewrites it.
+    records!(
+        claude_usage_family_pending,
+        *index
+            .claude_usage_family_pending
+            .resident_mut()
+            .ok_or(Error::Refused("usage pending cold"))?
+    );
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
             .original_holds
@@ -1828,7 +1878,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
-        self.records_checked(field, span, debt, |_| false)
+        self.records_checked(field, span, debt, |_| false, None)
     }
     fn records_checked<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -1836,9 +1886,16 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
         repaired: impl Fn(&T) -> bool,
+        unknown: Option<fn() -> T>,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
+            if let Some(unknown) = unknown {
+                return Ok(BTreeMap::from([(
+                    codex_compressed_input::UNKNOWN_ARCHIVE_SCOPE.to_owned(),
+                    unknown(),
+                )]));
+            }
             if debt {
                 return Err(Error::Refused("unkeyed negative collection"));
             }
@@ -1862,6 +1919,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             } else {
                 self.typed(value)
             };
+            let decoded = decoded.or_else(|error| unknown.map(|f| f()).ok_or(error));
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
@@ -1940,6 +1998,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             span,
             true,
             |record: &SnapshotQuarantineRecord| !snapshot_quarantine_deadline_is_bounded(record),
+            None,
         )?;
         self.repair_held(
             "quarantined_snapshot_fingerprints",
@@ -2101,6 +2160,23 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "files" => {
                             index.files = self.records::<Shared<_>>("files", value, true)?.into()
                         }
+                        "archive_deferred_alarm_count" => {
+                            index.archive_deferred_alarm_count =
+                                self.diagnostic_timestamp(value)?.unwrap_or(0)
+                        }
+                        "archives" => {
+                            index.archives = self
+                                .records_checked(
+                                    "archives",
+                                    value,
+                                    false,
+                                    |_| false,
+                                    Some(codex_compressed_input::ArchiveEvidence::unknown),
+                                )?
+                                .into_iter()
+                                .map(|(key, a)| (key, a.checked()))
+                                .collect()
+                        }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }
@@ -2187,7 +2263,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_family_pending" => {
                             index.claude_usage_family_pending =
-                                self.records("claude_usage_family_pending", value, true)?
+                                UsagePending::from(self.records::<ClaudeUsageFamilyPending>(
+                                    "claude_usage_family_pending",
+                                    value,
+                                    true,
+                                )?)
                         }
                         "claude_request_census" => {
                             index.claude_request_census = self
@@ -2605,7 +2685,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
                         "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending.remove(&key);
+                            index.claude_usage_family_pending.discard(&key);
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
@@ -3097,7 +3177,9 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repair_key(value: &str) -> [u8; 32] {
+/// A full 256-bit key over the exact string: equal strings give equal keys
+/// (spelling-sensitive), so a holder or join never keeps the strings.
+pub(super) fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 

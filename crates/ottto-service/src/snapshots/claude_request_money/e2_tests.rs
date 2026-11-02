@@ -766,6 +766,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     index_key: &local_index_key(&off_page),
                     source_file_fingerprint: &"a".repeat(64),
                     census_window_end: "2026-08-02T09:00:00Z",
+                    held_index_keys: &Default::default(),
                     complete: true,
                     lossy: false,
                     source_verified: true,
@@ -987,13 +988,24 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
                 basis: claude_request_identity::TELEMETRY_LOGIN,
                 account_source: None,
             });
-            place_request_identity(fold, &occurrence, None, Some(missing), None);
+            // The grain stays under its parse-time account: an account near miss.
+            place_request_identity(
+                fold,
+                &occurrence,
+                None,
+                Some(missing),
+                None,
+                IdentityCaller::Request,
+            );
             assert_eq!(
                 fold.entity.certificate_failure,
-                Some(CertificateFailure::IdentityGrain)
+                Some(CertificateFailure::IdentityGrain(
+                    IdentityCaller::Request,
+                    GrainNearMiss::OtherAccount
+                ))
             );
             expected.insert("uncertified", 1);
-            expected.insert("uncertified_by=identity_grain", 1);
+            expected.insert("uncertified_by=identity_grain.request.other_account", 1);
         } else {
             items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
             expected.insert("request_owned_held", 1);
@@ -3984,13 +3996,22 @@ fn e2_absent_subagent_twin_holds_its_session() {
             )
         };
         let cold = route(&expected);
-        for proof in 0..4 {
+        for proof in 0..5 {
             let mut shorter = prefix.clone();
             if proof == 1 {
-                shorter.push(json!({"type":"last-prompt"}));
+                // The observed exit lines: no request id and no usage.
+                shorter.extend([
+                    json!({"type":"mode"}),
+                    json!({"type":"last-prompt"}),
+                    json!({"type":"cost-state"}),
+                ]);
+            }
+            if proof == 2 {
+                // A suffix row with usage is not request-free.
+                shorter.push(line("c", &at(3), 5));
             }
             write(&shorter_path, &shorter);
-            if proof == 2 {
+            if proof == 3 {
                 use crate::snapshots::claude_request_census::{
                     ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
                 };
@@ -4015,7 +4036,7 @@ fn e2_absent_subagent_twin_holds_its_session() {
             // An older, uncertified writer produced the observed longer copy
             // at the later-born path. Its own session requests still count.
             let mut case_full = full.clone();
-            let birth = if proof == 3 {
+            let birth = if proof == 4 {
                 for value in &mut case_full {
                     if value["type"] == "assistant" {
                         value["version"] = json!("2.0.0");
@@ -4032,14 +4053,19 @@ fn e2_absent_subagent_twin_holds_its_session() {
             };
             let mut items = vec![parse(&longer, Some(birth), &index, &case_full)];
             let mut reasons = BTreeMap::new();
-            assert!(finish_page(
+            let withheld = finish_page(
                 &mut items,
                 &index,
                 TelemetryRead::Loaded,
                 &mut reasons,
-                &Default::default()
-            )
-            .is_empty());
+                &Default::default(),
+            );
+            if proof == 2 {
+                assert_eq!(withheld.len(), 1, "the absent twin stays held");
+                assert_eq!(reasons.get("absent_twin"), Some(&1));
+                continue;
+            }
+            assert!(withheld.is_empty());
             assert!(reasons.is_empty());
             let actual = tag_owned(
                 vec![parse(&longer, Some(birth), &index, &case_full)],

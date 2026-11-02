@@ -116,31 +116,30 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         ))
         .unwrap();
     let source = durable::DurableSource::ClaudeCode;
-    let allowlist: [u8; 32] = "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+    let allowlist: [u8; 32] = "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2"
         .as_bytes()
         .chunks_exact(2)
         .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    let entry = index.files.get("synthetic-file").unwrap();
-    // A freshly decoded index has no active upload context yet.
+    // The saved index carries no source-wide upload context (retired), and
+    // a freshly decoded index has no active one yet.
+    let logical = serde_json::to_value(index).unwrap();
+    assert!(logical.get("upload_context_fingerprint").is_none());
     let context = None;
     let binding = durable::Binding {
         source,
         key: durable::key_digest(source, "synthetic-file"),
         context: durable::context_digest(&"a".repeat(64), context),
         scope: durable::scope_digest("synthetic-scope", &allowlist, "identity:v1", "legacy"),
-        entry: durable::replay_entry_digest(
-            &durable::entry_digest(
-                &entry.source_file_fingerprint,
-                entry.last_upload_body_witness.as_deref(),
-            ),
-            entry.effective_upload_body_witness_revision,
-            0,
-        ),
+        entry: [0; 32],
     };
     let record = durable::PendingRecord {
+        acquisition: Some(durable::AcquisitionFields {
+            acquired_revision: 3,
+            protocol: crate::snapshots::AcquisitionProtocol::Legacy,
+        }),
         binding: binding.clone(),
         certificate,
         body: crate::snapshots::durable_store_fixture_body(
@@ -154,7 +153,12 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     let mut store = durable::DurableTailStore::new(dir.clone(), source);
     assert_eq!(
         store
-            .write_after_save(&lock, generation, vec![record.clone()])
+            .write_after_save(
+                &lock,
+                generation,
+                fs::metadata(s.root()).unwrap().len(),
+                vec![record.clone()]
+            )
             .unwrap()
             .written,
         1
@@ -170,24 +174,26 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     };
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
-    // The actual #865 admission seam checks entry/context/scope AND generation.
+    // The actual admission seam: a write-ahead record may lead its index, so
+    // context and scope always refuse.
     let expected = durable::Expected {
         binding: binding.clone(),
-        committed_generation: root["generation"].as_u64().unwrap(),
     };
     assert!(restored.eligible(&expected).is_ok());
     assert!(restored
         .eligible(&durable::Expected {
             binding: binding.clone(),
-            committed_generation: generation - 1
-        })
-        .is_err());
-    assert!(restored
-        .eligible(&durable::Expected {
-            binding,
-            committed_generation: generation + 1
         })
         .is_ok());
+    assert!(restored
+        .eligible(&durable::Expected {
+            binding: durable::Binding {
+                scope: [9; 32],
+                ..binding.clone()
+            },
+        })
+        .is_err());
+    assert!(restored.eligible(&durable::Expected { binding }).is_ok());
     assert!(restored.index_generation <= root["generation"].as_u64().unwrap());
     assert!(crate::snapshots::verify_durable_body(
         &restored.record.body,

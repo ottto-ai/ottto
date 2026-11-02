@@ -86,17 +86,13 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         let hash = format!("{root}-{sequence}").replace('-', "0");
         let hashes = BTreeSet::from([hash.clone()]);
         let occurrences = BTreeMap::from([(hash, carry_occurrence(sequence as u64, 10))]);
-        witness
-            .member_request_id_fingerprints
-            .insert(member.clone(), claude_request_id_set_fingerprint(&hashes));
-        witness.member_occurrence_fingerprints.insert(
-            member.clone(),
-            claude_occurrence_map_fingerprint(&occurrences),
-        );
         pending
             .member_request_id_hashes
             .insert(member.clone(), hashes);
-        pending.member_occurrences.insert(member, occurrences);
+        pending
+            .member_occurrences
+            .insert(member.clone(), occurrences);
+        carry_witness_member(&mut witness, &member, &pending);
     }
     index
         .claude_usage_family_pending
@@ -1158,7 +1154,7 @@ fn assert_compacted_and_invalid(index: &ScanIndex, root: &str) {
     assert!(claude_stale_pending_keeps_census_invalid(
         index,
         root,
-        pending,
+        usage_pending::UsageView::Full(pending),
         true,
         &window_indexed_ids(index)
     ));
@@ -2117,6 +2113,8 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         .unwrap();
     record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
     record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+    // A terminal verdict formed after the E2 cutover keeps its hold.
+    record.retry_after_unix_seconds = PRE_E2_TERMINAL_DEADLINE_CUTOFF + 1;
     let holds = fixture.index.claude_usage_authority_quarantine.clone();
     let bindings = fixture.index.session_account_bindings.clone();
     let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
@@ -2626,7 +2624,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
             &mut fixture.index.claude_usage_family_pending,
             CARRY_FAILED,
             100,
-        );
+        )
+        .unwrap();
         assert!(fixture.index.claude_usage_family_pending[&root].invalid);
         assert!(fixture.index.claude_usage_family_pending[&root]
             .idless_revision
@@ -2660,7 +2659,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
                     &mut fixture.index.claude_usage_family_pending,
                     CARRY_FAILED,
                     100,
-                );
+                )
+                .unwrap();
             }
             "lossy" => {
                 let mut value =
@@ -3966,8 +3966,8 @@ fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
     for candidate in &fixture.candidates {
         let key = local_index_key(&candidate.path);
         let (root, member) = claude_index_path_family_member(&candidate.path).unwrap();
-        let hashes = &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes
-            [&member];
+        let hashes =
+            &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes[&member];
         let record = scoped_retry_record(
             &key,
             serde_json::json!({
@@ -3988,7 +3988,13 @@ fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         assert_eq!(row["rearmed_index_files"], healthy);
     }
-    let window = fixture.index.traversal.as_ref().unwrap().census_window_end.clone();
+    let window = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .census_window_end
+        .clone();
     (fixture, window)
 }
 
@@ -4045,7 +4051,11 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
             assert_eq!(counts, Default::default());
         }
         let owed = fixture.index.files.values().filter(|e| e.evidence_owed);
-        assert_eq!(owed.count(), usize::from(on), "only the changed member stays owed");
+        assert_eq!(
+            owed.count(),
+            usize::from(on),
+            "only the changed member stays owed"
+        );
     }
 }
 
@@ -4080,7 +4090,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         &window,
     );
     assert_eq!(parsed, 0);
-    for (root, pending) in &before {
+    for (root, pending) in before.iter() {
         let full = ClaudeUsageFamilyPending {
             census_window_end: window.clone(),
             ..pending.clone()
@@ -4138,7 +4148,10 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         &window,
     );
     assert_eq!(parsed, 0);
-    assert_eq!(scope.finish().contract.evidence_owed.restamped_from_record, 1);
+    assert_eq!(
+        scope.finish().contract.evidence_owed.restamped_from_record,
+        1
+    );
     assert_eq!(index.claude_usage_family_pending, full);
     assert!(!index.files[&key].evidence_owed);
     assert_eq!(
@@ -4166,7 +4179,11 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     // Cap-invalid: invalid, evidence-free pending from the record's window.
     let (mut fixture, window) = owed_rearmed(1, true);
     let root = fixture.roots[0].clone();
-    let pending = fixture.index.claude_usage_family_pending.get_mut(&root).unwrap();
+    let pending = fixture
+        .index
+        .claude_usage_family_pending
+        .get_mut(&root)
+        .unwrap();
     pending.member_occurrences.clear();
     pending.member_request_id_hashes.clear();
     pending.invalid = true;
@@ -4551,6 +4568,7 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
                     census_window_end: window,
+                    held_index_keys: &BTreeSet::new(),
                     complete: true,
                     lossy: false,
                     source_verified: true,
@@ -4671,14 +4689,17 @@ fn owed_evidence_contract_stamp_restamps_under_the_latch_and_keeps_the_vetoes() 
     let (parsed, counts) = visit(&mut index);
     assert_eq!(parsed, 0);
     assert_eq!((counts.restamped_under_latch, counts.restamped), (2, 0));
-    for (root, pending) in &before {
+    for (root, pending) in before.iter() {
         let full = ClaudeUsageFamilyPending {
             census_window_end: window.clone(),
             ..pending.clone()
         };
         assert_eq!(index.claude_usage_family_pending[root], full);
     }
-    assert!(index.claude_request_identity_contract_changed, "latch untouched");
+    assert!(
+        index.claude_request_identity_contract_changed,
+        "latch untouched"
+    );
     assert!(index.files.values().all(|entry| entry.evidence_owed));
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(&index, &window),
@@ -4754,11 +4775,22 @@ fn owed_evidence_reads_are_capped_per_page() {
     );
     let counts = scope.finish().contract.evidence_owed;
     assert_eq!(
-        (parsed, counts.read, counts.refused_no_pending, counts.restamped),
+        (
+            parsed,
+            counts.read,
+            counts.refused_no_pending,
+            counts.restamped
+        ),
         (3, 3, 3, 0)
     );
 
-    let queued = fixture.index.traversal.as_ref().unwrap().pending_candidates.len();
+    let queued = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .len();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let mut page = evidence_owed::Page {
         read_cap: 1,
@@ -4769,8 +4801,16 @@ fn owed_evidence_reads_are_capped_per_page() {
     assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
     let traversal = fixture.index.traversal.as_ref().unwrap();
     assert_eq!(traversal.pending_candidates.len(), queued + 2);
-    assert!(traversal.pending_candidates.iter().skip(queued).all(|path| !path.census_member));
-    assert!(fixture.index.files.values().all(|entry| entry.evidence_owed));
+    assert!(traversal
+        .pending_candidates
+        .iter()
+        .skip(queued)
+        .all(|path| !path.census_member));
+    assert!(fixture
+        .index
+        .files
+        .values()
+        .all(|entry| entry.evidence_owed));
 }
 
 /// [regress] A persisted unfinished admission vetoed traversal health for
@@ -4838,7 +4878,10 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
                 .is_empty()
         })
         .count();
-    assert_eq!(cleared, 0, "re-armed members stay owed with their fingerprint");
+    assert_eq!(
+        cleared, 0,
+        "re-armed members stay owed with their fingerprint"
+    );
 
     // A healthy start is not completion: while members stay owed they give no
     // fence coverage, no family proof, no retirement and no latch clear.
@@ -4856,9 +4899,14 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
         .collect::<Vec<_>>();
     assert!(!pending.is_empty());
     for (root, pending) in pending {
-        assert!(evidence_owed::owed_at_completion(root, pending, false, &indexed));
+        assert!(evidence_owed::owed_at_completion(
+            root, pending, false, &indexed
+        ));
     }
-    assert_eq!(evidence_owed::latch_clearable(index, &window, &indexed), None);
+    assert_eq!(
+        evidence_owed::latch_clearable(index, &window, &indexed),
+        None
+    );
 }
 
 /// [behaviour] An unfinished admission dropped at an evidence-owed start keeps
@@ -4963,5 +5011,182 @@ fn owed_evidence_drop_keeps_unserved_due_service_once() {
     );
     let state = retained(&fixture.index);
     assert!(state.due_complete && state.complete);
-    assert!(!evidence_owed::due_unoffered(&fixture.index, &state, CARRY_RETRY));
+    assert!(!evidence_owed::due_unoffered(
+        &fixture.index,
+        &state,
+        CARRY_RETRY
+    ));
+}
+
+const CARRY_SHARER: &str = "d4444444-4444-4444-8444-444444444444";
+
+/// Add `hash` to one member's pending requests and occurrences; a witnessed
+/// family's witness follows, so the family still matches it.
+fn carry_add_request(index: &mut ScanIndex, root: &str, member: &str, hash: &str) {
+    let pending = index.claude_usage_family_pending.get_mut(root).unwrap();
+    let hashes = pending.member_request_id_hashes.get_mut(member).unwrap();
+    hashes.insert(hash.to_string());
+    let occurrences = pending.member_occurrences.get_mut(member).unwrap();
+    occurrences.insert(hash.to_string(), carry_occurrence(9, 10));
+    if let Some(witness) = index.claude_usage_family_witnesses.get_mut(root) {
+        carry_witness_member(witness, member, pending);
+    }
+}
+
+/// A witness member's fingerprints over that member's pending.
+fn carry_witness_member(
+    witness: &mut ClaudeUsageFamilyWitness,
+    member: &str,
+    pending: &ClaudeUsageFamilyPending,
+) {
+    let hashes = &pending.member_request_id_hashes[member];
+    let occurrences = &pending.member_occurrences[member];
+    witness
+        .member_request_id_fingerprints
+        .insert(member.into(), claude_request_id_set_fingerprint(hashes));
+    witness.member_occurrence_fingerprints.insert(
+        member.into(),
+        claude_occurrence_map_fingerprint(occurrences),
+    );
+}
+
+/// The failed window plus a second witnessed family, rooted after the first
+/// in root order. `shared`: the root's first request is also read in the
+/// second family, and another request is read by both of the root's own
+/// members.
+fn carry_shared_index(shared: bool) -> ScanIndex {
+    let mut index = carry_index();
+    carry_family(&mut index, CARRY_SHARER, &[None], true);
+    if shared {
+        let root = carry_member(CARRY_ROOT, None);
+        let agent = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+        let first = index.claude_usage_family_pending[CARRY_ROOT].member_request_id_hashes[&root]
+            .first()
+            .unwrap()
+            .clone();
+        carry_add_request(&mut index, CARRY_SHARER, CARRY_SHARER, &first);
+        let own = "e".repeat(64);
+        carry_add_request(&mut index, CARRY_ROOT, &root, &own);
+        carry_add_request(&mut index, CARRY_ROOT, &agent, &own);
+    }
+    index
+}
+
+/// The carry fixture with each `body-…` snapshot fingerprint spelled as a
+/// real one (64 lowercase hex): a store load drops any other accepted
+/// identity, which would leave every family body unaccepted.
+fn carry_hex_bodies(index: &mut ScanIndex) {
+    use sha2::Digest;
+    let hex = |body: &str| format!("{:x}", sha2::Sha256::digest(body.as_bytes()));
+    for (_, entry) in &mut index.files {
+        if let Some(body) = entry.last_snapshot_fingerprint.as_mut() {
+            *body = hex(body);
+        }
+    }
+    for (_, bodies) in &mut index.file_snapshot_fingerprints {
+        *bodies = bodies.iter().map(|body| hex(body)).collect();
+    }
+    let accepted: BTreeSet<String> = index
+        .accepted_snapshot_fingerprints
+        .iter()
+        .map(|body| hex(body))
+        .collect();
+    index.accepted_snapshot_fingerprints = accepted.into();
+}
+
+/// [money] The shared-owner tie-breaks as on main: a request read in two
+/// carried families is owned by the later root in root order, so only that
+/// owner keeps its re-arm; a request read twice inside one family names no
+/// other owner. Control: without them both witnessed families are carried.
+#[test]
+fn stale_carry_shared_request_is_owned_by_the_later_carried_root() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let carried = |shared: bool| {
+        let mut index = carry_shared_index(shared);
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        index.claude_stale_family_carry.roots
+    };
+    assert_eq!(
+        carried(false),
+        BTreeSet::from([CARRY_ROOT.to_string(), CARRY_SHARER.to_string()])
+    );
+    assert_eq!(carried(true), BTreeSet::from([CARRY_ROOT.to_string()]));
+}
+
+/// [money] Under state v2, on the same failed window published cold: the
+/// streamed two-pass join carries and compacts exactly what the resident
+/// graph and a whole-kind load do, whether the pass
+/// holds no family or the sharer first, and keeps no family it does not
+/// carry. A row gone from the store defers the start, counted: nothing
+/// carried, no fingerprint cleared, no family compacted.
+#[test]
+fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
+    use state_v2::money_test_support as v2;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let dir = crate::test_scratch::canonical_private_dir("stale-carry-cold");
+    let mut fixture = carry_shared_index(true);
+    carry_hex_bodies(&mut fixture);
+    let (custody, cold) = v2::ColdSession::publish(&fixture, &dir);
+    assert_eq!(
+        cold.accepted_snapshot_fingerprints, fixture.accepted_snapshot_fingerprints,
+        "the load keeps every accepted body"
+    );
+    assert!(cold
+        .claude_usage_family_pending
+        .family(CARRY_SHARER)
+        .is_err());
+    let start = |mut index: ScanIndex| {
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        index
+    };
+    let outcome = |index: &ScanIndex| {
+        let view = v2::resident(index);
+        (
+            format!("{:?}", view.claude_stale_family_carry),
+            serde_json::to_value(&view.files).unwrap(),
+            serde_json::to_value(&view.claude_usage_family_pending).unwrap(),
+        )
+    };
+    let resident = start(v2::resident(&cold));
+    assert_eq!(
+        resident.claude_stale_family_carry.roots,
+        BTreeSet::from([CARRY_ROOT.to_string()])
+    );
+    let expected = outcome(&resident);
+    let mut whole = cold.clone();
+    state_v2::load_usage(&mut whole, None).unwrap();
+    assert_eq!(outcome(&start(whole)), expected, "whole-kind load");
+    let streamed = start(cold.clone());
+    assert_eq!(outcome(&streamed), expected, "streamed");
+    assert!(v2::usage_head_only(&streamed, CARRY_SHARER));
+    assert!(v2::usage_loaded(&streamed, CARRY_ROOT), "compacted");
+    let mut held = cold.clone();
+    state_v2::load_usage(&mut held, Some(&BTreeSet::from([CARRY_SHARER.to_string()]))).unwrap();
+    assert_eq!(outcome(&start(held)), expected, "sharer held first");
+
+    let mut gone = cold.clone();
+    v2::delete_usage_row_in_session(&gone, CARRY_SHARER);
+    let before = v2::usage_unknown_count();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut gone,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert!(v2::usage_unknown_count() > before, "counted");
+    assert!(gone.claude_stale_family_carry.roots.is_empty());
+    for key in carry_family_keys() {
+        assert_eq!(
+            gone.files[&key].source_file_fingerprint,
+            cold.files[&key].source_file_fingerprint
+        );
+    }
+    assert!(v2::usage_head_only(&gone, CARRY_ROOT), "nothing compacted");
+    drop(custody);
+    let _ = std::fs::remove_dir_all(dir);
 }

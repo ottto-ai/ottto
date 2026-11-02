@@ -4443,11 +4443,7 @@ fn scan_index_rebuild_override_repair(
     if *authorization != RequestAuthorization::TrustedCompanionApp {
         return None;
     }
-    let snapshot_source = match source {
-        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
-    };
+    let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(source);
     let outcome = crate::snapshots::arm_scan_index_rebuild_manual_override(
         snapshot_source,
         SystemTime::now(),
@@ -6871,7 +6867,7 @@ fn clear_pending_device_credential(
     Ok(())
 }
 
-fn promote_pending_device_credential_with_stores(
+pub(crate) fn promote_pending_device_credential_with_stores(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
     pending_store: &FilePendingDeviceCredentialStore,
@@ -6879,6 +6875,15 @@ fn promote_pending_device_credential_with_stores(
     device_store: &FileDeviceStore,
     active_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
+    // A failed marker write keeps the candidate staged, so recovery retries both.
+    if let Ok(Some(current)) = device_store.load() {
+        crate::snapshot_sync::disable_sources_dropped_from_grant(
+            &default_support_dir(),
+            &current,
+            &pending.device,
+        )
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
     // After server confirmation the old active secret may already be invalid.
     // Never roll it back on a file-side failure: keep the separately staged
     // candidate intact so restart recovery can finish the same generation.
@@ -9562,6 +9567,17 @@ fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
     matches!(details.status, Some(401) | Some(403))
 }
 
+fn set_source_marker(
+    write: fn(&Path, crate::snapshots::SnapshotSource) -> anyhow::Result<()>,
+    source: &SourceKind,
+) -> Result<(), LocalApiError> {
+    write(
+        &default_support_dir(),
+        crate::snapshot_sync::snapshot_source_of_kind(source),
+    )
+    .map_err(|_| LocalApiError::StatePoisoned)
+}
+
 fn setup_answer(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -9570,6 +9586,10 @@ fn setup_answer(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    // Before any connection or POST: collection stops even if the run is gone.
+    if answer_type.trim() == "disable_source" {
+        set_source_marker(crate::snapshot_sync::disable_snapshot_source, &source)?;
+    }
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
@@ -9623,6 +9643,9 @@ fn setup_action(
         }
     };
     let queued = queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    if action_type == "install_source" {
+        set_source_marker(crate::snapshot_sync::reconnect_snapshot_source, &source)?;
+    }
     let action_results =
         process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
@@ -22041,11 +22064,35 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
     fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
         fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        seed_private_literal_canary(&support_root.join("snapshots"));
+        for destination in ["old", "other"] {
+            for source in crate::snapshots::durable_sources::SOURCES {
+                let index = support_root
+                    .join("snapshots/destinations")
+                    .join(destination)
+                    .join(format!("{}-scan-index.json", source.snapshot.api_slug()));
+                let dir = crate::durable_tail_store::store_dir_for_index(&index);
+                fs::create_dir_all(&dir).unwrap();
+                // Whole-tree forget cannot depend on inventory or body decoding.
+                fs::write(
+                    dir.join(format!("{}.rec", "f".repeat(64))),
+                    b"opaque record",
+                )
+                .unwrap();
+                fs::write(dir.join("torn.tmp"), b"unfinished write").unwrap();
+                fs::create_dir_all(dir.join("temp/child")).unwrap();
+                fs::write(dir.join("temp/child/pending"), b"unfinished child").unwrap();
+                fs::write(dir.with_extension("private-labels"), b"opaque marker").unwrap();
+                assert!(dir.exists());
+            }
+        }
         fs::create_dir_all(&secret_root).unwrap();
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
@@ -24754,8 +24801,53 @@ for line in sys.stdin:
         );
     }
 
+    /// Seed the private record directory with codec bytes, so both diagnostic
+    /// paths must exclude stored literals rather than merely redact a Debug.
+    fn seed_private_literal_canary(support: &Path) -> &'static str {
+        use crate::durable_tail_codec::{Durable, Enc};
+        use crate::snapshots::PlText;
+        const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
+        let literal = PlText::<96>::new(CANARY.into()).unwrap();
+        let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();
+        assert!(body
+            .windows(CANARY.len())
+            .any(|bytes| bytes == CANARY.as_bytes()));
+        let dir =
+            crate::durable_tail_store::store_dir_for_index(&support.join("claude-scan-index.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = dir.join(format!("{}.rec", "0".repeat(64)));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record)
+            .unwrap();
+        file.write_all(&body).unwrap();
+        // F8: the support collector must also omit transient replay input,
+        // including raw-value magic keys and malformed-selector material.
+        std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
+            "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
+        )).unwrap();
+        let canaries =
+            crate::snapshots::test_replay_privacy_artifacts(&support.join("bounded-replay-input"));
+        assert_eq!(canaries[0], CANARY);
+        CANARY
+    }
+
     #[test]
+    #[serial]
     fn diagnostics_collect_is_local_only_without_upload() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-export");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -24774,6 +24866,14 @@ for line in sys.stdin:
 
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
+        assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!serde_json::to_string(&payload).unwrap().contains(private));
+        }
         assert!(payload
             .get("bundle_id")
             .and_then(|value| value.as_str())
@@ -24833,7 +24933,18 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-support-bundle");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let captured = Arc::new(Mutex::new(None));
         let api_base_url = diagnostics_upload_server(captured.clone());
         let response = handle_request(
@@ -24896,6 +25007,16 @@ for line in sys.stdin:
         assert!(body.contains("\"retention_disclosure_accepted\":true"));
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
+        assert!(!body.contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!body.contains(private));
+            assert!(!payload_json.contains(private));
+        }
+        assert!(!payload_json.contains(canary));
     }
 
     #[test]
@@ -27927,20 +28048,36 @@ X-API-Key = "otel_redacted"
     #[serial]
     #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
+        use crate::otlp_relay::tests::with_bind_plan;
+
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
-        let port = ports[1];
         write_startup_relay_settings(
             &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(port),
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
         );
-        let _busy_preferred = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let default_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(default_listener.local_addr().unwrap().port(), ports[0]);
-        // Keep default occupied too; the first fallback is the preferred busy
-        // port, so the next candidate must be selected.
-        let fallback_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(fallback_listener.local_addr().unwrap().port(), ports[2]);
+        // Plan the candidate binds: any real candidate number can be held by a
+        // parallel test's ephemeral port, so the free one is a held listener.
+        let busy = || -> std::io::Result<std::net::TcpListener> {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        };
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let default_listener = with_bind_plan([(ports[1], busy()), (ports[0], Ok(held))], || {
+            crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+        });
+        assert_eq!(default_listener.local_addr().unwrap(), addr);
+        // Default busy too: the preferred port is not retried as a fallback,
+        // so the next candidate is selected.
+        let fallback_listener = with_bind_plan(
+            [
+                (ports[1], busy()),
+                (ports[0], busy()),
+                (ports[2], Ok(default_listener)),
+            ],
+            || crate::otlp_relay::bind_startup_local_relay_listener().unwrap(),
+        );
+        assert_eq!(fallback_listener.local_addr().unwrap(), addr);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27950,17 +28087,24 @@ X-API-Key = "otel_redacted"
     fn startup_relay_ignores_unapproved_hosts_ports_and_settings() {
         let (root, _guards) = managed_claude_relay_fixture();
         let port = startup_relay_candidates()[1];
+        // The default port is the first bind attempted; a held listener stands
+        // in for it, since a parallel test's ephemeral port can hold 43119.
+        let binds_default_first = || {
+            let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = held.local_addr().unwrap();
+            let default = crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT;
+            let listener = crate::otlp_relay::tests::with_bind_plan([(default, Ok(held))], || {
+                crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+            });
+            assert_eq!(listener.local_addr().unwrap(), addr);
+        };
         for base in [
             format!("http://192.0.2.1:{port}"),
             format!("http://localhost:{port}"),
             "http://127.0.0.1:48123".to_string(),
         ] {
             write_startup_relay_settings(&root, &base);
-            let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-            assert_eq!(
-                listener.local_addr().unwrap().port(),
-                crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-            );
+            binds_default_first();
         }
         write_startup_relay_settings(
             &root,
@@ -27973,11 +28117,7 @@ X-API-Key = "otel_redacted"
                 sources: vec!["codex".into()],
             })
             .unwrap();
-        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().port(),
-            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-        );
+        binds_default_first();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27998,23 +28138,34 @@ X-API-Key = "otel_redacted"
         let settings = root.join(".claude/settings.json");
         let before = fs::read(&settings).unwrap();
         let _busy = std::net::TcpListener::bind(("127.0.0.1", approved)).unwrap();
+        // The approved binds hit the held busy listener. The old port is
+        // planned: a parallel test's ephemeral port can hold that number.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
         let mut attempts = 0;
-        let listener = crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
-            attempts += 1;
-            assert!(attempt <= 3, "approved retry must be bounded");
-            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
-            if attempt < 3 {
-                assert!(result.is_err(), "approved port gets its retry budget first");
-            }
-            result
+        let listener = crate::otlp_relay::tests::with_bind_plan([(old, Ok(held))], || {
+            crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
+                attempts += 1;
+                assert!(attempt <= 3, "approved retry must be bounded");
+                let result =
+                    crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+                if attempt < 3 {
+                    assert!(result.is_err(), "approved port gets its retry budget first");
+                }
+                result
+            })
         });
         assert_eq!(attempts, 3);
-        let addr = listener.local_addr().unwrap();
-        assert_eq!(addr.port(), old, "old port precedes the free default port");
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            addr,
+            "old port precedes the free default port"
+        );
         let daemon = daemon().with_account(connected_account());
+        let endpoint = format!("http://127.0.0.1:{old}");
         let connected = ottto_protocol::RelayState {
             state: ottto_protocol::RelayRuntimeState::Connected,
-            endpoint: Some(format!("http://{addr}")),
+            endpoint: Some(endpoint.clone()),
             last_connected_at: None,
             last_error: None,
         };
@@ -28032,7 +28183,7 @@ X-API-Key = "otel_redacted"
         daemon
             .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
                 state: ottto_protocol::RelayRuntimeState::Failed,
-                endpoint: Some(format!("http://{addr}")),
+                endpoint: Some(endpoint),
                 last_connected_at: None,
                 last_error: Some(StableMessage {
                     code: "relay_listener_failed".into(),

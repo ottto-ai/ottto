@@ -169,6 +169,7 @@ impl Family {
                     .expect("exact parsed member key");
                 let old = &previous.files[key];
                 PendingIndexFinalization {
+                    restored_behind_accepted: false,
                     withheld_content: None,
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
@@ -214,7 +215,7 @@ impl Family {
             &BTreeSet::new(),
             None,
             Some(completion.fold_view(Some(&lease))),
-            &BTreeMap::new(),
+            ClaudeEvidenceRows::Whole(&BTreeMap::new()),
         );
         items.clone_from_slice(&scan.snapshots);
         completion.capture_native_corrections(

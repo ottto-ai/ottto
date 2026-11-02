@@ -24,6 +24,9 @@ pub(super) struct KindCx {
     /// Outcomes of the store-only rollovers this save writes. A sibling's
     /// committed rollovers are skipped, and a failed save's are discarded.
     pub(super) archived: Archived,
+    /// Archive reads an ordinary save may spend compacting whole families.
+    pub(super) compact_allowance: Option<usize>,
+    pub(super) compaction: kinds_accounts::Compaction,
     valid: bool,
 }
 
@@ -114,8 +117,8 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 /// skeletons precede census-owned request membership; no partial graph escapes.
 /// Test view: cold archives are read back resident, for graph comparisons.
 #[cfg(test)]
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+pub(super) fn hydrate(
+    store: &mut sqlite::Sqlite,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
@@ -188,6 +191,7 @@ pub(super) fn delta(
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
     cx.archived = Archived::default();
+    cx.compaction = Default::default();
     let result = (|| {
         let mut rows = mapper::Rows {
             tx: Some(tx),
@@ -247,6 +251,14 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
+                // Loaded usage families now match the rows this save left.
+                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
+                    let rows = &digests.rows;
+                    cold.saved(|root| {
+                        let key = mapper::key("usage.pending", root, 1).ok()?;
+                        rows.get(&key).copied()
+                    });
+                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
@@ -261,9 +273,10 @@ pub(super) fn save_graph(
                     count += u64::from(n > 64);
                     windows += n;
                     max = max.max(n);
-                    family
-                        .previous_windows
-                        .saved(ids.split_last().map_or(&[][..], |(_, archived)| archived));
+                    family.previous_windows.saved(
+                        ids.split_last().map_or(&[][..], |(_, archived)| archived),
+                        pending.compaction.done.contains(root),
+                    );
                     uncollapsed += family.previous_windows.uncollapsed() as u64;
                 }
                 if count != 0 {
@@ -277,6 +290,7 @@ pub(super) fn save_graph(
                         "replaced": pending.archived.replaced, "pushed": pending.archived.pushed
                     }),
                 );
+                telemetry::event("account_windows_compacted", &pending.compaction.counts);
                 Ok(digests)
             }
             DurableCommitOutcome::Published(generation) => {
@@ -386,4 +400,4 @@ thread_local! {
 
 #[cfg(test)]
 #[path = "kinds_tests.rs"]
-mod tests;
+pub(super) mod tests;

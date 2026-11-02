@@ -108,6 +108,28 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
+/// Native label losses only, never label text. Twelve fixed u64 cells (96 B),
+/// no per-key state. Invalid activity signals count inputs, since the existing
+/// detector deliberately does not expose the unnamed/dropped labels.
+#[inline(never)]
+pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    let source_slot = match source {
+        "claude_code" => 0,
+        "codex" => 1,
+        "pi" => 2,
+        _ => return,
+    };
+    let slot = source_slot * 4
+        + usize::from(set == "activity") * 2
+        + usize::from(reason == "invalid_signal");
+    let total = COUNTS[slot].fetch_add(1, Relaxed).saturating_add(1);
+    durable_tail_alarm(
+        source,
+        &serde_json::json!({"skill_label_native_dropped": {(set): {(reason): total}}}),
+    );
+}
+
 #[cfg(not(test))]
 static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
@@ -192,39 +214,63 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed, content-free refusal labels; cumulative process counters on #799.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// Closed causes for native archive reader refusal and owed custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
-    ReplayNotAuthorized,
+    ReplayNotAuthorized = 0,
     #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported,
+    ProofParentUnsupported = 1,
     #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported,
+    ProofChildUnsupported = 2,
     #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported,
+    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedDurableTailUnsupported")]
-    DurableTailUnsupported,
+    DurableTailUnsupported = 4,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
-    GroupProbeUnsupported,
+    GroupProbeUnsupported = 5,
     #[serde(rename = "CompressedGroupReadUnsupported")]
-    GroupReadUnsupported,
+    GroupReadUnsupported = 6,
     #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound,
+    ParentLedgerUnbound = 7,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
-    PhysicalOffsetUnsupported,
-    #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded,
-    #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded,
+    PhysicalOffsetUnsupported = 8,
     #[serde(rename = "CompressedAdmissionRefused")]
-    AdmissionRefused,
-    // Subset of decoder refusals: the unchanged free-only floor would fit
-    // without optional header entries. Attempts, not files or lost usage.
+    AdmissionRefused = 9,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed = 10,
+    #[serde(rename = "CompressedOwnerUnproven")]
+    OwnerUnproven = 11,
+    #[serde(rename = "CompressedOutputHeld")]
+    OutputHeld = 12,
+    #[serde(rename = "CompressedDecodedOverLimit")]
+    DecodedOverLimit = 13,
+    #[serde(rename = "CompressedHeaderInvalid")]
+    HeaderInvalid = 14,
+    #[serde(rename = "CompressedCorrectionUnapplied")]
+    CorrectionUnapplied = 15,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded = 16,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded = 17,
+    // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy,
+    DecoderRefusedHeaderOccupancy = 18,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven = 19,
+    #[serde(rename = "ArchiveEquivalenceUnproven")]
+    ArchiveEquivalenceUnproven = 20,
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Count = 21,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
+impl std::fmt::Display for CodexZstCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CodexZstCause {}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -253,6 +299,12 @@ pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
     cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
 }
 
+/// Counts per observed `priority` or `flex` thread-settings snapshot, dated or
+/// not; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn codex_non_default_thread_tier() {
+    cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -279,6 +331,14 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
             )]),
         );
     }
+}
+
+pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
+    traversal_point(
+        "codex_zst_held",
+        "codex",
+        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
+    );
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.
@@ -439,13 +499,6 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
-}
-/// One failed parking decision; no logging, resource probes or scan ownership.
-pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
-    source_count(source, 16 + usize::from(layout_supported), |slot| {
-        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-            .unwrap_or_else(|n| n)
-    });
 }
 
 /// A vanished file's index entry was retired while its parsed body was not
@@ -862,8 +915,6 @@ impl Probe {
             #[serde(flatten)]
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
@@ -898,10 +949,6 @@ impl Probe {
                         .and_then(|memo| memo.held_gauge())
                 })
                 .flatten(),
-            source_rotation_serial_fallback: drain(
-                source,
-                &[("unsupported_layout", 16), ("bound_refused", 17)],
-            ),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
@@ -1539,12 +1586,21 @@ crate::heap_layout_bound::no_heap!(false; NativeDecision);
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink: u64,
+    /// Native Full read completed; does not imply verification or publication.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink_completed: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
         self.restore_outcome.restored == 0
             && self.restore_outcome.held == 0
+            && self.restore_outcome.pending == 0
             && self.restore_outcome.miss.is_empty()
+            && self.restore_outcome.stale.is_empty()
+            && self.owed_full_after_lossy_shrink == 0
+            && self.owed_full_after_lossy_shrink_completed == 0
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -1553,17 +1609,36 @@ pub(crate) struct RestoreCounts {
     restored: u64,
     #[serde(skip_serializing_if = "is_zero")]
     held: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pending: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
     pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
-            RestoreOutcome::Restored(_) => &mut self.restored,
-            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Restored(..) => &mut self.restored,
+            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
+            RestoreOutcome::Pending | RestoreOutcome::QuietPending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
+            RestoreOutcome::StaleUnregistered(reason, obligation) => {
+                let label =
+                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
+                let attribution = self.stale_attribution.entry(label).or_default();
+                *attribution = attribution.saturating_add(1);
+                self.stale.entry(reason).or_default()
+            }
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }
@@ -1982,18 +2057,34 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
+            AdmissionRefused,
+            DecodeFailed,
+            OwnerUnproven,
+            OutputHeld,
+            DecodedOverLimit,
+            HeaderInvalid,
+            CorrectionUnapplied,
             HeaderUnfunded,
             CompatibilityUnfunded,
-            AdmissionRefused,
             DecoderRefusedHeaderOccupancy,
+            FamilyUnproven,
+            ArchiveEquivalenceUnproven,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
             serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
             "decoder_refused_header_occupancy"
         );
+        let mut labels = std::collections::BTreeSet::new();
+
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
+            let label = serde_json::to_string(cause).unwrap();
+            assert!(labels.insert(label.clone()), "unique persisted label");
+            assert_eq!(
+                serde_json::from_str::<super::CodexZstCause>(&label).unwrap(),
+                *cause
+            );
         }
     }
 
@@ -2045,9 +2136,33 @@ mod tests {
             crate::durable_tail_store::Refusal::Unknown,
         ));
         assert_eq!(counts.held, u64::MAX);
-        counts.restored = 1;
+        counts.held = 0;
+        counts.record(&RestoreOutcome::Pending);
+        assert!(
+            !probe.full_causes.is_empty(),
+            "pending-only pages remain visible"
+        );
+        probe.full_causes.restore_outcome.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+        assert_eq!(json["restore_outcome"]["pending"], 1);
+        let causes = FullCauses {
+            owed_full_after_lossy_shrink: 1,
+            ..Default::default()
+        };
+        assert!(!causes.is_empty());
+        assert_eq!(
+            serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
+            1
+        );
+        let completed = FullCauses {
+            owed_full_after_lossy_shrink_completed: 1,
+            ..Default::default()
+        };
+        assert!(!completed.is_empty(), "completion may fall on a later page");
+        let json = serde_json::to_value(completed).unwrap();
+        assert_eq!(json["owed_full_after_lossy_shrink_completed"], 1);
+        assert!(json.get("owed_full_after_lossy_shrink").is_none());
     }
 
     #[test]
@@ -2788,8 +2903,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi observation fields add 97 bytes at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2304);
+        // The two Pi fields add 97 bytes at u64::MAX, the Codex tier field 53.
+        assert!(serde_json::to_string(record).unwrap().len() < 2357);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -3335,3 +3450,5 @@ pub(crate) fn state_v2_memory() -> StateV2Memory {
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
 }
+
+crate::heap_layout_bound::no_heap!(true; CodexZstCause);

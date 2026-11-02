@@ -37,6 +37,7 @@ fn warm_delivered(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     warm.finish();
     deliver(&mut warm);
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+    assert!(disk.records() > 0, "the warm owner persists its records");
     (scanner, prior)
 }
 
@@ -54,6 +55,7 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// restart between pages.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
@@ -61,7 +63,7 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         let mut c = corpus("resumed_copy_prefix_dedupe");
         let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
         input_clock(&holder);
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_delivered(&c, &disk);
         let path = c.write_at(
             &file(COPY),
@@ -136,6 +138,8 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// lets the receipt prove, and later pages neither read nor POST anything.
 #[test]
 fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
+    // As every owner of this harness: commits persist durable records.
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("never_delivered_holder_reread_bound") {
         return;
     }

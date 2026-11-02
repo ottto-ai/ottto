@@ -307,7 +307,7 @@ pub(super) struct Sqlite {
     last_collection_check: Option<(SystemTime, Instant)>,
     recovery_attempts_left: u8,
     paths: PathExtractor,
-    references: Option<ReferenceExtractor>,
+    references: ReferenceExtractor,
     // Keep DB identity separate from ownership: Darwin flock conflicts with
     // SQLite's fcntl locks on the same inode. Both fds outlive the connection.
     owner: File,
@@ -336,6 +336,7 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
+                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -541,8 +542,8 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -636,18 +637,6 @@ impl Sqlite {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("state_v2_connection_unavailable"))
     }
-    /// Immutable identity probe must precede a read-write open, WAL recovery,
-    /// settings changes, and SHM creation. The expected identity comes from the
-    /// independently read fence, never from the candidate database.
-    #[cfg(test)]
-    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
-        Self::open_with_policy(
-            path,
-            identity,
-            Duration::from_secs(86400),
-            Duration::from_secs(2),
-        )
-    }
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
@@ -666,16 +655,10 @@ impl Sqlite {
         ensure!(actual == *identity, "state_v2_foreign_binding");
         Ok(())
     }
-    pub(super) fn open_with_policy(
-        path: &Path,
-        identity: &super::Identity,
-        deadline: Duration,
-        work: Duration,
-    ) -> Result<Self> {
-        ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
-            "state_v2_purge_policy"
-        );
+    /// Immutable identity probe must precede a read-write open, WAL recovery,
+    /// settings changes, and SHM creation. The expected identity comes from the
+    /// independently read fence, never from the candidate database.
+    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -740,19 +723,20 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
             save_failure: None,
         };
-        store.set_purge_policy(deadline, work)?;
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
         store.maintenance(false)?;
         store.control("phase", &1_u8)?;
+        // Runtime loads re-emit any separate save/custody hold after hydration.
+        super::telemetry::event("hold", &"none");
         Ok(store)
     }
     pub(super) fn finish_import(mut self) -> Result<()> {
@@ -818,6 +802,10 @@ impl Sqlite {
         }
     }
     #[cfg(test)]
+    pub(super) fn validate_references(&self) -> Result<()> {
+        references::verify_counts(self.conn()?, self.references)
+    }
+    #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
         let conn = self.conn()?;
         // A bounded row scan verifies all owner lengths/digests. The separate
@@ -851,9 +839,8 @@ impl Sqlite {
     }
 }
 
-impl Store for Sqlite {
-    type Txn<'a> = Txn<'a>;
-    fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
+impl Sqlite {
+    pub(super) fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
             telemetry::row_cap_reset();
             self.save_failure = None;
@@ -861,6 +848,7 @@ impl Store for Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
+            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -884,7 +872,7 @@ impl Store for Sqlite {
             dirty_rows: 0,
         })
     }
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
+    pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         if mode == CheckpointMode::Purge && self.vacuum().is_err() {
             self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
@@ -1016,14 +1004,7 @@ fn scan_record_range(
         values.push(SqlValue::Integer(i64::try_from(*position)?));
         filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
     }
-    values.push(SqlValue::Integer(limit as i64));
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
-        projection(Table::Records),
-        values.len()
-    ))?;
-    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    record_headers(conn, &filter, values, "key_bytes,position", limit)
 }
 fn scan_record_key(
     conn: &Connection,
@@ -1042,15 +1023,25 @@ fn scan_record_key(
         values.push(SqlValue::Integer(i64::try_from(position)?));
         filter.push_str(" AND position>?3");
     }
+    record_headers(conn, &filter, values, "position", limit)
+}
+fn record_headers(
+    conn: &Connection,
+    filter: &str,
+    mut values: Vec<SqlValue>,
+    order: &str,
+    limit: usize,
+) -> Result<Vec<Header>> {
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
+        "SELECT {} FROM records WHERE {filter} ORDER BY {order} LIMIT ?{}",
         projection(Table::Records),
         values.len()
     ))?;
     let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
     ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
     if let RowKey::Meta(name) = &h.key {
@@ -1122,18 +1113,11 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
 /// The semantic encoder owns path classification, including paths inside raw
 /// holds and packed maps AND the primary key. Only actual PL strings are
 /// emitted, through a bounded sink before allocation. No table field knowledge
-/// belongs here. Missing extractors refuse mutations, never infer privacy.
+/// belongs here. The default extractors use the semantic encoder.
 pub(super) type PathExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
 pub(super) type ReferenceExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()>;
-fn missing_path_extractor(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    bail!("state_v2_private_path_extractor_required")
-}
 struct StoredValue<'a> {
     conn: &'a Connection,
     header: &'a Header,
@@ -1144,11 +1128,13 @@ impl Value for StoredValue<'_> {
     }
 }
 impl Sqlite {
+    #[cfg(test)]
     pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
         self.paths = paths;
     }
+    #[cfg(test)]
     pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
-        self.references = Some(refs);
+        self.references = refs;
     }
 }
 impl Sqlite {
@@ -1178,21 +1164,17 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
-    fn record_save_error(&mut self, error: &anyhow::Error, dirty_bytes: u64) {
+    /// Charged bytes of the last refused save, for its ceiling alarm.
+    pub(super) fn refused_save_bytes(&self) -> u64 {
+        self.stats.refused_save_bytes
+    }
+    fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
         }
         if disk_full(error) {
             self.save_failure = Some(Hold::SaveFull);
             telemetry::event("sqlite_full", &1);
-        } else if error
-            .chain()
-            .any(|e| e.to_string() == "state_v2_save_ceiling")
-        {
-            // A save hold is never silent: alarm with its content-free cause.
-            self.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &dirty_bytes);
-            telemetry::event("save_ceiling_cause", &"error_chain");
         }
     }
 }
@@ -1225,8 +1207,6 @@ impl Txn<'_> {
         // exceed them. Only the hard charged-work ceiling refuses publication.
         if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
-            telemetry::event("save_ceiling_cause", &"charged_work");
             anyhow::bail!(Hold::SaveCeiling);
         }
         Ok(())
@@ -1486,7 +1466,7 @@ impl Transaction for Txn<'_> {
             Ok(h)
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
         }
         self.failed |= result.is_err();
         result
@@ -1523,7 +1503,7 @@ impl Transaction for Txn<'_> {
             Ok(count != 0)
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
         }
         self.failed |= result.is_err();
         result
@@ -1628,7 +1608,7 @@ impl Txn<'_> {
             Ok(())
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
             self.store
                 .stats
                 .commit(&DurableCommitOutcome::NotPublished, None);
@@ -1673,7 +1653,7 @@ impl Txn<'_> {
             return DurableCommitOutcome::Committed(next);
         }
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
             if self.store.save_failure == Some(Hold::SaveFull) {
                 // FULL is retryable only after abandoning the complete save.
                 // SQLite may already have auto-rolled back the transaction.
@@ -1684,6 +1664,7 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
+            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;
@@ -1742,42 +1723,25 @@ fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
     );
     Ok(())
 }
-unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
-    // Callback is installed only for quick_check and removed before the stack
-    // deadline is dropped. No panic crosses the C boundary.
-    let deadline = unsafe { &*(raw.cast::<Instant>()) };
-    (Instant::now() >= *deadline) as std::ffi::c_int
-}
 fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
-    let mut deadline = Instant::now()
-        .checked_add(budget)
-        .context("state_v2_work_budget")?;
+    #[cfg(test)]
+    let budget = open_check_tests::budget(budget);
     super::telemetry::event("quick_check", &1);
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            conn.handle(),
-            1000,
-            Some(progress),
-            (&mut deadline as *mut Instant).cast(),
-        );
-    }
+    // An interrupted check starts over on every open. Finish the finite scan;
+    // the former deadline is an alarm threshold, never an ingestion gate.
+    let started = Instant::now();
     let result = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0));
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
-    }
-    let checked = result.map_err(|error| {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
-            anyhow::Error::from(super::Hold::IntegrityRetry)
-        } else {
-            error.into()
-        }
-    })?;
-    ensure!(
-        checked == "ok",
-        "state_v2_integrity_requires_explicit_repair"
-    );
+    let elapsed = started.elapsed();
+    super::telemetry::event("quick_check_ms", &elapsed.as_millis());
+    super::telemetry::event("quick_check_slow_alarm", &(elapsed > budget));
+    let checked = result?;
+    ensure!(checked == "ok", INTEGRITY_REPAIR);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sqlite/open_check_tests.rs"]
+mod open_check_tests;
 
 #[cfg(test)]
 #[path = "sqlite/fixtures.rs"]

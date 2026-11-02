@@ -334,28 +334,20 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
 fn over_budget_path_diff_commits_and_requires_erasure() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let keys = ["a", "b", "c"].map(|k| file(format!("synthetic-progress-{k}")));
+    let key = file("synthetic-progress".into());
     let kept = serde_json::to_vec(&["kept-string"]).unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    for key in &keys {
-        put(&mut tx, key, &kept);
-    }
+    put(&mut tx, &key, &kept);
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    // Within budget, a replacement that keeps every string needs no erasure.
+    // Within budget this string-keeping replacement marks no erasure (c1).
+    // Over budget it commits and assumes a removed string.
+    sqlite::set_path_diff_budget(&mut db, 1);
     let grown = serde_json::to_vec(&["kept-string", "added-string"]).unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &keys[0], &grown);
+    put(&mut tx, &key, &grown);
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
-    // Over budget, the same change commits and assumes a removed string.
-    sqlite::set_path_diff_budget(&mut db, 1);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    for key in &keys[1..] {
-        put(&mut tx, key, &grown);
-    }
-    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
     assert_eq!(db.save_failure(), None);
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     let alarm = telemetry::latest_for_test("path_diff_conservative").unwrap();
     assert!(alarm["bytes"].as_u64().unwrap() > 1);
     assert_eq!(alarm["rows"], 1);
@@ -1028,6 +1020,77 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(db.begin(TxnMode::Write).is_err());
     drop(db);
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+}
+
+/// [behaviour] idle maintenance emits counts once per daily reference-maintenance pass.
+#[test]
+fn store_growth_gauge_is_daily_and_counts_only() {
+    fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
+        if matches!(&h.key, RowKey::Record { kind, .. } if kind.name() == "raw_hold.files") {
+            emit(&RowKey::RequestSet(1))?;
+        }
+        Ok(())
+    }
+    fn sample(db: &mut sqlite::Sqlite) -> Vec<serde_json::Value> {
+        let (_, records) =
+            crate::local_resource_diagnostics::capture(|| db.maintenance(true).unwrap());
+        records
+            .into_iter()
+            .filter_map(|r| r["counts"]["latest"].get("store_growth").cloned())
+            .collect()
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.reference_extractor(refs);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(
+        &mut tx,
+        &test_record("synthetic-private-key".into()),
+        b"synthetic-private-value",
+    );
+    put(&mut tx, &traversal("other-key".into()), &[b'x'; 600]);
+    tx.put(RowInput {
+        key: &RowKey::RequestSet(1),
+        fixed: &Fixed::RequestSet {
+            commitment: [5; 32],
+            refs: 1,
+        },
+        value_version: 1,
+        value: &[b'y'; 700],
+    })
+    .unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // Ordinary save/maintenance paths cannot start the daily sample.
+    let (_, records) =
+        crate::local_resource_diagnostics::capture(|| db.maintenance(false).unwrap());
+    assert!(!records.iter().any(|r| r["counts"].get("latest").is_some()));
+    let gauges = sample(&mut db);
+    assert_eq!(gauges.len(), 1);
+    let gauge = &gauges[0];
+    assert!(gauge["page_count"].as_u64().unwrap() > 0);
+    assert!(gauge["freelist_count"].as_u64().unwrap() <= gauge["page_count"].as_u64().unwrap());
+    assert!(gauge["page_size"].as_u64().unwrap().is_power_of_two());
+    assert_eq!(
+        gauge["kinds"]["raw_hold.files"],
+        serde_json::json!({
+            "rows": 1, "key_bytes": 21, "value_bytes": 23
+        })
+    );
+    assert_eq!(
+        gauge["kinds"]["scan_state.traversal"],
+        serde_json::json!({
+            "rows": 1, "key_bytes": 9, "value_bytes": 600
+        })
+    );
+    assert_eq!(gauge["shared_value_bytes"], 700);
+    assert_eq!(gauge["chunk_bytes"], 1300);
+    assert_eq!(gauge["partial"], false);
+    assert!(!gauge.to_string().contains("synthetic-private"));
+    // No second sample until the next daily maintenance pass runs.
+    assert!(sample(&mut db).is_empty());
+    db.control("reference_check_success", &0_u64).unwrap();
+    db.control("reference_check_attempt", &0_u64).unwrap();
+    assert_eq!(sample(&mut db).len(), 1);
 }
 
 /// [format] one save commits all dirty rows above soft targets.

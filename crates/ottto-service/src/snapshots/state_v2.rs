@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
+
 mod fence;
 mod import;
 mod runtime;
@@ -22,21 +24,24 @@ mod runtime;
     )
 )]
 pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{IncompleteReason, LiveKeys};
+pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
+pub(super) use runtime::BaselineRelease;
+pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    guard_local, idle, load_locked, published, recovery_save_guard, save_locked,
-    save_oversize_active, save_read_admitted, save_read_completed,
+    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
+    save_oversize_active, save_read_admitted, save_read_completed, settle_usage, visit_usage,
 };
-pub(super) use runtime::{BaselineRelease, Hold};
 mod catalogue;
 mod codec;
 mod ignored;
 mod interning;
 mod kinds;
+#[cfg(test)]
+pub(super) use kinds::tests::compact_reopened_for_test;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
@@ -300,14 +305,6 @@ pub(super) trait Transaction {
         limit: usize,
     ) -> Result<Vec<Header>>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
-}
-
-pub(super) trait Store {
-    type Txn<'a>: Transaction
-    where
-        Self: 'a;
-    fn begin(&mut self, mode: TxnMode) -> Result<Self::Txn<'_>>;
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult;
 }
 
 const KEY_BYTES: usize = 4096;
