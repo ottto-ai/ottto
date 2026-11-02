@@ -65,254 +65,239 @@ fn offer(
     calls
 }
 
-/// [regress] Older activity and mixed usage are owed for every source; exact
-/// refused bytes are suppressed even after exhaustion and a quiet restart.
-/// A changed body has one offer and acquires its own suppression, never an ACK.
+/// [regress] The observed timestamp refusal remains owed through exhaustion;
+/// exact revisions stay suppressed, while a changed body receives one offer.
 #[test]
 #[serial_test::serial(client_report)]
 fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
-    for source in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ] {
-        for reason in [STALE, MIXED] {
-            let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-            item.cache_observations = None;
-            item.session_account_evidence = None;
-            item.snapshot_fingerprint = fp(1);
-            let mut progress = ledger(source);
-            assert_eq!(offer(&item, source, reason, &mut progress), 1);
-            let body = snapshot_upload_body_witness(&item);
-            assert!(progress.stale_body(&item.snapshot_fingerprint, &body));
-            assert_eq!(PermanentRefusalCounts::of(&progress).dominated, 0);
-            assert!(!RejectedUsageReason::AcceptedLogStaleOlderUpload.is_dominated());
-            for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES + 1 {
-                progress.quarantine_body(&item.snapshot_fingerprint, &body);
-            }
-            progress.hold_unstored_body(&item.snapshot_fingerprint, &body);
-            progress.prepare_quarantine_retries(&BTreeMap::new());
-            assert_eq!(
-                progress.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
-                SnapshotQuarantineDisposition::RetryPending
-            );
-            assert!(progress.active_quarantine_retries.is_empty());
-            assert_eq!(offer(&item, source, reason, &mut progress), 0);
-            let encoded = serde_json::to_vec(&progress).unwrap();
-            let mut restored: SnapshotUploadProgress = serde_json::from_slice(&encoded).unwrap();
-            restored.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
-            restored.prepare_quarantine_retries(&BTreeMap::new());
-            assert_eq!(offer(&item, source, reason, &mut restored), 0);
-            item.tool_usage_truncated = !item.tool_usage_truncated;
-            assert_eq!(offer(&item, source, reason, &mut restored), 1);
-            assert_eq!(offer(&item, source, reason, &mut restored), 0);
-            assert!(restored.accepted_fingerprints.is_empty());
-            let rows = census(&ScanIndex::default(), &restored, current_unix_seconds());
-            assert_eq!(rows.values().map(|c| c.entities).sum::<usize>(), 2);
-            assert_eq!(rows.values().map(|c| c.unknown_requests).sum::<usize>(), 0);
-            assert_eq!(
-                rows.values().map(|c| c.known_requests).sum::<u64>(),
-                item.request_count * 2
-            );
-            assert_eq!(
-                rows.values().map(|c| c.known_tokens).sum::<u64>(),
-                (item.input_tokens + item.output_tokens + item.unattributed_total_tokens) * 2
-            );
-            let encoded = serde_json::to_vec(&restored).unwrap();
-            restored = serde_json::from_slice(&encoded).unwrap();
-            restored.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
-            let old_body = body;
-            assert!(restored.contains_body(&item.snapshot_fingerprint, &old_body));
-            let mut returned = item.clone();
-            returned.tool_usage_truncated = !returned.tool_usage_truncated;
-            assert_eq!(offer(&returned, source, reason, &mut restored), 0);
-            assert!(cache_head_probe_held(
-                &restored,
-                &cache_head_probe(&returned)
-            ));
-            let new_body = snapshot_upload_body_witness(&item);
-            restored.record_body(&item.snapshot_fingerprint, &new_body);
-            assert!(restored.stale_body(&item.snapshot_fingerprint, &old_body));
-            restored.record_body(&item.snapshot_fingerprint, &old_body);
-            assert!(!restored.stale_body(&item.snapshot_fingerprint, &old_body));
-        }
+    let source = SnapshotSource::ClaudeCode;
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.cache_observations = None;
+    item.session_account_evidence = None;
+    item.snapshot_fingerprint = fp(1);
+    let mut progress = ledger(source);
+    assert_eq!(offer(&item, source, STALE, &mut progress), 1);
+    let old_body = snapshot_upload_body_witness(&item);
+    assert!(!RejectedUsageReason::AcceptedLogStaleOlderUpload.is_dominated());
+    assert_eq!(PermanentRefusalCounts::of(&progress).dominated, 0);
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES + 1 {
+        progress.quarantine_body(&item.snapshot_fingerprint, &old_body);
     }
+    progress.hold_unstored_body(&item.snapshot_fingerprint, &old_body);
+    progress.prepare_quarantine_retries(&BTreeMap::new());
+    assert_eq!(
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(progress.active_quarantine_retries.is_empty());
+    assert_eq!(offer(&item, source, STALE, &mut progress), 0);
+    let mut restored: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+    restored.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
+    item.tool_usage_truncated = !item.tool_usage_truncated;
+    assert_eq!(offer(&item, source, STALE, &mut restored), 1);
+    assert_eq!(offer(&item, source, STALE, &mut restored), 0);
+    assert!(restored.contains_body(&item.snapshot_fingerprint, &old_body));
+    assert!(restored.accepted_fingerprints.is_empty());
+    let new_body = snapshot_upload_body_witness(&item);
+    restored.record_body(&item.snapshot_fingerprint, &new_body);
+    assert!(restored.stale_body(&item.snapshot_fingerprint, &old_body));
+    restored.record_body(&item.snapshot_fingerprint, &old_body);
+    assert!(!restored.stale_body(&item.snapshot_fingerprint, &old_body));
+    // Mixed uses ordinary non-permanent custody, never permanent Other.
+    let mut mixed = ledger(source);
+    assert_eq!(offer(&item, source, MIXED, &mut mixed), 1);
+    assert!(mixed.permanent_rejections.is_empty());
+    assert_eq!(
+        mixed.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
 }
 
-/// [format] Pre-extension state round-trips without adding defaults or changing
-/// enum vocabulary; mixed classification is additive and never a daily Other offer.
+/// [format] Old exact JSON is unchanged; an invalid optional observation is
+/// isolated from the refusal, just like the existing re-offer extension.
 #[test]
 fn old_state_decode_keeps_canonical_bytes_and_legacy_unknowns() {
-    let old =
-        serde_json::json!({"body_witness": fp(2), "reason": "accepted_log_stale_older_upload"});
+    let old = serde_json::json!({"body_witness": fp(2), "reason": STALE});
     let refusal: PermanentSnapshotRejection = serde_json::from_value(old.clone()).unwrap();
     assert_eq!(serde_json::to_value(&refusal).unwrap(), old);
-    assert!(refusal.is_stale());
     assert!(refusal.exposure.is_none());
-    let mut progress = ledger(SnapshotSource::Pi);
+    let progress = ledger(SnapshotSource::ClaudeCode);
     let old_progress = serde_json::to_value(&progress).unwrap();
-    assert!(old_progress.get("stale_reopen_consumed").is_none());
     let decoded: SnapshotUploadProgress = serde_json::from_value(old_progress.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), old_progress);
-    progress.permanent_rejections.insert(fp(1), refusal);
-    let rows = census(&ScanIndex::default(), &progress, current_unix_seconds());
-    let row = rows.get(&(STALE.into(), "unknown")).unwrap();
+    let mut invalid = old.clone();
+    invalid["exposure"] = serde_json::json!({"requests": "invalid"});
+    let decoded: PermanentSnapshotRejection = serde_json::from_value(invalid).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), old);
     assert_eq!(
-        (
-            row.entities,
-            row.unknown_requests,
-            row.unknown_tokens,
-            row.unknown_age
-        ),
-        (1, 1, 1, 1)
+        entity_hash("claude_code", "machine-example", "session-example"),
+        "2fe67006"
     );
-    progress.quarantine_permanent_body(&fp(3), &fp(4), MIXED);
-    let mixed = &progress.permanent_rejections[&fp(3)];
-    assert_eq!(mixed.reason, RejectedUsageReason::Other);
-    assert_eq!(
-        mixed.reoffer,
-        Some(reason_reoffer::RefusalReoffer::Classified)
-    );
-    assert!(mixed.is_stale());
 }
 
-/// [regress] Legacy terminal and progress-only refusals remain unchanged without
-/// the explicit action. A persisted action gives one paced acquisition, consumes
-/// before I/O, survives restart and never grants permission to resend the body.
+/// [regress] Receipt-covered entities supersede without acquisition. Only the
+/// explicitly owed entities get one paced Full; native results use the shared
+/// money oracle. No input, unlisted input, restart and a later trigger conserve debt.
 #[test]
 #[serial_test::serial(client_report)]
-fn reopen_is_explicit_paced_and_durably_once() {
-    let root = std::env::temp_dir().join(format!(
-        "ottto-stale-once-{}-{}",
-        std::process::id(),
-        fp(current_unix_seconds())
-    ));
+fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
+    let scratch = crate::test_scratch::ScratchDir::new("stale-head-compare");
+    let path = scratch.join("progress.json");
+    let root = scratch.join("sources");
     std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("progress.json");
-    let input = root.join("source");
-    std::fs::create_dir(&input).unwrap();
-    let session_path = input.join("session.jsonl");
-    std::fs::write(&session_path, concat!(
-        "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-08-31T08:00:00Z\"}\n",
-        "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1788163201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-    )).unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let collected = "2026-10-25T07:01:00Z";
+    for n in 0..67 {
+        let session = format!("session-{n:02}");
+        std::fs::write(root.join(format!("{session}.jsonl")), format!("{}\n", serde_json::json!({
+            "timestamp":"2026-10-25T07:00:00Z", "type":"assistant", "sessionId":session,
+            "requestId":format!("req-{n}"), "message":{"id":format!("msg-{n}"), "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}
+        }))).unwrap();
+    }
     let mut index = ScanIndex::default();
-    let collected = "2026-09-01T03:27:03Z";
     let mut first = crate::snapshots::scan_source_roots(
-        SnapshotSource::Pi,
-        std::slice::from_ref(&input),
+        source,
+        &[root.clone()],
         &mut index,
         collected,
         crate::snapshots::BACKFILL_WINDOW_DAYS,
     )
     .unwrap();
-    crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
-    let entity = first.snapshots[0].snapshot_fingerprint.clone();
-    let body = snapshot_upload_body_witness(&first.snapshots[0]);
-    let mut progress = ledger(SnapshotSource::Pi);
-    for (key, refused_body) in [(&entity, &body), (&fp(2), &fp(12))] {
-        progress.permanent_rejections.insert(
-            key.clone(),
-            PermanentSnapshotRejection {
-                body_witness: refused_body.clone(),
-                reason: RejectedUsageReason::AcceptedLogStaleOlderUpload,
-                reoffer: None,
-                exposure: None,
-            },
-        );
+    crate::snapshots::finalize_scan_after_policy(source, &mut first, &mut index);
+    assert_eq!(first.snapshots.len(), 67);
+    let mut progress = ledger(source);
+    let mut entries = Vec::new();
+    let mut owed_items = Vec::new();
+    for item in &first.snapshots {
+        let n: usize = item
+            .source_session_id
+            .strip_prefix("session-")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let fp = &item.snapshot_fingerprint;
+        let body = snapshot_upload_body_witness(item);
+        progress.quarantine_permanent_body(fp, &body, STALE);
+        progress.permanent_rejections.get_mut(fp).unwrap().exposure = None;
+        progress
+            .quarantined_fingerprints
+            .get_mut(fp)
+            .unwrap()
+            .disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        if n == 66 {
+            continue;
+        }
+        if n >= 63 {
+            owed_items.push(item.clone());
+        }
+        entries.push(serde_json::json!({"entity_hash":entity_hash(source.api_slug(), "synthetic", &item.source_session_id),
+            "source_session_id":item.source_session_id, "snapshot_fingerprint":fp, "body_witness":body,
+            "verdict":if n < 63 {"covered"} else {"owed"}}));
     }
-    progress.quarantine_permanent_body(&entity, &fp(99), STALE);
-    progress.quarantine_body(&entity, &body);
-    let record = progress.quarantined_fingerprints.get_mut(&entity).unwrap();
-    record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-    record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     let before = serde_json::to_value(&progress).unwrap();
-    assert!(!progress.reopen_stale_once(&path).unwrap());
-    progress.prepare_quarantine_retries(&BTreeMap::new());
+    assert!(!progress
+        .reopen_stale_once(&path, source, "synthetic", &mut index)
+        .unwrap());
     assert_eq!(serde_json::to_value(&progress).unwrap(), before);
-    std::fs::write(path.with_extension("stale-older-reopen-once"), b"").unwrap();
-    assert!(progress.reopen_stale_once(&path).unwrap());
-    progress.save(&path).unwrap();
-    progress.prepare_quarantine_retries(&BTreeMap::new());
+    assert_eq!(
+        progress
+            .refusal_exposure(current_unix_seconds())
+            .owed_entities,
+        67
+    );
+    let marker = path.with_extension("stale-older-reopen-once");
+    let mut request = serde_json::json!({"nonce":"first", "entities":entries});
+    std::fs::write(&marker, serde_json::to_vec(&request).unwrap()).unwrap();
+    assert!(progress
+        .reopen_stale_once(&path, source, "synthetic", &mut index)
+        .unwrap());
+    assert_eq!(index.snapshot_superseded_terminal_count(), 63);
+    assert_eq!(
+        progress
+            .refusal_exposure(current_unix_seconds())
+            .owed_entities,
+        4
+    );
+    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     assert!(
         progress.active_quarantine_retries.is_empty(),
-        "existing pacing applies"
+        "ordinary pacing"
     );
-    for record in progress.quarantined_fingerprints.values_mut() {
-        record.retry_after_unix_seconds = 0;
+    for r in progress.quarantined_fingerprints.values_mut() {
+        r.retry_after_unix_seconds = 0;
     }
-    progress.save(&path).unwrap();
-    let mut restored = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::Pi),
-    )
-    .unwrap();
-    assert!(!restored.reopen_stale_once(&path).unwrap());
-    assert!(restored.prepare_quarantine_retries(&BTreeMap::new()));
-    restored.save(&path).unwrap();
-    assert_eq!(restored.active_quarantine_retries.len(), 2);
-    assert!(restored.contains_body(&entity, &body));
-    assert!(restored.contains_body(&fp(2), &fp(12)));
+    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    assert_eq!(progress.active_quarantine_retries.len(), 3);
     let hints =
-        save_terminal_contract_claims_for_scan(&mut index, &restored, &root.join("index.json"))
+        save_terminal_contract_claims_for_scan(&mut index, &progress, &scratch.join("index.json"))
             .unwrap();
-    assert_eq!(hints, vec![session_path.clone()]);
+    assert_eq!(hints.len(), 3);
+    assert!(progress.record_stale_acquisitions(&index));
+    progress.save(&path).unwrap();
     let (mut fresh, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
         crate::snapshots::scan_source_roots_with_test_limit_and_hints(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&input),
+            source,
+            &[root.clone()],
             &mut index,
             collected,
             crate::snapshots::BACKFILL_WINDOW_DAYS,
-            1,
+            67,
             true,
             &hints,
         )
         .unwrap()
     });
-    crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut fresh, &mut index);
-    assert_eq!(reads.get(&session_path), Some(&1), "one fresh acquisition");
-    assert_eq!(reads.values().sum::<usize>(), 1);
-    assert_eq!(fresh.snapshots.len(), 1);
-    assert_eq!(
-        offer(
-            &fresh.snapshots[0],
-            SnapshotSource::Pi,
-            STALE,
-            &mut restored
-        ),
-        0
-    );
-    let mut again = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::Pi),
-    )
-    .unwrap();
-    assert!(!again.reopen_stale_once(&path).unwrap());
-    again.prepare_quarantine_retries(&BTreeMap::new());
-    assert!(
-        again.active_quarantine_retries.is_empty(),
-        "crash cannot renew the claim"
-    );
-    assert_eq!(again.quarantined_fingerprints.len(), 2);
-    index.activate_reason_reoffer_cooldowns(again.reason_reoffer_cooldowns(current_unix_seconds()));
-    index.activate_terminal_contract_retries(BTreeSet::new());
-    index.activate_stale_reopen_retries(BTreeSet::new());
-    let (_, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-        crate::snapshots::scan_source_roots_with_test_limit_and_hints(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&input),
-            &mut index,
-            collected,
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            1,
-            true,
-            &[],
+    crate::snapshots::finalize_scan_after_policy(source, &mut fresh, &mut index);
+    assert_eq!(reads.len(), 3);
+    assert_eq!(reads.values().sum::<usize>(), 3);
+    assert_eq!(fresh.snapshots.len(), 3);
+    let route = |mode, items: &[SnapshotItem]| {
+        let mut ordered = items.to_vec();
+        ordered.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+        let request = snapshot_batch_request(
+            source,
+            "synthetic",
+            ordered,
+            SnapshotUploadPolicy::default(),
+            crate::client_report::ClientReport::empty(),
+        );
+        RouteResult::emitted(
+            mode,
+            source,
+            vec![serde_json::to_vec(&request).unwrap()],
+            items,
         )
-        .unwrap()
-    });
-    assert!(reads.is_empty(), "no timer renewal after the one-shot");
-    std::fs::remove_dir_all(root).unwrap();
+    };
+    money_oracle::assert_equivalent(
+        &route(Mode::ColdFull, &owed_items),
+        &route(Mode::Restart, &fresh.snapshots),
+    );
+    for item in &fresh.snapshots {
+        assert_eq!(offer(item, source, STALE, &mut progress), 0);
+    }
+    let mut restored =
+        SnapshotUploadProgress::load(&path, &"a".repeat(64), snapshot_quarantine_witness(source))
+            .unwrap();
+    assert!(!restored
+        .reopen_stale_once(&path, source, "synthetic", &mut index)
+        .unwrap());
+    restored.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    assert!(
+        restored.active_quarantine_retries.is_empty(),
+        "recorded attempt cannot renew itself"
+    );
+    request["nonce"] = "later-explicit-action".into();
+    std::fs::write(&marker, serde_json::to_vec(&request).unwrap()).unwrap();
+    assert!(restored
+        .reopen_stale_once(&path, source, "synthetic", &mut index)
+        .unwrap());
+    assert_eq!(
+        restored
+            .refusal_exposure(current_unix_seconds())
+            .owed_entities,
+        4
+    );
 }

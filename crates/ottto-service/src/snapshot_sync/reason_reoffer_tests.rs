@@ -53,6 +53,7 @@ fn refused(
             fp(*value),
             PermanentSnapshotRejection {
                 exposure: None,
+                revisions: BTreeMap::new(),
                 body_witness: body(*value),
                 reason: crate::upload_receipts::RejectedUsageReason::Other,
                 reoffer: *reoffer,

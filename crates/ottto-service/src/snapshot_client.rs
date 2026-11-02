@@ -886,6 +886,10 @@ impl SnapshotEntityRejection {
         )
     }
 
+    pub(crate) fn ordinary_retryable(&self) -> bool {
+        self.safe_reason() == "accepted_log_stale_older_mixed"
+    }
+
     pub(crate) fn safe_reason(&self) -> &'static str {
         match self.reason.as_str() {
             "reserved_session_identity_separator" => "reserved_session_identity_separator",
@@ -1068,10 +1072,11 @@ impl SnapshotBatchResponse {
     /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
     fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
-        for rejection in self.rejected_entities.iter().filter(|r| !r.permanent) {
-            if rejection.safe_reason() == "accepted_log_stale_older_mixed" {
-                continue;
-            }
+        for rejection in self
+            .rejected_entities
+            .iter()
+            .filter(|r| !r.permanent && r.usage_decrease_hold())
+        {
             let held_literal = declared
                 && request.snapshots.iter().any(|item| {
                     item.source_session_id == rejection.source_session_id
@@ -1233,7 +1238,7 @@ impl SnapshotBatchResponse {
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent
                 && !rejection.usage_decrease_hold()
-                && rejection.safe_reason() != "accepted_log_stale_older_mixed"
+                && !rejection.ordinary_retryable()
             {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }

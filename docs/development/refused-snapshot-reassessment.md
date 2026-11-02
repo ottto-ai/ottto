@@ -1,45 +1,64 @@
 # Refused snapshot reassessment
 
 An older activity timestamp does not prove that accepted usage covers a refused
-snapshot. `accepted_log_stale_older_upload` and
-`accepted_log_stale_older_mixed` remain owed. The mixed reply may be non-permanent;
-it is recognized for Claude, Codex and Pi independently of request-owned usage
-contracts. Refusals and body witnesses remain in the destination's upload ledger.
-An identical refused body is suppressed. Input changes can produce a new body
-and one new offer. Parser labels, elapsed time and exhausted retries grant no
-permission to resend refused bytes.
+snapshot. `accepted_log_stale_older_upload` remains owed and its exact refused
+bytes stay suppressed. Input changes can produce a new body and one new offer.
+`accepted_log_stale_older_mixed` uses ordinary non-permanent retry custody.
+These reply paths are shared by Claude, Codex and Pi; the observed timestamp
+refusal and the head-comparison operator action currently concern Claude.
 
-Existing terminal records retain their disposition until explicitly reassessed.
-For a one-time reassessment, the local data owner creates a regular file beside
-that source's destination-scoped upload-progress JSON, replacing its `.json`
-extension with `.stale-older-reopen-once`. Symlinks and non-files grant nothing.
-The marker is an operator action, not a persistent feature switch. Removing it
-does not cancel already saved work. Leaving it present or recreating it cannot
-renew the action. No daemon restart is required.
+Existing terminal records retain their disposition without an operator action.
+They remain counted as owed. To apply a server head comparison, place a regular
+JSON file beside the destination/source upload-progress JSON, replacing its
+`.json` extension with `.stale-older-reopen-once`:
 
-On the next ordinary source cycle, the upload ledger atomically records the
-action as consumed and marks retained stale refusals non-terminal and pending
-one reconstruction. Each pending record uses the existing paced retry budget.
-Before source acquisition, its claim is saved; a failed save prevents reading.
-Unchanged bytes remain suppressed even during this acquisition. Source holds
-and interrupted claims remain owed and visible; they do not gain timer-based
-renewal. This action clears no ACK, proof, identity or refusal evidence and
-changes no server acceptance rule. A changed-body ACK alone does not erase an
-older refused revision without coverage evidence.
+```json
+{
+  "nonce": "unique-operator-action",
+  "entities": [{
+    "entity_hash": "2fe67006",
+    "source_session_id": "session-example",
+    "snapshot_fingerprint": "<64 lowercase hex from the retained record>",
+    "body_witness": "<64 lowercase hex from that exact refusal>",
+    "verdict": "covered"
+  }]
+}
+```
 
-`owed_exposure` page diagnostics and a daily summary on the next source cycle
-report distinct entities by source, refusal reason and age bucket. Snapshot
-mirrors and resolvable authority member aliases are combined before counting.
-Unresolved body revisions stay separate; an identical mirror counts once.
-Known request and token counts are reported separately from unknown counts.
-Token totals respect the body's declared cached-input scope.
-Legacy age remains unknown; observation time is never substituted for it.
-A rising entity count or oldest known age emits a local alarm. These diagnostics
-do not gate, cap, wake, settle or retire work.
+The entity hash is the first eight lowercase hex digits of SHA-256 of the UTF-8
+source slug, machine identifier and source session identifier, separated by byte
+`0x1f`. The example hash uses `claude_code`, `machine-example` and
+`session-example`. Supply the verdict from the server's per-entity head
+comparison; activity order is never coverage proof. Use `owed` when any portion
+has no coverage proof, including unknown hour/model grains. Unlisted records
+retain their disposition and debt. Symlinks, invalid bindings and a body that
+has since changed grant no action. The list is validated before it is applied.
 
-Older stale revisions retain their own body witnesses and exposure when a later
-body is refused. Only exact acknowledgement clears that revision's debt.
+A `covered` verdict marks the exact retained revision `superseded_terminal`
+without reading a source or creating an ACK. An `owed` verdict sets the existing
+quarantine to `retry_pending` and requests one fresh Full through existing
+pacing and the existing shared per-cycle retry limit. It does not resend
+identical refused bytes. The claim remains pending until an owning acquisition
+lease is recorded; a failed save prevents acquisition. The last nonce and
+pending claims are durable, so leaving the file present does not renew them.
+A later explicit action uses a new nonce. There is no timer, new cap or ongoing
+OFF switch. The action records an attempt, never discharges the remaining debt.
+Input changes and subsequent server answers retain their ordinary behavior.
 
-The state extensions are optional, default absent, and omitted when absent.
-Existing disposition and reason enum values are unchanged. No schema or parser
-version changes are required.
+Exact refused revisions stay with the existing refusal owner. A changed-body
+ACK does not establish coverage of another revision. Proof, identity, ACK
+custody and server acceptance authority are unchanged.
+
+Existing refusal counters, `native_collection_page` and `source_finish` records
+carry scalar owed count, known requests/tokens, unknown counts and oldest known
+age. Existing terminal counters remain alongside them. Overlapping revisions
+count as one entity; known usage describes one retained revision, not the sum of
+overlapping bodies. Tokens respect the declared cached-input scope. Missing age
+stays unknown. The existing per-source last-line counter emits an alarm when the
+owed count or oldest known age rises. Page and finish records also support daily inspection; there is
+no separate daily replay, observation window, history or age bucket structure.
+Diagnostics gate and retire nothing.
+
+State extensions default absent and are omitted when empty. Existing reason and
+disposition vocabulary, schema and parser versions are unchanged. A malformed
+optional exposure observation cannot discard its owning refusal.

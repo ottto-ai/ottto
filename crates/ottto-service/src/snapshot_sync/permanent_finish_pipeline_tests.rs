@@ -242,14 +242,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
-    let owed_stale = matches!(
-        outcome,
-        FinishOutcome::Dominated {
-            reason: "accepted_log_stale_older_upload",
-            ..
-        }
-    );
-    let expected_valid = expected_valid && !owed_stale;
     let cycles = if outcome.retains_refusal_across_quiet_cycles() {
         3
     } else {
@@ -274,7 +266,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         })
         .unwrap()
         .expect("real due native preparation");
-        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2 && !owed_stale,
+        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
         "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
@@ -314,7 +306,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         });
         assert_eq!(
             result.is_ok(),
-            !matches!(outcome, FinishOutcome::Retryable) && !owed_stale,
+            !matches!(outcome, FinishOutcome::Retryable),
             "{outcome:?}: {result:?}"
         );
         // A held entity has its own quarantine clock: no finished cycle,
@@ -360,11 +352,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             terminal[cycle]["last_error_code"],
             match outcome {
                 FinishOutcome::Retryable => "server_error",
-                // A timestamp-only refusal is owed and keeps the retryable status.
-                FinishOutcome::Dominated {
-                    reason: "accepted_log_stale_older_upload",
-                    ..
-                } => "server_error",
+                // The refused body is settled unproven-terminal residue; the
+                // server already owns a better or newer record for it.
                 FinishOutcome::Dominated {
                     admit_residue: true,
                     ..
@@ -379,24 +368,16 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             },
             "{outcome:?}, cycle {cycle}"
         );
-        if let FinishOutcome::Dominated {
-            reason,
-            admit_residue,
-        } = outcome
-        {
-            let dominated = reason != "accepted_log_stale_older_upload";
-            assert_eq!(terminal[cycle]["last_census_residue_settled"], dominated);
-            assert_eq!(
-                terminal[cycle]["last_snapshot_unproven_terminal_count"],
-                u64::from(dominated)
-            );
+        if let FinishOutcome::Dominated { admit_residue, .. } = outcome {
+            assert_eq!(terminal[cycle]["last_census_residue_settled"], true);
+            assert_eq!(terminal[cycle]["last_snapshot_unproven_terminal_count"], 1);
             assert_eq!(
                 terminal[cycle]["consecutive_failures"],
-                u64::from(!admit_residue || !dominated)
+                u64::from(!admit_residue)
             );
             assert_eq!(
                 terminal[cycle]["last_success_at"].is_string(),
-                admit_residue && dominated
+                admit_residue
             );
         }
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
@@ -478,17 +459,15 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
 
-/// [regress] Authority refusals retain their residue status; older activity
-/// alone stays owed on the first refusal and quiet cycles, never dominated.
+/// The page's only permanent refusals are dominated, no holds. The
+/// first refusal and both quiet retained cycles report settled residue, never
+/// `backend_validation_error`, and the native lease outcome is unchanged.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
-    for reason in [
-        "usage_accounting_authority_downgrade",
-        "accepted_log_stale_older_upload",
-    ] {
+    for reason in ["usage_accounting_authority_downgrade"] {
         permanent_finish_pipeline(
             FinishOutcome::Dominated {
                 reason,

@@ -3713,6 +3713,13 @@ pub(crate) struct UploadAckRetirementHandoff {
 
 /// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
 /// each new field's save rule there (serde `skip_serializing*` keys here are inert).
+#[derive(Debug, Clone)]
+struct QuarantineRetryLease {
+    file: String,
+    fresh_full: bool,
+}
+crate::heap_layout_bound::fields!(QuarantineRetryLease; file, fresh_full);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
     /// V2-only custody and growth debt; absent on ordinary v1 paths.
@@ -4141,10 +4148,9 @@ pub struct ScanIndex {
     /// Runtime file owners for this cycle's quarantine retries. Contract-origin
     /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
-    terminal_contract_retries: BTreeMap<String, String>,
-    /// Runtime-only entities whose durably claimed operator action requires a fresh Full.
+    terminal_contract_retries: BTreeMap<String, QuarantineRetryLease>,
     #[serde(skip)]
-    stale_reopen_retries: BTreeSet<String>,
+    pub(crate) refusal_exposure: crate::local_resource_diagnostics::RefusalExposure,
     /// Runtime-only: this index's path was loaded in this process with no
     /// verified prior history (missing, quarantined, or generation 0 with no
     /// files), so a census absence there is not positive and retires nothing.
@@ -4548,7 +4554,7 @@ impl Default for ScanIndex {
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
             terminal_contract_retries: BTreeMap::new(),
-            stale_reopen_retries: BTreeSet::new(),
+            refusal_exposure: Default::default(),
             claude_history_unverified_in_process: false,
             claude_rebuild_read_load_eligible: false,
             reason_reoffer_cooldowns: BTreeMap::new(),
@@ -27233,6 +27239,7 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
+        resource_probe.refusal_exposure = Some(owned_index.refusal_exposure);
         let index = &mut owned_index;
         if source == SnapshotSource::ClaudeCode {
             // Restore population disclosure even before a restarted/evicted
@@ -27399,7 +27406,7 @@ impl OwnedSourceScan {
             let due_retries = index
                 .terminal_contract_retries
                 .values()
-                .map(Path::new)
+                .map(|lease| Path::new(&lease.file))
                 .collect::<BTreeSet<_>>();
             traversal.pending_candidates.retain(|candidate| {
                 let due = pending_paths.len() < selection_limit
@@ -34954,7 +34961,7 @@ impl OwnedSourceScan {
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
                             && !forced_family
-                            && !index.stale_reopen_leased(&key)
+                            && !index.reason_reoffer_leased(&key)
                             && !comparison_target
                             && !parent_proof_required;
                         context
@@ -52087,47 +52094,6 @@ impl ScanIndex {
         }
     }
 
-    /// Counts-only diagnostics resolve member aliases through the existing entity incidence.
-    pub(crate) fn authority_owed_snapshot_fingerprints(&self) -> (BTreeSet<&str>, usize) {
-        let mut entities = BTreeSet::new();
-        let mut unbound = self
-            .claude_usage_authority_quarantine
-            .iter()
-            .map(|(root, record)| {
-                (
-                    root.as_str(),
-                    record
-                        .member_source_file_fingerprints
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<BTreeSet<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (key, fingerprints) in &self.file_snapshot_fingerprints {
-            if unbound.is_empty() {
-                break;
-            }
-            let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
-                continue;
-            };
-            if !fingerprints.is_empty()
-                && unbound
-                    .get_mut::<str>(root.as_str())
-                    .is_some_and(|members| members.remove::<str>(member.as_str()))
-            {
-                entities.extend(fingerprints.iter().map(String::as_str));
-                if unbound
-                    .get::<str>(root.as_str())
-                    .is_some_and(BTreeSet::is_empty)
-                {
-                    unbound.remove::<str>(root.as_str());
-                }
-            }
-        }
-        (entities, unbound.values().map(BTreeSet::len).sum())
-    }
-
     pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {
         self.quarantined_snapshot_fingerprints
             .values()
@@ -52370,23 +52336,18 @@ impl ScanIndex {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
     }
 
-    pub(crate) fn activate_stale_reopen_retries(&mut self, leases: BTreeSet<String>) {
-        self.stale_reopen_retries = leases;
-    }
-
-    fn stale_reopen_leased(&self, key: &str) -> bool {
-        self.file_snapshot_fingerprints
-            .get(key)
-            .is_some_and(|entities| {
-                entities
-                    .iter()
-                    .any(|entity| self.stale_reopen_retries.contains(entity))
-            })
-    }
-
+    #[cfg(test)]
     pub(crate) fn activate_terminal_contract_retries(
         &mut self,
         leases: BTreeSet<String>,
+    ) -> Vec<PathBuf> {
+        self.activate_terminal_contract_retries_with_mode(leases, &BTreeSet::new())
+    }
+
+    pub(crate) fn activate_terminal_contract_retries_with_mode(
+        &mut self,
+        leases: BTreeSet<String>,
+        fresh_full: &BTreeSet<String>,
     ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
@@ -52395,17 +52356,36 @@ impl ScanIndex {
             for fingerprint in fingerprints.intersection(&leases) {
                 self.terminal_contract_retries
                     .entry(fingerprint.clone())
-                    .or_insert_with(|| key.clone());
+                    .or_insert_with(|| QuarantineRetryLease {
+                        file: key.clone(),
+                        fresh_full: fresh_full.contains(fingerprint),
+                    });
             }
         }
         // Use the same revalidated candidate admission as exact refusal re-offers.
         // Distinct entities in one file and duplicate incidences own one hint.
         self.terminal_contract_retries
             .values()
+            .map(|lease| &lease.file)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .map(PathBuf::from)
             .collect()
+    }
+
+    /// Canonical local entity incidence binds a supplied head comparison.
+    pub(crate) fn stale_comparison_binds_entity(&self, session: &str, fp: &str) -> bool {
+        self.file_snapshot_fingerprints
+            .iter()
+            .any(|(path, entities)| {
+                entities.contains(fp)
+                    && claude_index_path_member_ref(Path::new(path))
+                        .is_some_and(|m| m.matches_member(session))
+            })
+    }
+
+    pub(crate) fn quarantine_retry_has_owner(&self, fingerprint: &str) -> bool {
+        self.terminal_contract_retries.contains_key(fingerprint)
     }
 
     /// A leased file still queued for a bounded page has not reached a hold.
@@ -52417,7 +52397,7 @@ impl ScanIndex {
                     .iter()
                     .flat_map(|traversal| traversal.pending_candidates.iter())
                     .chain(self.claude_stale_family_carry.replay.iter())
-                    .any(|pending| pending.path == Path::new(key))
+                    .any(|pending| pending.path == Path::new(&key.file))
             })
     }
 
@@ -52443,6 +52423,14 @@ impl ScanIndex {
 
     /// This cycle leased the file's snapshot for a reason re-offer.
     fn reason_reoffer_leased(&self, key: &str) -> bool {
+        if self
+            .terminal_contract_retries
+            .values()
+            .any(|lease| lease.fresh_full && lease.file == key)
+        {
+            return true;
+        }
+
         !self.reason_reoffer_retries.is_empty()
             && self
                 .file_snapshot_fingerprints
@@ -52562,7 +52550,7 @@ impl ScanIndex {
             && self
                 .terminal_contract_retries
                 .get(fingerprint)
-                .map_or(true, |owner| owner == key)
+                .map_or(true, |owner| owner.file == key)
             && !self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
@@ -54823,7 +54811,7 @@ impl ScanIndex {
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
             terminal_contract_retries: self.terminal_contract_retries.clone(),
-            stale_reopen_retries: self.stale_reopen_retries.clone(),
+            refusal_exposure: self.refusal_exposure,
             claude_history_unverified_in_process: self.claude_history_unverified_in_process,
             claude_rebuild_read_load_eligible: self.claude_rebuild_read_load_eligible,
             reason_reoffer_cooldowns: self.reason_reoffer_cooldowns.clone(),

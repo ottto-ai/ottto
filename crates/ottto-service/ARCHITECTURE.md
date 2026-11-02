@@ -27,6 +27,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
   accepted, and parts the server did accept stay recorded.
 
+Timestamp-only refusals remain owed with exact-body suppression. A server head
+comparison can explicitly supersede a covered revision or trigger one paced Full
+for an owed revision; see [refusal reassessment](../../docs/development/refused-snapshot-reassessment.md).
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and

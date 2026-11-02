@@ -659,6 +659,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
         fingerprint,
         PermanentSnapshotRejection {
             exposure: None,
+            revisions: BTreeMap::new(),
             body_witness: body,
             reason: crate::upload_receipts::RejectedUsageReason::Other,
             reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {

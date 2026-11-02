@@ -1,151 +1,108 @@
-//! Refusal exposure and a destination-local, durably consumed operator action.
-//! No acceptance evidence or scheduler lives here. All diagnostics are counts.
+//! Exact refusal revisions and an explicit, receipt-bound operator trigger.
 use super::*;
 use crate::upload_receipts::RejectedUsageReason;
 
 pub(super) fn is_stale_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "accepted_log_stale_older_upload" | "accepted_log_stale_older_mixed"
-    )
+    reason == "accepted_log_stale_older_upload"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Exposure {
-    /// None for legacy records: observation today cannot establish their age.
     first_held_unix: Option<u64>,
     requests: Option<u64>,
     tokens: Option<u64>,
-    /// The old reason vocabulary remains `other` for this retryable reason.
-    mixed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) covered: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) reopen_pending: bool,
 }
 impl Exposure {
-    pub(super) fn new(reason: &str, now: u64) -> Self {
+    pub(super) fn new(now: u64) -> Self {
         Self {
             first_held_unix: Some(now),
             requests: None,
             tokens: None,
-            mixed: reason == "accepted_log_stale_older_mixed",
+            covered: false,
             reopen_pending: false,
         }
     }
     fn legacy() -> Self {
         Self {
             first_held_unix: None,
-            ..Self::new("", 0)
+            ..Self::new(0)
         }
     }
 }
-crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens, mixed, reopen_pending);
+/// An invalid optional observation cannot discard the refusal that owns it.
+pub(super) fn decode_exposure<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Exposure>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
+crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens, covered, reopen_pending);
 
 impl PermanentSnapshotRejection {
     pub(super) fn is_stale(&self) -> bool {
         self.reason == RejectedUsageReason::AcceptedLogStaleOlderUpload
-            || self.exposure.as_ref().is_some_and(|e| e.mixed)
     }
-    fn reason_label(&self) -> String {
-        if self.exposure.as_ref().is_some_and(|e| e.mixed) {
-            "accepted_log_stale_older_mixed".into()
-        } else {
-            // An enum serialization, never a server-provided diagnostic label.
-            serde_json::to_value(self.reason)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "other".into())
-        }
+    pub(super) fn refused_body(&self, body: &str) -> bool {
+        self.body_witness == body || self.revisions.contains_key(body)
+    }
+    pub(super) fn owed(&self) -> bool {
+        self.is_stale() && !self.exposure.as_ref().is_some_and(|e| e.covered)
     }
 }
 impl SnapshotUploadProgress {
-    pub(super) fn refused_body(&self, fingerprint: &str, body: &str) -> bool {
+    pub(super) fn refused_body(&self, fp: &str, body: &str) -> bool {
         self.permanent_rejections
-            .get(fingerprint)
-            .is_some_and(|r| r.body_witness == body)
-            || self
-                .retained_stale_rejections
-                .get(fingerprint)
-                .is_some_and(|revisions| revisions.contains_key(body))
+            .get(fp)
+            .is_some_and(|r| r.refused_body(body))
     }
-
-    pub(super) fn stale_body(&self, fingerprint: &str, body: &str) -> bool {
-        self.permanent_rejections
-            .get(fingerprint)
-            .is_some_and(|r| r.is_stale() && r.body_witness == body)
-            || self
-                .retained_stale_rejections
-                .get(fingerprint)
-                .is_some_and(|revisions| revisions.contains_key(body))
+    pub(super) fn stale_body(&self, fp: &str, body: &str) -> bool {
+        self.permanent_rejections.get(fp).is_some_and(|r| {
+            (r.is_stale() && r.body_witness == body)
+                || r.revisions
+                    .get(body)
+                    .is_some_and(PermanentSnapshotRejection::is_stale)
+        })
     }
-
-    pub(super) fn retain_replaced_stale(&mut self, fingerprint: &str, next_body: &str) {
-        if self
-            .permanent_rejections
-            .get(fingerprint)
-            .is_some_and(|r| r.is_stale() && r.body_witness != next_body)
-        {
-            let refusal = self
-                .permanent_rejections
-                .remove(fingerprint)
-                .expect("checked refusal");
-            self.retained_stale_rejections
-                .entry(fingerprint.into())
-                .or_default()
-                .entry(refusal.body_witness.clone())
-                .or_insert(refusal);
+    pub(super) fn retained_revisions(
+        &mut self,
+        fp: &str,
+        next: &str,
+    ) -> BTreeMap<String, PermanentSnapshotRejection> {
+        let Some(mut old) = self.permanent_rejections.remove(fp) else {
+            return BTreeMap::new();
+        };
+        let mut revisions = std::mem::take(&mut old.revisions);
+        if old.is_stale() && old.body_witness != next {
+            revisions.insert(old.body_witness.clone(), old);
         }
+        revisions.remove(next);
+        revisions
     }
-
-    pub(super) fn stale_reopen_pending(&self, fingerprint: &str) -> bool {
+    pub(super) fn stale_reopen_pending(&self, fp: &str) -> bool {
         self.permanent_rejections
-            .get(fingerprint)
-            .into_iter()
-            .chain(
-                self.retained_stale_rejections
-                    .get(fingerprint)
-                    .into_iter()
-                    .flat_map(|r| r.values()),
-            )
-            .any(|r| r.exposure.as_ref().is_some_and(|e| e.reopen_pending))
+            .get(fp)
+            .is_some_and(|r| r.exposure.as_ref().is_some_and(|e| e.reopen_pending))
     }
-
-    pub(super) fn consume_stale_reopen_claim(&mut self, fingerprint: &str) {
-        for refusal in self
+    pub(super) fn note_refused_exposure<T: Serialize>(&mut self, fp: &str, item: &T) {
+        let Some(e) = self
             .permanent_rejections
-            .get_mut(fingerprint)
-            .into_iter()
-            .chain(
-                self.retained_stale_rejections
-                    .get_mut(fingerprint)
-                    .into_iter()
-                    .flat_map(|r| r.values_mut()),
-            )
-        {
-            if let Some(exposure) = &mut refusal.exposure {
-                exposure.reopen_pending = false;
-            }
-        }
-    }
-
-    pub(super) fn note_refused_exposure<T: Serialize>(&mut self, fingerprint: &str, item: &T) {
-        let Some(exposure) = self
-            .permanent_rejections
-            .get_mut(fingerprint)
+            .get_mut(fp)
             .and_then(|r| r.exposure.as_mut())
         else {
             return;
         };
-        let Ok(value) = serde_json::to_value(item) else {
+        let Ok(v) = serde_json::to_value(item) else {
             return;
         };
-        exposure.requests = value
-            .get("request_count")
-            .and_then(serde_json::Value::as_u64);
-        // Reasoning is included in output. Cached input is a subset when
-        // the body declares inclusive_cached; no source-name assumption.
-        let scope = value
+        e.requests = v.get("request_count").and_then(serde_json::Value::as_u64);
+        let scope = v
             .pointer("/provenance/input_token_scope")
             .and_then(serde_json::Value::as_str);
-        exposure.tokens = match scope {
+        e.tokens = match scope {
             Some("inclusive_cached" | "uncached" | "total_only") => [
                 "input_tokens",
                 "output_tokens",
@@ -155,11 +112,10 @@ impl SnapshotUploadProgress {
             ]
             .iter()
             .filter(|key| !(scope == Some("inclusive_cached") && **key == "cache_read_tokens"))
-            .try_fold(0u64, |sum, key| sum.checked_add(value.get(key)?.as_u64()?))
+            .try_fold(0u64, |sum, key| sum.checked_add(v.get(key)?.as_u64()?))
             .and_then(|sum| {
                 sum.checked_add(
-                    value
-                        .get("unattributed_total_tokens")
+                    v.get("unattributed_total_tokens")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
                 )
@@ -168,235 +124,211 @@ impl SnapshotUploadProgress {
         };
     }
 
-    /// Owner-set regular-file sentinel, like existing local support markers.
-    /// Save the returned mutation BEFORE preparing leases or acquiring sources.
-    /// The consumed bit survives removal/re-delivery of the sentinel and ACKs.
-    pub(super) fn reopen_stale_once(&mut self, progress_path: &Path) -> Result<bool> {
-        if self.stale_reopen_consumed == Some(true) {
+    /// The explicit list binds the server comparison to the exact local revision.
+    /// No timestamp, activity order or transcript read can establish coverage.
+    pub(super) fn reopen_stale_once(
+        &mut self,
+        path: &Path,
+        source: SnapshotSource,
+        machine: &str,
+        index: &mut ScanIndex,
+    ) -> Result<bool> {
+        let marker = path.with_extension("stale-older-reopen-once");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(m) if m.is_file() && !m.file_type().is_symlink() => (),
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).context("read local one-shot input"),
+        }
+        let request: Request = serde_json::from_slice(&std::fs::read(marker)?)
+            .context("decode local one-shot input")?;
+        anyhow::ensure!(!request.nonce.is_empty(), "one-shot requires a nonce");
+        if self.stale_reopen_nonce.as_ref() == Some(&request.nonce) {
             return Ok(false);
         }
-        let marker = progress_path.with_extension("stale-older-reopen-once");
-        match std::fs::symlink_metadata(marker) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error).context("read local one-shot marker"),
+        // Validate the entire list before changing either existing owner.
+        let mut seen = BTreeSet::new();
+        for e in &request.entities {
+            anyhow::ensure!(
+                e.entity_hash == entity_hash(source.api_slug(), machine, &e.source_session_id)
+                    && is_snapshot_fingerprint(&e.snapshot_fingerprint)
+                    && is_snapshot_fingerprint(&e.body_witness)
+                    && source == SnapshotSource::ClaudeCode
+                    && index.stale_comparison_binds_entity(
+                        &e.source_session_id,
+                        &e.snapshot_fingerprint
+                    )
+                    && seen.insert(&e.snapshot_fingerprint),
+                "invalid or duplicate one-shot entity binding"
+            );
+            let body_matches = self.refused_body(&e.snapshot_fingerprint, &e.body_witness)
+                || index
+                    .quarantined_snapshot_fingerprints
+                    .get(&e.snapshot_fingerprint)
+                    .is_some_and(|r| r.upload_body_witness.as_ref() == Some(&e.body_witness));
+            anyhow::ensure!(
+                body_matches
+                    && self
+                        .quarantined_fingerprints
+                        .get(&e.snapshot_fingerprint)
+                        .or_else(|| index
+                            .quarantined_snapshot_fingerprints
+                            .get(&e.snapshot_fingerprint))
+                        .is_none_or(|r| r.upload_body_witness.as_ref() == Some(&e.body_witness)),
+                "one-shot revision is no longer current"
+            );
         }
-        self.stale_reopen_consumed = Some(true);
-        let active = self
-            .active_quarantine_witness
-            .as_ref()
-            .expect("upload progress has an active witness");
-        for (fingerprint, refusal) in self.permanent_rejections.iter_mut().chain(
-            self.retained_stale_rejections
-                .iter_mut()
-                .flat_map(|(fp, revisions)| revisions.values_mut().map(move |r| (fp, r))),
-        ) {
-            if !refusal.is_stale() {
-                continue;
-            }
-            refusal
-                .exposure
-                .get_or_insert_with(Exposure::legacy)
-                .reopen_pending = true;
+        for e in request.entities {
+            let active = self
+                .active_quarantine_witness
+                .clone()
+                .expect("active upload witness");
             let record = self
                 .quarantined_fingerprints
-                .entry(fingerprint.clone())
-                .or_insert_with(|| SnapshotQuarantineRecord {
-                    contract_retry_claims: None,
-                    reconstruction_contract:
-                        crate::snapshots::terminal_contract_retry::current_contract(),
-                    witness: active.clone(),
-                    retry_after_unix_seconds: 0,
-                    upload_body_witness: None,
-                    failed_reconstruction_count: 1,
-                    disposition: SnapshotQuarantineDisposition::RetryPending,
+                .entry(e.snapshot_fingerprint.clone())
+                .or_insert_with(|| {
+                    index
+                        .quarantined_snapshot_fingerprints
+                        .get(&e.snapshot_fingerprint)
+                        .cloned()
+                        .unwrap_or(SnapshotQuarantineRecord {
+                            contract_retry_claims: None,
+                            reconstruction_contract:
+                                crate::snapshots::terminal_contract_retry::current_contract(),
+                            witness: active.clone(),
+                            retry_after_unix_seconds: 0,
+                            upload_body_witness: None,
+                            failed_reconstruction_count: 1,
+                            disposition: SnapshotQuarantineDisposition::RetryPending,
+                        })
                 });
-            record.witness = active.clone();
-            record.upload_body_witness = Some(refusal.body_witness.clone());
-            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            // A supplied verdict cannot be borrowed by another local body.
+            record.upload_body_witness = Some(e.body_witness.clone());
+            record.disposition = match e.verdict {
+                Verdict::Covered => SnapshotQuarantineDisposition::SupersededTerminal,
+                Verdict::Owed => SnapshotQuarantineDisposition::RetryPending,
+            };
             record.contract_retry_claims = None;
             record.failed_reconstruction_count = 1;
-            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            record.retry_after_unix_seconds = quarantine_retry_after(&e.snapshot_fingerprint);
+            record.witness = self
+                .active_quarantine_witness
+                .clone()
+                .expect("active upload witness");
+            let refusal = self
+                .permanent_rejections
+                .entry(e.snapshot_fingerprint.clone())
+                .or_insert_with(|| PermanentSnapshotRejection {
+                    body_witness: e.body_witness.clone(),
+                    reason: RejectedUsageReason::AcceptedLogStaleOlderUpload,
+                    reoffer: None,
+                    exposure: None,
+                    revisions: BTreeMap::new(),
+                });
+            let refusal = if refusal.body_witness == e.body_witness {
+                refusal
+            } else {
+                refusal
+                    .revisions
+                    .get_mut(&e.body_witness)
+                    .expect("validated retained revision")
+            };
+            let exposure = refusal.exposure.get_or_insert_with(Exposure::legacy);
+            exposure.covered = e.verdict == Verdict::Covered;
+            exposure.reopen_pending = e.verdict == Verdict::Owed;
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(e.snapshot_fingerprint, record.clone());
         }
+        // This records the trigger, not a lifetime retry limit. Pending work is
+        // consumed only after the existing lease acquires an owning file.
+        self.stale_reopen_nonce = Some(request.nonce);
         Ok(true)
     }
-}
 
-#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
-struct Counts {
-    entities: usize,
-    known_requests: u64,
-    known_tokens: u64,
-    unknown_requests: usize,
-    unknown_tokens: usize,
-    unknown_age: usize,
-    oldest_age_seconds: u64,
-    reopen_pending: usize,
-}
-impl Counts {
-    fn add(&mut self, exposure: Option<&Exposure>, now: u64) {
-        self.entities += 1;
-        if let Some(n) = exposure.and_then(|e| e.requests) {
-            self.known_requests = self.known_requests.saturating_add(n);
-        } else {
-            self.unknown_requests += 1;
-        }
-        if let Some(n) = exposure.and_then(|e| e.tokens) {
-            self.known_tokens = self.known_tokens.saturating_add(n);
-        } else {
-            self.unknown_tokens += 1;
-        }
-        if let Some(at) = exposure
-            .and_then(|e| e.first_held_unix)
-            .filter(|at| *at <= now)
-        {
-            self.oldest_age_seconds = self.oldest_age_seconds.max(now - at);
-        } else {
-            self.unknown_age += 1;
-        }
-        self.reopen_pending += usize::from(exposure.is_some_and(|e| e.reopen_pending));
-    }
-}
-fn age_bucket(exposure: Option<&Exposure>, now: u64) -> &'static str {
-    match exposure
-        .and_then(|e| e.first_held_unix)
-        .filter(|at| *at <= now)
-        .map(|at| now - at)
-    {
-        None => "unknown",
-        Some(0..=86_399) => "under_day",
-        Some(86_400..=604_799) => "day_to_week",
-        Some(_) => "week_or_more",
-    }
-}
-
-/// Union mirrors at the entity grain before aggregation. Authority member aliases
-/// resolve through the existing incidence table; unbound members stay unknown.
-fn census(
-    index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    now: u64,
-) -> BTreeMap<(String, &'static str), Counts> {
-    let mut entities = BTreeMap::new();
-    for (fingerprint, record) in &index.quarantined_snapshot_fingerprints {
-        if record.disposition != SnapshotQuarantineDisposition::RetryPending {
-            entities.insert(
-                (
-                    fingerprint.as_str(),
-                    record.upload_body_witness.as_deref().unwrap_or(""),
-                ),
-                ("snapshot_terminal".to_string(), None),
-            );
-        }
-    }
-    for (fingerprint, record) in &progress.quarantined_fingerprints {
-        if record.disposition != SnapshotQuarantineDisposition::RetryPending {
-            entities.insert(
-                (
-                    fingerprint.as_str(),
-                    record.upload_body_witness.as_deref().unwrap_or(""),
-                ),
-                ("snapshot_terminal".to_string(), None),
-            );
-        }
-    }
-    let (authority, unbound) = index.authority_owed_snapshot_fingerprints();
-    for fingerprint in authority {
-        entities
-            .entry((fingerprint, ""))
-            .or_insert_with(|| ("usage_authority_held".into(), None));
-    }
-    for (fingerprint, refusal) in progress.permanent_rejections.iter().chain(
-        progress
-            .retained_stale_rejections
-            .iter()
-            .flat_map(|(fp, revisions)| revisions.values().map(move |r| (fp, r))),
-    ) {
-        entities.insert(
-            (fingerprint.as_str(), refusal.body_witness.as_str()),
-            (refusal.reason_label(), refusal.exposure.as_ref()),
-        );
-    }
-    let bound_entities = entities
-        .keys()
-        .filter(|(_, body)| !body.is_empty())
-        .map(|(fp, _)| *fp)
-        .collect::<BTreeSet<_>>();
-    entities.retain(|(fp, body), _| !body.is_empty() || !bound_entities.contains(fp));
-    let mut result: BTreeMap<_, Counts> = BTreeMap::new();
-    for (reason, exposure) in entities.values() {
-        result
-            .entry((reason.clone(), age_bucket(*exposure, now)))
-            .or_default()
-            .add(*exposure, now);
-    }
-    if unbound > 0 {
-        let counts = result
-            .entry(("usage_authority_unbound".into(), "unknown"))
-            .or_default();
-        counts.entities += unbound;
-        counts.unknown_age += unbound;
-        counts.unknown_requests += unbound;
-        counts.unknown_tokens += unbound;
-    }
-    result
-}
-
-#[derive(Default)]
-struct LastReport {
-    at: u64,
-    entities: usize,
-    oldest: u64,
-}
-static LAST: OnceLock<Mutex<BTreeMap<&'static str, LastReport>>> = OnceLock::new();
-
-/// One page report, plus the existing-sync daily diagnostic. No scheduling input.
-/// Legacy ages stay unknown. No identifiers, paths, dimensions or amounts.
-pub(super) fn report(
-    source: SnapshotSource,
-    index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    now: u64,
-) {
-    let rows = census(index, progress, now);
-    let entities = rows.values().map(|c| c.entities).sum();
-    let oldest = rows
-        .values()
-        .map(|c| c.oldest_age_seconds)
-        .max()
-        .unwrap_or(0);
-    let (daily, alarm) = match LAST.get_or_init(|| Mutex::new(BTreeMap::new())).lock() {
-        Ok(mut state) => {
-            let last = state.entry(source.api_slug()).or_default();
-            let daily = last.at == 0 || now.saturating_sub(last.at) >= 86_400;
-            let alarm = entities > last.entities || oldest > last.oldest;
-            last.entities = entities;
-            last.oldest = oldest;
-            if daily {
-                last.at = now;
+    pub(super) fn record_stale_acquisitions(&mut self, index: &ScanIndex) -> bool {
+        let mut changed = false;
+        for fp in &self.active_quarantine_retries {
+            if index.quarantine_retry_has_owner(fp) {
+                if let Some(e) = self
+                    .permanent_rejections
+                    .get_mut(fp)
+                    .and_then(|r| r.exposure.as_mut())
+                {
+                    changed |= e.reopen_pending;
+                    e.reopen_pending = false;
+                }
             }
-            (daily, alarm)
         }
-        Err(_) => (true, true),
-    };
-    for ((reason, age_bucket), counts) in rows {
-        crate::local_resource_diagnostics::traversal_point(
-            "owed_exposure",
-            source.api_slug(),
-            &serde_json::json!({"scope": "page", "reason": reason, "age_bucket": age_bucket, "counts": counts}),
-        );
-        if daily {
-            crate::local_resource_diagnostics::traversal_point(
-                "owed_exposure",
-                source.api_slug(),
-                &serde_json::json!({"scope": "daily", "reason": reason, "age_bucket": age_bucket, "counts": counts}),
-            );
+        changed
+    }
+
+    pub(super) fn refusal_exposure(
+        &self,
+        now: u64,
+    ) -> crate::local_resource_diagnostics::RefusalExposure {
+        let mut counts = crate::local_resource_diagnostics::RefusalExposure::default();
+        for refusal in self.permanent_rejections.values() {
+            let mut owed = std::iter::once(refusal)
+                .chain(refusal.revisions.values())
+                .filter(|r| r.owed());
+            let Some(first_owed) = owed.next() else {
+                continue;
+            };
+            counts.owed_entities += 1;
+            // Revisions can overlap; disclose one known revision per entity,
+            // rather than adding overlapping request/token populations.
+            let e = first_owed.exposure.as_ref();
+            if let Some(n) = e.and_then(|e| e.requests) {
+                counts.known_requests = counts.known_requests.saturating_add(n);
+            } else {
+                counts.unknown_requests += 1;
+            }
+            if let Some(n) = e.and_then(|e| e.tokens) {
+                counts.known_tokens = counts.known_tokens.saturating_add(n);
+            } else {
+                counts.unknown_tokens += 1;
+            }
+            let first = std::iter::once(first_owed)
+                .chain(owed)
+                .filter_map(|r| r.exposure.as_ref()?.first_held_unix)
+                .min();
+            if let Some(first) = first {
+                counts.oldest_age_seconds =
+                    counts.oldest_age_seconds.max(now.saturating_sub(first));
+            } else {
+                counts.unknown_age += 1;
+            }
         }
+        counts
     }
-    if alarm {
-        eprintln!("local snapshot owed exposure alarm: source={} entities={} oldest_age_seconds={} rising=true", source.api_slug(), entities, oldest);
-    }
+}
+
+#[derive(Deserialize)]
+struct Request {
+    nonce: String,
+    entities: Vec<Entity>,
+}
+#[derive(Deserialize)]
+struct Entity {
+    entity_hash: String,
+    source_session_id: String,
+    snapshot_fingerprint: String,
+    body_witness: String,
+    verdict: Verdict,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Verdict {
+    Covered,
+    Owed,
+}
+fn entity_hash(source: &str, machine: &str, session: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{source}\x1f{machine}\x1f{session}"))
+    )[..8]
+        .into()
 }
 
 #[cfg(test)]
