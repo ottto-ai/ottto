@@ -3471,6 +3471,28 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
+    /// [regress] Compressed byte length never refuses an archive before decoder admission.
+    #[test]
+    fn archive_over_the_former_file_limit_reaches_opened_identity() {
+        let fixture =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let bytes = former_file_cap(SnapshotSource::Codex) + 1;
+        File::options()
+            .write(true)
+            .open(&fixture.0)
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        let mut candidate = fixture.candidate();
+        let (file, _) =
+            open_candidate_file_stat_retained(SnapshotSource::Codex, &mut candidate, None, false)
+                .expect("archive size is not decoder admission");
+        assert_eq!(file.metadata().unwrap().len(), bytes);
+        assert_eq!(candidate.size_bytes, bytes);
+        // This exercises bounded metadata/identity admission only. Appended
+        // sparse padding is not a valid archive and is not sent to the decoder.
+    }
+
     /// [format] Unopened header permission is cancelled, interrupted durable
     /// permission stays paced, and deferred alarms survive a real reload.
     #[test]

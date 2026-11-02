@@ -30,6 +30,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         pending_directories: VecDeque::new(),
         pending_candidates: VecDeque::new(),
         observed_index_keys: Default::default(),
+        retired_oversized_discovery: Default::default(),
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,

@@ -528,9 +528,6 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
-    Size,
-    /// The subset of size skips whose key holds a withheld-account revision.
-    WithheldOversized,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }

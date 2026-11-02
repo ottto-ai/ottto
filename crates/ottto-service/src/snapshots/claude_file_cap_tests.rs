@@ -85,6 +85,7 @@ fn write_mixed(fixture: &Fixture, target: u64) -> (u64, u64) {
     assert_eq!(fs::metadata(fixture.path()).unwrap().len(), bytes);
     (bytes, requests)
 }
+#[cfg(target_os = "macos")]
 fn assert_native(scan: &SourceScanResult, requests: u64) {
     assert_eq!(scan.oversized_file_count, 0);
     assert_eq!(scan.scanned_file_count, 1);

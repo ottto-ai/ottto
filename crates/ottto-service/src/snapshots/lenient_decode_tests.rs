@@ -4061,6 +4061,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     }
 }
 
+/// [format] Retired observations keep their positional slot and live neighbors.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
@@ -4097,7 +4098,9 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             .take(if full { legacy.len() } else { 1 })
             .enumerate()
             .map(|(n, name)| {
-                let value = if defaults[*name].is_number() {
+                let value = if *name == "oversized_file_count" {
+                    serde_json::json!(13)
+                } else if defaults[*name].is_number() {
                     serde_json::json!(n + 7)
                 } else {
                     defaults[*name].clone()
@@ -4106,6 +4109,10 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("oversized_file_count");
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
