@@ -9705,7 +9705,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         );
         // Owed evidence (a terminal-retry re-arm) proves nothing until it
         // resolves.
-        let owed_roots = evidence_owed::owed_roots(index, census_window_end);
+        let owed_roots = evidence_owed::owed_roots(index);
         for (root_session_id, members) in &complete_families {
             if uncertified_roots.contains(root_session_id) || owed_roots.contains(root_session_id) {
                 continue;
@@ -11293,10 +11293,8 @@ fn claude_family_members_unobserved_where(
                 return false;
             };
             // A re-stamped family's still-owed member is verified at its own
-            // selection; until then it is unobserved (`evidence_owed`), unless
-            // this window read it (a held revert restores the old debt).
-            (entry.evidence_owed
-                && !evidence_owed::observed_in_window(index, index_key, census_window_end))
+            // selection; until then it is unobserved (`evidence_owed`).
+            entry.evidence_owed
                 || !(covered.contains(&member)
                     || index.confirmed_empty_files.contains(*index_key)
                     || excused_root(&root_session_id)
@@ -54976,10 +54974,8 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        // An owed (kept) revision keeps its validated CONTENT memo Skip; a
-        // cleared entry still reads.
-        let withheld_unchanged = !entry.source_file_fingerprint.is_empty()
-            && self.withheld_account_unchanged(&key, candidate);
+        let withheld_unchanged =
+            !entry.rearmed() && self.withheld_account_unchanged(&key, candidate);
         // A withheld key's audit debt (carried onto its reverted entry) cannot
         // settle while held; an unchanged one defers it to its next counted
         // re-parse, usually the binding read, instead of a Full every pass.

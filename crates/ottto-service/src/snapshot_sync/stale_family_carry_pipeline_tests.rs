@@ -530,14 +530,27 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
         let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
         let family = rearm_family_sessions().len();
-        for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(2).take(2) {
+        // terminal-retry owe: the first retry reads under the old contract;
+        // the second re-stamps that current-contract read (E1).
+        let base_reads = [family, 0];
+        for ((window, base_window), base_reads) in fix
+            .windows
+            .iter()
+            .zip(&base.windows)
+            .skip(2)
+            .take(2)
+            .zip(base_reads)
+        {
             if refused {
-                assert_eq!(window.family_reads, family, "the latch keeps the re-arm");
+                assert_eq!(
+                    window.family_reads, base_reads,
+                    "the latch keeps the re-arm"
+                );
                 assert_eq!(window.family_reads, base_window.family_reads);
                 assert_eq!(window.start, base_window.start, "the start is BASE's");
             } else {
                 assert_eq!(
-                    base_window.family_reads, family,
+                    base_window.family_reads, base_reads,
                     "BASE still reads every member"
                 );
                 assert_eq!(window.family_reads, 0, "contract-only debt adds no read");

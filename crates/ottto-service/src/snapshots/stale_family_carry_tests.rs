@@ -4020,9 +4020,7 @@ fn owed_selected_parses(
     candidates
         .iter()
         .filter(|candidate| {
-            let (mut decision, mut reason) = index.candidate_decision_with_reason_at(candidate, 0);
-            evidence_owed::resolve(index, page, candidate, window, &mut decision, &mut reason);
-            decision == CandidateDecision::Parse
+            owed_window_decision(index, page, candidate, window, 0).0 == CandidateDecision::Parse
         })
         .count()
 }
@@ -4046,8 +4044,19 @@ fn owed_page_decision(
         .as_ref()
         .map(|traversal| traversal.census_window_end.clone())
         .unwrap_or_default();
+    owed_window_decision(index, page, candidate, &window, now)
+}
+
+/// `owed_page_decision` in census window `window`.
+fn owed_window_decision(
+    index: &mut ScanIndex,
+    page: &mut evidence_owed::Page,
+    candidate: &CandidateFile,
+    window: &str,
+    now: u64,
+) -> (CandidateDecision, Option<CandidateParseReason>) {
     let (mut decision, mut reason) = index.candidate_decision_with_reason_at(candidate, now);
-    evidence_owed::resolve(index, page, candidate, &window, &mut decision, &mut reason);
+    evidence_owed::resolve(index, page, candidate, window, &mut decision, &mut reason);
     (decision, reason)
 }
 
@@ -4663,12 +4672,12 @@ pub(super) fn assert_bodies_equal_a_full(full: &[SnapshotItem], kept: &[Snapshot
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(&route(full), &route(kept));
 }
 
-/// [money] With the identity-contract latch SET (E1), a family whose pending
-/// is stamped with the recorded, real contract re-stamps with no read only when
-/// each member's own loss-free census record was written in the first window
-/// started under that contract (W1) or later: its pending equals a Full's fold,
-/// its members leave owed and fence coverage is the Full's; the latch clears
-/// only through its own routes. A record from before W1 (or no W1), a legacy
+/// [behaviour] With the identity-contract latch SET (E1), a family whose
+/// pending is stamped with the recorded, real contract re-stamps with no read
+/// only when each member's own loss-free census record was written in the
+/// first window started under that contract (W1) or later (the re-stamp arm:
+/// `owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch`).
+/// A record from before W1 (or no W1), a legacy
 /// (None), mixed (other contract or body-witness revision) or
 /// placeholder-recorded family reads. A contract-unproven family proves its
 /// contract only through its own stamp.
@@ -4707,35 +4716,6 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
         (parsed, scope.finish().contract.evidence_owed)
     };
 
-    let mut index = fixture.index.clone();
-    stamp(&mut index, current);
-    since(&mut index, Some(CARRY_FAILED));
-    let before = index.claude_usage_family_pending.clone();
-    let (parsed, counts) = visit(&mut index);
-    assert_eq!(parsed, 0);
-    assert_eq!(
-        (counts.restamped_current_contract, counts.restamped),
-        (2, 0)
-    );
-    for (root, pending) in before.iter() {
-        let full = ClaudeUsageFamilyPending {
-            census_window_end: window.clone(),
-            ..pending.clone()
-        };
-        assert_eq!(index.claude_usage_family_pending[root], full);
-    }
-    assert!(
-        index.claude_request_identity_contract_changed,
-        "latch untouched"
-    );
-    assert!(index.files.values().all(|entry| !entry.evidence_owed));
-    assert_eq!(
-        claude_duplicate_fence_coverage_missing_member_count(&index, &window),
-        0,
-        "observed: the Full's fence coverage"
-    );
-    assert!(evidence_owed::owed_roots(&index, &window).is_empty());
-
     let mut placeholder = fixture.index.clone();
     stamp(&mut placeholder, current);
     since(&mut placeholder, Some(CARRY_FAILED));
@@ -4761,10 +4741,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
         let (parsed, counts) = visit(&mut index);
         assert_eq!(parsed, 2, "{name}");
         assert_eq!(
-            (
-                counts.refused_contract_latch,
-                counts.restamped_current_contract
-            ),
+            (counts.refused_contract_latch, counts.restamped),
             (2, 0),
             "{name}"
         );
@@ -4817,12 +4794,13 @@ fn owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch() {
         pending.identity_contract = current;
     }
     let indexed = fixture.roots.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(evidence_owed::owed_roots(index, &window), indexed);
+    assert_eq!(evidence_owed::owed_roots(index), indexed);
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(index, &window),
         3
     );
 
+    let before = index.claude_usage_family_pending.clone();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let parsed = owed_selected_parses(
         index,
@@ -4831,12 +4809,17 @@ fn owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch() {
         &window,
     );
     let counts = scope.finish().contract.evidence_owed;
-    assert_eq!(
-        (parsed, counts.restamped_current_contract, counts.read),
-        (0, 3, 0)
-    );
+    assert_eq!((parsed, counts.restamped, counts.read), (0, 3, 0));
+    // [money] Each re-stamped pending equals a Full's fold in this window.
+    for (root, pending) in before.iter() {
+        let full = ClaudeUsageFamilyPending {
+            census_window_end: window.clone(),
+            ..pending.clone()
+        };
+        assert_eq!(index.claude_usage_family_pending[root], full);
+    }
     assert!(index.files.values().all(|entry| !entry.evidence_owed));
-    assert!(evidence_owed::owed_roots(index, &window).is_empty());
+    assert!(evidence_owed::owed_roots(index).is_empty());
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(index, &window),
         0,
@@ -4908,7 +4891,7 @@ fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
             counts.read,
             counts.refused_contract_latch,
             counts.identity_owed_read_under_latch,
-            counts.restamped_current_contract
+            counts.restamped
         ),
         (2, 2, 2, 2, 0),
         "{counts:?}"

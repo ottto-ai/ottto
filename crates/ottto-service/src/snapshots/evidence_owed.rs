@@ -332,13 +332,6 @@ pub(super) fn resolve(
         claude_contract::note(|c| c.evidence_owed.selected_by_other_reason += 1);
         return;
     }
-    // A hold's own Skip (authority quarantine, or a validated CONTENT memo
-    // under an account hold) is never escalated to a read: the member stays
-    // owed, counted by its hold, until a change or the hold's release reads it.
-    let held = family
-        .as_ref()
-        .is_some_and(|(root, _)| index.claude_usage_authority_quarantine.contains_key(root))
-        || index.withheld_account_unchanged(&key, candidate);
     if let Some((root, member)) = family {
         if empty_from_record(index, &key, &root) {
             claude_contract::note(|c| c.evidence_owed.restamped_from_record += 1);
@@ -353,15 +346,7 @@ pub(super) fn resolve(
                 // (`current_contract_read`): it equals a Full under the
                 // current contract. The latch itself clears only through its
                 // own routes.
-                let latched = index.claude_request_identity_contract_changed;
-                claude_contract::note(|c| {
-                    let owed = &mut c.evidence_owed;
-                    *if latched {
-                        &mut owed.restamped_current_contract
-                    } else {
-                        &mut owed.restamped
-                    } += 1;
-                });
+                claude_contract::note(|c| c.evidence_owed.restamped += 1);
                 if let Some(entry) = index.files.get_mut(&key) {
                     entry.evidence_owed = false;
                 }
@@ -381,9 +366,6 @@ pub(super) fn resolve(
                 } += 1;
             }),
         }
-    }
-    if held {
-        return;
     }
     let Some(entry) = index.files.get(&key) else {
         return;
@@ -617,56 +599,16 @@ fn empty_from_record(index: &ScanIndex, key: &str, root: &str) -> bool {
         })
 }
 
-/// A family with an owed member not observed in this window is not proven
-/// at completion: owed evidence earns no credit, retirement or fence decision
-/// until it resolves.
-pub(super) fn owed_roots(index: &ScanIndex, census_window_end: &str) -> BTreeSet<String> {
+/// A family with an owed member is not proven at completion: owed evidence
+/// earns no credit, retirement or fence decision until it resolves.
+pub(super) fn owed_roots(index: &ScanIndex) -> BTreeSet<String> {
     index
         .files
         .iter()
-        .filter(|(key, entry)| {
-            entry.evidence_owed && !observed_in_window(index, key, census_window_end)
-        })
+        .filter(|(_, entry)| entry.evidence_owed)
         .filter_map(|(key, _)| claude_index_path_family_member(Path::new(key)))
         .map(|(root, _)| root)
         .collect()
-}
-
-/// A read of `key` in this census window: its loss-free census record was
-/// written in `census_window_end` and lists exactly the member's pending
-/// request ids (one per id). It credits the record's revision, the one read
-/// this window, never a committed older one a held upload restored; the
-/// credit expires with the window.
-pub(super) fn observed_in_window(index: &ScanIndex, key: &str, census_window_end: &str) -> bool {
-    let (Some((root, member)), Some(window)) = (
-        claude_index_path_family_member(Path::new(key)),
-        rfc3339_unix_seconds(census_window_end),
-    ) else {
-        return false;
-    };
-    let Some(record) = index.claude_request_census.get(key).filter(|record| {
-        record.window() == window
-            && record.current_derivation()
-            && !record.is_lossy()
-            && !record.over_budget()
-            && !record.unverified_or_twin()
-            && record.retired().is_none()
-    }) else {
-        return false;
-    };
-    let empty = BTreeSet::new();
-    let hashes = match index.claude_usage_family_pending.family(&root) {
-        Ok(None) => &empty,
-        Ok(Some(pending)) if !pending.invalid && pending.census_window_end == census_window_end => {
-            pending
-                .member_request_id_hashes
-                .get(&member)
-                .unwrap_or(&empty)
-        }
-        Ok(Some(_)) | Err(_) => return false,
-    };
-    hashes.len() == record.request_hashes().len()
-        && record_hashes(hashes).as_deref() == Some(record.request_hashes())
 }
 
 /// Pending keys request ids by full SHA-256 hex; a census record keeps the
