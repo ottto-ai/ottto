@@ -52,8 +52,9 @@ use crate::snapshots::{
     claude_fork_line_provenance, claude_index_path_member_ref, claude_request_id_set_fingerprint,
     claude_request_money, claude_subagent_identity, opened_object_identity,
     scan_file_fingerprint_with_opened_identity, string_at, ClaudeForkLineProvenance,
-    ClaudeTitleMetadata, OwnedJsonlParser, ScanIndex, SnapshotAccumulator, SnapshotItem,
-    SnapshotSource, SnapshotUploadPolicy, UsageTotals, MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES,
+    ClaudeTitleMetadata, ClaudeTranscriptUsageOccurrence, OwnedJsonlParser, ScanIndex,
+    SnapshotAccumulator, SnapshotItem, SnapshotSource, SnapshotUploadPolicy, UsageTotals,
+    MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -125,6 +126,23 @@ struct MissingUsage {
     response_key: Option<String>,
     tuple: Option<String>,
     dims: Dims,
+    synthetic_zero: bool,
+}
+/// An evidenced zero-token synthetic placeholder: every observation of the
+/// response carries an explicit usage object of zero tokens and the model
+/// `<synthetic>`. Missing usage never reaches here (no usage object, no
+/// response), so unknown usage is never treated as zero.
+fn synthetic_zero(usage: &UsageTotals, model: Option<&str>) -> bool {
+    usage.is_zero() && model == Some("<synthetic>")
+}
+/// Counting dimensions under the ordinary placement rule: zero usage places
+/// no row, so an evidenced synthetic placeholder adds no request.
+fn placed_dims(usage: &UsageTotals, model: Option<&str>) -> Dims {
+    let mut dims = Dims::of_usage(usage);
+    if synthetic_zero(usage, model) {
+        dims.request_count = 0;
+    }
+    dims
 }
 fn sum_missing(missing: &[MissingUsage]) -> Option<Dims> {
     missing
@@ -713,10 +731,14 @@ impl Dims {
     }
 }
 
-fn sum_dims<'a>(usages: impl IntoIterator<Item = &'a UsageTotals>) -> Option<Dims> {
-    usages.into_iter().try_fold(Dims::default(), |sum, usage| {
-        sum.checked_add(Dims::of_usage(usage))
-    })
+fn sum_dims<'a>(
+    occurrences: impl IntoIterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
+) -> Option<Dims> {
+    occurrences
+        .into_iter()
+        .try_fold(Dims::default(), |sum, occurrence| {
+            sum.checked_add(placed_dims(&occurrence.usage, occurrence.model.as_deref()))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +897,8 @@ fn parse_target_transcript(
                         response.model.as_deref(),
                         &response.usage,
                     ),
-                    dims: Dims::of_usage(&response.usage),
+                    dims: placed_dims(&response.usage, response.model.as_deref()),
+                    synthetic_zero: synthetic_zero(&response.usage, response.model.as_deref()),
                 });
             }
         }
@@ -1429,6 +1452,12 @@ pub(crate) fn produce(
         None => None,
     };
 
+    let synthetic_zero_total = |field: &str| {
+        target_reports
+            .iter()
+            .filter_map(|report| report["synthetic_zero_responses"][field].as_u64())
+            .sum::<u64>()
+    };
     let mut reason_counts = BTreeMap::<&str, u64>::new();
     for reason in &packet_reasons {
         *reason_counts.entry(reason.as_str()).or_default() += 1;
@@ -1443,6 +1472,10 @@ pub(crate) fn produce(
         "computed_unqualified_candidates": computed_count,
         "held_packet_members": target_count,
         "held_reason_counts": reason_counts,
+        "synthetic_zero_responses": {
+            "native": synthetic_zero_total("native"),
+            "idless": synthetic_zero_total("idless"),
+        },
         "peer_file_count": peers.file_count,
         "cumulative_peer_bytes_read": peers.total_bytes,
         "b2_allocation_sha256": allocation.sha256,
@@ -1626,11 +1659,7 @@ fn original_target(
         return held("no counted usage");
     }
     let totals = Dims::of_item(&item);
-    let occurrence_sum = sum_dims(
-        item.claude_usage_occurrences
-            .values()
-            .map(|occurrence| &occurrence.usage),
-    );
+    let occurrence_sum = sum_dims(item.claude_usage_occurrences.values());
     let missing_sum = sum_missing(&parsed.missing);
     if occurrence_sum.and_then(|dims| dims.checked_add(missing_sum?)) != Some(totals) {
         return held("unsupported grain: item totals differ from per-request usage");
@@ -2821,6 +2850,20 @@ fn build_target(
         "request_set_fingerprint": request_set_fingerprint(&original.request_ids),
         "totals": original.totals.json(),
     });
+    // Disclosed apart: they add no request, as in the ordinary parse.
+    let native_synthetic_zero = original
+        .item
+        .claude_usage_occurrences
+        .values()
+        .filter(|occurrence| synthetic_zero(&occurrence.usage, occurrence.model.as_deref()))
+        .count();
+    let idless_synthetic_zero = original
+        .missing
+        .iter()
+        .filter(|missing| missing.synthetic_zero)
+        .count();
+    report["synthetic_zero_responses"] =
+        json!({"native": native_synthetic_zero, "idless": idless_synthetic_zero});
     let initial_residual = sum_missing(&original.missing).expect("validated missing sum");
     report["missing_evidence_counted"] = json!({"lines": initial_residual.request_count, "totals": initial_residual.json(), "usd": Value::Null, "usd_basis": "admission_catalog_required"});
     if let Some(reason) = coverage.held_reason().or_else(|| {
@@ -2860,13 +2903,7 @@ fn build_target(
         .collect::<BTreeSet<_>>();
     let usage_of = |ids: &BTreeSet<String>| {
         ids.iter()
-            .map(|id| {
-                original
-                    .item
-                    .claude_usage_occurrences
-                    .get(id)
-                    .map(|occurrence| &occurrence.usage)
-            })
+            .map(|id| original.item.claude_usage_occurrences.get(id))
             .collect::<Option<Vec<_>>>()
             .and_then(sum_dims)
     };

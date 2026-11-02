@@ -1571,3 +1571,112 @@ fn source_r4_idless_before_replica_owner_holds_late_owner() {
     assert!(target_report(&artifact, 18).get("body").is_none());
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+const SYNTHETIC: &str = "<synthetic>";
+
+/// A zero-token response under `model`, as Claude Code writes an API-error
+/// or interruption placeholder; `None` drops its native request id.
+fn zero_response(session: &str, minute: usize, request_id: Option<&str>, model: &str) -> Value {
+    let mut line = assistant_line(
+        session,
+        minute,
+        (request_id.unwrap_or("idless-zero"), 0, 0, 0),
+    );
+    line["message"]["model"] = json!(model);
+    if request_id.is_none() {
+        line.as_object_mut().unwrap().remove("requestId");
+    }
+    line
+}
+
+/// [regress] The ordinary parse places no row for explicit zero usage, so an
+/// evidenced `<synthetic>` placeholder adds no request to the item. The
+/// producer's occurrence and residual sums now agree, and the placeholders
+/// are disclosed apart by count.
+#[test]
+fn synthetic_zero_placeholders_reconcile_like_the_ordinary_parse() {
+    let fixture = fixture();
+    let target = &fixture.input.targets[17];
+    let session = &target.source_session_id;
+    let mut lines = transcript_lines(session, &[("req-t18-a", 25, 2, 100)]);
+    lines.push(zero_response(
+        session,
+        1,
+        Some("req-t18-synthetic"),
+        SYNTHETIC,
+    ));
+    lines.push(zero_response(session, 2, None, SYNTHETIC));
+    write_lines(&target.transcript_path, &lines);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    let report = target_report(&artifact, 18);
+    assert_eq!(
+        report["candidate_status"], "computed_unqualified",
+        "{report}"
+    );
+    let disclosed = json!({"native": 1, "idless": 1});
+    assert_eq!(report["synthetic_zero_responses"], disclosed);
+    assert_eq!(output.summary["synthetic_zero_responses"], disclosed);
+    assert_eq!(report["missing_evidence_counted"]["lines"], 0);
+    assert_eq!(report["body"]["item_totals"]["request_count"], 1);
+    assert_eq!(report["body"]["item_totals"]["input_tokens"], 25);
+    assert_eq!(output.summary["computed_unqualified_candidates"], 18);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// [money] Only an explicit zero observation under `<synthetic>` is a
+/// placeholder. Zero usage under a real model stays held as before, and a
+/// `<synthetic>` line without a usage object is no response at all: unknown
+/// usage is never treated as zero.
+#[test]
+fn zero_usage_without_synthetic_evidence_is_not_a_placeholder() {
+    for (case, request_id, model, with_usage) in [
+        ("native real-model zero", Some("req-t18-zero"), MODEL, true),
+        ("idless real-model zero", None, MODEL, true),
+        (
+            "synthetic without usage",
+            Some("req-t18-unknown"),
+            SYNTHETIC,
+            false,
+        ),
+    ] {
+        let fixture = fixture();
+        let target = &fixture.input.targets[17];
+        let session = &target.source_session_id;
+        let mut response = zero_response(session, 1, request_id, model);
+        if !with_usage {
+            response["message"].as_object_mut().unwrap().remove("usage");
+        }
+        let mut lines = transcript_lines(session, &[("req-t18-a", 25, 2, 100)]);
+        lines.push(response);
+        write_lines(&target.transcript_path, &lines);
+        let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+        let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+        let report = target_report(&artifact, 18);
+        assert_eq!(
+            output.summary["synthetic_zero_responses"],
+            json!({"native": 0, "idless": 0}),
+            "{case}"
+        );
+        if with_usage {
+            assert_eq!(report["candidate_status"], "held", "{case}");
+            assert_eq!(
+                report["held_detail"],
+                "unsupported grain: item totals differ from per-request usage",
+                "{case}"
+            );
+            assert!(report.get("body").is_none(), "{case}");
+        } else {
+            assert_eq!(
+                report["candidate_status"], "computed_unqualified",
+                "{case}: {report}"
+            );
+            assert_eq!(
+                report["synthetic_zero_responses"],
+                json!({"native": 0, "idless": 0})
+            );
+            assert_eq!(report["body"]["item_totals"]["request_count"], 1);
+        }
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
