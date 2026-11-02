@@ -175,6 +175,11 @@ impl TailStage {
     }
     pub(super) fn stage(&mut self, key: &str, mut file: StagedFile) {
         let key = key.as_bytes().to_vec();
+        // A reset replaces every prior row itself; retiring after it would
+        // delete the fresh head.
+        if file.change == Change::Reset {
+            self.retire.remove(&key);
+        }
         if let Some(Entry::File(prior)) = self.files.remove(&key) {
             file.absorb(prior);
         }
@@ -186,9 +191,19 @@ impl TailStage {
             .insert(key.as_bytes().to_vec(), Entry::Failed(cause));
         self.report();
     }
-    /// `keys` must be an authoritative statement that these files are absent.
+    /// `keys` must be authoritative: the files are absent, or their stored
+    /// state is void. Anything staged for them is stale and goes.
     pub(super) fn retire(&mut self, keys: impl IntoIterator<Item = String>) {
-        self.retire.extend(keys.into_iter().map(String::into_bytes));
+        for key in keys.into_iter().map(String::into_bytes) {
+            self.files.remove(&key);
+            self.retire.insert(key);
+        }
+    }
+    /// Files staged with their complete new state.
+    pub(super) fn staged(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.files
+            .iter()
+            .filter_map(|(key, entry)| matches!(entry, Entry::File(_)).then_some(key))
     }
     pub(super) fn bytes(&self) -> u64 {
         self.files.values().fold(0, |sum, entry| match entry {
@@ -571,6 +586,7 @@ struct Applied {
     dirty_pages: u64,
     old_page_touches: u64,
     set_aside: u64,
+    rolled_back: u64,
     retired: u64,
 }
 fn member(table: &mut MembershipTable, collection: Collection) -> Result<&mut Membership> {
@@ -695,19 +711,30 @@ pub(super) fn removed_files(old: &mapper::Digests) -> Vec<Vec<u8>> {
         })
         .collect()
 }
-/// Every staged file, each alone: its failure rolls back only its own rows and
-/// sets it aside, so siblings commit. A systemic failure abandons the save.
+/// Every staged file, each alone, with its own graph rows (`Rows::take_closure`):
+/// a failure rolls back only that file and sets it aside, so siblings and shared
+/// rows commit. A systemic failure abandons the save. `true`: a file rolled back.
 pub(super) fn apply(
-    tx: &mut dyn Transaction,
+    rows: &mut mapper::Rows<'_>,
     stage: Option<&TailStage>,
     removed: &[Vec<u8>],
-) -> Result<()> {
+) -> Result<bool> {
     let mut applied = Applied::default();
     for (file, entry) in stage.into_iter().flat_map(|stage| &stage.files) {
         let failed = match entry {
             Entry::Failed(cause) => Some(*cause),
             Entry::File(staged) => {
-                let result = tx.isolated(&mut |tx| {
+                let closure = rows.take_closure(file)?;
+                // The file's closure boundary: its graph rows, then its Tail rows.
+                let result = rows.tx()?.isolated(&mut |tx| {
+                    for row in &closure {
+                        match &row.value {
+                            Some(value) => {
+                                mapper::put(tx, &row.key, &**value)?;
+                            }
+                            None => mapper::remove(tx, &row.key)?,
+                        }
+                    }
                     let one = replace(tx, file, staged)?;
                     applied.files += one.files;
                     applied.head_bytes += one.head_bytes;
@@ -716,14 +743,19 @@ pub(super) fn apply(
                     applied.old_page_touches += one.old_page_touches;
                     Ok(())
                 })?;
+                if result.is_err() {
+                    rows.revert(closure);
+                    applied.rolled_back += 1;
+                }
                 result.err().map(|_| SetAsideCause::Row)
             }
         };
         if let Some(cause) = failed {
-            mark_set_aside(tx, file, cause)?;
+            mark_set_aside(rows.tx()?, file, cause)?;
             applied.set_aside += 1;
         }
     }
+    let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
     for file in removed.iter().chain(authorised) {
         delete_rows(tx, file)?;
@@ -733,7 +765,7 @@ pub(super) fn apply(
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);
     }
-    Ok(())
+    Ok(applied.rolled_back != 0)
 }
 /// The pass's last save when no later graph save will carry the stage: one
 /// Tail-only commit G to G+1. The caller holds the owner locks, recovered ACK
@@ -758,7 +790,15 @@ pub(super) fn commit_exit(
             &serde_json::to_vec(&catalogue::LAYOUT)?,
         )?;
     }
-    apply(&mut tx, Some(stage), &[])?;
+    // No graph rows here: a rolled-back file leaves nothing in RAM ahead.
+    apply(
+        &mut mapper::Rows {
+            tx: Some(&mut tx),
+            ..Default::default()
+        },
+        Some(stage),
+        &[],
+    )?;
     let outcome = tx.commit(expected, next);
     span.outcome(&outcome);
     let published = outcome != DurableCommitOutcome::NotPublished;

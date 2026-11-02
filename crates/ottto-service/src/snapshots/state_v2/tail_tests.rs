@@ -258,13 +258,31 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
     assert_eq!(erasure_marks(&index), 1);
 }
 
-/// [behaviour] One bad file rolls back alone: its predecessor stays, the marker
-/// and sibling commit and bookkeeping is restored. Retry clears the marker.
+fn usage_family() -> crate::snapshots::ClaudeUsageFamilyPending {
+    crate::snapshots::ClaudeUsageFamilyPending {
+        census_window_end: "2026-11-02T00:00:00Z".into(),
+        member_request_id_hashes: BTreeMap::from([(
+            "family".into(),
+            std::collections::BTreeSet::from(["c".repeat(64)]),
+        )]),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+        idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
+    }
+}
+
+/// [behaviour] One bad file rolls back alone with its own graph rows: its
+/// predecessor stays, while its marker, a sibling and shared rows commit and the
+/// route reloads. Hydrate accepts the shared rows ahead of the file's; the retry
+/// merges them idempotently and clears the marker.
 #[test]
-fn one_bad_file_rolls_back_while_sibling_and_marker_commit() {
+fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.files.insert(FILE.into(), progress_row());
     stage_tail(
         &f.path,
         FILE,
@@ -284,8 +302,29 @@ fn one_bad_file_rolls_back_while_sibling_and_marker_commit() {
             ],
         )
     };
+    // The file's rows change and gain a member; a sibling's and shared rows too.
+    let advance = |index: &mut ScanIndex| {
+        let mut grown = progress_row();
+        grown.size_bytes = 8;
+        index.files.insert(FILE.into(), grown);
+        index.confirmed_empty_files.insert(FILE.into());
+        index.files.insert(SIBLING.into(), progress_row());
+        index.accepted_snapshot_fingerprints.insert("b".repeat(64));
+        index
+            .claude_usage_family_pending
+            .add("family".into(), usage_family());
+    };
+    let shared_committed = |index: &ScanIndex| {
+        assert!(index.files.get(SIBLING).is_some());
+        assert!(index
+            .accepted_snapshot_fingerprints
+            .contains(&"b".repeat(64)));
+        let family = index.claude_usage_family_pending.view("family");
+        assert_eq!(family.map(|family| family.hash_member_count()), Some(1));
+    };
     for attempts in 1..=2 {
         with_session_db(&index, |db| sqlite::set_save_ceiling(db, 1024 * 1024));
+        advance(&mut index);
         stage_tail(&f.path, FILE, bad()).unwrap();
         stage_tail(
             &f.path,
@@ -293,13 +332,19 @@ fn one_bad_file_rolls_back_while_sibling_and_marker_commit() {
             staged(b"sibling", &[(Collection::Requests, 0, b"sibling")]),
         )
         .unwrap();
-        save_with(&f.path, &mut index).unwrap();
+        let reload = save_with(&f.path, &mut index).unwrap_err();
+        assert_eq!(reload.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+        assert!(stage_empty(&f.path), "the commit published the stage");
+
+        index = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(index.files.get(FILE).unwrap().size_bytes, 4);
+        assert!(!index.confirmed_empty_files.contains(FILE), "counted out");
+        shared_committed(&index);
         let (head, pages) = read(&index, FILE).unwrap();
         assert_eq!(head.unwrap().body, b"old", "the predecessor stays");
         assert_eq!(pages[&(Collection::Responses, 0)], b"old");
         assert_eq!(pages.len(), 1);
         assert_eq!(erasure_marks(&index), 0, "the reset's marks rolled back");
-        with_session_db(&index, |db| assert_eq!(db.save_failure(), None));
         let (head, _) = read(&index, SIBLING).unwrap();
         assert_eq!(head.unwrap().body, b"sibling");
         let marker = tail_set_aside(&index, FILE).unwrap().unwrap();
@@ -310,9 +355,13 @@ fn one_bad_file_rolls_back_while_sibling_and_marker_commit() {
         assert!(tail_set_aside(&index, SIBLING).unwrap().is_none());
     }
 
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, u64::MAX));
+    advance(&mut index);
     stage_tail(&f.path, FILE, bad()).unwrap();
     save_with(&f.path, &mut index).unwrap();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.files.get(FILE).unwrap().size_bytes, 8);
+    assert!(index.confirmed_empty_files.contains(FILE));
+    shared_committed(&index);
     let (head, pages) = read(&index, FILE).unwrap();
     assert_eq!(head.unwrap().body, b"new");
     assert_eq!(pages[&(Collection::Responses, 1)], oversized);
@@ -320,6 +369,48 @@ fn one_bad_file_rolls_back_while_sibling_and_marker_commit() {
         tail_set_aside(&index, FILE).unwrap().is_none(),
         "retry clears"
     );
+}
+
+/// [behaviour] A retire drops the key's pending stage, and a later reset
+/// cancels the retire, so the same save keeps the fresh head.
+#[test]
+fn retire_drops_pending_stage_and_reset_cancels_retire() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    stage_tail(
+        &f.path,
+        FILE,
+        staged(b"head", &[(Collection::Responses, 0, b"page")]),
+    )
+    .unwrap();
+    save_with(&f.path, &mut index).unwrap();
+
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"fresh", &[(Collection::Requests, 0, b"fresh")])
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let (head, pages) = read(&index, FILE).unwrap();
+    assert_eq!(head.unwrap().body, b"fresh");
+    assert_eq!(
+        pages,
+        Pages::from([((Collection::Requests, 0), b"fresh".to_vec())])
+    );
+
+    stage_tail(
+        &f.path,
+        FILE,
+        staged(b"stale", &[(Collection::Responses, 1, b"stale")]),
+    )
+    .unwrap();
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    let files = with_state(&f.path, |state| Ok(state.tail.files())).unwrap();
+    assert_eq!(files, 0, "the stale stage went");
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, FILE), 0);
 }
 
 /// [behaviour] A full database is no one file's fault: nothing commits.
