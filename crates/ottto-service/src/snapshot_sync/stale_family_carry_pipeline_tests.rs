@@ -370,9 +370,9 @@ fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
 
 /// T0/T1, the unrelated-red-window shape: an unrelated session turns the
 /// 08:10 window red. BASE re-arms every family parsed there at each retry
-/// start, so the unchanged witnessed family is re-read at 08:20 and 08:30
-/// only to find semantic no-ops. The fix carries it at both retries and reads
-/// only the unrelated sessions, which are unwitnessed and keep the BASE
+/// start; the terminal-retry re-arm owes, so BASE re-stamps the unchanged
+/// families instead of re-reading them. The fix carries the witnessed family
+/// at both retries; the unrelated sessions are unwitnessed and keep the BASE
 /// re-arm. Every window's liveness (RetryPending, red or complete terminal,
 /// fence, full re-arm, retained proof) equals BASE, the accepted heads and the
 /// witness never change, and the complete 08:30 census retires the carried
@@ -408,7 +408,13 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
             start.stale_pending_families,
             base_start.stale_pending_families
         );
-        assert!(window.parsed.contains(REARM_TERMINAL), "unwitnessed: BASE");
+        // The unwitnessed session keeps BASE's route: owed and re-stamped,
+        // not re-read, under the terminal-retry re-arm.
+        assert_eq!(
+            window.parsed.contains(REARM_TERMINAL),
+            base_window.parsed.contains(REARM_TERMINAL),
+            "unwitnessed: BASE"
+        );
         // BASE re-stamps (no read) where the fix carries.
         assert_eq!(window.family_reads, 0, "the carried family is not read");
         assert_eq!(window.reads, base_window.reads);
