@@ -415,6 +415,7 @@ mod content;
 
 /// Content obligations without a supported, pre-funded extractor.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct RederiveUnfunded;
 
 impl Decoded {

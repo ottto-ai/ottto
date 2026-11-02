@@ -1035,6 +1035,7 @@ impl LocalDaemon {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
         self.reset_account_for_authorized_client()
     }
@@ -1068,6 +1069,7 @@ impl LocalDaemon {
         })
     }
 
+    #[cfg(test)]
     pub fn update_sources(
         &self,
         token: &str,
