@@ -363,24 +363,15 @@ impl TerminalJoin {
         };
         // The root sequence `derive_claude_legacy_usage_exclusions` reads.
         let mut candidate = false;
-        if let Some(occurrences) = root_occurrences {
-            let mut ordered = occurrences
-                .iter()
-                .map(|(hash, occurrence)| (occurrence.sequence, hash))
-                .collect::<Vec<_>>();
-            ordered.sort();
-            if let Some((_, head)) = ordered
-                .first()
-                .filter(|_| !ordered.windows(2).any(|pair| pair[0].0 == pair[1].0))
-            {
-                self.first_keys
-                    .insert(root.to_owned(), lenient_decode::repair_key(head));
-                candidate = inputs.legacy_request_owners.is_some_and(|owners| {
-                    owners
-                        .get(*head)
-                        .is_some_and(|owner| owner.root_session_id != root)
-                });
-            }
+        if let Some(sequence) = claude_root_request_sequence(root, family) {
+            let head = sequence[0];
+            self.first_keys
+                .insert(root.to_owned(), lenient_decode::repair_key(head));
+            candidate = inputs.legacy_request_owners.is_some_and(|owners| {
+                owners
+                    .get(head)
+                    .is_some_and(|owner| owner.root_session_id != root)
+            });
         }
         if candidate {
             self.candidates.insert(root.to_owned());

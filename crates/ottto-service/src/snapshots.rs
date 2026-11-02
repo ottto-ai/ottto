@@ -5438,13 +5438,16 @@ pub(crate) enum ClaudeTerminalOutcome {
     Refused,
 }
 
-/// The streamed terminal's visitor slices and memory, and how long the Claude
+/// The streamed terminal's visitor slices, time and memory, and how long the Claude
 /// duplicate fence has been closed (census clock seconds since a fold first
 /// saw it closed). Logged beside the duplicate census; absent while empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTerminalStreamCounts {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal_slices: u64,
+    /// Monotonic time the terminal's visits took. Never compared.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub terminal_ms: u64,
     /// The most stored-row bytes one slice decoded.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal_peak_slice_bytes: u64,
@@ -8153,15 +8156,15 @@ pub struct SourceScanResult {
     /// end, and on an unaccelerated attempt.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
     continuation_evidence: Option<Arc<Mutex<Option<CodexContinuationEvidence>>>>,
-    /// A complete Claude census's traversal checkpoint, retired by this scan
-    /// before its terminal fold: the fold puts it back unless its terminal
-    /// is Complete. Moved, never copied; RAM only.
+    /// A complete census's traversal checkpoint, retired by this scan before
+    /// its fold: the Claude fold puts it back unless its terminal is
+    /// Complete; other sources drop it. Moved, never copied; RAM only.
     claude_terminal_custody: Option<Box<ClaudeTerminalCustody>>,
 }
 }
 
-/// The traversal checkpoint and resume cursor a complete Claude census
-/// retired before its terminal fold.
+/// The traversal checkpoint and resume cursor a complete census retired
+/// before its fold.
 #[derive(Debug, Clone)]
 struct ClaudeTerminalCustody {
     traversal: Option<ScanTraversalCheckpoint>,
@@ -8171,12 +8174,9 @@ struct ClaudeTerminalCustody {
 }
 
 impl ClaudeTerminalCustody {
-    /// A refused terminal keeps its traversal: the next pass re-enters it.
-    /// A traversal started since is never replaced.
+    /// A terminal that did not complete keeps its traversal: the next pass
+    /// re-enters it. Nothing starts a traversal between the scan and its fold.
     fn restore(self, index: &mut ScanIndex) {
-        if index.traversal.is_some() || self.traversal.is_none() {
-            return;
-        }
         index.traversal = self.traversal;
         index.resume_after_path = self.resume_after_path;
         index.resume_upper_bound_path = self.resume_upper_bound_path;
@@ -9495,59 +9495,60 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     comparison: Option<claude_native_comparison::FoldView<'_>>,
     veto_api_rows: &ClaudeVetoApiRows,
 ) -> ClaudeUsageAuthorityDisposition {
-    if !index.persistence_available() {
+    let disposition = if index.persistence_available() {
+        // A previous unsettled upload requires a clean followup before manifest /
+        // replay settlement, but cannot erase the actual healthy terminal native
+        // window. Fold those observations once before any recovered body can leave.
+        let native_census_complete = scan.census_complete
+            || comparison
+                .as_ref()
+                .is_some_and(|view| view.native_census_complete(scan));
+        let current_files = if index.claude_usage_authority_quarantine.is_empty() {
+            BTreeSet::new()
+        } else {
+            scan.pending_finalization
+                .iter()
+                .map(|pending| pending.index_key.clone())
+                .collect()
+        };
+        let mut disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+            &mut scan.snapshots,
+            api_report,
+            trace_report,
+            index,
+            native_census_complete,
+            &scan.census_window_end,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            identity,
+            &current_files,
+            observations,
+            comparison,
+            veto_api_rows,
+        );
+        // Slice D1: report only. The shadow was measured by the scan; no fold
+        // input above read it.
+        disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
+        disposition
+    } else {
         scan.census_complete = false;
-        return ClaudeUsageAuthorityDisposition {
+        ClaudeUsageAuthorityDisposition {
             quarantined_source_session_ids: scan
                 .snapshots
                 .iter()
                 .map(|s| s.source_session_id.clone())
                 .collect(),
             ..Default::default()
-        };
-    }
-
-    // A previous unsettled upload requires a clean followup before manifest /
-    // replay settlement, but cannot erase the actual healthy terminal native
-    // window. Fold those observations once before any recovered body can leave.
-    let native_census_complete = scan.census_complete
-        || comparison
-            .as_ref()
-            .is_some_and(|view| view.native_census_complete(scan));
-    let current_files = if index.claude_usage_authority_quarantine.is_empty() {
-        BTreeSet::new()
-    } else {
-        scan.pending_finalization
-            .iter()
-            .map(|pending| pending.index_key.clone())
-            .collect()
+        }
     };
-    let mut disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
-        &mut scan.snapshots,
-        api_report,
-        trace_report,
-        index,
-        native_census_complete,
-        &scan.census_window_end,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        identity,
-        &current_files,
-        observations,
-        comparison,
-        veto_api_rows,
-    );
-    // Slice D1: report only. The shadow was measured by the scan; no fold
-    // input above read it.
-    disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
     // Cursor custody: the scan retired its traversal before this fold; only
-    // a Complete terminal keeps it retired. A refused one leaves the census
-    // incomplete and puts the traversal back, so the next pass re-enters it.
-    let custody = scan.claude_terminal_custody.take();
-    if disposition.terminal == ClaudeTerminalOutcome::Refused {
-        scan.census_complete = false;
-        scan.scan_cap_hit = true;
-        if let Some(custody) = custody {
+    // a Complete terminal keeps it retired. Any other outcome (refused, or
+    // the whole page quarantined) leaves the census incomplete and puts the
+    // traversal back, so the next pass re-enters it.
+    if disposition.terminal != ClaudeTerminalOutcome::Complete {
+        if let Some(custody) = scan.claude_terminal_custody.take() {
+            scan.census_complete = false;
+            scan.scan_cap_hit = true;
             custody.restore(index);
         }
     }
@@ -9782,6 +9783,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     let mut terminal = None;
     let mut terminal_stream = ClaudeTerminalStreamCounts::default();
     if census_complete {
+        let started = std::time::Instant::now();
         let owed_roots = evidence_owed::owed_roots(index);
         let inputs = terminal_join::TerminalInputs {
             census_window_end,
@@ -9797,6 +9799,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         match terminal_join::sweep(index, &inputs) {
             Ok(join) => {
                 terminal_stream.terminal_slices = join.slices as u64;
+                terminal_stream.terminal_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 terminal_stream.terminal_peak_slice_bytes = join.peak_slice_bytes as u64;
                 terminal_stream.terminal_installed_families = join.installed_families as u64;
                 terminal = Some(join);
@@ -12628,7 +12632,7 @@ fn take_claude_fence_alarm_slot(alarm: ClaudeFenceAlarm, now: std::time::Instant
 /// A closed duplicate fence older than this alarms (throttled).
 const CLAUDE_FENCE_AGE_ALARM_SECONDS: u64 = 24 * 60 * 60;
 
-/// C5: record when a fold first sees the duplicate fence closed (cleared when
+/// Record when a fold first sees the duplicate fence closed (cleared when
 /// it opens) and return its age on the census clock. Past a day, alarm with
 /// the census counts, throttled. Counts only; decides nothing.
 fn note_claude_duplicate_fence_age(
@@ -13071,6 +13075,25 @@ struct ClaudeLegacyRequestOwner {
     evidence_fingerprint: String,
 }
 
+/// A family's root-member requests in sequence order; None when it has none
+/// or two share a sequence number.
+fn claude_root_request_sequence<'p>(
+    root_session_id: &str,
+    pending: &'p ClaudeUsageFamilyPending,
+) -> Option<Vec<&'p String>> {
+    let mut ordered = pending
+        .member_occurrences
+        .get(root_session_id)?
+        .iter()
+        .map(|(request_hash, occurrence)| (occurrence.sequence, request_hash))
+        .collect::<Vec<_>>();
+    ordered.sort();
+    if ordered.is_empty() || ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
+    Some(ordered.into_iter().map(|(_, hash)| hash).collect())
+}
+
 /// Infer only the usage exclusion, never a provider graph edge, for legacy
 /// top-level forks written before `forkedFrom` existed. A child is eligible
 /// only when its non-owned responses are one contiguous leading prefix, that
@@ -13090,21 +13113,10 @@ fn derive_claude_legacy_usage_exclusions(
         .keys()
         .filter_map(|root_session_id| {
             let pending = pending_by_root.get(root_session_id)?;
-            let occurrences = pending.member_occurrences.get(root_session_id)?;
-            let mut ordered = occurrences
-                .iter()
-                .map(|(request_hash, occurrence)| (occurrence.sequence, request_hash.clone()))
-                .collect::<Vec<_>>();
-            ordered.sort();
-            if ordered.is_empty() || ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-                return None;
-            }
+            let sequence = claude_root_request_sequence(root_session_id, pending)?;
             Some((
                 root_session_id.clone(),
-                ordered
-                    .into_iter()
-                    .map(|(_, hash)| hash)
-                    .collect::<Vec<_>>(),
+                sequence.into_iter().cloned().collect::<Vec<_>>(),
             ))
         })
         .collect::<BTreeMap<_, _>>();
@@ -33031,7 +33043,7 @@ impl OwnedSourceScan {
                         resume_upper_bound_path: index.resume_upper_bound_path.take(),
                         resume_census_window_end: index.resume_census_window_end.take(),
                     };
-                    if source == SnapshotSource::ClaudeCode && census_complete {
+                    if census_complete {
                         claude_terminal_custody = Some(Box::new(retired));
                     }
                 }
