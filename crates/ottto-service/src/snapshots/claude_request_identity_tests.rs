@@ -4525,7 +4525,11 @@ fn no_key_flip_refusals_count_only_uncompared_terminal_flips() {
             .as_u64()
             .unwrap_or(0)
     };
-    assert_eq!(refusals("cli"), 0, "keyed: the new sentence explains the flip");
+    assert_eq!(
+        refusals("cli"),
+        0,
+        "keyed: the new sentence explains the flip"
+    );
     identity::set_test_session_context_key(None);
     assert_eq!(refusals("cli"), 1, "only the request after the flip");
     assert_eq!(refusals("claude-desktop"), 0, "Desktop markers are trusted");
