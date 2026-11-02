@@ -496,6 +496,7 @@ fn eze_identical_repeat_is_overlap() {
     // own equal-total repeat: never admitted, so the group replays.
     assert_eq!(
         eze_rows(vec![
+            native(OWNER, "r-c", 10, 310),
             ui(10, 310, "2026-11-04T10:00:00Z"),
             ui(0, 310, "2026-11-04T10:00:10Z"),
             ui(10, 310, "2026-11-04T10:00:00Z"),
