@@ -188,7 +188,8 @@ fn run_page(
     let dir = scratch();
     let path = dir.join(format!("{ROOT}.jsonl"));
     fs::write(&path, b"fixture\n").unwrap();
-    let index = index_holding(&dir, copied);
+    let mut index = index_holding(&dir, copied);
+    accepted_receipt(&mut index, &dir);
     let mut items = read_file(&path, &index, lines);
     decide_page_copies(&mut items, &index, None);
     let read = sidecar(rows);
@@ -360,16 +361,7 @@ fn copy_at(dir: &Path) -> PathBuf {
     path
 }
 fn accepted_receipt(index: &mut ScanIndex, dir: &Path) {
-    index
-        .files
-        .get_mut(&holder_key(dir))
-        .unwrap()
-        .upload_context_receipt = Some(Receipt {
-        context_fingerprint: "another-upload-context".into(),
-        replay_generation: RECEIPT_REPLAY_EPOCH,
-        source_witness: "a".repeat(64),
-        body_witness: "b".repeat(64),
-    });
+    crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(index, &holder_key(dir));
 }
 
 /// [regress] A holder with no accepted body in any context (its census alone

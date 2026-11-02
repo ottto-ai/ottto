@@ -173,7 +173,7 @@ impl ProofChain {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.activate_upload_context("proof-recovery-context".into());
         index.load_claude_reemission_exclusions(&self.support);
-        let (index, scan, _) = E2ScanFixture::capturing_identity().scan(
+        let (mut index, scan, _) = E2ScanFixture::capturing_identity().scan(
             std::slice::from_ref(&self.root),
             &self.support,
             index,
@@ -182,6 +182,15 @@ impl ProofChain {
             &self.births,
             &[],
         );
+        // These tests are about census proof, so every origin's body is already
+        // accepted; a file's real ACK replaces this in `accept`.
+        for path in &self.paths {
+            let key = local_index_key(path);
+            let held = index.files.get(&key);
+            if held.is_some_and(|entry| entry.upload_context_receipt.is_none()) {
+                fixture::origin_accepted_for_test(&mut index, &key);
+            }
+        }
         (index, scan)
     }
 
