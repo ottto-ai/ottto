@@ -64,6 +64,36 @@ impl FileStamp {
         })
     }
 
+    /// Archive completion keeps only the same_content witness, never ctime.
+    pub(crate) fn content_only(mut self) -> Self {
+        #[cfg(unix)]
+        {
+            self.changed = (0, 0);
+        }
+        self
+    }
+
+    /// Compare the complete listing key without another metadata read.
+    pub(crate) fn same_listing(
+        &self,
+        device: u64,
+        inode: u64,
+        length: u64,
+        modified: (i64, i64),
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == device
+                && self.inode == inode
+                && self.length == length
+                && self.modified == modified
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, inode, length, modified);
+            false
+        }
+    }
     pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
