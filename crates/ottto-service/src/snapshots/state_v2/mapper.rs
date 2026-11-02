@@ -347,11 +347,7 @@ pub(super) fn put<T: Serialize + ?Sized>(
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {
-        if !matches!(
-            kind,
-            "account_window" | "usage.pending" | "file.census" | "proof.usage"
-        ) && old.digest == codec::digest(&json)
-        {
+        if shared(kind).is_none() && old.digest == codec::digest(&json) {
             return Ok(old.clone());
         }
     }
@@ -592,10 +588,7 @@ pub(super) fn references(
     let RowKey::Record { kind, .. } = &h.key else {
         return Ok(());
     };
-    if !matches!(
-        kind.name(),
-        "account_window" | "usage.pending" | "file.census" | "proof.usage"
-    ) {
+    if shared(kind.name()).is_none() {
         return Ok(());
     }
     let bytes = codec::capture(value, value_cap(&h.key))?;
