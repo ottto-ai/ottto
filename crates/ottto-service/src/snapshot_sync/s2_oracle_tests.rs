@@ -360,6 +360,42 @@ fn scan_below_floor_holds_without_a_smaller_reemit() {
     });
 }
 
+/// Failure context for the lossy row: scan counters and every index field
+/// that names the lossy file.
+fn lossy_diag(label: &str, page: &Page, key: &str) -> String {
+    let scan = &page.scan;
+    let fields = serde_json::to_value(&page.committed)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.to_string().contains(key))
+        .map(|(k, v)| {
+            let text = v.to_string().chars().take(1500).collect::<String>();
+            format!("{k}={text}")
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "\n[{label}] modes={:?} discovered={} scanned={} limit_skipped={} \
+         malformed={} census_complete={} emitted={:?} decode_hold={} \
+         len={:?}\n committed_entry={:?}\n after_entry={:?}\n fields={fields:?}",
+        page.modes,
+        scan.discovered_file_count,
+        scan.scanned_file_count,
+        scan.skipped_file_count_due_to_limit,
+        scan.malformed_json_line_count,
+        scan.census_complete,
+        scan.snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        page.committed.decode_holds_file(key),
+        std::fs::metadata(key).map(|m| m.len()).ok(),
+        page.committed.files.get(key),
+        page.index.files.get(key),
+    )
+}
+
 /// [money] A lossy append gets no new stored authority. Repeated reads from
 /// the last good head retain the cold Full's money and loss disclosures.
 #[test]
@@ -387,8 +423,14 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let current = page(&c, prior, 100, true);
-        assert_eq!(current.modes.0, 0);
-        assert!(current.modes.1 > 0);
+        let key = path.to_str().unwrap().to_owned();
+        let mut diag = format!(
+            "cold emitted={:?}",
+            cold.snapshots.keys().collect::<Vec<_>>()
+        );
+        diag += &lossy_diag("lossy", &current, &key);
+        assert_eq!(current.modes.0, 0, "{diag}");
+        assert!(current.modes.1 > 0, "{diag}");
         let mut held = result(&current, Mode::Restart);
         held.accepted = previous.accepted.clone();
         money_oracle::assert_held(ROOT, &previous, &held, &cold);
@@ -399,13 +441,19 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
         append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let replay = page(&c, prior, 100, true);
+        diag += &lossy_diag("replay", &replay, &key);
+        if replay.modes.1 == 0 {
+            // Context only: do later walks pick the file up?
+            let later = page(&c, replay.index.clone(), 100, true);
+            diag += &lossy_diag("later", &later, &key);
+        }
         assert_eq!(
             replay.modes.0, 0,
-            "lossy completion must leave the old head"
+            "lossy completion must leave the old head{diag}"
         );
         assert!(
             replay.modes.1 > 0,
-            "the old seal must replay the lossy suffix"
+            "the old seal must replay the lossy suffix{diag}"
         );
         let mut held = result(&replay, Mode::Restart);
         held.accepted = previous.accepted.clone();
