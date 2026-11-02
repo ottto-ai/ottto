@@ -345,6 +345,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                     });
                 Ok(response)

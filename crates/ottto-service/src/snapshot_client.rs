@@ -837,6 +837,34 @@ pub(crate) struct SnapshotConflictRescan {
     pub(crate) answered: bool,
 }
 
+/// Class H accepted-head digest. Debug exposes presence, never digest bytes.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AcceptedRevisionV2Hash {
+    hash: String,
+}
+
+impl TryFrom<String> for AcceptedRevisionV2Hash {
+    type Error = &'static str;
+    fn try_from(hash: String) -> std::result::Result<Self, Self::Error> {
+        if !crate::hex::is_sha256_lower(&hash) {
+            return Err("accepted head revision must be 64 lowercase hex digits");
+        }
+        Ok(Self { hash })
+    }
+}
+impl From<AcceptedRevisionV2Hash> for String {
+    fn from(value: AcceptedRevisionV2Hash) -> Self {
+        value.hash
+    }
+}
+impl std::fmt::Debug for AcceptedRevisionV2Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AcceptedRevisionV2Hash(present)")
+    }
+}
+crate::heap_layout_bound::fields!(AcceptedRevisionV2Hash; hash);
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SnapshotEntityRef {
     pub source_session_id: String,
@@ -849,6 +877,9 @@ pub struct SnapshotEntityRef {
     pub body_witness_digest: Option<String>,
     #[serde(default)]
     pub head_etag: Option<String>,
+    /// Server-canonical accepted head revision; decoded only for head-CAS requests.
+    #[serde(default)]
+    pub accepted_revision_v2_hash: Option<AcceptedRevisionV2Hash>,
     #[serde(default)]
     pub head_challenge: Option<String>,
     /// Set only on an `unchanged` ref the server settled because its stored
@@ -991,6 +1022,26 @@ impl SnapshotBatchResponse {
         }
     }
 
+    /// Ignore the additive revision field unless this POST declared head-CAS.
+    pub(crate) fn decode_for_head_cas(mut value: Value, head_cas: bool) -> Result<Self> {
+        if !head_cas {
+            for field in [
+                "accepted_entities",
+                "unchanged_entities",
+                "conflict_entities",
+            ] {
+                if let Some(refs) = value.get_mut(field).and_then(Value::as_array_mut) {
+                    for reference in refs {
+                        if let Some(reference) = reference.as_object_mut() {
+                            reference.remove("accepted_revision_v2_hash");
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value).map_err(anyhow::Error::from)
+    }
+
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -1104,6 +1155,12 @@ impl SnapshotBatchResponse {
             .iter()
             .chain(&self.unchanged_entities)
         {
+            if reference.unchanged_basis.is_some() && reference.accepted_revision_v2_hash.is_some()
+            {
+                return Err(anyhow!(
+                    "snapshot ACK revision hash is not stored-body proof"
+                ));
+            }
             if !valid_snapshot_head_token(reference.head_etag.as_deref())
                 || reference.head_challenge.is_some()
             {
@@ -1114,6 +1171,7 @@ impl SnapshotBatchResponse {
         }
         for reference in &self.conflict_entities {
             if reference.head_etag.is_some()
+                || reference.accepted_revision_v2_hash.is_some()
                 || !valid_snapshot_head_token(reference.head_challenge.as_deref())
             {
                 return Err(anyhow!(
@@ -1222,6 +1280,7 @@ impl SnapshotBatchResponse {
                 body_witness_version: None,
                 body_witness_digest: None,
                 head_etag: None,
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
@@ -2378,10 +2437,11 @@ impl SnapshotApiClient {
                 let decoded = if retry.is_some() {
                     bounded_response_json(response, crate::snapshot_retry::RESPONSE_BYTES)
                 } else {
-                    response
-                        .into_json::<SnapshotBatchResponse>()
-                        .map_err(anyhow::Error::from)
-                };
+                    response.into_json::<Value>().map_err(anyhow::Error::from)
+                }
+                .and_then(|value| {
+                    SnapshotBatchResponse::decode_for_head_cas(value, enforce_head_cas)
+                });
                 match decoded {
                     Ok(response) => {
                         self.record_batch_success(
@@ -4601,6 +4661,7 @@ mod tests {
             body_witness_version: None,
             body_witness_digest: None,
             head_etag: None,
+            accepted_revision_v2_hash: None,
             head_challenge: None,
             unchanged_basis: None,
             retained_proof_missing: Vec::new(),
@@ -4706,6 +4767,7 @@ mod tests {
                 body_witness_version: Some(14),
                 body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),

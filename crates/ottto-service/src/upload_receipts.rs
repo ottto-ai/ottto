@@ -1143,6 +1143,7 @@ mod tests {
                 body_witness_version: None,
                 body_witness_digest: None,
                 head_etag: None,
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),

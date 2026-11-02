@@ -86,7 +86,13 @@ none of these keys uploads no defaults at all rather than an empty record, so
 When a scan needs multiple uploads, `ottto-service` stores a temporary local
 resume checkpoint containing only the semantic hashes of snapshots the backend
 already accepted, their hash-neutral body witnesses, and a
-one-way hash that binds the checkpoint to its relay device. It does not store
+one-way hash that binds the checkpoint to its relay device. Upload-progress
+schema v4 also allowlists `accepted_revision_v2_hashes` as class H: one optional
+64-character lowercase hexadecimal server-canonical head digest per accepted
+entity. Only a stored-body head-CAS ACK writes it; an omitted value preserves
+existing proof. Entity retirement and source-off erase it with its checkpoint,
+and diagnostics expose no digest bytes. Version 3 checkpoints migrate without
+this field; newer schemas hold without replacement. It does not store
 raw account/device identifiers, titles, prompts,
 responses, paths, session ids, usage payloads, or attribution labels. The
 checkpoint is scoped to the active collection policy and relay destination;

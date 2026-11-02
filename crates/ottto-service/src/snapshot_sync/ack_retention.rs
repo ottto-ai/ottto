@@ -343,6 +343,7 @@ impl SnapshotUploadProgress {
                 .retain(|fp, _| !retired.contains(fp) || locally_held.contains(fp));
             self.accepted_fingerprints
                 .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
+            self.retain_accepted_revision_hashes();
         } else {
             self.retire_listed_acks_after_index_save(saved, &retired, locally_held);
         }
@@ -809,9 +810,13 @@ impl SnapshotUploadProgress {
     ) -> Result<()> {
         let retired = self.saved_handoff_retirements(saved);
         let mut removed = BTreeMap::new();
+        let mut removed_revisions = BTreeMap::new();
         for fp in retired {
             if let Some(body) = self.accepted_body_witnesses.remove(&fp) {
                 self.accepted_fingerprints.remove(&fp);
+                if let Some(hash) = self.accepted_revision_v2_hashes.remove(&fp) {
+                    removed_revisions.insert(fp.clone(), hash);
+                }
                 removed.insert(fp, body);
             }
         }
@@ -821,6 +826,7 @@ impl SnapshotUploadProgress {
                 self.generation = generation;
                 self.accepted_fingerprints.extend(removed.keys().cloned());
                 self.accepted_body_witnesses.extend(removed);
+                self.accepted_revision_v2_hashes.extend(removed_revisions);
                 return Err(error);
             }
         }
@@ -946,5 +952,6 @@ impl SnapshotUploadProgress {
         });
         self.accepted_fingerprints
             .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
+        self.retain_accepted_revision_hashes();
     }
 }

@@ -124,7 +124,7 @@ const SNAPSHOT_INPLACE_RETRY_MIN_WAIT: Duration = Duration::from_millis(250);
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
 // remaining identities across restarts.
 const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
-const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
+const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 4;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]
@@ -203,12 +203,11 @@ fn bootstrap_cache_heads_with_budget(
                     persist(progress)?;
                 }
                 for probe in probes {
+                    // Force the repeat through the existing runtime retry lease,
+                    // retaining accepted proof when an archived head omits it.
                     progress
-                        .accepted_fingerprints
-                        .remove(&probe.snapshot_fingerprint);
-                    progress
-                        .accepted_body_witnesses
-                        .remove(&probe.snapshot_fingerprint);
+                        .active_quarantine_retries
+                        .insert(probe.snapshot_fingerprint.clone());
                 }
             }
             let mut accepted = 0;
@@ -1535,6 +1534,8 @@ struct PermanentSnapshotRejection {
     reoffer: Option<reason_reoffer::RefusalReoffer>,
 }
 
+#[cfg(test)]
+mod accepted_revision_progress_tests;
 mod ack_retention;
 mod head_conflict;
 mod upload_context_resend;
@@ -1564,6 +1565,10 @@ struct SnapshotUploadProgress {
     /// Exact context of each durable stored-body ACK; absent means unknown.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     accepted_body_contexts: BTreeMap<String, String>,
+    /// Class H: one server-canonical revision per accepted entity, for a later
+    /// replaces_witness. Never infer it from local content or expose its bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accepted_revision_v2_hashes: BTreeMap<String, crate::snapshot_client::AcceptedRevisionV2Hash>,
     #[serde(skip)]
     context_resend: upload_context_resend::Cycle,
     /// Admission only: current live incidence plus bounded unsettled ACK debt.
@@ -1647,6 +1652,7 @@ impl SnapshotUploadProgress {
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
             accepted_body_contexts: BTreeMap::new(),
+            accepted_revision_v2_hashes: BTreeMap::new(),
             context_resend: upload_context_resend::Cycle::default(),
             ack_capacity: ack_retention::default_ack_capacity(),
             retained_stale_ack_count: 0,
@@ -1699,12 +1705,19 @@ impl SnapshotUploadProgress {
             progress.ack_recovery = ack_recovery.map(Box::new);
             return Ok(progress);
         }
-        let parsed = std::fs::read(path)
-            .context("read snapshot upload progress")
-            .and_then(|bytes| {
-                serde_json::from_slice::<Self>(&bytes)
-                    .context("parse v3 local snapshot upload progress")
-            });
+        let bytes = std::fs::read(path).context("read snapshot upload progress")?;
+        #[derive(Deserialize)]
+        struct Version {
+            schema_version: u16,
+        }
+        if let Ok(version) = serde_json::from_slice::<Version>(&bytes) {
+            anyhow::ensure!(
+                version.schema_version <= SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+                "snapshot upload progress future schema hold"
+            );
+        }
+        let parsed =
+            serde_json::from_slice::<Self>(&bytes).context("parse local snapshot upload progress");
         // Option (ii) proof is scoped to the namespace that ACKed it.
         if let Ok(progress) = &parsed {
             if progress.destination_namespace_hash != expected_destination_namespace_hash {
@@ -1715,9 +1728,11 @@ impl SnapshotUploadProgress {
         }
         let mut progress = match parsed {
             Ok(progress)
-                if progress.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-                    && progress.destination_namespace_hash
-                        == expected_destination_namespace_hash
+                if matches!(
+                    progress.schema_version,
+                    3 | SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+                ) && progress.destination_namespace_hash
+                    == expected_destination_namespace_hash
                     && is_snapshot_fingerprint(&progress.destination_namespace_hash)
                     && progress
                         .accepted_fingerprints
@@ -1740,6 +1755,10 @@ impl SnapshotUploadProgress {
                             progress.accepted_body_witnesses.contains_key(key)
                                 && is_snapshot_fingerprint(context)
                         })
+                    && progress
+                        .accepted_revision_v2_hashes
+                        .keys()
+                        .all(|key| progress.accepted_body_witnesses.contains_key(key))
                     && progress.accepted_cache_heads.iter().all(|(key, head)| {
                         is_snapshot_fingerprint(key) && is_snapshot_fingerprint(head)
                     })
@@ -1801,6 +1820,7 @@ impl SnapshotUploadProgress {
                 ));
             }
         };
+        progress.schema_version = SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION;
         let permanent = &progress.permanent_rejections;
         progress.terminal_contract_retry_pending_save =
             crate::snapshots::terminal_contract_retry::rearm(
@@ -2365,6 +2385,7 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
         self.accepted_body_contexts.clear();
+        self.accepted_revision_v2_hashes.clear();
         self.quarantined_fingerprints.clear();
         for pending in self.pending_cache_heads.values_mut() {
             pending.settled_entities.clear();
@@ -2648,6 +2669,7 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
         self.accepted_body_contexts.remove(fingerprint);
+        self.accepted_revision_v2_hashes.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
     }
 
@@ -2818,13 +2840,21 @@ impl SnapshotUploadProgress {
     /// The concurrent-writer stamp of every progress write: `on_disk` is this
     /// owner's last save and nobody has saved since.
     fn same_writer(&self, on_disk: &Self) -> bool {
-        on_disk.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            && on_disk.generation == self.generation
+        matches!(
+            on_disk.schema_version,
+            3 | SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+        ) && on_disk.generation == self.generation
             && on_disk.destination_namespace_hash == self.destination_namespace_hash
     }
+    fn retain_accepted_revision_hashes(&mut self) {
+        self.accepted_revision_v2_hashes
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+    }
+
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+        self.retain_accepted_revision_hashes();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
@@ -11035,6 +11065,14 @@ where
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
+                if let Some(hash) = stored_refs
+                    .get(item_fingerprint)
+                    .and_then(|entity| entity.accepted_revision_v2_hash.as_ref())
+                {
+                    progress
+                        .accepted_revision_v2_hashes
+                        .insert(item_fingerprint.to_string(), hash.clone());
+                }
                 if let Some(context) = &progress.context_resend.active {
                     progress
                         .accepted_body_contexts
@@ -11320,6 +11358,7 @@ where
     progress
         .accepted_fingerprints
         .retain(|value| progress.accepted_body_witnesses.contains_key(value));
+    progress.retain_accepted_revision_hashes();
     retain_counted_poison_fingerprints(poison_scope, &current_fingerprints);
     // Replay and cycle retirement clear disposable quarantine records. Restore
     // the index-facing refusal only when this frozen input proves the same body.
@@ -12938,8 +12977,10 @@ pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str)
     }
     let owner: Owner = serde_json::from_slice(bytes)?;
     anyhow::ensure!(
-        owner.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            && is_snapshot_fingerprint(namespace)
+        matches!(
+            owner.schema_version,
+            3 | SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+        ) && is_snapshot_fingerprint(namespace)
             && owner.destination_namespace_hash == namespace
             && owner.generation < u64::MAX,
         "state_v2_original_progress_owner"
@@ -13483,6 +13524,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -13703,6 +13745,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -13750,6 +13793,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(&item)),
                         head_etag: (item.snapshot_fingerprint != sibling.snapshot_fingerprint)
                             .then(|| "e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
                             .then(|| "c".repeat(64)),
                         unchanged_basis: None,
@@ -13877,6 +13921,7 @@ mod tests {
                         body_witness_version: Some(14),
                         body_witness_digest: Some(snapshot_upload_body_witness(&sibling)),
                         head_etag: Some("e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -13992,6 +14037,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -14102,6 +14148,7 @@ mod tests {
                         body_witness_version: Some(14),
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -14271,6 +14318,7 @@ mod tests {
                         .as_ref()
                         .map(|_| snapshot_upload_body_witness(item)),
                     head_etag: head,
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
@@ -14593,6 +14641,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -14668,6 +14717,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -14719,6 +14769,7 @@ mod tests {
                         body_witness_version: Some(14),
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("f".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -14837,6 +14888,7 @@ mod tests {
                     body_witness_version: None,
                     body_witness_digest: None,
                     head_etag: enforce.then(|| "e".repeat(64)),
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
@@ -14910,6 +14962,7 @@ mod tests {
                     body_witness_version: None,
                     body_witness_digest: None,
                     head_etag: None,
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: basis.map(str::to_string),
                     retained_proof_missing: Vec::new(),
@@ -14996,6 +15049,7 @@ mod tests {
                     body_witness_version: None,
                     body_witness_digest: None,
                     head_etag: None,
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: unchanged.then(|| basis.to_string()),
                     retained_proof_missing: Vec::new(),
@@ -15107,6 +15161,7 @@ mod tests {
                     body_witness_version: None,
                     body_witness_digest: None,
                     head_etag: None,
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
@@ -15163,6 +15218,7 @@ mod tests {
                             body_witness_version: None,
                             body_witness_digest: None,
                             head_etag: Some("2".repeat(64)),
+                            accepted_revision_v2_hash: None,
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
@@ -15307,6 +15363,7 @@ mod tests {
                     } else {
                         "66".repeat(32)
                     }),
+                    accepted_revision_v2_hash: None,
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
@@ -15444,6 +15501,7 @@ mod tests {
                 body_witness_version: Some(14),
                 body_witness_digest: Some(snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
@@ -15807,6 +15865,7 @@ mod tests {
                 body_witness_version: version,
                 body_witness_digest: proof,
                 head_etag: None,
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
@@ -16058,6 +16117,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -16416,6 +16476,7 @@ mod tests {
             body_witness_version: None,
             body_witness_digest: None,
             head_etag: None,
+            accepted_revision_v2_hash: None,
             head_challenge: None,
             unchanged_basis: None,
             retained_proof_missing: Vec::new(),
@@ -16515,6 +16576,7 @@ mod tests {
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -24808,6 +24870,7 @@ mod tests {
                         }),
                         body_witness_digest: Some(body.clone()),
                         head_etag: Some("f".repeat(64)),
+                        accepted_revision_v2_hash: None,
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
@@ -24857,7 +24920,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, accepted_revision_v2_hashes, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

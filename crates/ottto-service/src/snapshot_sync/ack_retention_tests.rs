@@ -152,6 +152,7 @@ pub(super) fn exact_ack(
                 body_witness_version: body_version,
                 body_witness_digest: body_version.map(|_| snapshot_upload_body_witness(item)),
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                accepted_revision_v2_hash: None,
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),

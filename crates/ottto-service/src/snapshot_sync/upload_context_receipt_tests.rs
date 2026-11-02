@@ -44,6 +44,7 @@ pub(crate) fn exact_acks(
                                 .iter()
                                 .any(|item| item.cache_observations.is_some())
                                 .then(|| "e".repeat(64)),
+                            accepted_revision_v2_hash: None,
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
@@ -469,6 +470,7 @@ impl Uploader {
                                     .unwrap()
                                     .map(|_| snapshot_upload_body_witness(item)),
                             head_etag: cas.then(|| "e".repeat(64)),
+                            accepted_revision_v2_hash: None,
                             head_challenge: None,
                             unchanged_basis: not_stored.then(|| "usage_identical".into()),
                             retained_proof_missing: Vec::new(),
