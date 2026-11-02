@@ -7485,7 +7485,7 @@ fn capture_codex_recovery_evidence(
 
 /// The batch request around `snapshots` for this collector's source,
 /// machine, version and upload policy.
-fn snapshot_batch_request(
+pub(crate) fn snapshot_batch_request(
     source: SnapshotSource,
     machine_id: &str,
     snapshots: Vec<SnapshotItem>,
