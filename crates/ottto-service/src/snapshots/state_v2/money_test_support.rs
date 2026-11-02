@@ -55,8 +55,8 @@ pub(super) fn populate(
     sqlite::Sqlite::open(path, &identity).unwrap()
 }
 
-pub(crate) fn roundtrip(source: Source, index: &ScanIndex, path: &Path) -> ScanIndex {
-    ColdStore::roundtrip(source, index, path).2
+pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
+    ColdStore::roundtrip(index, path).2
 }
 
 /// Condition b's v2 store. Its graphs load as a live pass loads them, on a
@@ -67,16 +67,12 @@ pub(crate) struct ColdStore {
 }
 impl ColdStore {
     /// (store, its cold graph, the same graph read back resident).
-    pub(crate) fn roundtrip(
-        source: Source,
-        index: &ScanIndex,
-        path: &Path,
-    ) -> (Self, ScanIndex, ScanIndex) {
+    pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> (Self, ScanIndex, ScanIndex) {
         // Feed v1 bytes through its decoder, rather than smuggling runtime
         // state into the oracle. Leases and in-process flags are not custody.
         let bytes = serde_json::to_vec(index).unwrap();
         let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-        let mut db = populate(source, path, &expected, BTreeMap::new());
+        let mut db = populate(Source::Claude, path, &expected, BTreeMap::new());
         let restored = hydrate_resident(&mut db);
         expected.generation += 1;
         assert_eq!(
@@ -90,7 +86,7 @@ impl ColdStore {
         );
         expected.generation -= 1;
         let (session, cold) =
-            ColdSession::publish(source, &expected, &path.with_extension("session"));
+            ColdSession::publish(Source::Claude, &expected, &path.with_extension("session"));
         (Self { session }, cold, restored)
     }
 

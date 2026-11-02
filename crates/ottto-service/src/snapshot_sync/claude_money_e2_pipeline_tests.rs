@@ -3024,7 +3024,7 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("copy_prefix_route_tests.rs");
     }
     #[cfg(unix)]
-    pub(in crate::snapshot_sync) mod durable_transition_tests {
+    mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
 }

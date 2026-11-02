@@ -1,7 +1,6 @@
-//! Codex-ON: one source row table drives import, hydrate, save and live keys.
+//! Codex-ON: one source row table drives import, hydrate and save.
 //! A source the store serves adds a row here, never a second test body.
 use super::*;
-use crate::durable_tail_store::{key_digest, DurableSource};
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::{
     CodexParentProofOwed, CodexParentProofState, LoadOrigin, OwedOrigin, SnapshotSource,
@@ -18,10 +17,10 @@ fn fixtures() -> [FixtureRow; 2] {
         (Source::Codex, codex_fixture),
     ]
 }
-fn sources(source: Source) -> (SnapshotSource, DurableSource) {
+fn snapshot_source_of(source: Source) -> SnapshotSource {
     match source {
-        Source::Claude => (SnapshotSource::ClaudeCode, DurableSource::ClaudeCode),
-        Source::Codex => (SnapshotSource::Codex, DurableSource::Codex),
+        Source::Claude => SnapshotSource::ClaudeCode,
+        Source::Codex => SnapshotSource::Codex,
         Source::Pi => unreachable!("Pi is not served by the store yet"),
     }
 }
@@ -156,10 +155,10 @@ fn page(mut index: ScanIndex) -> ScanIndex {
 
 /// [format] Each row fills every persisted field of its source at the current
 /// layout, imports through the production route, hydrates equal to its
-/// normalized v1 load, and a selected page saves and reopens equal. [money]
-/// Committed live keys are exactly the row source's digests of its file keys.
+/// normalized v1 load, and a selected page saves and reopens equal. Live keys
+/// per source: runtime_tests' f6 table.
 #[test]
-fn source_rows_import_hydrate_save_and_key_like_v1() {
+fn source_rows_import_hydrate_and_save_like_v1() {
     let empty = serde_json::to_value(ScanIndex::default()).unwrap();
     let filled = serde_json::to_value(codex_fixture()).unwrap();
     let codex = catalogue::LAYOUTS
@@ -175,7 +174,7 @@ fn source_rows_import_hydrate_save_and_key_like_v1() {
         );
     }
     for (source, build) in fixtures() {
-        let (snapshot_source, durable) = sources(source);
+        let snapshot_source = snapshot_source_of(source);
         let route = Route::new(source);
         std::fs::write(&route.path, serde_json::to_vec(&build()).unwrap()).unwrap();
         let load = |support: Option<&Path>| {
@@ -196,28 +195,11 @@ fn source_rows_import_hydrate_save_and_key_like_v1() {
         let mut saved = page(reopened);
         saved.save(&route.path).unwrap();
         assert_same(&saved, &load(None));
-        let live = {
-            let _owner = crate::snapshots::CheckpointLock::acquire(&route.path).unwrap();
-            live_key_digests(&route.path).unwrap()
-        };
-        assert!(live.complete && !live.digests.is_empty(), "{source:?}");
-        assert_eq!(live.generation, saved.generation);
-        let keys = saved.files.keys().map(|key| key_digest(durable, key));
-        assert_eq!(live.digests, keys.collect::<BTreeSet<_>>());
         money_test_support::assert_selected_saves(source, &build(), &[page(build())]);
     }
 }
 
-/// [money] Codex-ON: the existing 24b Codex transition row with its index
-/// published to state v2. Cold Full, restored Tail and restarted arms emit
-/// equal money and placement.
-#[cfg(unix)]
-#[test]
-fn codex_transition_on_published_state_v2_emits_equal_money_and_placement() {
-    crate::snapshot_sync::codex_24b_on_published_state_v2();
-}
-
-/// [regress] D62: a state v2 reload whose store holds no incarnation mints a
+/// [behaviour] D62: a state v2 reload whose store holds no incarnation mints a
 /// fresh RAM nonce each time, though its fence is unchanged; the path's
 /// first-load flag and seq high-water still come from the memo.
 #[test]

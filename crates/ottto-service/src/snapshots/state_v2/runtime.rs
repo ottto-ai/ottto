@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Hold {
+pub(in super::super) enum Hold {
     Future,
     UnknownRecordKind,
     DbUnavailable,

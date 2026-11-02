@@ -13197,10 +13197,6 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
 }
 
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
-    // A state v2 hold is a fixed content-free code: no text, no paths.
-    if let Some(hold) = error.downcast_ref::<crate::snapshots::state_v2::Hold>() {
-        return format!("local state store held: {hold}");
-    }
     if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
         return settlement.to_string();
     }
@@ -13296,9 +13292,6 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         "sync failed".to_string()
     }
 }
-
-#[cfg(all(test, unix))]
-pub(crate) use tests::claude_money_e2_pipeline_tests::money_equivalence_tests::durable_transition_tests::codex_24b_on_published_state_v2;
 
 #[cfg(test)]
 mod tests {
@@ -19204,13 +19197,6 @@ mod tests {
             })),
             "local health authorization rejected"
         );
-        assert_eq!(
-            safe_error(
-                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
-                    .context("scan local snapshots /synthetic/private/path")
-            ),
-            "local state store held: state_v2_save_ceiling"
-        );
     }
 
     #[test]
@@ -23972,7 +23958,6 @@ mod tests {
             let bytes = std::fs::read(&f.progress_path).unwrap();
             let index_bytes = std::fs::read(&f.index_path).unwrap();
             let recovery = crate::snapshots::ProgressRecovery::synthetic(
-                crate::snapshots::scan_index_persistence::Source::Claude,
                 &f.index_path,
                 &f.progress.destination_namespace_hash,
                 f.baseline.generation,
