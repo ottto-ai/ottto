@@ -172,13 +172,22 @@ impl FinishServer {
     }
 }
 
+/// Stops a loopback test server and joins its worker. A worker panic fails
+/// the test unless the test is already unwinding.
+pub(super) fn stop_server(
+    stop: &std::sync::atomic::AtomicBool,
+    worker: &mut Option<std::thread::JoinHandle<()>>,
+) {
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let result = worker.take().unwrap().join();
+    if !std::thread::panicking() {
+        result.unwrap();
+    }
+}
+
 impl Drop for FinishServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        stop_server(&self.stop, &mut self.worker);
     }
 }
 
@@ -432,7 +441,7 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
 
-/// T1/T6: the page's only permanent refusals are dominated, no holds. The
+/// The page's only permanent refusals are dominated, no holds. The
 /// first refusal and both quiet retained cycles report settled residue, never
 /// `backend_validation_error`, and the native lease outcome is unchanged.
 #[test]
@@ -763,11 +772,7 @@ impl AckScriptedServer {
 
 impl Drop for AckScriptedServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        stop_server(&self.stop, &mut self.worker);
     }
 }
 

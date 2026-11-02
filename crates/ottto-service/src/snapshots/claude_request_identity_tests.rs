@@ -1096,8 +1096,8 @@ fn classify_follows_the_session_rulings() {
 
     // No telemetry row: pending only for this request's own young clock with
     // a witnessed healthy writer; otherwise missing and open to transcript
-    // evidence. Production has no qualified writer witness (SESSION ruling
-    // pending), so a young missing request is missing there.
+    // evidence. Production has no qualified writer witness, so a young
+    // missing request is missing there.
     assert_eq!(
         identity::classify(
             &evidence,
@@ -1239,7 +1239,7 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
     assert_eq!(desktop(&none, true), org_only);
 }
 
-/// SESSION ruling: a trace owner outranks the transcript. A request whose
+/// A trace owner outranks the transcript. A request whose
 /// owner is foreign, duplicated or unpaired is refused and never borrows this
 /// transcript's org or sole login, even where both would otherwise qualify.
 #[test]
@@ -1574,7 +1574,7 @@ fn parser_captures_owned_markers_and_never_inherited_ones() {
 
 #[test]
 fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
@@ -1622,11 +1622,11 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// D1 leaves new-collector items alone, so contract 5 must apply the same
-/// lifecycle spelling D1 applies; the lifecycle component may not drift.
+/// The legacy account path leaves new-collector items alone, so contract 5
+/// must apply the same lifecycle spelling it applies; the lifecycle component may not drift.
 #[test]
 fn contract5_lifecycle_matches_the_legacy_qualification_path() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
@@ -1669,7 +1669,7 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
         new.snapshot_fingerprint,
         snapshot_fingerprint(SnapshotSource::ClaudeCode, new)
     );
-    // An item whose rows contract 5 cannot reproduce returns to D1 unchanged.
+    // An item whose rows contract 5 cannot reproduce returns to the legacy account path unchanged.
     let mut untagged = original;
     untagged[0].usage_buckets[0].model_usage[0].request_count += 1;
     let before = serde_json::to_vec(&untagged).unwrap();
@@ -1817,7 +1817,7 @@ fn assert_usage_conserved(tagged: &SnapshotItem, before: &SnapshotItem) {
 /// refused while the transcript requests keep their telemetry login.
 #[test]
 fn reported_rebuild_groups_requests_without_changing_its_output() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     for (with_aux, aux_login) in [(false, true), (true, true), (true, false)] {
         let (dir, parent, items) = claude_account_family_fixture(true);
@@ -2031,12 +2031,12 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
 /// F1 repair path. A complete census that proves a family re-arms each member
 /// that pass did not parse (the existing earlier-page re-arm), so the next
 /// pass re-parses it and rebuilds its reported body from the family witness.
-/// Before telemetry-only requests were admitted, that body reached D1 and
+/// Before telemetry-only requests were admitted, that body reached the legacy account path and
 /// became the unknown-account collector; now it is contract 5, also under an
 /// unsettled census, with a fingerprint the upload no-op check cannot match.
 #[test]
 fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     use crate::snapshots::claude_request_accounts as accounts;
     const WINDOW: &str = "2026-08-02T07:10:00Z";
@@ -2109,7 +2109,7 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
     }));
     assert_eq!(reparsed[0].request_count, 6);
     let before = reparsed.clone();
-    // What the same pass emitted before: the untagged body through D1.
+    // What the same pass emitted before: the untagged body through the legacy account path.
     let mut legacy = reparsed.clone();
     let _ =
         accounts::apply_with_shared_index(&mut legacy, &api, &trace, &BTreeMap::new(), &evidence);
@@ -2146,9 +2146,9 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
     let _ = fs::remove_dir_all(dir);
 }
 
-const LEGACY_PARENT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-const LEGACY_CHILD: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
-const LEGACY_WINDOW: &str = "2026-08-02T07:10:00Z";
+pub(super) const LEGACY_PARENT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+pub(super) const LEGACY_CHILD: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+pub(super) const LEGACY_WINDOW: &str = "2026-08-02T07:10:00Z";
 
 fn legacy_line(session: &str, second: u64, request_id: &str, input: u64, output: u64) -> String {
     format!(
@@ -2162,7 +2162,7 @@ fn legacy_line(session: &str, second: u64, request_id: &str, input: u64, output:
 /// also holds `aux` telemetry-only requests: an aggregate cache-creation call
 /// and then a Haiku side call. Returns the raw parsed items, the reports, and
 /// the item index both members are tracked by.
-fn legacy_fork_fixture(
+pub(super) fn legacy_fork_fixture(
     aux: usize,
 ) -> (
     PathBuf,
@@ -2270,7 +2270,7 @@ fn request_hash(request_id: &str) -> String {
 /// admits the child, so this repair takes no such item off contract 5.
 #[test]
 fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let parent_login = "b".repeat(64);
     // One auxiliary request first: the item 0.1.172 already sent as contract 5.
@@ -2547,6 +2547,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
                 itemless_request_hashes: vec![],
                 opened_birth: None,
                 modified_unix_seconds: 0,
+                accepted_recovery_member: false,
             },
             &[],
         );
@@ -2579,7 +2580,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
 /// it); every refused item keeps today's bytes.
 #[test]
 fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     // Two telemetry-only requests: the 0.1.172 count guard (4 != 3) is
     // negative, so only exact owned accounting could admit the child.
@@ -2705,7 +2706,7 @@ fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
 
 #[test]
 fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let (dir, _root, items) = claude_account_family_fixture(true);
     let (api, trace) = reports(Vec::new(), Vec::new());
@@ -2921,14 +2922,14 @@ fn bind_owner_a(
     )
 }
 
-/// SESSION ruling 3: a bound session admits this scan's exact contract-5 body
+/// A bound session admits this scan's exact contract-5 body
 /// only when creator proof is absent or names the retained owner, for mixed
 /// AND single-identity bodies (including all-A rows that would take today's
 /// matching-owner shortcut); the owner and the rows are never rewritten, and
 /// nothing else obtains the exception.
 #[test]
 fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let login_b = "b".repeat(64);
     for mixed in [true, false] {
@@ -3014,9 +3015,9 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     );
     let _ = fs::remove_dir_all(dir);
 
-    // Creator conflicts and clock loss stay separate under direct D1
+    // Creator conflicts and clock loss stay separate under direct account
     // qualification (was `claude_h296_root_clocks_and_creator_conflicts_stay_separate`):
-    // the h296 root (requests 1-4 at login A, child-owned req_5) parsed as
+    // the root (requests 1-4 at login A, child-owned req_5) parsed as
     // ordinary (listed) money; every case is refused with creator and usage kept.
     let (dir, _, mut family) = claude_account_family_fixture(true);
     let mut original = family.remove(0);
@@ -3459,7 +3460,7 @@ fn parse_session_with_money(folder: &Path, lines: &[Value], ordinary: bool) -> V
 
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     use crate::claude_status_coverage::{home_key, Ledger, Registration, MAX_LOST};
     let dir = temp_dir("claude-request-identity-removed-slot");
@@ -3750,12 +3751,12 @@ fn rows_under_another_root_own_the_request() {
     );
 }
 
-/// The open/settled result that D2 will supply cannot authorize copied
+/// The open/settled result a later change will supply cannot authorize copied
 /// markers. Both production grouping routes must withdraw them, even before
-/// D2 exists, on legacy/OFF and default state, and after index reload.
+/// that change exists, on legacy/OFF and default state, and after index reload.
 #[test]
 fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     use crate::snapshots::ClaudeDuplicateCensusCounts;
     let dir = temp_dir("claude-i1b-copied-markers");
@@ -3813,8 +3814,8 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
         restarted.claude_duplicate_request_owners,
         saved.claude_duplicate_request_owners
     );
-    // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
-    // and future D2-open inputs reach the same unconditional boundary.
+    // There is deliberately no open-result switch in this prerequisite. Legacy/OFF
+    // and future open-result inputs reach the same unconditional boundary.
     for (state, index, census, compared) in [
         ("settled-open", &clean, open, true),
         (
@@ -4033,11 +4034,11 @@ fn tagged_body(item: &SnapshotItem) -> (Value, Value, Value, u64) {
 /// carries a request id (an API error) adds no row, token or money. Appending
 /// one keeps the session contract 5 with exactly the tagged usage it had: the
 /// error is never counted, placed or classified, so even telemetry of its own
-/// under another login claims nothing. Non-permit D1 and the parser's
+/// under another login claims nothing. The non-permit account path and the parser's
 /// request-id set keep today's behavior.
 #[test]
 fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let dir = temp_dir("claude-request-identity-zero-usage");
     let other_login = "b".repeat(64);
@@ -4136,7 +4137,7 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
             .contains(&other_login));
     }
 
-    // Non-permit D1 keeps the plain request-id count guard.
+    // The non-permit account path keeps the plain request-id count guard.
     let d1 = |raw: &SnapshotItem| {
         let mut items = vec![raw.clone()];
         let coverage = claude_request_accounts::apply(&mut items, &api, &trace).coverage;
@@ -4167,7 +4168,7 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
 /// does it let a copied request owned under another root lend that login.
 #[test]
 fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let dir = temp_dir("claude-request-identity-zero-usage-negatives");
     let (api, trace) = owned_session_reports();
@@ -4473,7 +4474,7 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
 /// foreign-owned, conflicting or other-account request records nothing.
 #[test]
 fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let dir = temp_dir("desktop-recent-enrichment");
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();

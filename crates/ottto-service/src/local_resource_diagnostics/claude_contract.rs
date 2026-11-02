@@ -23,7 +23,7 @@ counters!(Transition {
     mid_traversal_placeholder
 });
 counters!(Latch { set, cleared });
-// Lead A ruling (a): the one cutover terminal (`runs`) and the files and bytes it re-armed.
+// The one cutover terminal (`runs`) and the files and bytes it re-armed.
 counters!(CutoverRearm { runs, files, bytes });
 counters!(ContextChange {
     backfill_changed,
@@ -44,7 +44,6 @@ counters!(EvidenceOwed {
     read,
     selected_by_other_reason,
     deferred_page_cap,
-    owed_waiting_cap,
     changed,
     refused_contract_latch,
     refused_contract_unproven,

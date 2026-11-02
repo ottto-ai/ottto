@@ -1,4 +1,4 @@
-//! E7-8a: per-family Claude census completion, in shadow.
+//! Per-family Claude census completion, in shadow.
 //!
 //! Each Claude page evaluates, for the families its selection touched, the
 //! families a parse attested on the previous page, and a rotating cursor of at
@@ -7,7 +7,7 @@
 //! (source `census_complete`, manifest, wire, account window), calls a fold,
 //! retires, loads evidence, schedules or reads. It feeds no decisions.
 //!
-//! Coverage is attestation, not presence (E1 Q-E1-3). A member counts as
+//! Coverage is attestation, not presence. A member counts as
 //! covered only when this generation recorded a real attestation of its
 //! current revision: a completed parse, or the ordinary equality Skip after
 //! every selection gate passed on the opened identity. Discovery-only
@@ -81,7 +81,7 @@ pub(super) enum Incomplete {
     /// `MAX_FAMILY_KEYS`.
     MembershipUnknown,
     /// A member is queued (census member, re-read hint or carry replay).
-    /// Claude growth hints stay current-generation members (Q-E1-4).
+    /// Claude growth hints stay current-generation members.
     Queued,
     /// A member's read was refused by the size cap (`oversized_discovery`).
     RefusedRead,
@@ -1143,7 +1143,7 @@ pub(super) struct PendingCensusMembers {
     pub(super) freshness: super::money_freshness::Counts,
 }
 
-/// E1's rotation diagnostic: an order-free digest of the skipped entries and
+/// The rotation diagnostic: an order-free digest of the skipped entries and
 /// how many the previous page already skipped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(super) struct SkippedSet {
@@ -1546,7 +1546,7 @@ pub(super) fn evaluate_page<'p>(
 }
 
 /// The retained worst case of one `Runtime`, in bytes, with the key length
-/// assumption spelled out. See `RUNTIME`.
+/// assumption spelled out. See `with_runtime`.
 #[cfg(test)]
 pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
     const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
@@ -1561,51 +1561,33 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
         + 2 * LONGEST_KEY
 };
 
-/// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
-/// no cycle or overlap budget charges it, so its bound is stated here and
-/// reported per page as `cost.runtime_heap_bytes`.
-///
-/// Retained heap, worst case, with every cap full (no maps: sorted vectors
-/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
-/// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
-/// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
-/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
-/// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
-/// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
-/// typical lengths), plus at most 4 MiB for enlarged stamp transients with
-/// per-entry classification, outside `runtime_heap_bytes`;
-/// no separate gauge-dedup allocation, outside `runtime_heap_bytes`. Counts only, so nothing is
-/// refused at the bound.
-///
-/// `observe_page` holds this lock for its whole evaluation and each equality
-/// Skip for its own attestation, so every update is whole: a sticky veto,
-/// attestation or cap meter is never overwritten, and one state exists. The
-/// hold is bounded by the page budgets (16,384 member advances, 8,192 root
-/// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
-#[cfg(not(test))]
-static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
-
-#[cfg(test)]
-thread_local! {
-    static RUNTIME_FOR_TEST: std::cell::RefCell<Runtime> =
-        const { std::cell::RefCell::new(Runtime::new()) };
-}
-
-#[cfg(not(test))]
-fn with_runtime<T>(body: impl FnOnce(&mut Runtime) -> T) -> T {
-    // Each critical section is one whole update; a poisoned value is still
-    // bounded and only feeds counts.
-    let mut runtime = RUNTIME.lock().unwrap_or_else(|poisoned| {
-        RUNTIME.clear_poison();
-        poisoned.into_inner()
-    });
-    body(&mut runtime)
-}
-
-#[cfg(test)]
-fn with_runtime<T>(body: impl FnOnce(&mut Runtime) -> T) -> T {
-    RUNTIME_FOR_TEST.with(|runtime| body(&mut runtime.borrow_mut()))
+process_state! {
+    /// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
+    /// no cycle or overlap budget charges it, so its bound is stated here and
+    /// reported per page as `cost.runtime_heap_bytes`.
+    ///
+    /// Retained heap, worst case, with every cap full (no maps: sorted vectors
+    /// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
+    /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
+    /// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
+    /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
+    /// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
+    /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
+    /// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
+    /// typical lengths), plus at most 4 MiB for enlarged stamp transients with
+    /// per-entry classification, outside `runtime_heap_bytes`;
+    /// no separate gauge-dedup allocation, outside `runtime_heap_bytes`. Counts only, so nothing is
+    /// refused at the bound.
+    ///
+    /// `observe_page` holds this lock for its whole evaluation and each equality
+    /// Skip for its own attestation, so every update is whole: a sticky veto,
+    /// attestation or cap meter is never overwritten, and one state exists. The
+    /// hold is bounded by the page budgets (16,384 member advances, 8,192 root
+    /// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
+    ///
+    /// Each critical section is one whole update; a poisoned value is still
+    /// bounded and only feeds counts.
+    fn with_runtime: Runtime = Runtime::new(); clear_poison: true
 }
 
 fn scope_of(sampling: &Option<sampled_scan::Context>) -> &str {
@@ -1626,9 +1608,6 @@ pub(super) fn attest_equality_skip(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
-    if !super::money_freshness::enabled() {
-        return;
-    }
     let Some(traversal) = index.traversal.as_ref() else {
         return;
     };
@@ -1667,9 +1646,6 @@ pub(super) fn observe_page(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
-    if !super::money_freshness::enabled() {
-        return;
-    }
     let none = Touched::default();
     let touched = touched.as_deref().unwrap_or(&none);
     let scope = scope_of(sampling);
@@ -1689,14 +1665,4 @@ pub(super) fn observe_page(
     if let Some(counts) = counts {
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
-}
-
-#[cfg(test)]
-pub(super) fn runtime_pristine_for_test() -> bool {
-    with_runtime(|runtime| {
-        runtime.scope_since.is_none()
-            && runtime.first_pending.stamps.is_empty()
-            && runtime.attested.len() == 0
-            && runtime.meter.attempts == 0
-    })
 }

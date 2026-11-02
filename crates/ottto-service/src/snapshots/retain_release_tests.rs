@@ -1,10 +1,11 @@
-//! P1-RETAIN R0: a sampled Tail/Unchanged singleton's completion-time release
+//! A sampled Tail/Unchanged singleton's completion-time release
 //! of residents ranked below its copy's re-admission rank (shape F), and the
 //! diagnostic packet's
 //! refusal buckets. Its own block, apart from the shared appends above.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
 use crate::session_attribution::SessionAttributionContext;
+use crate::snapshots::cache_policy_tests::u3_identity;
 use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
 use sampled_scan::test_hooks::{self, Decision, Point, Probe};
 use sampled_scan::{ReleaseOutcome, RetainBudget};
@@ -525,7 +526,7 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
     }
 }
 
-/// T-D2: the retained lock is never relocked on one thread; a debug build
+/// The retained lock is never relocked on one thread; a debug build
 /// panics before it would deadlock.
 #[test]
 #[cfg(debug_assertions)]
@@ -536,7 +537,7 @@ fn r0_retained_relock_panics_in_debug_builds() {
     let _ = cache.retained();
 }
 
-/// T-D1: R0's completion measure waits for a held retained lock; every other
+/// The completion measure waits for a held retained lock; every other
 /// walk reads contention as unbounded.
 #[test]
 fn r0_blocking_measure_waits_for_the_retained_lock() {
@@ -576,7 +577,7 @@ fn r0_blocking_measure_waits_for_the_retained_lock() {
     );
 }
 
-/// T-D3 (β): an insert keeps its own finalization charge on the entry, apart
+/// An insert keeps its own finalization charge on the entry, apart
 /// from the cursor reservation, and the next take carries it.
 #[test]
 fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
@@ -1185,16 +1186,6 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_account_display: _, // K (None at finish; set post-scan, contract-5 tagging)
         } = item;
     };
-}
-
-fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
-    crate::context_footprint::RepositoryIdentity {
-        repository_hash: Some(format!("hash-{tag}")),
-        repository_label: Some(format!("label-{tag}")),
-        repository_label_source: Some("git_remote".to_string()),
-        repository_identity_source: Some("git".to_string()),
-        workspace_kind: Some("git_repo".to_string()),
-    }
 }
 
 /// X_out family U3 control (c22 amendment 2): a cold or expired cache entry

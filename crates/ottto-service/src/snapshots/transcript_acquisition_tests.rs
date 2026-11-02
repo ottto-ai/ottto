@@ -52,7 +52,7 @@ impl Drop for Fixture {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
+pub(super) fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
     let timestamp = format!("2026-10-07T{:02}:00:00Z", 10 + id % 3);
     match source {
         SnapshotSource::Codex => json!({"type":"event_msg", "timestamp":timestamp,
@@ -335,7 +335,7 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
-/// D1: the Codex context windows ride the retained accumulator, so every
+/// The Codex context windows ride the retained accumulator, so every
 /// real incremental Tail pass (one record per pass, so each window rule meets
 /// a record boundary: change, equal-peak tie, missing window, fill) renders
 /// what a full re-read renders.
@@ -735,7 +735,7 @@ fn sampled_native_wrong_provider_cache_refuses_reuse() {
     ));
 }
 
-// P1-RETAIN-3: Codex forks whose ownership boundary is decided from in-file
+// Codex forks whose ownership boundary is decided from in-file
 // header fields alone continue from a retained native reduction.
 fn lineage_fixture(values: &[Value]) -> Fixture {
     let fixture = Fixture::new(SnapshotSource::Codex);
@@ -1235,6 +1235,30 @@ fn production_scan_page_at_with_setup(
     finish_production_scan_page(scan, source)
 }
 
+/// The collector's post-scan for a finished page: upload policy and
+/// finalization on a projected copy, then exact acceptance into `index`.
+/// Returns the projected scan; `scan` stays the raw native output.
+pub(super) fn accept_after_policy(
+    source: SnapshotSource,
+    scan: &SourceScanResult,
+    index: &mut ScanIndex,
+) -> SourceScanResult {
+    let mut projected = scan.clone();
+    apply_upload_policy(
+        source,
+        &mut projected.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(source, &mut projected, index);
+    let accepted = projected
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect();
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    projected
+}
+
 // Also drive scans constructed with multiple roots through the same native
 // finalization and acceptance path as the ordinary single-root fixtures.
 fn finish_production_scan_page(
@@ -1261,19 +1285,7 @@ fn finish_production_scan_page(
                 // Exercise existing native post-policy finalization and exact
                 // acceptance before testing durable no-op suppression. Preserve
                 // raw native output separately for full-oracle comparisons.
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                let projected = accept_after_policy(source, &scan, &mut index);
                 return (index, scan, projected, modes, metrics);
             }
         }
@@ -1425,7 +1437,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
         eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
     }
 }
-/// SOURCE B2: a Codex restart through the real scanner. A first process
+/// A Codex restart through the real scanner. A first process
 /// reads the rollout Full under an active counting cutover (the V2 view)
 /// with live turn traces and parent ledgers, saves, and writes its record
 /// under #801's lock. A restarted process (fresh RAM cache, same live inputs
@@ -1437,7 +1449,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
 /// priority (the restored copy's priority re-check refuses reuse), or the key
 /// becomes a referenced parent (no record I/O). Nonempty #660 maps are unchanged
 /// by restore + Tail and byte-equal to the cold Full maps. Legacy-ACK
-/// stickiness (Lead B r8 condition 2): a dated root header that a fresh read
+/// stickiness: a dated root header that a fresh read
 /// would count as V2, seeded with a prior Legacy ACK, writes a Legacy record;
 /// restore + Tail keeps Legacy and equals the cold Full's body, census and
 /// counting state. The restore itself is proven where the layout is
@@ -2095,7 +2107,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 );
             }
             if pending > 0 {
-                // E3 C2: index debt population is not resident-cache capacity.
+                // Index debt population is not resident-cache capacity.
                 // Inspect the actual retained copy and the real retention
                 // call's allowance; no fabricated budget or copy is injected.
                 use sampled_scan::test_hooks::Decision;
@@ -2312,7 +2324,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 group.is_some() && witness.is_some(),
                 "accepted body is bound"
             );
-            // Ordinary Claude Tail already commits its M3 record before ACK;
+            // Ordinary Claude Tail already commits its native record before ACK;
             // Codex's paged cursor still offers its record after index save.
             // Verify that boundary as well as the exact replacement below.
             if source == SnapshotSource::ClaudeCode {
@@ -3049,7 +3061,7 @@ fn step_until(
 
 /// L-A1 guard matrix: the copy-refusal release called directly on the real
 /// step-start shape of an unsampled native read, and on a borrowed Tail
-/// (P1-RETAIN R0: no release unless it borrows more than its reduction).
+/// (no release unless it borrows more than its reduction).
 #[test]
 fn sampled_unsampled_native_refusal_guard_matrix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3250,7 +3262,7 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         assert_eq!(counts.clear_other_active, 0, "{source:?}");
         drop(scan);
 
-        // P1-RETAIN R0: a sampled Tail singleton borrows only its taken
+        // A sampled Tail singleton borrows only its taken
         // reduction, so its step-start refusal releases nothing, measured or
         // not; its release is decided at completion. Any other borrowed
         // state keeps ClearOtherActive.

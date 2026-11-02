@@ -13,13 +13,13 @@
 //! so a re-armed file (fingerprint cleared) is unchanged history.
 //!
 //! An owed upgrade passes only the protected-list state, the listed-family
-//! skip, the no-list birth hold, the Amendment 10/11 stop latch and the page
+//! skip, the no-list birth hold, the stop latch and the page
 //! budget, in that order. The no-list birth hold applies only where the
 //! list is not intended (no list file and no seen-marker) and the Mac's
 //! history is unverified or was recorded for another destination under a
 //! claim policy other than an explicit `full` (`NoListPolicy`); everywhere
-//! else without a list, owed history is paced through the budget (SOURCE
-//! Amendment 16, StateMissing N1). A held file may still be parsed for its other
+//! else without a list, owed history is paced through the budget.
+//! A held file may still be parsed for its other
 //! reason (census records, proofs, index identity), but none of its new
 //! bodies reaches an upload path, and its upload tuple (revision, semantic
 //! group, body witness, membership) stays as it was. A file that only owes
@@ -31,7 +31,7 @@
 //! The parse reason is a diagnostic only; no decision here reads it.
 //!
 //! Under a revision whose policy row denies the request-owned literal
-//! (revision 3, SOURCE Amendment 14), a listed family, or any family while
+//! (revision 3), a listed family, or any family while
 //! the list is paused, still emits its ordinary body on a genuine change, as
 //! today. Only items carrying `claude_request_owned_usage:v1` are removed,
 //! and the file never stamps that revision, so it stays owed and gated.
@@ -49,16 +49,16 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is open for (SOURCE F2). MONEY's
-/// activation (E2) raised it to the revision-3 row together with
-/// the Claude revision constant and the E2 gate (SOURCE h732 C1). Above it
+/// Highest active Claude revision the gate is open for. Activating `e2` raised
+/// it to the revision-3 row together with the Claude revision constant and the
+/// `e2` gate. Above it
 /// every owed upgrade and every listed change is held, no file is stamped,
 /// activation is refused at runtime
 /// (`activate_effective_upload_body_witness_revision`), and the Claude
 /// revision constant fails to compile. The release check reads the next
 /// line, so keep it free of comments and other digits.
 pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
-/// E2's request-owned usage literal. Listed roots never emit it.
+/// The `e2` request-owned usage literal. Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
 
 /// At most one owed-without-list alarm an hour.
@@ -156,8 +156,7 @@ pub(super) enum HistoryKind {
 }
 
 /// Where a destination's Claude prior-history evidence comes from. It is read
-/// before scanning from state outside the index, so it survives index loss
-/// (SOURCE F1a/F1b).
+/// before scanning from state outside the index, so it survives index loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PriorHistory {
     /// A positively fresh support state.
@@ -186,15 +185,15 @@ impl PriorHistory {
 pub(crate) enum NoListPolicy {
     /// Paced through the page budget: this destination's own history, a
     /// fresh install, or another destination's history under an explicit
-    /// `full` claim (StateMissing N1; SOURCE ruling on a cross-org move).
+    /// `full` claim.
     #[default]
     Pace,
-    /// Held up to the later of 2026-10-21 and the history cutoff (SOURCE
-    /// F4a): the backfill state is unreadable, so the Mac fails closed.
+    /// Held up to the later of 2026-10-21 and the history cutoff: the
+    /// backfill state is unreadable, so the Mac fails closed.
     HoldUnverified,
     /// Held likewise: history recorded for another destination (a re-pair
     /// or account move) under any claim policy but an explicit `full`. The
-    /// named policy row for SOURCE's cross-org move ruling.
+    /// named policy row for a cross-org move.
     HoldMoveNotFull,
 }
 
@@ -260,7 +259,7 @@ pub(crate) enum HistoryHold {
     Latched,
     /// This page's history budget is spent.
     Budget,
-    /// This page could not read Claude telemetry (E2 gate on): an upgrade
+    /// This page could not read Claude telemetry (`e2` gate on): an upgrade
     /// would settle on transcript estimates for good, so it waits.
     TelemetryUnread,
 }
@@ -318,7 +317,7 @@ pub(super) fn path_twins<'a>(
         .map(Vec::as_slice)
 }
 
-/// E2: the ONE path-twin rule and member spelling. Built once per scan page
+/// `e2`: the ONE path-twin rule and member spelling. Built once per scan page
 /// (`HistoryPage::twin_groups`) and shared by candidate selection, twin
 /// staging and the parse-time birth context; the page finish (after the
 /// scan) builds it again only when a session's birth table names a path the
@@ -504,9 +503,9 @@ pub(super) fn decide(
     decision
 }
 
-/// SOURCE F4a, narrowed by Amendment 16: where no list is intended and the
+/// Where no list is intended and the
 /// policy holds, owed history is held up to the later of the active
-/// revision's own no-list cutoff (F4b) and the saved history cutoff. Unknown
+/// revision's own no-list cutoff and the saved history cutoff. Unknown
 /// birth is history. Under `Pace` nothing is held here; the budget paces it.
 fn no_list_hold(inputs: &PolicyInputs<'_>, policy: Option<RevisionPolicy>) -> Option<HistoryHold> {
     let hold = match inputs.no_list_policy {
@@ -549,16 +548,16 @@ pub(crate) struct HistoryPage {
     /// the census prints their count, never a root.
     pub(super) listed_literal_roots: BTreeSet<String>,
     /// Subagent members held as listed only through their family root, while
-    /// the root file is absent (StateMissing M1, SOURCE d680b524).
+    /// the root file is absent.
     pub(super) family_closure_root_absent_excluded: u64,
-    /// E2: the path twins (same Claude member file under another project
+    /// `e2`: the path twins (same Claude member file under another project
     /// directory, with indexed sizes) of the owed candidate being decided.
     /// Its reservation takes them too, both or neither.
     staged_twins: Option<(String, Vec<(String, u64)>)>,
-    /// E2: this page's path-twin groups (`claude_path_twin_groups`), built
+    /// `e2`: this page's path-twin groups (`claude_path_twin_groups`), built
     /// once on first use (selection, staging or a parse-time birth context).
     twin_index: std::cell::OnceCell<ClaudeTwinGroups>,
-    /// E2: this page cleared the birth table's page probes.
+    /// `e2`: this page cleared the birth table's page probes.
     birth_page_begun: bool,
     /// Selection deferrals on this page, retained only for the hold diagnostic.
     pub(super) queued_family_deferred_paths: BTreeSet<super::claude_money_birth_store::LocationKey>,
@@ -606,7 +605,7 @@ impl HistoryPage {
         if self.reserved.contains(index_key) {
             return true;
         }
-        // E2 path twins settle as one entity, so they are reserved as one
+        // `e2` path twins settle as one entity, so they are reserved as one
         // group: a twin held only by this budget would hold its sibling's
         // body too, page after page. A page's first group passes the file
         // count (never the bytes), so a pair always fits within two pages.
@@ -811,7 +810,7 @@ impl HistoryEmission {
 }
 
 impl super::ScanIndex {
-    /// E2: stage the births of every indexed path twin before the candidate
+    /// `e2`: stage the births of every indexed path twin before the candidate
     /// folds; owed candidates also reserve their twins through HistoryPage.
     pub(super) fn stage_claude_history_twins(&mut self, index_key: &str, page: &mut HistoryPage) {
         if !page.birth_page_begun {
@@ -853,7 +852,7 @@ impl super::ScanIndex {
         page.staged_twins = Some((index_key.to_owned(), twins));
     }
 
-    /// E2: this page's Claude telemetry read failed. Every permitted owed
+    /// `e2`: this page's Claude telemetry read failed. Every permitted owed
     /// upgrade is held (`telemetry_unread`) before the emission seam, so it
     /// emits nothing, keeps its upload tuple and stays owed: delayed, never
     /// settled on estimates. Returns how many files were held.
@@ -885,8 +884,8 @@ pub(super) fn denies_request_owned_literal(revision: u64) -> bool {
 }
 
 /// The request-owned literal items one upload path may carry, read from the
-/// active row, the list and the index, never from this cycle's decisions
-/// (SOURCE h732 C2): a settlement, a re-offer outside the scan hints or an
+/// active row, the list and the index, never from this cycle's decisions:
+/// a settlement, a re-offer outside the scan hints or an
 /// in-place resend can carry a literal of a listed root that was not a
 /// candidate this cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -970,40 +969,14 @@ struct OwedWithoutListAlarm<'a> {
     list: &'static str,
 }
 
-#[cfg(not(test))]
-static OWED_WITHOUT_LIST_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static OWED_WITHOUT_LIST_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
+process_state! {
+    fn with_owed_without_list_last_alarm: Option<std::time::Instant> = None;
+    clear_poison: false
 }
 
-#[cfg(not(test))]
 fn take_alarm_slot(now: std::time::Instant) -> bool {
-    let mut last = OWED_WITHOUT_LIST_LAST_ALARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let due = last.map_or(true, |at| {
-        now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-    });
-    if due {
-        *last = Some(now);
-    }
-    due
-}
-
-#[cfg(test)]
-fn take_alarm_slot(now: std::time::Instant) -> bool {
-    OWED_WITHOUT_LIST_LAST_ALARM.with(|last| {
-        let due = last.get().map_or(true, |at| {
-            now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-        });
-        if due {
-            last.set(Some(now));
-        }
-        due
+    with_owed_without_list_last_alarm(|last| {
+        super::take_throttled_alarm_slot(last, now, OWED_WITHOUT_LIST_ALARM_INTERVAL)
     })
 }
 
@@ -1113,48 +1086,20 @@ struct ActivationRefusedAlarm {
     history_activation_refused: u64,
 }
 
-#[cfg(not(test))]
-static ACTIVATION_REFUSED_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static ACTIVATION_REFUSED_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
+process_state! {
+    fn with_activation_refused_last_alarm: Option<std::time::Instant> = None;
+    clear_poison: false
 }
 
-fn activation_alarm_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last.map_or(true, |at| {
-        now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-    })
-}
-
-#[cfg(not(test))]
 fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
-    let mut last = ACTIVATION_REFUSED_LAST_ALARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let due = activation_alarm_due(*last, now);
-    if due {
-        *last = Some(now);
-    }
-    due
-}
-
-#[cfg(test)]
-fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
-    ACTIVATION_REFUSED_LAST_ALARM.with(|last| {
-        let due = activation_alarm_due(last.get(), now);
-        if due {
-            last.set(Some(now));
-        }
-        due
+    with_activation_refused_last_alarm(|last| {
+        super::take_throttled_alarm_slot(last, now, OWED_WITHOUT_LIST_ALARM_INTERVAL)
     })
 }
 
 /// True when `revision` may be activated. Otherwise counts every refusal
-/// and raises a local alarm on the first, then at most hourly (SOURCE h732
-/// retry may happen each cycle); the caller keeps its active revision.
+/// and raises a local alarm on the first, then at most hourly (a retry may
+/// happen each cycle); the caller keeps its active revision.
 pub(super) fn admit_activation(revision: u64, kept_revision: u64) -> bool {
     admit_activation_at(revision, kept_revision, std::time::Instant::now())
 }
@@ -1186,33 +1131,8 @@ struct UnverifiedSince {
     last_alarm: Option<std::time::Instant>,
 }
 
-#[cfg(not(test))]
-static PRIOR_HISTORY_UNVERIFIED: std::sync::Mutex<Option<UnverifiedSince>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static PRIOR_HISTORY_UNVERIFIED: std::cell::Cell<Option<UnverifiedSince>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(not(test))]
-fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
-    access(
-        &mut PRIOR_HISTORY_UNVERIFIED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-}
-
-#[cfg(test)]
-fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
-    PRIOR_HISTORY_UNVERIFIED.with(|slot| {
-        let mut seen = slot.get();
-        let result = access(&mut seen);
-        slot.set(seen);
-        result
-    })
+process_state! {
+    fn with_unverified_since: Option<UnverifiedSince> = None; clear_poison: false
 }
 
 #[derive(serde::Serialize)]
@@ -1252,13 +1172,10 @@ fn note_prior_history_unverified_at(
             last_alarm: None,
         });
         seen.claude_cycles = seen.claude_cycles.saturating_add(1);
-        let due = seen.last_alarm.map_or(true, |at| {
-            now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-        });
-        if !due {
+        let interval = OWED_WITHOUT_LIST_ALARM_INTERVAL;
+        if !super::take_throttled_alarm_slot(&mut seen.last_alarm, now, interval) {
             return None;
         }
-        seen.last_alarm = Some(now);
         Some(PriorHistoryUnverifiedAlarm {
             unverified_since_unix_seconds: seen.since_unix_seconds,
             unverified_for_seconds: now_unix_seconds.saturating_sub(seen.since_unix_seconds),
@@ -1374,7 +1291,7 @@ mod tests {
         );
     }
 
-    /// SOURCE Amendment 16 and addendum 8, StateMissing N1: where no list is
+    /// Where no list is
     /// intended, old and unknown-birth history is paced unless the Mac is
     /// unverified (`no_list_birth`) or the history was moved under a claim
     /// policy other than `full` (`move_not_full`). An intended list (an
@@ -1531,7 +1448,7 @@ mod tests {
         });
     }
 
-    /// SOURCE h732 C2: the literal guard reads the active row, the list and
+    /// The literal guard reads the active row, the list and
     /// the index, never this cycle's decisions; unknown sources fail closed.
     #[test]
     fn literal_guard_ignores_this_cycles_decisions() {
@@ -1803,7 +1720,7 @@ mod tests {
     const AGENT: &str =
         "/h/.claude/projects/-a/11111111-1111-4111-8111-111111111111/subagents/agent-x.jsonl";
 
-    /// E2 path twins: a pair is reserved both or neither, and a page's first
+    /// `e2` path twins: a pair is reserved both or neither, and a page's first
     /// group passes the file count, so under a budget of one or two files a
     /// pair held by another file's reservation settles on the next page.
     #[test]
@@ -1878,7 +1795,7 @@ mod tests {
         });
     }
 
-    /// E2: a failed telemetry read holds every permitted owed upgrade of the
+    /// `e2`: a failed telemetry read holds every permitted owed upgrade of the
     /// cycle (it stays owed), never a held or literal-denied file's state.
     #[test]
     fn unread_telemetry_holds_permitted_upgrades_only() {

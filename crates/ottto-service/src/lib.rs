@@ -1033,6 +1033,7 @@ impl LocalDaemon {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
         self.reset_account_for_authorized_client()
     }
@@ -1066,6 +1067,7 @@ impl LocalDaemon {
         })
     }
 
+    #[cfg(test)]
     pub fn update_sources(
         &self,
         token: &str,
@@ -2936,7 +2938,7 @@ fn local_health_source_for_status(
             next_action: Some("review_scan_index_repair".to_string()),
             // The automatic retry time is the guard's own witness stamp plus
             // seven days; a user Repair may run one gated rebuild sooner.
-            // A refused override (SI-718-O1) names its code; the source and
+            // A refused override names its code; the source and
             // its index stay as they were.
             clear_condition: Some(format!(
                 "successful compatible scan-index load after a user Repair (one gated rebuild per 24 h) or the automatic retry{}{}; preserve the index and quarantine witnesses, never delete the index",

@@ -377,7 +377,7 @@ fn seal_refusals_route_to_the_request_path_and_the_rearm_table() {
 }
 
 /// Q-U28 at admission: a ctime-only change refuses `SameSizeEdit` (a
-/// parent seal and its parsed-stamp guard keep the exact stamp, E1 S3 C1),
+/// parent seal and its parsed-stamp guard keep the exact stamp),
 /// the samples match, so it is the same object and takes the request path.
 /// A same-size rewrite between the sealed windows that moves mtime also
 /// matches both samples: refused `SameSizeEdit` and re-requested, never
@@ -435,7 +435,7 @@ fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     assert_eq!(restarted.state_ctime, parent.ctime());
 }
 
-/// R1-M1: one fence reads the record's sealed windows at most once. On the
+/// One fence reads the record's sealed windows at most once. On the
 /// `SameSizeEdit` path with changed samples, the guard and the `_` arm
 /// share one `samples_match`.
 #[test]

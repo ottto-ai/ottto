@@ -452,7 +452,7 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// SOURCE condition 2: a subagent file is exempt from the birth rule only.
+/// A subagent file is exempt from the birth rule only.
 /// The telemetry tripwire still applies wherever sidecars exist.
 #[test]
 fn subagent_file_is_not_exempt_from_the_tripwire() {
@@ -502,7 +502,7 @@ fn subagent_file_is_not_exempt_from_the_tripwire() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// F1 / SESSION Context: the files of one session id are not merged, so
+/// The files of one session id are not merged, so
 /// neither file ships its own first/peak/last or compaction count as the
 /// session's numbers. The whole tuple is withheld and session start keeps the
 /// version only; the counter stays.
@@ -572,10 +572,10 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// SOURCE Amendment 5 (review F7): a restored, synced or slot-moved file that
+/// A restored, synced or slot-moved file that
 /// keeps growing is admitted with post-birth numbers only and counted as
 /// `partially_pre_birth`. When the original file of the same session id is
-/// also present, F1's whole-tuple withhold wins.
+/// also present, the whole-tuple withhold wins.
 #[test]
 fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_present() {
     let dir = temp_dir("claude-file-birth-restored-grows");
@@ -1114,7 +1114,7 @@ fn remembered_tripwire_fails_closed_when_full() {
     assert_eq!(verdict, ClaudeFileBirthVerdict::Tripwire);
     assert!(counts.remembered_veto_overflowed);
     assert_eq!(counts.total.withheld_tripwire_remembered_session_count, 1);
-    // review-678c R1: a full list is a resource withhold. The accessor
+    // A full list is a resource withhold. The accessor
     // reports it and the first one raises the local alarm, once.
     assert!(!ClaudeContextFileBirthCounts::default().resource_withheld());
     assert!(counts.resource_withheld());
@@ -1354,14 +1354,14 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// SI byte-identity check with request identity capture ON: through the real
+/// Byte-identity check with request identity capture ON: through the real
 /// scan and local evidence pipeline, the rule changes context scalars,
 /// session start, the unavailable curve reason and the derived fingerprint
 /// only. Money, usage, identity,
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
-    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+    // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
@@ -1694,7 +1694,7 @@ fn tail_and_full_read_select_the_same_first_request() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// #677 stop latch (SOURCE Amendments 7 and 10): the first Claude fold that
+/// #677 stop latch: the first Claude fold that
 /// withholds for a resource limit stops the one-time re-read until the daemon
 /// restarts; a later clean fold does not resume it. The evidence-bound trigger
 /// uses the merged seam; the full remembered-veto table triggers it too.
@@ -2009,7 +2009,7 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
     let _ = fs::remove_dir_all(dir);
 }
 
-// ---- first_own_request_at (SOURCE ruling, Ron's go) -------------------------
+// ---- first_own_request_at ---------------------------------------------------
 
 /// Every body that carries `first_own_request_at` also carries this scan
 /// identity, so the server takes the start scalars from the same body.

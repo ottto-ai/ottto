@@ -249,7 +249,7 @@ fn peak_rss() -> u64 {
     u64::try_from(usage.ru_maxrss).unwrap()
 }
 
-// Same Darwin TASK_VM_INFO rev3 layout used by the existing E2 benchmark.
+// Same Darwin TASK_VM_INFO rev3 layout used by the existing `e2` benchmark.
 #[cfg(target_os = "macos")]
 fn footprint() -> (u64, u64) {
     #[repr(C)]

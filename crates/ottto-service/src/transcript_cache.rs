@@ -47,7 +47,7 @@ struct Entry<S> {
     heap_bytes: usize,
     modified_hint: (i64, i64),
     /// The finalization copy's charge reserved beside this entry at its
-    /// admission (P1-RETAIN R0, Q-PR13(iii) β). Inline; it charges no heap.
+    /// admission. Inline; it charges no heap.
     finalization_charge: usize,
     /// Read eligibility only, owned by this resident and lost on take. Never
     /// persisted or exposed to delivery/census authority readers. The B-tree
@@ -74,18 +74,18 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
 pub(crate) enum Release {
     /// Room for a paused cursor job's admission (K6).
     CursorReservation,
-    /// A copy refusal fitting the residents beside the active file (M1).
+    /// A copy refusal fitting the residents beside the active file.
     CopyRefusal,
     /// Room for a tail's own copy, from entries ranked strictly older than
-    /// the tailed file only: a non-F tail's zero-budget step start (M1 Path
+    /// the tailed file only: a non-F tail's zero-budget step start (Path
     /// A), and a shape-F completion's exact prefix ranked below its copy's
-    /// re-admission rank after every non-budget gate (P1-RETAIN R0, through
+    /// re-admission rank after every non-budget gate (through
     /// the same `release_older_until`).
     CopyAdmission,
 }
 
 /// A retained copy moved out of the cache, with the admission facts the
-/// caller's completion needs (P1-RETAIN R0).
+/// caller's completion needs.
 pub(crate) struct Taken<S> {
     pub(crate) durable: crate::snapshots::DurableCustody,
     pub(crate) retained: Retained<S>,
@@ -130,7 +130,7 @@ impl<S> Incoming<S> for Box<Taken<S>> {
 /// The victim-order hint an entry modified at `modified` is admitted at,
 /// at `now`: future source timestamps are clipped to admission time, so they
 /// cannot rank an entry ahead of later live work. Every admission ranks
-/// through this; P1-RETAIN R0 ranks a completed copy once with it and carries
+/// through this; copy retention ranks a completed copy once with it and carries
 /// that value to its release and its insert.
 pub(crate) fn admission_rank(modified: (i64, i64), now: std::time::Duration) -> (i64, i64) {
     modified.min((
@@ -290,7 +290,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn release_until_for(&mut self, limit: usize, cause: Release) -> bool {
         self.evict_until(limit, cause, None)
     }
-    /// M1 Path A: `release_until_for` restricted to entries ranked strictly
+    /// Path A: `release_until_for` restricted to entries ranked strictly
     /// below `rank` (their `modified_hint`), in the same victim order, counted
     /// under `Release::CopyAdmission`. Evicts nothing, and returns false,
     /// unless evicting all of them fits `limit` by their stored `heap_bytes`
@@ -301,8 +301,8 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// `release_older_until`'s fit-or-nothing test, evicting nothing: the
     /// cache fits `limit` already, or evicting every entry ranked strictly
-    /// below `rank` fits it by their stored `heap_bytes` alone (U1a-2a
-    /// D6(e): a suspended proof is retired only where Path A can fit).
+    /// below `rank` fits it by their stored `heap_bytes` alone
+    /// (a suspended proof is retired only where Path A can fit).
     pub(crate) fn older_release_fits(&self, limit: usize, rank: (i64, i64)) -> bool {
         if heap_layout_bound::bound(self, limit).is_some() {
             return true;
@@ -408,7 +408,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.entries.keys()
     }
-    /// A retained entry without taking it (M1 durable write after an index
+    /// A retained entry without taking it (the durable write after an index
     /// save encodes it in place under the retained lock; deletion diagnostics).
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
@@ -464,7 +464,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// `live_bytes` is an actual checked native-layout charge, not file size.
     /// Native output/active copies keep this room while entries are admitted.
     /// `finalization_charge` (within `live_bytes`) is this entry's own
-    /// finalization copy, carried to its next take (P1-RETAIN β). Production
+    /// finalization copy, carried to its next take. Production
     /// admits through the lossless `insert_taken_reserving` primitive.
     #[cfg(test)]
     pub(crate) fn insert_reserving(
@@ -477,7 +477,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         self.insert_reserving_at_rank(key, retained, live_bytes, finalization_charge, None)
     }
     /// `insert_reserving`, admitting the entry at `rank` when one was computed
-    /// before (P1-RETAIN R0: the rank its completion's release ran against,
+    /// before (the rank its completion's release ran against,
     /// `admission_rank` of this checkpoint's mtime), so the entry's hint is
     /// exactly the one its release ranked residents against and no later clock
     /// read moves it. `None` ranks it now, as every other admission does.
@@ -1069,7 +1069,7 @@ mod tests {
         assert!(cache.take("shared").is_none());
     }
 
-    /// P1-RETAIN R0: `entry_slot_bytes` is exactly what one entry adds to the
+    /// `entry_slot_bytes` is exactly what one entry adds to the
     /// cache's bound beyond its `heap_bytes`, and what removing it frees.
     #[test]
     fn entry_slot_bytes_equals_the_measured_bound_delta_of_one_insert_and_one_remove() {
@@ -1109,8 +1109,8 @@ mod tests {
         );
     }
 
-    /// P1-RETAIN R0 releases through M1's `release_older_until` (c22 integ1
-    /// ruling 6): only entries ranked strictly below the rank leave, in victim
+    /// Copy retention releases through `release_older_until`: only entries
+    /// ranked strictly below the rank leave, in victim
     /// order, the shortest prefix that fits; an unreachable fit evicts
     /// nothing; equal and newer hints never leave.
     #[test]
@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     /// Every admission ranks through `admission_rank` (a future mtime clips to
-    /// the admission clock); a rank computed before (P1-RETAIN R0, the rank
+    /// the admission clock); a rank computed before (the rank
     /// its release ran against) is admitted exactly, never re-ranked by a
     /// later clock read.
     #[test]

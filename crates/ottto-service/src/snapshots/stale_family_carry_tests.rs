@@ -7,6 +7,7 @@
 // `starting` row. A BASE arm runs the same start under
 // `KeepStaleClaudeFamilyRearmForTest`, which carries nothing. Fixtures are
 // synthetic and content-free.
+use super::census_convergence_tests::occurrence as carry_occurrence;
 use super::*;
 
 const CARRY_FAILED: &str = "2026-08-02T07:10:00Z";
@@ -26,21 +27,6 @@ fn carry_key(root: &str, subagent: Option<&str>) -> String {
 
 fn carry_member(root: &str, subagent: Option<&str>) -> String {
     subagent.map_or_else(|| root.to_string(), |stem| format!("{root}_{stem}"))
-}
-
-fn carry_occurrence(sequence: u64, output_tokens: u64) -> ClaudeTranscriptUsageOccurrenceWitness {
-    ClaudeTranscriptUsageOccurrenceWitness {
-        sequence,
-        input_tokens: 10,
-        output_tokens,
-        cache_read_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        reasoning_output_tokens: 0,
-        model: Some("model-a".to_string()),
-        speed_mode: None,
-        reasoning_effort: None,
-    }
 }
 
 /// One committed, accepted file for a family member.
@@ -193,7 +179,7 @@ fn carry_arms(
     ((fix, fix_row), (base, base_row))
 }
 
-/// T1, positive: a same-context red retry with the fence already closed keeps
+/// Positive: a same-context red retry with the fence already closed keeps
 /// the witnessed family's committed revisions, compacts its old-window
 /// pending to member keys only, and re-arms the unwitnessed family exactly as
 /// BASE does. The row stays count-only.
@@ -750,7 +736,7 @@ fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
     let _ = (root_key, fs::remove_dir_all(support));
 }
 
-/// R1, admitted: a parse of a carried family's member on a non-terminal page
+/// Admitted: a parse of a carried family's member on a non-terminal page
 /// clears the other member's revision and queues it, once, into the replay
 /// buffer the carry funded, never into the candidate queue. The parsed member
 /// keeps its revision for the caller; nothing is refused or held.
@@ -889,7 +875,7 @@ fn carry_assert_cancel_uses_only_the_funded_buffer(index: &mut ScanIndex) {
     assert!(carry.roots.is_empty(), "the family left the carry");
 }
 
-/// R1, after a reload: a saved and loaded buffer keeps no spare capacity, so
+/// After a reload: a saved and loaded buffer keeps no spare capacity, so
 /// the page that resumes the traversal reserves it again before it selects
 /// anything, and the same cancel behind the same backlog still uses only
 /// that buffer.
@@ -922,7 +908,7 @@ fn carry_worst_case(keys: &[String]) -> usize {
         .sum()
 }
 
-/// R1, carry-time refusal: when no carried family's worst-case cancellation
+/// Carry-time refusal: when no carried family's worst-case cancellation
 /// is funded, none is carried and the start is BASE's byte for byte, row and
 /// transition counters included, with each dropped family counted once.
 #[test]
@@ -998,7 +984,7 @@ fn unfunded_replay_clears_fingerprints_on_every_platform() {
     assert_eq!(fix_value, serde_json::to_value(&base).unwrap());
 }
 
-/// R1, re-funding refused at a reload before the walk passed any member: the
+/// Re-funding refused at a reload before the walk passed any member: the
 /// family is uncarried in place, every member's revision cleared, and the
 /// index equals a real BASE arm resumed the same way, apart from the carried
 /// pending the start compacted, which credits no evidence and which this
@@ -1058,7 +1044,7 @@ fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
     assert_eq!(fix_value, base_value, "the index is BASE's");
 }
 
-/// R1, re-funding refused at a reload after the walk passed a carried member:
+/// Re-funding refused at a reload after the walk passed a carried member:
 /// uncarrying in place would leave that member unread in this window, so the
 /// traversal starts again with the family re-armed and nothing carried, and
 /// the uncarry precedes every pass of the new walk.
@@ -2036,7 +2022,7 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
         .count()
 }
 
-/// SOURCE (a)-(e), B1/B3: each healthy file's own accepted evidence removes
+/// Each healthy file's own accepted evidence removes
 /// both global vetoes. Saved request evidence, authority witnesses, accepted
 /// heads and account bindings are byte-identical, including across reload.
 #[test]
@@ -2087,7 +2073,7 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
     }
 }
 
-/// SOURCE (c)/(d): overdue RetryPending work runs on this next cycle, while
+/// Overdue RetryPending work runs on this next cycle, while
 /// healthy siblings remain unread. Terminal holds retain disclosure/bindings
 /// and retry a changed revision, without an early terminal conversion.
 #[test]
@@ -2127,7 +2113,7 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         .unwrap();
     record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
     record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
-    // A terminal verdict formed after the E2 cutover keeps its hold.
+    // A terminal verdict formed after the `e2` cutover keeps its hold.
     record.retry_after_unix_seconds = PRE_E2_TERMINAL_DEADLINE_CUTOFF + 1;
     let holds = fixture.index.claude_usage_authority_quarantine.clone();
     let bindings = fixture.index.session_account_bindings.clone();
@@ -2400,7 +2386,7 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
         let key = local_index_key(&fixture._scratch.join(format!("{root}.jsonl")));
         // These historical local-witness controls remain refusal tests only
         // with missing body ACK state. Local witness absence/mismatch alone
-        // is accepted by SOURCE; the positive test below isolates that rule.
+        // is accepted; the positive test below isolates that rule.
         if matches!(case, "missing_record" | "witness_mismatch" | "no_witness") {
             fixture
                 .index
@@ -3340,7 +3326,7 @@ fn deferred_retry_resumes_after_transient_funding_refusal() {
 
 include!("retry_admission_tests.rs");
 
-// E3 PR1: exact accepted bodies may wait on global contract correction only.
+// Exact accepted bodies may wait on global contract correction only.
 fn contract_debt_fixture(healthy: usize) -> ScopedRetryFixture {
     let mut fixture = retry_durable_fixture(0, healthy);
     fixture.index.bounded_sweep_had_unsettled_upload = false;
@@ -4101,8 +4087,8 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
 /// member with no pending re-stamped from its census record (a Full folds
 /// nothing for it); both arms also against a real parse and fold of the same
 /// bytes and from an identity-incomplete record of the same revision; an
-/// owed cap-invalid family gets no read and no credit
-/// unless its recorded requests fit the cap.
+/// owed invalid, evidence-free family (cap-invalid in an older store) is
+/// read, paced, with no credit.
 #[test]
 fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4210,7 +4196,8 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         assert!(index.files[&key].evidence_owed);
     }
 
-    // Cap-invalid: invalid, evidence-free pending from the record's window.
+    // Invalid, evidence-free pending from the record's window (an older
+    // store's cap invalidation).
     let (mut fixture, window) = owed_rearmed(1);
     let root = fixture.roots[0].clone();
     let pending = fixture
@@ -4222,22 +4209,15 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     pending.member_request_id_hashes.clear();
     pending.invalid = true;
     let invalid = pending.clone();
-    // Under the identity-contract latch it is read, never kept waiting.
-    for (cap, latched, parsed) in [
-        (0, false, 0),
-        (MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, false, 1),
-        (0, true, 1),
-    ] {
+    // Read, paced, never kept waiting for capacity, latched or not.
+    for latched in [false, true] {
         let mut index = fixture.index.clone();
         index.claude_request_identity_contract_changed = latched;
-        let mut page = evidence_owed::Page {
-            cap,
-            ..Default::default()
-        };
+        let mut page = evidence_owed::Page::default();
         assert_eq!(
             owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
-            parsed,
-            "cap {cap} latched {latched}"
+            1,
+            "latched {latched}"
         );
         assert_eq!(index.claude_usage_family_pending[&root], invalid);
         assert!(index.files.values().all(|entry| entry.evidence_owed));
@@ -4603,6 +4583,7 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 0,
+                    accepted_recovery_member: false,
                 },
                 &items,
             )
@@ -4675,7 +4656,7 @@ pub(super) fn assert_bodies_equal_a_full(full: &[SnapshotItem], kept: &[Snapshot
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(&route(full), &route(kept));
 }
 
-/// [behaviour] With the identity-contract latch SET (E1), a family whose
+/// [behaviour] With the identity-contract latch SET, a family whose
 /// pending is stamped with the recorded, real contract re-stamps with no read
 /// only when each member's own loss-free census record was written in the
 /// first window started under that contract (W1) or later (the re-stamp arm:
@@ -5067,7 +5048,7 @@ fn stale_carry_shared_request_is_owned_by_the_later_carried_root() {
 
 /// [money] Under state v2, on the same failed window published cold: the
 /// streamed two-pass join carries and compacts exactly what the resident
-/// graph and a whole-kind load do, whether the pass
+/// graph and a graph with every family loaded do, whether the pass
 /// holds no family or the sharer first, and keeps no family it does not
 /// carry. A row gone from the store defers the start, counted: nothing
 /// carried, no fingerprint cleared, no family compacted.
@@ -5112,14 +5093,15 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
     );
     let expected = outcome(&resident);
     let mut whole = cold.clone();
-    state_v2::load_usage(&mut whole, None).unwrap();
-    assert_eq!(outcome(&start(whole)), expected, "whole-kind load");
+    let every: BTreeSet<String> = whole.claude_usage_family_pending.roots().cloned().collect();
+    state_v2::load_usage(&mut whole, &every).unwrap();
+    assert_eq!(outcome(&start(whole)), expected, "every family loaded");
     let streamed = start(cold.clone());
     assert_eq!(outcome(&streamed), expected, "streamed");
     assert!(v2::usage_head_only(&streamed, CARRY_SHARER));
     assert!(v2::usage_loaded(&streamed, CARRY_ROOT), "compacted");
     let mut held = cold.clone();
-    state_v2::load_usage(&mut held, Some(&BTreeSet::from([CARRY_SHARER.to_string()]))).unwrap();
+    state_v2::load_usage(&mut held, &BTreeSet::from([CARRY_SHARER.to_string()])).unwrap();
     assert_eq!(outcome(&start(held)), expected, "sharer held first");
 
     let mut gone = cold.clone();

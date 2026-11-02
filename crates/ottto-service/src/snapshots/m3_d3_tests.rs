@@ -202,7 +202,7 @@ impl Rig {
         Self::open_with_scope(source, root, Scope("m3-d3".into()))
     }
     /// One production pass: begin, scan, save, then the post-save hook that
-    /// writes M1 copies, collects garbage and reports the diagnostics line.
+    /// writes durable copies, collects garbage and reports the diagnostics line.
     fn pass(&mut self) -> Pass {
         let cache = self.cache.clone();
         cache.durable_begin_pass(self.source, &self.index_path, &self.namespace, true);
@@ -259,7 +259,7 @@ impl Rig {
             })
             .count()
     }
-    /// The record on disk is the native format-3 write, not an M1 copy.
+    /// The record on disk is the native format-3 write, not a post-save durable copy.
     fn assert_native_record(&self, session: &str) {
         let mut disk =
             store::DurableTailStore::new(self.store_dir(), durable_source(self.source).unwrap());
@@ -1100,7 +1100,7 @@ impl OrderPoint {
     const ALL: [Self; 3] = [Self::Staged, Self::BeforeRename, Self::Receipted];
     fn name(self) -> &'static str {
         // Shared crash classification is exact; FileSynced is explicitly N/A
-        // for all native-M3 rows (plain-flush engine: no fsync boundary).
+        // for all native rows (plain-flush engine: no fsync boundary).
         use sampled_scan::transition_fixture::CrashPoint;
         assert_eq!(
             Self::ALL.map(|point| match point {

@@ -30,7 +30,7 @@ pub(super) struct Cycle {
     // Shared by every uploader invocation in this source pass. Ordinary
     // bodies reserve first, even when they exceed this allowance; only
     // stamp-only catch-up is capped by the existing packing byte target.
-    // A file's catch-up tail past it stays owed (Lead B Q1, 2026-10-31).
+    // A file's catch-up tail past it stays owed.
     remaining_bytes: usize,
     ordinary_pending: BTreeSet<String>,
     pub deferred: BTreeSet<String>,
@@ -148,7 +148,7 @@ impl Cycle {
     }
 }
 impl SnapshotUploadProgress {
-    /// Lead B Q1 (2026-10-31): one file's context ACKs may split across
+    /// One file's context ACKs may split across
     /// passes. An earlier pass's ACK counts only by its stamp of the same mode
     /// context and exact body, in the ledger or durably in the index; an
     /// unstamped ACK stays unknown.
@@ -185,7 +185,7 @@ impl SnapshotUploadProgress {
         self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
         self.context_resend
             .retain_candidates(&self.context_receipt_candidates);
-        // P1: a retired ACK still proves THIS entity's exact body under this
+        // A retired ACK still proves THIS entity's exact body under this
         // context, destination and replay generation by its durable stamp.
         if let Some(active) = self.context_resend.active.as_deref() {
             self.context_resend.stamped = self

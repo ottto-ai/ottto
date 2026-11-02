@@ -184,7 +184,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
     assert!(discover(&marked.files));
 }
 
-/// Exercise the production M3 descriptor boundary with a real decoder, even
+/// Exercise the production descriptor boundary with a real decoder, even
 /// when the path looks plain. The remaining route preconditions cannot turn
 /// the archive input into physical prefix authority or candidate-less debt.
 /// [money] m3 compressed archive bypasses staging and finishes without receipt debt.

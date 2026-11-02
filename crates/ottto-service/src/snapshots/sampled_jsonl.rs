@@ -39,7 +39,7 @@ crate::durable_tail_codec::durable_struct!(borrowed CachedJsonlReduction {
     N positive_usage_evidence: bool,
 });
 
-/// M1 durable warm-cache reuse: the record body and its re-derivation.
+/// Durable warm-cache reuse: the record body and its re-derivation.
 #[cfg(unix)]
 pub(super) mod durable;
 #[cfg(test)]
@@ -77,16 +77,16 @@ impl CachedJsonlReduction {
         &mut self.accumulator
     }
     /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
-    /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.
+    /// beside a taken copy for the completion-time release guard.
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
-    /// The copy's source (M1: a durable record is written per source).
+    /// The copy's source (a durable record is written per source).
     #[cfg(unix)]
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
-    /// The borrowed PRE-finalization fields an M3 record stages from, in the
+    /// The borrowed PRE-finalization fields a durable record stages from, in the
     /// body's field order; the live finish seam passes the same five.
     #[cfg(unix)]
     pub(super) fn finish_view(
@@ -124,7 +124,7 @@ pub(super) struct CompletedNativeAcquisition {
     pub(super) durable: super::DurableCustody,
     pub(super) checkpoint: Checkpoint,
     pub(super) reduction: Option<CachedJsonlReduction>,
-    /// `Some(rank)`: this completion's deferred release ran (P1-RETAIN R0)
+    /// `Some(rank)`: this completion's deferred release ran
     /// against `rank`, the copy's re-admission rank, so the copy is admitted
     /// at exactly that rank and its finalization copy is limited by its
     /// peak-reserved `budget_after`, not the pre-release budget
@@ -173,7 +173,7 @@ pub(in crate::snapshots) struct PrepareRejected {
 }
 
 impl OwnedJsonlParser {
-    /// The read's custody, retail attempt ended; also the uncertified M3 owner.
+    /// The read's custody, retail attempt ended; also the uncertified restart-restore owner.
     pub(super) fn completed_durable(&mut self) -> super::DurableCustody {
         let durable = self.reader.reader.take_durable();
         #[cfg(unix)]
@@ -682,7 +682,7 @@ impl OwnedJsonlParser {
         charge
     }
 
-    /// P1-RETAIN R0, a completion with a feasible release: every non-budget gate
+    /// A completion with a feasible release: every non-budget gate
     /// first, then the commit, the checkpoint-charged admission at
     /// `budget_after` (within the insert's entry limit), the stamp gate, and
     /// only then the release. Any refusal before `execute` evicts nothing.

@@ -774,6 +774,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 1,
+                    accepted_recovery_member: false,
                 },
                 &[held],
             );
@@ -814,7 +815,7 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
     // A trace-named member the walk has not discovered may still have a
     // transcript that counts the row: the root holds rather than count it
     // twice. Once the family directory is listed, a member still without a
-    // transcript falls back to the root (COST Q3).
+    // transcript falls back to the root.
     {
         let p = root_file("side-wait");
         let family = p.parent().unwrap().join(ROOT);
@@ -1612,7 +1613,7 @@ fn tag_owned_with_fallbacks(
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
-    // Production's legacy map collapses twins; E2 activity must not use it.
+    // Production's legacy map collapses twins; `e2` activity must not use it.
     let originals = items
         .iter()
         .filter_map(|item| {
@@ -1999,7 +2000,7 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
 
 #[test]
 fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting_account() {
-    // SOURCE R2-N2: the R3-N2 pair request also carries its own exact
+    // The R3-N2 pair request also carries its own exact
     // telemetry login. Two orgs on one request are never guessed, and the
     // login does not move it either: starting account, counted.
     const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
@@ -2505,7 +2506,7 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
         let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (20, 20));
-        // SOURCE: overflowing proof cannot be replaced by the starting org.
+        // Overflowing proof cannot be replaced by the starting org.
         // The old uniform-retry expectation would manufacture that identity.
         assert!(item.request_evidence.is_empty());
         assert!(rows_of(&item).all(|row| row.identity_parts.is_none()

@@ -185,11 +185,11 @@ fn listed_family_selected_for_another_reason_emits_nothing() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// Group 3: no list on an unverified Mac (SOURCE F4a as narrowed by
-/// Amendment 16). Old or unknown births are held whatever the reason; newer
+/// Group 3: no list on an unverified Mac. Old or unknown births are held
+/// whatever the reason; newer
 /// births pass. A malformed list, a list missing after install and an
 /// unrecordable install hold everything even with budget available. On a
-/// verified Mac without a list, old history is paced instead (N1).
+/// verified Mac without a list, old history is paced instead.
 #[test]
 fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     let (home, root, index) = families("history-gate-no-list", 2);
@@ -262,7 +262,7 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// Group 4 (M1): an installed empty list paces history selected for another
+/// Group 4: an installed empty list paces history selected for another
 /// reason, one file per page under budget 1; the rest keep their tuples and
 /// census records. A missing (never installed) list is not the same: old
 /// births are held.
@@ -321,9 +321,9 @@ fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
     let _ = fs::remove_dir_all(home_missing);
 }
 
-/// Design E2 item 8, the switch-on re-read: a revision bump (2 to 3) on an
-/// M4-shaped index (families of a root and 0-3 subagents, empty files, and a
-/// walk longer than one page, as 13,424 files are on the M4 against 10,000 per
+/// The switch-on re-read: a revision bump (2 to 3) on a live-shaped
+/// index (families of a root and 0-3 subagents, empty files, and a
+/// walk longer than one page, as 13,424 files observed live are against 10,000 per
 /// page) re-reads every stamped file once, paced by the byte budget, in
 /// ceil(bytes / budget) reading pages, and then a complete walk reads nothing.
 /// A budget hold queues the file again as a re-read for the next page of its
@@ -584,7 +584,7 @@ fn listed_member(index: &ScanIndex, family: &str) -> String {
         .unwrap()
 }
 
-/// M1 (AutoReview): a member directory the closure cannot read may hold a
+/// A member directory the closure cannot read may hold a
 /// listed member, so its root is held, not sent.
 #[cfg(unix)]
 #[test]
@@ -745,7 +745,7 @@ fn rootless_family_walk_that_cannot_finish_holds_the_root() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// StateMissing M2: a listed (held) family member owed only a proof
+/// A listed (held) family member owed only a proof
 /// correction is not re-read every traversal: it is skipped like any held
 /// adoption, and its correction is deferred to the history gate (disclosed)
 /// instead of blocking a fully settled upload.
@@ -872,7 +872,7 @@ fn history_cutoff_is_bounded_by_the_clock() {
     index.claude_history_cutoff_unix_seconds = Some(u64::MAX - 1);
     index.note_claude_history_cutoff(PriorHistory::None, false, false);
     assert!(index.claude_history_cutoff_unix_seconds.unwrap() <= now());
-    // StateMissing M3: prior history records a cutoff on the first gated
+    // Prior history records a cutoff on the first gated
     // load of an index without one, never on an index a gated daemon already
     // loaded (a fresh install's after its bootstrap).
     let mut pre_gate = ScanIndex::default();
@@ -934,7 +934,7 @@ fn history_cutoff_is_the_last_received_activity() {
     assert!(future.claude_history_cutoff_unix_seconds.unwrap() <= now + 60);
 }
 
-/// SOURCE Amendment 16 and its cross-org move ruling: the cycle's no-list
+/// The cycle's no-list
 /// policy. An unverified Mac holds; a move under a claim policy other than
 /// an explicit `full` holds, and its index keeps that after its own
 /// bootstrap until a `full` claim; everything else is paced.
@@ -1028,7 +1028,7 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     }
 }
 
-/// Owner B ruling 2: activating a revision with no history-policy row keeps
+/// Activating a revision with no history-policy row keeps
 /// the previous active revision, raises one local alarm and counts it; with
 /// a row it activates. The static release check above stays the second line.
 #[test]
@@ -1154,7 +1154,7 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
     });
 }
 
-/// SOURCE h732 C2: a literal item and a covering stamp for a listed root that
+/// A literal item and a covering stamp for a listed root that
 /// is not a candidate this cycle (a settlement, a re-offer outside the scan
 /// hints, a #692 in-place resend): no literal of the listed family passes
 /// either upload path and it never stamps revision 3, while an unlisted

@@ -76,7 +76,7 @@ pub(super) fn note_tail_repeat(
     now: Option<u64>,
     window: u64,
 ) {
-    // Fallback definition approved by Lead A: the revalidated Tail certificate
+    // Fallback definition: the revalidated Tail certificate
     // starts at the committed prefix, the unchanged sampled fingerprint binds
     // the previously observed EOF, and no terminated record advanced that prefix.
     if entry.codex_fragment.is_none()

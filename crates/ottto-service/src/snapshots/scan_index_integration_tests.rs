@@ -513,7 +513,7 @@ fn recovery_emission_boundaries(
     use claude_request_money::e2;
     // Mirror ordinary preparation before the evidence/finalization seam. A
     // loaded index starts with active revision 0; S-726-1 intentionally vetoes
-    // E2's request-owned literal there, even for an undamaged control. This
+    // `e2`'s request-owned literal there, even for an undamaged control. This
     // activation is also done by snapshot_sync before any production scan.
     let revision =
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);

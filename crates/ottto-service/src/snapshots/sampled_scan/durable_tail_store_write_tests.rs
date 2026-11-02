@@ -1,6 +1,6 @@
-//! Lead B's condition for #882: count the restart Fulls left by a failed
+//! For #882: count the restart Fulls left by a failed
 //! post-save store write, and the write failures themselves. Counters and
-//! alarm only; the requeue fix is E1 / M3 D3.
+//! alarm only, not the requeue fix.
 use super::tests::{certificate, native_fixture, native_record, native_v3_completion};
 use super::*;
 use crate::locked_state_dir::test_locks;
@@ -305,7 +305,7 @@ fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
     let _ = std::fs::remove_dir_all(&run.root);
 }
 
-/// Real M1 post-save boundary, independent of M3's earlier native v3 write.
+/// Real post-save boundary, independent of the earlier native v3 write.
 /// A failed rename preserves A; without the quiet-RAM repair, restart must
 /// refuse A and count the actual Full. The healthy control restores a Tail.
 #[test]
@@ -346,7 +346,7 @@ fn failed_write_case(fail: bool) {
             .collect::<String>()
     ));
     // Drive the real parser/certificate and retained owner, but deliberately
-    // exercise M1's post-save writer with a natively acquired v3 chain.
+    // exercise the post-save writer with a natively acquired v3 chain.
     let parse = |taken| {
         let mut parser = OwnedJsonlParser::new(
             File::open(&path).unwrap(),

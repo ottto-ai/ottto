@@ -1,4 +1,4 @@
-// Slice D1: durable Claude request-census records and the shadow predicate.
+// Durable Claude request-census records and the shadow predicate.
 // Records are produced, persisted, pruned and measured; no decision reads
 // them. All fixtures are synthetic and content-free.
 use super::*;
@@ -76,7 +76,7 @@ fn census_write(root: &Path, name: &str, lines: &[String]) {
     std::fs::write(path, lines.concat()).expect("write census fixture");
 }
 
-/// The canary corpus (SOURCE S3(b)): every shape class the parser can give a
+/// The canary corpus: every shape class the parser can give a
 /// Claude record, under a fixed name each. Not covered (see the PR): the
 /// 65,536 response-record cap (it drops through the same `note_dropped_usage`
 /// as the invalid `forkedFrom` row here) and multi-item files (a Claude file
@@ -474,6 +474,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
                     itemless_request_hashes: vec![],
                     opened_birth: None,
                     modified_unix_seconds: 0,
+                    accepted_recovery_member: false,
                 },
                 if exact {
                     std::slice::from_ref(&item)
@@ -562,7 +563,7 @@ fn census_derivation_canary_pins_ids_and_shapes() {
     );
 }
 
-/// TD1f (review F1, SOURCE S2(c)): a re-parse of a previously complete key
+/// TD1f: a re-parse of a previously complete key
 /// that ends as residue, with copied ids, replaces the old record. The key is
 /// never covered by the old revision, and the copied ids join the census.
 #[test]
@@ -783,7 +784,7 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
     );
 }
 
-/// StateMissing M1: an unchanged re-parse of a record retired at 35 days
+/// An unchanged re-parse of a record retired at 35 days
 /// (a backfill re-reading every file, a resume miss) is no derivation drift
 /// and leaves the record retired: neither the hashes nor the index bytes
 /// bounce back.
@@ -1241,7 +1242,7 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
     let mut base = census_index_json(serde_json::json!({}));
     base["generation"] = serde_json::json!(7);
     let mut expected = base.clone();
-    // Every loaded index carries the tombstone marker (SOURCE Round 13 F1).
+    // Every loaded index carries the tombstone marker.
     expected["claude_retired_family_tombstones_initialized"] = serde_json::json!(true);
     for (name, field, raw) in [
         ("field", "claude_request_census", "1e400".to_owned()),
@@ -1324,7 +1325,7 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
         .expect("CAS also drains oversized evidence");
 }
 
-/// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
+/// A pre-census shape has no census fields: IgnoredAny consumes their tokens,
 /// including non-finite numbers, without trying to interpret them.
 #[test]
 fn census_old_shape_decoder_ignores_new_evidence() {

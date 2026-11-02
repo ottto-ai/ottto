@@ -1,4 +1,4 @@
-//! Claude Code context scalars from the transcript file itself (design E).
+//! Claude Code context scalars from the transcript file itself.
 //!
 //! A ROOT transcript record whose timestamp is more than 60 s before the
 //! file's birth was written before the file existed, so it was copied in
@@ -15,7 +15,7 @@
 //!
 //! Everything here is local. Nothing is uploaded except the existing scalar
 //! fields and the content-free local counters; the content-free scalars are
-//! persisted only in the local durable-tail store (M1).
+//! persisted only in the local durable-tail store.
 use super::*;
 use std::hash::{Hash, Hasher};
 
@@ -37,7 +37,7 @@ const MAX_TELEMETRY_PARTITION_DOUBLINGS: usize = 4;
 
 /// At most this many Claude Code versions get their own counter row, in
 /// first-seen order; the rest share `other`. Keeps the local stats line
-/// bounded (SOURCE condition 3: 16 plus `other`).
+/// bounded (16 plus `other`).
 const MAX_CONTEXT_BASIS_VERSION_KEYS: usize = 16;
 const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 
@@ -287,7 +287,7 @@ impl ClaudeFileBirth {
     pub(super) fn refresh_opened(&mut self, current: &Self) {
         self.opened = current.opened;
         // Same path, same key for a RAM copy; a durable-restored copy never
-        // carries this path-derived key (M1) and takes it from the live parse.
+        // carries this path-derived key and takes it from the live parse.
         self.path_key_hash = current.path_key_hash;
     }
 
@@ -334,7 +334,7 @@ impl ClaudeFileBirth {
         self
     }
 
-    /// E2-only cutoff for a subagent with a proven earlier path twin.
+    /// `e2`-only cutoff for a subagent with a proven earlier path twin.
     /// Context scalars keep their independent subagent exemption.
     pub(in crate::snapshots) fn with_money_birth(mut self, birth: Option<i128>) -> Self {
         self.scope = root_birth_scope(birth);
@@ -456,7 +456,7 @@ impl ClaudeFileBirth {
             .count() as u64
     }
 
-    /// SOURCE Amendment 5: the earliest kept record follows excluded
+    /// The earliest kept record follows excluded
     /// pre-birth records (a restore, sync, slot move or Rewind that then
     /// grew). Its numbers cover post-birth activity only.
     fn partially_pre_birth(&self, observations: &[ClaudeCompactionObservation]) -> bool {
@@ -517,8 +517,8 @@ pub(super) fn apply_own_context_scalars(
         .saturating_add(id_less.after);
 }
 
-/// When the session's first own request ended (SOURCE ruling on
-/// `first_own_request_at`): only for a root file whose birth was measured and
+/// When the session's first own request ended (`first_own_request_at`): only for
+/// a root file whose birth was measured and
 /// whose first own request follows no copied record. Read from values the
 /// fold already holds; `None` when that request carried no request id (no
 /// occurrence), any of its records was unstamped (the kept timestamp may be
@@ -703,7 +703,7 @@ impl ClaudeTelemetryTripwire {
                 if request_hash % partitions != partition {
                     continue;
                 }
-                // SI ruling: an API row without its trace row still names the
+                // An API row without its trace row still names the
                 // owner. A row whose session disagrees with its sidecar root
                 // has no single owner. Two ids sharing a hash can only merge
                 // into `Several`, which withholds.
@@ -802,7 +802,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// SOURCE Amendment 7 seam: run `body` with the per-root evidence bound
+/// Seam: run `body` with the per-root evidence bound
 /// lowered to `bound` on this thread, whatever bound the fold passes. The
 /// owners-lookup slice cap is unchanged.
 #[cfg(test)]
@@ -944,7 +944,7 @@ pub struct ClaudeContextBasisCounts {
     /// file version was vetoed earlier in the process (or the memory is full).
     pub withheld_tripwire_remembered_session_count: usize,
     pub withheld_evidence_bound_session_count: usize,
-    /// SOURCE Amendment 5: files judged by the birth rule whose earliest kept
+    /// Files judged by the birth rule whose earliest kept
     /// record follows excluded pre-birth records. Admitted ones carry
     /// post-birth numbers only.
     pub partially_pre_birth_session_count: usize,
@@ -1006,12 +1006,11 @@ pub struct ClaudeContextFileBirthCounts {
     /// Sessions the family demotion quarantine held back this fold (R7): the
     /// hold is unchanged, so their scalars wait with the rest of the body.
     pub demotion_quarantined_session_count: usize,
-    /// SOURCE condition 6 / R9: Claude bodies without the v1 contract that
+    /// Claude bodies without the v1 contract that
     /// carry context scalars, split by the local proven family witness. With
     /// the witness the demotion quarantine holds the body, so no contract-less
     /// scalar change goes out against a proven head. Without it the daemon
-    /// cannot know the server head and offers the body once per change
-    /// (SOURCE Amendment 2, option (i)).
+    /// cannot know the server head and offers the body once per change.
     pub contractless_scalars_witness_present_session_count: usize,
     pub contractless_scalars_witness_missing_session_count: usize,
     /// The remembered-veto list was full when this fold judged a file-birth
@@ -1029,9 +1028,9 @@ pub struct ClaudeContextFileBirthCounts {
 }
 
 impl ClaudeContextFileBirthCounts {
-    /// SOURCE Amendment 7: this fold withheld scalars for a resource limit,
+    /// This fold withheld scalars for a resource limit,
     /// not for their content: a family over its own evidence bound, or a full
-    /// remembered-veto list (review-678c R1). The #677 backfill stops on it.
+    /// remembered-veto list. The #677 backfill stops on it.
     pub(crate) fn resource_withheld(&self) -> bool {
         self.total.withheld_evidence_bound_session_count > 0 || self.remembered_veto_overflowed
     }
@@ -1106,7 +1105,7 @@ struct ResourceWithholdAlarm {
     remembered_veto_overflowed: bool,
 }
 
-/// SOURCE Amendment 7: the first fold of the process that withholds for a
+/// The first fold of the process that withholds for a
 /// resource limit raises one local alarm on the service log. Counts only: no
 /// path, id, wire field or UI. Later folds keep counting on the counts line.
 pub(super) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCounts) {

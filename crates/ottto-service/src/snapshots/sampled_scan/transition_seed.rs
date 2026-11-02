@@ -1,5 +1,5 @@
 //! Historical transition seeds come only from the checked 53d05a43 archive.
-//! M3 retires this pin: these bytes exercise rebuild dispatch, never current
+//! The native engine retires this pin: these bytes exercise rebuild dispatch, never current
 //! encoding disguised as v1. Only the scratch-path key and checksum move.
 use super::super::transition_fixture::load_v1_goldens;
 use super::*;

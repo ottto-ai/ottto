@@ -2,6 +2,7 @@
 //! Every fixture is synthetic; no provider account content.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold;
+use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
@@ -210,7 +211,7 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
                 // A paused skip delivers and counts nothing.
                 assert_eq!(reader.report.physical_line_count, 1);
                 assert!(reader.buf.len() <= 64);
-                // E4: the paused skip holds no prefix byte.
+                // The paused skip holds no prefix byte.
                 assert!(reader.buf.is_empty());
                 if partials == 1 {
                     // Pause-time shrink (parent ACK): a grown buffer is cut
@@ -249,7 +250,7 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
     assert_eq!(seen, vec![json!({"n":1}), json!({"n":2})]);
 }
 
-/// Parent S5 "Critical" (R1-B4): at sealed cursor completion a final record
+/// At sealed cursor completion a final record
 /// without its newline at or before the frozen extent is never parsed,
 /// counted or certified, even when no byte beyond the extent is visible.
 /// A read without an extent keeps today's trailing-line behavior.
@@ -288,7 +289,7 @@ fn sealed_completion_withholds_unterminated_record_even_at_end_of_file() {
     assert_eq!(report.parsed_json_line_count, 3);
 }
 
-/// S12 (R1-B5): `finish` honours a grown object only for the identity the
+/// S12: `finish` honours a grown object only for the identity the
 /// passed certificate proved, and only while the held FD is still that
 /// object and no shorter than the frozen extent.
 #[test]
@@ -313,7 +314,7 @@ fn sealed_prefix_grant_holds_only_for_the_certified_object() {
     assert!(!grant.holds(&File::open(&other.0).unwrap()));
 }
 
-/// Parent ruling 2: the lossy same-object grant revalidates in `finish`
+/// The lossy same-object grant revalidates in `finish`
 /// against the held FD and the selected path: growth holds; a replaced path
 /// (the held FD unchanged) or a shrunk object does not.
 #[test]
@@ -394,9 +395,9 @@ fn overlong_envelope_row() -> Vec<u8> {
     .into_bytes()
 }
 
-/// E1 + E4: a withheld final record applied at a genuine EOF matches a
+/// A withheld final record applied at a genuine EOF matches a
 /// read without an extent applying its trailing line, for a valid, a
-/// malformed and an overlong record (whose salvage E4 took early).
+/// malformed and an overlong record (whose salvage was taken early).
 #[test]
 fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     for last in [
@@ -431,7 +432,7 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     }
 }
 
-/// E4 (R2-H2): a paused cursor skip holds no prefix byte, so a pause never
+/// A paused cursor skip holds no prefix byte, so a pause never
 /// charges the salvage prefix, and its salvage (taken from the capped
 /// prefix when the skip first paused) is the envelope an unchunked read
 /// takes at the newline, value for value.
@@ -509,7 +510,7 @@ fn strict(reason: DebtReason) -> Disclosure {
     }
 }
 
-/// K2 (R1-B2, parent H-3): `JoinStateBound` and `MemberChanged` keep the
+/// K2: `JoinStateBound` and `MemberChanged` keep the
 /// strict census gate (a retryable unreadable file, never residue) with the
 /// owner blocked and the prior body kept; only a held terminal refusal is
 /// settleable residue. One writer classifies fresh, memo and parked debt.
@@ -879,7 +880,7 @@ fn page_with(
 }
 
 /// `page_with` that fails once the page takes more than `max_steps` steps
-/// (E2: one scan object never spins).
+/// (one scan object never spins).
 fn page_steps(
     fixture: &ScanRoot,
     index: ScanIndex,
@@ -942,19 +943,7 @@ fn page_selections(
                 mut scan,
                 ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 carry(&fixture.root, &mut scan);
                 return (index, scan, selections);
             }
@@ -1051,7 +1040,7 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
-/// D1: a paged (paused and resumed) read pairs each context watermark with
+/// A paged (paused and resumed) read pairs each context watermark with
 /// the same Codex window an unpaged read does, across page boundaries where
 /// the window changes, ties at the peak and goes missing.
 #[test]
@@ -1151,7 +1140,7 @@ fn uncached_scan_never_pages() {
     assert_eq!(fingerprints(&scaled), fingerprints(&full));
 }
 
-/// P1-RETAIN-3 reaches cursor sealed-prefix retention too: a Codex fork whose
+/// Sealed-prefix retention covers cursor jobs too: a Codex fork whose
 /// ownership boundary is in-file (`Ordinal`) keeps its certified prefix, then
 /// tails from it with the output of an unpaged full read.
 #[test]
@@ -1250,7 +1239,7 @@ impl Drop for TestClock {
     }
 }
 
-/// R2-M6 #1 with the §e.2 essential-acceptance assertions (i)–(iii): an
+/// Essential-acceptance assertions (i)–(iii): an
 /// active singleton larger than B, appended every page.
 #[test]
 fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
@@ -1563,7 +1552,7 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         .all(|path| pending_hint(&index, path).is_none()));
 }
 
-/// K10 (R1-H3): a live paused job of another namespace is never evicted by a
+/// K10: a live paused job of another namespace is never evicted by a
 /// concurrent scan (no ping-pong); its own namespace keeps resuming it. Only
 /// a stale job, untouched for `NAMESPACE_STALE_PAGES` cursor pages because
 /// its namespace stopped scanning, is evicted, and its file restarts there.
@@ -1630,7 +1619,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
     });
 }
 
-/// K1 (R1-B1 = R2-B3): a session larger than B with more than 256 distinct
+/// K1: a session larger than B with more than 256 distinct
 /// usage-bearing turns (UUID-shaped turn ids in `task_started`,
 /// `turn_context`, `token_count`, `task_complete` shapes) keeps every exact
 /// witness in its byte-charged slot, pages to a certificate, publishes once
@@ -1949,7 +1938,7 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
         let active = scan.active_file.as_deref_mut().unwrap();
         active.sampling = sampling;
         active.parser.reader.acquisition = acquisition;
-        // P1-RETAIN R0 (T-R0d): read as a Tail, with its acquisition, the
+        // Read as a Tail, with its acquisition, the
         // cursor conjunct alone still keeps the job off shape F, so its
         // refusal keeps ClearOtherActive and its completion never reaches
         // R0's release.
@@ -2124,7 +2113,7 @@ fn many_hour_session_pauses_past_the_walk_visit_limit_and_publishes_once() {
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
-/// N1 (R1-B1 = R2-N-B2): while the sidecar census is incomplete main still
+/// While the sidecar census is incomplete main still
 /// reads and publishes a large file, only unverified. A file larger than the
 /// singleton budget pages as a cursor-only job (no retained state), publishes
 /// once with main's fingerprints and index verification, keeps no copy, and
@@ -2196,11 +2185,11 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
     });
 }
 
-/// [regress] E2 (R2-B1): a resume whose evidence is unavailable is tried at
+/// [regress] A resume whose evidence is unavailable is tried at
 /// most once per page and ends after `UNAVAILABLE_RESUMES` such pages,
 /// freeing the slot. The trigger: an untrusted census plus reduction
 /// dependencies that cannot be computed (the existing refusal hook).
-/// Before E2 the deferred job was resumed again on the next step of the
+/// Previously the deferred job was resumed again on the next step of the
 /// same scan object, forever; every page here must finish within a bound.
 #[test]
 fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
@@ -2277,7 +2266,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     });
 }
 
-/// E1 (R1-B1 = R2-B2): a quiescent file larger than B whose last record has
+/// A quiescent file larger than B whose last record has
 /// no newline. At a genuine unchanged EOF (held FD stamp equal to the open
 /// stamp, reader at that extent) the job applies the buffered record with
 /// main's trailing-line rule, reading no byte: a valid record is counted
@@ -2631,8 +2620,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     }
 }
 
-/// R1-H1 (#606 final review): a tail-mode cursor job whose genuine-EOF
-/// record (E1) introduces the file's first priority tier goes through the
+/// #606 final review: a tail-mode cursor job whose genuine-EOF
+/// record introduces the file's first priority tier goes through the
 /// protected-tier full replay before anything publishes, as main's trailing
 /// line does: a sampled prefix never mints the receipt.
 #[test]
@@ -2717,7 +2706,7 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
     });
 }
 
-/// E1: a file that grew during the job keeps its unterminated record
+/// A file that grew during the job keeps its unterminated record
 /// withheld (the held FD is no longer the opened object); the next page
 /// tails it from `s`, so it is counted once, after its newline.
 #[test]
@@ -2772,7 +2761,7 @@ fn grown_unterminated_last_record_stays_withheld() {
     });
 }
 
-/// Parent ruling 2 (R1-H1): a lossy cursor job whose file grew past its
+/// A lossy cursor job whose file grew past its
 /// frozen extent publishes UNCERTIFIED through its same-object identity
 /// proof: main's semantic output for the object it read, the original debt
 /// and age kept, no checkpoint, copy or verification. Before the grant its
@@ -3073,19 +3062,7 @@ fn hinted_page_limited(
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
@@ -4057,7 +4034,7 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
     assert_eq!(latest, fresh_totals(&fixture));
 }
 
-/// R1-H1 (#630 review): a hold an append may cure is memoized on the held
+/// #630 review: a hold an append may cure is memoized on the held
 /// file's exact stamp only when the job's read reached the file's end.
 /// Bytes appended past the frozen extent may already cure it, so the job
 /// keeps no hold offset (no memo entry) and its next attempt reads them.
@@ -4126,11 +4103,11 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
     }
 }
 
-/// R1-L1 / class 7 (NC4, NC5): the sidecar fingerprint and the memo digest
+/// The sidecar fingerprint and the memo digest
 /// carry the set of the path's conflicted candidate ids, not their count. A
-/// conflict moving between two candidates at an equal count changes both
-/// (NC4); a conflict appearing changes the digest too, so an ordinary fork's
-/// entry, which has no sidecar wake, misses (NC5).
+/// conflict moving between two candidates at an equal count changes both;
+/// a conflict appearing changes the digest too, so an ordinary fork's
+/// entry, which has no sidecar wake, misses.
 #[test]
 fn memo_wakes_on_the_conflicted_identity_set() {
     // A timestamp-shaped name has two candidate ids: the whole raw stem
@@ -4203,7 +4180,7 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     };
     assert_ne!(digest(&on_a), digest(&on_b));
     assert_ne!(digest(&none), digest(&on_a));
-    // NC6 (R1-L1): a path with no rollout id is identity-ambiguous exactly
+    // A path with no rollout id is identity-ambiguous exactly
     // while the state census holds any created thread; both wake inputs
     // carry that bit.
     let orphan = PathBuf::from("/synthetic/sessions/orphan.jsonl");
@@ -4509,7 +4486,7 @@ fn created_fingerprints(scan: &SourceScanResult) -> Vec<String> {
         .collect()
 }
 
-/// R1-L2: the admitting generation's `index` no longer blocks the thread,
+/// The admitting generation's `index` no longer blocks the thread,
 /// and generation `n` after it, with nothing changed, admits nothing new and
 /// re-holds nothing. It publishes nothing, or republishes the same snapshots
 /// (same fingerprints, so idempotent); its index still does not block the
@@ -4704,7 +4681,7 @@ impl CreatedThreadHome {
 
 /// What a generation discloses about held files: the per-file loss and
 /// residue counts the scan result exposes, and the index's full state-only
-/// blocked set (R2-M1).
+/// blocked set.
 fn census(
     index: &ScanIndex,
     scan: &SourceScanResult,
@@ -4783,7 +4760,7 @@ fn assert_oracle(
     }
 }
 
-/// B1 (N1a, R1's failing case): a thread declared created by its rollout
+/// B1: a thread declared created by its rollout
 /// header only (the state row says `user`), with a spawn-edge parent and a
 /// projection ahead of the flushed file. The bind refuses the mismatched
 /// extent, so no trusted parent binds, the parentless proof needs the state
@@ -5013,7 +4990,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
 
 const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 
-/// R1-L1 (NC6): a rollout whose file name carries no rollout id is
+/// A rollout whose file name carries no rollout id is
 /// identity-ambiguous exactly while the state census holds any created
 /// thread, so it is held as `AmbiguousFork` and memoized, and its only wake
 /// input for that fact is the candidate-less term of the conflicted-id set.
@@ -5107,7 +5084,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "{}",
         counters(&cache)
     );
-    // SB-T1 (L-SB): its usage-free cure publishes nothing, but the re-read
+    // Its usage-free cure publishes nothing, but the re-read
     // no longer blocks it and no other key holds it, so the warm index
     // releases it, as a cold parse never sets it.
     assert!(!index.codex_state_only_blocked_session_ids.contains(ORPHAN));
@@ -5169,11 +5146,11 @@ fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
 
 /// PR-1 replay and gate. A usage-bearing held fork (the full body with
 /// `forked_from_id` and no trusted parent) is now memoized.
-/// - T1/C-T3: an unchanged generation hits at zero transcript bytes and
+/// - An unchanged generation hits at zero transcript bytes and
 ///   discloses exactly what a cold full parse does: every replayed census
 ///   count, `scanned_session_count` and the blocked set. The before-parse
 ///   seam never runs for a hit.
-/// - T20 (R1-M1): an entry forced to `own_ledger(true)` for an owed parent
+/// - T20: an entry forced to `own_ledger(true)` for an owed parent
 ///   is bypassed (counted `memo_miss_other`) and the file is parsed again.
 /// - T18: growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
@@ -5278,7 +5255,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
 
 /// L-SB site 3 (the one writer): a settleable disclosure replaces the key's
 /// attribution and releases what it no longer blocks; a strict one keeps
-/// the prior attribution and adds its owner (R1-M2). A replayed disclosure
+/// the prior attribution and adds its owner. A replayed disclosure
 /// adds the held line and drop totals and re-requests its parent.
 #[test]
 fn one_writer_attributes_and_replays_held_totals() {
@@ -5438,19 +5415,7 @@ fn page_between(
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
@@ -5614,7 +5579,7 @@ impl ForkHome {
 }
 
 /// P rewritten in place, not appended: a turn with usage inserted after its
-/// first turn, every later signature kept (B2-T1's change).
+/// first turn, every later signature kept.
 fn rewrite_parent(path: &Path) {
     let parent = ForkHome::parent();
     let mut changed = parent[..3].to_vec();
@@ -5642,7 +5607,7 @@ fn append_parent_turn(path: &Path, n: u64) {
     .unwrap();
 }
 
-/// T1 (kind (iii)) and C-T3: a fork whose copied prefix diverges from its
+/// Kind (iii): a fork whose copied prefix diverges from its
 /// parent's complete ledger at signature 0 is held with usage and memoized
 /// with the ledger it used and the parent's current identity. An unchanged
 /// generation hits at zero transcript bytes and discloses exactly what a
@@ -5733,7 +5698,7 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     assert_eq!(replayed_census(&hit), replayed_census(&reread));
 }
 
-/// SOURCE 1(b), B2's scan-level case (M1 durable warm-cache reuse): restore +
+/// The scan-level case for durable warm-cache reuse: restore +
 /// Tail beside a non-empty held-fork memo and a non-empty parent ledger. One
 /// sessions root holds P (a complete ledger of real signatures), its kind
 /// (iii) fork C (held, memoized with P's ledger as its dependency) and a
@@ -6099,7 +6064,7 @@ fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     assert_eq!(census(&index, &quiet), census(&oracle_index, &oracle));
 }
 
-/// Every parse started inside `run`, by file name: the B2-T1 seam fires
+/// Every parse started inside `run`, by file name: the before-parse seam fires
 /// after a memo miss (or no lookup) and before the parse, never on a hit.
 fn parses<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
     let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -6257,7 +6222,7 @@ fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
-/// T1d (R1-L4 control): a fork that matches its parent's first signatures
+/// Control: a fork that matches its parent's first signatures
 /// and diverges while later parent signatures exist is owned from there: it
 /// is admitted once with its own usage and never memoized.
 #[test]
@@ -6281,7 +6246,7 @@ fn mid_ledger_divergence_is_admitted_and_never_memoized() {
     );
 }
 
-/// B2-T1 (scan-level liveness and safety): the child grows, so its lookup
+/// Scan-level liveness and safety: the child grows, so its lookup
 /// misses (exact stamp) after probing P; the seam then rewrites P before
 /// C's parse, which uses the page-start ledger. The fence re-opens P and
 /// refuses C (parent-pending: not recorded, nothing published). Later
@@ -6411,7 +6376,7 @@ fn parent_appended_after_page_start_still_gets_its_ledger() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
-/// L6-T1: a rollout-declared created thread with a spawn parent, flushed to
+/// A rollout-declared created thread with a spawn parent, flushed to
 /// 9 of the 10 records its projection covers. The bind seeds at that length
 /// (no bind: held), and the 10th record lands between the parser's open and
 /// its read. The hold must not be recorded at a stamp its bind never saw.
@@ -6800,7 +6765,7 @@ fn touched_replaced_or_shrunk_held_file_misses() {
     );
 }
 
-/// T19 (R1-L3) and the T9 fences, at the digest: a tier-receipt content
+/// T19 and the T9 fences, at the digest: a tier-receipt content
 /// change with the same `required` (Some → Some), the upload context, each
 /// unscoped-incomplete census flag and the owner member count each change
 /// the memo digest; the same inputs give the same digest.
@@ -6837,29 +6802,11 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
-                codex_fragment: None,
                 size_bytes: 8,
-                modified_unix_seconds: 0,
-                modified_unix_nanos: None,
                 source_file_fingerprint: "revision".into(),
-                last_snapshot_fingerprint: None,
-                last_upload_body_witness: None,
-                effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
-                codex_joined_member_set: None,
-                codex_captured_joined_member_set: None,
-                codex_protected_owner: None,
                 codex_applied_tier_receipt: Some(receipt),
-                codex_applied_tier_receipt_required: false,
-                codex_captured_tier_receipt: None,
-                codex_captured_tier_receipt_required: false,
-                codex_captured_uncommitted: false,
-                codex_counting_v2: false,
-                codex_counting_owner: None,
-                opened_changed_nanos: 0,
-                opened_birth_nanos: 0,
-                upload_context_receipt: None,
-                evidence_owed: false,
+                ..ScanIndexEntry::default()
             },
         );
         index
@@ -6994,7 +6941,7 @@ fn state_only(scan: &SourceScanResult) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// C-T1/C-T2 after generation `n`, against a cold oracle of the same files:
+/// Warm-covers-cold checks after generation `n`, against a cold oracle of the same files:
 /// - SB-T18: every attributed id is blocked;
 /// - warm ⊇ cold on the blocked set outside the ids a published body covers
 ///   (cold's set there depends on page order around an acceptance); the
@@ -7087,7 +7034,7 @@ fn assert_warm_covers_cold(
     (excess, cold_state)
 }
 
-/// C-T1 (sweep): one home through nine generations; after each, warm covers
+/// Sweep: one home through nine generations; after each, warm covers
 /// cold (see `assert_warm_covers_cold`). Generations: a held fork appears;
 /// a memo hit; a second file blocks the same id; the first is cured and
 /// publishes while the second still claims the id; the second is deleted;
@@ -7166,7 +7113,7 @@ fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
     assert!(!state_only(&scan).contains_key(CREATED));
 }
 
-/// C-T2 (legacy start): the C-T1 home from a pre-upgrade index (no
+/// Legacy start: the sweep's home from a pre-upgrade index (no
 /// attribution, plus a legacy-only claim on a thread whose claimant is never
 /// re-parsed). Legacy ids are never released by attribution; `legacy` never
 /// grows; warm never publishes a state-only total cold does not (cold
@@ -7656,7 +7603,7 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
     });
 }
 
-/// R2-M1: an admission that cannot fit even after every eviction it may make
+/// An admission that cannot fit even after every eviction it may make
 /// evicts nothing. A hopeless paused reserve (`JoinStateBound`) keeps both
 /// provenance entries and the retained copy; optional provenance inside the
 /// empty-retained floor window is refused and keeps the copy too.
@@ -8057,7 +8004,7 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
     assert_eq!(cache.cursor_resident(), empty);
 }
 
-/// #643 intake ruling (a), N2: an optional witness or match mark for a new
+/// #643: an optional witness or match mark for a new
 /// 65th namespace is refused before admission and changes nothing retained:
 /// the 64 namespaces keep their entries, witnesses and marks, and the
 /// newcomer gets no settling witness and no match mark, so step start applies
@@ -8320,7 +8267,7 @@ fn feasible_reserve_forgets_provenance_then_witnesses() {
     });
 }
 
-/// P-T5/P-T33b (D2): with the ref set full, a new fork's ref does not fit,
+/// P-T5/P-T33b: with the ref set full, a new fork's ref does not fit,
 /// so the fork is held `DeferredRef` (counted, never published) with no
 /// restart, and memo-hits from its second generation. Once refs leave the
 /// set it resolves as a cold scan does.
@@ -8370,7 +8317,7 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
-/// Fix round 6 (R1-F1): the proof hook's `Proven` transition for C over P,
+/// The proof hook's `Proven` transition for C over P,
 /// on the page's own index (census keys): C's proof as the job mints it (m
 /// = the leading signatures C shares with P's `parent_records`, the chain
 /// over C's s_0..s_m, P at `parent` sealed now under the proof scope), P's
@@ -8449,13 +8396,13 @@ fn prove_child(
     c_key
 }
 
-/// Fix round 6 (R1-F1, control A): with the ref set full, C's parser is
+/// With the ref set full, C's parser is
 /// built while C is owed (no install), and C's proof turns `Proven` before
 /// C's parse completes (production: a cursor job paused across the hook's
 /// page; here: between two step calls of C's parse, so the record site sees
 /// the same state). C completes pending, is deferred `DeferredRef` with no
 /// step-map witness and held, and that hold is not memoized; the next page
-/// parses C, installs the proof and C resolves. Before fix round 6 the hold
+/// parses C, installs the proof and C resolves. Previously the hold
 /// was memoized and replayed on every later page.
 #[test]
 fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
@@ -8527,7 +8474,7 @@ fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
     assert_eq!(parent_causes(&resolved), only(DeferredRef, 0));
 }
 
-/// P-T14 (M1): the step-start match runs once per traversal: one census
+/// P-T14: the step-start match runs once per traversal: one census
 /// pass per generation here (each generation is one traversal and one
 /// page), and the namespace is marked matched for exactly that traversal,
 /// so a later page of it re-applies without matching.
@@ -8791,7 +8738,7 @@ fn admitted_parent_loses_its_witness_and_its_child_resolves() {
     assert_eq!(warm, oracle.unwrap());
 }
 
-/// P-T25 (R1-M2): a parent last modified outside the backfill window is
+/// P-T25: a parent last modified outside the backfill window is
 /// witnessed `OutOfWindow`: its fork is held under that cause and never
 /// `DeferredRestart` at two consecutive generations. Touching the parent
 /// changes its identity: the witness drops, the parent is read and the
@@ -8836,7 +8783,7 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
-/// P-T28 (N3, M4): C forks P and P forks C. With the budget spent, both wait
+/// P-T28: C forks P and P forks C. With the budget spent, both wait
 /// on each other (`DeferredRestart` wait records); the next match finds the
 /// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
 /// and neither file is read again.
@@ -8908,7 +8855,7 @@ fn chain_fixture(reversed: bool) -> ScanRoot {
     fixture
 }
 
-/// P-T26b (M2): a `ParentHeld` witness is never stale-pruned. After 20
+/// P-T26b: a `ParentHeld` witness is never stale-pruned. After 20
 /// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
 /// chain's next generation parses nothing and its holds memo-hit.
 #[test]
@@ -9021,7 +8968,7 @@ fn held_then_quiet_from(
     }
 }
 
-/// P-T31 (R1-L1): a second rollout claiming P's id makes P `Duplicated`:
+/// P-T31: a second rollout claiming P's id makes P `Duplicated`:
 /// the fork is held under it, never `ParentLossy`, and nothing is read
 /// again.
 #[test]
@@ -9086,7 +9033,7 @@ fn append_oversized_line(path: &Path) {
         .unwrap();
 }
 
-/// P-T34 (R1-M1, R2-M1): event (c). P's only rollout ends in a terminal
+/// P-T34: event (c). P's only rollout ends in a terminal
 /// over-line-cap line, so its one complete parse records a terminal
 /// disposition and no ledger. When C requests P, the unchanged P is skipped
 /// and witnessed `ParentLossy` at its probed identity instead of being read
@@ -9395,7 +9342,7 @@ fn cold_census(fixture: &ScanRoot, n: u64) -> (Vec<(&'static str, u64)>, BTreeSe
     last.unwrap()
 }
 
-/// P-T10c (R2-M1, covers P-T10): C -> P -> G -> H in the worst page order (C
+/// P-T10c (covers P-T10): C -> P -> G -> H in the worst page order (C
 /// first, H last) with the scope's restart budget already spent. No restart
 /// runs; links wait as `DeferredRestart` while the chain converges, never a
 /// `parent_debt()` cause; the chain then settles as a cold scan does.
@@ -9467,7 +9414,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
     assert_eq!(warm, cold_census(&fixture, n + 1), "{history:#?}");
 }
 
-/// P-T16 (R2-M1): a traversal spanning pages. Twelve changed sessions and C
+/// P-T16: a traversal spanning pages. Twelve changed sessions and C
 /// (a fork of absent P, sorted first) are 13 candidates over 10-file pages.
 /// On each steady traversal the step-start match runs once, C's `Absent`
 /// count appears on its page and every later page of the traversal reports
@@ -9554,7 +9501,7 @@ fn multi_page_traversal_folds_parent_causes_and_matches_once() {
     }
 }
 
-/// P-T18b (R1-M2): P-T18 with P before G on the page. G absent: P is held
+/// P-T18b: P-T18 with P before G on the page. G absent: P is held
 /// `Absent` and witnessed `ParentHeld`, C is held `ParentHeld`. When G
 /// appears, P's re-read finds G not yet read, so P's settling witness is
 /// replaced by a `DeferredRestart` wait record on G (and unwitnessed in the
@@ -9648,7 +9595,7 @@ fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
     }
 }
 
-/// P-T23 (R1-M1, R2-M1): P's index ledger is admitted and the fork settled;
+/// P-T23: P's index ledger is admitted and the fork settled;
 /// then a copy of P appears and C changes once. The admitted ledger no
 /// longer validates and does not hide P: C is held `Duplicated` (never
 /// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
@@ -9808,28 +9755,7 @@ fn proof_room_keeps_the_headroom() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let context = super::super::Context {
-        cache: Arc::new(SharedCache::default()),
-        namespace: Scope("ns-a".to_owned()),
-        audit_metadata_supported: true,
-        audit_slots: 0,
-        full_files: 0,
-        tail_files: 0,
-        unchanged_files: 0,
-        native_bytes: 0,
-        sample_bytes: 0,
-        full_reasons: [0; 11],
-        priority_replays: 0,
-        audits_started: 0,
-        audits_completed: 0,
-        audit_quiet_retired: 0,
-        audit_cap_full: 0,
-        audit_cap_delay: 0,
-        pace_evicted: 0,
-        start_overdue_seconds: 0,
-        completion_overdue_seconds: 0,
-        admission: Default::default(),
-    };
+    let context = zero_context(&Arc::new(SharedCache::default()), "ns-a");
     let resident = crate::heap_layout_bound::bound(&context, state_bytes()).unwrap();
     let exact = state_bytes() - resident - PROOF_STEP_HEADROOM_BYTES;
     assert_eq!(proof_room(&context), Some(exact));
@@ -9966,7 +9892,7 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
     assert!(cache.proof_suspended_for_test().is_none());
     let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
     assert_eq!(refreshed.reuse_evictions, 2);
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
     assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
     let headers = cache
@@ -10043,10 +9969,14 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
     }
 }
 
-fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
+/// A sampled context in `namespace` whose every counter is zero.
+pub(in crate::snapshots) fn zero_context(
+    cache: &Arc<SharedCache>,
+    namespace: &str,
+) -> super::super::Context {
     super::super::Context {
         cache: Arc::clone(cache),
-        namespace: Scope("ns-main".to_owned()),
+        namespace: Scope(namespace.to_owned()),
         audit_metadata_supported: true,
         audit_slots: 0,
         full_files: 0,
@@ -10109,7 +10039,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         let copy = cache.take(&key).expect("retained").retained;
         let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
         let proof = proof_charge(&job);
-        let context = main_context(&cache);
+        let context = zero_context(&cache, "ns-main");
         let budget = || super::super::copy_budget_step(Some(&context), None, false);
         let (without, measured_without) = budget();
         assert!(without > proof, "precondition: a visible difference");
@@ -10134,7 +10064,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
     });
 }
 
-/// R2-B3, fix round 2 DB1 (c22 ruling (b)), fix round 3 DM3: main's copy
+/// Main's copy
 /// budget funds two shares, so where it is allocated against
 /// (`retire_proof_beside_copy`) a suspended proof over `room - budget -
 /// min(budget, ENTRY_BYTES)` is retired, even one the finish/output share
@@ -10149,7 +10079,7 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let budget = || super::super::copy_budget_step(Some(&context), None, false);
     let (without, measured) = budget();
     let room = measured.room().expect("a measured room");
@@ -10263,7 +10193,7 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
     let room = step.room().expect("a measured room");
     assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
@@ -10308,7 +10238,7 @@ fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     }
     let room = {
         let cache = Arc::new(SharedCache::default());
-        let context = main_context(&cache);
+        let context = zero_context(&cache, "ns-main");
         let (_, step) = super::super::copy_budget_step(Some(&context), None, false);
         step.room().expect("a measured room")
     };
@@ -10403,7 +10333,7 @@ fn a_completion_that_retains_no_copy_keeps_the_proof() {
 }
 
 // ---------------------------------------------------------------------------
-// U1a-2a D6(e): M1's release to fit measures main's cursor state (no
+// The release to fit measures main's cursor state (no
 // suspended proof) and retires the proof first, under the same locks.
 
 type SideCounts = crate::local_resource_diagnostics::codex_side_lifecycle::Counts;
@@ -10457,7 +10387,7 @@ impl ReleaseScene {
                 .unwrap();
         state_bytes() - self.main - floor + 1
     }
-    /// M1's release (`release_to_fit`) or Path A (`release_older_to_fit`)
+    /// The release (`release_to_fit`) or Path A (`release_older_to_fit`)
     /// at `rank`, observing both counter sets.
     fn release(
         &self,
@@ -10494,7 +10424,7 @@ fn evicted(counts: &CacheCounts) -> (u64, u64, u64) {
 const NONE_OLDER: (i64, i64) = (0, 0);
 const ALL_OLDER: (i64, i64) = (i64::MAX, 0);
 
-/// D6(e) (a), (d): over budget only beside a suspended proof. M1's release
+/// Over budget only beside a suspended proof. `release_to_fit`
 /// retires the proof first, counted under its own cause, and evicts no
 /// copy; with room for both, the proof stays. One retained lock, then one
 /// cursor critical section: the proof's box is freed under them (a
@@ -10534,7 +10464,7 @@ fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
     assert_eq!(scene.cache.cursor_reserved(), 0);
 }
 
-/// D6(e) (b): Path A likewise, with no copy ranked older than the tail: an
+/// Path A likewise, with no copy ranked older than the tail: an
 /// overflow the proof covers retires the proof and evicts nothing; one past
 /// it cannot fit, so nothing goes, the proof included (fit-or-nothing).
 #[test]
@@ -10562,10 +10492,10 @@ fn release_older_to_fit_retires_the_proof_only_where_path_a_fits() {
     assert!(scene.charged(pinned) <= state_bytes());
 }
 
-/// D6(e) (c) and no-proof parity: an overflow past the proof retires the
+/// No-proof parity: an overflow past the proof retires the
 /// proof first, then evicts in victim order only what main's room still
 /// needs, exactly what the same release evicts with no proof (one copy),
-/// for M1's release and for Path A with every copy ranked older.
+/// for `release_to_fit` and for Path A with every copy ranked older.
 #[test]
 fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -10598,8 +10528,8 @@ fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
     }
 }
 
-/// D6(e) no-proof parity and the charge bound: with no proof, main's measure
-/// is the whole cursor state, so M1's limit is unchanged. `pinned` carries
+/// No-proof parity and the charge bound: with no proof, main's measure
+/// is the whole cursor state, so the existing limit is unchanged. `pinned` carries
 /// the side ledger's fixed charge once and nothing adds it again: copies
 /// fitting exactly beside main's state and `pinned` evict nothing (as the
 /// cursor admission floor agrees, F4b), one byte more evicts one copy, an
@@ -10645,7 +10575,7 @@ fn with_no_proof_the_release_is_m1s() {
     assert!(scene.charged(exact + 1) <= state_bytes());
 }
 
-/// D6(e): a release that cannot measure keeps M1's refusal and drops no
+/// A release that cannot measure keeps its refusal and drops no
 /// proof: an unreachable fit, a `pinned` past the budget, unsupported
 /// (overflowing) cursor accounting, a poisoned cursor lock. No copy goes.
 #[test]
@@ -10702,19 +10632,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
                 if continuation {
                     return (index, scan);
                 }
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
@@ -11111,8 +11029,7 @@ fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
     });
 }
 
-// Stage 1 S1-b (`stage1/c14c15-answer.md` §6, §7 Guard row; conditions 2 and
-// 4): the accelerate guard, its pace table and their accounting.
+// Stage 1: the accelerate guard, its pace table and their accounting.
 
 fn rev(ino: u64, extent: u64) -> OpenStamp {
     OpenStamp {
@@ -12910,7 +12827,7 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
     });
 }
 
-/// R1 singleton: a paged cursor job starts while its file is indexed, so it
+/// Singleton case: a paged cursor job starts while its file is indexed, so it
 /// captures no missing-carrier due, then parks; the per-pass index loses the
 /// entry. On completion settlement re-probes the record read-only (live
 /// context, once-clamped) and stages the marker, counting the miss and the

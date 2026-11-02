@@ -1,4 +1,4 @@
-//! E2 request-owned Claude money from the native resolved-response fold.
+//! `e2` request-owned Claude money from the native resolved-response fold.
 //! Native resolution owns counts; this module only decides copies, attaches
 //! reported telemetry cost and side calls, and emits one literal body per
 //! session. The upload gate is ON; DARK test arms never change an item, a
@@ -44,13 +44,13 @@ use crate::heap_layout_bound::split_fields as money_heap_fields;
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
-/// Same bound the P1 holder walk used. A census walk that hits it cannot
+/// Same bound the earlier holder walk used. A census walk that hits it cannot
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Owner B (SOURCE Amendment 14): revision 3 keeps a listed family, and
-/// every family while the list pauses adoption, on ordinary (pre-E2)
-/// money. With the gate on, E2 applies to every other family; a family it
+/// Revision 3 keeps a listed family, and
+/// every family while the list pauses adoption, on ordinary (pre-`e2`)
+/// money. With the gate on, `e2` applies to every other family; a family it
 /// does not apply to behaves exactly as gate off (no fold, so no literal).
 pub(crate) fn family_applies(index: &ScanIndex, root: &str, subagent_stem: Option<&str>) -> bool {
     applies_unless_listed(
@@ -78,9 +78,9 @@ fn applies_unless_listed(index: &ScanIndex, listed: bool) -> bool {
     !listed && !index.claude_reemission_exclusions.pauses_adoption()
 }
 // Synthetic transcripts are created when a test runs, after their records'
-// fixed timestamps, so E2 would read every record as copied in. A fixture
+// fixed timestamps, so `e2` would read every record as copied in. A fixture
 // that models ordinary transcripts (written after their file's birth) sets
-// the physical birth E2 sees for every file read on this thread. Staged
+// the physical birth `e2` sees for every file read on this thread. Staged
 // per-file births still win.
 #[cfg(test)]
 thread_local! {
@@ -163,7 +163,7 @@ fn diag_max(key: &'static str, value: u64) {
     let _ = (key, value);
 }
 
-/// The parse-time view of the durable birth table (T1's `BirthStore`).
+/// The parse-time view of the durable birth table (`BirthStore`).
 pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) path: &'a Path,
@@ -798,7 +798,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeEntityBody {
     entity_heap_method!(heap_bound);
     entity_heap_method!(completed_heap_bound);
 }
-// Existing grain types were inline P1 values; E retains only the aggregate.
+// Existing grain types were inline values; E retains only the aggregate.
 // Exhaustive: every field is an inline token/counter, already paid
 // by its containing slot. No per-token graph walk is needed.
 crate::heap_layout_bound::no_heap!(true; ClaudeGrainSide {
@@ -837,8 +837,8 @@ impl std::fmt::Debug for FoldNanos {
 }
 crate::heap_layout_bound::no_heap!(true; FoldNanos);
 
-/// The copied prefix's page outcome (copy-family fix, Lead B Addendum 2),
-/// local diagnostics only until SOURCE/COST consume the flag: requests of
+/// The copied prefix's page outcome (copy-family fix),
+/// local diagnostics only until the flag is consumed: requests of
 /// the copied prefix (before the file's resume boundary) that count because
 /// their copy proof failed (flagged and disclosed, never dropped), the
 /// reported cost of those matched to priced telemetry, and stored removals
@@ -901,7 +901,7 @@ pub(crate) struct FileFold {
     /// Request hashes two responses of this file claim; filled on demand.
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
-    /// Wall time in this fold's E2-added work only (`fold_us`, see `spend`).
+    /// Wall time in this fold's `e2`-added work only (`fold_us`, see `spend`).
     e2_nanos: FoldNanos,
     responses: u64,
     root_fallbacks: u64,
@@ -1144,11 +1144,11 @@ impl FileFold {
         fold
     }
 
-    /// `fold_us` (owner definition, P2) counts ONLY the work E2 adds: this
+    /// `fold_us` counts ONLY the work `e2` adds: this
     /// fold's new/set_identity, observe per response and finish_native, plus
     /// the page passes (`PageSpent`). The native parse, resolve, placement
     /// and row add it shares are never in it; total page CPU against the
-    /// pre-E2 reference is the cost gate for those.
+    /// pre-`e2` reference is the cost gate for those.
     fn spend(&mut self, started: Instant) {
         self.e2_nanos.0 = self
             .e2_nanos
@@ -1498,10 +1498,10 @@ impl FileFold {
         context.twin_key(&member, location).map(str::to_owned)
     }
 
-    /// Owner ruling (/branch, --fork-session): an all-pre-birth MAIN file
+    /// /branch and --fork-session: an all-pre-birth MAIN file
     /// whose copies `decide_page_copies` checks against other sessions'
-    /// earlier main files, in one census walk per page. Copy-family fix
-    /// (Lead B 2026-10-30): a resumed MAIN file (own turns after its copied
+    /// earlier main files, in one census walk per page. Copy-family fix:
+    /// a resumed MAIN file (own turns after its copied
     /// prefix) whose writer is not certified gets the same per-request check
     /// for its prefix, whatever the writer version. A certified resumed file
     /// keeps its timestamp or twin rule (never two removals of one request).
@@ -1685,7 +1685,7 @@ impl FileFold {
     }
 }
 
-/// The one E2 grain key: T1's native row placement plus the billing fields
+/// The one `e2` grain key: the native row placement plus the billing fields
 /// and effort the literal emitter hoists. Estimated, matched and side-call
 /// grains all go through here, so an estimated key equals the native row's.
 fn grain_key(
@@ -1727,7 +1727,7 @@ impl Grain {
     }
 }
 
-/// A native placement as the E2 grain key: its bucket and reduced context
+/// A native placement as the `e2` grain key: its bucket and reduced context
 /// plus the billing fields and effort the literal emitter hoists.
 fn live_key(
     model: &str,
@@ -1901,7 +1901,7 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
         .map(|(id, _)| id)
 }
 
-/// Owner rulings (COST: never twice, never dropped). Decide every held copy
+/// Never count twice, never drop. Decide every held copy
 /// skip of the page once, before telemetry attach, so a copy that counts
 /// after all is matched like any counted request. A request stays removed
 /// only if its proof file's CURRENT revision holds that request id: that
@@ -1915,7 +1915,7 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
 /// `accepted`, this cycle's #909 accepted-share hints, keeps accepted usage
-/// where the server holds it (gate on, Lead B F3): a prefix hold over
+/// where the server holds it (gate on): a prefix hold over
 /// accepted buckets defers the whole session instead of a shrunken revision.
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
@@ -1996,7 +1996,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
         .min();
     let mut rebuilt =
         accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
-    // SOURCE 2026-10-31 (#944 xPR F5): identity a copied marker lent to a
+    // #944: identity a copied marker lent to a
     // counted request is invalidated where a stored body froze it, so the
     // identity pass learns which (bucket, account) this re-derivation moved.
     if let Some(own) = rebuilt.as_mut() {
@@ -2045,7 +2045,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
 }
 
 /// The flagged range of a decided fold: its copied-prefix requests that
-/// count because their proof failed (Lead B Addendum 2). A held fold emits
+/// count because their proof failed. A held fold emits
 /// nothing on this page, so it flags nothing.
 fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
     let SnapshotItem {
@@ -2112,7 +2112,7 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
 }
 
 /// A stored removal of `hash` under `holder` (index key): `None` when the
-/// holder is no longer indexed (Lead B F5) or its census can no longer
+/// holder is no longer indexed or its census can no longer
 /// answer (retired, over budget or no record), so the stored decision
 /// stands; else whether its record holds the hash (a record that lacks it
 /// disproves the stored ownership).
@@ -2127,7 +2127,7 @@ fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> O
             } else if record.is_lossy() {
                 None
             }
-            // E7 Addendum 6: absence is unknown.
+            // Absence is unknown.
             else {
                 Some(false)
             }
@@ -2189,7 +2189,7 @@ enum Evidence {
 /// evidence). The record of the settled revision (its index entry, same
 /// fingerprint) proves it; so does the record of a scan whose upload is held
 /// (entry absent or not advanced), while the file is still there. A file
-/// modified since its recorded read is Stale until read again (PR A M2).
+/// modified since its recorded read is Stale until read again.
 /// A queued size change also waits, including changes within one mtime
 /// second (PR C). Unchanged held scans remain evidence, never upload proof.
 fn scan_evidence(
@@ -2405,7 +2405,7 @@ fn decide_holders(
             // Addendum 1: a stored removal stays removed after its holder's
             // id list retires. A holder whose census disproves it invalidates
             // that saved decision. Positive proof also remains valid if the
-            // walk hits its deadline. Lead B F5: a holder no longer indexed
+            // walk hits its deadline. A holder no longer indexed
             // (its transcript deleted) cannot disprove anything; its recorded
             // removals stand, counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
@@ -2599,7 +2599,7 @@ fn decide_holders(
         if let Some(state) = updates.state.as_mut() {
             state.clear_hold(wanted.order.1);
         }
-        // Lead B Addendum 2: what no holder proves now (its id list retired,
+        // What no holder proves now (its id list retired,
         // over budget or missing, no stored removal) counts, flagged.
         let ids = skipped_ids(&items[wanted.at])
             .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
@@ -2612,7 +2612,7 @@ fn decide_holders(
 
 /// The file's removals to store: its stored hashes not disproven by their
 /// still-indexed holder's record (a holder no longer indexed disproves
-/// nothing: Lead B F5), plus each newly proven hash under its earliest
+/// nothing), plus each newly proven hash under its earliest
 /// current holder.
 fn stored_groups<'a>(
     index: &'a ScanIndex,
@@ -2668,7 +2668,7 @@ fn defer_prefix(
         .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
         .cloned()
         .collect::<Vec<_>>();
-    // Lead B F3: a held request in a bucket a stored-body ACK may have frozen
+    // A held request in a bucket a stored-body ACK may have frozen
     // would leave that bucket undeclared-short and drop its #909 shares at
     // the next ACK. Such a session defers whole (no new revision).
     let accepted_prefix = accepted.is_some_and(|accepted| {
@@ -3277,7 +3277,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
 }
 
 /// Side calls (telemetry-only requests no family transcript holds) keep
-/// today's attribution (COST): the trace-named member's body; the root only
+/// today's attribution: the trace-named member's body; the root only
 /// when no trace row names a member (counted). One membership pass over the
 /// family's rows; off-page holders come from the family-scoped census
 /// lookup, skipped when there are no candidates. Runs after the per-root
@@ -3467,7 +3467,7 @@ pub(crate) fn side_calls_page(
                 None => root.as_str(),
             };
             // A named member with no transcript anywhere can never count it:
-            // the root does, counted as a fallback (COST Q3). A member with
+            // the root does, counted as a fallback. A member with
             // a transcript (indexed, or seen and still to be read) counts it
             // itself when read.
             if !targets.contains_key(owner)
@@ -4238,7 +4238,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "unmatched_1h",
     "side_call_root_fallback",
     "resolver_conflicts",
-    // Copy-family fix (Lead B Addendum 2), class N, diagnostics only: the
+    // Copy-family fix, class N, diagnostics only: the
     // flagged copied-prefix requests and files, the matched priced share
     // with its reported cost, stored removals reused without a current
     // holder, and stored-removal writes and cap refusals.
@@ -4259,7 +4259,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "copy_prefix_removed_cost_micros",
     "copy_prefix_own_requests",
     "copy_prefix_families_corrected",
-    // Copy-prefix ENABLE readiness (Lead B F3/F5): sessions whose held
+    // Copy-prefix ENABLE readiness: sessions whose held
     // prefix has accepted buckets deferred whole, and stored removals kept
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",

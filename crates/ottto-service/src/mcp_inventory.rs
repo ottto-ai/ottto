@@ -1,7 +1,8 @@
 //! Configured-MCP context-footprint harvest.
 //!
 //! Every six hours this module discovers the MCP servers each
-//! coding agent has configured (Claude Code, Codex), runs the MCP
+//! coding agent has configured (Claude Code, Codex; including servers declared
+//! by installed, enabled plugins), runs the MCP
 //! `initialize` + `tools/list` handshake against every reachable server, and
 //! POSTs the raw `tools/list` output to the backend ingest endpoint
 //! `POST /api/v1/mcp/inventory`. The backend tokenizes the schemas and persists
@@ -18,6 +19,7 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+use crate::command_env::SpawnEnv;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
@@ -682,6 +684,49 @@ fn mcp_servers_block(value: &Value) -> impl Iterator<Item = (&String, &Value)> {
         .flat_map(|map| map.iter())
 }
 
+/// Servers declared by an installed, enabled plugin in its MCP file `file`.
+/// They are ordinary configured servers: the agent's own normalizer parses
+/// them, a relative `cwd` resolves against the plugin `root`, and the harvest
+/// probes them. Claude Code substitutes `${CLAUDE_PLUGIN_ROOT}` with the root.
+fn plugin_servers(
+    file: &Path,
+    root: &Path,
+    prefix: &str,
+    normalize: fn(&str, &Value, Option<&Path>) -> Option<ConfiguredServer>,
+) -> Vec<ConfiguredServer> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    // Claude Code substitutes the plugin root for this token; a root that is
+    // not valid inside a JSON string fails to parse and declares nothing.
+    let text = text.replace("${CLAUDE_PLUGIN_ROOT}", &root.to_string_lossy());
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    mcp_servers_block(&value)
+        .filter_map(|(name, cfg)| normalize(&format!("{prefix}{name}"), cfg, Some(root)))
+        .collect()
+}
+
+/// The MCP file a cached Codex plugin declares, with that plugin version's root:
+/// the newest cached version's `.codex-plugin/plugin.json` names the file in
+/// `mcpServers`. A file outside the version's root is not a declaration.
+fn codex_plugin_declaration(plugin_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = std::fs::read_dir(plugin_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join(".codex-plugin").join("plugin.json").is_file())
+        .max_by_key(|dir| dir.metadata().and_then(|meta| meta.modified()).ok())?;
+    let manifest = load_json(&root.join(".codex-plugin").join("plugin.json"))?;
+    let file = root
+        .join(manifest.get("mcpServers")?.as_str()?)
+        .canonicalize()
+        .ok()?;
+    let root = root.canonicalize().ok()?;
+    file.starts_with(&root).then_some((file, root))
+}
+
 /// Discover Claude Code MCP servers across the global config and every known
 /// project.
 ///
@@ -691,6 +736,9 @@ fn mcp_servers_block(value: &Value) -> impl Iterator<Item = (&String, &Value)> {
 ///   * `<project dir>/.mcp.json` `mcpServers` for every project dir
 ///   * `~/.claude/settings.json` `mcpServers`
 ///   * `~/.claude/settings.local.json` `mcpServers`
+///   * then servers of plugins installed in `~/.claude/plugins/installed_plugins.json`
+///     and enabled in those settings' `enabledPlugins`, named
+///     `plugin_<plugin>_<server>`; an explicit server of the same name wins
 ///
 /// The reference harvester is invoked with a single `--cwd`; the daemon has no
 /// single project cwd, so it unions across all `projects` keys to capture every
@@ -734,6 +782,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     // including per-project settings, so a server the agent never loads is not
     // counted as context cost the user is paying.
     let mut disabled_names: Vec<String> = Vec::new();
+    let mut enabled_plugins: BTreeMap<String, bool> = BTreeMap::new();
     for settings in [
         home.join(".claude").join("settings.json"),
         home.join(".claude").join("settings.local.json"),
@@ -745,6 +794,47 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 }
             }
             disabled_names.extend(get_disabled_servers(&value));
+            if let Some(plugins) = value.get("enabledPlugins").and_then(Value::as_object) {
+                enabled_plugins.extend(
+                    plugins
+                        .iter()
+                        .filter_map(|(id, on)| Some((id.clone(), on.as_bool()?))),
+                );
+            }
+        }
+    }
+    // Plugin servers count only when the plugin is installed AND enabled; a
+    // cached copy alone is never configured.
+    let installed = load_json(
+        &home
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
+    );
+    let plugins = installed
+        .as_ref()
+        .and_then(|value| value.get("plugins"))
+        .and_then(Value::as_object);
+    for (id, installs) in plugins.into_iter().flatten() {
+        if enabled_plugins.get(id) != Some(&true) {
+            continue;
+        }
+        let prefix = format!("plugin_{}_", id.split('@').next().unwrap_or(id));
+        let roots = installs
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|install| install.get("installPath")?.as_str());
+        for root in roots {
+            let root = Path::new(root);
+            for server in plugin_servers(
+                &root.join(".mcp.json"),
+                root,
+                &prefix,
+                normalize_claude_server,
+            ) {
+                servers.entry(server.name.clone()).or_insert(server);
+            }
         }
     }
     if let Some(root) = claude_json.as_ref() {
@@ -776,7 +866,9 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     servers.into_values().collect()
 }
 
-/// Discover Codex MCP servers from `~/.codex/config.toml` `[mcp_servers.*]`.
+/// Discover Codex MCP servers from `~/.codex/config.toml` `[mcp_servers.*]`,
+/// then the servers of each plugin enabled in `[plugins]` whose cached
+/// manifest declares them; an explicit server of the same name wins.
 fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
     let codex_dir = home.join(".codex");
     let path = codex_dir.join("config.toml");
@@ -786,11 +878,9 @@ fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
     let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
-    let Some(table) = document.get("mcp_servers").and_then(|item| item.as_table()) else {
-        return Vec::new();
-    };
     let mut servers: BTreeMap<String, ConfiguredServer> = BTreeMap::new();
-    for (name, item) in table.iter() {
+    let table = document.get("mcp_servers").and_then(|item| item.as_table());
+    for (name, item) in table.into_iter().flat_map(|table| table.iter()) {
         // Re-serialize the per-server sub-table to JSON via toml->json so the
         // normalizer can share Claude Code's value-shape logic.
         let Some(value) = toml_item_to_json(item) else {
@@ -798,6 +888,23 @@ fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
         };
         if let Some(server) = normalize_codex_server(name, &value, Some(&codex_dir)) {
             servers.insert(name.to_string(), server);
+        }
+    }
+    let plugins = document.get("plugins").and_then(|item| item.as_table());
+    for (id, plugin) in plugins.into_iter().flat_map(|table| table.iter()) {
+        let enabled = plugin
+            .get("enabled")
+            .and_then(toml_edit::Item::as_value)
+            .and_then(toml_edit::Value::as_bool);
+        let Some((name, marketplace)) = id.split_once('@').filter(|_| enabled == Some(true)) else {
+            continue;
+        };
+        let cached = codex_dir.join("plugins").join("cache").join(marketplace);
+        let Some((file, root)) = codex_plugin_declaration(&cached.join(name)) else {
+            continue;
+        };
+        for server in plugin_servers(&file, &root, "", normalize_codex_server) {
+            servers.entry(server.name.clone()).or_insert(server);
         }
     }
     servers.into_values().collect()
@@ -917,28 +1024,7 @@ fn discover_servers(home: &Path, source: SnapshotSource) -> Vec<ConfiguredServer
 // stdio MCP handshake
 // ---------------------------------------------------------------------------
 
-/// The environment a stdio MCP server is spawned with, resolved ONCE per harvest
-/// cycle. The daemon runs under launchd with a minimal `PATH`
-/// (`/usr/bin:/bin:…`), so a bare `Command::new("npx")` cannot find the common
-/// MCP launchers (`npx`/`uvx`/`node`) and every such server would falsely report
-/// `reachable:false`. We resolve a launchd-safe `PATH` and the user's provider
-/// env exactly as the daemon spawns its other agent subprocesses, so the harvest
-/// sees the same servers an interactive shell (and the reference harvester) does.
-#[derive(Clone)]
-struct SpawnEnv {
-    path: Option<OsString>,
-    provider: BTreeMap<String, OsString>,
-}
-
 impl SpawnEnv {
-    /// Resolve once per cycle (`provider_env` may briefly consult a login shell).
-    fn resolve() -> Self {
-        Self {
-            path: crate::command_env::path_env(),
-            provider: crate::command_env::provider_env(),
-        }
-    }
-
     /// Resolve `command` to an absolute path against the launchd-safe search dirs
     /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
     /// child (so the launched server and its own subprocesses resolve too).
@@ -1984,9 +2070,6 @@ fn clear_org_disabled_marker(path: &Path) {
 /// Gating is implicit and safe: harvest only runs for sources the relay device
 /// has been granted (`enabled_snapshot_sources`), and only when the device is
 /// registered at all — so telemetry-off ⇒ no device/sources ⇒ no harvest.
-pub fn spawn_mcp_inventory_sync() -> Result<()> {
-    spawn_inventory_sync(None)
-}
 pub fn spawn_mcp_inventory_sync_for_daemon(daemon: &crate::LocalDaemon) -> Result<()> {
     spawn_inventory_sync(Some(daemon.codex_versions.clone()))
 }
@@ -3793,6 +3876,7 @@ done
         let _ = fs::remove_dir_all(&dir);
     }
     include!("mcp_inventory_version_tests.rs");
+    include!("mcp_inventory_plugin_tests.rs");
 }
 
 #[cfg(test)]

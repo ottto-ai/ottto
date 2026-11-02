@@ -1,4 +1,4 @@
-//! D1: Codex `model_context_window` paired with each context watermark.
+//! Codex `model_context_window` paired with each context watermark.
 //! Synthetic fixtures only; no content comes from a provider account.
 use super::*;
 

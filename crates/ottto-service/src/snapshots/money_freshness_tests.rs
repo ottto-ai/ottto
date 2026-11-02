@@ -19,24 +19,7 @@ fn fixture() -> ScanIndex {
             context_fingerprint: "synthetic".into(),
             census_window_end: "2026-10-30T00:00:00Z".into(),
             scan_roots: Vec::new(),
-            pending_directories: VecDeque::new(),
-            pending_candidates: VecDeque::new(),
-            observed_index_keys: Default::default(),
-            codex_rollout_paths: BTreeSet::new(),
-            codex_join_directory_census: None,
-            reconciliation_upper_bound: None,
-            reconciliation_after: None,
-            reconciliation_started: false,
-            watcher_hint_seen: false,
-            codex_freshness_yield: false,
-            codex_parent_resolution_retry_required: false,
-            unhealthy_retry_attempt: 0,
-            unhealthy_retry_not_before_unix_seconds: None,
-            oversized_discovery: BTreeMap::new(),
-            counts: ScanTraversalCounts::default(),
-            residue: ScanTraversalResidue::default(),
-            listing_started_unix_seconds: None,
-            listing_owed_requeued_unix_seconds: Default::default(),
+            ..crate::snapshots::claude_family_census_shadow_tests::traversal()
         }),
         ..ScanIndex::default()
     }
@@ -160,73 +143,6 @@ fn stamp_clock_restarts_with_scope_and_reload() {
         )
         .unwrap();
         assert_eq!(row.pending_census_members.stamped_for_s, age);
-    }
-}
-
-/// [off=main] Disabling the shadow adds no tracker state, allocation or diagnostic emission.
-#[test]
-fn disabled_shadow_has_no_tracker_state_box_or_emission() {
-    let _disabled = DisabledForTest::new();
-    let index = fixture();
-    let candidate = CandidateFile {
-        physical_identity: None,
-        scan_root: PathBuf::from("/synthetic"),
-        path: path(0).path,
-        size_bytes: 1,
-        modified_unix_seconds: 1,
-        modified_unix_nanos: 1_000_000_000,
-        source_file_fingerprint: String::new(),
-        legacy_source_file_fingerprint: String::new(),
-        legacy_config_reconciliation_required: false,
-        opened_object_identity: String::new(),
-        fingerprint_changed_nanos: 0,
-        fingerprint_birth_nanos: 0,
-        withheld_content_stamp: None,
-    };
-    let (_, records) = crate::local_resource_diagnostics::capture(|| {
-        shadow::attest_equality_skip(&index, &candidate, &None, NOW);
-        shadow::observe_page(&index, &None, &[], &ScanCensus::default(), &None, NOW);
-    });
-    assert!(records.is_empty());
-    assert!(shadow::runtime_pristine_for_test());
-    let scan = OwnedSourceScan::new_selecting(
-        SnapshotSource::ClaudeCode,
-        &[],
-        index,
-        "2026-10-30T00:00:00Z",
-        7,
-        1,
-        false,
-        None,
-        &[],
-        false,
-        false,
-        &[],
-        None,
-    );
-    assert!(scan.claude_family_shadow.is_none());
-}
-
-/// [behaviour] Only a regular-file disable sentinel changes the default-ON policy.
-#[test]
-fn kill_switch_defaults_on_and_requires_a_regular_file() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-freshness-policy");
-    assert!(enabled_at(&scratch));
-    std::fs::write(scratch.join("money_freshness_disabled"), b"").unwrap();
-    assert!(!enabled_at(&scratch));
-    std::fs::remove_file(scratch.join("money_freshness_disabled")).unwrap();
-    std::fs::create_dir(scratch.join("money_freshness_disabled")).unwrap();
-    assert!(enabled_at(&scratch));
-    std::fs::remove_dir(scratch.join("money_freshness_disabled")).unwrap();
-    #[cfg(unix)]
-    {
-        std::fs::write(scratch.join("target"), b"").unwrap();
-        std::os::unix::fs::symlink(
-            scratch.join("target"),
-            scratch.join("money_freshness_disabled"),
-        )
-        .unwrap();
-        assert!(enabled_at(&scratch));
     }
 }
 

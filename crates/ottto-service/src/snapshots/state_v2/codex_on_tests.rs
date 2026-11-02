@@ -251,7 +251,7 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     }
 }
 
-/// [behaviour] D62: a state v2 reload whose store holds no incarnation mints a
+/// [behaviour] A state v2 reload whose store holds no incarnation mints a
 /// fresh RAM nonce each time, though its fence is unchanged; the path's
 /// first-load flag and seq high-water still come from the memo.
 #[test]

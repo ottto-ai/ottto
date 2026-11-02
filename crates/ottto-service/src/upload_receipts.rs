@@ -508,6 +508,7 @@ pub fn clear(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn append_success(
     state_dir: &Path,
     source: SourceKind,
@@ -756,6 +757,7 @@ pub(crate) fn append_http_failure_with_context_bounded(
     )
 }
 
+#[cfg(test)]
 pub fn append_transport_error(
     state_dir: &Path,
     source: SourceKind,

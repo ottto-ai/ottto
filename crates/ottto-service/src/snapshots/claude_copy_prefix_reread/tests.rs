@@ -6,6 +6,7 @@ fn run(scope: &Path, support: &Path, apply: bool) -> Result<Estimate> {
         support,
         &scope.parent().unwrap().join("scan-index.json"),
         apply,
+        false,
         BACKFILL_WINDOW_DAYS,
     )
 }
@@ -53,7 +54,7 @@ fn walk(
     index: ScanIndex,
     scope: &[PathBuf],
 ) -> (ScanIndex, SourceScanResult, Vec<PathBuf>) {
-    let mut scan = OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+    let mut scan = OwnedSourceScan::new_selecting(
         SnapshotSource::ClaudeCode,
         &[root.into()],
         index,
@@ -66,6 +67,7 @@ fn walk(
         false,
         true,
         scope,
+        None,
     );
     let mut opened = Vec::new();
     for _ in 0..100_000 {
@@ -689,3 +691,6 @@ fn combined_twin_bytes_are_blocked_without_increasing_the_native_page_cap() {
     });
     fs::remove_dir_all(home).unwrap();
 }
+
+#[path = "proof_recovery_tests.rs"]
+mod proof_recovery_tests;

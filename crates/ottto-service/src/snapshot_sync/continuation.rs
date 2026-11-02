@@ -857,8 +857,8 @@ pub(super) fn run_production_page(
     )
 }
 
-/// K4 (amended W12): the interval a continuation page stands for in c22's
-/// E2 accounting (`max(elapsed, ordinary)`), read once per page by
+/// The interval a continuation page stands for in c22's
+/// `e2` accounting (`max(elapsed, ordinary)`), read once per page by
 /// [`run_page`] under the sync lock after its rechecks, so only while
 /// enabled. It is exactly `ordinary_interval`: the tier floor, or the failure
 /// backoff while failing, lengthened only by the server directive, with no

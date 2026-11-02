@@ -5,8 +5,14 @@ use super::*;
 fn production_import_preserves_pre_archive_presence_and_rows() {
     // Preserve the historical inventory boundary independently of the
     // production exclusion predicate and its appended v1 decoder slots.
-    let fields = &crate::snapshots::lenient_decode::FIELDS[..89];
-    assert_eq!(fields.last(), Some(&"upload_context_proof"));
+    let historical = &crate::snapshots::lenient_decode::FIELDS[..89];
+    assert_eq!(historical.last(), Some(&"upload_context_proof"));
+    // Claude fields appended after the archive slots stay in presence.
+    let fields: Vec<&str> = historical
+        .iter()
+        .copied()
+        .chain(["copy_prefix_last_accepted_nonce"])
+        .collect();
     let positional = original_presence(b"[2,0,null,{}]".as_slice()).unwrap();
     let positional_expected: BTreeMap<String, bool> = fields
         .iter()
@@ -60,7 +66,7 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
             serde_json::to_vec(&presence).unwrap(),
             serde_json::to_vec(&expected).unwrap()
         );
-        // Main's hydration rule accepts only its original field names.
+        // Hydration accepts only original names; layout 3 adds the nonce.
         assert!(presence.keys().all(|name| fields.contains(&name.as_str())));
         let (restored, mut actual) = hydrate_context(&mut db).unwrap();
         let mut control = KindCx::default();
@@ -78,4 +84,54 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
         let control = kinds::baseline(&control_index, &mut control).unwrap().rows;
         assert_eq!(actual, control, "{shape}: every row value commitment");
     }
+}
+
+/// [regress] A v1 original holding Codex archive custody imports: presence keeps
+/// the pre-archive inventory, the rows carry both fields and hydrate equal.
+#[test]
+fn import_carries_archive_custody_from_a_v1_original() {
+    let mut archives = BTreeMap::new();
+    archives.insert(
+        "/synthetic/archived/a.jsonl.zst".to_string(),
+        crate::snapshots::codex_compressed_input::ArchiveEvidence::unknown(),
+    );
+    let c = Corpus::new();
+    let value = serde_json::json!({
+        "schema_version": 2, "generation": 0, "upload_context_fingerprint": null,
+        "files": {}, "archives": archives, "archive_deferred_alarm_count": 2
+    });
+    ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&value).unwrap())
+        .unwrap();
+    let original = Original::read(&c.path).unwrap();
+    assert!(!original.presence.contains_key("archives"));
+    assert!(!original
+        .presence
+        .contains_key("archive_deferred_alarm_count"));
+    let index = ScanIndex::load(&c.path).unwrap();
+    assert_eq!(index.archives.len(), 1);
+    let mut db =
+        sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
+    db.control(
+        "identity",
+        &Identity {
+            format: FORMAT,
+            db_id: "synthetic-archive-import".into(),
+            binding: c.binding(),
+            fence_generation: index.generation + 1,
+        },
+    )
+    .unwrap();
+    db.control("generation", &index.generation).unwrap();
+    import_graph(&mut db, &index, Some(&original)).unwrap();
+    let presence: BTreeMap<String, bool> = db.read_control("field_presence").unwrap().unwrap();
+    assert_eq!(presence.get("archives"), Some(&true));
+    assert_eq!(presence.get("archive_deferred_alarm_count"), Some(&true));
+    let (restored, _) = hydrate_context(&mut db).unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.archives).unwrap(),
+        serde_json::to_value(&index.archives).unwrap()
+    );
+    assert_eq!(restored.archive_deferred_alarm_count, 2);
 }

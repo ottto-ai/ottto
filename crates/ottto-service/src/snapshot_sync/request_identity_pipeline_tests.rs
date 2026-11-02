@@ -200,7 +200,7 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 }
 
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence_on_scan_worker() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
@@ -245,7 +245,7 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
 }
 
 fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();
@@ -618,7 +618,7 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 #[serial(client_report)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
     run_on_scan_worker_stack(|| {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_real_bootstrap: supported_positive=UNEXECUTED layout_supported=false; actual unsupported BASE preparation covered separately").unwrap();

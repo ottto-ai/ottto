@@ -403,7 +403,7 @@ mod tests {
         format!("2026-10-21T10:{:02}:{:02}Z", index / 60, index % 60)
     }
 
-    /// Round 2's `claude_compaction_events`, kept as the oracle: collect every
+    /// The earlier `claude_compaction_events`, kept as the oracle: collect every
     /// candidate, stable-sort by `at`, dedup (first in parse order wins), keep
     /// the newest 64, then the same gap walk.
     fn round_two_claude_compaction_events<'a>(

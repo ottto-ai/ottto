@@ -671,7 +671,7 @@ fn claude_native_finish_peak_covers_decode_output_and_retained_copy() {
     drop(retained);
 }
 
-// #665 X_out (R1a R8; hunk map T1, T3-T6). Receipts: `X_OUT_T3`, `X_OUT_T1`.
+// #665 X_out (cases T1, T3-T6). Receipts: `X_OUT_T3`, `X_OUT_T1`.
 
 fn x_out_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
     crate::context_footprint::RepositoryIdentity {
@@ -796,7 +796,7 @@ fn family_r_measured(item: &SnapshotItem) -> Option<usize> {
         .checked_add(completed_heap_only(&item.usage_buckets)?)
 }
 
-/// What a T1 case adds around its file (fresh-r1 N1, N3).
+/// What a T1 case adds around its file.
 #[derive(Default)]
 struct FinishCase<'a> {
     /// Runs on the read accumulator before X_out is taken: rows that exist

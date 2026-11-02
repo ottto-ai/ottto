@@ -1,5 +1,4 @@
-//! Field codec for durable warm-cache reuse (M1; SOURCE field ruling with
-//! Amendment 1).
+//! Field codec for durable warm-cache reuse.
 //!
 //! Every persisted type names each of its fields once, next to its definition,
 //! with an admission class:
@@ -105,6 +104,7 @@ impl<'a> Enc<'a> {
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
+    #[cfg(test)]
     pub(crate) fn count_write(
         limit: usize,
         put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,

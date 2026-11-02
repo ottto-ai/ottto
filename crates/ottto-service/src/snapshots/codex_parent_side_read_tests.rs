@@ -5,6 +5,7 @@
 //! account.
 use super::*;
 use crate::local_resource_diagnostics::codex_side_lifecycle::{observe, Counts};
+use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use sampled_scan::side_ledger::{parent_of, GateOpen, LedgerKey, LedgerTag};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -118,19 +119,7 @@ fn page(
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }

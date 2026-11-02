@@ -289,6 +289,12 @@ impl PiDriver {
         (store.store_faults, store.store_write_cleanup_failed)
     }
 
+    /// This route's paced/resource Full count of one phase.
+    fn resource_full(&self, mode: Mode, phase: &str) -> u64 {
+        let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        counts.resource_full.get(phase).copied().unwrap_or(0)
+    }
+
     /// This route's certificate refusals of one class (`full_reason_class`).
     fn certificate_refused(&self, mode: Mode, class: &str) -> u64 {
         let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
@@ -389,6 +395,10 @@ impl TransitionDriver for PiDriver {
 /// usage.
 impl super::durable_transition_tests::SharedSource for PiDriver {
     const HEAD_REDERIVE_CONSUMED: bool = false;
+    const RESTORE_SPENDS_HEAD_ONCE: bool = true;
+    fn resource_full(&self, mode: Mode, phase: &str) -> u64 {
+        PiDriver::resource_full(self, mode, phase)
+    }
     fn entity(&self) -> &str {
         &self.entity
     }
@@ -494,8 +504,9 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
     assert_eq!(f.restarts, 2);
 }
 
-/// [money] Smaller Tail/Unchanged survivors and a RAM-resident shrink retain
-/// their distinct read modes and publish the complete cold body without a floor.
+/// [money] A smaller restored Tail survivor publishes below accepted; an
+/// unchanged survivor is metadata-quiet and takes the paced Full; a RAM-resident
+/// shrink reads Full. Each publishes the complete cold body without a floor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -569,14 +580,25 @@ fn pi_smaller_extent_routes_publish_the_cold_body() {
         let published = f.emit_bodies(mode);
         let expected = match arm {
             "tail" => ((0, 1, 0), 1),
-            "unchanged" => ((0, 0, 1), 1),
+            // A metadata-quiet restore defers before decode (`rederive_quiet`);
+            // the selection takes its ordinary paced Full.
+            "unchanged" => ((1, 0, 0), 0),
             "ram" => ((1, 0, 0), 0),
             _ => unreachable!(),
         };
         assert_eq!((published.modes, published.restored), expected, "{arm}");
+        if arm == "unchanged" {
+            let (counts, _) = f.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+            assert_eq!(counts.ineligible.get("rederive_quiet"), Some(&1), "{arm}");
+            assert_eq!(
+                counts.resource_full.get("rederive_quiet"),
+                Some(&1),
+                "{arm}"
+            );
+        }
         assert_eq!(f.restored_behind(mode), u64::from(arm == "tail"));
         assert_eq!(f.restored_behind(Mode::ColdFull), 0, "Full never counts");
-        if arm == "ram" {
+        if arm != "tail" {
             assert_eq!(published.io.consumed, extent);
         }
         let (_, refused, t14) = f.counters(mode);
@@ -1319,15 +1341,38 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
         let tail = f.grow(&[line]);
         requests += u64::from(counted);
         let cold = f.emit_bodies(Mode::ColdFull);
-        assert_eq!(cold.snapshots[&f.entity]["request_count"], json!(requests));
+        // An uncounted line can leave the accepted body unchanged: cold Full
+        // then uploads nothing, and neither may any route.
+        let unchanged = !cold.snapshots.contains_key(&f.entity);
+        if unchanged {
+            assert!(!counted);
+            assert_eq!(f.accepted[&f.entity].body["request_count"], json!(requests));
+        } else {
+            assert_eq!(cold.snapshots[&f.entity]["request_count"], json!(requests));
+        }
         for mode in [Mode::Ram, Mode::Restart, Mode::EvictRetry] {
             let route = f.emit_bodies(mode);
-            assert_eq!(route.modes, (0, 1, 0));
-            if mode != Mode::Ram {
-                assert_eq!(route.restored, 1);
+            if unchanged {
+                assert!(
+                    route.snapshots.is_empty(),
+                    "{mode:?}: unchanged body uploaded"
+                );
+                assert_eq!(f.counters(mode).1, 0);
+                continue;
             }
-            // Pi re-derives the restored head by pread, outside consumed bytes.
-            assert_eq!(route.io.consumed, tail);
+            if mode == Mode::EvictRetry && f.restarts > 0 {
+                // The restarted owner's Ram route already restored this record
+                // extent; head-once pacing makes its retry the paced Full.
+                assert_eq!((route.modes, route.restored), ((1, 0, 0), 0));
+                assert_eq!(f.resource_full(mode, "rederive_paced"), 1);
+            } else {
+                assert_eq!(route.modes, (0, 1, 0));
+                if mode != Mode::Ram {
+                    assert_eq!(route.restored, 1);
+                }
+                // Pi re-derives the restored head by pread, outside consumed bytes.
+                assert_eq!(route.io.consumed, tail);
+            }
             money_oracle::assert_equivalent(&cold, &route);
             whole_body(&cold, &route);
             assert_eq!(route.snapshots[&f.entity]["session_display_name"], title);

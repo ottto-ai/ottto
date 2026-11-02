@@ -51,6 +51,26 @@ pub(super) fn deserialize<'de, T: de::Deserialize<'de>, D: de::Deserializer<'de>
         .into_inner();
     Ok((value, observed))
 }
+/// Forwards each listed `deserialize_*` method through a wrapped visitor.
+macro_rules! forward_deserialize {
+    ($($name:ident($($arg:ident: $ty:ty),*);)*) => {$(
+        fn $name<V: Visitor<'de>>(self, $($arg: $ty,)* v: V) -> Result<V::Value, D::Error> {
+            let v = self.wrap(v);
+            self.inner.$name($($arg,)* v)
+        }
+    )*};
+}
+/// Records a scalar map key, then forwards each listed `visit_*` method.
+macro_rules! capture_key {
+    ($($name:ident($ty:ty);)*) => {$(
+        fn $name<E: de::Error>(self, v: $ty) -> Result<V::Value, E> {
+            if self.key {
+                self.observed.borrow_mut().key = Some(v.to_string());
+            }
+            self.inner.$name(v)
+        }
+    )*};
+}
 impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Guard<D> {
     type Error = D::Error;
     fn deserialize_ignored_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, D::Error> {
@@ -64,93 +84,34 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Guard<D> {
         let v = self.wrap(v);
         self.inner.deserialize_any(v)
     }
-    fn deserialize_bool<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_bool(v)
-    }
-    fn deserialize_i8<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_i8(v)
-    }
-    fn deserialize_i16<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_i16(v)
-    }
-    fn deserialize_i32<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_i32(v)
-    }
-    fn deserialize_i64<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_i64(v)
-    }
-    fn deserialize_i128<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_i128(v)
-    }
-    fn deserialize_u8<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_u8(v)
-    }
-    fn deserialize_u16<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_u16(v)
-    }
-    fn deserialize_u32<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_u32(v)
-    }
-    fn deserialize_u64<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_u64(v)
-    }
-    fn deserialize_u128<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_u128(v)
-    }
-    fn deserialize_f32<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_f32(v)
-    }
-    fn deserialize_f64<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_f64(v)
-    }
-    fn deserialize_char<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_char(v)
-    }
-    fn deserialize_str<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_str(v)
-    }
-    fn deserialize_string<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_string(v)
-    }
-    fn deserialize_bytes<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_bytes(v)
-    }
-    fn deserialize_byte_buf<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_byte_buf(v)
-    }
-    fn deserialize_option<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_option(v)
-    }
-    fn deserialize_unit<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_unit(v)
-    }
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        v: V,
-    ) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_unit_struct(name, v)
+    forward_deserialize! {
+        deserialize_bool();
+        deserialize_i8();
+        deserialize_i16();
+        deserialize_i32();
+        deserialize_i64();
+        deserialize_i128();
+        deserialize_u8();
+        deserialize_u16();
+        deserialize_u32();
+        deserialize_u64();
+        deserialize_u128();
+        deserialize_f32();
+        deserialize_f64();
+        deserialize_char();
+        deserialize_str();
+        deserialize_string();
+        deserialize_bytes();
+        deserialize_byte_buf();
+        deserialize_option();
+        deserialize_unit();
+        deserialize_unit_struct(name: &'static str);
+        deserialize_seq();
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map();
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier();
     }
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
@@ -162,27 +123,6 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Guard<D> {
         }
         let v = self.wrap(v);
         self.inner.deserialize_newtype_struct(name, v)
-    }
-    fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_seq(v)
-    }
-    fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_tuple(len, v)
-    }
-    fn deserialize_tuple_struct<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        len: usize,
-        v: V,
-    ) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_tuple_struct(name, len, v)
-    }
-    fn deserialize_map<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_map(v)
     }
     fn deserialize_struct<V: Visitor<'de>>(
         self,
@@ -197,19 +137,6 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Guard<D> {
         let v = self.wrap(v);
         self.inner.deserialize_struct(name, fields, v)
     }
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        variants: &'static [&'static str],
-        v: V,
-    ) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_enum(name, variants, v)
-    }
-    fn deserialize_identifier<V: Visitor<'de>>(self, v: V) -> Result<V::Value, D::Error> {
-        let v = self.wrap(v);
-        self.inner.deserialize_identifier(v)
-    }
 }
 impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Guard<S> {
     type Value = S::Value;
@@ -223,107 +150,24 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Guard<V> {
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.expecting(f)
     }
-    fn visit_bool<E: de::Error>(self, v: bool) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_bool(v)
-    }
-    fn visit_i8<E: de::Error>(self, v: i8) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_i8(v)
-    }
-    fn visit_i16<E: de::Error>(self, v: i16) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_i16(v)
-    }
-    fn visit_i32<E: de::Error>(self, v: i32) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_i32(v)
-    }
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_i64(v)
-    }
-    fn visit_i128<E: de::Error>(self, v: i128) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_i128(v)
-    }
-    fn visit_u8<E: de::Error>(self, v: u8) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_u8(v)
-    }
-    fn visit_u16<E: de::Error>(self, v: u16) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_u16(v)
-    }
-    fn visit_u32<E: de::Error>(self, v: u32) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_u32(v)
-    }
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_u64(v)
-    }
-    fn visit_u128<E: de::Error>(self, v: u128) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_u128(v)
-    }
-    fn visit_f32<E: de::Error>(self, v: f32) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_f32(v)
-    }
-    fn visit_f64<E: de::Error>(self, v: f64) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_f64(v)
-    }
-    fn visit_char<E: de::Error>(self, v: char) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_char(v)
-    }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_str(v)
-    }
-    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_borrowed_str(v)
-    }
-    fn visit_string<E: de::Error>(self, v: String) -> Result<V::Value, E> {
-        if self.key {
-            self.observed.borrow_mut().key = Some(v.to_string());
-        }
-        self.inner.visit_string(v)
+    capture_key! {
+        visit_bool(bool);
+        visit_i8(i8);
+        visit_i16(i16);
+        visit_i32(i32);
+        visit_i64(i64);
+        visit_i128(i128);
+        visit_u8(u8);
+        visit_u16(u16);
+        visit_u32(u32);
+        visit_u64(u64);
+        visit_u128(u128);
+        visit_f32(f32);
+        visit_f64(f64);
+        visit_char(char);
+        visit_str(&str);
+        visit_borrowed_str(&'de str);
+        visit_string(String);
     }
     fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<V::Value, E> {
         self.inner.visit_bytes(v)

@@ -23,7 +23,6 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
-pub const CLAUDE_CODE_RELAY_PORT: u16 = LOCAL_RELAY_DEFAULT_PORT;
 pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
 pub const CODEX_RELAY_SOURCE: &str = "codex";
 pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
@@ -131,10 +130,6 @@ struct HttpRequest {
 
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
-}
-
-pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
-    spawn_local_otlp_relay(daemon)
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
@@ -698,23 +693,6 @@ pub fn local_relay_port_from_endpoint(endpoint: &str) -> Option<u16> {
     Some(port)
 }
 
-pub fn local_relay_base_url_from_state(relay: &RelayState) -> String {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .map(local_relay_base_url_for_port)
-        .unwrap_or_else(default_local_relay_base_url)
-}
-
-pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
-}
-
 pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {
     let mut ports = Vec::with_capacity(usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
     push_unique_port(&mut ports, LOCAL_RELAY_DEFAULT_PORT);
@@ -989,14 +967,8 @@ fn handle_control_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto control"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "control") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = control_cors_headers(origin);
 
@@ -1058,14 +1030,8 @@ fn handle_whoami_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto identity"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "identity") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1117,14 +1083,8 @@ fn handle_local_health_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto health"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "health") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1192,6 +1152,20 @@ fn local_health_response_payload(
         "machine_id": status.machine.machine_id,
         "machine_name": status.machine.display_name,
         "health": health,
+    }))
+}
+
+/// The 403 body for a browser `Origin` outside the control allowlist, or `None`
+/// when the request has no `Origin` or an allowed one. `noun` names the
+/// endpoint in the message ("control", "identity", "health").
+fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
+    let origin = origin?;
+    if is_allowed_control_origin(origin) {
+        return None;
+    }
+    Some(json!({
+        "error": "origin_forbidden",
+        "message": format!("Origin is not allowed for local Ottto {noun}"),
     }))
 }
 
@@ -1709,6 +1683,20 @@ pub(crate) mod tests {
         assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
         assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn forbidden_origin_body_keeps_each_message_verbatim() {
+        for (noun, message) in [
+            ("control", "Origin is not allowed for local Ottto control"),
+            ("identity", "Origin is not allowed for local Ottto identity"),
+            ("health", "Origin is not allowed for local Ottto health"),
+        ] {
+            assert_eq!(
+                forbidden_origin_body(Some("https://ottto.net.evil"), noun),
+                Some(json!({"error": "origin_forbidden", "message": message}))
+            );
+        }
     }
 
     #[test]

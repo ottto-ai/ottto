@@ -412,7 +412,7 @@ pub(crate) fn retained_refusal_settles_for_test(
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in; 3 (E2)
+// Code 2 re-reads its history once so the newer context numbers fill in; 3 (`e2`)
 // re-reads it once more for request-owned money, paced. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
@@ -422,7 +422,7 @@ pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSourc
     }
 }
 
-// SOURCE F2: a Claude revision the history gate is not complete for does not
+// A Claude revision the history gate is not complete for does not
 // build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
 const _: () = assert!(
     effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
@@ -434,9 +434,8 @@ fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
     effective_upload_body_witness_revision(source)
 }
 
-/// Where this destination's Claude prior history comes from (SOURCE
-/// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
-/// support state.
+/// Where this destination's Claude prior history comes from. A fresh install
+/// is only a positively empty support state.
 /// - `Unverified`: the backfill state is unreadable.
 /// - `Here`: this destination's completed bootstrap; a server-attested record
 ///   in its upload ledger (an accepted, quarantined or refused body or
@@ -444,14 +443,14 @@ fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
 ///   sibling of this index; or the re-emission seen-marker. Also, when the
 ///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
-///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   beside `destinations/`: it names no destination, so it
 ///   is not a move, but this Mac did index history, so a cutoff keeps that
 ///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
 ///   copy another destination's directory holds (an interrupted bootstrap
 ///   before a re-pair). A leftover is another destination only when it sits
-///   under a different namespace (I-r3-1); unless a claim
+///   under a different namespace; unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -476,7 +475,7 @@ fn claude_prior_history(
         == Some(destination_namespace);
     // A quarantined copy of this index, of a legacy index or of this
     // destination's ledger. An unreadable directory fails closed; a missing
-    // one is empty (SOURCE h695 N2).
+    // one is empty.
     let quarantined_sibling = || {
         let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
         let claude_prefix = format!("{slug}-scan-index");
@@ -502,20 +501,8 @@ fn claude_prior_history(
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
-        // An unreadable directory fails closed; a missing one is empty.
-        let holds_claude_state = |directory: &Path| {
-            Some(directory) != own
-                && match std::fs::read_dir(directory) {
-                    Ok(mut entries) => entries.any(|entry| match entry {
-                        Ok(entry) => entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name.starts_with(&prefix)),
-                        Err(_) => true,
-                    }),
-                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-                }
-        };
+        let holds_claude_state =
+            |directory: &Path| Some(directory) != own && dir_holds_prefixed(directory, &prefix);
         match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
             Ok(mut destinations) => destinations.any(|destination| match destination {
                 Ok(destination) => holds_claude_state(&destination.path()),
@@ -524,7 +511,7 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
-    // Fails closed: only a positively missing marker is absent (h695 N2).
+    // Fails closed: only a positively missing marker is absent.
     let seen_marker = || match std::fs::symlink_metadata(
         crate::snapshots::claude_reemission_seen_marker_path(support_dir),
     ) {
@@ -541,7 +528,7 @@ fn claude_prior_history(
     // A claim that recorded a different-user cutoff keeps the other
     // destinations' history excluded by that cutoff, not by the gate, but
     // only on that claim's own destination: a later same-user re-claim keeps
-    // the cutoff on a new destination (SOURCE h695 N1).
+    // the cutoff on a new destination.
     let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
         && backfill_state
             .backfill_cutoff_destination_namespace
@@ -554,20 +541,12 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
-    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
-    // directory fails closed; a missing one is empty.
+    // A pre-scoping daemon's unscoped index.
     let unscoped_legacy_index = || {
-        let prefix = format!("{slug}-scan-index");
-        match std::fs::read_dir(support_dir.join("snapshots")) {
-            Ok(mut entries) => entries.any(|entry| match entry {
-                Ok(entry) => entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix)),
-                Err(_) => true,
-            }),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
+        dir_holds_prefixed(
+            &support_dir.join("snapshots"),
+            &format!("{slug}-scan-index"),
+        )
     };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
@@ -575,6 +554,21 @@ fn claude_prior_history(
         PriorHistory::Here
     } else {
         PriorHistory::None
+    }
+}
+
+/// True when `directory` holds an entry named `{prefix}*`. An unreadable
+/// directory or entry fails closed; a missing directory is empty.
+fn dir_holds_prefixed(directory: &Path, prefix: &str) -> bool {
+    match std::fs::read_dir(directory) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix)),
+            Err(_) => true,
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -1117,7 +1111,7 @@ fn settle_index_after_upload(
 }
 
 /// Correction completion depends on the final selected file/empty facts. In
-/// particular, the last M2 no-body drain must precede the completion decision.
+/// particular, the last no-body drain must precede the completion decision.
 #[expect(
     clippy::too_many_arguments,
     reason = "the selected index, page facts, correction candidates and drain ledger"
@@ -1132,7 +1126,7 @@ fn settle_upload_corrections_after_selection(
     transport_fully_settled: bool,
     body_drains: &mut crate::snapshots::ClaudeProofBodyDrains,
 ) -> bool {
-    // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
+    // This drain is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
     // It settles against the selected entries, but a later account-audit
     // release can still clear one; its drains join the finish restore.
@@ -1161,7 +1155,7 @@ fn settle_upload_corrections_after_selection(
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
     // Correction members the history gate holds wait for it; they are counted,
-    // not blocking (StateMissing M2).
+    // not blocking.
     let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
     if deferred > 0 {
         eprintln!(
@@ -1230,7 +1224,7 @@ fn finish_selected_settlement(
         );
     }
     // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // can clear a drained entry's revision: a drain (pre-selection or settlement)
     // whose entry this save does not keep stays owed.
     if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
@@ -1625,9 +1619,9 @@ struct SnapshotUploadProgress {
 impl SnapshotUploadProgress {
     /// A server-attested record of an earlier upload to this destination: an
     /// accepted, quarantined or refused body, or accepted cache evidence
-    /// (SOURCE F1a prior history). A saved generation, a replay claim or a
+    /// (prior history). A saved generation, a replay claim or a
     /// pending cache head is this daemon's own claim, saved before any upload,
-    /// so it is not evidence (StateMissing N1).
+    /// so it is not evidence.
     fn records_server_attested_upload(&self) -> bool {
         !self.accepted_fingerprints.is_empty()
             || !self.accepted_body_witnesses.is_empty()
@@ -3658,7 +3652,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);
     }
     if let Some(scan) = correction_scan {
-        // A2: settle no-body grants only against the file/empty/map facts
+        // Settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
     }
@@ -6490,8 +6484,7 @@ fn load_source_checkpoints(
     crate::snapshots::ScanIndexLoadOrigin,
     SnapshotUploadProgress,
 )> {
-    let custody = source == SnapshotSource::ClaudeCode
-        && crate::snapshots::state_v2_custody_published(index_path)?;
+    let custody = crate::snapshots::state_v2_custody_published(index_path)?;
     if custody {
         // Begin once at preparation admission. Claim-only nested loads must
         // preserve the pass's measurements rather than start another pass.
@@ -6600,17 +6593,11 @@ fn prepare_sync_source_inner(
         activity_hint.local_usage_reconciliation_enabled,
     );
     if receipt_window_days == 0 {
-        let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
-        withdraw_source_manifest(&destination_namespace, source);
-        let _ =
-            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
-        report_status_with_fresh_relay_token(
+        withdraw_and_report_policy_stop(
             client,
             device,
             device_secret,
             support_dir,
-            source,
-            TerminalManifestSource::Withdraw,
             CollectorStatus {
                 source,
                 machine_id,
@@ -6618,7 +6605,6 @@ fn prepare_sync_source_inner(
                 counts: SyncCounts::for_policy(0),
                 state: CollectorState::PolicyTombstone,
             },
-            None,
         )?;
         return Ok(None);
     }
@@ -6646,25 +6632,18 @@ fn prepare_sync_source_inner(
     }
 
     // The configured-MCP context-footprint harvest runs on its own slower
-    // schedule (run-at-start + every 6 h, `spawn_mcp_inventory_sync`), NOT on the
-    // 5-minute snapshot sync: each harvest spawns every configured MCP server's
-    // stdio process, so doing it every cycle would be needlessly intrusive and
-    // re-POST unchanged inventories 12×/hour. See `crate::mcp_inventory`.
+    // schedule (run-at-start + every 6 h, `spawn_mcp_inventory_sync_for_daemon`),
+    // NOT on the 5-minute snapshot sync: each harvest spawns every configured
+    // MCP server's stdio process, so doing it every cycle would be needlessly
+    // intrusive and re-POST unchanged inventories 12×/hour. See
+    // `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
-        withdraw_source_manifest(
-            &snapshot_upload_destination_namespace(device, device_secret),
-            source,
-        );
-        let _ =
-            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
-        report_status_with_fresh_relay_token(
+        withdraw_and_report_policy_stop(
             client,
             device,
             device_secret,
             support_dir,
-            source,
-            TerminalManifestSource::Withdraw,
             CollectorStatus {
                 source,
                 machine_id,
@@ -6672,7 +6651,6 @@ fn prepare_sync_source_inner(
                 counts: SyncCounts::for_policy(receipt_window_days),
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
-            None,
         )?;
         return Ok(None);
     }
@@ -6808,16 +6786,19 @@ fn prepare_sync_source_inner(
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
     // Absent, quarantined or undecodable: every file would come back new. The
-    // load origin decides it (StateMissing M3); an empty saved index counts too.
+    // load origin decides it; an empty saved index counts too.
     let claude_index_loaded_fresh = load_origin.is_fresh(&index);
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
         upload_progress.save(&upload_progress_path)?;
     }
-    if source == SnapshotSource::ClaudeCode {
+    // One serialization feeds both input digests: the traversal contract
+    // (Claude) and the per-item proof's input record (every source).
+    let policy_bytes = serde_json::to_vec(&upload_policy).expect("upload policy is serializable");
+    if claude {
         claude_contract::prepare_context(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
         );
@@ -6829,7 +6810,7 @@ fn prepare_sync_source_inner(
     index.note_upload_context_inputs(
         source,
         crate::snapshots::UploadContextInputs::new(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
             copy_unproven_enabled,
@@ -7537,7 +7518,7 @@ fn capture_codex_recovery_evidence(
     scan_result.finish_codex_capture_boundary(index);
 }
 
-/// U1a-2a D5′ (C15), Codex only: read immediately before the call that
+/// Codex only: read immediately before the call that
 /// assembles and writes the selected save; no side writer runs in between.
 fn codex_side_save_mark(
     daemon: &LocalDaemon,
@@ -7618,7 +7599,7 @@ fn finish_sync_source(
     } = preparation;
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
-    // D3: a source-fault fallback may not reach any POST until the retained
+    // A source-fault fallback may not reach any POST until the retained
     // Codex entry no longer binds stale A on disk. Save only committed PRE
     // facts; a failed barrier returns before upload/ACK/settlement.
     #[cfg(unix)]
@@ -8536,20 +8517,25 @@ fn finish_sync_source(
             clear_shed_streak(source);
             // Scope the unsettled stamp to the families of this page's
             // entities without an exact ACK of their body, and held ones.
-            let unsettled_roots = index.claude_entity_family_roots(
-                &scan_result
-                    .snapshots
-                    .iter()
-                    .filter(|item| {
-                        upload_progress
-                            .accepted_body_witnesses
-                            .get(&item.snapshot_fingerprint)
-                            != Some(&snapshot_upload_body_witness(item))
-                    })
-                    .map(|item| item.snapshot_fingerprint.clone())
-                    .chain(local_holds.held_fingerprints.iter().cloned())
-                    .collect(),
-            );
+            // Codex and Pi scopes have no reader: their stamp stays sweep-wide.
+            let unsettled_roots = if source == SnapshotSource::ClaudeCode {
+                index.claude_entity_family_roots(
+                    &scan_result
+                        .snapshots
+                        .iter()
+                        .filter(|item| {
+                            upload_progress
+                                .accepted_body_witnesses
+                                .get(&item.snapshot_fingerprint)
+                                != Some(&snapshot_upload_body_witness(item))
+                        })
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .chain(local_holds.held_fingerprints.iter().cloned())
+                        .collect(),
+                )
+            } else {
+                None
+            };
             let settlement = settle_checkpointed_upload(
                 index,
                 &committed_index,
@@ -9435,7 +9421,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
-    /// E2 requests left Unknown because their family's strict read failed;
+    /// `e2` requests left Unknown because their family's strict read failed;
     /// absent from the line while empty.
     #[serde(
         skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
@@ -9449,6 +9435,9 @@ pub struct ClaudeLocalEvidenceStats {
     /// Fix 1's skipped full re-arms; absent from the line while empty.
     #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
     pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
+    /// The streamed terminal's slices and the fence's age; absent while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeTerminalStreamCounts::is_empty")]
+    pub terminal_stream: crate::snapshots::ClaudeTerminalStreamCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -9960,7 +9949,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
-    // E2: every held copy skip is decided (or the session held) before
+    // `e2`: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
@@ -10122,7 +10111,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-    // E2: roots whose strict API and trace reads were both healthy. A healthy
+    // `e2`: roots whose strict API and trace reads were both healthy. A healthy
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
@@ -10238,7 +10227,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
         );
     }
-    // E2 side calls need the trace-named owner, so they follow the trace read.
+    // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
         &api_report,
@@ -10254,7 +10243,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
         // A discarded strict trace read defers the family's bodies through the
-        // E2 withhold: the accepted revision stays, delayed one pass, never
+        // `e2` withhold: the accepted revision stays, delayed one pass, never
         // replaced by an untagged one. Listed families included.
         let (deferred, unfolded) = crate::snapshots::claude_request_money::e2::hold_trace_discarded(
             &mut scan_result.snapshots,
@@ -10338,7 +10327,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &request_owned_originals,
         )
     });
-    // E2 bodies are final before any identity owner runs: contract 5, D1 and
+    // `e2` bodies are final before any identity owner runs: contract 5, transcript ownership and
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
@@ -10390,7 +10379,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         index.hold_claude_history_for_unread_telemetry();
     }
     if let Some(evidence) = &identity_evidence {
-        // Contract 5 first: D1 below leaves new-collector items untouched. The
+        // Contract 5 first: the ownership step below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
@@ -10484,6 +10473,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .count();
     stats.duplicate_census = disposition.duplicate_census;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
+    stats.terminal_stream = disposition.terminal_stream;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
@@ -10503,7 +10493,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // All local consumers (comparison/fallback, finalizer, identity, account
     // qualification and the optional shadow) have finished. Release native
-    // inputs only for emitted E2 bodies before upload clones/checkpoints.
+    // inputs only for emitted `e2` bodies before upload clones/checkpoints.
     // Held and legacy bodies retain their inputs for their existing owners.
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
@@ -12431,6 +12421,34 @@ fn report_status_with_fresh_relay_token(
     }
     client.report_status(&relay_token, &request)?;
     Ok(())
+}
+
+/// A policy stop before scanning: withdraw this source's manifest, clear its
+/// active sessions, then report `status` with the manifest withdrawn.
+fn withdraw_and_report_policy_stop(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    support_dir: &Path,
+    status: CollectorStatus<'_>,
+) -> Result<()> {
+    let source = status.source;
+    withdraw_source_manifest(
+        &snapshot_upload_destination_namespace(device, device_secret),
+        source,
+    );
+    let _ =
+        crate::active_sessions::clear_active_sessions(support_dir, source, status.scan_started_at);
+    report_status_with_fresh_relay_token(
+        client,
+        device,
+        device_secret,
+        support_dir,
+        source,
+        TerminalManifestSource::Withdraw,
+        status,
+        None,
+    )
 }
 
 /// Post a non-terminal collector check-in receipt.
@@ -15059,7 +15077,7 @@ mod tests {
         }
     }
 
-    /// COST condition: a held body (an `unchanged` ACK with a basis) never
+    /// A held body (an `unchanged` ACK with a basis) never
     /// blocks a later, different body of the same session. Unchanged ACK,
     /// then local growth, then the grown body is offered and accepted, in the
     /// same cycle and in the next one (hold carried through the index).
@@ -16418,14 +16436,18 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [format] damaged custody or a stat error holds before progress containment or transcript reads.
+    /// [regress] for every state v2 source, damaged custody or a stat error holds before progress
+    /// containment or transcript reads.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
-        for stat_error in [false, true] {
+        for (source, stat_error) in [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+            .into_iter()
+            .flat_map(|source| [(source, false), (source, true)])
+        {
             let root = crate::test_scratch::private_dir("v2-route-before-progress");
             let namespace = root.join("snapshots/destinations").join("b".repeat(64));
             std::fs::create_dir_all(&namespace).unwrap();
-            let index_path = namespace.join("claude_code-scan-index-v3.json");
+            let index_path = namespace.join(format!("{}-scan-index-v3.json", source.api_slug()));
             let progress_path = snapshot_upload_progress_path(&index_path);
             std::fs::write(&index_path, b"{broken-fence").unwrap();
             std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
@@ -16449,10 +16471,10 @@ mod tests {
                 load_source_checkpoints(
                     &index_path,
                     &progress_path,
-                    SnapshotSource::ClaudeCode,
+                    source,
                     &root,
                     &"b".repeat(64),
-                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                    snapshot_quarantine_witness(source),
                 )
             });
             let counts = scope.finish();
@@ -18087,7 +18109,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// [regress] M4 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
+    /// [regress] Version 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
     #[test]
     fn version_only_quarantine_witness_change_keeps_retry_after() {
         let root = test_dir("snapshot-upload-progress-quarantine-upgrade");
@@ -18181,7 +18203,7 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
-    /// [regress] M4 q8: four due quarantines had already left census pending.
+    /// [regress] Observed live: four due quarantines had already left census pending.
     /// Also retains the live 0.1.121 strand: the quarantine deadline became
     /// due after a settled sibling had already advanced the shared backend
     /// head, but an independently backed-off terminal-unhealthy traversal
@@ -18302,7 +18324,7 @@ mod tests {
             "the current-schema manifest revision stays armed rather than becoming unproven"
         );
         // Resume the retained traversal with this file already observed and
-        // absent from its candidate queue, just like the four M4 quarantines.
+        // absent from its candidate queue, just like the four quarantines observed live.
         let mut state = serde_json::to_value(&index).unwrap();
         state["traversal"]["scan_roots"] = serde_json::json!([root]);
         state["traversal"]["observed_index_keys"] =
@@ -18405,7 +18427,7 @@ mod tests {
             progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
             0
         );
-        // Round 4 P2a (theoretical): a count-only HTTP reply remains a real
+        // Theoretical: a count-only HTTP reply remains a real
         // send even though it cannot settle legacy reconciliation.
         let replied = upload_resumable_batches(
             &retry.snapshots,
@@ -20577,7 +20599,7 @@ mod tests {
         }
     }
 
-    /// The M1 codex witness once its residue settles (ottto#399): a COMPLETED
+    /// The codex witness once its residue settles (ottto#399): a COMPLETED
     /// census whose every nonzero loss class equals its terminal counterpart,
     /// with the witness reported as counts only.
     fn m1_named_residue_counts() -> SyncCounts {
@@ -24684,7 +24706,7 @@ mod tests {
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
@@ -24848,7 +24870,7 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);

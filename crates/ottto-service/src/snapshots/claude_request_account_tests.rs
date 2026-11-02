@@ -27,7 +27,7 @@ pub(crate) fn output(name: &str, item: &SnapshotItem) {
 
 #[test]
 fn claude_p92_clock_qualification_and_all_bucket_coverage() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, root, items) = claude_account_family_fixture(true);
     let path = dir
@@ -372,7 +372,7 @@ pub(crate) fn claude_request_account_mixed_fixture(
 
 #[test]
 fn claude_p92_mixed_body_capability_and_restart_refusals() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, mut mixed, api, trace) = claude_request_account_mixed_fixture(4, true);
     let (prior_dir, mut prior, _, _) = claude_request_account_mixed_fixture(2, true);
@@ -800,7 +800,7 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -900,7 +900,7 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
         "qualification is not an ACK"
     );
     output("native-root-production.json", qualified);
-    // Root and child keep independent exact logins under direct D1
+    // Root and child keep independent exact logins under direct
     // qualification (was `claude_h296_root_and_child_have_independent_exact_request_logins`),
     // on the same h296 rows with the root parsed as ordinary (listed) money.
     {

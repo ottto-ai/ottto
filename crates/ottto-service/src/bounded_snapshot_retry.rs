@@ -286,6 +286,7 @@ impl PreparedRetry {
     /// Called only by the existing owner at an admitted collection boundary.
     /// `validate` must establish fresh account/device/destination/stop plus
     /// complete native dependency and policy authority.
+    #[cfg(test)]
     pub(super) fn turn(
         &mut self,
         client: &SnapshotApiClient,

@@ -87,7 +87,7 @@ impl ClaudeProofCorrectionCandidate {
 
 /// Content-free counts of unbound Claude authority records dropped on load or
 /// save, of the indexed family members re-armed with them, and of demotions
-/// that found no current witness and so formed no record (SOURCE U3).
+/// that found no current witness and so formed no record.
 static CLAUDE_AUTHORITY_DROPS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static CLAUDE_AUTHORITY_DROP_REARMED_FILES: std::sync::atomic::AtomicUsize =
@@ -195,7 +195,7 @@ impl ScanIndex {
         }
     }
 
-    // SOURCE ruling: an unbound or ill-formed record fails closed alone, on
+    // An unbound or ill-formed record fails closed alone, on
     // load and on save, with its pending proof state. Terminal refusals and
     // the upload ledger stay. Its indexed members are re-armed, bounded by
     // family size, so the next pass re-reads the family and re-forms the
@@ -266,7 +266,7 @@ impl ScanIndex {
         );
     }
 
-    // M1: only the existing complete healthy census can retire absent grants.
+    // Only the existing complete healthy census can retire absent grants.
     fn retire_absent_claude_proof_corrections(
         &mut self,
         complete: &BTreeMap<String, BTreeSet<String>>,
@@ -449,7 +449,7 @@ impl ScanIndex {
         }
     }
 
-    // R2, the body-drain analogue of the A2 restore above: a drain certifies
+    // The body-drain analogue of the restore above: a drain certifies
     // only the revision and entity set the selected save keeps. Any other
     // selected entry leaves the member owed under the same proof with its
     // pre-drain pair. A record its last drain removed is re-bound with its
@@ -523,7 +523,7 @@ impl ScanIndex {
             owed_again = true;
             let previous = drain.previous.unwrap_or_else(|| {
                 // A valid record pairs every owed member; keep the debt with a
-                // domain-separated nonmatching revision, as A2 does.
+                // domain-separated nonmatching revision, as the restore does.
                 sha256_hex(&[
                     "claude_proof_body_drain_restore_missing_previous:v1",
                     &drain.revision,
@@ -598,7 +598,7 @@ impl ScanIndex {
         }
     }
 
-    // M2 drains only local authority correction bookkeeping, never old entity
+    // This settlement drains only local authority correction bookkeeping, never old entity
     // or manifest debt. Partial checkpoint keeps its existing prior-entity rule.
     pub(crate) fn settle_empty_claude_proof_corrections(&mut self, result: &SourceScanResult) {
         if !result.census_complete || !self.claude_authority_proof_correction_pending() {
@@ -694,7 +694,7 @@ impl ScanIndex {
             .collect::<BTreeMap<_, _>>();
         let mut candidates = Vec::new();
         for snapshot in &mut result.snapshots {
-            // E2 (gate on): an owed member's request-owned literal settles
+            // `e2` (gate on): an owed member's request-owned literal settles
             // its correction on the same exact ACK as a reported body.
             let settles = snapshot.usage_accounting_contract.as_deref()
                 == Some("session_exclusive_reported_usage:v1")
@@ -820,7 +820,7 @@ impl ScanIndex {
         });
     }
 
-    // D2: apply only after final file selection. Restoring a prior entity or
+    // Apply only after final file selection. Restoring a prior entity or
     // revision invalidates the current-page no-body evidence and keeps debt.
     pub(crate) fn settle_cutoff_claude_proof_corrections(
         &mut self,
@@ -995,7 +995,7 @@ impl ScanIndex {
             // (counted); nothing of it is applied.
             let roots = BTreeSet::from([candidate.root.clone()]);
             if !drains.families.contains_key(&candidate.root)
-                && state_v2::load_usage(self, Some(&roots)).is_err()
+                && state_v2::load_usage(self, &roots).is_err()
             {
                 continue;
             }

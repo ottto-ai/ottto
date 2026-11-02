@@ -1,9 +1,10 @@
 //! LD: the physical-line hook at the one reader, the per-pass lifecycle,
-//! excluded reads, K10 counters and E3's selection-identity conditions.
+//! excluded reads, counters and the selection-identity conditions.
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::codex_prelude_footprint::tests::metric;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use crate::transcript_acquisition::FileObject;
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -134,19 +135,7 @@ fn finish(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(source, &scan, &mut index);
                 return (index, scan, steps);
             }
         }
@@ -233,7 +222,7 @@ fn drive(
     }
 }
 
-/// D1/D2: every newline-complete physical line reaches the tap with its
+/// Every newline-complete physical line reaches the tap with its
 /// physical length, blank, malformed and invalid-UTF-8 lines with no value. The
 /// tap borrows the one parse that money then receives; the report and money
 /// stream are those of the untapped reader. An unterminated EOF line goes to
@@ -296,7 +285,7 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
     assert_eq!(report.invalid_utf8_line_count, 1);
 }
 
-/// D2/D3: an overlong line skipped across paused steps is delivered once,
+/// An overlong line skipped across paused steps is delivered once,
 /// at its newline, with no value and its whole physical length; money still
 /// receives the salvaged Codex envelope.
 #[test]
@@ -364,7 +353,7 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
     assert_eq!(report.over_line_cap_count, 1);
 }
 
-/// D6: a frozen-extent read withholds its unterminated record; applying it at
+/// A frozen-extent read withholds its unterminated record; applying it at
 /// an unchanged EOF reaches money only. Once its newline arrives, the next
 /// read from the sealed offset delivers it exactly once.
 #[test]
@@ -507,7 +496,7 @@ fn skip_delivers_no_lines_and_ends_once() {
     assert!(counts.get("lines").is_none() && counts.get("bytes").is_none());
 }
 
-/// D4/R5: a native comparison target is excluded at the one begin site; its
+/// A native comparison target is excluded at the one begin site; its
 /// role is final before the first dispatch.
 #[test]
 fn comparison_target_read_calls_no_observer() {
@@ -528,7 +517,7 @@ fn comparison_target_read_calls_no_observer() {
     assert_eq!(recorder.events(), Vec::new());
 }
 
-/// D4/R5: a side read is rejected by the same begin predicate.
+/// A side read is rejected by the same begin predicate.
 #[test]
 fn side_read_calls_no_observer() {
     let root = Root::new("ld-side");
@@ -557,7 +546,7 @@ fn side_read_calls_no_observer() {
     assert_eq!(recorder.events(), Vec::new());
 }
 
-/// D4/O-E1-G: Codex group member reads replay through the group job and call
+/// Codex group member reads replay through the group job and call
 /// no observer.
 #[test]
 fn codex_group_member_reads_call_no_observer() {
@@ -609,7 +598,7 @@ fn two_lines_delivered(recorder: &Recorder) -> impl Fn(&OwnedSourceScan) -> bool
     move |_| recorder.lines().len() >= 2
 }
 
-/// D6: an open file removed between steps ends once `Incomplete`, also when
+/// An open file removed between steps ends once `Incomplete`, also when
 /// the page completes in that same step.
 #[test]
 fn file_removed_mid_read_ends_incomplete() {
@@ -626,7 +615,7 @@ fn file_removed_mid_read_ends_incomplete() {
     assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
 }
 
-/// D6: a failed read ends once `Incomplete` and is counted.
+/// A failed read ends once `Incomplete` and is counted.
 #[test]
 fn failed_read_ends_incomplete_and_is_counted() {
     let root = Root::new("ld-failed");
@@ -648,7 +637,7 @@ fn failed_read_ends_incomplete_and_is_counted() {
     assert_eq!(page_counts(&rows)["line_delivery"]["test"]["incomplete"], 1);
 }
 
-/// D6: a pass dropped mid-file still ends its open file once `Incomplete`.
+/// A pass dropped mid-file still ends its open file once `Incomplete`.
 #[test]
 fn dropped_pass_ends_open_file_once_incomplete() {
     let root = Root::new("ld-dropped");
@@ -898,7 +887,7 @@ fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
     );
 }
 
-// ---- E3 condition 1: unselected counters after unchanged gate decisions ----
+// ---- unselected counters after unchanged gate decisions ----------------
 
 fn set_old(path: &Path) {
     fs::OpenOptions::new()
@@ -1080,7 +1069,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     assert_eq!(recounted, counted);
 }
 
-// ---- E3: withheld-account holds stay discoverable until they resolve ----
+// ---- withheld-account holds stay discoverable until they resolve ------
 
 /// The key holds a parsed revision withheld for an unresolved account.
 fn withhold(index: &mut ScanIndex, path: &Path) {
@@ -1821,7 +1810,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
 /// `heap_layout_bound::layout_supported()` holds (macOS on the pinned rustc).
 /// Elsewhere (Linux CI) the cache refuses retention (`retention_bound_refused`),
 /// so every read is `Full(StateMissing)`, as for the other sampled-mode tests.
-/// Never pin macOS to Full: a macOS Full here is E1's acquisition binding (W1).
+/// Never pin macOS to Full: a macOS Full here is the acquisition binding.
 fn held_growth_mode() -> DeliveryMode {
     if crate::heap_layout_bound::layout_supported() {
         DeliveryMode::Tail
@@ -1975,7 +1964,7 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     sampled_scan::set_test_now(Some(1_600));
     index.probe_absent_claude_account_deferred_holds();
     sampled_scan::set_test_now(None);
-    // Lead A round 2: "deleted held file: hold released, counted".
+    // A deleted held file: hold released, counted.
     assert_eq!(
         crate::local_resource_diagnostics::withheld_support::take_withheld()[0],
         BTreeMap::from([("deleted", 1)])
@@ -2015,7 +2004,7 @@ fn assistant_line(uuid: &str) -> Vec<u8> {
     [raw(&value), b"\n".to_vec()].concat()
 }
 
-/// [behaviour] HOLD RULE fixture (GUARDRAILS "No hold may drop a growing file"): a key
+/// [behaviour] Hold-rule fixture (no hold may drop a growing file): a key
 /// whose account stays unresolved grows over held passes, grows again and then
 /// idles past a 7-day window. The next page still discovers it, reads only the
 /// unread growth as a Tail, emits the session once, and keeps the entry and
@@ -2138,7 +2127,7 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     assert!(!after.files.contains_key(&key), "ordinary aging retires it");
 }
 
-/// [money] M3: grown held usage survives an aged in-root rename; unknown generation keeps debt.
+/// [money] Grown held usage survives an aged in-root rename; unknown generation keeps debt.
 #[test]
 #[cfg(unix)]
 fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() {
@@ -2477,7 +2466,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
     }
 }
 
-/// [behaviour] Option C (Lead A, round 2) and fixture (c): within a process a held key
+/// [behaviour] Fixture (c): within a process a held key
 /// whose content stamp and account evidence are unchanged has no parse or
 /// line delivery over many passes (bounded identity samples remain). It re-parses exactly once after an account
 /// evidence change, at most once after a restart, and as a Tail on growth;
@@ -2641,7 +2630,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     touch();
     assert_eq!(page(committed.clone(), &cache).2, Vec::new());
 
-    // SOURCE condition 1: a metadata-only touch (mtime and ctime move, the
+    // A metadata-only touch (mtime and ctime move, the
     // content does not) has no parse, aged past the window or recent.
     let touch = |modified: SystemTime| {
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -2798,7 +2787,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     withhold(&mut committed, parsed, &result);
     assert_eq!(reparses(), BTreeMap::from([("evidence", 1)]));
 
-    // SOURCE condition 2: the account binds on new evidence; that parse is
+    // The account binds on new evidence; that parse is
     // the one read, and later generations read nothing.
     fs::write(&api_sidecar, b"{}\n{}\n").unwrap();
     let (mut bound, result, reads) = page(committed, &cache);
@@ -3470,7 +3459,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         assert!(crate::snapshot_sync::withheld_support::withheld_settled(
             &removed
         ));
-        // SOURCE N3 applies equally to the NO-HINT healthy-census path:
+        // This applies equally to the NO-HINT healthy-census path:
         // removal discharges only the now-unfulfillable debt, never incidence
         // custody or an entity ACK. Completed settlement remains unblocked.
         assert_eq!(

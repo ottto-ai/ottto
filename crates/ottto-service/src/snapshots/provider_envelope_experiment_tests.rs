@@ -482,7 +482,7 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to native grains.
 
     let mut fixture = NativePreparationFixture::new();
     fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(
@@ -664,7 +664,7 @@ fn native_recovery_priority_scan(
     limit: usize,
     paths: &[PathBuf],
 ) -> OwnedSourceScan {
-    OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+    OwnedSourceScan::new_selecting(
         SnapshotSource::ClaudeCode,
         &fixture.roots,
         index,
@@ -677,6 +677,7 @@ fn native_recovery_priority_scan(
         false,
         false,
         paths,
+        None,
     )
 }
 
@@ -2596,7 +2597,7 @@ fn native_comparison_fallback_marks_name_unattributed() {
     );
 }
 
-/// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
+/// A selected restore (#588) reverts the withheld key
 /// to `previous` and REMOVES its request-census record. No record of the
 /// withheld revision, and none restored from `previous`, survives.
 #[test]
@@ -2940,7 +2941,7 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
@@ -2962,7 +2963,7 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",

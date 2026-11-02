@@ -1,5 +1,5 @@
 //! Native EOF consumer contracts. Disk tests here use this writer, not a
-//! substitute for E1's required pinned old-writer transition fixture.
+//! substitute for the required pinned old-writer transition fixture.
 use super::*;
 use crate::snapshots::codex_version::CodexVersionFeed;
 
