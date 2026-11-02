@@ -11801,7 +11801,7 @@ fn update_detected_uses_cache(
 
 /// Read the persisted detected-uses cache, or an empty list when it is missing
 /// or unreadable (a fresh machine, or a malformed file we simply rebuild).
-fn detected_uses_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+pub(crate) fn detected_uses_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("detected_uses")
         .join(format!("{}.json", source.api_slug()))
@@ -11835,6 +11835,14 @@ fn upload_agent_status(
     persist_machine_icon(&response);
     crate::net_resilience::note_upstream_upload_succeeded("agent_status");
     Ok(response.accepted as usize)
+}
+
+pub(crate) fn snapshot_source_of_kind(kind: &SourceKind) -> SnapshotSource {
+    match kind {
+        SourceKind::Codex => SnapshotSource::Codex,
+        SourceKind::ClaudeCode => SnapshotSource::ClaudeCode,
+        SourceKind::Pi => SnapshotSource::Pi,
+    }
 }
 
 fn source_kind(source: SnapshotSource) -> SourceKind {
@@ -12607,13 +12615,12 @@ pub(crate) fn disable_sources_dropped_from_grant(
         .try_for_each(|source| disable_snapshot_source(support_dir, source))
 }
 
-/// One attempt per owed source, under the cycle lock. Returns the worst count of
-/// consecutive failures. Errors can name paths, so only counts are logged.
+/// One attempt per owed source, under the cycle lock. Errors can name paths, so
+/// only counts are logged.
 pub(crate) fn erase_disabled_sources(
     support_dir: &Path,
     cache: &crate::snapshots::sampled_scan::SharedCache,
-) -> u32 {
-    let mut worst = 0;
+) {
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
         let state = source_marker(support_dir, source);
@@ -12643,12 +12650,16 @@ pub(crate) fn erase_disabled_sources(
         });
         let failures = turn.entry(marker).or_default();
         *failures = if erased.is_ok() { 0 } else { *failures + 1 };
-        worst = worst.max(*failures);
         if *failures > 3 {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
-    worst
+}
+
+#[cfg(test)]
+pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
+    let marker = source_marker_path(support_dir, source);
+    source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
 fn erase_source_files(

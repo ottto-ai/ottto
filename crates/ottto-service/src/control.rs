@@ -4443,11 +4443,7 @@ fn scan_index_rebuild_override_repair(
     if *authorization != RequestAuthorization::TrustedCompanionApp {
         return None;
     }
-    let snapshot_source = match source {
-        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
-    };
+    let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(source);
     let outcome = crate::snapshots::arm_scan_index_rebuild_manual_override(
         snapshot_source,
         SystemTime::now(),
@@ -6871,7 +6867,7 @@ fn clear_pending_device_credential(
     Ok(())
 }
 
-fn promote_pending_device_credential_with_stores(
+pub(crate) fn promote_pending_device_credential_with_stores(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
     pending_store: &FilePendingDeviceCredentialStore,
@@ -9575,12 +9571,11 @@ fn set_source_marker(
     write: fn(&Path, crate::snapshots::SnapshotSource) -> anyhow::Result<()>,
     source: &SourceKind,
 ) -> Result<(), LocalApiError> {
-    let source = match source {
-        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
-    };
-    write(&default_support_dir(), source).map_err(|_| LocalApiError::StatePoisoned)
+    write(
+        &default_support_dir(),
+        crate::snapshot_sync::snapshot_source_of_kind(source),
+    )
+    .map_err(|_| LocalApiError::StatePoisoned)
 }
 
 fn setup_answer(

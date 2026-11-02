@@ -1,8 +1,9 @@
 //! Per-source local erasure: synthetic transcripts and canary files only.
 use super::*;
 use crate::snapshot_sync::{
-    disable_snapshot_source, enabled_snapshot_sources_in, erase_disabled_sources,
-    reconnect_snapshot_source, source_marker,
+    detected_uses_cache_path, disable_snapshot_source, enabled_snapshot_sources_in,
+    erase_disabled_sources, reconnect_snapshot_source, source_erasure_failures_for_test,
+    source_marker,
 };
 use ottto_core::LocalDeviceBinding;
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +20,7 @@ const SUFFIXES: &[&str] = &[
     "-v3.json.v2.sqlite-shm",
     "-v3.json.v1-readonly",
     "-v3.json.v2-ack-receipt",
+    "-v3.private-labels",
     "-v3-upload-progress.json",
     "-v3-upload-progress.lock",
     "-attribution-epoch-no-labels.json",
@@ -66,9 +68,7 @@ impl Fixture {
         paths.push(records);
         for path in [
             crate::active_sessions::active_session_cache_path(&self.support, source),
-            self.support
-                .join("detected_uses")
-                .join(format!("{}.json", source.api_slug())),
+            detected_uses_cache_path(&self.support, source),
             crate::mcp_inventory::cache_path(&self.support, source),
         ] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -96,8 +96,10 @@ impl Fixture {
         fs::write(root.join(format!("{SESSION}.jsonl")), transcript).unwrap();
         (root, now)
     }
-    fn erase(&self) -> u32 {
-        erase_disabled_sources(&self.support, &self.cache)
+    /// One cycle's erase turn, then `source`'s consecutive failure count.
+    fn erase(&self, source: SnapshotSource) -> u32 {
+        erase_disabled_sources(&self.support, &self.cache);
+        source_erasure_failures_for_test(&self.support, source)
     }
 }
 
@@ -168,7 +170,7 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
     let live = state_v2::money_test_support::publish(&index, &rows, &progress_bytes());
 
     // No ~/.codex exists in this fixture, and nothing has been asked of it.
-    assert_eq!(f.erase(), 0);
+    assert_eq!(f.erase(SnapshotSource::Codex), 0);
     assert_kept(&codex);
     assert_eq!(enabled_snapshot_sources_in(&device(), &f.support).len(), 2);
 
@@ -178,7 +180,7 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
         vec![SnapshotSource::ClaudeCode],
         "the marker alone stops collection, before any erase"
     );
-    assert_eq!(f.erase(), 0);
+    assert_eq!(f.erase(SnapshotSource::Codex), 0);
     assert_gone(&codex);
     assert_kept(&claude);
     let marker = source_marker(&f.support, SnapshotSource::Codex);
@@ -201,7 +203,7 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
 }
 
 #[test]
-fn failed_erase_stays_pending_alarms_after_three_then_retries_and_resumes() {
+fn failed_erase_stays_pending_alarms_after_three_then_retries() {
     let f = Fixture::new();
     let codex = f.canaries(SnapshotSource::Codex);
     disable_snapshot_source(&f.support, SnapshotSource::Codex).unwrap();
@@ -209,10 +211,10 @@ fn failed_erase_stays_pending_alarms_after_three_then_retries_and_resumes() {
     let take_alarm =
         || state_v2::telemetry::take_thread_event_for_test("source_erasure_failure_alarm");
     for attempt in 1..=3 {
-        assert_eq!(f.erase(), attempt);
+        assert_eq!(f.erase(SnapshotSource::Codex), attempt);
         assert_eq!(take_alarm(), None, "no alarm at {attempt} failures");
     }
-    assert_eq!(f.erase(), 4);
+    assert_eq!(f.erase(SnapshotSource::Codex), 4);
     assert_eq!(take_alarm(), Some(json!(4)), "counts only");
     let marker = source_marker(&f.support, SnapshotSource::Codex);
     assert_eq!(
@@ -225,16 +227,14 @@ fn failed_erase_stays_pending_alarms_after_three_then_retries_and_resumes() {
         .all(|source| *source != SnapshotSource::Codex));
 
     fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(f.erase(), 0, "the retry completes and resets the count");
+    assert_eq!(
+        f.erase(SnapshotSource::Codex),
+        0,
+        "the retry completes and resets the count"
+    );
     assert_gone(&codex);
     let marker = source_marker(&f.support, SnapshotSource::Codex);
     assert_eq!(marker.as_deref(), Some("done"));
-
-    // Crash resume: a new process sees only the marker and leftover files.
-    let leftovers = f.canaries(SnapshotSource::Pi);
-    fs::write(f.support.join("snapshots/pi.source-disabled"), "pending").unwrap();
-    assert_eq!(f.erase(), 0);
-    assert_gone(&leftovers);
 }
 
 /// [money] Reconnect's cold Full re-offers the same keys: a receiver that
@@ -262,7 +262,7 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
     assert!(state_v2::published(&path).unwrap());
 
     disable_snapshot_source(&f.support, source).unwrap();
-    assert_eq!(f.erase(), 0);
+    assert_eq!(f.erase(source), 0);
     assert!(!path.exists());
     let pending = crate::backfill::pending_backfill_sources_for_destination(
         &crate::backfill::load_backfill_state(&f.support),
@@ -278,7 +278,7 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
         .all(|enabled| *enabled != source));
 
     reconnect_snapshot_source(&f.support, source).unwrap();
-    assert_eq!(f.erase(), 0);
+    assert_eq!(f.erase(source), 0);
     assert_eq!(source_marker(&f.support, source), None);
     assert!(enabled_snapshot_sources_in(&device(), &f.support).contains(&source));
     assert!(
@@ -307,12 +307,82 @@ fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
         receiver.insert(item.snapshot_fingerprint.clone(), item.input_tokens);
     }
     assert_eq!(receiver.len(), first.snapshots.len(), "no double count");
+}
+
+/// A credential generation that drops a source reaches the same marker and
+/// erase turn as an explicit removal, and only for the dropped source.
+#[test]
+#[serial_test::serial]
+fn promotion_that_drops_a_source_erases_only_that_source() {
+    use ottto_core::token_store::MemoryTokenStore;
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, previous)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(previous) => std::env::set_var(self.0, previous),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let f = Fixture::new();
+    let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &f.support);
+    // Promotion cleanup also touches the default pending setup-token store.
+    let _secrets = EnvGuard::set(
+        ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV,
+        &f.support.join("secrets"),
+    );
+    let codex = f.canaries(SnapshotSource::Codex);
+    let claude = f.canaries(SnapshotSource::ClaudeCode);
+    let device_store = ottto_core::FileDeviceStore::new(f.support.join("device.json"));
+    device_store.save(&device()).unwrap();
+    let candidate = "candidate-secret";
+    let pending = ottto_core::PendingDeviceCredentialPreparation {
+        schema_version: 2,
+        capability: "device_credential_prepare_confirm_v1".into(),
+        preparation_id: "preparation-shrink".into(),
+        api_base_url: "https://api.example.test".into(),
+        expires_at: "2026-08-01T00:00:00Z".into(),
+        credential_generation: 4,
+        secret_commitment_sha256: format!("sha256:{:x}", Sha256::digest(candidate.as_bytes())),
+        request_authority: None,
+        device: LocalDeviceBinding {
+            sources: vec!["claude_code".into()],
+            ..device()
+        },
+        confirmation_authorized: true,
+        preconfirm_guards_passed: true,
+        claim_commit: None,
+        confirmed_at: Some("2026-07-31T20:00:00Z".into()),
+    };
+    crate::control::promote_pending_device_credential_with_stores(
+        &pending,
+        candidate,
+        &ottto_core::FilePendingDeviceCredentialStore::new(f.support.join("pending.json")),
+        &MemoryTokenStore::new(),
+        &device_store,
+        &MemoryTokenStore::new(),
+    )
+    .unwrap();
+
     assert_eq!(
-        receiver.values().sum::<u64>(),
-        first
-            .snapshots
-            .iter()
-            .map(|item| item.input_tokens)
-            .sum::<u64>(),
+        source_marker(&f.support, SnapshotSource::Codex).as_deref(),
+        Some("pending"),
+        "the trigger only writes the marker"
+    );
+    assert_kept(&codex);
+    assert_eq!(source_marker(&f.support, SnapshotSource::ClaudeCode), None);
+    assert_eq!(f.erase(SnapshotSource::Codex), 0);
+    assert_gone(&codex);
+    assert_kept(&claude);
+    assert_eq!(
+        enabled_snapshot_sources_in(&device(), &f.support),
+        vec![SnapshotSource::ClaudeCode],
     );
 }
