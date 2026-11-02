@@ -79,3 +79,53 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
         assert_eq!(actual, control, "{shape}: every row value commitment");
     }
 }
+
+/// [regress] A v1 original holding Codex archive custody imports: presence keeps
+/// the pre-archive inventory, the rows carry both fields and hydrate equal.
+#[test]
+fn import_carries_archive_custody_from_a_v1_original() {
+    let mut archives = BTreeMap::new();
+    archives.insert(
+        "/synthetic/archived/a.jsonl.zst".to_string(),
+        crate::snapshots::codex_compressed_input::ArchiveEvidence::unknown(),
+    );
+    let c = Corpus::new();
+    let value = serde_json::json!({
+        "schema_version": 2, "generation": 0, "upload_context_fingerprint": null,
+        "files": {}, "archives": archives, "archive_deferred_alarm_count": 2
+    });
+    ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&value).unwrap())
+        .unwrap();
+    let original = Original::read(&c.path).unwrap();
+    assert!(!original.presence.contains_key("archives"));
+    assert!(!original
+        .presence
+        .contains_key("archive_deferred_alarm_count"));
+    let index = ScanIndex::load(&c.path).unwrap();
+    assert_eq!(index.archives.len(), 1);
+    let mut db =
+        sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
+    db.control(
+        "identity",
+        &Identity {
+            format: FORMAT,
+            db_id: "synthetic-archive-import".into(),
+            binding: c.binding(),
+            fence_generation: index.generation + 1,
+        },
+    )
+    .unwrap();
+    db.control("generation", &index.generation).unwrap();
+    import_graph(&mut db, &index, Some(&original)).unwrap();
+    let presence: BTreeMap<String, bool> = db.read_control("field_presence").unwrap().unwrap();
+    assert_eq!(presence.get("archives"), Some(&true));
+    assert_eq!(presence.get("archive_deferred_alarm_count"), Some(&true));
+    let (restored, _) = hydrate_context(&mut db).unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.archives).unwrap(),
+        serde_json::to_value(&index.archives).unwrap()
+    );
+    assert_eq!(restored.archive_deferred_alarm_count, 2);
+}

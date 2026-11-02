@@ -350,6 +350,12 @@ impl<'de> serde::de::Visitor<'de> for Presence {
             .map(|f| ((*f).into(), false))
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
+            if !claude_original_field(&name) {
+                // Codex archive custody records its presence when its rows are
+                // written (kinds_misc::ARCHIVE_KINDS); the original never does.
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
             let present = fields
                 .get_mut(&name)
                 .ok_or_else(|| serde::de::Error::custom("unknown original field"))?;
