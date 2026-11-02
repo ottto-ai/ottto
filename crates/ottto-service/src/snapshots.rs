@@ -28203,40 +28203,17 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         self.index.archive_pass.started = false;
-        let archive_cpu = (!self.index.archives.is_empty())
-            .then(crate::context_composition::thread_cpu_micros)
-            .flatten();
-        let archive_wall = archive_cpu.map(|_| std::time::Instant::now());
+        let archive_wall = (!self.index.archives.is_empty()).then(std::time::Instant::now);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
-        if let Some(cpu) = archive_cpu
-            .and_then(|start| {
-                crate::context_composition::thread_cpu_micros().map(|end| (start, end))
-            })
-            .map(|(a, b)| b.saturating_sub(a))
-        {
-            match &mut result {
-                Ok(OwnedSourceScanStep::Pending(s)) if s.index.archive_pass.started => {
-                    s.index.archive_pass.cpu = s.index.archive_pass.cpu.saturating_add(cpu);
-                    s.index.archive_pass.work =
-                        s.index
-                            .archive_pass
-                            .work
-                            .saturating_add(archive_wall.map_or(0, |t| {
-                                t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
-                            }));
-                }
-                Ok(OwnedSourceScanStep::Complete { index, .. }) if index.archive_pass.started => {
-                    index.archive_pass.cpu = index.archive_pass.cpu.saturating_add(cpu);
-                    index.archive_pass.work =
-                        index
-                            .archive_pass
-                            .work
-                            .saturating_add(archive_wall.map_or(0, |t| {
-                                t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
-                            }));
-                }
-                _ => {}
-            }
+        let pass = match &mut result {
+            Ok(OwnedSourceScanStep::Pending(scan)) => Some(&mut scan.index.archive_pass),
+            Ok(OwnedSourceScanStep::Complete { index, .. }) => Some(&mut index.archive_pass),
+            Err(_) => None,
+        };
+        if let Some(pass) = pass.filter(|pass| pass.started) {
+            pass.work = pass.work.saturating_add(archive_wall.map_or(0, |start| {
+                start.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+            }));
         }
         match &result {
             Ok(OwnedSourceScanStep::Pending(scan)) => state_v2::telemetry::acquired(&scan.index),
@@ -33847,7 +33824,6 @@ impl OwnedSourceScan {
                                 a.stamp.as_ref().is_some_and(|old| old.same_content(&stamp))
                             })
                 }) {
-                    index.archive_transition(&candidate.path, ArchiveTransition::Quiet);
                     pending!();
                 }
                 // Identity samples are archive reads too: only the funded,
@@ -33951,14 +33927,7 @@ impl OwnedSourceScan {
             else {
                 if archive_candidate {
                     let path = Path::new(&rescue_key);
-                    let change = if fs::symlink_metadata(path)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        ArchiveTransition::Gone
-                    } else {
-                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                    };
-                    index.archive_transition(path, change);
+                    index.archive_io_error(path, fs::symlink_metadata(path).err().as_ref());
                 }
                 if verification_rescue {
                     sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
@@ -34370,16 +34339,14 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
                 index.archive_pass.started = true;
-                match index.archive_admit(
+                if !index.archive_admit(
                     &candidate,
                     &opened_file,
                     codex_join_inventory.as_ref(),
                     &codex_page,
                     codex_parent_ownership_ledgers.as_ref(),
                 ) {
-                    codex_archive_catchup::Admission::Read => {}
-                    codex_archive_catchup::Admission::Quiet => pending!(),
-                    codex_archive_catchup::Admission::Held => pending!(),
+                    pending!();
                 }
             }
             let decision = if codex_archive_path(&candidate.path) {
@@ -46455,7 +46422,7 @@ fn codex_fresh_data_pending(
 }
 
 // One boundary for fresh, persisted and held work. Admission is scheduling only:
-// archive decoding still requires live power, CPU/byte budget and a funded reader.
+// archive decoding still requires live power, work/byte budget and a funded reader.
 fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("jsonl")
         || (source == SnapshotSource::Codex && codex_archive_path(path))
@@ -47264,14 +47231,7 @@ fn advance_bounded_directory_traversal_with_budget(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    index.archive_transition(
-                        &path,
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            ArchiveTransition::Gone
-                        } else {
-                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                        },
-                    );
+                    index.archive_io_error(&path, Some(&error));
                     continue;
                 }
                 Err(_) => {
@@ -47310,14 +47270,7 @@ fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    index.archive_transition(
-                        &path,
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            ArchiveTransition::Gone
-                        } else {
-                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                        },
-                    );
+                    index.archive_io_error(&path, Some(&error));
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -47622,14 +47575,9 @@ fn candidate_from_traversal_path_at(
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if source == SnapshotSource::Codex && codex_archive_path(&pending.path) => {
-            discovery.index.archive_transition(
-                &pending.path,
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ArchiveTransition::Gone
-                } else {
-                    ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                },
-            );
+            discovery
+                .index
+                .archive_io_error(&pending.path, Some(&error));
             return None;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -81053,7 +81001,6 @@ mod tests {
                     // Reproduce the permitting macOS gate on every platform;
                     // no cache or reservation-save owner exists on this route.
                     state.index.archive_pass.power = true;
-                    state.index.archive_pass.cpu = 0;
                     match state.step(None) {
                         OwnedSourceScanStep::Pending(next) => state = next,
                         OwnedSourceScanStep::Complete {
@@ -81164,7 +81111,6 @@ mod tests {
                 let mut completed = None;
                 for _ in 0..256 {
                     state.index.archive_pass.power = true;
-                    state.index.archive_pass.cpu = 0;
                     match state.step(None) {
                         OwnedSourceScanStep::Pending(next) => state = next,
                         OwnedSourceScanStep::Complete { index: next, .. } => {
