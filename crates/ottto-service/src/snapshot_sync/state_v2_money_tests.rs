@@ -748,3 +748,8 @@ cold_rows! {
     v2_cold_side_without_owner_places_money_identically => "side_without_owner",
     v2_cold_side_owner_directory_unlisted_places_money_identically => "side_owner_directory_unlisted",
 }
+
+#[cfg(unix)]
+mod web_disable_replay_tests {
+    include!("web_disable_replay_tests.rs");
+}

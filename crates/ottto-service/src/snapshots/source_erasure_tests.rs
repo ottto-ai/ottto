@@ -386,3 +386,5 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
         vec![SnapshotSource::ClaudeCode],
     );
 }
+
+mod source_control_tests;

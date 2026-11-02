@@ -132,6 +132,10 @@ pub struct BackfillState {
     /// Never automatically cleared by a claim, index rebuild or census.
     #[serde(default, skip_serializing_if = "ClaudeHistoryListIntent::is_absent")]
     pub(crate) claude_history_list_intent: ClaudeHistoryListIntent,
+    /// Last applied web source-control revision per source slug, with the
+    /// device it was issued for: `[device_id, revision]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) source_control_revisions: BTreeMap<String, (String, u64)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

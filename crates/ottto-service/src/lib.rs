@@ -3450,6 +3450,7 @@ fn local_health_capabilities(status: &DaemonStatus) -> Vec<String> {
         "service.reconcile".to_string(),
         "source.remove".to_string(),
         "backfill.v1".to_string(),
+        crate::snapshot_sync::source_control::CAPABILITY.to_string(),
     ];
     for source in &status.sources {
         capabilities.push(format!("verify.{}", source_slug(&source.source)));

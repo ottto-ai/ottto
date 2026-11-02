@@ -59,6 +59,7 @@ pub(crate) mod continuation;
 mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
+pub(crate) mod source_control;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -4996,9 +4997,9 @@ fn sync_once_with_retry(
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
-    let enabled_sources = enabled_snapshot_sources(&device);
 
-    if let Some(source) = enabled_sources.first().copied() {
+    // Web disable/install arrives on this heartbeat: apply it before selection.
+    if let Some(source) = source_control::transport_source(&device) {
         if let Err(error) = upload_local_health_projection_reporting(
             &client,
             &device,
@@ -5013,6 +5014,7 @@ fn sync_once_with_retry(
             );
         }
     }
+    let enabled_sources = enabled_snapshot_sources(&device);
 
     // Cycle-start scan receipts: one cheap non-terminal status per enabled
     // source before any scanning. Sources late in the sequential cycle would
@@ -5461,7 +5463,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
+    let Some(source) = source_control::transport_source(&device) else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
     let client = SnapshotApiClient::new(snapshot_api_base_url()?);
@@ -5792,7 +5794,11 @@ fn upload_local_health_projection_with(
         .as_ref()
         .ok_or_else(|| anyhow!("canonical local health projection is missing"))?;
 
-    client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    let response = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    if source_control::apply(&default_support_dir(), &device.device_id, &response) {
+        // The existing serialized cycle erases or reconnects; never this thread.
+        let _ = spawn_one_shot_local_snapshot_sync(daemon.clone());
+    }
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
