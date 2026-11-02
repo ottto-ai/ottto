@@ -96,14 +96,7 @@ impl Hold {
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
-        } else if error.chain().any(|e| {
-            matches!(
-                e.to_string().as_str(),
-                "state_v2_save_ceiling"
-                    | "state_v2_path_diff_admission"
-                    | "state_v2_value_admission"
-            )
-        }) {
+        } else if Self::ceiling_cause(&error).is_some() {
             Self::SaveCeiling
         } else if error
             .chain()
@@ -128,6 +121,15 @@ impl Hold {
         };
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
+    }
+    /// Content-free cause of save pressure: the charged-work ceiling or one
+    /// logical row over its value cap. Both hold as `SaveCeiling`.
+    fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
+        error.chain().find_map(|e| match e.to_string().as_str() {
+            "state_v2_save_ceiling" => Some("charged_work"),
+            "state_v2_value_admission" => Some("value_admission"),
+            _ => None,
+        })
     }
 }
 struct RouteState {
@@ -660,6 +662,7 @@ fn with_save_session<T>(
 ) -> Result<Option<T>> {
     let binding = binding_for(path)?;
     let mut stale_graph = false;
+    let mut ceiling = None;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = runtime else {
@@ -682,7 +685,11 @@ fn with_save_session<T>(
             stale_graph = true;
             bail!(Hold::ReloadRequired);
         }
-        write(state, session, identity).map(Some)
+        let written = write(state, session, identity);
+        if let Err(error) = &written {
+            ceiling = Hold::ceiling_cause(error).map(|c| (c, session.db.refused_save_bytes()));
+        }
+        written.map(Some)
     }));
     if let Err(error) = &result {
         if stale_graph {
@@ -691,6 +698,13 @@ fn with_save_session<T>(
         with_state(path, |state| {
             state.save_digests = None;
             state.save_retry_completed = false;
+            if let (Some(Hold::SaveCeiling), Some((cause, bytes))) =
+                (error.downcast_ref::<Hold>(), ceiling)
+            {
+                // A save-pressure hold is never silent: alarm with its fixed cause.
+                telemetry::event("save_ceiling_alarm", &bytes);
+                telemetry::event("save_ceiling_cause", &cause);
+            }
             if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
                 && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
             {
@@ -1287,11 +1301,159 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
     Ok(())
 }
 
+/// Store-only rows of one kind, read on the graph's own session in one short
+/// read transaction. `Some`: those families' rows by key (a missing row is no
+/// callback). `None`: the whole kind, complete by its manifest count. Each
+/// value comes with its row digest as stored. A graph not at the generation
+/// its save would commit over (its own, or its confirmed growth claim's),
+/// or a store changed elsewhere, holds.
+pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
+    index: &ScanIndex,
+    kind: &str,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
+) -> Result<()> {
+    // The save path's rule: a claim-only growth save in this pass moved the
+    // store past the working graph. Authenticate before the session lock.
+    let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
+    let generation = super::super::sampled_audit::own_growth_claim_generation(index, &path)
+        .unwrap_or(index.generation);
+    let runtime = index
+        .v2()
+        .persistence_v2
+        .as_ref()
+        .ok_or(Hold::DbUnavailable)?;
+    let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+    let session = guard.as_mut().ok_or(Hold::DbUnavailable)?;
+    ensure!(
+        !session.reload && !session.db.reload_required(),
+        Hold::DbUnavailable
+    );
+    let stamp = session.db.stamp()?;
+    ensure!(
+        stamp == session.stamp && generation == stamp.0,
+        Hold::DbUnavailable
+    );
+    let mut tx = session.db.begin(TxnMode::Read)?;
+    let expected = match roots {
+        Some(_) => None,
+        None => {
+            let h = tx
+                .get(&mapper::key(kind, "", 0)?)?
+                .context("state_v2_missing_manifest")?;
+            Some(mapper::read::<usize>(&mut tx, &h, None)?)
+        }
+    };
+    let mut count = 0_usize;
+    mapper::visit(&mut tx, kind, roots, |tx, h| {
+        let RowKey::Record {
+            key_bytes,
+            position,
+            ..
+        } = &h.key
+        else {
+            bail!("state_v2_record_key")
+        };
+        if *position == 0 {
+            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+            return Ok(());
+        }
+        ensure!(*position == 1, "state_v2_member_position");
+        count += 1;
+        let mut digests = mapper::Digests::new();
+        let value = mapper::read(tx, &h, Some(&mut digests))?;
+        let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
+        f(mapper::family(key_bytes)?, value, digest)
+    })?;
+    ensure!(
+        expected.map_or(true, |expected| expected == count),
+        "state_v2_missing_member"
+    );
+    Ok(())
+}
+
+/// Cold usage pending: load the families a page names before it
+/// accumulates (`Some`), or every family before a decision that joins them
+/// (`None`). A missing, changed or unreadable row, or a store this graph does
+/// not hold, is Unknown and the caller refuses its whole decision. Counted.
+/// Rows install one at a time, only after every wanted row was read: a later
+/// digest mismatch can leave earlier verified rows installed while the caller
+/// still refuses the whole decision.
+pub(in super::super) fn load_usage(
+    index: &mut ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    if usage.cold().is_none() {
+        return Ok(());
+    }
+    let wanted = match roots {
+        Some(roots) => {
+            let wanted = usage.unloaded(roots.iter().map(String::as_str));
+            if wanted.is_empty() {
+                return Ok(());
+            }
+            Some(wanted)
+        }
+        None if usage.all().is_ok() => return Ok(()),
+        None => None,
+    };
+    let result = (|| -> Result<()> {
+        let mut read = Vec::new();
+        read_cold(
+            index,
+            "usage.pending",
+            wanted.as_ref(),
+            &mut |root, value, digest| {
+                read.push((root, value, digest));
+                Ok(())
+            },
+        )?;
+        // Every wanted row must have been read before any is installed.
+        if let Some(wanted) = &wanted {
+            let read: std::collections::BTreeSet<&String> =
+                read.iter().map(|(root, _, _)| root).collect();
+            ensure!(
+                wanted.iter().all(|root| read.contains(root)),
+                super::super::usage_pending::Unknown
+            );
+        }
+        let cold = index
+            .claude_usage_family_pending
+            .cold_mut()
+            .ok_or(Hold::DbUnavailable)?;
+        for (root, value, digest) in read {
+            cold.install(root, value, digest)?;
+        }
+        if wanted.is_none() {
+            cold.complete()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        telemetry::count("usage_pending_unknown", 1);
+    }
+    result
+}
+
+/// End a decision that loaded every cold usage family: values unchanged
+/// since their row was read return to heads, except the `keep` families.
+pub(in super::super) fn settle_usage(
+    index: &mut ScanIndex,
+    keep: &std::collections::BTreeSet<String>,
+) {
+    if let Some(cold) = index.claude_usage_family_pending.cold_mut() {
+        cold.settle(keep, |family| mapper::digest(family).ok());
+    }
+}
+
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::erase_published;
+pub(in super::super) use tests::{
+    delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
+};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]

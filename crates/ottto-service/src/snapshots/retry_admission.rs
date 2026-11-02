@@ -186,10 +186,10 @@ fn claude_retry_singleton_storage_only_scoped(
     root: &str,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
-    let Some(pending) = index.claude_usage_family_pending.get(root) else {
+    let Some(pending) = index.claude_usage_family_pending.view(root) else {
         return false;
     };
-    if pending.invalid
+    if pending.invalid()
         || index.claude_usage_authority_quarantine.contains_key(root)
         || index.decode_holds_family(root)
     {
@@ -247,11 +247,7 @@ fn claude_retry_singleton_storage_only_scoped(
             return false;
         }
         let upper = page[len - 1].expect("last slot").0;
-        for name in pending
-            .member_request_id_hashes
-            .keys()
-            .chain(pending.member_occurrences.keys())
-        {
+        for name in pending.hash_members().chain(pending.occurrence_members()) {
             let Some(member) = ClaudeIndexPathMemberRef::of_family_member(root, name) else {
                 return false;
             };
@@ -267,7 +263,7 @@ fn claude_retry_singleton_storage_only_scoped(
         }
         after = Some(upper);
     }
-    represented == pending.member_request_id_hashes.len() + pending.member_occurrences.len()
+    represented == pending.hash_member_count() + pending.occurrence_members().count()
 }
 
 // The due arm of retry admission: an unfinished due walk, a path after the

@@ -66,6 +66,8 @@ pub(in super::super) struct MaintenanceStats {
     cache_used_bytes: Option<u64>,
     db_bytes: Option<u64>,
     pub(super) encoded_bytes_per_save: u64,
+    #[serde(skip)]
+    pub(super) refused_save_bytes: u64,
     pub(super) dirty_rows_per_save: u64,
     pub(super) max_value_bytes: u64,
     pub(super) record_rows: u64,
