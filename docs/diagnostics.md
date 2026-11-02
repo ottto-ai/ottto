@@ -1694,9 +1694,10 @@ line and no path or session id, and it never affects money.
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
-`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
-saturating process-lifetime counter for that cause. These count refused attempts,
-not distinct sessions, decoded bytes or money. No path or session id is included.
+`counts.codex_zst_refused{cause}`: a sparse map of the non-zero, saturating
+process-lifetime counters. One line is flushed per Codex pass, only when the
+counters changed since the last flush. These count refused attempts, not distinct
+sessions, decoded bytes or money. No path or session id is included.
 
 | Cause | Unsupported boundary |
 | --- | --- |
@@ -1719,11 +1720,16 @@ usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
-retained → cursor before taking the durable Stores leaf lock. It keeps an
+retained → cursor before taking the durable Stores leaf lock. It keeps a
 fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
-for primary Tail reads; admission never evicts or charges retained bytes twice.
+for primary Tail reads and never charges retained bytes twice. When free room is
+short and the claim can fit beside the whole cursor state, it reclaims optional
+header facts, then releases retained copies, counted in
+`cursor_reservation_entries_evicted`. It never drops a suspended proof, join
+owner, witness or durable owed state. A released copy can mean one more existing
+`state_missing` Full. `decoder_refused_header_occupancy` is no longer counted.
 Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
-A short reservation or busy singleton yields `None`, counts
+A claim that cannot fit evicts nothing. It or a busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
