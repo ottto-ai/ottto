@@ -167,23 +167,52 @@ pub(super) struct PiDriver {
     /// route would restore an earlier route's record.
     committed: Records,
     restarts: usize,
+    /// Custody of an index published to state v2; dropping it erases it.
+    custody: Option<crate::snapshots::StateV2ColdSession>,
 }
 impl PiDriver {
     pub(super) fn warm(name: &str, initial: &str) -> Self {
         let c = corpus(name);
         let disk = Disk::new(&c);
-        Self::warm_in(c, disk, initial)
+        Self::warm_in(c, disk, initial, None)
+    }
+
+    /// The same warm owner on an index published to state v2: every save and
+    /// reload goes through the store, and a restart reads it in place.
+    pub(super) fn warm_v2(name: &str, initial: &str) -> Self {
+        let mut c = corpus(name);
+        // Custody, record store and writer lock share one canonical prefix.
+        c.base = c.base.canonicalize().unwrap();
+        c.root = c.base.join("projects");
+        c.support = c.base.join("support");
+        let mut disk = Disk::new(&c);
+        let (custody, start) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Pi,
+            &ScanIndex::default(),
+            &disk.dir,
+        );
+        disk.index = custody.path().to_owned();
+        Self::warm_in(c, disk, initial, Some((custody, start)))
     }
 
     /// The warm owner reads Full and commits; its native receipt is the
     /// record every later route restores.
-    fn warm_in(c: Corpus, disk: Disk, initial: &str) -> Self {
+    fn warm_in(
+        c: Corpus,
+        disk: Disk,
+        initial: &str,
+        v2: Option<(crate::snapshots::StateV2ColdSession, ScanIndex)>,
+    ) -> Self {
+        let (custody, start) = match v2 {
+            Some((custody, start)) => (Some(custody), start),
+            None => (None, ScanIndex::default()),
+        };
         let path = c.root.join("session.jsonl");
         std::fs::write(&path, initial).unwrap();
         input_clock(&path);
         let ram = E2ScanFixture::default();
         disk.begin(&ram, SOURCE);
-        let (warm, mut index, accepted) = pi_route(&c, &ram, ScanIndex::default(), Mode::ColdFull);
+        let (warm, mut index, accepted) = pi_route(&c, &ram, start, Mode::ColdFull);
         assert_eq!(warm.modes, (1, 0, 0));
         assert_eq!(warm.snapshots.len(), 1, "one synthetic Pi session");
         let entity = warm.snapshots.keys().next().unwrap().clone();
@@ -202,6 +231,7 @@ impl PiDriver {
             pages: BTreeMap::new(),
             committed,
             restarts: 0,
+            custody,
         }
     }
 
@@ -302,7 +332,14 @@ impl TransitionDriver for PiDriver {
                 &fresh
             }
             Mode::DiskRestore | Mode::Restart => {
-                fresh = self.disk.owner(SOURCE);
+                fresh = if self.custody.is_some() {
+                    // The v2 store is the committed index: no restart fork.
+                    let owner = E2ScanFixture::default();
+                    self.disk.begin(&owner, SOURCE);
+                    owner
+                } else {
+                    self.disk.owner(SOURCE)
+                };
                 &fresh
             }
         };
@@ -837,6 +874,7 @@ fn pi_mixed_with_claude_keeps_each_source_cold_equivalent() {
                 index: disk.dir.join("pi-scan-index.json"),
             },
             &pi_seed(),
+            None,
         );
         assert_eq!((disk.records(), f.disk.records()), (1, 1));
         let claude_record = disk.record_bytes();
@@ -901,6 +939,23 @@ fn pi_mixed_with_claude_keeps_each_source_cold_equivalent() {
             held = false;
         }
     });
+}
+
+/// [money] Pi-ON: the shared two-restart row on an index published to state
+/// v2. Cold Full, Tail and restarted arms emit equal money and placement.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_tail_routes_on_published_state_v2_match_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("pi_transition_state_v2") {
+        return;
+    }
+    let mut f = PiDriver::warm_v2("transition-pi-state-v2", &pi_seed());
+    super::durable_transition_tests::tail_routes_across_two_restarts(&mut f);
+    assert_eq!(f.restarts, 2);
 }
 
 const CANARY_RESPONSE: &str = "CANARY_RESPONSE_pi_private";
