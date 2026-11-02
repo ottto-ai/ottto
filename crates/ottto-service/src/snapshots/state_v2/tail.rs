@@ -221,9 +221,9 @@ pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) summary: DebtSummary,
     /// New revisions; the store allocates their ids at commit, in order.
     pub(in crate::snapshots) added: Vec<Vec<u8>>,
-    /// Committed revisions overwritten in place; an unknown id is ignored.
+    /// Committed revisions overwritten in place; an unknown id fails the file.
     pub(in crate::snapshots) replaced: BTreeMap<u64, Vec<u8>>,
-    /// Committed revisions settled by their owner; an unknown id is ignored.
+    /// Committed revisions settled by their owner; an unknown id fails the file.
     pub(in crate::snapshots) resolved: BTreeSet<u64>,
     /// Replaces the head's facts; `None` keeps them.
     pub(in crate::snapshots) inventory: Option<InventoryFacts>,
@@ -917,15 +917,12 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result
 /// The file's committed revision rows, from headers alone.
 fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
     let kind = RecordKind::parse(REVISION)?;
-    let (mut found, mut after) = (Vec::new(), None);
-    loop {
-        let rows = tx.scan_record_key(&kind, file, after, HEADER_PAGE)?;
-        let Some(last) = rows.last() else {
-            return Ok(found);
-        };
-        after = Some(position(last)?);
-        found.extend(rows);
-    }
+    let mut found = Vec::new();
+    mapper::visit_key(tx, &kind, file, HEADER_PAGE, |_, header| {
+        found.push(header);
+        Ok(())
+    })?;
+    Ok(found)
 }
 /// Debt presence from row headers, with its oldest known change when the head
 /// is readable. A damaged head must never prevent scope erasure.
@@ -1001,9 +998,7 @@ fn observe(
         .chain(observation.resolved.iter().map(|id| (*id, None)));
     for (id, value) in changed {
         let key = row(REVISION, file, id)?;
-        let Some(old) = tx.get(&key)? else {
-            continue;
-        };
+        let old = tx.get(&key)?.context("state_v2_tail_membership")?;
         toggle(&mut entry.commit, &term(REVISION, id, &old.digest));
         tx.mark_erasure()?;
         match value {
@@ -1045,8 +1040,7 @@ fn write_file(
 ) -> Result<Applied> {
     let reset = staged.is_some_and(|staged| staged.change == Change::Reset);
     let (mut revision, mut table, mut common, mut reduction) = if reset {
-        // Acquisition state only: committed debt stays and merges, and a
-        // damaged head never blocks the reset that replaces it.
+        // Acquisition state only: committed debt stays and merges.
         let (revision, table, common) = committed_debt(tx, file)?;
         delete_rows(tx, file, true)?;
         (revision, table, common, None)
@@ -1172,10 +1166,10 @@ fn write_file(
     applied.head_bytes = head.len() as u64;
     Ok(applied)
 }
-/// The file's debt alone, its membership rebuilt from revision row headers so
-/// no stored value has to decode: a damaged head never blocks a reset or retire.
+/// The file's debt alone, its membership rebuilt from revision row headers. An
+/// unreadable or future head is an error, never default state.
 fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, MembershipTable, Common)> {
-    let prior = read_head(tx, file).ok().flatten();
+    let prior = read_head(tx, file)?;
     let (revision, mut common) =
         prior.map_or((0, Common::default()), |head| (head.revision, head.common));
     let mut table = MembershipTable::new();
@@ -1201,6 +1195,14 @@ fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
         write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     }
     Ok(keep)
+}
+/// Retire over a future head written in `tx`, which the caller drops uncommitted.
+#[cfg(test)]
+pub(super) fn retire_future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+    let mut head = encode_head(1, &MembershipTable::new(), &Common::default(), None)?;
+    head[5] = 2;
+    write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
+    retire(tx, file)
 }
 /// Written outside the file's rolled-back boundary, in the same transaction.
 /// Only `attempts` changes; there is no next-try time and no parking threshold.

@@ -863,6 +863,22 @@ fn debt_survives_reset_and_retire_until_disposed() {
     assert_eq!(all_tail_rows(&index, FILE), 0, "no reduction, no debt");
     assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "disposed");
 
+    // An unknown revision id fails this file alone: set aside, nothing written.
+    let mut unknown = observation(&[]);
+    unknown.resolved.insert(99);
+    observe_tail(&f.path, FILE, unknown).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(
+        tail_set_aside(&index, FILE).unwrap().is_some(),
+        "unknown id"
+    );
+    assert!(revisions(&index, FILE).is_empty());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let error = tail::retire_future_head_for_test(&mut tx, FILE.as_bytes()).unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+    });
+
     // A newer envelope, code or flag holds; never a default.
     let common = Common {
         representation: Representation::Archive,
