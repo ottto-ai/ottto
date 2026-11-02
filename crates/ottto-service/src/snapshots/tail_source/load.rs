@@ -246,6 +246,9 @@ fn stored<S: TailSource>(
 }
 
 #[cfg(test)]
+#[path = "floor_tests.rs"]
+mod floor_tests;
+#[cfg(test)]
 #[path = "settlement_tests.rs"]
 mod settlement_tests;
 #[cfg(test)]

@@ -34,16 +34,40 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
-/// This file's next read is native, once.
-pub(in crate::snapshots) fn owe_native_read(path: &Path, key: &str) -> Result<()> {
+/// This file's next read is native, once; `pass` is when it was owed.
+pub(in crate::snapshots) fn owe_native_read(path: &Path, key: &str, pass: u64) -> Result<()> {
     with_state(path, |state| {
-        state.tail_native_owed.insert(key.to_owned());
+        state.tail_native_owed.insert(key.to_owned(), pass);
         Ok(())
     })
 }
-/// Whether this file's read is the native one it owes; the debt ends here.
-pub(in crate::snapshots) fn take_native_read(path: &Path, key: &str) -> bool {
-    with_state(path, |state| Ok(state.tail_native_owed.remove(key))).unwrap_or(false)
+/// The pass this file's native read was owed in, if this read is it; the
+/// debt ends here.
+pub(in crate::snapshots) fn take_native_read(path: &Path, key: &str) -> Option<u64> {
+    with_state(path, |state| Ok(state.tail_native_owed.remove(key)))
+        .ok()
+        .flatten()
+}
+/// The accepted floor holds this file.
+pub(in crate::snapshots) fn hold_floor(path: &Path, key: &str) -> Result<()> {
+    with_state(path, |state| {
+        state.tail_floor_held.insert(key.to_owned());
+        Ok(())
+    })
+}
+/// Whether the floor held this file until now; the hold ends here.
+pub(in crate::snapshots) fn release_floor(path: &Path, key: &str) -> bool {
+    with_state(path, |state| Ok(state.tail_floor_held.remove(key))).unwrap_or(false)
+}
+/// A process restart: the route's RAM notes are gone, the database stays.
+#[cfg(test)]
+pub(in crate::snapshots) fn forget_ram_for_test(path: &Path) {
+    with_state(path, |state| {
+        state.tail_native_owed.clear();
+        state.tail_floor_held.clear();
+        Ok(())
+    })
+    .unwrap();
 }
 /// One file's committed head, on the graph's authenticated session; no page is
 /// visited. A future revision holds; a lower one is the caller's to decide.

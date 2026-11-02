@@ -11,7 +11,7 @@ use crate::snapshots::claude_request_census::{
 };
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
 use crate::snapshots::state_v2::BaselineRelease;
-use crate::snapshots::stored_refinalize::{reuse_label, reuses_stored};
+use crate::snapshots::stored_refinalize::{reuse_label, reuses_stored, take_native};
 use crate::snapshots::tail_source::counters;
 use crate::snapshots::tail_source::floor::AcceptedFloor;
 use crate::snapshots::tests::manifest_index_entry;
@@ -19,7 +19,7 @@ use crate::transcript_acquisition::ReadMode;
 
 const REASON: CandidateParseReason = CandidateParseReason::Rearmed;
 
-fn candidate(path: &Path) -> CandidateFile {
+pub(super) fn candidate(path: &Path) -> CandidateFile {
     CandidateFile {
         physical_identity: None,
         scan_root: path.parent().unwrap().to_owned(),
@@ -335,13 +335,14 @@ fn an_identical_stored_body_takes_the_ack_path() {
     assert!(scan.snapshots.is_empty());
     assert_eq!(scan.semantic_noop_count, count);
     assert!(!route.index.files[&key].rearmed());
-    assert!(!state_v2::take_native_read(&route.path, &key));
+    assert!(!take_native(&route.path, &key));
     assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 0);
 }
 
 /// [money] D142: a stored reuse that finishes another body sends nothing and
 /// never claims a rescan: the entry keeps its ACKed tuple, stays selected, and
 /// owes exactly one native read, which then sends the body as a Full does.
+/// §12: that read's wait is counted, one pass here.
 #[test]
 fn a_differing_stored_body_falls_back_to_one_native_read() {
     let mut route = route();
@@ -357,8 +358,12 @@ fn a_differing_stored_body_falls_back_to_one_native_read() {
         Some("acked-before")
     );
     assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 1);
-    assert!(state_v2::take_native_read(&route.path, &key));
-    assert!(!state_v2::take_native_read(&route.path, &key), "one use");
+    counters::begin_pass();
+    assert!(take_native(&route.path, &key));
+    assert!(!take_native(&route.path, &key), "one use");
+    assert_eq!(counters::total("tail_reuse_wait", "reads"), 1);
+    assert_eq!(counters::total("tail_reuse_wait", "passes"), 1);
+    assert_eq!(counters::total("tail_reuse_wait", "max_passes"), 1);
 
     let count = items.len();
     let scan = finalize(&mut route, &key, items, false, None);
@@ -367,7 +372,7 @@ fn a_differing_stored_body_falls_back_to_one_native_read() {
         count,
         "the native read's body is sent"
     );
-    assert!(!state_v2::take_native_read(&route.path, &key));
+    assert!(!take_native(&route.path, &key));
     assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 1);
     let wire = serde_json::to_value(snapshot_semantic_envelope(
         SnapshotSource::ClaudeCode,

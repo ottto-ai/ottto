@@ -3429,6 +3429,9 @@ pub(crate) fn begin_durable_pass(
     identity_capture: bool,
     skill_labels_enabled: bool,
 ) {
+    if source == SnapshotSource::ClaudeCode {
+        tail_source::counters::begin_pass();
+    }
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
     cache.durable_skill_label_permission(source, skill_labels_enabled);
     if index_fresh {
@@ -35134,12 +35137,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         if !allow_sample
                             && restore_floor.is_some_and(|a| {
-                                parser
-                                    .reader
-                                    .reader
-                                    .get_ref()
-                                    .metadata()
-                                    .map_or(true, |m| a.behind(m.len()))
+                                let held = parser.reader.reader.get_ref().metadata();
+                                a.holds(index, &key, held.ok().map(|m| m.len()))
                             })
                         {
                             context.cache.durable_custody_hold(
@@ -35172,7 +35171,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let native_owed = tail_route
                             .as_deref()
-                            .is_some_and(|route| state_v2::take_native_read(route, &key));
+                            .is_some_and(|route| stored_refinalize::take_native(route, &key));
                         #[cfg(unix)]
                         let tail_load = tail_route.as_deref().filter(|_| {
                             retained.is_none()
@@ -35630,11 +35629,8 @@ impl OwnedSourceScan {
                         // but before body I/O/output. Preparing may race a truncate.
                         #[cfg(unix)]
                         if restore_floor.is_some_and(|a| {
-                            parser
-                                .reader
-                                .acquisition
-                                .as_ref()
-                                .map_or(true, |plan| a.behind(plan.frozen_length()))
+                            let plan = parser.reader.acquisition.as_ref();
+                            a.holds(index, &key, plan.map(|plan| plan.frozen_length()))
                         }) {
                             context.cache.durable_custody_hold(
                                 source,
@@ -35841,17 +35837,14 @@ impl OwnedSourceScan {
             // actual held extent, never a fabricated zero or a skipped guard.
             #[cfg(unix)]
             if restore_floor.is_some_and(|a| {
-                parser.reader.acquisition.as_ref().map_or_else(
+                let length = parser.reader.acquisition.as_ref().map_or_else(
                     || {
-                        parser
-                            .reader
-                            .reader
-                            .get_ref()
-                            .metadata()
-                            .map_or(true, |m| a.behind(m.len()))
+                        let held = parser.reader.reader.get_ref().metadata();
+                        held.ok().map(|m| m.len())
                     },
-                    |plan| a.behind(plan.frozen_length()),
-                )
+                    |plan| Some(plan.frozen_length()),
+                );
+                a.holds(index, &local_index_key(&candidate.path), length)
             }) {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     cache.durable_custody_hold(source, "accepted_body_floor", index, &candidate);
@@ -35859,6 +35852,12 @@ impl OwnedSourceScan {
                     claude_request_census::retain_held(index, &candidate);
                 }
                 pending!();
+            }
+            // Past every floor check: a held file's hold ends here, by name.
+            #[cfg(unix)]
+            if accepted_floor.is_some() {
+                let key = local_index_key(&candidate.path);
+                tail_source::floor::release(index, &key, native_edit_proven);
             }
             if source == SnapshotSource::ClaudeCode
                 && file_sampling.is_none()

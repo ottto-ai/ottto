@@ -48,9 +48,23 @@ pub(super) fn withhold_for_native(
         evidence_owed::keep_or_clear(entry, false);
     }
     if let Ok(Some(route)) = state_v2::runtime_path(index) {
-        let _ = state_v2::owe_native_read(&route, &pending.index_key);
+        let _ =
+            state_v2::owe_native_read(&route, &pending.index_key, tail_source::counters::pass());
     }
     if let Some(label) = reuse_label(reason) {
         tail_source::counters::bump("tail_reuse_differs", label);
     }
+}
+
+/// Whether this read is the native one a differing body owes. §12 counts its
+/// delay: the passes the body waited for this read.
+pub(super) fn take_native(route: &Path, key: &str) -> bool {
+    let Some(owed) = state_v2::take_native_read(route, key) else {
+        return false;
+    };
+    let waited = tail_source::counters::pass().saturating_sub(owed);
+    tail_source::counters::bump("tail_reuse_wait", "reads");
+    tail_source::counters::add("tail_reuse_wait", "passes", waited);
+    tail_source::counters::max("tail_reuse_wait", "max_passes", waited);
+    true
 }
