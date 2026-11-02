@@ -20,6 +20,11 @@ diagnostics flow sends a redacted payload.
 Agents, the CLI, the macOS app, and the web app are clients. They should not
 duplicate local setup or repair logic.
 
+`ottto uninstall --backup-state <directory>` copies the local sync state,
+which contains local session titles, prompts and workspace paths. Keep the
+backup private; the CLI writes its files as 0600 and its folders as 0700. The
+local state folder is not excluded from Time Machine or iCloud backups.
+
 The loopback `/local-health` endpoint may return the current pseudonymous
 relay-device id to an allowlisted Ottto browser origin so the web app can
 distinguish two macOS users on one physical Mac. Origin-less callers do not
