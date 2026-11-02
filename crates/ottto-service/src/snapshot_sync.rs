@@ -6490,8 +6490,7 @@ fn load_source_checkpoints(
     crate::snapshots::ScanIndexLoadOrigin,
     SnapshotUploadProgress,
 )> {
-    let custody = source == SnapshotSource::ClaudeCode
-        && crate::snapshots::state_v2_custody_published(index_path)?;
+    let custody = crate::snapshots::state_v2_custody_published(index_path)?;
     if custody {
         // Begin once at preparation admission. Claim-only nested loads must
         // preserve the pass's measurements rather than start another pass.
@@ -16426,14 +16425,18 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [format] damaged custody or a stat error holds before progress containment or transcript reads.
+    /// [regress] for every state v2 source, damaged custody or a stat error holds before progress
+    /// containment or transcript reads.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
-        for stat_error in [false, true] {
+        for (source, stat_error) in [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+            .into_iter()
+            .flat_map(|source| [(source, false), (source, true)])
+        {
             let root = crate::test_scratch::private_dir("v2-route-before-progress");
             let namespace = root.join("snapshots/destinations").join("b".repeat(64));
             std::fs::create_dir_all(&namespace).unwrap();
-            let index_path = namespace.join("claude_code-scan-index-v3.json");
+            let index_path = namespace.join(format!("{}-scan-index-v3.json", source.api_slug()));
             let progress_path = snapshot_upload_progress_path(&index_path);
             std::fs::write(&index_path, b"{broken-fence").unwrap();
             std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
@@ -16457,10 +16460,10 @@ mod tests {
                 load_source_checkpoints(
                     &index_path,
                     &progress_path,
-                    SnapshotSource::ClaudeCode,
+                    source,
                     &root,
                     &"b".repeat(64),
-                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                    snapshot_quarantine_witness(source),
                 )
             });
             let counts = scope.finish();

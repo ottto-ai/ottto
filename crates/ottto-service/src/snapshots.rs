@@ -49153,8 +49153,8 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
-        // Custody is the single authority for Claude v2 maintenance priority.
-        // Legacy Claude, Codex and Pi retain main's nonblocking flock behavior,
+        // Custody is the single authority for v2 maintenance priority. Routes
+        // the store does not serve keep main's nonblocking flock behavior,
         // including when the v2 checkpoint-owner registry is poisoned.
         // Maintenance already owns a reservation even if its runtime was
         // invalidated while it waited for the previous checkpoint owner.
