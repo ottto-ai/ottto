@@ -151,13 +151,6 @@ pub(crate) const fn transcript_email_enabled() -> bool {
     TRANSCRIPT_EMAIL_ENABLED || cfg!(test)
 }
 
-/// `transcript_sole_login` needs the receiver's time-scoped sole-login body
-/// veto verified as deployed, on top of contract-5 emission. Until then a
-/// qualifying Desktop census still yields org-only (`transcript_org`); the
-/// email gate does not cover this basis. Flipping this is a separate,
-/// parent-owned change.
-pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
-
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
@@ -196,7 +189,9 @@ const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
 
 pub(crate) const TELEMETRY: &str = "telemetry";
 pub(crate) const TELEMETRY_LOGIN: &str = "telemetry_login";
-pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
+/// Retired basis: no build ever emitted it. Still parsed, unchanged, so an
+/// older body or accepted record that names it never fails to decode.
+pub(crate) const LEGACY_TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
@@ -774,8 +769,8 @@ impl Grouping {
         self.groups.get(bucket_start)?.get(row_key)
     }
 
-    /// Drops every tag that rests on transcript markers: the org-only and
-    /// sole-login bases, and a marker org joined to login-only telemetry. Their
+    /// Drops every tag that rests on transcript markers: the org-only (and
+    /// legacy sole-login) bases, and a marker org joined to login-only telemetry. Their
     /// usage stays on its row, untagged or login-only; refusals stay.
     fn withdraw_transcript_tags(&mut self) {
         for group in self.groups.values_mut().flat_map(BTreeMap::values_mut) {
@@ -2006,7 +2001,7 @@ fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
                                 TELEMETRY => TELEMETRY,
                                 TELEMETRY_LOGIN => TELEMETRY_LOGIN,
                                 TRANSCRIPT_ORG => TRANSCRIPT_ORG,
-                                TRANSCRIPT_SOLE_LOGIN => TRANSCRIPT_SOLE_LOGIN,
+                                LEGACY_TRANSCRIPT_SOLE_LOGIN => LEGACY_TRANSCRIPT_SOLE_LOGIN,
                                 _ => return None,
                             };
                             IdentityRef::Tagged(KeyRef {
@@ -4461,10 +4456,6 @@ pub(crate) struct ScanEvidence<'a> {
     invalid_logins: BTreeSet<(&'a str, &'a str)>,
     /// Orgs per login, proven by complete telemetry request identity.
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
-    /// Desktop store logins per org, present only under a valid census witness.
-    pub(crate) desktop_census: Option<DesktopCensus>,
-    /// `TRANSCRIPT_SOLE_LOGIN_ENABLED`; off, a sole census login stays org-only.
-    sole_login_enabled: bool,
     /// This scan's copy of the local status-coverage history.
     status_coverage: Option<crate::claude_status_coverage::Ledger>,
     /// Key of the shared default folder, where the email basis never applies.
@@ -4550,23 +4541,14 @@ pub(crate) fn prove_membership(
     login.is_some()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DesktopCensus {
-    pub(crate) completed_at_unix_seconds: u64,
-    pub(crate) logins_by_org: BTreeMap<String, BTreeSet<String>>,
-}
-
 impl<'a> ScanEvidence<'a> {
     pub(crate) fn new(
         api: &'a ClaudeLocalOtelLoadReport,
         trace: &'a ClaudeTraceOwnershipLoadReport,
         unhealthy_roots: BTreeSet<String>,
-        desktop_census: Option<DesktopCensus>,
     ) -> Self {
         let mut evidence = Self {
             unhealthy_roots,
-            desktop_census,
-            sole_login_enabled: TRANSCRIPT_SOLE_LOGIN_ENABLED,
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
@@ -4694,13 +4676,6 @@ impl<'a> ScanEvidence<'a> {
     #[cfg(test)]
     pub(crate) fn with_pending_writer_witnesses(mut self, roots: BTreeSet<String>) -> Self {
         self.pending_writer_witnesses = roots;
-        self
-    }
-
-    /// Test-only stand-in for a verified sole-login body veto.
-    #[cfg(test)]
-    pub(crate) fn with_sole_login_enabled(mut self) -> Self {
-        self.sole_login_enabled = true;
         self
     }
 }
@@ -4920,7 +4895,7 @@ pub(crate) fn classify_ref<'k>(
         None => {
             // A trace that already owns this request outranks the transcript:
             // a foreign, duplicated or unpaired owner refuses and never borrows
-            // this transcript's org or sole login.
+            // this transcript's org.
             if let Some(owner) = evidence.owners.get(&(facts.root, facts.request_id)) {
                 return Refused(match owner {
                     None => Refusal::ConflictingDuplicate,
@@ -5029,33 +5004,14 @@ fn transcript_identity<'k>(
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
     };
-    let sole_login = (facts.desktop && evidence.sole_login_enabled)
-        .then_some(())
-        .and(evidence.desktop_census.as_ref())
-        .filter(|census| {
-            facts
-                .terminal_unix_seconds
-                .is_some_and(|at| census.completed_at_unix_seconds >= at)
-        })
-        .and_then(|census| census.logins_by_org.get(org))
-        .filter(|logins| logins.len() == 1)
-        .and_then(|logins| logins.first());
     if let Some(refusal) = email_refusal(evidence, facts, org) {
         return Some(IdentityRef::Refused(refusal));
     }
-    Some(IdentityRef::Tagged(match sole_login {
-        Some(login) => KeyRef {
-            login: Some(login),
-            org: Some(org),
-            basis: TRANSCRIPT_SOLE_LOGIN,
-            account_source: None,
-        },
-        None => KeyRef {
-            login: None,
-            org: Some(org),
-            basis: TRANSCRIPT_ORG,
-            account_source: None,
-        },
+    Some(IdentityRef::Tagged(KeyRef {
+        login: None,
+        org: Some(org),
+        basis: TRANSCRIPT_ORG,
+        account_source: None,
     }))
 }
 
@@ -5105,41 +5061,7 @@ fn email_refusal(
     })
 }
 
-// --- Desktop census freshness witness ---------------------------------------
-
-/// Local completion witness for the Desktop store census: set only when a
-/// sweep finishes complete and error-free, bound to this process and to the
-/// store inventory it swept. Sole-login inference needs it to postdate the
-/// request; anything else (older index, restart, other inventory) is unknown.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DesktopCensusWitness {
-    completed_at_unix_seconds: u64,
-    process_id: u32,
-    inventory: String,
-}
-
-impl DesktopCensusWitness {
-    pub(super) fn new(now: u64, store_dirs: &BTreeSet<PathBuf>) -> Self {
-        Self {
-            completed_at_unix_seconds: now,
-            process_id: std::process::id(),
-            inventory: inventory_digest(store_dirs),
-        }
-    }
-
-    pub(super) fn retain_for_inventory(witness: &mut Option<Self>, store_dirs: &BTreeSet<PathBuf>) {
-        if witness
-            .as_ref()
-            .is_some_and(|witness| witness.inventory != inventory_digest(store_dirs))
-        {
-            *witness = None;
-        }
-    }
-
-    fn valid_at(&self, now: u64) -> bool {
-        self.process_id == std::process::id() && self.completed_at_unix_seconds <= now
-    }
-}
+// --- Desktop store inventory digest -----------------------------------------
 
 pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
     let mut digest = sha2::Sha256::new();
@@ -5148,47 +5070,6 @@ pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
         digest.update([0]);
     }
     format!("{:x}", digest.finalize())
-}
-
-/// The census this pass may use: the persisted complete Desktop identity
-/// census under a valid witness. Logins per org come from native (unimported)
-/// original identities only; bounded by the store's own file cap.
-pub(crate) fn desktop_census(index: &ScanIndex) -> Option<DesktopCensus> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    desktop_census_at(index, now)
-}
-
-pub(super) fn desktop_census_at(index: &ScanIndex, now: u64) -> Option<DesktopCensus> {
-    let witness = index.claude_desktop_census_witness.as_ref()?;
-    if !index.claude_desktop_identity_census_complete || !witness.valid_at(now) {
-        return None;
-    }
-    let mut logins_by_org: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for entry in index.claude_desktop_title_files.values() {
-        let Some(identity) = entry
-            .original_identity
-            .as_ref()
-            .filter(|identity| !identity.imported)
-        else {
-            continue;
-        };
-        if let (Some(login), Some(org)) = (
-            identity.account_identifier_hash.as_ref(),
-            identity.provider_workspace_hash.as_ref(),
-        ) {
-            logins_by_org
-                .entry(org.clone())
-                .or_default()
-                .insert(login.clone());
-        }
-    }
-    Some(DesktopCensus {
-        completed_at_unix_seconds: witness.completed_at_unix_seconds,
-        logins_by_org,
-    })
 }
 
 // --- Scan integration -----------------------------------------------------
@@ -6035,7 +5916,6 @@ crate::durable_tail_codec::durable_struct!(OrgMarker {
     U org: Option<String>,
     N terminal_trusted: bool,
 });
-crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
 crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);

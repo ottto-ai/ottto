@@ -10280,7 +10280,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
-            crate::snapshots::claude_request_identity::desktop_census(index),
         );
         let evidence = match &whole_corpus {
             Some(_) => evidence,

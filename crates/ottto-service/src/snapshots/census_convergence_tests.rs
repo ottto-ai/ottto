@@ -1307,7 +1307,7 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
         crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
         crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
     );
-    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
     // One terminal pass over `index`, then contract 5 under its ownership.
     let run = |mut index: ScanIndex| {
         let mut items = parse();

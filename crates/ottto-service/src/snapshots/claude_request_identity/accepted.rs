@@ -289,7 +289,7 @@ fn basis_token(basis: &str) -> Option<&'static str> {
     match basis {
         TELEMETRY => Some(TELEMETRY),
         TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_SOLE_LOGIN => Some(TRANSCRIPT_SOLE_LOGIN),
+        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
         TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
         _ => None,
     }

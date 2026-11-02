@@ -388,7 +388,6 @@ impl Serialize for ScanIndex {
         field!(claude_desktop_store_sweep_had_errors);
         field!(claude_desktop_identity_census_complete);
         field!(claude_desktop_lineage_census_complete);
-        field!(claude_desktop_census_witness, Option::is_none);
         field!(claude_desktop_store_retry_attempt);
         field!(
             claude_desktop_store_retry_not_before_unix_seconds,
@@ -500,7 +499,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_sweep_had_errors",
     "claude_desktop_identity_census_complete",
     "claude_desktop_lineage_census_complete",
-    "claude_desktop_census_witness",
+    "claude_desktop_census_witness", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_desktop_store_retry_attempt",
     "claude_desktop_store_retry_not_before_unix_seconds",
     "resume_after_path",
@@ -2379,9 +2378,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_lineage_census_complete" => {
                             index.claude_desktop_lineage_census_complete = self.typed(value)?
                         }
-                        "claude_desktop_census_witness" => {
-                            index.claude_desktop_census_witness = self.typed(value)?
-                        }
+                        "claude_desktop_census_witness" => {} // TOMBSTONE: decode-and-drop.
                         "claude_desktop_store_retry_attempt" => {
                             index.claude_desktop_store_retry_attempt = self.typed(value)?
                         }

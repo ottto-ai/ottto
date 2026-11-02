@@ -1622,7 +1622,7 @@ fn tag_owned_with_fallbacks(
                 .map(|original| (item.source_session_id.clone(), original))
         })
         .collect();
-    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
@@ -2030,8 +2030,7 @@ fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting
         attach_page(&mut items, &read);
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (3, 60));
@@ -2240,8 +2239,7 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
         attach_page(&mut items, &read);
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (2, 30));
@@ -2374,7 +2372,7 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
             let trace = ClaudeTraceOwnershipLoadReport::default();
             side_calls_page(&mut items, &api, &trace, &index);
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
             assert!(items
                 .iter()
@@ -2457,8 +2455,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
         side_calls_page(&mut items, &api, &trace, &index);
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (2, 30));
@@ -2666,7 +2663,7 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
             let api = ClaudeLocalOtelLoadReport::default();
             let trace = ClaudeTraceOwnershipLoadReport::default();
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             let outcome =
                 claude_request_identity::apply_scan(&mut items, &evidence, BTreeMap::new());
             assert_eq!(outcome.ineligible, 1);
@@ -2706,7 +2703,7 @@ fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
             let trace = ClaudeTraceOwnershipLoadReport::default();
             side_calls_page(&mut items, &api, &trace, &index);
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
             assert!(items
                 .iter()
@@ -3057,8 +3054,7 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
         let mut items = vec![item];
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
         let ownership =
             claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
@@ -3120,8 +3116,7 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
         let before = serde_json::to_vec(&items).unwrap();
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
         let ownership =
             claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
@@ -3644,7 +3639,7 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                 let api = ClaudeLocalOtelLoadReport::default();
                 let trace = ClaudeTraceOwnershipLoadReport::default();
                 let evidence =
-                    claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                    claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
                 claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
                 side_calls_page(&mut items, &Default::default(), &Default::default(), &index);
                 assert!(items

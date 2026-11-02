@@ -462,4 +462,12 @@ mod alias_tests {
         )
         .is_err());
     }
+
+    /// [format] An older index holding the retired Desktop census witness
+    /// still passes the import inventory: the slot decodes and drops.
+    #[test]
+    fn inventory_accepts_the_retired_desktop_census_witness() {
+        let raw = br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#;
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
+    }
 }

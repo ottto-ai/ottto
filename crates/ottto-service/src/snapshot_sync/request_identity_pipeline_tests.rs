@@ -289,10 +289,6 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
             item.claude_org_markers.is_some(),
             "{name}: markers captured"
         );
-        assert!(
-            identity::desktop_census(&cycle.scanned_index).is_some(),
-            "{name}: census witness"
-        );
         // Even a settled pass withdraws marker-only tags. Nothing is refused
         // and usage is unchanged.
         assert!(item.request_evidence.is_empty(), "{name}");

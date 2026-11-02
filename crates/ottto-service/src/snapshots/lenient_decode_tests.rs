@@ -1605,6 +1605,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                     *name,
                     "reread_guard"
                         | "upload_context_fingerprint"
+                        | "claude_desktop_census_witness"
                         | "claude_desktop_store_inventory"
                         | "context_curve_capability_enabled"
                         | "context_curve_replay_epoch"
@@ -1617,6 +1618,28 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
     assert!(decoded.decode_holds.is_empty());
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
+}
+
+/// [format] An older index holding the retired Desktop census witness still
+/// loads on every decoder; the slot is dropped and never written again.
+#[test]
+fn retired_desktop_census_witness_decodes_and_drops() {
+    let _on = RestartRestoreForTest::enabled();
+    let current = serde_json::to_value(fixture()).unwrap();
+    assert!(current.get("claude_desktop_census_witness").is_none());
+    let mut older = current.clone();
+    older["claude_desktop_census_witness"] = serde_json::json!({
+        "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
+    });
+    let bytes = serde_json::to_vec(&older).unwrap();
+    let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+    let streaming =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    for decoded in [native, streaming, bounded] {
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
+    }
 }
 
 /// [format] historical named and positional writers preserve appended v1 fields.
@@ -4186,7 +4209,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_sweep_had_errors",
             "claude_desktop_identity_census_complete",
             "claude_desktop_lineage_census_complete",
-            "claude_desktop_census_witness",
+            "claude_desktop_census_witness", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "claude_desktop_store_retry_attempt",
             "claude_desktop_store_retry_not_before_unix_seconds",
             "resume_after_path",
