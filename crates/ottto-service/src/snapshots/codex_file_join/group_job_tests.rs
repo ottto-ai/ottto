@@ -460,6 +460,11 @@ fn v2_group_with_ui_only_turn_held_until_turn_hook() {
 
 /// R(t), E(t), zero Z, then `repeat` in member b.
 fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
+    eze_rows(vec![repeat])
+}
+
+/// R(t), E(t), zero Z, then `tail` in member b.
+fn eze_rows(tail: Vec<Value>) -> Option<(JoinRefusal, usize)> {
     let root = temp_root("eze");
     write_rows(
         &root.join("sessions/a.jsonl"),
@@ -471,7 +476,7 @@ fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
         ui(200, 300, "2026-10-01T10:01:30Z"),
         ui(0, 300, "2026-10-01T10:01:40Z"),
     ];
-    rows.push(repeat);
+    rows.extend(tail);
     write_rows(&root.join("sessions/b.jsonl"), &rows);
     let result = refused(replay_group(group_of(&root), None, &ScanIndex::default()));
     fs::remove_dir_all(root).unwrap();
@@ -480,20 +485,29 @@ fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
 
 #[test]
 fn eze_identical_repeat_is_overlap() {
-    // The repeated E has the same identity (the whole record): the parser
-    // admits it again after Z, and the tap's identity set refuses it.
+    // Right after Z the repeated E is the counter's own equal-total repeat:
+    // never admitted, so the group replays with E counted once.
+    assert_eq!(eze(ui(200, 300, "2026-10-01T10:01:30Z")), None);
+    // After another counted record the same identity (the whole record) is
+    // admitted again, and the tap's identity set refuses it.
     assert_eq!(
-        eze(ui(200, 300, "2026-10-01T10:01:30Z")),
+        eze_rows(vec![
+            ui(10, 310, "2026-10-01T10:01:45Z"),
+            ui(200, 300, "2026-10-01T10:01:30Z"),
+        ]),
         Some((JoinRefusal::Overlap, 1))
     );
 }
 
 #[test]
 fn eze_distinct_identity_repeat_is_ui_repeat_unproven() {
-    // A distinct record of the same tuple, with no native between the two
-    // admissions: held, never counted twice.
+    // The same `last` and total at a new timestamp is the counter's
+    // equal-total repeat: dropped before the tap.
+    assert_eq!(eze(ui(200, 300, "2026-10-01T10:01:50Z")), None);
+    // The same `last` with a grown total is admitted; with no native between
+    // the two admissions the group is held, never counted twice.
     assert_eq!(
-        eze(ui(200, 300, "2026-10-01T10:01:50Z")),
+        eze(ui(200, 500, "2026-10-01T10:01:50Z")),
         Some((JoinRefusal::UiRepeatUnproven, 1))
     );
 }

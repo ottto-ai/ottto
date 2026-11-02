@@ -135,7 +135,8 @@ fn parse_archived_at(
     let mut result = scan_at(&acked.root, &mut working, collected_at);
     assert_eq!(result.snapshots.len(), 1, "archive is fully parsed");
     assert_eq!(result.scanned_file_count, 1);
-    assert_eq!(result.snapshots[0].input_tokens, if v2 { 200 } else { 400 });
+    // `rows` re-emits its token_count at a new timestamp; both counters drop it.
+    assert_eq!(result.snapshots[0].input_tokens, 200);
     let key = local_index_key(&archived);
     assert_eq!(working.files[&key].codex_counting_v2, v2);
     // Both fresh and cursor restore use the moved evidence prepared by inventory.
