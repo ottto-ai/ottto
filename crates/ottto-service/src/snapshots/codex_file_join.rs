@@ -151,6 +151,25 @@ pub(super) struct HeaderWitness {
     metadata: String,
     stamp: crate::transcript_acquisition::FileStamp,
 }
+/// A header-pass candidate from its discovery stat. Opening the file later
+/// refreshes size, mtime and identity from the opened object.
+fn header_candidate(scan_root: PathBuf, path: PathBuf, stat: &fs::Metadata) -> CandidateFile {
+    CandidateFile {
+        physical_identity: None,
+        scan_root,
+        path,
+        size_bytes: stat.len(),
+        modified_unix_seconds: stat.modified().ok().and_then(unix_seconds).unwrap_or(0),
+        modified_unix_nanos: stat.modified().ok().and_then(unix_nanos).unwrap_or(0),
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
+    }
+}
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
         .find(|path| {
@@ -604,21 +623,7 @@ impl HeaderInventory {
                     stat.is_file() && !stat.file_type().is_symlink(),
                     "archive object unavailable"
                 );
-                let mut candidate = CandidateFile {
-                    physical_identity: None,
-                    scan_root: root.clone(),
-                    path: path.clone(),
-                    size_bytes: stat.len(),
-                    modified_unix_seconds: stat.modified().ok().and_then(unix_seconds).unwrap_or(0),
-                    modified_unix_nanos: stat.modified().ok().and_then(unix_nanos).unwrap_or(0),
-                    source_file_fingerprint: String::new(),
-                    legacy_source_file_fingerprint: String::new(),
-                    legacy_config_reconciliation_required: false,
-                    opened_object_identity: String::new(),
-                    fingerprint_changed_nanos: 0,
-                    fingerprint_birth_nanos: 0,
-                    withheld_content_stamp: None,
-                };
+                let mut candidate = header_candidate(root.clone(), path.clone(), &stat);
                 prepare_owned_scan_candidate(
                     SnapshotSource::Codex,
                     &mut candidate,
@@ -710,26 +715,7 @@ impl HeaderInventory {
                 stat.is_file() && !stat.file_type().is_symlink(),
                 "invalid Codex header member"
             );
-            let seconds = stat.modified().ok().and_then(unix_seconds).unwrap_or(0);
-            let mut candidate = CandidateFile {
-                physical_identity: None,
-                scan_root,
-                path,
-                size_bytes: stat.len(),
-                modified_unix_seconds: seconds,
-                modified_unix_nanos: stat
-                    .modified()
-                    .ok()
-                    .and_then(unix_nanos)
-                    .unwrap_or(seconds.saturating_mul(1_000_000_000)),
-                source_file_fingerprint: String::new(),
-                legacy_source_file_fingerprint: String::new(),
-                legacy_config_reconciliation_required: false,
-                opened_object_identity: String::new(),
-                fingerprint_changed_nanos: 0,
-                fingerprint_birth_nanos: 0,
-                withheld_content_stamp: None,
-            };
+            let mut candidate = header_candidate(scan_root, path, &stat);
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,
                 &mut candidate,
