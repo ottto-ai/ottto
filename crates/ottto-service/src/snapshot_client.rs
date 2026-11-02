@@ -23,8 +23,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
-// Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
-const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
