@@ -1240,6 +1240,20 @@ struct Codex24b {
     disk: Disk,
     prior: ScanIndex,
     pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
+    v2: bool,
+}
+
+/// A restarted owner. A published v2 index stays at its bound custody path:
+/// M3's fork moves it to an unbound path whose save is refused as foreign.
+/// Each 24b commit has one durable arm, so the committed store is already
+/// every arm's predecessor.
+fn owner_24b(disk: &mut Disk, source: SnapshotSource, v2: bool) -> E2ScanFixture {
+    if !v2 {
+        return disk.owner(source);
+    }
+    let owner = E2ScanFixture::default();
+    disk.begin(&owner, source);
+    owner
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1270,7 +1284,7 @@ impl TransitionDriver for Codex24b {
         let mut scanner = if mode == Mode::ColdFull {
             E2ScanFixture::default()
         } else {
-            self.disk.owner(source)
+            owner_24b(&mut self.disk, source, self.v2)
         };
         if mode != Mode::ColdFull
             && self
@@ -1386,7 +1400,7 @@ fn codex_24b_old_writer_row(v2: bool) {
     };
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
-    let writer = disk.owner(source);
+    let writer = owner_24b(&mut disk, source, v2);
     let (mut index, scan, modes) = other_page(&c, &writer, source, start);
     assert_eq!(modes, (1, 0, 0));
     assert!(scan.snapshots[0].request_count > 0);
@@ -1411,6 +1425,7 @@ fn codex_24b_old_writer_row(v2: bool) {
         disk,
         prior,
         pages: BTreeMap::new(),
+        v2,
     };
     append(&path, &codex_rows("golden-rebuild", 5));
     input_clock(&path);
@@ -1473,7 +1488,7 @@ fn codex_24b_old_writer_row(v2: bool) {
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
         // M3's unchanged restart performs no acquisition/body decode. The
         // M1 raw-restored-EOF/version-observation subarm has no M3 equivalent.
-        let owner = driver.disk.owner(source);
+        let owner = owner_24b(&mut driver.disk, source, v2);
         let (quiet_index, quiet, modes) =
             other_page(&driver.c, &owner, source, driver.prior.clone());
         assert_eq!(modes.0, 0);
