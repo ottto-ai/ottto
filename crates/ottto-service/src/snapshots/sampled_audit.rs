@@ -1,4 +1,7 @@
 //! Audit status lives in the existing per-file index, never in a new ledger.
+#[cfg(unix)]
+pub(in crate::snapshots) mod quiet_retirement;
+
 use super::*;
 use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
 use crate::transcript_cache::CACHE_ENTRIES;

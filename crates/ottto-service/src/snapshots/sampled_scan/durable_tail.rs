@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
 pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
+#[path = "legacy_records.rs"]
+mod legacy_records;
 mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
 pub(crate) use owed::{OwedAdmission, OwedQuery, ReceiptOwed};
@@ -53,6 +55,7 @@ use crate::transcript_acquisition::{
     birth_unix_nanos, CertificateRefusal, Checkpoint, DurableCertificate, FullReason, Scope,
 };
 use crate::transcript_cache::Taken;
+use sampled_audit::quiet_retirement::{certificate_at, QuietRetirement};
 use sampled_jsonl::durable as codec;
 use sampled_jsonl::CachedJsonlReduction;
 
@@ -505,7 +508,7 @@ impl ScopeDecision {
 pub(crate) const RESTART_FULL_ALARM_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
-struct Slot {
+pub(in crate::snapshots) struct Slot {
     dir: PathBuf,
     index_path: PathBuf,
     store: DurableTailStore,
@@ -588,20 +591,14 @@ impl Slot {
     }
 }
 
-#[derive(Clone, Copy)]
-struct QuietRetirement {
-    key: store::Digest32,
-    source: SnapshotSource,
-    fingerprint: store::Digest32,
-    durable: bool,
-}
-
 /// OFF retains only the source context needed by the approved privacy and v1
 /// exceptions, and main's fixed quiet-marker staging table. No store is opened
 /// or allocated by pass registration.
-pub(super) struct StoreRoot {
-    passes: [Option<OffPass>; crate::snapshots::durable_sources::SOURCES.len()],
-    retiring: [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
+pub(in crate::snapshots) struct StoreRoot {
+    pub(in crate::snapshots) passes:
+        [Option<OffPass>; crate::snapshots::durable_sources::SOURCES.len()],
+    pub(in crate::snapshots) retiring:
+        [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
     state: Option<Box<Stores>>,
 }
 impl Default for StoreRoot {
@@ -614,7 +611,7 @@ impl Default for StoreRoot {
     }
 }
 #[derive(Clone)]
-struct OffPass {
+pub(in crate::snapshots) struct OffPass {
     index_path: PathBuf,
     namespace: Scope,
     identity_capture: bool,
@@ -632,7 +629,8 @@ pub(crate) struct Stores {
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
     // At most CACHE_ENTRIES; the persisted marker remains owed until receipt.
-    retiring: [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
+    pub(in crate::snapshots) retiring:
+        [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
     /// Keys whose restore refused the record as `entry_changed`, until their
     /// next acquisition completes. Process-local, never persisted.
     stale_predecessor: BTreeSet<u64>,
@@ -897,7 +895,7 @@ impl Stores {
                 cap.saturating_add(slot.indexed)
             })
     }
-    fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
+    pub(in crate::snapshots) fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
         &mut self.slots[source.slot()]
     }
 }
@@ -1275,28 +1273,6 @@ fn full_reason_class(reason: FullReason) -> &'static str {
     }
 }
 
-/// The retained checkpoint's certificate with the birth of the object now
-/// at `key`'s path, or `None` when that object is not the checkpoint's (it
-/// was replaced since the read: nothing is persisted for it).
-fn certificate_at(
-    key: &str,
-    checkpoint: &Checkpoint,
-    index: &ScanIndex,
-    now: u64,
-) -> Option<DurableCertificate> {
-    let mut certificate = checkpoint.durable_certificate(0)?;
-    let metadata = std::fs::metadata(key).ok()?;
-    if metadata.dev() != certificate.device || metadata.ino() != certificate.inode {
-        return None;
-    }
-    certificate.birth_nanos = birth_unix_nanos(&metadata);
-    // Downgrade readers still consume these bytes. A decoded checkpoint has
-    // dropped them; only the current committed index supplies write truth.
-    certificate.audit_debt_unix_seconds =
-        sampled_audit::debt_for_key(index, key, now).map(|debt| debt.due_unix_seconds);
-    Some(certificate)
-}
-
 fn refuse_class(refuse: Refuse) -> &'static str {
     match refuse {
         Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field) => field,
@@ -1311,7 +1287,7 @@ thread_local! { static STORES_HELD: std::cell::Cell<bool> = const { std::cell::C
 pub(super) fn stores_held() -> bool {
     STORES_HELD.with(std::cell::Cell::get)
 }
-pub(super) struct StoresGuard<'a>(std::sync::MutexGuard<'a, StoreRoot>);
+pub(in crate::snapshots) struct StoresGuard<'a>(std::sync::MutexGuard<'a, StoreRoot>);
 impl std::ops::Deref for StoresGuard<'_> {
     type Target = Stores;
     fn deref(&self) -> &Stores {
@@ -1955,7 +1931,7 @@ impl SharedCache {
         allowed
     }
 
-    pub(super) fn durable(&self) -> Option<StoresGuard<'_>> {
+    pub(in crate::snapshots) fn durable(&self) -> Option<StoresGuard<'_>> {
         debug_assert!(!stores_held(), "Stores cannot be nested");
         let mut guard = self.durable.lock().ok()?;
         if guard.state.is_none() {
@@ -1970,64 +1946,6 @@ impl SharedCache {
         }
         STORES_HELD.with(|held| held.set(true));
         Some(StoresGuard(guard))
-    }
-
-    /// Allocate the existing store owner only inside an approved OFF action.
-    /// Registration never probes disk. Missing directories need no owner.
-    fn off_exception(&self, source: SnapshotSource) -> Result<bool, ()> {
-        if restart_restore::enabled() {
-            return Ok(true);
-        }
-        let Some(ds) = durable_source(source) else {
-            return Ok(false);
-        };
-        let mut root = self.durable.lock().map_err(|_| ())?;
-        let Some(pass) = root.passes[ds.slot()].clone() else {
-            return Ok(false);
-        };
-        let dir = store::store_dir_for_index(&pass.index_path);
-        if let Some(state) = root.state.as_mut() {
-            if let Some(old) = state.slot(ds).as_mut().filter(|slot| slot.dir != dir) {
-                // Keep the old owner and its age evidence until its own unlink
-                // is durable. This never holds native OFF publication.
-                let writer = crate::locked_state_dir::held_for(&old.dir)
-                    .map(|writer| writer as &dyn SingleWriter);
-                old.store.retry_off_v1_unlink(writer).map_err(|_| ())?;
-            }
-        }
-        if matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Ok(false);
-        }
-        let state = root.state.get_or_insert_with(Default::default);
-        let slot = state.slot(ds);
-        if slot.as_ref().map_or(true, |slot| slot.dir != dir) {
-            let mut replacement =
-                Slot::new(ds, pass.index_path, pass.namespace, pass.identity_capture);
-            if let Some(previous) = slot.as_ref() {
-                replacement.store.inherit_off_v1_counts(&previous.store);
-            }
-            *slot = Some(replacement);
-            for debt in state.key_debt.values_mut() {
-                if debt
-                    .off_v1_failed_since
-                    .is_some_and(|(source, _)| source == ds)
-                {
-                    debt.off_v1_failed_since = None;
-                }
-            }
-            state.key_debt.retain(|_, debt| !debt.is_empty());
-        }
-        state
-            .slot(ds)
-            .as_mut()
-            .expect("exception slot")
-            .skill_labels_enabled = pass.skill_labels_enabled;
-        self.durable_bytes.store(
-            size_of::<Stores>() + std::mem::align_of::<Stores>(),
-            Ordering::Relaxed,
-        );
-        Ok(true)
     }
 
     /// Committed growth uses the ordinary per-key Full pace.
@@ -2045,32 +1963,6 @@ impl SharedCache {
             .then_some(())
     }
 
-    /// Selects `source`'s store for this pass, the sibling of `index_path`,
-    /// under the pass's sampled scope (`namespace`) and identity-capture
-    /// mode. An index at another path (a destination or account switch) gets
-    /// a fresh store; the old directory is left to its own index's GC.
-    pub(in crate::snapshots) fn durable_skill_label_permission(
-        &self,
-        source: SnapshotSource,
-        enabled: bool,
-    ) {
-        if !restart_restore::enabled() {
-            if let (Some(ds), Ok(mut root)) = (durable_source(source), self.durable.lock()) {
-                if let Some(pass) = root.passes[ds.slot()].as_mut() {
-                    pass.skill_labels_enabled = enabled;
-                }
-            }
-            return;
-        }
-        if let (Some(ds), Some(mut stores)) = (durable_source(source), self.durable()) {
-            if let Some(slot) = stores.slot(ds).as_mut() {
-                slot.skill_labels_enabled = enabled;
-                if enabled {
-                    slot.skill_label_purge_complete = false;
-                }
-            }
-        }
-    }
     #[inline(never)]
     pub(in crate::snapshots) fn skill_labels_enabled(&self, source: SnapshotSource) -> bool {
         durable_source(source)
@@ -2092,165 +1984,6 @@ impl SharedCache {
                     Counters::bump(&mut stores.counters.not_persisted, class);
                 }
             }
-        }
-    }
-
-    pub(crate) fn durable_begin_pass(
-        &self,
-        source: SnapshotSource,
-        index_path: &Path,
-        namespace: &Scope,
-        identity_capture: bool,
-    ) {
-        if !restart_restore::enabled() {
-            let Some(ds) = durable_source(source) else {
-                return;
-            };
-            if let Ok(mut root) = self.durable.lock() {
-                if root.passes[ds.slot()].as_ref().is_some_and(|pass| {
-                    pass.index_path != index_path
-                        || pass.namespace != *namespace
-                        || pass.identity_capture != identity_capture
-                }) {
-                    for pending in &mut root.retiring {
-                        if pending.is_some_and(|p| p.source == source) {
-                            *pending = None;
-                        }
-                    }
-                }
-                root.passes[ds.slot()] = Some(OffPass {
-                    index_path: index_path.to_owned(),
-                    namespace: namespace.clone(),
-                    identity_capture,
-                    skill_labels_enabled: false,
-                });
-            }
-            return;
-        }
-        let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
-            return;
-        };
-        let dir = store::store_dir_for_index(index_path);
-        if restart_restore::enabled() {
-            // P2 head budget is per pass; authorityless custody nodes are freed.
-            stores.rederive_spent[source.slot()] = 0;
-            // A native error may discard staging without a publication. Its empty
-            // reservation carries no authority and cannot pin next-pass capacity.
-            stores.key_debt.retain(|_, debt| !debt.is_empty());
-            stores
-                .retail_spent
-                .retain(|_, custody| custody.has_authority());
-        }
-        let changed = stores.slot(source).as_ref().map_or(true, |slot| {
-            slot.dir != dir
-                || slot.namespace != *namespace
-                || slot.identity_capture != identity_capture
-        });
-        if changed {
-            for pending in &mut stores.retiring {
-                if pending.is_some_and(|pending| durable_source(pending.source) == Some(source)) {
-                    *pending = None;
-                }
-            }
-        }
-        if stores
-            .slot(source)
-            .as_ref()
-            .is_some_and(|slot| slot.dir != dir)
-        {
-            for debt in stores.key_debt.values_mut() {
-                if debt.off_v1_failed_since.is_some_and(|(s, _)| s == source) {
-                    debt.off_v1_failed_since = None;
-                }
-            }
-            stores.key_debt.retain(|_, debt| !debt.is_empty());
-        }
-        let slot = stores.slot(source);
-        if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
-            current.decided.clear();
-            current.index_path = index_path.to_owned();
-            current.namespace = namespace.clone();
-            current.identity_capture = identity_capture;
-            current.skill_labels_enabled = false;
-        } else {
-            if let Some(old) = slot
-                .as_mut()
-                .filter(|s| restart_restore::enabled() && s.store.has_pending())
-            {
-                old.store.disable("namespace_pending");
-                return;
-            }
-            *slot = Some(Slot::new(
-                source,
-                index_path.to_owned(),
-                namespace.clone(),
-                identity_capture,
-            ));
-        }
-        if let Some(slot) = slot.as_mut() {
-            if restart_restore::enabled() {
-                slot.store.begin_pass();
-            }
-            // At most one resource probe per pass; the store owns its back-off.
-            // Held keys retry through their own next native write.
-            if restart_restore::enabled() && slot.store.resource_paused() {
-                if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-                    let index_len = std::fs::metadata(index_path).map_or(0, |m| m.len());
-                    // This pass-start probe only refreshes an existing pause.
-                    // An I/O error keeps it held; the write path reports errors.
-                    let _ = slot.store.check_resources(writer, index_len);
-                }
-            }
-        }
-    }
-
-    /// The sole OFF publication exception: discard this key's outgrown v1
-    /// restart record. No inventory, body read, new store or publication hold.
-    pub(crate) fn durable_off_published(
-        &self,
-        source: SnapshotSource,
-        key: &str,
-        published_end: u64,
-    ) {
-        if restart_restore::enabled() {
-            return;
-        }
-        if self.off_exception(source) != Ok(true) {
-            return;
-        }
-        let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
-            return;
-        };
-        let digest = store::key_digest(source, key);
-        let Some(slot) = stores.slot(source).as_mut() else {
-            return;
-        };
-        let outcome = if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-            slot.store
-                .invalidate_outgrown_v1(writer, &digest, published_end)
-        } else if !slot.dir.try_exists().unwrap_or(true) && slot.store.record_missing(&digest) {
-            Ok(true) // No record or outstanding unlink barrier remains.
-        } else {
-            return;
-        };
-        match outcome {
-            Err(_) => {
-                // The diagnostic shares the prepaid, bounded key owner; it
-                // never grants discovery/receipt custody or blocks a publish.
-                if let Some(debt) = stores.fund_debt(digest) {
-                    debt.off_v1_failed_since
-                        .get_or_insert((source, std::time::Instant::now()));
-                } else if let Some(slot) = stores.slot(source).as_mut() {
-                    slot.off_v1_failed_age_untracked = true;
-                }
-            }
-            Ok(true) => {
-                if let Some(debt) = stores.key_debt.get_mut(&digest) {
-                    debt.off_v1_failed_since = None;
-                }
-                stores.release_idle_debt(&digest);
-            }
-            Ok(false) => {} // Inconclusive or unchanged: keep the first failure.
         }
     }
 
@@ -2890,23 +2623,12 @@ impl SharedCache {
             let Ok(root) = self.durable.lock() else {
                 return RestoreOutcome::Miss(MissClass::Unavailable);
             };
-            // Pass registration replaces main's slot fact without opening or
-            // allocating a store. Preserve its pre-I/O and no-record decisions.
-            let has_slot = root.passes[source.slot()].is_some();
-            let entry = index.files.get(key);
-            return RestoreOutcome::Miss(if entry.is_none() && !has_slot {
-                MissClass::NoEntry
-            } else if selection_cleared(index, key) {
-                MissClass::SelectionCleared
-            } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
-                MissClass::HistoryOwed
-            } else if entry.is_none() {
-                MissClass::NoEntry
-            } else if has_slot {
-                MissClass::Missing
-            } else {
-                MissClass::Unavailable
-            });
+            // Registration remains a pre-I/O fact, without opening a store.
+            return RestoreOutcome::Miss(super::ram_miss_class(
+                index,
+                key,
+                root.passes[source.slot()].is_some(),
+            ));
         }
         let floor_behind = interpretation
             .accepted
@@ -4522,163 +4244,6 @@ impl SharedCache {
         }
     }
 
-    /// No durable slot means no old certificate exists in this acquisition
-    /// context. Otherwise keep the persisted marker until this exact body's
-    /// debt-free replacement and a second index CAS both succeed.
-    pub(crate) fn durable_stage_quiet_retirement(
-        &self,
-        source: SnapshotSource,
-        key: &str,
-        fingerprint: &str,
-    ) -> bool {
-        if !restart_restore::enabled() {
-            let Some(ds) = durable_source(source) else {
-                return false;
-            };
-            let Ok(mut root) = self.durable.lock() else {
-                return true;
-            };
-            if root.passes[ds.slot()].is_none() {
-                return false;
-            }
-            let key = store::key_digest(ds, key);
-            let slot = root
-                .retiring
-                .iter()
-                .position(|p| p.is_some_and(|p| p.key == key))
-                .or_else(|| root.retiring.iter().position(Option::is_none))
-                .unwrap_or(0);
-            root.retiring[slot] = Some(QuietRetirement {
-                key,
-                source,
-                fingerprint: Sha256::digest(fingerprint.as_bytes()).into(),
-                durable: false,
-            });
-            return true;
-        }
-        let Some(mut stores) = self.durable() else {
-            return true;
-        };
-        let Some(durable_source) = durable_source(source) else {
-            return false;
-        };
-        if restart_restore::enabled() && stores.slot(durable_source).is_none() {
-            return false;
-        }
-        let key = store::key_digest(durable_source, key);
-        let slot = stores
-            .retiring
-            .iter()
-            .position(|pending| pending.is_some_and(|p| p.key == key))
-            .or_else(|| stores.retiring.iter().position(Option::is_none))
-            .unwrap_or(0);
-        // Replacing a RAM proof candidate never removes its persisted marker;
-        // that key must revalidate on its next visit before it can retire.
-        stores.retiring[slot] = Some(QuietRetirement {
-            key,
-            source,
-            fingerprint: Sha256::digest(fingerprint.as_bytes()).into(),
-            durable: false,
-        });
-        true
-    }
-
-    pub(crate) fn durable_reconcile_retirements<W: SingleWriter>(
-        &self,
-        writer: &W,
-        source: SnapshotSource,
-        index: &mut ScanIndex,
-        index_path: &Path,
-    ) -> usize {
-        if !index_path.starts_with(writer.state_dir()) {
-            return 0;
-        }
-        let Some(durable_source) = durable_source(source) else {
-            return 0;
-        };
-        let retiring = if restart_restore::enabled() {
-            self.durable().map(|stores| stores.retiring)
-        } else {
-            self.durable.lock().ok().map(|root| root.retiring)
-        };
-        let ready: Vec<_> = retiring
-            .map(|retiring| {
-                index
-                    .files
-                    .iter()
-                    .filter(|(key, entry)| {
-                        retiring
-                            .iter()
-                            .flatten()
-                            .find(|pending| pending.key == store::key_digest(durable_source, key))
-                            .is_some_and(|pending| {
-                                pending.source == source
-                                    && pending.durable
-                                    && pending.fingerprint
-                                        == <[u8; 32]>::from(Sha256::digest(
-                                            entry.source_file_fingerprint.as_bytes(),
-                                        ))
-                            })
-                    })
-                    .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut undo = BTreeMap::new();
-        for (key, fingerprint) in &ready {
-            let previous = index
-                .files
-                .get(key)
-                .and_then(|entry| entry.scan_identity_version.clone());
-            if !index.claude_account_deferred_holds.contains_key(key)
-                && index.retire_quiet_audit(key, fingerprint)
-            {
-                undo.insert(key.clone(), previous);
-            }
-        }
-        if undo.is_empty() {
-            return 0;
-        }
-        if index.save(index_path).is_err() {
-            for (key, previous) in undo {
-                if let Some(entry) = index.files.get_mut(&key) {
-                    entry.scan_identity_version = previous;
-                }
-            }
-            return 0;
-        }
-        let retired = undo.len();
-        if !restart_restore::enabled() {
-            if let Ok(mut root) = self.durable.lock() {
-                for pending in &mut root.retiring {
-                    if pending.is_some_and(|p| {
-                        undo.keys()
-                            .any(|key| store::key_digest(durable_source, key) == p.key)
-                    }) {
-                        *pending = None;
-                    }
-                }
-            }
-        }
-        if let Some(mut stores) = self.durable() {
-            for pending in &mut stores.retiring {
-                if pending.is_some_and(|p| {
-                    undo.keys()
-                        .any(|key| store::key_digest(durable_source, key) == p.key)
-                }) {
-                    *pending = None;
-                }
-            }
-        }
-        crate::local_resource_diagnostics::traversal_point(
-            "sampled_audit_retirement",
-            source.api_slug(),
-            &serde_json::json!({"audit_quiet_retired": retired,
-                "pending_audits": index.files.values().filter(|entry| entry.has_unverified_source()).count()}),
-        );
-        retired
-    }
-
     /// After a successful save of `index` (the committed generation), writes
     /// the records of this source's entries admitted since its last write
     /// that are still resident and kept by the save, then collects records
@@ -4698,47 +4263,7 @@ impl SharedCache {
             Ok(None),
         );
         if !restart_restore::enabled() {
-            // The committed save, not the working index, owns quiet-marker
-            // settlement even without a record. Keep the ordinary second CAS.
-            let source = durable_source(snapshot_source)?;
-            let retiring = self.durable.lock().ok()?.retiring;
-            let mut ready = BTreeSet::new();
-            if let Ok(cache) = self.retained() {
-                for key in cache.keys() {
-                    let Some(entry) = index.files.get(key) else {
-                        continue;
-                    };
-                    let digest = store::key_digest(source, key);
-                    if retiring.iter().flatten().any(|pending| {
-                        pending.key == digest
-                            && pending.source == snapshot_source
-                            && pending.fingerprint
-                                == <[u8; 32]>::from(Sha256::digest(
-                                    entry.source_file_fingerprint.as_bytes(),
-                                ))
-                    }) && entry.has_unverified_source()
-                        && !entry.has_prefix_provenance()
-                        && !index.claude_account_deferred_holds.contains_key(key)
-                        && cache.peek(key).is_some_and(|retained| {
-                            retained.checkpoint.audit_debt().is_none()
-                                && certificate_at(
-                                    key,
-                                    &retained.checkpoint,
-                                    index,
-                                    unix_seconds(SystemTime::now()).unwrap_or(0),
-                                )
-                                .is_some()
-                        })
-                    {
-                        ready.insert(digest);
-                    }
-                }
-            }
-            if let Ok(mut root) = self.durable.lock() {
-                for pending in root.retiring.iter_mut().flatten() {
-                    pending.durable |= ready.contains(&pending.key);
-                }
-            }
+            self.qualify_quiet_retirements(snapshot_source, index)?;
             return None;
         }
         let store::LeaseWait::Granted(lease) = self.acquire_active(
@@ -4758,106 +4283,6 @@ impl SharedCache {
         );
         lease.release();
         result
-    }
-
-    fn erase_private_labels<W: SingleWriter>(
-        &self,
-        writer: &W,
-        snapshot_source: SnapshotSource,
-        reason: store::PrivateLabelEraseReason,
-        keep: std::io::Result<Option<&BTreeSet<store::Digest32>>>,
-    ) {
-        let (keep, candidate_error) = match keep {
-            Ok(keep) => (keep, None),
-            Err(error) => (None, Some(error)),
-        };
-        let owner = self.off_exception(snapshot_source);
-        if owner == Ok(false) {
-            return;
-        }
-        let owner_blocked = owner.is_err();
-        let Some(source) = durable_source(snapshot_source) else {
-            return;
-        };
-        let needed = owner_blocked
-            || candidate_error.is_some()
-            || self.durable().is_some_and(|mut stores| {
-                stores.slot(source).as_ref().is_some_and(|slot| {
-                    (keep.is_some()
-                        || (!slot.skill_labels_enabled && !slot.skill_label_purge_complete))
-                        && slot.store.private_label_purge_needed(keep)
-                })
-            });
-        if !needed {
-            return;
-        }
-        let store::LeaseWait::Granted(lease) =
-            self.acquire_active(snapshot_source, store::RESTORE_INPUT_BYTES)
-        else {
-            return;
-        };
-        if let Some(mut stores) = self.durable() {
-            if let Some(slot) = stores.slot(source).as_mut() {
-                let result = if let Some(error) = candidate_error {
-                    Err(error)
-                } else if owner_blocked {
-                    Err(std::io::Error::other("prior OFF unlink barrier"))
-                } else {
-                    match keep {
-                        Some(keep) => {
-                            slot.store
-                                .purge_private_labels_kept(writer, keep, reason, |body| {
-                                    codec::body_has_skill_labels(snapshot_source, body)
-                                        .unwrap_or(true)
-                                })
-                        }
-                        None => slot.store.purge_private_labels(writer, |body| {
-                            codec::body_has_skill_labels(snapshot_source, body).unwrap_or(true)
-                        }),
-                    }
-                };
-                let (visited, scanned, verified, erased, failed) = result
-                    .map_or((0, 0, 0, 0, 1), |r| {
-                        (r.visited, r.scanned, r.verified, r.erased, r.refused)
-                    });
-                slot.skill_label_purge_complete =
-                    failed == 0 && !slot.store.private_label_purge_needed(None);
-                slot.skill_label_purge_failures = if failed > 0 {
-                    slot.skill_label_purge_failures.saturating_add(1)
-                } else if slot.skill_label_purge_complete {
-                    0
-                } else {
-                    // A bounded partial page is progress, not a verified
-                    // successful traversal that can clear earlier failures.
-                    slot.skill_label_purge_failures
-                };
-                let alarm = slot.skill_label_purge_failures > 3;
-                for (class, count) in [
-                    ("skill_label_entries_visited", visited),
-                    ("skill_label_scanned", scanned),
-                    ("skill_label_verified", verified),
-                    ("skill_label_purged", erased),
-                    ("skill_label_purge_failed", failed),
-                ] {
-                    *stores.counters.not_persisted.entry(class).or_default() += count;
-                }
-                if visited + scanned + erased + failed > 0 {
-                    crate::local_resource_diagnostics::durable_tail_alarm(
-                        snapshot_source.api_slug(),
-                        &serde_json::json!({"skill_label_entries_visited":visited,
-                            "skill_label_scanned":scanned, "skill_label_verified":verified,
-                            "skill_label_purged":erased, "skill_label_purge_failed":failed}),
-                    );
-                }
-                if alarm {
-                    crate::local_resource_diagnostics::durable_tail_alarm(
-                        snapshot_source.api_slug(),
-                        &serde_json::json!({"skill_label_purge_failed_consecutive":4}),
-                    );
-                }
-            }
-        }
-        lease.release();
     }
 
     fn write_after_save_active<W: SingleWriter>(
@@ -5230,254 +4655,6 @@ impl SharedCache {
         Some(receipt)
     }
 
-    /// Collects records the committed `index` no longer keeps, from another
-    /// context, scope or allowlist, and torn temps. Runs after a save.
-    pub(crate) fn durable_gc<W: SingleWriter>(
-        &self,
-        writer: &W,
-        snapshot_source: SnapshotSource,
-        index: &ScanIndex,
-    ) -> std::io::Result<()> {
-        match self.off_exception(snapshot_source) {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
-            Err(()) => {
-                // Count refusal without touching the old slot under new context.
-                self.erase_private_labels(
-                    writer,
-                    snapshot_source,
-                    store::PrivateLabelEraseReason::ConsentOrSource,
-                    Ok(None),
-                );
-                return Ok(());
-            }
-        }
-        if let Some(ds) = durable_source(snapshot_source) {
-            let possible = self.durable().and_then(|mut stores| {
-                let slot = stores.slot(ds).as_mut()?;
-                if !slot.store.private_label_purge_needed(None) {
-                    return None;
-                }
-                Some(slot.store.private_label_candidates())
-            });
-            match possible {
-                Some(Ok(possible)) => {
-                    // Retention intersects a bounded marker/inventory, never a
-                    // second unbounded copy of the committed index.
-                    let keep = index
-                        .files
-                        .keys()
-                        .map(|key| store::key_digest(ds, key))
-                        .filter(|key| possible.contains(key))
-                        .collect();
-                    self.erase_private_labels(
-                        writer,
-                        snapshot_source,
-                        store::PrivateLabelEraseReason::CommittedKeyAbsent,
-                        Ok(Some(&keep)),
-                    );
-                }
-                Some(Err(error)) => {
-                    self.erase_private_labels(
-                        writer,
-                        snapshot_source,
-                        store::PrivateLabelEraseReason::CommittedKeyAbsent,
-                        Err(error),
-                    );
-                }
-                None => {}
-            }
-        }
-        if !restart_restore::enabled() {
-            return Ok(());
-        }
-        let Some(source) = durable_source(snapshot_source) else {
-            return Ok(());
-        };
-        let Some(mut stores) = self.durable() else {
-            return Ok(());
-        };
-        stores.note_indexed(source, index);
-        let Some(slot) = stores.slot(source).as_mut() else {
-            return Ok(());
-        };
-        let (namespace, identity_capture) = (&slot.namespace, slot.identity_capture);
-        let context = store::context_digest(
-            &namespace.0,
-            index.active_upload_context_fingerprint.as_deref(),
-        );
-        // Only keys with a record on disk (at most `INVENTORY_BOUND`) are
-        // looked up; the index is streamed, never copied.
-        let inventory = slot.store.inventory()?;
-        if source == DurableSource::ClaudeCode {
-            slot.store.revoke_all();
-        }
-        let mut keep = BTreeMap::new();
-        let mut mapping_holds = BTreeMap::new();
-        if !inventory.is_empty() {
-            for key in index.files.keys() {
-                let digest = store::key_digest(source, key);
-                if !inventory.contains(&digest) {
-                    continue;
-                }
-                if let Some(ScopeDecision::LayoutUnavailable { settled, verified }) =
-                    slot.decided.get(key)
-                {
-                    keep.insert(
-                        digest,
-                        if *settled {
-                            store::GcKeep::LayoutUnavailable {
-                                audit_debt: index.files[key].unverified_deadline(),
-                                verified: *verified,
-                            }
-                        } else {
-                            store::GcKeep::Unknown
-                        },
-                    );
-                    continue;
-                }
-                if matches!(slot.decided.get(key), Some(ScopeDecision::Excluded))
-                    || source == DurableSource::Codex
-                        && index.files[key].codex_history_is_protected()
-                {
-                    keep.insert(
-                        digest,
-                        store::GcKeep::Excluded {
-                            audit_debt: index.files[key].unverified_deadline(),
-                        },
-                    );
-                    continue;
-                }
-                let scope = slot
-                    .decided
-                    .get(key)
-                    .and_then(ScopeDecision::scope)
-                    .and_then(|scope| {
-                        if index.files[key].has_unverified_source() {
-                            return None; // Keep the predecessor until a verified Full replaces it.
-                        }
-                        let interpretation = Interpretation::of(
-                            snapshot_source,
-                            key,
-                            index,
-                            identity_capture,
-                            namespace,
-                        );
-                        if source == DurableSource::ClaudeCode {
-                            let ReadOutcome::Found(record) = slot.store.read(&digest) else {
-                                return None;
-                            };
-                            let (original, _) = match claude_expected(
-                                key,
-                                scope,
-                                index,
-                                &interpretation,
-                                &record,
-                            ) {
-                                Ok(proof) => proof,
-                                Err(reason) => {
-                                    Counters::bump(&mut mapping_holds, reason);
-                                    slot.held += 1;
-                                    return None;
-                                }
-                            };
-                            slot.store.authorize(&record, &original);
-                            return Some(original.binding.scope);
-                        }
-                        None
-                    });
-                keep.insert(
-                    digest,
-                    scope.map_or(store::GcKeep::Unknown, store::GcKeep::Scope),
-                );
-            }
-        }
-        for (reason, n) in mapping_holds {
-            *stores.counters.ineligible.entry(reason).or_default() += n;
-        }
-        stores.counters.gc_keep_peak = stores.counters.gc_keep_peak.max(keep.len() as u64);
-        let Some(slot) = stores.slot(source).as_mut() else {
-            return Ok(());
-        };
-        slot.store.gc_classified(writer, &context, &keep)
-    }
-
-    /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
-    pub(crate) fn durable_remove<W: SingleWriter>(
-        &self,
-        writer: &W,
-        snapshot_source: SnapshotSource,
-    ) -> std::io::Result<()> {
-        self.erase_private_labels(
-            writer,
-            snapshot_source,
-            store::PrivateLabelEraseReason::ConsentOrSource,
-            Ok(Some(&BTreeSet::new())),
-        );
-        // OFF fresh-index cleanup only erases private labels. It cannot
-        // settle v1 failures, especially when an old unlink barrier deferred
-        // that erasure; only verified absence/invalidation clears those ages.
-        if !restart_restore::enabled() {
-            return Ok(());
-        }
-        if let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
-        {
-            for debt in stores.key_debt.values_mut() {
-                if debt.off_v1_failed_since.is_some_and(|(s, _)| s == source) {
-                    debt.off_v1_failed_since = None;
-                }
-            }
-            stores.key_debt.retain(|_, debt| !debt.is_empty());
-            if let Some(slot) = stores.slot(source).as_mut() {
-                slot.off_v1_failed_age_untracked = false;
-            }
-        }
-        let Some(source) = durable_source(snapshot_source) else {
-            return Ok(());
-        };
-        let Some(mut stores) = self.durable() else {
-            return Ok(());
-        };
-        for pending in &mut stores.retiring {
-            if pending.is_some_and(|pending| pending.source == snapshot_source) {
-                *pending = None;
-            }
-        }
-        match stores.slot(source).as_mut() {
-            Some(slot) => {
-                if source == DurableSource::ClaudeCode {
-                    slot.store.revoke_all();
-                }
-                slot.store.gc(writer, &[0; 32], &BTreeMap::new())
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// After a source's local copy is erased. With restart restore on, the next
-    /// `durable_begin_pass` sees no slot and drops this source's retirements. Key
-    /// custody and pacing stay: they are source+key state, never cleared here.
-    pub(crate) fn durable_forget_source(&self, source: SnapshotSource) {
-        if let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) {
-            *stores.slot(source) = None;
-        }
-    }
-
-    /// A post-save pass in a process that does not hold the state-directory
-    /// lock: nothing is written or collected, and the admitted keys are
-    /// dropped (they would never be written).
-    pub(crate) fn durable_note_unlocked(&self, snapshot_source: SnapshotSource) {
-        if durable_source(snapshot_source).is_none() {
-            return;
-        }
-        if let Some(mut stores) = self.durable() {
-            stores.touched.clear();
-            stores.selected.clear();
-            stores.retiring.fill(None);
-            stores.counters.write_unlocked += 1;
-        }
-    }
-
     /// Local alarm on the `local_resources` carrier (#799), counts only: this
     /// source's held keys, T14 rebuilds and mode repairs since the last
     /// report (with totals), and once, the cause that disabled the store.
@@ -5488,29 +4665,7 @@ impl SharedCache {
 
     pub(crate) fn durable_alarm_at(&self, snapshot_source: SnapshotSource, at: std::time::Instant) {
         if !restart_restore::enabled() {
-            let Some(source) = durable_source(snapshot_source) else {
-                return;
-            };
-            let Some(mut stores) = self.durable() else {
-                return;
-            };
-            let (keys, age, untracked) = stores.off_v1_failure_age(source, at);
-            let Some(slot) = stores.slot(source).as_ref() else {
-                return;
-            };
-            let counts = slot.store.counters();
-            if counts.off_v1_invalidated > 0 || counts.off_v1_invalidate_failed > 0 {
-                crate::local_resource_diagnostics::durable_tail_alarm(
-                    snapshot_source.api_slug(),
-                    &serde_json::json!({
-                        "off_v1_invalidated": counts.off_v1_invalidated,
-                        "off_v1_invalidate_failed": counts.off_v1_invalidate_failed,
-                        "off_v1_invalidate_failed_age": {"keys": keys, "oldest_age": age.as_secs()},
-                        "off_v1_invalidate_failed_alarm": age > RESTART_FULL_ALARM_WINDOW || untracked,
-                        "off_v1_failed_age_untracked": untracked,
-                    }),
-                );
-            }
+            self.legacy_alarm_at(snapshot_source, at);
             return;
         }
         self.durable_restart_full_alarm(snapshot_source, at);

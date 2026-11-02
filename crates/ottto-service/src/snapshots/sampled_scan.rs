@@ -72,7 +72,7 @@ pub(super) fn retained_held() -> bool {
 /// The retained-copy lock, marked held for its scope, so a relock on the same
 /// thread panics in debug builds instead of hanging. Reset on drop, unwinds
 /// included.
-pub(super) struct RetainedGuard<'a> {
+pub(in crate::snapshots) struct RetainedGuard<'a> {
     guard: std::sync::MutexGuard<'a, RetainedCache>,
 }
 impl<'a> RetainedGuard<'a> {
@@ -194,7 +194,7 @@ pub(crate) struct SharedCache {
     /// held while taking another. Not part of the state budget: bounded by
     /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
     #[cfg(unix)]
-    durable: Mutex<durable_tail::StoreRoot>,
+    pub(in crate::snapshots) durable: Mutex<durable_tail::StoreRoot>,
     #[cfg(unix)]
     durable_bytes: std::sync::atomic::AtomicUsize,
 }
@@ -289,7 +289,7 @@ impl SharedCache {
 
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
-    pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
+    pub(in crate::snapshots) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
         debug_assert!(
             !codex_cursor::cursor_held(),
             "retained lock taken under the cursor lock"
@@ -2482,5 +2482,28 @@ impl HeapLayoutBound for std::sync::Weak<SharedCache> {
     const INLINE_ONLY: bool = true;
     fn heap_bound(&self, _: &mut Counter) -> Option<()> {
         Some(())
+    }
+}
+
+/// A RAM miss classified solely from committed index state and pass registration.
+#[cfg(unix)]
+pub(in crate::snapshots) fn ram_miss_class(
+    index: &ScanIndex,
+    key: &str,
+    has_slot: bool,
+) -> MissClass {
+    let entry = index.files.get(key);
+    if entry.is_none() && !has_slot {
+        MissClass::NoEntry
+    } else if entry.is_some_and(|entry| entry.source_file_fingerprint.is_empty()) {
+        MissClass::SelectionCleared
+    } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
+        MissClass::HistoryOwed
+    } else if entry.is_none() {
+        MissClass::NoEntry
+    } else if has_slot {
+        MissClass::Missing
+    } else {
+        MissClass::Unavailable
     }
 }
