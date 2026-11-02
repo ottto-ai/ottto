@@ -17,15 +17,14 @@ pub(super) fn binding(source: Source) -> super::super::scan_index_persistence::B
 
 /// Synthetic v1 file name that `scan_index_storage_binding` binds to `source`.
 pub(super) fn synthetic_file(source: Source, suffix: &str) -> String {
-    let slug = match source {
-        Source::Claude => "claude_code",
-        Source::Codex => "codex",
-        Source::Pi => "pi",
-    };
-    format!("{slug}-synthetic-scan-index{suffix}")
+    format!(
+        "{}-synthetic-scan-index{suffix}",
+        source.snapshot().api_slug()
+    )
 }
 
 pub(super) fn populate(
+    source: Source,
     path: &Path,
     index: &ScanIndex,
     presence: BTreeMap<String, bool>,
@@ -34,13 +33,13 @@ pub(super) fn populate(
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-money-custody".into(),
-        binding: binding(Source::Claude),
+        binding: binding(source),
         fence_generation: index.generation,
     };
     db.control("identity", &identity).unwrap();
     db.control("generation", &index.generation).unwrap();
     let mut cx = KindCx::default();
-    cx.binding = Some(binding(Source::Claude));
+    cx.binding = Some(binding(source));
     cx.presence = presence;
     let mut tx = db.begin(TxnMode::Write).unwrap();
     kinds::populate(index, &mut tx, &mut cx).unwrap();
@@ -71,7 +70,7 @@ impl ColdStore {
         // state into the oracle. Leases and in-process flags are not custody.
         let bytes = serde_json::to_vec(index).unwrap();
         let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-        let mut db = populate(path, &expected, BTreeMap::new());
+        let mut db = populate(Source::Claude, path, &expected, BTreeMap::new());
         let restored = hydrate_resident(&mut db);
         expected.generation += 1;
         assert_eq!(
@@ -84,7 +83,8 @@ impl ColdStore {
             expected.decode_holds.v2_provenance()
         );
         expected.generation -= 1;
-        let (session, cold) = ColdSession::publish(&expected, &path.with_extension("session"));
+        let (session, cold) =
+            ColdSession::publish(Source::Claude, &expected, &path.with_extension("session"));
         (Self { session }, cold, restored)
     }
 
@@ -109,11 +109,11 @@ pub(crate) struct ColdSession {
 }
 impl ColdSession {
     /// (custody under `dir`, its cold graph).
-    pub(crate) fn publish(index: &ScanIndex, dir: &Path) -> (Self, ScanIndex) {
+    pub(crate) fn publish(source: Source, index: &ScanIndex, dir: &Path) -> (Self, ScanIndex) {
         let path = dir
             .join("snapshots/destinations")
             .join("a".repeat(64))
-            .join("claude_code-test-scan-index.json");
+            .join(synthetic_file(source, ".json"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let progress = serde_json::to_vec(&serde_json::json!({
             "schema_version": 3,
@@ -123,6 +123,10 @@ impl ColdSession {
         let cold = publish(index, &path, &progress);
         assert!(cold.v2().persistence_v2.is_some(), "a live session");
         (Self { path }, cold)
+    }
+    /// The published index path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
     /// Save `page` (descended from this custody's graph) through the
     /// production route and reload it: (cold graph, resident view).
@@ -194,20 +198,21 @@ pub(crate) fn has_cold_archive(index: &ScanIndex) -> bool {
 
 /// Compare each selected page with the graph the full-clone saver received.
 /// Keep returned commitments across pages, including a freshly rebuilt subset.
-pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
+pub(crate) fn assert_selected_saves(source: Source, initial: &ScanIndex, pages: &[ScanIndex]) {
     let scratch = crate::test_scratch::ScratchDir::canonical("selected-row-saves");
     let mut db = populate(
+        source,
         &scratch.join("state.v2.sqlite.import"),
         initial,
         BTreeMap::new(),
     );
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (previous, mut cx) = kinds::hydrate(&mut db, binding(Source::Claude)).unwrap();
+    let (previous, mut cx) = kinds::hydrate(&mut db, binding(source)).unwrap();
     let mut digests = kinds::baseline(&previous, &mut cx).unwrap();
     for page in pages {
         let mut expected = page.clone();
         digests = kinds::save_graph(&mut db, &identity, digests, &mut expected, &mut cx).unwrap();
-        let restored = kinds::hydrate(&mut db, binding(Source::Claude)).unwrap().0;
+        let restored = kinds::hydrate(&mut db, binding(source)).unwrap().0;
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
             serde_json::to_vec(&expected).unwrap()
@@ -226,7 +231,7 @@ pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
 
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
-    let mut db = populate(path, index, BTreeMap::new());
+    let mut db = populate(Source::Claude, path, index, BTreeMap::new());
     hydrate_resident(&mut db)
 }
 

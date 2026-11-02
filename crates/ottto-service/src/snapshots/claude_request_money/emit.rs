@@ -96,7 +96,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         return false;
     }
     // The uniform session account the account owner already set on every
-    // row carries to the final rows; D1 re-derives it on them afterwards.
+    // row carries to the final rows; the legacy account path re-derives it on them afterwards.
     let account = exact_session_account_hash(item);
     const MAX: u64 = (1_u64 << 53) - 1;
     let mut tokens = ClaudeMoneyTokens::default();

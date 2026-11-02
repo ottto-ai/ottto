@@ -112,11 +112,11 @@ pub struct BackfillState {
     /// installing its credentials. Legacy unbound cutoffs fail closed.
     /// Claude history recorded for another destination is left to the cutoff (not the
     /// history gate) only on this destination, so a later same-user re-claim
-    /// that keeps the cutoff on a new destination is gated (SOURCE h695 N1).
+    /// that keeps the cutoff on a new destination is gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_cutoff_destination_namespace: Option<String>,
-    /// Set when this state stands in for a present but unreadable state file
-    /// (SOURCE F1a, StateMissing H1). Its history is unknown, so it counts as
+    /// Set when this state stands in for a present but unreadable state file.
+    /// Its history is unknown, so it counts as
     /// prior history and arms no bootstrap or replay. Any writer that loads,
     /// changes and saves keeps it, so the signal is never replaced by a plain
     /// default.
@@ -125,7 +125,7 @@ pub struct BackfillState {
     /// The last claim completion returned an explicit `full` policy. Claude
     /// history recorded only for another destination (a re-pair or account
     /// move) is paced through the history gate only then; any other or
-    /// unknown policy holds it (SOURCE ruling, cross-org `full` move).
+    /// unknown policy holds it (cross-org `full` move).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claim_backfill_policy_full: bool,
     /// Set only by a well-formed protected-list read, including an empty list.
@@ -921,7 +921,7 @@ mod tests {
         );
     }
 
-    /// SOURCE F1a, StateMissing H1: only a missing file is a fresh state. An
+    /// Only a missing file is a fresh state. An
     /// unreadable one arms nothing and keeps its marker through a writer
     /// that loads, changes and saves.
     #[test]
@@ -1201,7 +1201,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// SOURCE ruling (cross-org move): each claim records whether its policy
+    /// Cross-org move: each claim records whether its policy
     /// was an explicit `full`; any other or unknown policy clears it.
     #[test]
     fn each_claim_records_whether_its_policy_was_full() {
@@ -1220,7 +1220,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// SOURCE h695 N1: bind at claim persistence, before any bootstrap.
+    /// Bind at claim persistence, before any bootstrap.
     /// A same-user full re-claim keeps that binding even if it interrupts
     /// the first claim's bootstrap. Legacy unbound cutoffs stay unbound.
     #[test]

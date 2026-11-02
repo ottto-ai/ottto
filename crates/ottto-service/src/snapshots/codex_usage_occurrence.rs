@@ -31,8 +31,8 @@ const MAX_TURN_ID_BYTES: usize = 128;
 /// Recently closed turn ids kept for closure finality. A native or a
 /// `task_started` for one of them can never reopen native authority.
 pub(super) const MAX_CLOSED_TURN_IDS: usize = 64;
-/// Counting-contract size of the per-session filter of EVERY closed turn id
-/// (COST round 2): 8 KiB, four bit positions per id from SHA-256 (no process
+/// Counting-contract size of the per-session filter of EVERY closed turn id:
+/// 8 KiB, four bit positions per id from SHA-256 (no process
 /// seed), so membership is a pure function of the record prefix. It has no
 /// false negatives; a hit outside the exact ring is unconfirmed (a reopen
 /// beyond 64 closures, or a false positive) and only zeroes natives.
@@ -775,6 +775,7 @@ impl SnapshotAccumulator {
                 self.latest_turn_id.as_deref(),
             )
         });
+        self.stamp_codex_thread_tier(&mut usage_selector, timestamp);
         // Match the UI price stamp after tier replay, on this row only. Codex
         // input already includes cached input; price the original request's
         // prompt, even when coverage admits only part of its usage.
@@ -1013,7 +1014,7 @@ impl SnapshotAccumulator {
             reducer.note_ui(tuple);
             return Some((resolved_model, legacy_delta, false));
         }
-        // Rule 2: same `last` and same total as the previous UI candidate with
+        // Same `last` and same total as the previous UI candidate with
         // no native between is a re-emission. A decreased total never matches.
         if !reducer.native_since_prev_ui && tuple.is_some() && tuple == reducer.prev_ui {
             reducer.counters.ui_equal_total_repeat += 1;

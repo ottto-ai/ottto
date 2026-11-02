@@ -480,7 +480,7 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     assert!(inputs.holds_attribution(), "a refusal keeps it cached");
 }
 
-/// Contract-5 cutover, byte-stable keys (Lead B): a Claude cycle's sampled
+/// Contract-5 cutover, byte-stable keys: a Claude cycle's sampled
 /// scope keeps the permit-era permitted `:request_identity` suffix for good,
 /// and a Codex cycle keeps its suffix-free bytes, so durable records and
 /// retained parsers written before the cutover still bind after it. Golden

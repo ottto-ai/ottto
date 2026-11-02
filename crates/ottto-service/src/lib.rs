@@ -282,7 +282,7 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
-    scan_index_health_revisions: [[u64; 3]; 2],
+    scan_index_health_revisions: [[u64; 3]; 3],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
@@ -306,7 +306,12 @@ struct DaemonState {
     /// report it; every status query reports the query time only as
     /// `last_seen_at`.
     started_at: String,
+    /// In memory only: when each active read-time blocker was first seen.
+    blocker_first_seen: BlockerFirstSeen,
 }
+
+/// First-seen `since` per blocker, keyed by `(code, source)`.
+type BlockerFirstSeen = BTreeMap<(String, String), String>;
 
 impl DaemonState {
     fn first_seen(&self, source: &SourceKind) -> Option<String> {
@@ -493,7 +498,7 @@ impl LocalDaemon {
                 sources: Vec::new(),
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
-                scan_index_health_revisions: [[0; 3]; 2],
+                scan_index_health_revisions: [[0; 3]; 3],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
                 command_ledger: Vec::new(),
@@ -505,6 +510,7 @@ impl LocalDaemon {
                 running: true,
                 started_at: now.clone(),
                 now,
+                blocker_first_seen: BlockerFirstSeen::new(),
             })),
             control_token,
         }
@@ -650,7 +656,7 @@ impl LocalDaemon {
             let finding = self.relay_mismatch.observe(
                 observed.filter(|_| state.relay == relay && state.relay.last_error.is_none()),
             );
-            status_from_state_with_relay_finding(&state, finding)
+            status_from_state_with_relay_finding(&mut state, finding)
         };
         if snapshots::claude_native_comparison::enabled() {
             status.native_comparison = Some(self.native_comparison.status());
@@ -2250,7 +2256,7 @@ fn projected_scan_index_refusal(
 }
 
 fn status_from_state_with_relay_finding(
-    state: &DaemonState,
+    state: &mut DaemonState,
     relay_finding: Option<StableMessage>,
 ) -> DaemonStatus {
     let mut status = empty_status(state.machine.clone(), current_rfc3339_timestamp());
@@ -2283,17 +2289,17 @@ fn status_from_state_with_relay_finding(
     }
     status.sources = state.sources.clone();
     for health in &mut status.sources {
-        let source = match health.source {
-            SourceKind::Codex => snapshots::SnapshotSource::Codex,
-            SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
-            SourceKind::Pi => snapshots::SnapshotSource::Pi,
-        };
+        let source = snapshot_sync::snapshot_source_of_kind(&health.source);
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
-    refresh_canonical_local_health_with_started_at(&mut status, &state.started_at);
+    refresh_canonical_local_health_with_started_at(
+        &mut status,
+        &state.started_at,
+        &mut state.blocker_first_seen,
+    );
     status
 }
 
@@ -2376,12 +2382,26 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
         .as_ref()
         .map(|heartbeat| heartbeat.started_at.clone())
         .unwrap_or_else(|| status.generated_at.clone());
-    refresh_canonical_local_health_with_started_at(status, &started_at);
+    // Keep the first-seen times the status already carries.
+    let mut first_seen: BlockerFirstSeen = status
+        .canonical_health
+        .iter()
+        .flat_map(|health| &health.blockers)
+        .map(|blocker| {
+            let key = (blocker.code.clone(), blocker.source.clone());
+            (key, blocker.since.clone())
+        })
+        .collect();
+    refresh_canonical_local_health_with_started_at(status, &started_at, &mut first_seen);
 }
 
 /// Project canonical health from daemon state, where `started_at` is the
 /// process start instant recorded once at construction.
-pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus, started_at: &str) {
+fn refresh_canonical_local_health_with_started_at(
+    status: &mut DaemonStatus,
+    started_at: &str,
+    first_seen: &mut BlockerFirstSeen,
+) {
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
     let runtime_event = LocalHealthEventV1 {
@@ -2436,7 +2456,8 @@ pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus,
         }
     }
     apply_account_prerequisite_to_sources(&account, &mut sources);
-    let blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
+    let mut blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
+    keep_blocker_first_seen(&mut blockers, &observed_at, first_seen);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
     let evidence = events
         .iter()
@@ -2899,11 +2920,7 @@ fn local_health_source_for_status(
     projection_revision: u64,
     events: &[LocalHealthEventV1],
 ) -> LocalHealthSourceV1 {
-    let snapshot_source = match source.source {
-        SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => snapshots::SnapshotSource::Pi,
-    };
+    let snapshot_source = snapshot_sync::snapshot_source_of_kind(&source.source);
     if let Some((reason, since)) = projected_scan_index_refusal(events, snapshot_source) {
         return scan_index_refused_source(&source.source, projection_revision, since, reason);
     }
@@ -2919,7 +2936,7 @@ fn local_health_source_for_status(
             next_action: Some("review_scan_index_repair".to_string()),
             // The automatic retry time is the guard's own witness stamp plus
             // seven days; a user Repair may run one gated rebuild sooner.
-            // A refused override (SI-718-O1) names its code; the source and
+            // A refused override names its code; the source and
             // its index stay as they were.
             clear_condition: Some(format!(
                 "successful compatible scan-index load after a user Repair (one gated rebuild per 24 h) or the automatic retry{}{}; preserve the index and quarantine witnesses, never delete the index",
@@ -3284,6 +3301,26 @@ fn local_health_blockers_for_status(
         ));
     }
     blockers
+}
+
+/// A blocker without an event time is stamped with the read time. Report the
+/// first read that saw it while it stays active; forget it once it clears.
+fn keep_blocker_first_seen(
+    blockers: &mut [LocalHealthBlockerV1],
+    observed_at: &str,
+    first_seen: &mut BlockerFirstSeen,
+) {
+    let previous = std::mem::take(first_seen);
+    for blocker in blockers
+        .iter_mut()
+        .filter(|blocker| blocker.since == observed_at)
+    {
+        let key = (blocker.code.clone(), blocker.source.clone());
+        if let Some(since) = previous.get(&key) {
+            blocker.since.clone_from(since);
+        }
+        first_seen.insert(key, blocker.since.clone());
+    }
 }
 
 fn blocker(
@@ -6122,6 +6159,43 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// [regress] A standing blocker reported the read time as `since`, so
+    /// every status read showed it as new.
+    #[test]
+    fn standing_blocker_keeps_first_seen_since_until_it_clears() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let stale_since = |status: &DaemonStatus| {
+            status
+                .canonical_health
+                .as_ref()
+                .expect("canonical health")
+                .blockers
+                .iter()
+                .find(|blocker| blocker.code == otlp_relay::legacy::STALE_EXPORTER_CODE)
+                .map(|blocker| blocker.since.clone())
+        };
+        let read = |now| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            otlp_relay::legacy::with_recent_request_for_test(1000, now, || {
+                let mut status = daemon.status(TOKEN).expect("status");
+                let since = stale_since(&status);
+                // A re-projection of the same status keeps it too.
+                refresh_canonical_local_health(&mut status);
+                assert_eq!(stale_since(&status), since);
+                (since, status.generated_at)
+            })
+        };
+        let (first, first_read) = read(1000);
+        assert_eq!(first.as_deref(), Some(first_read.as_str()));
+        let (second, second_read) = read(1001);
+        assert_ne!(second_read, first_read);
+        assert_eq!(second, first);
+        assert_eq!(read(4600).0, None);
+        let (again, again_read) = read(1002);
+        assert_eq!(again.as_deref(), Some(again_read.as_str()));
+        assert_ne!(again, first);
     }
 
     #[test]

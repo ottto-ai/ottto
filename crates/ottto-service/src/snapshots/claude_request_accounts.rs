@@ -36,8 +36,8 @@ pub(crate) struct MixedUploads {
     bodies: BTreeMap<String, (String, String)>,
     /// Contract-5 bodies tagged in this scan, bound the same way.
     request_identity: BTreeMap<String, (String, String)>,
-    /// Bodies left with no account by a non-discard unhealthy read this scan
-    /// (Lead B Addendum 4), bound the same way, with the account it cleared.
+    /// Bodies left with no account by a non-discard unhealthy read this scan,
+    /// bound the same way, with the account it cleared.
     unhealthy_unknown: BTreeMap<String, ((String, String), String)>,
 }
 
@@ -70,7 +70,7 @@ impl MixedUploads {
         }
     }
 
-    /// Call before the E2 fold is released: it names the unhealthy reason.
+    /// Call before the `e2` fold is released: it names the unhealthy reason.
     pub(crate) fn admit_unhealthy_unknown(&mut self, item: &SnapshotItem) {
         if let Some(cleared) = super::claude_request_identity::unhealthy_cleared_account(item) {
             if super::exact_session_account_hash(item).is_none() {
@@ -92,7 +92,7 @@ impl MixedUploads {
     }
 
     /// Only the hold the clear itself created: main uploads a body whose
-    /// account is the owner's, and keeps holding any other (Lead B Addendum 4).
+    /// account is the owner's, and keeps holding any other.
     pub(super) fn permits_unhealthy_unknown(&self, item: &SnapshotItem, owner: &str) -> bool {
         self.unhealthy_unknown
             .get(&item.source_session_id)
@@ -300,7 +300,7 @@ pub(super) fn normalize_activity(item: &mut SnapshotItem) -> bool {
 /// All counted requests must have genuine original terminal usage-event clocks
 /// before any fallback/fold, and must reproduce EVERY represented hourly min/max.
 /// Legacy OTLP v2 cannot prove event-vs-observer origin; auxiliary-only rows and
-/// timestamps carried across unstamped partials therefore cannot qualify D1.
+/// timestamps carried across unstamped partials therefore cannot qualify.
 fn original_event_clocks_complete(item: &SnapshotItem) -> bool {
     if item.request_count == 0
         || item.claude_usage_occurrences.len() as u64 != item.request_count

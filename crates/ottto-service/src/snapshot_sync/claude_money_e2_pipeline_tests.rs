@@ -1,4 +1,4 @@
-// E2 acceptance from synthetic files through the production scan, fresh
+// `e2` acceptance from synthetic files through the production scan, fresh
 // sidecar read, native finalize, emission, policy, batch and ACK settlement.
 // No supplied accumulators, literal bodies or money totals stand in for reads.
 // Terminal policy is the production default. Quiet-context controls also need
@@ -6,7 +6,10 @@
 // into future-paging completion just to make those controls pass.
 use super::*;
 use crate::snapshots::claude_request_money::e2;
-use crate::snapshots::e2_pipeline_scan_fixture::{birth_store_bytes, E2ScanFixture};
+use crate::snapshots::e2_pipeline_scan_fixture::{
+    accept_upload_context_acks_for_test, birth_store_bytes, upload_context_owed_for_test,
+    upload_context_receipt_earned_for_test, E2ScanFixture,
+};
 use serde_json::json;
 
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -162,6 +165,8 @@ impl Corpus {
             disposition: Default::default(),
             released: Default::default(),
             unhealthy: Default::default(),
+            stats: Default::default(),
+            delivered: None,
         }
     }
 
@@ -189,6 +194,10 @@ struct Page {
     released: e2::pipeline_test_observer::Released,
     /// #947: requests the last enrichment left Unknown for an unhealthy root.
     unhealthy: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
+    stats: ClaudeLocalEvidenceStats,
+    /// Exact ACKs of this page's final bodies, when `ready` delivered them:
+    /// `finish` then earns the file receipts as the service finish does.
+    delivered: Option<BTreeMap<String, String>>,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -206,9 +215,27 @@ impl Page {
     fn enrich_with_budget(
         &mut self,
         corpus: &Corpus,
-        accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        mut accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
         wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+        // The streamed-evidence arm: the same enrichment, keeping every root's
+        // rows, first (taking the check so it does not recurse). It only
+        // observes: the fixture's diag, read receipts and hooks stay its own.
+        let checks = STREAMED_CHECKS.with(std::cell::Cell::take);
+        let terminal = self.scan.census_complete;
+        let whole = checks.map(|_| {
+            unobserved(|| {
+                let mut whole = twin(self);
+                let mut accepted = accepted.as_deref().cloned();
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
+                let reads = api_reads(|| {
+                    whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
+                });
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
+                (whole, accepted, reads)
+            })
+        });
+        let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
@@ -224,11 +251,12 @@ impl Page {
                 )
                 .unwrap()
             });
-        if let Some(accepted) = accepted {
+        if let Some(accepted) = accepted.as_deref_mut() {
             accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
         }
         self.released = released;
         self.unhealthy = stats.unhealthy_root_no_fallback_requests;
+        self.stats = stats;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
         let deferred = self.index.bind_session_accounts_with_mixed(
@@ -251,7 +279,23 @@ impl Page {
             &disposition,
             &backfill,
         );
+        // The streamed terminal's local counters depend on the store's
+        // representation (resident or cold) and are logged only; the arms
+        // compare what the fold decided (its stats copy included).
+        disposition.terminal_stream = Default::default();
+        self.stats.terminal_stream = Default::default();
         self.disposition = disposition.clone();
+        if let (Some(mut checks), Some((whole, whole_accepted, whole_reads))) = (checks, whole) {
+            let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
+            unobserved(|| {
+                checks.compare(
+                    terminal,
+                    (&whole, whole_accepted.as_ref(), whole_reads),
+                    (self, accepted.as_deref(), reads),
+                )
+            });
+            STREAMED_CHECKS.with(|slot| slot.set(Some(checks)));
+        }
         disposition
     }
     fn finish(&mut self) -> LocalHoldSettlement {
@@ -274,6 +318,9 @@ impl Page {
         );
         self.index
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
+        if let Some(acks) = &self.delivered {
+            accept_upload_context_acks_for_test(&mut self.index, &self.scan.snapshots, acks);
+        }
         holds
     }
 
@@ -289,6 +336,383 @@ impl Page {
                 )
             })
             .collect()
+    }
+}
+// --- Streamed local evidence equals a whole-corpus fold (arm) -------------
+
+thread_local! {
+    /// `Some` while the arm runs: every enrichment is compared both ways.
+    static STREAMED_CHECKS: std::cell::Cell<Option<StreamedChecks>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One side of a compared enrichment: the page, its accepted buckets and the
+/// API sidecar opens its fold made.
+type ComparedSide<'p> = (
+    &'p Page,
+    Option<&'p crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    usize,
+);
+
+/// What the compared enrichments exercised, so the arm cannot pass vacuously.
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamedChecks {
+    non_terminal: usize,
+    terminal: usize,
+    /// Enrichments whose streamed read dropped another complete root's rows.
+    dropped: usize,
+    /// Enrichments whose terminal proof reread a pair the page did not keep.
+    reread: usize,
+    /// Enrichments whose bodies, both ways, carry L2 and its org forward to
+    /// root A's own request that has no telemetry row.
+    carried: usize,
+}
+
+impl StreamedChecks {
+    /// One enrichment: the streamed fold (only the page's roots keep rows)
+    /// against the same fold keeping every root's rows. Byte equality
+    /// without normalization for bodies (contract-5 tags included), the
+    /// persisted index, stats, holds and the finalized wire; the money oracle
+    /// for totals and account placement.
+    fn compare(
+        &mut self,
+        terminal: bool,
+        whole: ComparedSide<'_>,
+        streamed: ComparedSide<'_>,
+    ) {
+        use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
+        let ((whole, whole_accepted, whole_reads), (streamed, accepted, reads)) = (whole, streamed);
+        assert_eq!(
+            canonical(&whole.scan.snapshots),
+            canonical(&streamed.scan.snapshots),
+            "bodies, contract-5 tags included"
+        );
+        assert_eq!(whole.scan.census_complete, streamed.scan.census_complete);
+        assert_eq!(canonical(&whole.index), canonical(&streamed.index), "index");
+        assert_eq!(canonical(&whole.stats), canonical(&streamed.stats), "stats");
+        assert_eq!(whole.disposition, streamed.disposition, "holds and counts");
+        assert_eq!(whole_accepted, accepted, "accepted buckets");
+        let [(whole_index, whole_route), (index, route)] =
+            [(whole, Mode::ColdFull), (streamed, Mode::Ram)].map(|(page, mode)| {
+                let mut sent = twin(page);
+                sent.finish();
+                let (result, batches, _) = upload(&sent.scan.snapshots, &mut e2_progress(), ack);
+                let route = matches!(result, Ok(ResumableUploadResult::Completed)).then(|| {
+                    RouteResult::emitted(
+                        mode,
+                        SnapshotSource::ClaudeCode,
+                        batches.clone(),
+                        &sent.scan.snapshots,
+                    )
+                });
+                (canonical(&sent.index), (batches, route))
+            });
+        assert_eq!(whole_index, index, "settled index");
+        assert_eq!(whole_route.0, route.0, "wire bytes");
+        if let (Some(whole_route), Some(route)) = (&whole_route.1, &route.1) {
+            if !whole_route.snapshots.is_empty() {
+                money_oracle::assert_equivalent(whole_route, route);
+                if terminal {
+                    self.terminal += 1;
+                } else {
+                    self.non_terminal += 1;
+                }
+            }
+        }
+        let carried = [whole, streamed].map(|page| carried_forward(&page.scan.snapshots));
+        assert_eq!(carried[0], carried[1], "carried accounts");
+        self.carried += usize::from(carried[1].contains(&(
+            ROOT.to_owned(),
+            Some("2".repeat(64)),
+            Some("8".repeat(64)),
+            1,
+        )));
+        let page_roots = claude_evidence_root_session_ids(&streamed.scan.snapshots).len();
+        self.dropped += usize::from(streamed.stats.complete_sidecar_root_count > page_roots);
+        self.reread += usize::from(terminal && reads > whole_reads);
+    }
+}
+
+/// Runs the arm's own work leaving this thread's e2 diag, stage timers,
+/// evidence read receipts and pending trace hook as the fixture left them.
+fn unobserved<T>(f: impl FnOnce() -> T) -> T {
+    e2::without_diag(|| crate::claude_local_otel::without_read_receipts(f))
+}
+
+/// The API sidecar opens `read` makes on this thread.
+fn api_reads(read: impl FnOnce()) -> usize {
+    let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
+    read();
+    crate::claude_local_otel::evidence_read_counts_for_test().0 - before
+}
+
+/// (session, login, org, requests) of every share placed by a carried-forward
+/// account.
+fn carried_forward(snapshots: &[SnapshotItem]) -> Vec<(String, Option<String>, Option<String>, u64)> {
+    let mut carried = Vec::new();
+    for item in snapshots {
+        let evidence = |at: Option<u16>| at.map(|at| &item.request_evidence[usize::from(at)]);
+        for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+            let shares = match &row.identity_parts {
+                Some(parts) => parts
+                    .iter()
+                    .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                    .collect(),
+                None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+            };
+            for (login, at, requests) in shares {
+                if let Some(evidence) = evidence(at).filter(|evidence| {
+                    evidence.account_source == Some(crate::snapshots::AccountSource::CarriedForward)
+                }) {
+                    carried.push((
+                        item.source_session_id.clone(),
+                        login.clone(),
+                        evidence.provider_workspace_hash.clone(),
+                        requests,
+                    ));
+                }
+            }
+        }
+    }
+    carried
+}
+
+/// Runs `fixtures` with every enrichment compared both ways.
+fn streamed_checks(fixtures: impl FnOnce()) -> StreamedChecks {
+    STREAMED_CHECKS.with(|slot| slot.set(Some(StreamedChecks::default())));
+    fixtures();
+    STREAMED_CHECKS
+        .with(std::cell::Cell::take)
+        .expect("the arm's checks stay installed")
+}
+
+/// `api_for` with an intact `login` and, when given, a complete `org`.
+fn api_login(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    login: char,
+    org: Option<char>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    use crate::claude_local_otel::{
+        ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
+    };
+    let attribute = |hash: Option<String>| ClaudeIdentityAttributeEvidence {
+        origin: if hash.is_some() {
+            ClaudeIdentityAttributeOrigin::LogRecord
+        } else {
+            ClaudeIdentityAttributeOrigin::Missing
+        },
+        disposition: if hash.is_some() {
+            ClaudeIdentityDisposition::Complete
+        } else {
+            ClaudeIdentityDisposition::Missing
+        },
+        resource_hash: None,
+        log_record_hash: hash,
+    };
+    let login = login.to_string().repeat(64);
+    let mut row = api_for(session, request, tokens, tokens * 10);
+    row.account_identity_checked = true;
+    row.account_identifier_hash = Some(login.clone());
+    row.request_identity = Some(crate::claude_local_otel::ClaudeRequestIdentityEvidence {
+        identity_hash_scheme: "provider-sha256:v1".into(),
+        account: attribute(Some(login)),
+        organization: attribute(org.map(|org| org.to_string().repeat(64))),
+        disposition: ClaudeIdentityDisposition::Complete,
+    });
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&row).unwrap())
+    );
+    row
+}
+
+const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+const LOGINS: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+const MALFORMED: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+/// Five roots swept one file per page, then again after the page root grows,
+/// with the account-source capability on: root A (side call, a switch from
+/// login-only L1 to L2 with a complete org mid-stream, then an own request
+/// with no telemetry row that carries L2 forward), legacy
+/// fork F of A, resume copy C of A with no rows of its own, D (L1's complete
+/// org, and C's own request reported under D: the tripwire and a foreign
+/// owner), and U with a malformed sidecar. `multi_root`: F also claims A's
+/// request (MultiRootClaims).
+fn five_root_sweep(multi_root: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-streamed-evidence-{multi_root}"));
+        let a = c.root(
+            ROOT,
+            &(line(ROOT, "shared", AT, 10)
+                + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)
+                + &line(ROOT, "switch", "2026-08-02T07:02:00Z", 25)
+                + &line(ROOT, "gap", "2026-08-02T07:02:30Z", 12)),
+        );
+        c.evidence_for(
+            ROOT,
+            &[
+                api_login(ROOT, "shared", 10, '1', None),
+                api_login(ROOT, "parent", 20, '1', None),
+                api_login(ROOT, "switch", 25, '2', Some('8')),
+                api_for(ROOT, "side", 4, 40),
+            ],
+            &[
+                trace_for(ROOT, "shared", ""),
+                trace_for(ROOT, "parent", ""),
+                trace_for(ROOT, "switch", ""),
+                trace_for(ROOT, "side", ""),
+            ],
+        );
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "shared", AT, 10) + &line(COPY, "child", "2026-08-02T07:04:00Z", 30)),
+            "2026-08-02T07:03:00Z",
+        );
+        let mut fork_api = vec![api_for(COPY, "child", 30, 300)];
+        let mut fork_trace = vec![trace_for(COPY, "child", "")];
+        if multi_root {
+            fork_api.push(api_for(COPY, "shared", 10, 100));
+            fork_trace.push(trace_for(COPY, "shared", ""));
+        }
+        c.evidence_for(COPY, &fork_api, &fork_trace);
+        c.write_at(
+            &format!("{RESUMED}.jsonl"),
+            &(line(RESUMED, "parent", "2026-08-02T07:01:00Z", 20)
+                + &line(RESUMED, "resumed", "2026-08-02T07:05:00Z", 15)),
+            "2026-08-02T07:04:30Z",
+        );
+        c.write_at(
+            &format!("{LOGINS}.jsonl"),
+            &line(LOGINS, "d-own", "2026-08-02T07:06:00Z", 5),
+            "2026-08-02T07:05:30Z",
+        );
+        c.evidence_for(
+            LOGINS,
+            &[
+                api_login(LOGINS, "d-own", 5, '1', Some('9')),
+                api_for(LOGINS, "resumed", 15, 150),
+            ],
+            &[trace_for(LOGINS, "d-own", ""), trace_for(LOGINS, "resumed", "")],
+        );
+        c.write_at(
+            &format!("{MALFORMED}.jsonl"),
+            &line(MALFORMED, "u-own", "2026-08-02T07:07:00Z", 3),
+            "2026-08-02T07:06:30Z",
+        );
+        c.evidence_for(
+            MALFORMED,
+            &[api_for(MALFORMED, "u-own", 3, 30)],
+            &[trace_for(MALFORMED, "u-own", "")],
+        );
+        append(
+            &c.support
+                .join("local-otel/claude-code-effort")
+                .join(format!("{:x}.jsonl", Sha256::digest(MALFORMED.as_bytes()))),
+            "{malformed\n",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut index = ScanIndex::default();
+        let mut accepted = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+        accepted.set_account_source_enabled(true);
+        for sweep in 0..2 {
+            if sweep == 1 {
+                append(&a, &line(ROOT, "later", "2026-08-02T07:08:00Z", 6));
+                c.evidence_for(
+                    ROOT,
+                    &[
+                        api_login(ROOT, "shared", 10, '1', None),
+                        api_login(ROOT, "parent", 20, '1', None),
+                        api_login(ROOT, "switch", 25, '2', Some('8')),
+                        api_for(ROOT, "side", 4, 40),
+                        api_login(ROOT, "later", 6, '2', None),
+                    ],
+                    &[
+                        trace_for(ROOT, "shared", ""),
+                        trace_for(ROOT, "parent", ""),
+                        trace_for(ROOT, "switch", ""),
+                        trace_for(ROOT, "side", ""),
+                        trace_for(ROOT, "later", ""),
+                    ],
+                );
+            }
+            for _ in 0..12 {
+                let mut page = c.raw(&scanner, index, 1, true, &[]);
+                page.enrich_with(&c, Some(&mut accepted));
+                page.finish();
+                index = c.reload(&mut page.index);
+                if page.scan.census_complete {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// [money] Streaming the Claude local evidence (only the page's roots keep
+/// rows; every root adds its cross-root answers as it is read; a terminal
+/// proof rereads the pairs it did not keep) emits exactly what a fold over
+/// every root's rows emits. Every enrichment of the fixtures below runs both
+/// ways: bodies, contract-5 tags, persisted index, holds and stats byte-equal,
+/// the money oracle equal, on non-terminal and terminal passes.
+#[test]
+fn streamed_evidence_equals_whole_corpus() {
+    // A request's API and trace rows under its own root are one owner; only
+    // another root's claim makes it ambiguous (the original has both rows).
+    let mut roots = crate::snapshots::claude_request_identity::RequestRootIndex::default();
+    roots.add_root(0, ["original", "copied", "original"].into_iter());
+    roots.add_root(1, ["copied"].into_iter());
+    roots.finish();
+    assert_eq!(roots.get("original"), Some(Some(0)));
+    assert_eq!(roots.get("copied"), Some(None));
+    assert_eq!(roots.get("absent"), None);
+
+    let checks = streamed_checks(|| {
+        five_root_sweep(false);
+        five_root_sweep(true);
+        // Existing fixtures, each enrichment now compared both ways:
+        e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback();
+        // An off-page trace-named subagent.
+        e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root();
+        // A queued, stale copy holder.
+        copy_waits_for_queued_holder(true);
+        // A prefix hold expiring.
+        e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions();
+        // Retired and departed holders.
+        e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires();
+        e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index();
+        // Path twins.
+        twins(false);
+        // A page copy with no own rows (the foreign-owner branch).
+        e2_pipeline_resumed_prefix_counts_removed_partial_dollars_and_own_turns();
+        e2_pipeline_legacy_fork_prefix_is_removed_exactly_once();
+    });
+    assert!(
+        checks.non_terminal > 0
+            && checks.terminal > 0
+            && checks.dropped > 0
+            && checks.reread > 0
+            && checks.carried > 0,
+        "the arm must compare non-terminal and terminal passes that drop and reread rows \
+         and carry an account forward: {checks:?}"
+    );
+}
+
+fn twin(p: &Page) -> Page {
+    Page {
+        cache: p.cache.clone(),
+        committed: p.committed.clone(),
+        index: p.index.clone(),
+        scan: p.scan.clone(),
+        modes: p.modes,
+        disposition: p.disposition.clone(),
+        released: p.released,
+        unhealthy: p.unhealthy,
+        stats: p.stats.clone(),
+        // A twin is an undelivered copy: only `ready`'s original earns receipts.
+        delivered: None,
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -507,23 +931,16 @@ fn ready(
 ) -> Page {
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
-    let mut send = Page {
-        cache: p.cache.clone(),
-        committed: p.committed.clone(),
-        index: p.index.clone(),
-        scan: p.scan.clone(),
-        modes: p.modes,
-        disposition: p.disposition.clone(),
-        released: p.released,
-        unhealthy: p.unhealthy,
-    };
+    let mut send = twin(&p);
     send.finish();
-    let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
+    let mut progress = e2_progress();
+    let (result, _, _) = upload(&send.scan.snapshots, &mut progress, ack);
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Completed,
         "real finalized bodies pass batching and entity ACK"
     );
+    p.delivered = Some(std::mem::take(&mut progress.fresh_context_body_acks));
     p
 }
 
@@ -855,7 +1272,7 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
-/// R1: each walk meets both path twins, but a settled twin does not pull its
+/// Each walk meets both path twins, but a settled twin does not pull its
 /// family into the page. Only a twin the page reads does; otherwise the
 /// family is read again and one batch is sent on every walk.
 #[test]
@@ -885,6 +1302,11 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
                 assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
                 page.index
                     .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+                accept_upload_context_acks_for_test(
+                    &mut page.index,
+                    &page.scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
             }
             pages.push((
                 page.scan.scanned_file_count,
@@ -979,7 +1401,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         std::fs::remove_file(original).unwrap();
         let stored = stored_bodies(&prior);
         let mut left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        // R1 (owner-authorized): the unchanged survivor is not read again
+        // The unchanged survivor is not read again
         // (latest wins); it re-emits on its next real change.
         assert!(
             left.scan.snapshots.is_empty(),
@@ -1585,7 +2007,7 @@ fn restored_twins(reverse: bool, equal: bool) {
         let stored = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
         let mut again = ready(&c, &scanner, prior, 100, false);
-        // R1 (owner-authorized): an unchanged repeated page reads and sends
+        // An unchanged repeated page reads and sends
         // nothing (latest wins); a real change re-emits the twin group.
         assert!(
             again.scan.snapshots.is_empty(),
@@ -1676,7 +2098,8 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
                       mut page: Page,
                       progress: &mut SnapshotUploadProgress| {
             page.finish();
-            upload(&page.scan.snapshots, progress, ack).0.unwrap();
+            let sent = page.scan.snapshots.clone();
+            upload(&sent, progress, ack).0.unwrap();
             let holds = LocalHoldSettlement::classify(
                 SnapshotSource::ClaudeCode,
                 &mut page.index,
@@ -1685,6 +2108,11 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             );
             let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
             settle_index_after_upload(&mut settled.index, committed, progress);
+            accept_upload_context_acks_for_test(
+                &mut settled.index,
+                &sent,
+                &progress.fresh_context_body_acks,
+            );
             c.reload(&mut settled.index)
         };
         let old = ScanIndex::default();
@@ -1764,7 +2192,8 @@ fn settle_in(
     index_name: &str,
 ) -> ScanIndex {
     page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let sent = page.scan.snapshots.clone();
+    upload(&sent, progress, ack).0.unwrap();
     let holds = LocalHoldSettlement::classify(
         SnapshotSource::ClaudeCode,
         &mut page.index,
@@ -1773,6 +2202,11 @@ fn settle_in(
     );
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
     c.reload_in(&mut settled.index, index_name)
 }
 
@@ -1807,7 +2241,7 @@ fn assert_withheld(page: &Page, session: &str, why: &str) {
     );
 }
 
-/// Owner ruling 1 (Codex P1-1 case 1): an earlier twin rewritten IN PLACE
+/// An earlier twin rewritten IN PLACE
 /// (same inode, size kept) no longer holds H. Its stale identity cannot
 /// remove H from the later twin: H counts once, from the twin.
 fn rewritten_original(reverse: bool) {
@@ -1882,7 +2316,7 @@ fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() 
     rewritten_original(true);
 }
 
-/// Owner ruling 1 (Codex P1-1 case 2): restored same-session histories H1
+/// Restored same-session histories H1
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
 /// the first page in either discovery order and through settlement.
 fn overlapping_restored(reverse: bool) {
@@ -1932,7 +2366,7 @@ fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
     overlapping_restored(true);
 }
 
-/// Owner ruling 2: an all-copied /branch is skipped on the request ids its
+/// An all-copied /branch is skipped on the request ids its
 /// earlier other-session holder has, whatever version wrote the lines.
 fn branch_by(version: &str) {
     with_e2(|| {
@@ -1965,11 +2399,11 @@ fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request
 }
 #[test]
 fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
-    // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
+    // `claude --version` observed on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
 
-/// Owner ruling 3: a /branch read before its original on a fresh index
+/// A /branch read before its original on a fresh index
 /// cannot decide: it is held (never counted), and a later page that reads
 /// the original skips it. Both discovery orders.
 fn branch_before_original(copy_first: bool) {
@@ -2209,7 +2643,7 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
     });
 }
 
-/// Owner ruling 3: the census walk deadline decides nothing: the /branch is
+/// The census walk deadline decides nothing: the /branch is
 /// held, then the next page's walk skips it.
 #[test]
 fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
@@ -2242,7 +2676,7 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
     });
 }
 
-/// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
+/// The legacy fork-prefix exclusion and the `e2` copy
 /// skip never both remove a copied request. A legacy fork child whose
 /// leading request telemetry assigns to its parent, with a divergent parent
 /// prefix (the exclusion's exact shape, derived on this page), publishes
@@ -2369,7 +2803,7 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
-/// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
+/// Stopgap, demo chain: the copy-only resume `COPY` repeats requests its
 /// original `ROOT` still holds. When both records are past 35 days, a
 /// complete terminal keeps both (they share ids), so a later re-read of the
 /// copy still proves its copies against the original instead of counting
@@ -2551,7 +2985,7 @@ fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() 
     copy_waits_for_queued_holder(false);
 }
 
-/// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
+/// A file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
 fn conflict_only(subagent: bool) {
@@ -2675,9 +3109,15 @@ fn settle_captured_holds(
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
     let holds = page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let sent = page.scan.snapshots.clone();
+    upload(&sent, progress, ack).0.unwrap();
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
     c.reload(&mut settled.index)
 }
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
@@ -2825,7 +3265,7 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     }
 }
 
-// Copy-family fix (Lead B 2026-10-30, brief e2-copyfamily-r1): resumed
+// Copy-family fix: resumed
 // files written by Claude Code versions outside the writer allowlist, with
 // turns of their own after the copied prefix (the demo 2026-08-12 shape).
 const THIRD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -2845,7 +3285,7 @@ const A: (&str, &str, &str) = ("a", "2026-08-02T07:00:10Z", OLD_WRITER);
 const B: (&str, &str, &str) = ("b", "2026-08-02T07:00:20Z", OLD_WRITER);
 const C: (&str, &str, &str) = ("c", "2026-08-02T07:03:10Z", RESUME_WRITER);
 const D: (&str, &str, &str) = ("d", "2026-08-02T07:06:10Z", RESUME_WRITER);
-/// The page's E2 diagnostics for these keys (test-only tally).
+/// The page's `e2` diagnostics for these keys (test-only tally).
 fn copy_diag(keys: &[&str]) -> Vec<u64> {
     let diag = e2::take_diag();
     keys.iter()
@@ -3461,7 +3901,7 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
                     (third.request_count, third.removed_request_count),
                     if retired { (5, Some(0)) } else { (2, Some(3)) }
                 );
-                // Lead B F4: an absent field reads as an empty store, never lost.
+                // An absent field reads as an empty store, never lost.
                 assert_eq!(
                     copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
                     if retired {
@@ -4004,7 +4444,7 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
                 [false, true]
             );
-            // X-B1 (Lead B 2026-10-31): `copy_invalidated` per bucket row.
+            // `copy_invalidated` per bucket row.
             let flags = |item: &SnapshotItem| {
                 item.usage_buckets
                     .iter()
@@ -4414,10 +4854,10 @@ fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
     }
 }
 
-/// [money] Lead B Addendum 4: a row frozen {X} by a copied marker, whose
+/// [money] A row frozen {X} by a copied marker, whose
 /// latest proof is the own account B, is not tombstoned while this pass
 /// cannot read the session's own evidence (a partial telemetry sidecar pair).
-/// #909 / option (ii) protection stays, counted; money and account unchanged.
+/// #909 protection stays, counted; money and account unchanged.
 /// Composed with #947: the unhealthy root's no-fallback branch leaves every
 /// loan unread, so the row is skipped, never tombstoned.
 #[test]
@@ -4507,7 +4947,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
     }
 }
 
-/// Lead B F3: a prefix hold over buckets #909 accepted defers the whole
+/// A prefix hold over buckets #909 accepted defers the whole
 /// session (no shrunken revision, no ledger change) under the same
 /// three-pass bound; a never-accepted session keeps the prefix-only hold.
 #[test]
@@ -4583,7 +5023,7 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
     }
 }
 
-/// Lead B F4: an empty removal store is not written, and its restart is not
+/// An empty removal store is not written, and its restart is not
 /// lost metadata; damaged metadata is lost, and survives the restart.
 #[test]
 fn e2_pipeline_empty_removal_store_restart_is_not_lost_metadata_but_damage_is() {
@@ -4614,7 +5054,7 @@ fn e2_pipeline_empty_removal_store_restart_is_not_lost_metadata_but_damage_is() 
     }
 }
 
-/// Lead B F5: holders whose transcripts left the index cannot disprove a
+/// Holders whose transcripts left the index cannot disprove a
 /// recorded removal. The resumed file's re-read keeps its copies removed,
 /// counted, and the decision stays recorded.
 #[test]

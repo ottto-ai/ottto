@@ -1,4 +1,4 @@
-// Ron's re-read rule at the real scan seam, for Claude and Codex: only
+// The re-read rule at the real scan seam, for Claude and Codex: only
 // content (size, mtime, sampled bytes) or output-relevant inputs may trigger
 // a re-read. ctime-only changes (xattr, mode, hard link) are cross-checks
 // that re-validate the bounded content samples and never read the file
@@ -323,7 +323,7 @@ fn real_content_changes_are_reread() {
     }
 }
 
-/// Rule 3: a ctime mismatch is a cross-check that runs only the bounded
+/// A ctime mismatch is a cross-check that runs only the bounded
 /// content-sample re-validation. A rewrite outside the head/tail samples
 /// with size and mtime restored is invisible to it, by design: the parse
 /// path's TOCTOU check still compares the live opened identity (which moves;
@@ -506,7 +506,7 @@ fn codex_fork_child_usage(root: &Path, index: &mut ScanIndex, hour: u32) -> (u64
     panic!("fork child never converged");
 }
 
-/// Reviewer P1-1: a ctime-only parent change (chmod) must keep the parent's
+/// A ctime-only parent change (chmod) must keep the parent's
 /// prefix ledger valid for a child that really changed. The parent is not
 /// re-read (its scan fingerprint adopts the stored ctime), so a dropped
 /// ledger would hold the child's fresh usage with nothing to repair it.
@@ -629,7 +629,7 @@ fn chmod_flip(path: &Path) {
     );
 }
 
-/// Reviewer r3 P1: a stored ctime binds only to its own object generation.
+/// A stored ctime binds only to its own object generation.
 /// The stored entry models an earlier object A on the same device and inode
 /// (deleted, the inode reused for B after a clock rollback): same bytes, the
 /// same preserved mtime and a stored ctime not before B's birth (so ordering
@@ -763,7 +763,7 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
     }
 }
 
-/// Reviewer r3 P1, parent ledgers: a ledger and parent entry witnessed on an
+/// Parent ledgers: a ledger and parent entry witnessed on an
 /// earlier object generation (same device, inode, bytes and mtime, another
 /// birth) are refused at page start after the parent's ctime moves. The
 /// ledger is never refreshed onto the live parent; the parent is read, and

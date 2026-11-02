@@ -1,4 +1,4 @@
-// E7-8a: the count-only per-family Claude census shadow. Every fixture is
+// The count-only per-family Claude census shadow. Every fixture is
 // synthetic and content-free, evaluates with transcript I/O denied, and checks
 // that the shadow leaves the index (including every `census_complete` bit)
 // byte-identical.
@@ -22,55 +22,6 @@ fn subagent_key(dir: &str, root: &str, agent: usize) -> String {
     format!("{SCAN_ROOT}/{dir}/{root}/subagents/agent-{agent}.jsonl")
 }
 
-/// [regress] N1: touched-family strings exhausted a parkable frame's visit cap.
-#[test]
-fn freshness_touched_families_do_not_refuse_a_parkable_frame() {
-    use crate::heap_layout_bound::{bound, layout_supported};
-    if !layout_supported() {
-        return;
-    }
-    // Reuse the I/O-free scan constructor; the bound walks the same fields
-    // for every source. Removed keys model the rest of a busy Claude page.
-    let mut frame =
-        OwnedSourceScan::new_continuation(&[], index(), WINDOW, 30, 10_000, false, None, None);
-    frame.source = SnapshotSource::ClaudeCode;
-    frame.census.removed_index_keys = (0..2_500)
-        .map(|n| root_key("removed", &root_id(n)))
-        .collect();
-    let limit = crate::source_rotation::PARKED_BUDGET;
-    let baseline = bound(&frame, limit).expect("the page without shadow state is parkable");
-    // More selected families than even the whole walk's visit cap; the
-    // shadow still evaluates only its existing bounded selection.
-    let paths = (0..4_097)
-        .map(|n| PathBuf::from(root_key("selected", &root_id(n))))
-        .collect::<Vec<_>>();
-    let (touched, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
-        Box::new(Touched::from_paths(paths.iter().map(PathBuf::as_path)))
-    });
-    let counts = evaluate_page(
-        &mut Runtime::default(),
-        &frame.index,
-        &touched,
-        std::iter::empty(),
-        false,
-        "scope",
-        NOW,
-    )
-    .unwrap();
-    assert_eq!(counts.touched_families, MAX_TOUCHED_FAMILIES as u64);
-    assert_eq!(
-        counts.touched_families_over_cap,
-        4_097 - MAX_TOUCHED_FAMILIES as u64
-    );
-    frame.claude_family_shadow = Some(touched);
-    let charged = bound(&frame, limit).expect("N1: the shadow must not force serial fallback");
-    assert!(charged >= baseline + allocation.requested_live as usize);
-    assert!(
-        bound(&frame, charged - 1).is_none(),
-        "byte limits still apply"
-    );
-}
-
 pub(super) fn traversal() -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
         context_fingerprint: "context".to_string(),
@@ -92,7 +43,6 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
-        context_inputs: None,
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
     }
@@ -619,8 +569,7 @@ fn coverage_needs_an_attestation_of_the_current_revision() {
         evaluate_attested(&grown, &refs, &attested).incomplete,
         presence_only
     );
-    // A growth hint after the attestation re-queues a current member
-    // (Q-E1-4).
+    // A growth hint after the attestation re-queues a current member.
     let mut hinted = base.clone();
     hinted
         .traversal
@@ -827,10 +776,10 @@ fn the_skipped_view_is_queue_plus_replay() {
     assert_eq!(view.iter().filter(|skipped| skipped.replay).count(), 1);
     assert_eq!(skipped_census_members(&index).count(), 2);
     let mut first_pending = FirstPending::default();
-    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None, 0);
+    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None);
     assert_eq!((first.count, first.replay, first.replay_repeat), (2, 1, 0));
     // Still replayed a page later: repeated, and its age a lower bound.
-    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None, 0);
+    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None);
     assert_eq!((again.replay, again.replay_repeat), (1, 1));
     assert_eq!(again.oldest_age_s, 60);
 }
@@ -934,7 +883,7 @@ fn quantum_admits_64_complete_families_and_defers_the_rest() {
     assert!(counts.incomplete.is_empty());
 }
 
-/// M4 shape: 1,000 three-member families, all 3,000 members queued, 100
+/// Live-sized shape: 1,000 three-member families, all 3,000 members queued, 100
 /// served per page in FIFO order, so many families span a served (uncapped)
 /// and a still-queued (capped) member at a page boundary.
 /// [behaviour] m4 shape drains 3000 queued members at 100 per page.
@@ -1153,10 +1102,10 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     }
     let mut first_pending = FirstPending::default();
     let early = (0..100).map(path).collect::<Vec<_>>();
-    first_pending.observe(queued(&early), |_| false, NOW, None, 0);
+    first_pending.observe(queued(&early), |_| false, NOW, None);
     let all = (0..MAX_FIRST_PENDING + 10).map(path).collect::<Vec<_>>();
     let (pending, skipped) =
-        first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY, None, 0);
+        first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY, None);
     assert_eq!(pending.count, (MAX_FIRST_PENDING + 10) as u64);
     assert_eq!(pending.tracked, MAX_FIRST_PENDING as u64);
     // The ten oldest stamps go; the remaining 90 early ones still age.
@@ -1167,14 +1116,14 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     // Members that leave the queue unresolved keep their stamps; resolved
     // ones drop out.
     let (pending, _) =
-        first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY, None, 0);
+        first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY, None);
     assert_eq!(
         (pending.count, pending.tracked),
         (0, MAX_FIRST_PENDING as u64)
     );
     assert_eq!(pending.unqueued_unresolved, MAX_FIRST_PENDING as u64);
     let (pending, _) =
-        first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY, None, 0);
+        first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY, None);
     assert_eq!((pending.count, pending.tracked), (0, 0));
 }
 
@@ -1752,12 +1701,12 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
     BTreeMap::from([(ROOT.to_string(), rows)])
 }
 
-/// R1: mid-pass, a key the merged pass already counted as observed-only moves
+/// Mid-pass, a key the merged pass already counted as observed-only moves
 /// into `files` while a post-observer settlement drops another entry, so both
 /// inventory sizes and the generation hold and no page reports a change. The
 /// union keeps the key: the cross-directory duplicate is counted either way,
 /// and the family never completes.
-/// [regress] R1 masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
+/// [regress] masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
 #[test]
 fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
     const FILLER: usize = 2 * ROOT_PASS_KEYS_PER_PAGE;

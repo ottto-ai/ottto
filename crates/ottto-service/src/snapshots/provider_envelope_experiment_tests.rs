@@ -374,8 +374,17 @@ impl NativePreparationFixture {
         let native_conjunction = claude_native_comparison::actual_native_conjunction(&disposition);
         assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        index.upload_context_fingerprint = Some("native-preparation-test".into());
-        index.active_upload_context_fingerprint = index.upload_context_fingerprint.clone();
+        index.active_upload_context_fingerprint = Some("native-preparation-test".into());
+        // Model delivered history: each file holds its receipt in this context.
+        let context = index.active_upload_context_fingerprint.clone().unwrap();
+        for entry in index.files.values_mut() {
+            entry.upload_context_receipt = Some(upload_context_receipt::Receipt {
+                context_fingerprint: context.clone(),
+                replay_generation: upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+                source_witness: entry.source_file_fingerprint.clone(),
+                body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
+            });
+        }
         assert!(index.claude_usage_family_witnesses.contains_key(&parent));
         Self {
             native_conjunction,
@@ -473,7 +482,7 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to native grains.
 
     let mut fixture = NativePreparationFixture::new();
     fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(
@@ -1497,6 +1506,12 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
                 .collect::<BTreeSet<_>>()
         );
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+        // Each establishing page is delivered: its exact ACKs earn receipts.
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
+        );
         if establishing_pass == 0 {
             assert!(index
                 .files
@@ -2581,7 +2596,7 @@ fn native_comparison_fallback_marks_name_unattributed() {
     );
 }
 
-/// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
+/// A selected restore (#588) reverts the withheld key
 /// to `previous` and REMOVES its request-census record. No record of the
 /// withheld revision, and none restored from `previous`, survives.
 #[test]
@@ -2925,7 +2940,7 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
@@ -2947,7 +2962,7 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",

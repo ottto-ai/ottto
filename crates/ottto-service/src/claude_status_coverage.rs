@@ -1,4 +1,4 @@
-//! Local status-coverage history for the `transcript_email` basis (plan §2a.9).
+//! Local status-coverage history for the `transcript_email` basis.
 //!
 //! The Claude status pass already qualifies each registered slot's login and
 //! organization hashes. It reports those values here, or reports that it could
@@ -10,7 +10,7 @@
 //! that no other login ran in between (an unseen A→B→A switch), and the email
 //! a transcript records is never joined to a login. So this history can only
 //! *disqualify*: it never selects a login, and every email-bearing request it
-//! is consulted for is refused (see `Verdict`). It also supplies §2a.12(b)
+//! is consulted for is refused (see `Verdict`). It also supplies
 //! org membership from each qualified (login, org) pairing.
 //!
 //! Nothing here reads a file, calls a provider, changes cadence or reaches the
@@ -476,7 +476,7 @@ impl Ledger {
     }
 
     /// Every retained (login, org) pairing the status pass qualified: the
-    /// `.claude.json` org-membership evidence of plan §2a.12(b).
+    /// `.claude.json` org-membership evidence.
     pub(crate) fn pairings(&self) -> impl Iterator<Item = (&str, &str)> {
         self.slots.values().flat_map(|history| {
             history

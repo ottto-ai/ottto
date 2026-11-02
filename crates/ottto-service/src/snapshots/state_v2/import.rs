@@ -62,7 +62,7 @@ pub(super) fn import_graph(
     anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
-    cx.presence = original.presence.clone();
+    cx.presence = original.claude_presence();
     kinds::populate(index, &mut tx, &mut cx)?;
     anyhow::ensure!(
         tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
@@ -117,6 +117,7 @@ pub(super) fn save(
         next.retire_committed_claude_account_pending_windows();
     }
     super::super::lenient_decode::check_held_output(next)?;
+    cx.compact_allowance = (!claim_only).then_some(128);
     kinds::save_graph(db, identity, previous, next, cx)
 }
 
@@ -331,6 +332,9 @@ impl OriginalFile {
 /// Stream root presence and validate JSON grammar without allocating leaf
 /// strings. The hashing pass separately validates their Unicode encoding.
 struct Presence;
+fn claude_original_field(name: &str) -> bool {
+    !matches!(name, "archives" | "archive_deferred_alarm_count")
+}
 impl<'de> serde::de::Visitor<'de> for Presence {
     type Value = std::collections::BTreeMap<String, bool>;
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -342,9 +346,16 @@ impl<'de> serde::de::Visitor<'de> for Presence {
     ) -> std::result::Result<Self::Value, A::Error> {
         let mut fields = super::super::lenient_decode::FIELDS
             .iter()
+            .filter(|name| claude_original_field(name))
             .map(|f| ((*f).into(), false))
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
+            if !claude_original_field(&name) {
+                // Codex archive custody records its presence when its rows are
+                // written (kinds_misc::ARCHIVE_KINDS); the original never does.
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
             let present = fields
                 .get_mut(&name)
                 .ok_or_else(|| serde::de::Error::custom("unknown original field"))?;
@@ -365,7 +376,9 @@ impl<'de> serde::de::Visitor<'de> for Presence {
         for name in super::super::lenient_decode::FIELDS {
             let present = !ended && seq.next_element::<serde::de::IgnoredAny>()?.is_some();
             ended |= !present;
-            fields.insert((*name).into(), present);
+            if claude_original_field(name) {
+                fields.insert((*name).into(), present);
+            }
         }
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(serde::de::Error::custom("unknown original slot"));
@@ -456,6 +469,13 @@ fn original_schema(file: &mut std::fs::File) -> Result<u16> {
     schema.get().ok_or_else(|| Pause::Malformed.into())
 }
 impl Original {
+    fn claude_presence(&self) -> std::collections::BTreeMap<String, bool> {
+        self.presence
+            .iter()
+            .filter(|(name, _)| claude_original_field(name))
+            .map(|(name, present)| (name.clone(), *present))
+            .collect()
+    }
     pub(super) fn read(path: &Path) -> std::result::Result<Self, Pause> {
         Self::read_inner(path).map_err(|e| {
             e.downcast_ref::<Pause>().copied().unwrap_or_else(|| {
@@ -723,7 +743,7 @@ fn verify_normalized_at(
     };
     let mut cx = KindCx::default();
     cx.binding = Some(binding);
-    cx.presence = original.presence.clone();
+    cx.presence = original.claude_presence();
     kinds::populate(index, &mut proof, &mut cx)?;
     let mut count = 0_u64;
     let mut after = None;
@@ -1219,6 +1239,10 @@ mod application_cases {
         assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
     }
 
+    mod codex_archive_tests {
+        include!("codex_archive_import_tests.rs");
+    }
+
     /// [format] desktop inventory conversion keeps original presence; only a
     /// versioned cursor fence keeps custody, like the v1 serializer.
     #[test]
@@ -1285,9 +1309,9 @@ mod application_cases {
         for bytes in [
             br#"{"schema_version":2,"files":{},"future_money":{"n":1}}"#.as_slice(),
             br#"{"schema_version":2,"files":{},"files":{}}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\q"}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\ud800"}"#,
-            b"{\"schema_version\":2,\"files\":{},\"upload_context_fingerprint\":\"\xff\"}",
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\q"}"#,
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\ud800"}"#,
+            b"{\"schema_version\":2,\"files\":{},\"historical_replay_generation\":\"\xff\"}",
             br#"{"schema_version":2,"files":{},"claude_request_census":{"~lost":{}}}"#,
         ] {
             let c = Corpus::new();
@@ -1574,6 +1598,7 @@ mod codec_mapper_regressions {
         }))
         .unwrap();
         let mut db = money_test_support::populate(
+            super::super::super::scan_index_persistence::Source::Claude,
             &scratch.join("state.v2.sqlite.import"),
             &index,
             Default::default(),

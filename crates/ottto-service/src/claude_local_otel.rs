@@ -1038,6 +1038,30 @@ pub(crate) fn claude_trace_read_generation(
         .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
+/// Both sidecars' generations, taken before a strict read so a later reread
+/// of the same pair can prove it read the same bytes. `None` when either
+/// file has no generation witness (missing, not a file, or no unix metadata).
+#[derive(PartialEq, Eq)]
+pub(crate) struct ClaudePairGeneration {
+    api: ApiFileGeneration,
+    trace: ApiFileGeneration,
+}
+
+pub(crate) fn claude_pair_generation(
+    support_dir: &Path,
+    session_id: &str,
+) -> Option<ClaudePairGeneration> {
+    let generation = |path: PathBuf| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|metadata| api_file_generation(&metadata))
+    };
+    Some(ClaudePairGeneration {
+        api: generation(evidence_path(support_dir, session_id))?,
+        trace: generation(trace_evidence_path(support_dir, session_id))?,
+    })
+}
+
 pub(crate) fn load_claude_trace_paid(
     support_dir: &Path,
     root: &str,
@@ -1148,14 +1172,10 @@ fn decode_api_sidecar(
     }
     health.oversized_files = u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
     let before_opened = api_file_generation(&opened);
-    let allowance = protected_allowance(
-        MAX_EVIDENCE_FILE_BYTES,
-        strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1)),
-    );
-    if opened.len() >= allowance {
-        health.unreadable_lines += 1;
-        return Ok(empty(health));
-    }
+    let pair_bytes =
+        strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1));
+    note_oversized_pair(pair_bytes);
+    let allowance = MAX_EVIDENCE_FILE_BYTES.max(pair_bytes);
     // Preserve ordinary API read-through on concurrent appends within the
     // protected per-pair allowance.
     let mut reader = BufReader::new((&file).take(allowance));
@@ -1248,8 +1268,9 @@ impl ApiSidecarDecoder<'_> {
     }
 }
 
-fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
-    if pair_bytes > quantum {
+/// Counts a root whose paired sidecars exceed the normal allowance.
+fn note_oversized_pair(pair_bytes: u64) {
+    if pair_bytes > MAX_EVIDENCE_FILE_BYTES {
         crate::local_resource_diagnostics::traversal_point(
             "claude_sidecar_read",
             "claude_code",
@@ -1259,7 +1280,6 @@ fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
             ]),
         );
     }
-    quantum.max(pair_bytes)
 }
 
 /// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
@@ -1317,17 +1337,10 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         report.oversized_files += u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
-        let allowance = protected_allowance(
-            MAX_EVIDENCE_FILE_BYTES,
-            strict_cohort_bytes(support_dir, &session_id).max(opened.len().saturating_add(1)),
-        );
-        if opened.len() >= allowance {
-            report.unreadable_lines += 1;
-            continue;
-        }
         // A concurrent writer must not extend the read past the opened
         // length; one extra byte is the growth sentinel.
-        let limit = allowance.min(opened.len().saturating_add(1));
+        let limit = opened.len().saturating_add(1);
+        note_oversized_pair(strict_cohort_bytes(support_dir, &session_id).max(limit));
         #[cfg(test)]
         TRACE_BEFORE_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -1470,6 +1483,22 @@ pub(crate) fn reset_evidence_read_counts_for_test() {
         receipt.set((0, 0, force));
     });
     TRACE_READ_RECEIPT.with(|count| count.set(0));
+}
+
+/// Runs `f`, then puts this thread's read receipts back as they were before
+/// it; a pending trace-read hook is set aside so `f` cannot fire it.
+#[cfg(test)]
+pub(crate) fn without_read_receipts<T>(f: impl FnOnce() -> T) -> T {
+    let api = API_READ_RECEIPT.with(std::cell::Cell::get);
+    let trace = TRACE_READ_RECEIPT.with(std::cell::Cell::get);
+    let bytes = TRACE_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    let hook = TRACE_BEFORE_READ.with(|slot| slot.borrow_mut().take());
+    let value = f();
+    API_READ_RECEIPT.with(|slot| slot.set(api));
+    TRACE_READ_RECEIPT.with(|slot| slot.set(trace));
+    TRACE_BYTES_FOR_TEST.with(|slot| slot.set(bytes));
+    TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
+    value
 }
 
 #[cfg(test)]
@@ -2138,7 +2167,7 @@ mod tests {
         // format. This test asserts refusal, not persistent completeness.
     }
 
-    /// [regress] ID1: capture and the shared streaming readers retain every
+    /// [regress] Capture and the shared streaming readers retain every
     /// request after a sidecar crosses its warning threshold, including retries.
     #[test]
     fn api_and_trace_past_warning_threshold_keep_every_request() {

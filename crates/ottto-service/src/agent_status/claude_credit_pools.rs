@@ -4,7 +4,7 @@
 //!
 //! This module owns the Claude provider field names for credits (quota
 //! contract v2.2 §11.1 kinds, §11.3 one-time pools, §11.7 C4 pinned names) and
-//! the Claude read cadence (design R7). Grant building, summaries,
+//! the Claude read cadence. Grant building, summaries,
 //! the one-time pool shape and section re-send stay in the model.
 
 use std::collections::BTreeMap;
@@ -66,8 +66,8 @@ const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
 /// counts as continuous observation of its sign-in (passes run every ~5 min).
 const CALLER_BINDING_MAX_GAP_SECONDS: u64 = 15 * 60;
 /// A window reset the stored reading predates earns one extra read this long
-/// after the reset, spread per account over the next minute (design R7
-/// amendment: reset read). The reading after it postdates the reset, so each
+/// after the reset, spread per account over the next minute. The reading
+/// after it postdates the reset, so each
 /// reset is read at most once.
 const RESET_READ_DELAY_SECONDS: u64 = 60;
 const RESET_READ_SPREAD_SECONDS: u64 = 60;
@@ -196,7 +196,7 @@ fn balance_section(balance: &AgentCreditBalance) -> Option<CreditSection> {
     }
 }
 
-/// The balances to send after a read (design R7b, contract v2.2 §11.5, C8/C9).
+/// The balances to send after a read (contract v2.2 §11.5, C8/C9).
 ///
 /// `previous` is the binding's last stored reading (same account and
 /// organization). Sections this read observed replace theirs; every other
@@ -621,7 +621,7 @@ pub(super) fn write_claude_read_schedule(
     )
 }
 
-/// The account's read slot (design R7: active-account freshness): the active
+/// The account's read slot (active-account freshness): the active
 /// slot while the account was active within the feed's last 30 min, else the default
 /// (unused-account) slot.
 pub(super) fn claude_usage_slot_seconds(
@@ -765,7 +765,7 @@ pub(super) fn claude_reading_due(
     })
 }
 
-/// Which read a due slot makes (design R7: no extra calls). `stored` is the
+/// Which read a due slot makes (no extra calls). `stored` is the
 /// binding's persisted reading.
 ///
 /// - While the variant is paused by its self-check every slot is plain.
@@ -935,8 +935,8 @@ pub(super) struct ClaudePassiveConfig {
 /// Check a Claude Code `.claude.json` against a binding. Reads only
 /// `oauthAccount` and `cachedUsageUtilization`.
 ///
-/// Passive input from Claude Code's own `cachedUsageUtilization` (design R7:
-/// active-account freshness).
+/// Passive input from Claude Code's own `cachedUsageUtilization`
+/// (active-account freshness).
 /// Every collection pass records where each caller is signed in, and a
 /// registered slot's identity gate ends the caller's run when it refuses the
 /// slot, as does a pass that skips the collector (an unresolved default-login

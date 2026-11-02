@@ -1,4 +1,4 @@
-// E2 upload path: request-owned families, literal batch errors, retry bytes.
+// `e2` upload path: request-owned families, literal batch errors, retry bytes.
 // Included into `snapshot_sync::tests`; uses its helpers.
 
 #[derive(Clone, Serialize)]

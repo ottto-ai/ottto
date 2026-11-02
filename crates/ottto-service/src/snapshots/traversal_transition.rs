@@ -70,34 +70,14 @@ pub(super) struct Starting {
     pub(super) stale_rearm_capped_families: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) stale_rearm_capped_files: usize,
-    /// Evidence owed ON: an unfinished retry admission this start dropped,
-    /// and one kept as its due cursor only. Omitted while zero.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) admissions_dropped: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) due_retained: usize,
-    /// Evidence owed ON: a context change that only added roots, changed the
-    /// backfill or the active upload context owes evidence instead of
-    /// clearing (1). Omitted while zero.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) context_change_owed: usize,
-    /// Evidence owed ON: families exempted from an identity-contract latch
-    /// clear while quarantined, still waiting to prove their contract.
-    /// Omitted while zero.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) contract_unproven_families: usize,
-    /// Evidence owed ON: request occurrences of pending kept from earlier
-    /// windows at this start. They use the shared pending occurrence cap a new
-    /// window's families and owed cap-room reads also need. Omitted while zero.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) stale_pending_occurrences: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
 impl Starting {
-    /// This start's re-arm owes evidence (keeps the fingerprint) under ON.
+    /// This start's re-arm owes evidence (keeps the fingerprint): only the
+    /// terminal-unhealthy retry.
     pub(super) fn owes(&self) -> bool {
-        super::evidence_owed::owes(self.rearm_cause()) || self.context_change_owed != 0
+        super::evidence_owed::owes(self.rearm_cause())
     }
     pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
         use crate::local_resource_diagnostics::rearm_cause::Cause;
@@ -132,7 +112,6 @@ impl Starting {
                 .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
                 .flatten(),
         );
-        let owed = super::evidence_owed::enabled();
         Self {
             prior_held_family_roots,
             prior_held_family_set_digest,
@@ -161,28 +140,6 @@ impl Starting {
             rearm_window_rearmed_families: 0,
             stale_rearm_capped_families: 0,
             stale_rearm_capped_files: 0,
-            admissions_dropped: 0,
-            due_retained: 0,
-            context_change_owed: 0,
-            contract_unproven_families: if owed {
-                index
-                    .claude_usage_family_pending
-                    .views()
-                    .filter(|(_, pending)| pending.contract_unproven())
-                    .count()
-            } else {
-                0
-            },
-            stale_pending_occurrences: if owed {
-                index
-                    .claude_usage_family_pending
-                    .views()
-                    .filter(|(_, pending)| pending.window() != now)
-                    .map(|(_, pending)| pending.occurrences())
-                    .fold(0, usize::saturating_add)
-            } else {
-                0
-            },
         }
     }
 
@@ -237,9 +194,8 @@ pub(super) fn retiring(
         unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
-        /// Claude only: path-(a) absence retirement process totals (SOURCE
-        /// Rounds 11-13, COST names), and the index's tombstone uncertainty
-        /// fence.
+        /// Claude only: path-(a) absence retirement process totals, and the
+        /// index's tombstone uncertainty fence.
         #[serde(skip_serializing_if = "Option::is_none")]
         absent_retry_pending_retired: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -810,10 +766,6 @@ mod tests {
                 );
             }
             assert_eq!(
-                plain.upload_context_fingerprint.as_deref(),
-                (!flag).then_some("unsettled-cause-context")
-            );
-            assert_eq!(
                 without_unsettled_causes(&plain),
                 without_unsettled_causes(&tagged),
                 "flag={flag}"
@@ -1084,9 +1036,9 @@ mod tests {
             assert_complete_max_row(rows[0].clone());
         }
     }
-    // SOURCE Round 13 F3: the Claude retiring row names every absence total
-    // and the fence state with their values (Round 15: and the upgrade fence
-    // count; Round 16, SOURCE h733: the aged-out tombstone and refused-drain
+    // The Claude retiring row names every absence total
+    // and the fence state with their values (and the upgrade fence
+    // count, the aged-out tombstone and refused-drain
     // counts); other sources omit them all.
     #[test]
     fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {

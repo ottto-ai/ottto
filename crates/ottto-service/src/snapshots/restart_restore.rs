@@ -1,4 +1,4 @@
-//! Machine-local M3 opt-in. Policy is fixed for the lifetime of the process.
+//! Machine-local restart-restore opt-in. Policy is fixed for the lifetime of the process.
 use std::path::Path;
 
 const NAME: &str = "restart_restore_enabled";

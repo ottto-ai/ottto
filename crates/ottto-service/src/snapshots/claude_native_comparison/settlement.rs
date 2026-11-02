@@ -407,7 +407,7 @@ impl Completion {
             .iter()
             .map(|item| claude_snapshot_family_root_ref(item).to_owned())
             .collect();
-        super::super::state_v2::load_usage(index, Some(&roots)).map_err(|_| unknown)?;
+        super::super::state_v2::load_usage(index, &roots).map_err(|_| unknown)?;
         let counts = super::super::evidence_owed::stamped(
             index,
             &scan.snapshots,
@@ -1312,7 +1312,7 @@ impl SelectedFallback {
                     index.terminal_jsonl_dispositions.remove(key);
                 }
             }
-            // Slice D1: fail closed, never a record of either revision. The
+            // Fail closed, never a record of either revision. The
             // first-seen birth of the same physical object stays (an in-place
             // stub every reader treats as no record; nothing is allocated).
             index.claude_request_census.invalidate_keeping_birth(key);

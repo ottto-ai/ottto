@@ -214,39 +214,63 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed, content-free refusal labels; cumulative process counters on #799.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// Closed causes for native archive reader refusal and owed custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
-    ReplayNotAuthorized,
+    ReplayNotAuthorized = 0,
     #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported,
+    ProofParentUnsupported = 1,
     #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported,
+    ProofChildUnsupported = 2,
     #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported,
+    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedDurableTailUnsupported")]
-    DurableTailUnsupported,
+    DurableTailUnsupported = 4,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
-    GroupProbeUnsupported,
+    GroupProbeUnsupported = 5,
     #[serde(rename = "CompressedGroupReadUnsupported")]
-    GroupReadUnsupported,
+    GroupReadUnsupported = 6,
     #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound,
+    ParentLedgerUnbound = 7,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
-    PhysicalOffsetUnsupported,
-    #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded,
-    #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded,
+    PhysicalOffsetUnsupported = 8,
     #[serde(rename = "CompressedAdmissionRefused")]
-    AdmissionRefused,
-    // Subset of decoder refusals: the unchanged free-only floor would fit
-    // without optional header entries. Attempts, not files or lost usage.
+    AdmissionRefused = 9,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed = 10,
+    #[serde(rename = "CompressedOwnerUnproven")]
+    OwnerUnproven = 11,
+    #[serde(rename = "CompressedOutputHeld")]
+    OutputHeld = 12,
+    #[serde(rename = "CompressedDecodedOverLimit")]
+    DecodedOverLimit = 13,
+    #[serde(rename = "CompressedHeaderInvalid")]
+    HeaderInvalid = 14,
+    #[serde(rename = "CompressedCorrectionUnapplied")]
+    CorrectionUnapplied = 15,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded = 16,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded = 17,
+    // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy,
+    DecoderRefusedHeaderOccupancy = 18,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven = 19,
+    #[serde(rename = "ArchiveEquivalenceUnproven")]
+    ArchiveEquivalenceUnproven = 20,
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Count = 21,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
+impl std::fmt::Display for CodexZstCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CodexZstCause {}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -275,6 +299,12 @@ pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
     cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
 }
 
+/// Counts per observed `priority` or `flex` thread-settings snapshot, dated or
+/// not; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn codex_non_default_thread_tier() {
+    cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -301,6 +331,14 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
             )]),
         );
     }
+}
+
+pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
+    traversal_point(
+        "codex_zst_held",
+        "codex",
+        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
+    );
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.
@@ -485,7 +523,7 @@ const UNACKED_LOST: [(&str, usize); 4] = [
     ("totals_unknown_files", UNACKED_LOST_START + 3),
 ];
 
-/// E3: Claude withheld-account hold events, in the slots after the reasons.
+/// Claude withheld-account hold events, in the slots after the reasons.
 #[derive(Clone, Copy)]
 pub(crate) enum WithheldEvent {
     /// A held key's file was proved absent and its hold released.
@@ -644,7 +682,7 @@ pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
 }
 
 /// Local alarm, once per process: a Claude context fold first withheld
-/// session scalars for a resource limit (SOURCE Amendment 7). Counts only.
+/// session scalars for a resource limit. Counts only.
 pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
 }
@@ -961,7 +999,7 @@ fn rearm_collection(rearm: claude_reread::Counts) {
         process_id: std::process::id(),
         stage: "native_collection_page",
         source: Source::from_slug("claude_code"),
-        observation: Observation::between(0, None, None),
+        observation: Observation::point(),
         counts: Counts {
             collection: CollectionCounts {
                 scanned_files: 0,
@@ -1005,6 +1043,10 @@ struct Observation {
     footprint: footprint::Observation,
 }
 impl Observation {
+    /// A zero-window event: a timestamp and no resource measurements.
+    fn point() -> Self {
+        Self::between(0, None, None)
+    }
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
         Self {
             observed_unix_ms: SystemTime::now()
@@ -1131,17 +1173,7 @@ pub(crate) fn codex_census_fence(
         source: Source::Codex,
         // A point observation has no measured resource window. Do not take
         // extra CPU/RSS samples or invent numeric measurements for this event.
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts: Counts {
             phase,
             outcome,
@@ -1201,7 +1233,7 @@ pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) 
         counts,
     );
 }
-/// E7-8a shadow, once per Claude page: per-family census completion counts
+/// Shadow, once per Claude page: per-family census completion counts
 /// (`family_census_complete`, `family_census_incomplete{reason}`,
 /// `family_complete_deferred{quantum}`), `pending_census_members`, the
 /// skipped-set digest and predicate cost. Counts only; never an authority
@@ -1218,7 +1250,7 @@ struct HistoryProofCorrectionDeferred {
     history_proof_correction_deferred_total: u64,
 }
 
-/// Local counter (StateMissing M2, SOURCE h695 N6): proof-correction members
+/// Local counter: proof-correction members
 /// the history gate holds, deferred instead of blocking settlement. This
 /// settlement's count and a saturating process total. Counts only; no path,
 /// id or wire event.
@@ -1266,7 +1298,7 @@ struct ReemissionFamilyClosureRootAbsentExcluded {
     claude_reemission_family_closure_root_absent_excluded_total: u64,
 }
 
-/// Local counter (StateMissing M1, SOURCE d680b524): subagent members the
+/// Local counter: subagent members the
 /// history gate held only through their listed family root while the root
 /// file is absent. This page's count and a saturating process total. Counts
 /// only; no path, id or wire event.
@@ -1297,7 +1329,7 @@ static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// One `claude_census_retire_kept_overlap` row (stopgap): a complete
 /// terminal's kept records, their hashes and those retired because the
 /// census was above 90% occupancy, with the terminal's census-full tombstone
 /// count; or the records an insert retired so it fits (admission overflow,
@@ -1332,7 +1364,7 @@ struct CensusRetireKeptOverlap {
     census_record_limit_refused_total: u64,
 }
 
-/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// Local counter (stopgap): aged Claude transcript census records kept
 /// because they share a request id with another unretired record, and those
 /// retired anyway: above 90% census occupancy at a terminal, or so an insert
 /// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
@@ -1380,7 +1412,7 @@ pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapC
     }
 }
 /// Local alarm: the one-time Claude history re-read latched its stop until
-/// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
+/// the daemon restarts, once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
 pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Serialize) {
     let stage = if reminder {
@@ -1421,17 +1453,7 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
         process_id: std::process::id(),
         stage,
         source: Source::from_slug(source),
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts,
     });
 }
@@ -1820,17 +1842,7 @@ pub(crate) fn sampled_audit_comparison(
         process_id: std::process::id(),
         stage: "sampled_audit_comparison",
         source: Source::from_slug(source),
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts: Counts {
             body_comparison_available: additive.1.is_some(),
             effective_body_changed: additive.0 != additive.1,
@@ -2019,18 +2031,34 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
+            AdmissionRefused,
+            DecodeFailed,
+            OwnerUnproven,
+            OutputHeld,
+            DecodedOverLimit,
+            HeaderInvalid,
+            CorrectionUnapplied,
             HeaderUnfunded,
             CompatibilityUnfunded,
-            AdmissionRefused,
             DecoderRefusedHeaderOccupancy,
+            FamilyUnproven,
+            ArchiveEquivalenceUnproven,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
             serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
             "decoder_refused_header_occupancy"
         );
+        let mut labels = std::collections::BTreeSet::new();
+
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
+            let label = serde_json::to_string(cause).unwrap();
+            assert!(labels.insert(label.clone()), "unique persisted label");
+            assert_eq!(
+                serde_json::from_str::<super::CodexZstCause>(&label).unwrap(),
+                *cause
+            );
         }
     }
 
@@ -2849,8 +2877,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi observation fields add 97 bytes at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2304);
+        // The two Pi fields add 97 bytes at u64::MAX, the Codex tier field 53.
+        assert!(serde_json::to_string(record).unwrap().len() < 2357);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -3396,3 +3424,5 @@ pub(crate) fn state_v2_memory() -> StateV2Memory {
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
 }
+
+crate::heap_layout_bound::no_heap!(true; CodexZstCause);

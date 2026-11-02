@@ -24,7 +24,7 @@ fn save_with_mode(
     claim_only: bool,
     owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
-    save_with_custody(path, index, claim_only, owner, published(path)?)
+    save_locked(path, index, claim_only, owner, published(path)?)
 }
 
 /// Generation of a freshly imported native fixture store.
@@ -563,7 +563,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
 /// loads only its own families, a sibling subset saves one of them, and the
 /// working graph then loads another, changes its occurrence count, removes a
 /// third and saves itself with no Unknown refusal. Its heads are refreshed by
-/// that save; a whole-kind join and a restart see the explicit rows, and the
+/// that save; loading every family and a restart see the explicit rows, and the
 /// running total equals the sum of heads and the fold of the rows (A1).
 #[test]
 fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
@@ -608,7 +608,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         let committed = working.clone();
 
         // The page loads r1 alone; r2 stays Unknown, never absent.
-        load_usage(&mut working, Some(&roots(&["r1"]))).unwrap();
+        load_usage(&mut working, &roots(&["r1"])).unwrap();
         assert_eq!(
             working.claude_usage_family_pending.family("r2").is_err(),
             cold
@@ -627,7 +627,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         // member's occurrences from it, removes r3 and saves itself: r1 is
         // rewritten as the sibling saved it and r4 is kept by its head.
         working.generation = subset.generation;
-        load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
+        load_usage(&mut working, &roots(&["r2"])).unwrap();
         let usage = &mut working.claude_usage_family_pending;
         let r2 = usage.family_mut("r2").unwrap().unwrap();
         r2.member_occurrences.pop_first().unwrap();
@@ -648,12 +648,19 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
             total(&expected)
         );
 
-        // A join loads every family and sees exactly the saved rows.
-        load_usage(&mut working, None).unwrap();
-        assert_eq!(
-            *working.claude_usage_family_pending.all().unwrap(),
-            expected
-        );
+        // Loading every family sees exactly the saved rows.
+        let every: BTreeSet<String> = working
+            .claude_usage_family_pending
+            .roots()
+            .cloned()
+            .collect();
+        load_usage(&mut working, &every).unwrap();
+        let usage = &working.claude_usage_family_pending;
+        let joined: Families = every
+            .iter()
+            .map(|root| (root.clone(), usage.family(root).unwrap().unwrap().clone()))
+            .collect();
+        assert_eq!(joined, expected);
         settle_usage(&mut working, &BTreeSet::new());
         assert_eq!(
             working.claude_usage_family_pending.family("r4").is_err(),
@@ -708,7 +715,7 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
     };
     let before = unknown();
     let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
-    assert!(load_usage(&mut working, Some(&page)).is_err());
+    assert!(load_usage(&mut working, &page).is_err());
     assert!(unknown() > before);
     let usage = &working.claude_usage_family_pending;
     assert!(usage.cold().unwrap().loaded().is_empty());
@@ -720,6 +727,21 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
 /// and exposes only committed file membership to the restart-record sweep.
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
+    use crate::durable_tail_store::DurableSource;
+    use crate::snapshots::scan_index_persistence::Source;
+    for (source, keys) in [
+        (Source::Claude, Some(DurableSource::ClaudeCode)),
+        (Source::Codex, Some(DurableSource::Codex)),
+        // Pi has no key mapping: never an empty complete set that a sweep could erase by.
+        (Source::Pi, None),
+    ] {
+        f6_forget(source, keys);
+    }
+}
+fn f6_forget(
+    source: crate::snapshots::scan_index_persistence::Source,
+    keys: Option<crate::durable_tail_store::DurableSource>,
+) {
     let mut f = Fixture::new();
     // This API is binding-scoped (source + namespace dir name), so a shared
     // literal namespace collides with parallel fixtures: use a unique one.
@@ -732,19 +754,19 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     };
     let parent = f.path.parent().unwrap().with_file_name(namespace);
     fs::rename(f.path.parent().unwrap(), &parent).unwrap();
-    f.path = parent.join(f.path.file_name().unwrap());
+    f.path = parent.join(super::super::money_test_support::synthetic_file(
+        source, ".json",
+    ));
     let live = || {
         let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
         crate::snapshots::state_v2::live_key_digests(&f.path).unwrap()
     };
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Off));
-    // Pi has no key mapping: never an empty complete set that a sweep could erase by.
-    let pi = crate::snapshots::state_v2::live_key_digests(
-        &f.path.with_file_name("pi-test-scan-index.json"),
-    )
-    .unwrap();
-    assert!(!pi.complete && pi.digests.is_empty());
-    assert_eq!(pi.incomplete_reason, Some(IncompleteReason::Off));
+    let Some(keys) = keys else {
+        let off = live();
+        assert!(!off.complete && off.digests.is_empty());
+        return;
+    };
     f.published();
     // Published custody before this process's first load: v1 JSON is stale.
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Import));
@@ -757,10 +779,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     .unwrap();
     index.files.insert("committed".into(), file);
     save_with(&f.path, &mut index).unwrap();
-    let digest = crate::durable_tail_store::key_digest(
-        crate::durable_tail_store::DurableSource::ClaudeCode,
-        "committed",
-    );
+    let digest = crate::durable_tail_store::key_digest(keys, "committed");
     let committed = live();
     assert!(committed.complete);
     assert_eq!(committed.incomplete_reason, None);
@@ -1010,9 +1029,8 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
-    index.upload_context_fingerprint = Some("synthetic-policy".into());
+    index.historical_replay_generation = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
-    index.file_upload_context_enabled = true;
     assert!(save_locked(
         &f.path,
         &mut index,
@@ -1054,11 +1072,11 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")
     );
-    assert!(index.file_upload_context_enabled && index.v2().persistence_v2.is_some());
+    assert!(index.v2().persistence_v2.is_some());
     let current = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
-        current.upload_context_fingerprint,
-        index.upload_context_fingerprint
+        current.historical_replay_generation,
+        index.historical_replay_generation
     );
     assert_eq!(current.generation, index.generation);
 }
@@ -1811,8 +1829,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     // Loads keep account archives cold; compare the bytes the store holds.
     let committed_view = materialized(&committed);
     let committed_generation = current.generation;
-    let committed_context = current.upload_context_fingerprint.clone();
-    current.upload_context_fingerprint = Some("uncommitted-context".into());
+    let committed_context = current.historical_replay_generation.clone();
+    current.historical_replay_generation = Some("uncommitted-context".into());
     fill_session(&mut current);
     assert!(save_locked(
         &f.path,
@@ -1849,7 +1867,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         committed.v2().growth_retention
     );
     assert_eq!(restored.generation, committed_generation);
-    assert_eq!(restored.upload_context_fingerprint, committed_context);
+    assert_eq!(restored.historical_replay_generation, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 
     let path = seed.files.keys().next().unwrap();

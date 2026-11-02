@@ -1,7 +1,7 @@
 //! Shared test-only transition vocabulary and emitted-money oracle.
 //!
 //! Drivers must use native scanning, upload/ACK and the one durable store.
-//! M1 writes AFTER index save; `Receipt` below does not imply write-ahead.
+//! The old writer writes AFTER index save; `Receipt` below does not imply write-ahead.
 //! New slice drivers supply their native order rather than changing this oracle.
 //!
 //! Extension rows (keep the one comparator):
@@ -12,9 +12,9 @@
 //!   pending receipt reconciliation and directory creation/parent-sync edges.
 //! - a1: live preparation/finish success/error and receipt BEFORE publication.
 //! - audit gate: quiet/append after 1h/50h and >256 slots, clock/debt controls.
-//! - E2: protected nonempty TierReplay, group/EOF/archive and cursor custody.
+//! - `e2`: protected nonempty TierReplay, group/EOF/archive and cursor custody.
 //!
-//! M1's named crash edges cannot stand in for the later edges; cheap/raw I/O
+//! The old writer's named crash edges cannot stand in for the later edges; cheap/raw I/O
 //! stays unmeasured until the acquisition owner supplies a real observation.
 use crate::snapshots::{
     snapshot_semantic_envelope, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
@@ -253,7 +253,7 @@ pub(crate) enum Mode {
     EvictRetry,
 }
 
-/// Logical boundaries use `reach`; physical M1 boundaries use the store's
+/// Logical boundaries use `reach`; physical old-writer boundaries use the store's
 /// existing before-rename and before-directory-sync hooks. No fake fsyncs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CrashPoint {
@@ -291,7 +291,7 @@ pub(crate) enum CrashPoint {
     BeforeCodexPublication,
 }
 impl CrashPoint {
-    // Preserve the existing M1 executable matrix. Later points must not be
+    // Preserve the existing old-writer executable matrix. Later points must not be
     // appended here until its child driver actually traverses those paths.
     pub(crate) const ALL: [Self; 16] = [
         Self::OldWriter,
@@ -311,9 +311,9 @@ impl CrashPoint {
         Self::RestartOne,
         Self::RestartTwo,
     ];
-    /// The executable native-M3 SIGKILL rows (m3_d3_tests::OrderPoint).
+    /// The executable native-engine SIGKILL rows (m3_d3_tests::OrderPoint).
     /// FileSynced is N/A: plain-flush engine: no fsync boundary.
-    /// The old-writer/M1 ALL matrix above keeps its historical row.
+    /// The old-writer ALL matrix above keeps its historical row.
     pub(crate) const NATIVE_M3: [Self; 3] = [
         Self::Prepared,
         Self::BeforeRename,
@@ -329,8 +329,8 @@ impl CrashPoint {
         Self::BeforeRetireSync,
         Self::RetiredSynced,
     ];
-    /// Names reserved for the owning a0/a1/E2 call sites. They are NOT a
-    /// runnable matrix on M1; reach() must be placed at the real boundaries.
+    /// Names reserved for the owning a0/a1/`e2` call sites. They are NOT a
+    /// runnable matrix on the old writer; reach() must be placed at the real boundaries.
     pub(crate) const LIVE_EXTENSION: [Self; 10] = [
         Self::BeforeParentSync,
         Self::ParentSynced,

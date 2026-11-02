@@ -158,7 +158,7 @@ fn side_request_round_trips_and_is_bounded() {
         referenced_epoch: u64::MAX,
     };
     let text = serde_json::to_string(&extreme).unwrap();
-    // D6(b): `"referenced_epoch":u64::MAX` adds 40 B: 439 → 479 B.
+    // `"referenced_epoch":u64::MAX` adds 40 B: 439 → 479 B.
     assert!(text.len() <= 480, "{} {text}", text.len());
     assert_eq!(serde_json::from_str::<SideRequest>(&text).unwrap(), extreme);
 }
@@ -477,7 +477,7 @@ fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
         );
     }
 
-    // Decoded per record (design rev 2 R1-M5, rev 3 §1.7): an undecodable
+    // Decoded per record: an undecodable
     // record is dropped and P has no record (the fence's request path);
     // every other record and field loads, and the index is not quarantined.
     let mut value = serde_json::to_value(&loaded).unwrap();
@@ -545,7 +545,7 @@ fn file_entry() -> ScanIndexEntry {
     }
 }
 
-/// Test support for the D2 capacity controls outside `snapshots`.
+/// Test support for the capacity controls outside `snapshots`.
 impl ScanIndex {
     /// Adds `parents` side records and side requests at field extremes.
     pub(crate) fn add_codex_side_state_for_test(&mut self, parents: usize) {
@@ -581,7 +581,7 @@ impl ScanIndex {
     }
 }
 
-/// D4: requests decode per entry. A malformed entry is dropped and counted
+/// Requests decode per entry. A malformed entry is dropped and counted
 /// once at `ScanIndex::load` (`side_request_rearm{decode_dropped}` →
 /// `side_requests_rearmed`); every valid sibling keeps its exact pacing,
 /// and a corrected save/reload persists only the valid entries.
@@ -641,7 +641,7 @@ fn side_requests_decode_per_entry_and_drop_only_the_malformed_one() {
     );
 }
 
-/// D4: all requests malformed still loads, and the rest of the index (ACK
+/// All requests malformed still loads, and the rest of the index (ACK
 /// fingerprints, held sessions, side records) is what the same file without
 /// any request loads as. A legacy index without the map keeps the defaults.
 /// The map's outer shape is not relaxed: a non-object still quarantines.
@@ -701,7 +701,7 @@ fn malformed_or_absent_side_requests_leave_the_rest_of_the_index_alone() {
     assert!(rebuilt.accepted_snapshot_fingerprints.is_empty());
 }
 
-/// D4: a dropped request is absent scheduling evidence only. Reloading the
+/// A dropped request is absent scheduling evidence only. Reloading the
 /// same corrupt file in the same process never resets the ledger's charge
 /// (C14 restores it every time), and the drop creates no record, so it can
 /// never admit a child by itself.
@@ -717,7 +717,7 @@ fn a_dropped_request_never_resets_the_ledger_charge_or_admits() {
     index.files.insert(p_key.into(), file_entry());
     index.save(&path).unwrap();
 
-    // The hydrated request has no loaded epoch: 0, unknown (D6(b)).
+    // The hydrated request has no loaded epoch: 0, unknown.
     let charged = SideRequest {
         attempts: 3,
         not_before_unix_seconds: 1_792_541_000,
@@ -756,7 +756,7 @@ fn a_dropped_request_never_resets_the_ledger_charge_or_admits() {
     }
 }
 
-/// Row 32 / D6(b) fixtures: P's key carries its session id in its name.
+/// Fixtures: P's key carries its session id in its name.
 const SWEPT: &str = "/s/rollout-2026-10-21T05-43-00-0199f0a1-2b3c-7d4e-8f90-000000000001.jsonl";
 
 fn epoch_request(state: SideRequestState, referenced_epoch: u64) -> SideRequest {
@@ -766,7 +766,7 @@ fn epoch_request(state: SideRequestState, referenced_epoch: u64) -> SideRequest 
     }
 }
 
-/// D6(b): an unset epoch keeps a request's bytes exactly (legacy identity);
+/// An unset epoch keeps a request's bytes exactly (legacy identity);
 /// a set one adds only its own member, and the request owns no heap.
 #[test]
 fn a_zero_request_epoch_keeps_the_legacy_bytes() {

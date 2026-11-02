@@ -238,8 +238,7 @@ fn temp_index_path(name: &str) -> std::path::PathBuf {
     dir.join("index.json")
 }
 
-/// Row 34 (rev 2 R1-M5, rev 3 §1.7, rev 4, rev 10 §2.3, rev 11/12): the
-/// proof map, both cursors, `seq` and the incarnation persist; the map
+/// The proof map, both cursors, `seq` and the incarnation persist; the map
 /// decodes per entry and then semantically (digest; cause ordinal, or
 /// `CAUSE_NO_EVIDENCE` only for lineage; side `Held` causes); the RAM
 /// parent fold is rebuilt at load and in the subset; the subset takes the
@@ -409,7 +408,7 @@ fn fold(pairs: &[(&str, u32)]) -> BTreeMap<String, u32> {
         .collect()
 }
 
-/// Row 2 (rev 3 §3.1, rev 5 R2-M6, rev 11 R1-M1): the owe is idempotent
+/// The owe is idempotent
 /// for the same parent (progress kept, no new `seq`), an unused `Proven`
 /// is a no-op, a refused `Proven` or another parent takes a fresh `seq`;
 /// the owed-parent fold follows every insert and remove and equals a
@@ -635,8 +634,7 @@ fn settle_and_finish_move_one_entry_and_the_finish_needs_the_jobs_seq_and_incarn
     assert!(index.codex_parent_prefix_proofs.is_empty());
 }
 
-/// Row 35 (rev 12 §5.3 table, rev 13 R1-L4; U-T59(a)/(c) unit legs): a
-/// missing index mints once and reuses while missing; an unsaved reload
+/// A missing index mints once and reuses while missing; an unsaved reload
 /// starts above the owe's high-water, so `seq` never repeats; a saved nonce
 /// is kept; a file without one reuses only while it is the same object; a
 /// quarantine mints fresh, and the then-missing path reuses it. Nothing is
@@ -865,7 +863,6 @@ fn drop_retires_a_keys_side_and_proof_items_and_its_ledger_generation() {
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
-            context_inputs: None,
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
         }),

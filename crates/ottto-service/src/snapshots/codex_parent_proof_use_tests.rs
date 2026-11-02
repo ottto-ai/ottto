@@ -1,4 +1,4 @@
-//! U1a-2a D6(a): proof consumption at `new_source_parser`'s Codex arm,
+//! Proof consumption at `new_source_parser`'s Codex arm,
 //! pinned against BASE (main's parse of the same bytes and evidence): a
 //! refused, missing, mis-scoped or mismatched proof is BASE exactly; only an
 //! admitted proof that decides as it says changes the child. Fixtures are
@@ -334,7 +334,7 @@ fn a_held_at_zero_proof_holds_as_the_ledger_arm_does() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// D6(a) BASE pins at the arm: a chain mismatch, EOF inside the proven
+/// BASE pins at the arm: a chain mismatch, EOF inside the proven
 /// prefix, a held-at-0 claim the child does not make, and a proof for
 /// another parent are each BASE exactly (main's witness hold, or main's
 /// pending child with no evidence); a non-cap witness never consults a
@@ -408,7 +408,7 @@ fn a_mismatched_or_undecided_proof_is_base_exactly() {
         assert_eq!(view(&ignored), view(&base), "{cause:?}");
         assert_eq!(ignored.codex_parent_proof_used, None);
     }
-    // R1-L3: an arm that decided, but not as the proof says (forged: it
+    // An arm that decided, but not as the proof says (forged: it
     // cannot occur), fails closed in every build: held under main's cause
     // (`NoLedger` with none), never pending, ownership-incomplete.
     for evidence in [witness(CodexParentUnresolvable::Oversize), BTreeMap::new()] {
@@ -483,7 +483,6 @@ impl Scene {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
-                context_inputs: None,
                 listing_started_unix_seconds: None,
                 listing_owed_requeued_unix_seconds: Default::default(),
             }),
@@ -596,7 +595,7 @@ fn the_install_admits_only_a_fenced_in_scope_proof() {
     assert!(scene.index.codex_parent_side_requests.is_empty());
 }
 
-/// D6(a) BASE pins at the install: missing proof, wrong namespace or scope
+/// BASE pins at the install: missing proof, wrong namespace or scope
 /// (another index, another proof scope, an owed entry), an unavailable
 /// census, an ambiguous parent, an unsettled side and a stale seal each
 /// install nothing, so the parse is main's exactly.
@@ -879,7 +878,7 @@ fn the_record_site_settles_the_entry_per_the_table() {
     }
 }
 
-// U1a-2a row 33 (D6(c)/(d)): the job's readers and lockstep.
+// The job's readers and lockstep.
 
 fn job_of(parent: &Path, children: &[&Path]) -> CodexProofReaders {
     let now = sampled_scan::now_seconds();
@@ -1081,7 +1080,7 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// D6(d): P's row straddling its frozen extent is withheld (the sealed
+/// P's row straddling its frozen extent is withheld (the sealed
 /// fragment): never parsed or observed, so it pushes no signature, and the
 /// seal would sit at the last newline. A child that diverges exactly there
 /// is `ParentExhausted`, while P's complete ledger (which saw the row) would
@@ -1172,7 +1171,7 @@ fn a_job_reads_nothing_past_its_budget() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Fix round 2b (DM1 ruling (a)): the derived fixed amount an ordinary
+/// The derived fixed amount an ordinary
 /// line adds to the readers' retained state, whatever its length or shape:
 /// P's ledger row and one ring slot and a child's paged signature (64-byte
 /// signatures), plus the acquisition's head and boundary samples
@@ -1500,7 +1499,7 @@ fn page_with(leftover: u64) -> PageBudget {
     page
 }
 
-/// R2-M1: after a failed save the side gate is closed. The next pass starts
+/// After a failed save the side gate is closed. The next pass starts
 /// no proof (nothing read, the entry untouched) and finishes none: a held
 /// job steps fd-only and suspends again. A saved pass finishes it.
 #[test]
@@ -1559,7 +1558,7 @@ fn a_closed_side_gate_starts_and_finishes_no_proof() {
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
 }
 
-/// R1-L4 / R2-M2: P's side record held for P's own lineage refuses the
+/// P's side record held for P's own lineage refuses the
 /// batch at the start's fence (charged; P is never read) as `LineageHeld`
 /// and owes P nothing in 2a. Held only by the finish (the record turned
 /// held while the job was suspended), the finish records the same and owes
@@ -1998,7 +1997,7 @@ fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
 }
 
-/// E1 S3 (C1): proof wakes compare raw path stamps exactly, ctime included,
+/// Proof wakes compare raw path stamps exactly, ctime included,
 /// as before S3. A path stamp carries no birth witness, so ctime is the only
 /// signal of a same-inode replacement or an mtime-restored rewrite until a
 /// birth fence exists (S3b). An untouched pair keeps a `Rewritten` wake

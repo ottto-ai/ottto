@@ -127,7 +127,9 @@ impl AckFixture {
     }
 }
 
-fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn exact_ack(
+    items: Vec<SnapshotItem>,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
@@ -1630,7 +1632,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
         "the retained exact ACK is not re-sent"
     );
 
-    // SOURCE h843 item 2: "kept" alone would allow a forever-kept ACK. The
+    // "kept" alone would allow a forever-kept ACK. The
     // pending obligation is persisted across recovery, and adopting the
     // settled containing file then retires the exact ACK.
     let (previous, mut progress) = f.load();
@@ -1772,7 +1774,7 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
         .unwrap();
     f.assert_ack(&f.load().1);
 
-    // SOURCE h843 item 2: the pending obligation is persisted across
+    // The pending obligation is persisted across
     // recovery; when the new file vanishes before it settled, a complete
     // census proves E absent and retires the exact ACK.
     let (previous, mut progress) = f.load();
@@ -1896,6 +1898,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &progress,
                 &holds,
                 other == "rejected",
+                None,
             ),
         };
         assert!(!settlement.fully_settled, "{outcome}");
@@ -2018,7 +2021,7 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
     assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
 }
 
-// M7: synthetic persisted ACKs only; no live source/provider/account state.
+// Synthetic persisted ACKs only; no live source/provider/account state.
 fn bound_progress(
     index_path: &Path,
     progress_path: &Path,
@@ -2383,7 +2386,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     .unwrap()
                     .map(Box::new);
             // Two exact sibling ACKs followed by a real uploader stop. No file
-            // publication changes: R1's activation/staging guard stays intact.
+            // publication changes: the activation/staging guard stays intact.
             let upload = |items: &[SnapshotItem],
                           progress: &mut SnapshotUploadProgress,
                           response: &mut dyn FnMut(

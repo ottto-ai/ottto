@@ -319,7 +319,7 @@ pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> 
         .is_some_and(|record| record.identity_incomplete_hold())
 }
 
-/// Option B (SOURCE rule 3: a hold may delay a re-offer, never cancel it). A
+/// A hold may delay a re-offer, never cancel it. A
 /// marker-erasing daemon (0.1.189's parse-free migrate) rewrote held entries
 /// to plain v2, dropping their audit deadline; an unchanged file then skips
 /// forever and an aged one leaves discovery. Re-derive the marker from the
@@ -456,7 +456,7 @@ fn progress_slot(key: String, due: u64, previous: Option<&HeldAuditProgress>) ->
     }
 }
 
-/// GUARDRAILS rule 5: a progress Full whose secure open keeps failing backs
+/// A progress Full whose secure open keeps failing backs
 /// off instead of retrying every page: 1 page after the first failure,
 /// doubling, each wait capped at 6 h. The eighth consecutive failure parks
 /// the key (one alarm); a parked key is retried only after its stat changes,
@@ -466,7 +466,7 @@ const OPEN_PARK_FAILURES: u8 = 8;
 const OPEN_BACKOFF_CAP_SECONDS: u64 = 6 * 60 * 60;
 /// Census keys are at most 4 KiB, so the map stays bounded (about 1 MiB at
 /// worst). On overflow the longest-quiet entry is evicted (counted) and that
-/// key may retry (rule 7: fail toward reading); its owed due moves into the
+/// key may retry (fail toward reading); its owed due moves into the
 /// slot with it, so the debt is never dropped or moved later.
 const OPEN_BACKOFF_KEYS: usize = 256;
 
@@ -579,24 +579,9 @@ impl OpenBackoff {
     }
 }
 
-#[cfg(not(test))]
-static OPEN_BACKOFF: std::sync::Mutex<OpenBackoff> = std::sync::Mutex::new(OpenBackoff::new());
-#[cfg(test)]
-thread_local! {
-    static OPEN_BACKOFF: std::cell::RefCell<OpenBackoff> =
-        const { std::cell::RefCell::new(OpenBackoff::new()) };
-}
-
-/// A leaf lock: `run` never takes another lock or re-enters.
-fn with_open_backoff<T>(run: impl FnOnce(&mut OpenBackoff) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        run(&mut OPEN_BACKOFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    OPEN_BACKOFF.with(|backoff| run(&mut backoff.borrow_mut()))
+process_state! {
+    /// A leaf lock: `body` never takes another lock or re-enters.
+    fn with_open_backoff: OpenBackoff = OpenBackoff::new(); clear_poison: false
 }
 
 fn open_blocked(key: &str, now: u64) -> bool {
@@ -608,15 +593,10 @@ fn open_blocked(key: &str, now: u64) -> bool {
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
     with_open_backoff(|backoff| {
         (
+            backoff.keys.len(),
             backoff
                 .keys
                 .values()
-                .filter(|failure| failure.failures > 0)
-                .count(),
-            backoff
-                .keys
-                .values()
-                .filter(|failure| failure.failures > 0)
                 .map(|failure| now.saturating_sub(failure.first_failed))
                 .max()
                 .unwrap_or(0),
@@ -658,22 +638,6 @@ struct HeldAuditOpenParked {
     held_audit_open_failed_keys: usize,
 }
 
-// All actual failed opens of an already owed key, including constructor
-// preflight, share the bounded failure record. No census/ACK state changes.
-fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
-    let (recorded, keys) =
-        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked.as_ref() {
-        // Counts only; no path or id. Once per park.
-        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
-            held_audit_open_failures: parked.failures,
-            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
-            held_audit_open_failed_keys: keys,
-        });
-    }
-    recorded
-}
-
 /// The queued progress Full for `key` failed its secure open. Back the key
 /// off (or park it), then rotate the turn, wrapping to `key` itself when no
 /// other member is eligible, but keep the owed due: a failed open never
@@ -687,9 +651,19 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
     else {
         return;
     };
-    let recorded = record_open_failure(key, due, now);
+    // The bounded failure record only; no census/ACK state changes.
+    let (recorded, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = recorded.parked.as_ref() {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
     let previous = index.held_audit_progress.take();
-    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
+    // An overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
     let (evicted, evicted_due) = recorded.evicted.unzip();
     index.held_audit_progress = evicted
@@ -1463,7 +1437,7 @@ mod provenance_tests {
     }
 
     /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
-    /// or legacy entry (never a prefix, SOURCE Option 1) re-recorded without
+    /// or legacy entry (never a prefix) re-recorded without
     /// verification or obligation becomes the clean identity; the same
     /// completion's FE mark still tags `p`.
     #[test]

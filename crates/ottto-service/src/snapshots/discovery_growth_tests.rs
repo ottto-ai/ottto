@@ -325,7 +325,7 @@ fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
     }
 }
 
-/// [behaviour] SOURCE's rewrite control: the same inode is truncated and rewritten past
+/// [behaviour] Rewrite control: the same inode is truncated and rewritten past
 /// the committed extent with a changed prefix. Growth retention discovers it;
 /// acquisition's existing prefix samples force the counted Full rebuild.
 #[test]
@@ -1273,3 +1273,5 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
         }
     }
 }
+
+mod codex_archive_tests;

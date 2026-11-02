@@ -432,7 +432,7 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
 
-/// T1/T6: the page's only permanent refusals are dominated, no holds. The
+/// The page's only permanent refusals are dominated, no holds. The
 /// first refusal and both quiet retained cycles report settled residue, never
 /// `backend_validation_error`, and the native lease outcome is unchanged.
 #[test]

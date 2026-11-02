@@ -64,6 +64,36 @@ impl FileStamp {
         })
     }
 
+    /// Archive completion keeps only the same_content witness, never ctime.
+    pub(crate) fn content_only(mut self) -> Self {
+        #[cfg(unix)]
+        {
+            self.changed = (0, 0);
+        }
+        self
+    }
+
+    /// Compare the complete listing key without another metadata read.
+    pub(crate) fn same_listing(
+        &self,
+        device: u64,
+        inode: u64,
+        length: u64,
+        modified: (i64, i64),
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == device
+                && self.inode == inode
+                && self.length == length
+                && self.modified == modified
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, inode, length, modified);
+            false
+        }
+    }
     pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
@@ -79,7 +109,7 @@ impl FileStamp {
     /// The one content rule: the same object at the same length and
     /// nanosecond mtime. ctime is never compared: a chmod, an xattr write
     /// (Spotlight, backup, quarantine) or a new hard link moves it without
-    /// touching a byte (Ron's re-read rule). A same-size rewrite that keeps
+    /// touching a byte (the re-read rule). A same-size rewrite that keeps
     /// mtime passes; samples are not consulted here. Without Unix identity
     /// this is the length alone, as the derived equality was, and
     /// `select_mode` still refuses as `UnsupportedIdentity`.
@@ -208,7 +238,7 @@ impl Samples {
     }
 }
 
-/// Parent ruling 2 (#606 round 3): the opened object's identity and the
+/// The opened object's identity and the
 /// samples covering its sealed prefix, minted only by
 /// `ReadPlan::commit_sealed_prefix_or_lossy_identity` when the certificate
 /// refused as `Lossy` alone (every identity, sample, scope and audit check
@@ -271,7 +301,7 @@ impl Checkpoint {
     /// Whether the opened object `file` still has the content this
     /// checkpoint committed (`FileStamp::same_content`): no append,
     /// truncation or mtime-moving edit since; a ctime-only change keeps it.
-    /// P1-RETAIN R0's gate before a release for this copy. It reads the open
+    /// The gate before a release for this copy. It reads the open
     /// handle, so a path replaced after revalidation is not seen here; the
     /// next take's `Replaced` check catches it (at most one wasted release).
     pub(crate) fn stamp_matches(&self, file: &File) -> io::Result<bool> {
@@ -454,7 +484,7 @@ impl PrefixSeal {
     /// only one such use is the caller's rule.
     ///
     /// Differences from `prepare` on the same checkpoint:
-    /// - Refusal-only, E1 S3 (C1): the stamp compares exactly, ctime
+    /// - Refusal-only: the stamp compares exactly, ctime
     ///   included (`CertificateView::exact_stamp`), so a ctime-only change
     ///   refuses as `SameSizeEdit` or `Replaced` where `prepare` admits it.
     /// - Refusal-only: a short or failed sample read refuses as
@@ -710,8 +740,8 @@ struct CertificateView<'a> {
     /// A `PrefixSeal`'s rule: the stamp exactly, ctime included. Its only
     /// users are Codex parent-proof authority (side records, proof install
     /// and re-fence), where ctime is the only witness of a same-inode
-    /// replacement or an mtime-restored rewrite until a birth fence exists
-    /// (E1 S3b). A `Checkpoint` compares `same_content`.
+    /// replacement or an mtime-restored rewrite until a birth fence exists.
+    /// A `Checkpoint` compares `same_content`.
     exact_stamp: bool,
     scope: &'a str,
     sealed_offset: u64,
@@ -751,7 +781,7 @@ fn select_mode(
     mut sample_eq: impl FnMut(SampleAt) -> io::Result<bool>,
 ) -> io::Result<ReadMode> {
     // Only PrefixSeal uses the exact-stamp view. Its proof horizon stays
-    // intact until S1; acquisition checkpoints reuse by content checks,
+    // intact; acquisition checkpoints reuse by content checks,
     // regardless of the audit clock or a carried deadline. A missing
     // checkpoint is StateMissing; debt never supplies Full authority.
     let proof_horizon = old.as_ref().is_some_and(|old| old.exact_stamp);
@@ -809,7 +839,7 @@ fn select_mode(
 impl ReadPlan {
     /// The admission hint of the checkpoint this plan commits: the commit
     /// refuses any source stamp but this plan's, and carries it unchanged
-    /// (`Checkpoint::modified_hint`). P1-RETAIN R0 ranks the completed copy
+    /// (`Checkpoint::modified_hint`). Copy retention ranks the completed copy
     /// from it before the commit.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {
         #[cfg(unix)]
@@ -1047,7 +1077,7 @@ impl ReadPlan {
 }
 
 impl ReadPlan {
-    /// `commit_sealed_prefix`, plus ruling 2's typed identity exactly when it
+    /// `commit_sealed_prefix`, plus the typed identity exactly when it
     /// refused as `Lossy`: that refusal is reached only after every other
     /// identity, sample, scope and audit check passed.
     #[allow(clippy::too_many_arguments)]
@@ -1489,7 +1519,7 @@ pub(crate) struct DurableAdmission {
     pub(crate) sample_bytes_read: usize,
 }
 
-/// The certificate samples' digest domain (M1, SOURCE P2-5): a sample digest
+/// The certificate samples' digest domain: a sample digest
 /// is never the plain SHA-256 of its window, so a file shorter than one
 /// window never yields the plain hash of the whole file.
 #[cfg(unix)]
@@ -1597,7 +1627,7 @@ impl DurableCertificate {
         self.restore_with_append(file, scope, false)
     }
 
-    /// M3's grown path permits concurrent appends outside the certified prefix.
+    /// The native engine's grown path permits concurrent appends outside the certified prefix.
     /// The legacy certificate fixture above keeps its exact metadata guard.
     pub(crate) fn restore_grown(
         &self,
@@ -1675,7 +1705,7 @@ impl DurableCertificate {
     }
 
     /// The existing allocation-free certificate edits. Keep these before
-    /// typed decode/rederive admission so resource pressure cannot hide A2.
+    /// typed decode/rederive admission so resource pressure cannot hide a metadata change.
     pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
         self.checked_stamp(file).map(|_| ())
     }
@@ -1785,7 +1815,7 @@ pub(crate) fn set_between_guards(hook: Option<Box<dyn FnMut()>>) {
     BETWEEN_GUARDS.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// Tests only (R1-M1): `PrefixSeal::samples_match` calls on this thread
+/// Tests only: `PrefixSeal::samples_match` calls on this thread
 /// since the last call, which resets the count.
 #[cfg(test)]
 pub(crate) fn samples_match_calls() -> u64 {
@@ -1953,7 +1983,7 @@ mod tests {
         let (mode, cp, read) = run(&f, Some(&cp), None, 200);
         assert_eq!(mode, ReadMode::Tail);
         assert_eq!(read, 2 * SAMPLE_BYTES);
-        // Ron's accepted residual: unchanged head/boundary samples can miss
+        // Accepted residual: unchanged head/boundary samples can miss
         // an interior edit in a growth-shaped file, without a later audit.
         let debt = cp.audit_debt();
         let (mode, next, read) = run(&f, Some(&cp), debt, 3700);
@@ -2635,7 +2665,7 @@ mod tests {
                 .unwrap_err(),
             PrefixRefusal::Lossy
         );
-        // AD-T1: a stable, complete read that outlived the interval verifies
+        // A stable, complete read that outlived the interval verifies
         // at commit; the horizon then runs from the commit.
         let (mut file, plan, frozen) = sealed_read(&f, 100);
         let cp = plan
@@ -2658,7 +2688,7 @@ mod tests {
             run(&g, Some(&grown), grown.audit_debt(), late + 1).0,
             ReadMode::Tail
         );
-        // AD-T1 continued: after an append, the stable read's checkpoint
+        // After an append, the stable read's checkpoint
         // continues to Tail even after the legacy audit horizon.
         f.append(b"three\n");
         let horizon = late + AUDIT_INTERVAL_SECONDS;
@@ -2710,7 +2740,7 @@ mod tests {
     /// exactly when `prepare` would reuse the checkpoint, with the same
     /// refusal reason and the same sample bytes read, on every identity,
     /// sample and scope case but a ctime-only change, which
-    /// `prepare` reuses (E1 S3) and a seal refuses as `SameSizeEdit` (C1: a
+    /// `prepare` reuses and a seal refuses as `SameSizeEdit` (C1: a
     /// seal keeps the exact stamp until a birth fence exists). The seal
     /// also retains its proof horizon, while acquisition ignores audit age.
     ///
@@ -2964,8 +2994,8 @@ mod tests {
 
     /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change and
     /// for a same-size change that moved mtime (both of which `admits`
-    /// still refuses as `SameSizeEdit`: a seal keeps the exact stamp, E1 S3
-    /// C1), false for a head or a boundary edit, a truncation and
+    /// still refuses as `SameSizeEdit`: a seal keeps the exact stamp),
+    /// false for a head or a boundary edit, a truncation and
     /// an invalid seal sample, and it leaves the FD's position where it was,
     /// so a reader on that FD continues correctly, on every path.
     #[test]
@@ -2987,7 +3017,7 @@ mod tests {
         };
 
         // ctime only: same bytes, so the samples match; admission is
-        // unchanged (`SameSizeEdit`: a seal keeps the exact stamp, E1 S3 C1).
+        // unchanged (`SameSizeEdit`: a seal keeps the exact stamp).
         let f = Fixture::new(&bytes);
         let seal = initial(&f, 1000).seal(1000);
         assert!(check(&f, &seal));
@@ -3521,7 +3551,7 @@ mod tests {
         panic!("{meta:?} never moved ctime");
     }
 
-    /// A change E1 S3 tests: metadata only, or an mtime move at equal
+    /// A change under test: metadata only, or an mtime move at equal
     /// length with no byte changed (`n` picks a distinct mtime).
     #[derive(Clone, Copy, Debug)]
     enum Change {
@@ -3547,11 +3577,11 @@ mod tests {
         }
     }
 
-    /// E1 S3: a change between a decision's opening stamp and its
+    /// A change between a decision's opening stamp and its
     /// re-capture (the `between_guards` hook). Metadata only keeps
     /// `prepare`'s tail and `unpark`'s resume; a moved mtime there still
     /// aborts each. A seal keeps the exact stamp (C1), so either change
-    /// there refuses its admission as `Replaced`, as before S3.
+    /// there refuses its admission as `Replaced`, as before.
     #[test]
     fn metadata_only_change_between_guard_captures_keeps_the_decision() {
         struct Clear;

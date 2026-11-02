@@ -23,7 +23,6 @@ macro_rules! scan_index_fields {
         scan_index_fields! { @apply $ctx
             schema_version => Misc (control check_field) [] side,
             generation => Misc (control check_field) [] side,
-            upload_context_fingerprint => Misc (misc check_field Field) ["setting.upload_context_fingerprint" => 1] side,
             known_configured_scan_roots => Misc (misc check_field Set) ["v1_field.known_configured_scan_roots" => 1] side,
             legacy_unresolved_root_file_witnesses => Misc (misc check_field Set) ["v1_field.legacy_unresolved_root_file_witnesses" => 1] side,
             codex_state_only_snapshot_fingerprints => Misc (misc check_field Map) ["v1_field.codex_state_only_snapshot_fingerprints" => 1] side,
@@ -85,6 +84,10 @@ macro_rules! scan_index_fields {
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2] side,
+            // Codex archive custody: rows only while held (kinds_misc::ARCHIVE_KINDS).
+            archives => Misc (hook check_field) ["v1_field.archives" => 2] side,
+            archive_deferred_alarm_count => Misc (hook check_field) ["v1_field.archive_deferred_alarm_count" => 2] side,
+            archive_pass => Misc (runtime none) [] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_account_family_witnesses" => 1, "raw_hold.claude_account_family_pending" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_family_pending" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,
             files => Files (map check_map) ["file.progress" => 1] own,
             terminal_jsonl_dispositions => Files (map check_map) ["file.terminal" => 1] side,
@@ -119,7 +122,6 @@ macro_rules! scan_index_fields {
             codex_counting_moved_evidence => Misc (runtime none) [] side,
             active_quarantine_witness => Misc (runtime none) [] side,
             active_upload_context_fingerprint => Files (runtime none) [] side,
-            file_upload_context_enabled => Files (runtime none) [] side,
             context_read_counts => Files (runtime none) [] side,
             active_effective_upload_body_witness_revision => Files (runtime none) [] side,
             active_effective_upload_body_witness_revision_monotone => Files (runtime none) [] side,
@@ -131,6 +133,8 @@ macro_rules! scan_index_fields {
             claude_rebuild_read_load_eligible => Misc (runtime none) [] side,
             reason_reoffer_cooldowns => Misc (runtime none) [] side,
             retired_reread_guard => Misc (retired none) [] side,
+            // An earlier store's row stays accepted and is never read or written.
+            retired_upload_context_fingerprint => Misc (retired none) ["setting.upload_context_fingerprint" => 1] side,
             retired_context_curve_capability_enabled => Misc (retired none) [] side,
             retired_context_curve_replay_epoch => Misc (retired none) [] side,
             retired_completed_context_curve_replay_generation => Misc (retired none) [] side,
@@ -139,6 +143,8 @@ macro_rules! scan_index_fields {
             claude_history_emission => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
+            copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
+            copy_prefix_recovery_scope => Misc (runtime none) [] side,
         }
     };
     (@apply [each $m:ident] $($f:ident => $g:ident $store:tt [$($kind:literal => $introduced:literal),*] $heap:ident,)*) => {
@@ -167,7 +173,7 @@ pub(super) enum Group {
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 2;
+pub(super) const LAYOUT: u32 = 3;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
@@ -214,6 +220,11 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
         };
     }
     scan_index_fields!(each check);
+    if field == "upload_context_fingerprint" {
+        // TOMBSTONE: decode-and-drop, as the v1 decoder does.
+        map.next_value::<serde::de::IgnoredAny>()?;
+        return Ok(true);
+    }
     Ok(false)
 }
 

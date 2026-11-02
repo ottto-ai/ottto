@@ -1,4 +1,4 @@
-//! Contract-5 cutover (SOURCE §B): contract 5 is always on for Claude Code.
+//! Contract-5 cutover: contract 5 is always on for Claude Code.
 //! The identity permit and #825's `STAMPED_WITHOUT_PERMIT` machinery are
 //! retired. Old stores keep decoding the retired bit (64), which is never
 //! set, cleared or replayed; money-rule version 2 keeps its meaning; a
@@ -13,7 +13,7 @@ use crate::local_resource_diagnostics::claude_reread;
 /// #825's `STAMPED_WITHOUT_PERMIT`, retired: decoded, never acted on.
 const RETIRED_PERMIT_MARK: u8 = 64;
 
-// Lead B / SOURCE: the contract-5 caps stay exactly as they were.
+// The contract-5 caps stay exactly as they were.
 const _: () = assert!(
     claude_request_identity::MAX_AUTHORITY_KEYS == 16
         && claude_request_identity::MAX_PARTS_PER_ROW == 17
