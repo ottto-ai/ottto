@@ -405,6 +405,43 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
     );
 }
 
+/// Sidecar read attempts and actual input bytes since the last Claude page.
+/// Repeated reads count again; missing/refused files add nothing. No identities.
+#[derive(Default, Serialize)]
+struct ClaudeSidecarReparse {
+    claude_sidecar_reparse_files: u64,
+    claude_sidecar_reparse_bytes: u64,
+}
+#[cfg(not(test))]
+static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_SIDECAR_REPARSE.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_SIDECAR_REPARSE)
+    }
+}
+pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    with_claude_sidecar_reparse(|counts| {
+        for (counter, delta) in counts.iter().zip([files, bytes]) {
+            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+        }
+    });
+}
+fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
+    with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
+        claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
+        claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+    })
+}
+
 /// Nonzero-only counters on the existing native_collection_page line. They
 /// observe a finalized file's retained records and gate nothing.
 #[derive(Default, Serialize)]
@@ -985,6 +1022,8 @@ impl Probe {
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
             #[serde(flatten)]
+            sidecar_reparse: Option<ClaudeSidecarReparse>,
+            #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
             reread: claude_reread::Counts,
@@ -1058,6 +1097,7 @@ impl Probe {
             } else {
                 Default::default()
             },
+            sidecar_reparse: claude.then(take_claude_sidecar_reparse),
             caps: if claude {
                 take_claude_record_caps()
             } else {
