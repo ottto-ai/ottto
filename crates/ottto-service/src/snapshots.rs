@@ -35405,10 +35405,11 @@ impl OwnedSourceScan {
                                     ) {
                                         Ok(attempt) => taken.durable.put_retail(attempt),
                                         Err(reason) => {
-                                            let full = matches!(reason,
-                                                sampled_scan::durable_tail::RetailHold::Exhausted |
-                                                sampled_scan::durable_tail::RetailHold::AccountingLost)
-                                                && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now());
+                                            let full = match reason {
+                                                sampled_scan::durable_tail::RetailHold::Exhausted => context.cache.retail_exhausted_full(&key, parser.reader.reader.get_ref(), SystemTime::now()),
+                                                sampled_scan::durable_tail::RetailHold::AccountingLost => context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now()),
+                                                sampled_scan::durable_tail::RetailHold::Ineligible => false,
+                                            };
                                             // A refused grant cannot leave a guardless
                                             // graph in RAM. Release graph before funding.
                                             drop(old.take());

@@ -1675,6 +1675,17 @@ impl SharedCache {
             old_end: accepted_end,
         })
     }
+    /// `RETAIL_DAILY` limits Tail grants only and never holds a file: a spent
+    /// grant takes the budgeted Full whether or not the file grew, as OFF does.
+    pub(crate) fn retail_exhausted_full(
+        &self,
+        key: &str,
+        file: &File,
+        now: std::time::SystemTime,
+    ) -> bool {
+        self.retail_full(key, file, 0, now)
+    }
+
     /// Ordinary Full admission, not another Tail allowance. Overflow reads safely.
     pub(crate) fn retail_full(
         &self,

@@ -3865,6 +3865,10 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         ),
         Err(RetailHold::Exhausted)
     ));
+    assert!(
+        cache.retail_exhausted_full(&key, parser.reader.reader.get_ref(), SystemTime::now()),
+        "the spent grant takes a Full without growth, never a daily hold"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

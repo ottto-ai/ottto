@@ -398,7 +398,9 @@ alarm when nonzero: `old_binding_no_match` (an unprovable original binding),
 lost). Each is one counted Full, taken only on growth past the accepted end and
 admitted by the per-source, per-pass Full byte budget (256 MiB; a larger file is
 admitted alone at the front); the rest waits for the next pass, oldest first.
-`retail_exhausted_paced` counts growth deferred by that budget. When the RAM
+`retail_exhausted` takes its Full without the growth condition: the 24 h limit
+bounds Tail grants and never holds a file. `retail_exhausted_paced` counts
+attempts deferred by that budget. When the RAM
 stamp map overflows, the oldest key's stamp is evicted; `pace_evicted` counts it
 and alarms separately from the growth counts. `t14_rebuild_full_started` is the process
 total of admitted rebuild Fulls. Audit deadlines remain owned by the index,
