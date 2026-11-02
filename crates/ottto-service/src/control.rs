@@ -2723,11 +2723,11 @@ where
         .setup_operation
         .expected_organization_identifier_hash
         .as_deref();
-    if matches!(
-        direct_slot_status.state,
-        ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-    ) || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
+    // `ConcurrentMutation` is a same-pass race (Claude Code rewrote the
+    // account file between two reads), not proof of another account: a real
+    // different owner is still caught by the binding comparisons below.
+    if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
         || matches!((bound_organization_hash, observed_organization_hash), (Some(bound), Some(observed)) if bound != observed)
     {
         return store
@@ -2815,6 +2815,19 @@ where
             historical_account_hash.as_deref(),
             historical_organization_hash.as_deref(),
             Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
+        )
+    } else if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation {
+        // No verified account yet (an owner switch arrives as
+        // `IdentityMismatch` above): keep waiting without asking for /login.
+        store.transition_setup_operation_with_binding(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
+            ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            None,
+            None,
+            Some("Ottto could not confirm this login yet; it will check it again."),
         )
     } else if matches!(
         direct_slot_status.state,
@@ -20654,11 +20667,22 @@ for line in sys.stdin:
                 Some("e".repeat(64)),
                 ClaudeAccountSetupOperationState::Reading,
             ),
+            // A same-owner race is never "wrong account": without a verified
+            // account it keeps waiting, and with the expected one it keeps
+            // reading. A race that switched owners arrives as
+            // `IdentityMismatch`; see
+            // `claude_account_check_sees_a_race_to_another_account_as_mismatch`.
             (
                 "claude_setup_66666666666666666666666666666666",
                 ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
                 None,
-                ClaudeAccountSetupOperationState::IdentityMismatch,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            ),
+            (
+                "claude_setup_77777777777777777777777777777777",
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                Some("7".repeat(64)),
+                ClaudeAccountSetupOperationState::Reading,
             ),
         ];
         for (operation_id, collection_state, account_hash, expected_state) in cases {
@@ -20696,6 +20720,103 @@ for line in sys.stdin:
                     .expect("stop matrix operation before next setup");
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// [regress] The real race status at the setup boundary: verified A, a
+    /// race ending on A keeps the setup complete; ending on B is a mismatch.
+    #[test]
+    #[serial]
+    fn claude_account_check_sees_a_race_to_another_account_as_mismatch() {
+        let root = control_test_root("claude-account-check-race-switch");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let hash = |kind: &str, value: &str| {
+            ottto_core::billing_identity_hash("anthropic", kind, value).expect("hash")
+        };
+        let account_a = hash("account", "account-a");
+        let operation = "claude_setup_5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+        let prepared = FileClaudeConfigSlotSettingsStore::default()
+            .prepare_managed_account(1, operation.to_string(), Some(account_a.clone()))
+            .expect("prepare exact account");
+        let slot = prepared.managed_slots.last().expect("managed slot");
+        let config_dir = slot.config_dir.clone().expect("managed config dir");
+        fs::create_dir_all(&config_dir).expect("managed config dir exists");
+        let write_identity = |account: &str| {
+            let identity = serde_json::json!({"oauthAccount": {
+                "accountUuid": account, "organizationUuid": "organization-race"}});
+            fs::write(
+                Path::new(&config_dir).join(".claude.json"),
+                identity.to_string(),
+            )
+            .expect("identity");
+        };
+        let race = |slot_id: &str, captured_at: String, _: String| {
+            crate::agent_status::registered_claude_race_status_for_test(
+                slot_id,
+                &config_dir,
+                &captured_at,
+            )
+        };
+        // [regress] A race with no verified account (approval lookup failed,
+        // no prior binding) keeps setup waiting without a /login prompt.
+        let unbound =
+            check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                    observed_at: Some("2026-08-04T09:59:00Z".to_string()),
+                    ..Default::default()
+                }
+            })
+            .expect("unbound race");
+        assert_eq!(
+            unbound.setup_operation.state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
+        assert!(!unbound
+            .setup_operation
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/login"));
+
+        write_identity("account-a");
+        let full =
+            check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account_a.clone()),
+                    organization_identifier_hash: Some(hash("organization", "organization-race")),
+                    observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+                    last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    ..Default::default()
+                }
+            })
+            .expect("verified full check");
+        assert_eq!(
+            full.setup_operation.state,
+            ClaudeAccountSetupOperationState::Complete
+        );
+
+        let same = check_claude_account_with_collector(1, operation, Some(&account_a), race)
+            .expect("same-owner race");
+        assert_eq!(
+            same.setup_operation.state,
+            ClaudeAccountSetupOperationState::Complete
+        );
+
+        write_identity("account-b");
+        let switched = check_claude_account_with_collector(1, operation, Some(&account_a), race)
+            .expect("switched race is typed");
+        assert_eq!(
+            switched.setup_operation.state,
+            ClaudeAccountSetupOperationState::IdentityMismatch
+        );
+        assert_ne!(
+            switched.setup_operation.account_identifier_hash,
+            Some(hash("account", "account-b"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 
