@@ -373,7 +373,7 @@ impl ProgressRecovery {
     }
 
     /// Caller holds the source owner; called before progress decoding/containment.
-    /// v1 and Codex/Pi perform no extra reads, writes or normalization.
+    /// A graph not active on state v2 performs no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {
         if !state_v2_growth_retention_active(index) {
             return Ok(None);

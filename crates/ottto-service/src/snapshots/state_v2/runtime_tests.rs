@@ -12,13 +12,13 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     states().lock().unwrap().remove(path);
 }
 
-fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
     Ok(load_locked(path, importable, published(path)?)?.0)
 }
-fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
+pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
 }
-fn save_with_mode(
+pub(super) fn save_with_mode(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
@@ -28,7 +28,7 @@ fn save_with_mode(
 }
 
 /// Generation of a freshly imported native fixture store.
-const G: u64 = 1;
+pub(super) const G: u64 = 1;
 
 /// (generation, data version) before and after a raced delete.
 type RacedStamps = Option<((u64, u64), (u64, u64))>;
@@ -90,12 +90,12 @@ fn fill_session(index: &mut ScanIndex) {
     }
 }
 
-struct Fixture {
-    support: PathBuf,
-    path: PathBuf,
+pub(super) struct Fixture {
+    pub(super) support: PathBuf,
+    pub(super) path: PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let support = crate::test_scratch::canonical_private_dir("ottto-v2-route");
         let parent = support.join("snapshots/destinations").join("b".repeat(64));
         fs::create_dir_all(&parent).unwrap();
@@ -104,7 +104,7 @@ impl Fixture {
             support,
         }
     }
-    fn identity(&self) -> Identity {
+    pub(super) fn identity(&self) -> Identity {
         Identity {
             format: FORMAT,
             db_id: "fixture-db".into(),
@@ -145,7 +145,7 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn published(&self) {
+    pub(super) fn published(&self) {
         self.imported();
         fence::publish(&self.path, &self.identity(), &mut false).unwrap();
     }

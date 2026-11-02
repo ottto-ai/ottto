@@ -566,13 +566,11 @@ impl HeaderInventory {
                             if a.quiet_disposition() {
                                 continue;
                             }
+                            let paced = a.header_paced();
                             let w = a.work.get_or_insert_with(Box::default);
-                            if w.header.is_none()
-                                && sampled_scan::now_seconds() >= w.header_retry_after
-                            {
+                            if w.header.is_none() && !paced {
                                 w.header_attempts = w.header_attempts.saturating_add(1);
-                                w.header_retry_after =
-                                    sampled_scan::now_seconds().saturating_add(21600);
+                                w.header_retry_after = 0;
                                 w.reservation = ArchiveReservation::HeaderSave;
                                 index.archive_pass.dirty = true;
                             }

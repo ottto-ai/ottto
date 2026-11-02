@@ -176,7 +176,7 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
                 .baseline
                 .save_with_read_limit(&f.index_path, crate::snapshot_retry::RESPONSE_BYTES)
                 .is_err());
-            assert!(checkpoint_partial_snapshot_index_with_read_limit(
+            assert!(checkpoint_partial_snapshot_index_with_audit_release(
                 &f.working,
                 &f.baseline,
                 &f.progress,
@@ -186,7 +186,11 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
                 &f.index_path,
                 &f.progress_path,
                 || Ok(()),
-                Some(crate::snapshot_retry::RESPONSE_BYTES)
+                Some(crate::snapshot_retry::RESPONSE_BYTES),
+                None,
+                None,
+                None,
+                Default::default(),
             )
             .is_err());
         }

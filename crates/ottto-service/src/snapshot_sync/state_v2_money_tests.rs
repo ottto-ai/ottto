@@ -687,11 +687,15 @@ fn cold_row(name: &str) {
         input_clock(&path);
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        let (custody, v2) = crate::snapshots::StateV2ColdSession::publish(
+        let (custody, mut v2) = crate::snapshots::StateV2ColdSession::publish(
             crate::snapshots::scan_index_persistence::Source::Claude,
             &v1,
             &c.base.canonicalize().unwrap().join("cold-session"),
         );
+        // Tail rows share this store: their presence must not move money.
+        crate::snapshots::state_v2_stage_tail_for_test(custody.path());
+        let v2 = custody.save_reload(&mut v2).0;
+        assert!(crate::snapshots::state_v2_tail_published_for_test(&v2));
         assert!(
             crate::snapshots::state_v2_cold_usage_families(&v2).is_some_and(|n| n > 0),
             "positive control: stored usage pending loads cold"
