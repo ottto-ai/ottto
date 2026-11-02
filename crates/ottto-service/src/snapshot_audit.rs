@@ -207,6 +207,7 @@ pub fn run_snapshot_audit<W: Write>(
             "session attribution HMAC key must be the exact 32-byte URL-safe no-pad activity-hint key"
         )
     })?;
+    crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
     let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::load(&index_path)?;
     let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(

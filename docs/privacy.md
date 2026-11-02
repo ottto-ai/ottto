@@ -20,6 +20,11 @@ diagnostics flow sends a redacted payload.
 Agents, the CLI, the macOS app, and the web app are clients. They should not
 duplicate local setup or repair logic.
 
+`ottto uninstall --backup-state <directory>` copies the local sync state,
+which contains local session titles, prompts and workspace paths. Keep the
+backup private; the CLI writes its files as 0600 and its folders as 0700. The
+local state folder is not excluded from Time Machine or iCloud backups.
+
 The loopback `/local-health` endpoint may return the current pseudonymous
 relay-device id to an allowlisted Ottto browser origin so the web app can
 distinguish two macOS users on one physical Mac. Origin-less callers do not
@@ -232,7 +237,10 @@ invoking the provider.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
-definitions in memory to derive tenant-scoped HMAC identifiers. When the
+definitions to derive tenant-scoped HMAC identifiers. Bounded native skill labels
+are kept in owner-only local records independently of upload settings; retirement,
+source removal, forget and uninstall still erase those records. The Companion
+session list also keeps local titles and workspace labels when uploads omit them. When the
 existing **session titles and minimal descriptions** setting is enabled and the
 backend advertises support, a template or skill fact may additionally include
 one display label: either a sanitized prompt prefix of at most 96 bytes or an

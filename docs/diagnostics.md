@@ -66,7 +66,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 
 | Field | Measurement |
 | --- | --- |
-| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
@@ -338,6 +338,13 @@ windows.
 Claude Code's local-evidence stage adds three such footprint records (empty
 counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
+Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
+read) and `evidence_cross_root` (each root's cross-root summary add plus the
+final sort) are summed over roots into one record each per pass, with
+`wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
+step) and no footprint fields.
+A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
+around folding stored usage families into heads.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
@@ -2121,17 +2128,20 @@ erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
-`store_growth` samples the SQLite store once per idle daily reference-maintenance
-pass, after reference verification (an hourly retry of a failed pass samples again).
-It reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
+`store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
+SQLite store once a day, on any between-cycles window, before reference verification.
+Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
 (`rows`), `key_bytes` and `value_bytes` for each present catalogue kind, plus
 `shared_value_bytes` and `chunk_bytes`. Value bytes use the store's logical
 length metadata; chunk bytes sum stored chunk lengths and overlap the logical
 record/shared values, so do not add them together. These are payload lengths,
-not per-table allocated space. Sampling uses what remains of the existing
-reference-check VM budget. `partial: true` means
+not per-table allocated space. Sampling has its own VM budget, the same size as
+the reference check's. `partial: true` means
 sampling was interrupted, failed or ran out of budget; completed counts remain,
 unavailable scalar counts are null and missing kinds are unknown, not zero.
+`reference_check_failed_causes` counts each failed reference check by a fixed cause:
+timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
+counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`
