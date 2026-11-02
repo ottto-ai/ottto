@@ -167,7 +167,8 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
     {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (kind, _, introduced) in catalogue::LAYOUTS {
-            if *introduced > previous_layout {
+            // Archive custody is written only while held; this fixture holds none.
+            if *introduced > previous_layout && !kinds_misc::ARCHIVE_KINDS.contains(kind) {
                 assert!(
                     tx.get(&mapper::key(kind, "", 0).unwrap())
                         .unwrap()
