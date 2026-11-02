@@ -44,7 +44,6 @@ pub(super) struct KeyDebt {
 #[derive(Clone, Copy)]
 pub(super) struct FullSpend {
     pub(super) at: std::time::SystemTime,
-    pub(super) near_extra: bool,
 }
 impl KeyDebt {
     /// Only idle reservations or expired pacing may be reclaimed. Receipt,

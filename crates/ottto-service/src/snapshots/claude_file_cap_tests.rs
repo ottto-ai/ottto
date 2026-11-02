@@ -99,144 +99,6 @@ fn assert_native(scan: &SourceScanResult, requests: u64) {
     assert_eq!(scan.snapshots[0].cache_read_tokens, requests * 20);
 }
 
-#[test]
-fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
-    let fixture = Fixture::new();
-    let path = fixture.path();
-    let mut file = File::create(&path).unwrap();
-    let valid_size = write_row(&mut file, &usage(0));
-    file.set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1).unwrap();
-    drop(file);
-    let key = local_index_key(&path);
-    let mut index = ScanIndex::default();
-    let skipped = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 9);
-    assert_eq!(skipped.oversized_file_count, 1);
-    assert_eq!(skipped.scanned_file_count, 0);
-    assert!(skipped.snapshots.is_empty());
-    assert!(!skipped.census_complete);
-    assert!(
-        !index.files.contains_key(&key),
-        "no proof before native read"
-    );
-    assert!(!index.file_snapshot_fingerprints.contains_key(&key));
-
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(valid_size)
-        .unwrap();
-    let mut admitted = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 11);
-    assert_native(&admitted, 1);
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut admitted, &mut index);
-    let prior = index.files[&key].source_file_fingerprint.clone();
-    assert!(!prior.is_empty());
-
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
-        .unwrap();
-    let grown = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 13);
-    assert_eq!(grown.oversized_file_count, 1);
-    assert_eq!(grown.scanned_file_count, 0);
-    assert!(grown.snapshots.is_empty());
-    assert!(!grown.census_complete);
-    assert_eq!(
-        index.files[&key].source_file_fingerprint, prior,
-        "oversized content cannot replace prior read authority"
-    );
-
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(valid_size)
-        .unwrap();
-    assert_native(&fixture.scan(SnapshotSource::ClaudeCode, &mut index, 15), 1);
-}
-
-#[test]
-fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
-    for (source, limit) in [
-        (SnapshotSource::ClaudeCode, 512 * MIB),
-        (SnapshotSource::Pi, 256 * MIB),
-        (SnapshotSource::Codex, 2048 * MIB),
-    ] {
-        let fixture = Fixture::new();
-        let file = File::create(fixture.path()).unwrap();
-        for (bytes, admitted) in [(limit, true), (limit + 1, false)] {
-            file.set_len(bytes).unwrap();
-            let opened =
-                opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap());
-            assert_eq!(opened.is_ok(), admitted, "opened {source:?} at {bytes}");
-            let mut census = ScanCensus::default();
-            let candidate = candidate_from_traversal_path(
-                source,
-                ScanTraversalPath {
-                    scan_root: fixture.0.clone(),
-                    path: fixture.path(),
-                    census_member: true,
-                    watcher_hint: false,
-                },
-                &mut census,
-                None,
-                BACKFILL_WINDOW_DAYS,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
-            );
-            assert_eq!(candidate.is_some(), admitted, "{source:?} at {bytes}");
-            assert_eq!(census.oversized_file_count, usize::from(!admitted));
-            if let Some(candidate) = candidate {
-                assert_eq!(candidate.size_bytes, limit);
-            }
-        }
-    }
-    assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
-}
-
-#[test]
-fn three_hundred_mib_admission_is_claude_only() {
-    let fixture = Fixture::new();
-    File::create(fixture.path())
-        .unwrap()
-        .set_len(300 * MIB)
-        .unwrap();
-    for (source, admitted) in [
-        (SnapshotSource::ClaudeCode, true),
-        (SnapshotSource::Pi, false),
-    ] {
-        let mut census = ScanCensus::default();
-        let candidate = candidate_from_traversal_path(
-            source,
-            ScanTraversalPath {
-                scan_root: fixture.0.clone(),
-                path: fixture.path(),
-                census_member: true,
-                watcher_hint: false,
-            },
-            &mut census,
-            None,
-            BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
-        );
-        assert_eq!(candidate.is_some(), admitted);
-        assert_eq!(census.oversized_file_count, usize::from(!admitted));
-        assert_eq!(
-            opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap())
-                .is_ok(),
-            admitted
-        );
-    }
-    let mut index = ScanIndex::default();
-    let scan = fixture.scan(SnapshotSource::Pi, &mut index, 9);
-    assert_eq!(scan.oversized_file_count, 1);
-    assert_eq!(scan.scanned_file_count, 0);
-    assert!(scan.snapshots.is_empty());
-    assert!(!scan.census_complete);
-    assert!(index.files.is_empty());
-}
-
 #[cfg(target_os = "macos")]
 fn peak_rss() -> u64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
@@ -367,4 +229,152 @@ fn large_claude_native_memory() {
         .collect::<Vec<_>>();
     assert_eq!(lines.len(), 1, "one actual native measurement per child");
     println!("{RECEIPT}{}", lines[0]);
+}
+
+fn source_rows(source: SnapshotSource, n: u64) -> Vec<Value> {
+    match source {
+        SnapshotSource::ClaudeCode => vec![usage(n)],
+        SnapshotSource::Codex => {
+            let mut rows = Vec::new();
+            if n == 1 {
+                rows.push(json!({"type":"session_meta", "timestamp":AT,
+                    "payload":{"id":SESSION}}));
+            }
+            rows.push(json!({"type":"event_msg", "timestamp":AT,
+                "payload":{"type":"token_count", "info":{"model":"gpt-5.2",
+                    "total_token_usage":{"input_tokens":n*100, "output_tokens":n*10},
+                    "last_token_usage":{"input_tokens":100, "output_tokens":10}}}}));
+            rows
+        }
+        SnapshotSource::Pi => {
+            let mut rows = Vec::new();
+            if n == 1 {
+                rows.push(json!({"type":"session", "version":3, "id":SESSION, "timestamp":AT}));
+            }
+            rows.push(
+                json!({"type":"message", "id":format!("entry-{n}"), "timestamp":AT,
+                "message":{"role":"assistant", "provider":"openai", "model":"gpt-5.4",
+                    "responseId":format!("response-{n}"), "timestamp":1793088000000u64,
+                    "usage":{"input":100, "output":10, "cacheRead":0, "cacheWrite":0}}}),
+            );
+            rows
+        }
+    }
+}
+
+// Keep allocation bounded by one MiB and the existing physical-line limit.
+// Padding has no usage records: this tests file admission, independent of response limits.
+fn padded_file(fixture: &Fixture, source: SnapshotSource, bytes: u64) {
+    let mut writer = BufWriter::new(File::create(fixture.path()).unwrap());
+    let mut written = 0;
+    for row in source_rows(source, 1) {
+        written += write_row(&mut writer, &row);
+    }
+    let mut padding = vec![b' '; MIB as usize];
+    *padding.last_mut().unwrap() = b'\n';
+    while bytes - written >= padding.len() as u64 {
+        writer.write_all(&padding).unwrap();
+        written += padding.len() as u64;
+    }
+    let remaining = (bytes - written) as usize;
+    if remaining > 0 {
+        padding[remaining - 1] = b'\n';
+        writer.write_all(&padding[..remaining]).unwrap();
+    }
+    writer.flush().unwrap();
+    assert_eq!(fs::metadata(fixture.path()).unwrap().len(), bytes);
+}
+
+/// [regress] A first file above each former limit publishes its usage through native scan/finalize.
+#[test]
+fn large_files_publish_usage_for_all_sources() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let fixture = Fixture::new();
+        padded_file(&fixture, source, former_file_cap(source) + 1);
+        let mut index = ScanIndex::default();
+        let mut scan = fixture.scan(source, &mut index, 9);
+        finalize_scan_after_policy(source, &mut scan, &mut index);
+        assert_eq!(scan.oversized_file_count, 0, "{source:?}");
+        assert_eq!(scan.over_line_cap_count, 0, "line limit stays unchanged");
+        assert_eq!(scan.scanned_file_count, 1, "{source:?}");
+        assert_eq!(
+            scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
+            100,
+            "{source:?}"
+        );
+        assert_eq!(
+            scan.snapshots.iter().map(|s| s.output_tokens).sum::<u64>(),
+            10,
+            "{source:?}"
+        );
+    }
+}
+
+/// [regress] Crossing a former limit remains admissible and the shared acquisition reads only the append.
+#[test]
+fn growth_past_former_caps_is_tailed_for_all_sources() {
+    use crate::transcript_acquisition::{ReadMode, ReadPlan, Scope};
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let fixture = Fixture::new();
+        let before = former_file_cap(source) - 1;
+        padded_file(&fixture, source, before);
+        let scope = Scope("large-file-growth".into());
+        let mut file = File::open(fixture.path()).unwrap();
+        let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 100).unwrap();
+        let mut buffer = vec![0; MIB as usize];
+        loop {
+            let read = file.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            plan.observe_record_fragment(&buffer[..read], buffer[read - 1] == b'\n')
+                .unwrap();
+        }
+        let checkpoint = plan
+            .commit_after_native_completion(&file, &scope, 100)
+            .unwrap();
+        let mut append = fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.path())
+            .unwrap();
+        let mut expected = Vec::new();
+        for row in source_rows(source, 2) {
+            write_row(&mut expected, &row);
+        }
+        append.write_all(&expected).unwrap();
+        drop(append);
+        assert!(fs::metadata(fixture.path()).unwrap().len() > former_file_cap(source));
+        let mut candidate = candidate_from_traversal_path(
+            source,
+            ScanTraversalPath {
+                scan_root: fixture.0.clone(),
+                path: fixture.path(),
+                census_member: true,
+                watcher_hint: true,
+            },
+            &mut ScanCensus::default(),
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
+        )
+        .expect("growth remains discoverable");
+        let mut file = open_candidate_file(source, &mut candidate).unwrap();
+        let tail = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope, None, 101).unwrap();
+        assert_eq!(tail.mode(), ReadMode::Tail);
+        assert_eq!(tail.start_offset(), before);
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(
+            read, expected,
+            "{source:?}: only appended usage is acquired"
+        );
+    }
 }

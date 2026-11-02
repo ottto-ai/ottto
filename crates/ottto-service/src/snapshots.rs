@@ -199,7 +199,6 @@ pub(crate) mod scan_index_persistence;
 pub(crate) mod state_v2;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
-mod oversized_discovery;
 pub(crate) mod scan_index_health;
 #[cfg(test)]
 pub(crate) use tests::claude_request_account_mixed_fixture;
@@ -1444,19 +1443,7 @@ fn rebuild_claude_context_posture(
     );
 }
 
-// Defensive size ceilings for the streaming JSONL read path. The scan caps the
-// file COUNT and an mtime window, but the per-file/-line byte lengths were
-// previously unbounded: a transcript whose monitored tool output embeds a huge
-// blob (one multi-hundred-MB/GB physical line) would be materialized whole in
-// RAM by the line reader (and cloned again by the artifact scraper), OOM-killing
-// the per-user daemon. Codex is source-special: long active sessions can exceed
-// the default file cap while still being safe to parse because its parser is
-// line-bounded and streaming. Keep the stricter cap for sources with heavier
-// artifact/session paths, and use the line cap as the real Codex OOM guard.
-pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
-// Claude-only admission; Pi retains the default cap. Parsing budgets stay unchanged.
-pub const MAX_CLAUDE_JSONL_FILE_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_CODEX_JSONL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// Bound one physical line while whole transcripts stream without a size limit.
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The line cap a transcript reader is built with: `MAX_JSONL_LINE_BYTES`,
@@ -2704,6 +2691,8 @@ struct ScanTraversalCounts {
     /// PR-P: held fork children per parent cause, traversal-cumulative.
     /// Additive: old checkpoints load as zero (struct-level `serde(default)`).
     parent_unresolvable: ParentUnresolvableCauses,
+    // Retired size-refusal observations are accepted and ignored on restore.
+    #[serde(skip)]
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -2805,7 +2794,6 @@ impl ScanTraversalCounts {
         self.symlink_rejected_count > 0
             || self.directory_entry_cap_exceeded_count > 0
             || self.unreadable_path_count > 0
-            || self.oversized_file_count > 0
             || self.disappeared_file_count > 0
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
@@ -2913,10 +2901,6 @@ struct ScanTraversalCheckpoint {
     unhealthy_retry_attempt: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unhealthy_retry_not_before_unix_seconds: Option<u64>,
-    /// Local scheduling witnesses only. Keys and content markers are hashes;
-    /// the sweep-wide oversized count still vetoes every completeness gate.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    oversized_discovery: BTreeMap<String, oversized_discovery::Debt>,
     counts: ScanTraversalCounts,
     /// Files this generation parsed cleanly but could not checkpoint because
     /// their content yields non-progressing residue. Recorded so the settled
@@ -3173,13 +3157,6 @@ fn codex_parent_side_scope() -> crate::transcript_acquisition::Scope {
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
     ]))
-}
-
-/// U1a-2a: P is over main's Codex file cap, so no side record is kept for it.
-/// The same predicate main's cap sites use.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the fence
-fn codex_parent_over_cap(len: u64) -> bool {
-    len > max_jsonl_file_bytes(SnapshotSource::Codex)
 }
 
 /// U1a-2a: the pacing a covering side record keeps after its request is
@@ -22862,9 +22839,7 @@ fn codex_parent_candidate_match(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(NotRegular);
     }
-    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
-        return Err(Oversize);
-    }
+
     let modified_unix_seconds = metadata
         .modified()
         .ok()
@@ -22905,9 +22880,7 @@ fn codex_parent_open_match_retained(
     if !metadata.is_file() {
         return Err(NotRegular);
     }
-    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
-        return Err(Oversize);
-    }
+
     let (_, identity, _) = cache.retained_open(&candidate.path, &file).ok_or(Absent)?;
     Ok((candidate.path, identity, file))
 }
@@ -25469,8 +25442,6 @@ pub(in crate::snapshots) enum SideFence {
     /// P's same-object, settled record covers `needed` and its seal admits
     /// (`admits(.., &side scope, now, false)` ∧ `wake_compatible`).
     Admitted,
-    /// P is over main's Codex cap: no side record is kept for it.
-    FileCapHeld,
     /// P could not be stamped, or changed while it was stamped.
     Unreadable,
     /// No usable record (none, or a new object consumed it): the request is
@@ -25576,9 +25547,7 @@ impl ScanIndex {
         let Some(at) = side_now(file) else {
             return SideFence::Unreadable;
         };
-        if codex_parent_over_cap(at.size) {
-            return SideFence::FileCapHeld;
-        }
+
         let entry =
             side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
         let mut view = match entry {
@@ -26640,6 +26609,7 @@ pub(crate) struct OwnedSourceScan {
     codex_versions: Option<Arc<codex_version::CodexVersionFeed>>,
 }
 struct OwnedActiveFile {
+    first_read: Option<crate::local_resource_diagnostics::FirstRead>,
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
     // Survives paging and missing preparation; only source verification retires it.
@@ -26888,7 +26858,6 @@ impl OwnedSourceScan {
             && local.directory_entry_cap_exceeded_count == 0
             && local.symlink_rejected_count == 0
             && local.unreadable_path_count == 0
-            && local.oversized_file_count == 0
             && local.disappeared_file_count == 0
             && local.malformed_json_line_count == 0
             && local.invalid_utf8_line_count == 0
@@ -29084,8 +29053,7 @@ impl OwnedSourceScan {
                 // No group byte or member cap: a group larger than
                 // the singleton budget pages through the cursor; without one
                 // (unsupported layout, uncached scan) it is read in one page
-                // like main's unpaged read: each member at most
-                // `MAX_CODEX_JSONL_FILE_BYTES`, the group's total uncapped
+                // like an ordinary unpaged read; group bytes are uncapped
                 // (R2-N7, disclosed).
                 let active_dependencies = boot.live().map(|(live, _)| {
                     sampled_scan::codex_cursor::group_dependencies(
@@ -30401,6 +30369,7 @@ impl OwnedSourceScan {
                     Some((digest, live, stamp, sidecar))
                 });
                 let OwnedActiveFile {
+                    first_read,
                     comparison_target,
                     sampling: file_sampling,
                     recovered_audit_due,
@@ -30424,6 +30393,7 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
                 });
+                let _first_read = first_read;
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -32644,10 +32614,6 @@ impl OwnedSourceScan {
                         .parent_unresolvable
                         .merge(census.parent_unresolvable);
                     traversal.counts.oversized_file_count += census.oversized_file_count;
-                    oversized_discovery::merge(
-                        &mut traversal.oversized_discovery,
-                        std::mem::take(&mut census.oversized_discovery),
-                    );
                     traversal.counts.disappeared_file_count += census.disappeared_file_count;
                     traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
                     traversal.counts.invalid_utf8_line_count += census.invalid_utf8_line_count;
@@ -32911,7 +32877,6 @@ impl OwnedSourceScan {
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
-                    oversized_discovery::alarm(source, &traversal.oversized_discovery);
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -34789,6 +34754,14 @@ impl OwnedSourceScan {
                                             preparation_lease.take();
                                     }
                                     active_file = Some(Box::new(OwnedActiveFile {
+                                        first_read:
+                                            crate::local_resource_diagnostics::FirstRead::begin(
+                                                source.api_slug(),
+                                                candidate.size_bytes,
+                                                !index.files.contains_key(&local_index_key(
+                                                    &candidate.path,
+                                                )),
+                                            ),
                                         comparison_target,
                                         sampling: None,
                                         recovered_audit_due,
@@ -35652,6 +35625,11 @@ impl OwnedSourceScan {
                 pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
+                first_read: crate::local_resource_diagnostics::FirstRead::begin(
+                    source.api_slug(),
+                    candidate.size_bytes,
+                    !index.files.contains_key(&local_index_key(&candidate.path)),
+                ),
                 comparison_target,
                 sampling: file_sampling,
                 recovered_audit_due,
@@ -42890,7 +42868,7 @@ struct ScanCensus {
     /// PR-P: held fork children of this page per parent cause (fresh parses
     /// and memo replays), merged into the traversal counts.
     parent_unresolvable: ParentUnresolvableCauses,
-    oversized_discovery: BTreeMap<String, oversized_discovery::Debt>,
+
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -45435,37 +45413,15 @@ fn ensure_bounded_traversal(
         .as_ref()
         .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
     {
-        // G1: discovery's census-member rule; pending re-reads do not hold
-        // the bounded retry.
-        // Bound family recovery remains independent of oversized admission debt.
-        let family_retry_due = rfc3339_unix_seconds(collected_at).is_some_and(|now| {
-            source == SnapshotSource::ClaudeCode
-                        && index.claude_usage_authority_quarantine.iter().any(|(root, record)| {
-                            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-                                && record.retry_after_unix_seconds <= now
-                                // A start already served all deadlines at or
-                                // before it, even if a held/deleted member
-                                // yielded no item and retained its old record.
-                                && rfc3339_unix_seconds(&traversal.census_window_end)
-                                    .is_some_and(|started| record.retry_after_unix_seconds > started)
-                                && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
-                                    claude_usage_authority_preserves_pending(record, witness)
-                                })
-                        })
-        });
-        let unsettled_retry_required =
-            index.unsettled_cause_bits() & !UnsettledUploadCause::CompletedBlockingHolds.bit() != 0;
-        let floor_retry_due = oversized_discovery::floor_retry_due(source, traversal, collected_at);
+        // Pending re-reads do not hold the bounded retry. Every remaining
+        // read/discovery error keeps its existing clock retry.
         let terminal_unhealthy = traversal.pending_directories.is_empty()
             && !traversal
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member)
             && index.claude_stale_family_carry.replay.is_empty()
-            && (oversized_discovery::clock_retry_required(source, traversal)
-                || (traversal.counts.has_errors()
-                    && (family_retry_due || unsettled_retry_required || floor_retry_due))
-                || prior_admission.is_some());
+            && (traversal.counts.has_errors() || prior_admission.is_some());
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
         // both start the next traversal at attempt zero. What bounds it: the
@@ -45474,10 +45430,9 @@ fn ensure_bounded_traversal(
         // absurdly far ahead, or missing altogether (an index persisted before
         // the deadline existed) is due now. The retry depends on the clock
         // alone, never on new input arriving.
-        let retry_due = floor_retry_due
-            || prior_admission
-                .as_ref()
-                .is_some_and(|state| !state.complete && state.progressed)
+        let retry_due = prior_admission
+            .as_ref()
+            .is_some_and(|state| !state.complete && state.progressed)
             || match rfc3339_unix_seconds(collected_at) {
                 Some(now) => {
                     traversal
@@ -45502,20 +45457,6 @@ fn ensure_bounded_traversal(
         Some(0)
     };
     let Some(retry_attempt) = retry_attempt else {
-        // Serve scoped oversized changes only after deciding that no ordinary
-        // retry starts. A simultaneous bound-family wake keeps its old cadence.
-        // An oversized admission refusal remains sweep-wide loss. Only its
-        // content can wake scoped discovery between the slow recovery re-walks;
-        // that scoped work must not re-arm unrelated families.
-        if source == SnapshotSource::ClaudeCode
-            && prior_traversal_context_matches
-            && prior_admission.is_none()
-            && index.claude_stale_family_carry.replay.is_empty()
-        {
-            if let Some(traversal) = index.traversal.as_mut() {
-                oversized_discovery::retry_changed(traversal, collected_at);
-            }
-        }
         // This page resumes the traversal. Before it selects anything, the
         // carry's replay buffer is funded again; a carry that cannot be is
         // uncarried, and if the walk already passed one of its members the
@@ -46076,7 +46017,7 @@ fn ensure_bounded_traversal(
         pending_directories,
         pending_candidates: VecDeque::new(),
         observed_index_keys: Default::default(),
-        oversized_discovery: BTreeMap::new(),
+
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
             .then(codex_file_join::DirectoryCensus::new),
@@ -46307,13 +46248,7 @@ fn enqueue_watcher_hints(
         {
             continue;
         }
-        if source == SnapshotSource::ClaudeCode
-            && traversal
-                .oversized_discovery
-                .contains_key(&oversized_discovery::path_hash(path))
-        {
-            continue;
-        }
+
         if let Some(&position) = pending.get(path) {
             let member = fresh_path_census_member(source, traversal, path);
             if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
@@ -46489,20 +46424,10 @@ fn refresh_retained_codex_roster(
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
+            crate::local_resource_diagnostics::observe_file_size(source.api_slug(), metadata.len());
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
-            if metadata.len() > max_jsonl_file_bytes(source) && !codex_archive_path(&path) {
-                traversal.counts.oversized_file_count += 1;
-                oversized_discovery::record(
-                    source,
-                    &scan_root,
-                    &path,
-                    metadata.len(),
-                    &mut traversal.oversized_discovery,
-                );
-                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
-                continue;
-            }
+
             if let Some(existing) = traversal
                 .pending_candidates
                 .iter_mut()
@@ -46594,11 +46519,8 @@ fn requeue_unindexed_codex_observed(index: &mut ScanIndex) {
                 && !index.codex_state_only_blocked_by_file.contains_key(*key)
                 && !index.terminal_jsonl_dispositions.contains_key(*key)
                 && !index.decode_holds_file(key)
-                && fs::symlink_metadata(key).is_ok_and(|metadata| {
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.len() <= max_jsonl_file_bytes(SnapshotSource::Codex)
-                })
+                && fs::symlink_metadata(key)
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         })
         .take(MAX_BACKFILL_FILES_PER_SOURCE)
         .cloned()
@@ -47046,9 +46968,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     &metadata,
                 );
             }
-            if codex_archive_path(&path) && index.archive_size_refused(&path, metadata.len()) {
-                continue;
-            }
+
             let recovery = DiscoveryRecovery {
                 files: &index.files,
                 cache,
@@ -47128,12 +47048,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     traversal.observed_index_keys.insert(key);
                     continue;
                 }
-                // Oversized debt and its loss count are recorded together by
-                // the first walk only. An unrecorded file stays unobserved, so
-                // a later pass lists it again once it is readable.
-                if metadata.len() > max_jsonl_file_bytes(source) {
-                    continue;
-                }
+
                 owed_unchanged = if codex_archive_path(&path) {
                     index
                         .archives
@@ -47156,21 +47071,10 @@ fn advance_bounded_directory_traversal_with_budget(
             let census_member = !relisting || fresh_path_census_member(source, &traversal, &path);
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
+            crate::local_resource_diagnostics::observe_file_size(source.api_slug(), metadata.len());
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
-            if metadata.len() > max_jsonl_file_bytes(source) {
-                traversal.counts.oversized_file_count += 1;
-                oversized_discovery::record(
-                    source,
-                    &directory.scan_root,
-                    &path,
-                    metadata.len(),
-                    &mut traversal.oversized_discovery,
-                );
-                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
-                retention.note_withheld_oversized(source, &path);
-                continue;
-            }
+
             if let Some(&position) = pending.get(&path) {
                 if !relisting {
                     let existing = traversal
@@ -47402,23 +47306,7 @@ fn candidate_from_traversal_path_at(
             .unwrap_or_default(),
         codex_fragment::Stamp::metadata(&metadata),
     );
-    if metadata.len() > max_jsonl_file_bytes(source) && !codex_archive_path(&pending.path) {
-        if pending.census_member {
-            census.oversized_file_count += 1;
-            census
-                .observed_index_keys
-                .insert(local_index_key(&pending.path));
-            oversized_discovery::record(
-                source,
-                &pending.scan_root,
-                &pending.path,
-                metadata.len(),
-                &mut census.oversized_discovery,
-            );
-            retention.note_withheld_oversized(source, &pending.path);
-        }
-        return None;
-    }
+
     let modified_unix_seconds = metadata
         .modified()
         .ok()
@@ -47782,21 +47670,6 @@ fn collect_recent_jsonl_files(
         }
         census.discovered_file_count += 1;
         census.observed_index_keys.insert(local_index_key(&path));
-        // Skip pathologically large transcripts before they ever reach the
-        // parser. metadata.len() is already read for fingerprinting, so this is
-        // free; an oversized file is dropped from the candidate set rather than
-        // opened, keeping the scan's memory bounded without aborting it.
-        if metadata.len() > max_jsonl_file_bytes(source) {
-            census.oversized_file_count += 1;
-            oversized_discovery::record(
-                source,
-                scan_root,
-                &path,
-                metadata.len(),
-                &mut census.oversized_discovery,
-            );
-            continue;
-        }
         selection.insert(CandidateFile {
             physical_identity: None,
             scan_root: scan_root.to_path_buf(),
@@ -47934,15 +47807,6 @@ impl<'a> DiscoveryRetention<'a> {
         }
         grown || self.owes(path)
     }
-
-    /// An oversized withheld-account key stays observed without a full parse;
-    /// its refusal is counted beside the ordinary size skip. Existing bounded
-    /// identity sampling can still open it at candidate revalidation.
-    fn note_withheld_oversized(&self, source: SnapshotSource, path: &Path) {
-        if self.account_holds.contains_key(&local_index_key(path)) {
-            line_delivery_unselected(source.api_slug(), UnselectedReason::WithheldOversized);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -48029,24 +47893,6 @@ fn codex_parent_outside_window(
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
-}
-
-#[cfg(test)]
-thread_local! {
-    // Scale the existing SIZE boundary in synthetic transition fixtures only.
-    static TEST_JSONL_FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
-    #[cfg(test)]
-    if let Some(cap) = TEST_JSONL_FILE_CAP.get() {
-        return cap;
-    }
-    match source {
-        SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
-        SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,
-        SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
-    }
 }
 
 /// Resolve one operator-configured root before discovery. A configured root
@@ -48243,29 +48089,6 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                     disappearance_diagnostics::Site::Open,
                 );
             }
-            return None;
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
-        {
-            retention.observe_growth(
-                &candidate.path,
-                candidate.size_bytes,
-                candidate.modified_unix_seconds,
-            );
-            census.oversized_file_count += 1;
-            census
-                .observed_index_keys
-                .insert(local_index_key(&candidate.path));
-            oversized_discovery::record(
-                source,
-                &candidate.scan_root,
-                &candidate.path,
-                candidate.size_bytes,
-                &mut census.oversized_discovery,
-            );
-            retention.note_withheld_oversized(source, &candidate.path);
             return None;
         }
         Err(_) => {
@@ -48540,11 +48363,11 @@ fn opened_object_identity_and_stat(
 /// With `content_only`, also the identity of the same samples with ctime
 /// zeroed: the withheld-account content stamp, at no extra read.
 fn opened_object_identity_and_stat_retained(
-    source: SnapshotSource,
+    _source: SnapshotSource,
     file: &mut File,
     retained: Option<(&sampled_scan::SharedCache, &Path)>,
     content_only: bool,
-    archive: bool,
+    _archive: bool,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>, Option<String>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
@@ -48554,17 +48377,7 @@ fn opened_object_identity_and_stat_retained(
             "snapshot candidate is not a regular file",
         ));
     }
-    if metadata.len() > max_jsonl_file_bytes(source) {
-        if archive {
-            return Err(std::io::Error::other(
-                codex_compressed_input::ArchiveAdmissionYield,
-            ));
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "snapshot candidate exceeds source file cap",
-        ));
-    }
+
     let len = metadata.len();
     let samples = read_opened_content_samples(file, len)?;
     #[cfg(unix)]
@@ -51912,7 +51725,7 @@ impl ScanIndex {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
-            oversized_discovery: BTreeMap::new(),
+
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -57033,7 +56846,7 @@ mod tests {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
-            oversized_discovery: BTreeMap::new(),
+
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -57054,38 +56867,21 @@ mod tests {
         }
     }
 
+    /// [format] Retired file-size refusal debt and counts decode without a state migration.
     #[test]
-    fn oversized_floor_retries_malformed_clocks_and_keeps_six_hour_cadence() {
-        let mut traversal = terminal_unhealthy_traversal(String::new());
-        traversal.oversized_discovery = serde_json::from_value(serde_json::json!({
-            "synthetic_path_hash": { "content_hash": "synthetic_content_hash", "observations": 1 }
-        }))
-        .unwrap();
-        for (anchor, collected_at, due) in [
-            ("2026-07-31T00:00:00Z", "malformed", true),
-            ("malformed", "2026-07-31T00:00:00Z", true),
-            ("malformed", "malformed", true),
-            ("2026-07-31T00:00:00Z", "2026-07-31T05:59:59Z", false),
-            ("2026-07-31T00:00:00Z", "2026-07-31T06:00:00Z", true),
-            ("2026-07-31T00:00:00Z", "2026-07-31T07:00:00Z", true),
-        ] {
-            traversal.census_window_end = anchor.to_string();
-            assert_eq!(
-                oversized_discovery::floor_retry_due(
-                    SnapshotSource::ClaudeCode,
-                    &traversal,
-                    collected_at,
-                ),
-                due,
-                "anchor={anchor}, collected_at={collected_at}"
-            );
-        }
-        traversal.oversized_discovery.clear();
-        assert!(!oversized_discovery::floor_retry_due(
-            SnapshotSource::ClaudeCode,
-            &traversal,
-            "malformed",
-        ));
+    fn retired_file_size_debt_is_ignored_and_omitted_on_save() {
+        let mut old = serde_json::to_value(terminal_unhealthy_traversal(String::new())).unwrap();
+        old["oversized_discovery"] = json!({
+            "synthetic_path_hash": {"content_hash":"synthetic_content_hash", "observations":1}
+        });
+        old["counts"]["oversized_file_count"] = json!(1);
+        old["counts"]["disappeared_file_count"] = json!(0);
+        let decoded: ScanTraversalCheckpoint = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.counts.oversized_file_count, 0);
+        assert!(!decoded.counts.has_errors());
+        let saved = serde_json::to_value(decoded).unwrap();
+        assert!(saved.get("oversized_discovery").is_none());
+        assert!(saved["counts"].get("oversized_file_count").is_none());
     }
 
     #[test]
@@ -58812,7 +58608,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn test_candidate(path: PathBuf) -> CandidateFile {
+    pub(super) fn test_candidate(path: PathBuf) -> CandidateFile {
         let scan_root = path
             .parent()
             .unwrap_or_else(|| Path::new("/"))
@@ -59757,7 +59553,7 @@ mod tests {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
-            oversized_discovery: BTreeMap::new(),
+
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -60270,7 +60066,7 @@ mod tests {
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: ["b".to_string(), "d".to_string()].into_iter().collect(),
-                oversized_discovery: BTreeMap::new(),
+
                 codex_rollout_paths: BTreeSet::new(),
                 codex_join_directory_census: None,
                 reconciliation_upper_bound: Some("d".to_string()),
@@ -60756,7 +60552,6 @@ mod tests {
             |counts| counts.symlink_rejected_count = 1,
             |counts| counts.directory_entry_cap_exceeded_count = 1,
             |counts| counts.unreadable_path_count = 1,
-            |counts| counts.oversized_file_count = 1,
             |counts| counts.disappeared_file_count = 1,
             |counts| counts.malformed_json_line_count = 1,
             |counts| counts.invalid_utf8_line_count = 1,
@@ -61082,7 +60877,7 @@ mod tests {
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: Default::default(),
-                oversized_discovery: BTreeMap::new(),
+
                 codex_rollout_paths: BTreeSet::new(),
                 codex_join_directory_census: None,
                 reconciliation_upper_bound: None,
@@ -61508,44 +61303,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn scan_policy_skips_oversized_non_codex_transcript_files() {
-        let root = temp_dir("scan-policy-oversized");
-        // Sparse file: logical length over the cap, negligible bytes on disk.
-        let oversized_path = root.join("session-oversized.jsonl");
-        let oversized = File::create(&oversized_path).expect("create oversized");
-        oversized
-            .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
-            .expect("grow oversized");
-        drop(oversized);
-        assert!(
-            fs::metadata(&oversized_path).expect("stat oversized").len()
-                > MAX_CLAUDE_JSONL_FILE_BYTES
-        );
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("scan must not abort on an oversized file");
-
-        // The census sees the path, records the explicit oversized reason, and
-        // never admits it to the bounded parse candidate set.
-        assert_eq!(scan.discovered_file_count, 1);
-        assert_eq!(scan.scanned_file_count, 0);
-        assert!(scan.snapshots.is_empty());
-        assert_eq!(scan.oversized_file_count, 1);
-        assert!(!scan.census_complete);
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -68772,7 +68529,7 @@ mod tests {
                         .filter(|key| *key != &child_key)
                         .cloned()
                         .collect(),
-                    oversized_discovery: BTreeMap::new(),
+
                     codex_rollout_paths: BTreeSet::new(),
                     codex_join_directory_census: None,
                     reconciliation_upper_bound: working.files.keys().next_back().cloned(),
@@ -84877,7 +84634,7 @@ mod tests {
             pending_directories,
             pending_candidates: VecDeque::new(),
             observed_index_keys: Default::default(),
-            oversized_discovery: BTreeMap::new(),
+
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -85459,7 +85216,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
+crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision; inline restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
@@ -85477,10 +85234,10 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U model_provider: Option<String>,
     U subscription_product: Option<String>,
 });
-crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
+crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
@@ -86416,4 +86173,13 @@ pub(crate) fn state_v2_recovery_save_guard(
     index: &ScanIndex,
 ) -> Result<Option<impl Fn() -> Result<()>>> {
     state_v2::recovery_save_guard(path, index)
+}
+
+#[cfg(test)]
+fn former_file_cap(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::ClaudeCode => 512 * 1024 * 1024,
+        SnapshotSource::Codex => 2 * 1024 * 1024 * 1024,
+        SnapshotSource::Pi => 256 * 1024 * 1024,
+    }
 }
