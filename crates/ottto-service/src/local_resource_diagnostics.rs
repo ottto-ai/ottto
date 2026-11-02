@@ -1636,6 +1636,20 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Content-free allocator launch configuration, called once before serving.
+pub fn log_startup_resources() {
+    let value = std::env::var_os("MallocLargeCache");
+    traversal_point(
+        "startup",
+        "unknown",
+        &serde_json::json!({
+            "malloc_large_cache_set": value.is_some(),
+            "malloc_large_cache": value.as_deref().and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok()),
+        }),
+    );
+}
+
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
@@ -2148,6 +2162,23 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    /// [behaviour] Startup settings use the versioned content-free diagnostic carrier.
+    #[test]
+    fn startup_resources_use_the_shared_carrier() {
+        let (_, rows) = super::capture(super::log_startup_resources);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], std::process::id());
+        assert_eq!(row["stage"], "startup");
+        assert_eq!(row["source"], "unknown");
+        let counts = row["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert!(counts["malloc_large_cache_set"].is_boolean());
+        let value = &counts["malloc_large_cache"];
+        assert!(value.is_null() || value.is_u64());
+    }
+
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
