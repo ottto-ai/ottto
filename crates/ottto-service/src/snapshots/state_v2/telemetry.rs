@@ -480,6 +480,11 @@ pub(super) fn row_cap_save() {
 }
 
 #[cfg(test)]
+pub(super) fn decoded_rows_for_test() -> u64 {
+    PASS.with(|pass| pass.borrow().decoded.rows)
+}
+
+#[cfg(test)]
 mod ops_tests {
     use super::*;
 
@@ -593,9 +598,4 @@ mod ops_tests {
         assert!(!json.contains("synthetic-private"));
         assert!(json.contains("family.requests"));
     }
-}
-
-#[cfg(test)]
-pub(super) fn decoded_rows_for_test() -> u64 {
-    PASS.with(|pass| pass.borrow().decoded.rows)
 }
