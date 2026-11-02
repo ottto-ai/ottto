@@ -379,8 +379,8 @@ fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
     ] {
         let root = fixture.roots[root_index].parent().unwrap();
         let mut row = loaded.root_sidecars[root].threads[&fixture.ids[0]].clone();
-        row.tokens_used = 400;
-        row.updated_at = Some(updated.to_string());
+        Arc::make_mut(&mut row).tokens_used = 400;
+        Arc::make_mut(&mut row).updated_at = Some(updated.to_string());
         let threads = BTreeMap::from([(fixture.ids[0].clone(), row)]);
         merge_threads(&mut metadata, root, &threads);
         metadata.root_sidecars.insert(
