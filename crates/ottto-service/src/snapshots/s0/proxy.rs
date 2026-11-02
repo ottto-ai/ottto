@@ -43,16 +43,23 @@ struct Coverage {
     decoded_fields: u64,
     encoded_peak: u64,
     head_moved_bytes: u64,
+    refused_fields: BTreeMap<&'static str, u64>,
 }
 macro_rules! round_field {
  (E,$f:ident,$ty:ty,$stats:ident)=>{{ $stats.moved_fields+=1;$stats.head_moved_bytes+=layout_bytes(&$f).unwrap_or(0) as u64;$f }};
  (X,$f:ident,$ty:ty,$stats:ident)=>{round_field!(E,$f,$ty,$stats)};
  (I,$f:ident,$ty:ty,$stats:ident)=>{round_field!(E,$f,$ty,$stats)};
+ // Opening state contains nested content requiring native re-derivation;
+ // move it whole in this proxy rather than silently stripping those fields.
+ (D,session_start,$ty:ty,$stats:ident)=>{round_field!(E,session_start,$ty,$stats)};
  ($class:ident,$f:ident,$ty:ty,$stats:ident)=>{{
- let bytes=Enc::count_write(usize::MAX,|e|{
+ let encoded=Enc::count_write(usize::MAX,|e|{
  let value=&$f;
  crate::durable_tail_codec::durable_field!(put $class,e,value,$ty,stringify!($f));Ok(())
- }).map_err(|_|stringify!($f))?;
+ });
+ match encoded {
+ Err(_)=>{*$stats.refused_fields.entry(stringify!($f)).or_default()+=1;round_field!(E,$f,$ty,$stats)},
+ Ok(bytes)=>{
  $stats.encoded+=bytes.len() as u64;
  $stats.encoded_peak=$stats.encoded_peak.max(bytes.len() as u64);$stats.decoded_fields+=1;
  drop($f);let mut decoder=Dec::new(&bytes);
@@ -61,6 +68,8 @@ macro_rules! round_field {
  Ok(crate::durable_tail_codec::durable_field!(take $class,d,$ty))
  })().map_err(|_|stringify!($f))?;
  decoder.finish().map_err(|_|stringify!($f))?;value
+ }
+ }
  }};
 }
 macro_rules! round_acc {
@@ -439,7 +448,7 @@ fn one(dir: &Path, path: &Path, source: SnapshotSource, label: &str) -> Value {
     json!({"label":label,"source":source.api_slug(),"transcript_bytes":size,"proxy":true,
  "full_output":full,"full_heap":full_heap,"full_floor":full_floor,"full_peak":full_peak,"full_ms":full_ms,
  "decoded_heap":decoded_heap,"encoded_bytes":coverage.encoded,"max_field_buffer":coverage.encoded_peak,
- "decoded_fields":coverage.decoded_fields,"moved_E_X_I_fields":coverage.moved_fields,"moved_heap":coverage.head_moved_bytes,
+ "decoded_fields":coverage.decoded_fields,"moved_E_X_I_opening_or_refused_fields":coverage.moved_fields,"moved_heap":coverage.head_moved_bytes,"codec_refused_fields_moved":coverage.refused_fields,
  "decode_floor":decode_floor,"decode_peak":decode_peak,"decode_ms":decode_ms,"resume_output":resume,"resume_mode":mode,
  "resume_floor":resume_floor,"resume_peak":resume_peak,"resume_ms":resume_ms,"suffix_bytes":size-cut,"max_response_records":response_records})
 }
