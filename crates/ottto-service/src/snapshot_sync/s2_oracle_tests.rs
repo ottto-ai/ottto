@@ -458,8 +458,11 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             replay.modes.1 > 0,
             "the old seal must replay the lossy suffix{diag}"
         );
-        let mut held = result(&replay, Mode::Restart);
-        held.accepted = previous.accepted.clone();
+        // Nothing new is emitted: the root is held again, as in a cold Full
+        // of the same bytes, and the sibling is unchanged since the lossy
+        // page, so that page's emitted sibling body is the stored path's.
+        assert!(replay.scan.snapshots.is_empty(), "{diag}");
+        assert!(!cold.snapshots.contains_key(ROOT), "{diag}");
         money_oracle::assert_held(ROOT, &previous, &held, &cold);
     });
 }
