@@ -544,10 +544,7 @@ impl HeaderInventory {
                             let Some(a) = index.archives.get_mut(&key) else {
                                 continue;
                             };
-                            if a.owner.is_none() {
-                                a.owner = a.header().map(|h| h.owner.clone());
-                            }
-                            if a.structural_latch() || a.quiet_disposition() && a.owner.is_some() {
+                            if a.quiet_disposition() {
                                 continue;
                             }
                             let w = a.work.get_or_insert_with(Box::default);

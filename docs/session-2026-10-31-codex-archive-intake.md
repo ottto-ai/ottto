@@ -49,8 +49,9 @@ generic correction/evidence debt remains a named follow-up.
 Other follow-ups are same-session union bodies, retained resend, durable
 continuation if measurement justifies it, archive parents, shared listing/owed
 resolution, end-to-end placement route and tagged positive-control coverage and resource measurements. The
-historical-writer compatibility probe currently runs in Linux CI; running it only
-at release cuts is follow-up work.
+historical-writer compatibility probe does not run in CI:
+`scripts/test_codex_zst_downgrade.py` is an uninvoked driver, and its two Rust
+verifier tests return early unless the driver supplies their environment.
 
 Header and Full reservation batches currently require up to two committed index
 saves per pass. Held counts aggregate by cause; generic alarms occur on transitions.

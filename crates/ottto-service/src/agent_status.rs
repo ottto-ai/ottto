@@ -24054,9 +24054,8 @@ for line in sys.stdin:
         print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
     if '"id":"ottto_account"' in line:
         account_read = True
-        refresh = json.loads(line)["params"]["refreshToken"]
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh.log"), "a") as log:
-            log.write(json.dumps(refresh) + "\n")
+        if json.loads(line).get("params", {}).get("refreshToken") is not False:
+            sys.exit(4)
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     if "account/rateLimits/read" in line:
         if not account_read:
@@ -24094,18 +24093,6 @@ for line in sys.stdin:
                 .pointer("/rateLimitResetCredits/availableCount")
                 .and_then(Value::as_u64),
             Some(2)
-        );
-
-        let slot = crate::test_scratch::ScratchDir::canonical("codex-slot-refresh");
-        call_codex_app_server_rate_limits_for_home(&slot, CodexHomeTrust::Managed, &|_, _, _| {
-            false
-        })
-        .expect("account home rate limits");
-        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
-        assert_eq!(
-            refreshes.lines().collect::<Vec<_>>(),
-            ["false", "false"],
-            "default home, account home"
         );
 
         let _ = std::fs::remove_dir_all(dir);
