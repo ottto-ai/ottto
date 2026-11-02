@@ -3086,6 +3086,31 @@ mod growth_tests {
         .0
     }
 
+    /// [regress] the two v2 loaders bound claims differently: Codex daemon loads
+    /// had no lineage, so every Full was refused. Both loaders, every active source.
+    #[test]
+    fn every_v2_loader_binds_growth_claims_for_every_active_source() {
+        use super::super::scan_index_persistence::Source;
+        use state_v2::money_test_support::ColdSession;
+
+        for source in [Source::Claude, Source::Codex] {
+            let fixture = Fixture::new();
+            let (session, _) = ColdSession::publish(source, &ScanIndex::default(), &fixture.root);
+            let path = session.path();
+            for daemon in [false, true] {
+                let index = if daemon {
+                    ScanIndex::load_for_snapshot_source(path, source.snapshot(), &fixture.root)
+                } else {
+                    ScanIndex::load(path)
+                }
+                .unwrap();
+                assert!(growth_active(&index));
+                let _lock = CheckpointLock::acquire(path).unwrap();
+                authenticate_growth_generation(&index, path).unwrap();
+            }
+        }
+    }
+
     /// [money] f3 growth full claim survives restart failure and subset save.
     #[test]
     fn f3_growth_full_claim_survives_restart_failure_and_subset_save() {
