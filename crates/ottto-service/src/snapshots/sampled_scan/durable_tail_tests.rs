@@ -1397,7 +1397,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             let purge = slot
                 .store
                 .purge_private_labels(lock, |body| {
-                    codec::body_has_skill_labels(body).unwrap_or(true)
+                    codec::body_has_skill_labels(source, body).unwrap_or(true)
                 })
                 .unwrap();
             assert_eq!((purge.erased, purge.refused), (0, 0));
