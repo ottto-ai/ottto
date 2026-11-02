@@ -2,7 +2,6 @@
 use super::*;
 use sampled_scan::transition_fixture::{money_oracle::assert_equivalent, scan_money};
 use serde_json::Value;
-use std::io::Write as _;
 
 const SOURCES: [SnapshotSource; 3] = [
     SnapshotSource::ClaudeCode,

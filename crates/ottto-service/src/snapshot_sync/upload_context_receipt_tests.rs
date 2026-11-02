@@ -394,7 +394,7 @@ impl Uploader {
             copy,
         );
         index.adopt_acquisition_context(&closure, &acquisition);
-        index.set_upload_context_closure(Arc::new(closure));
+        index.set_upload_context_closure(std::sync::Arc::new(closure));
         activate_source_contexts(source, context, acquisition, index, &mut self.progress);
         index.note_attribution_namespace(namespace);
         index.copy_unproven_enabled = copy;

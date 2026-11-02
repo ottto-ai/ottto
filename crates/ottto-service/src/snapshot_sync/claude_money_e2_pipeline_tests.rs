@@ -3078,6 +3078,7 @@ mod state_v2_money_tests {
     include!("state_v2_money_tests.rs");
 }
 
+#[cfg(unix)]
 mod privacy_flip_money_tests {
     include!("privacy_flip_money_tests.rs");
 }
