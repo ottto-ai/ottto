@@ -373,7 +373,6 @@ impl NativePreparationFixture {
         assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
         index.active_upload_context_fingerprint = Some("native-preparation-test".into());
-        index.active_acquisition_context = Some("native-preparation-test".into());
         // Model delivered history: each file holds its receipt in this context.
         let context = index.active_upload_context_fingerprint.clone().unwrap();
         for entry in index.files.values_mut() {
@@ -2165,10 +2164,7 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
             2 => {
                 page.index.confirmed_empty_files.insert(key);
             }
-            _ => {
-                page.index.active_upload_context_fingerprint = Some("changed-context".into());
-                page.index.active_acquisition_context = Some("changed-context".into());
-            }
+            _ => page.index.active_upload_context_fingerprint = Some("changed-context".into()),
         }
         page.window.retain_current(&page.index);
         assert_eq!(page.window.certified_member_count(), 0);

@@ -685,27 +685,20 @@ impl Context {
         source: SnapshotSource,
         candidate: &CandidateFile,
         sidecar: &str,
-        index: &ScanIndex,
     ) -> Scope {
+        // Only what changes the reader's output. Settings, capabilities and
+        // the replay directive apply after the scan; the parser is compiled,
+        // so it changes only across a restart, which drops RAM checkpoints.
         Scope(sha256_hex(&[
             "sampled_native_reduction:v2",
             &self.namespace.0,
             source.api_slug(),
-            source.parser_version(),
             source.scan_identity_version(),
             &local_index_key(&candidate.scan_root),
             &local_index_key(&candidate.path),
             sidecar,
             // Retired full context-curve upload: keeps the scope bytes.
             "no_curve",
-            index
-                .active_acquisition_context
-                .as_deref()
-                .unwrap_or("none"),
-            index
-                .historical_replay_generation
-                .as_deref()
-                .unwrap_or("none"),
         ]))
     }
     pub(super) fn record_mode(&mut self, mode: ReadMode, audit_due: Option<u64>) {
@@ -2389,7 +2382,10 @@ pub(super) fn configure_tier_replay(
     parser.accumulator.codex_tier_replay = Some(codex_file_join::TierReplay::new(
         previous.0,
         previous.1,
-        index.active_acquisition_context.clone().unwrap_or_default(),
+        index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap_or_default(),
     ));
 }
 

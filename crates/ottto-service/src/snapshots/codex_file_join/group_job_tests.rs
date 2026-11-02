@@ -1341,7 +1341,7 @@ fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
 }
 
 #[test]
-fn upload_context_change_invalidates_paused_group() {
+fn upload_context_change_keeps_paused_group() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1351,15 +1351,13 @@ fn upload_context_change_invalidates_paused_group() {
         let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
             counters(&cache).jobs_paused > 0
         });
-        // Receipts must not mix upload scopes.
+        // A delivery context is no group scope input: the job resumes.
         index.active_upload_context_fingerprint = Some("other-upload-context".into());
-        index.active_acquisition_context = Some("other-upload-context".into());
         let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
         assert!(!done.snapshots.is_empty());
     });
     let after = counters(&cache);
-    assert!(after.jobs_invalidated >= 1, "{after:?}");
-    assert_eq!(after.groups_started, 2, "{after:?}");
+    assert_eq!(after.jobs_invalidated, 0, "{after:?}");
     fs::remove_dir_all(root).unwrap();
 }
 

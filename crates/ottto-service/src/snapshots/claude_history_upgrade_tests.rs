@@ -1163,7 +1163,10 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
     with_max_gated_claude_revision(3, || {
         let (home, root, mut index) = families("history-gate-c2", 2);
         // Items with the indexed source files, as a resend would carry them.
+        // A delivery context alone reads nothing, so the probe drops the
+        // entity stamps to re-emit the proven bodies.
         let mut probe = index.clone();
+        probe.upload_context_proof.entity_stamps.clear();
         let mut items = scan(&root, &mut probe, "ctx-probe", 1).snapshots;
         assert_eq!(items.len(), 4);
         mint_request_owned_copies(&mut items);

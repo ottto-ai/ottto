@@ -299,7 +299,6 @@ struct NormalSkip {
     member: String,
     revision: String,
     census_window_end: String,
-    upload_context: Option<String>,
     candidate: CandidateFile,
 }
 
@@ -404,8 +403,7 @@ impl WindowEligibility {
                         && entry.scan_identity_version.as_deref()
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
-                }) && skip.upload_context == index.active_acquisition_context
-                    && !index.file_context_read_owed(key)
+                }) && !index.file_context_read_owed(key)
                     && !index.confirmed_empty_files.contains(key)
                     && !index.terminal_jsonl_dispositions.contains_key(key)
                     && !index.claude_account_deferred_holds.contains_key(key)
@@ -812,7 +810,7 @@ impl NativePhase {
     fn prepay_capture(
         &self,
         candidate: &CandidateFile,
-        skip_context: Option<(&ScanIndex, &str)>,
+        skip_context: Option<&str>,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Option<(usize, bool)> {
         use crate::heap_layout_bound::{Counter, HeapLayoutBound};
@@ -837,17 +835,11 @@ impl NativePhase {
         for _ in 0..7 {
             extra.add(length)?;
         }
-        if let Some((index, window)) = skip_context {
+        if let Some(window) = skip_context {
             extra.add(self.skips.growth_peak()?)?;
             candidate.completed_heap_bound(&mut extra)?;
             extra.add(candidate.source_file_fingerprint.len())?;
             extra.add(window.len())?;
-            extra.add(
-                index
-                    .active_acquisition_context
-                    .as_ref()
-                    .map_or(0, String::len),
-            )?;
         } else {
             // Parsed key, revoked correction key, parsed root: each compact
             // buffer is paid at its old-plus-new replacement peak.
@@ -909,8 +901,7 @@ impl NativePhase {
         if self.disabled {
             return;
         }
-        let Some((external, admitted)) =
-            self.prepay_capture(candidate, Some((index, window)), credit)
+        let Some((external, admitted)) = self.prepay_capture(candidate, Some(window), credit)
         else {
             self.disable();
             return;
@@ -1181,7 +1172,7 @@ impl NativePhase {
             || entry.last_snapshot_fingerprint.is_none()
             || entry.rearmed()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
-            || index.active_acquisition_context.is_none()
+            || !index.file_upload_context_enabled()
             || index.file_context_read_owed(&key)
         {
             return;
@@ -1193,7 +1184,6 @@ impl NativePhase {
                 member,
                 revision: candidate.source_file_fingerprint.clone(),
                 census_window_end: census_window_end.to_owned(),
-                upload_context: index.active_acquisition_context.clone(),
                 candidate: candidate.clone(),
             },
         );
@@ -1627,10 +1617,10 @@ impl NativePhase {
                 let (key, skip) = captured.next().expect("peeked captured certificate");
                 if !self.parsed_roots.contains(root)
                     && skip.census_window_end == census_window_end
-                    && index.files.get(&key).is_some_and(|entry| {
-                        entry.observed_fingerprint() == skip.revision
-                            && skip.upload_context == index.active_acquisition_context
-                    })
+                    && index
+                        .files
+                        .get(&key)
+                        .is_some_and(|entry| entry.observed_fingerprint() == skip.revision)
                     && retained
                         .member_request_id_fingerprints
                         .contains_key(&skip.member)
@@ -2877,7 +2867,7 @@ impl Drop for TestScope {
     }
 }
 
-crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
+crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, candidate);
 crate::heap_layout_bound::fields!(NativePhase; disabled, retained_target_bytes, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; proof, members, envelope, certified, prior_native, paired_roots);
 crate::heap_layout_bound::fields!(FrozenNativePrior; revision, request_fingerprint, occurrence_fingerprint, assigned);

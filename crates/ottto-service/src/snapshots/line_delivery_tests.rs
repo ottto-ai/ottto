@@ -4198,13 +4198,10 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         audited.candidate_decision_with_reason_at(&candidate, 2),
         (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
     );
+    // A delivery context changes no parse: CONTENT stays valid.
     let mut context = held.clone();
     context.activate_upload_context("new-authority".into());
-    assert!(!context.withheld_account_unchanged(&key, &candidate));
-    assert_eq!(
-        context.candidate_decision_at(&candidate, 1),
-        CandidateDecision::Parse
-    );
+    assert!(context.withheld_account_unchanged(&key, &candidate));
     let mut other_revision = held.clone();
     activate(&mut other_revision, revision - 1);
     assert!(!other_revision.withheld_account_unchanged(&key, &candidate));

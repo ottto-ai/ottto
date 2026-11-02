@@ -6764,7 +6764,7 @@ fn touched_replaced_or_shrunk_held_file_misses() {
 /// unscoped-incomplete census flag and the owner member count each change
 /// the memo digest; the same inputs give the same digest.
 #[test]
-fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
+fn memo_digest_fences_receipt_contents_census_flags_and_members() {
     use crate::snapshots::codex_file_join::AppliedTierReceipt;
     let temp = Temp::new("memo-fence-digest", b"{\"n\":1}\n");
     let file = File::open(&temp.0).unwrap();
@@ -6831,8 +6831,11 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
     );
     let mut context = with_receipt(receipt("priority"));
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
-    context.active_acquisition_context = Some("another-upload-context".into());
-    assert_ne!(reference, digest(&context, &codex, 1), "upload context");
+    assert_eq!(
+        reference,
+        digest(&context, &codex, 1),
+        "a delivery context wakes nothing"
+    );
     let flags: [fn(&mut CodexTitleMetadata); 3] = [
         |codex| {
             codex
@@ -8792,7 +8795,7 @@ fn fork_cycle_is_witnessed_and_then_quiet() {
     write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
     let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope(&ScanIndex::default());
+    let scope = group_scope();
     for _ in 0..PARENT_RESTART_BUDGET {
         cache.note_parent_restart(&namespace, &scope);
     }
@@ -9373,7 +9376,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
     }
     let cache = Arc::new(SharedCache::default());
     let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope(&ScanIndex::default());
+    let scope = group_scope();
     for _ in 0..PARENT_RESTART_BUDGET {
         cache.note_parent_restart(&namespace, &scope);
     }

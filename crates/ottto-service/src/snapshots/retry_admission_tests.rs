@@ -113,7 +113,6 @@ fn retry_test_context(index: &mut ScanIndex, root: &Path) {
     let context = scan_traversal_context_fingerprint(
         SnapshotSource::ClaudeCode,
         &[root.to_owned()],
-        index,
         BACKFILL_WINDOW_DAYS,
     );
     let traversal = index.traversal.as_mut().unwrap();

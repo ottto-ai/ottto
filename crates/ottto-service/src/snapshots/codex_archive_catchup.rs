@@ -131,29 +131,15 @@ impl ScanIndex {
         }
         archive_alarm(alarm);
     }
-    /// A privacy-only difference corrects nothing in an archive's evidence.
-    pub(super) fn adopt_archive_contexts(
-        &mut self,
-        closure: &upload_context_receipt::ContextClosure,
-        acquisition: &str,
-    ) {
-        for a in self.archives.values_mut() {
-            if a.context
-                .as_deref()
-                .is_some_and(|c| closure.admits_active(c))
-            {
-                a.context = Some(acquisition.to_owned());
-            }
-        }
-    }
-    pub(super) fn hold_archive_corrections(&mut self, context: Option<&str>) {
+    /// A historical replay re-owes every acquired archive. No setting or
+    /// capability does: they correct nothing in an archive's evidence.
+    pub(super) fn hold_archive_corrections(&mut self) {
         let mut count = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
-            ) && context.map_or(true, |context| a.context.as_deref() != Some(context))
-            {
+            ) {
                 a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 ));
@@ -261,7 +247,7 @@ impl ScanIndex {
                         continue;
                     }
                     a.transition(ArchiveTransition::Reserve);
-                    a.context = self.active_acquisition_context.clone();
+                    a.context = self.active_upload_context_fingerprint.clone();
                     self.archive_pass.dirty = true;
                 }
             }

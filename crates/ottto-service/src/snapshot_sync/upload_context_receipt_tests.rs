@@ -340,6 +340,10 @@ pub(crate) struct Uploader {
     pub completed: bool,
 }
 impl Uploader {
+    /// Forget which context each accepted body was ACKed under.
+    pub(crate) fn drop_body_contexts(&mut self) {
+        self.progress.accepted_body_contexts.clear();
+    }
     pub(crate) fn new(source: SnapshotSource) -> Self {
         Self {
             progress: SnapshotUploadProgress::new(
@@ -363,15 +367,10 @@ impl Uploader {
         context: String,
         index: &mut ScanIndex,
     ) {
-        // A bound acquisition context survives: a delivery-only change must not
-        // read as an acquisition change.
-        let acquisition = index
-            .bound_acquisition_context_for_test()
-            .unwrap_or_else(|| context.clone());
-        activate_source_contexts(source, context, acquisition, index, &mut self.progress);
+        activate_source_upload_context(source, context, index, &mut self.progress);
     }
 
-    /// The service prepare's context steps: closure, adoption, both contexts.
+    /// The service prepare's context steps.
     pub(crate) fn activate_like_prepare(
         &mut self,
         source: SnapshotSource,
@@ -385,18 +384,7 @@ impl Uploader {
         let base = cycle_upload_context(policy, namespace, cache);
         let context =
             copy_unproven_upload_context(resumed_prefix_upload_context(base.clone(), claude), copy);
-        let acquisition = cycle_acquisition_context(cache, claude, copy);
-        let closure = cycle_context_closure(
-            namespace,
-            index.last_attribution_namespace(),
-            cache,
-            claude,
-            copy,
-        );
-        index.adopt_acquisition_context(&closure, &acquisition);
-        index.set_upload_context_closure(std::sync::Arc::new(closure));
-        activate_source_contexts(source, context, acquisition, index, &mut self.progress);
-        index.note_attribution_namespace(namespace);
+        activate_source_upload_context(source, context, index, &mut self.progress);
         index.copy_unproven_enabled = copy;
         index.set_copy_prefix_base_upload_context(claude.then_some(base));
     }

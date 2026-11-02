@@ -151,7 +151,6 @@ pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
-pub(crate) use upload_context_receipt::ContextClosure as UploadContextClosure;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]
 mod upload_context_receipt_tests;
@@ -4119,14 +4118,6 @@ pub struct ScanIndex {
     /// complete census, so a bounded/failed sweep cannot skip untouched files.
     #[serde(skip)]
     active_upload_context_fingerprint: Option<String>,
-    /// Runtime-only context of every acquisition-reuse decision. Unlike the
-    /// delivery context above it has no privacy input, so a toggle moves no
-    /// file scope, group scope, tier receipt or traversal.
-    #[serde(skip)]
-    active_acquisition_context: Option<String>,
-    /// Runtime-only: this pass's delivery contexts that differ only by privacy.
-    #[serde(skip)]
-    upload_context_closure: Option<Arc<upload_context_receipt::ContextClosure>>,
     #[serde(skip)]
     pub(crate) context_read_counts: upload_context_read::LocalCounts,
     /// Runtime-only revision of the effective additive upload projection.
@@ -4549,8 +4540,6 @@ impl Default for ScanIndex {
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
-            active_acquisition_context: None,
-            upload_context_closure: None,
             context_read_counts: Default::default(),
             active_effective_upload_body_witness_revision: 0,
             active_effective_upload_body_witness_revision_monotone: false,
@@ -25113,7 +25102,7 @@ fn codex_parent_step_start(
     let Some(traversal) = index.traversal.as_ref() else {
         return;
     };
-    let scope = cursor::group_scope(index);
+    let scope = cursor::group_scope();
     let state = context.cache.parent_state(&context.namespace, &scope);
     identities.restart_budget_spent = state.restarts >= cursor::PARENT_RESTART_BUDGET;
     // N1: a poisoned cursor decides the budget spent above but reports no
@@ -29580,7 +29569,7 @@ impl OwnedSourceScan {
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
                         )?;
-                        Some(context.file_scope(source, member, &dependency, index))
+                        Some(context.file_scope(source, member, &dependency))
                     };
                     match codex_file_join::step_group(
                         &mut active,
@@ -30192,12 +30181,10 @@ impl OwnedSourceScan {
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
                     )
-                    .map(|dependency| {
-                        context.file_scope(source, &active.candidate, &dependency, index)
-                    });
+                    .map(|dependency| context.file_scope(source, &active.candidate, &dependency));
                     let counting_now =
                         sampled_scan::codex_cursor::job_counting_view(&active, index);
-                    let group_scope_now = sampled_scan::codex_cursor::group_scope(index);
+                    let group_scope_now = sampled_scan::codex_cursor::group_scope();
                     let census_trusted = state_census_complete
                         && sidecar_census_complete
                         && active
@@ -30536,7 +30523,7 @@ impl OwnedSourceScan {
                         )
                         .zip(sampling.as_ref())
                         .map(|(dependency, context)| {
-                            context.file_scope(source, &candidate, &dependency, index)
+                            context.file_scope(source, &candidate, &dependency)
                         });
                         // H3c: a passed certificate permits native finish of
                         // this prefix only. Discard its checkpoint: no cache copy,
@@ -31491,7 +31478,7 @@ impl OwnedSourceScan {
                         let shared = codex_parent_ownership_ledgers.as_ref();
                         let scope = sampling
                             .as_ref()
-                            .map(|_| sampled_scan::codex_cursor::group_scope(index));
+                            .map(|_| sampled_scan::codex_cursor::group_scope());
                         let ram = sampling.as_ref().zip(scope.as_ref());
                         match (at_current, scan_complete, cause) {
                             (true, true, _) => {
@@ -31588,7 +31575,7 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if let Some(context) = sampling.as_ref() {
-                            let scope = sampled_scan::codex_cursor::group_scope(index);
+                            let scope = sampled_scan::codex_cursor::group_scope();
                             context.cache.witness_parent(
                                 &context.namespace,
                                 &scope,
@@ -32990,7 +32977,7 @@ impl OwnedSourceScan {
                         codex_parent_identities.parent_restarts =
                             context.cache.note_parent_restart(
                                 &context.namespace,
-                                &sampled_scan::codex_cursor::group_scope(index),
+                                &sampled_scan::codex_cursor::group_scope(),
                             );
                     }
                 }
@@ -34070,7 +34057,7 @@ impl OwnedSourceScan {
                     // stays held; only a new fingerprint or generation
                     // re-opens the file (`candidate_decision`,
                     // `terminal_jsonl_loss`).
-                    let scope = sampled_scan::codex_cursor::group_scope(index);
+                    let scope = sampled_scan::codex_cursor::group_scope();
                     for parent in &owed {
                         let (current, fresh) = codex_parent_identities
                             .probe(codex_parent_identities.census(index), parent);
@@ -34444,10 +34431,7 @@ impl OwnedSourceScan {
                     // Stage 1 guard (§6): a side read is never paced.
                     side_plan
                         .is_none()
-                        .then_some(sampled_scan::codex_cursor::PaceProbe {
-                            file: &opened_file,
-                            index,
-                        }),
+                        .then_some(sampled_scan::codex_cursor::PaceProbe { file: &opened_file }),
                 ) {
                     // U1a-2a G4a: a side deferral writes nothing (uncharged).
                     sampled_scan::codex_cursor::StartPlan::Defer if side_plan.is_some() => {
@@ -34974,8 +34958,7 @@ impl OwnedSourceScan {
                             );
                             pending!();
                         }
-                        let scope =
-                            context.file_scope(source, &candidate, &reduction_sidecar, index);
+                        let scope = context.file_scope(source, &candidate, &reduction_sidecar);
                         // On a RAM miss, a durable record may restore
                         // the copy (charged to the RAM cache, then taken as
                         // a retained copy); resource refusal keeps it Pending.
@@ -35526,8 +35509,7 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let scope =
-                            context.file_scope(source, &candidate, &reduction_sidecar, index);
+                        let scope = context.file_scope(source, &candidate, &reduction_sidecar);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
                         let mode = match parser.prepare_acquisition(
@@ -35709,7 +35691,6 @@ impl OwnedSourceScan {
                     ),
                     Some(sampled_scan::codex_cursor::PaceProbe {
                         file: active.parser.reader.reader.get_ref(),
-                        index,
                     }),
                 ) {
                     sampled_scan::codex_cursor::StartPlan::Singleton => false,
@@ -45375,78 +45356,66 @@ fn sidecar_stat_fingerprint(path: &Path) -> String {
 fn scan_traversal_context_fingerprint(
     source: SnapshotSource,
     roots: &[PathBuf],
-    index: &ScanIndex,
     backfill_window_days: u64,
 ) -> String {
-    scan_traversal_context_fingerprint_with(
-        source,
-        roots,
-        index.active_acquisition_context.as_deref(),
-        index.historical_replay_generation.as_deref(),
-        backfill_window_days,
-    )
+    scan_traversal_context_fingerprint_with(source, roots, None, backfill_window_days)
 }
 
-/// A traversal or carry origin saved under a delivery context that differs only
-/// by privacy consumed its queue under the same scanner: keep it. Anything else
-/// stays a mismatch.
-fn adopt_traversal_acquisition_context(
+/// A traversal or carry origin saved under the earlier form, which also bound
+/// the delivery context and the replay generation, consumed its queue under
+/// the same walk when that form equals the active one: keep it under the new
+/// form. Anything else stays a mismatch and starts the walk as before.
+fn adopt_legacy_traversal_fingerprint(
     source: SnapshotSource,
     roots: &[PathBuf],
     index: &mut ScanIndex,
     backfill_window_days: u64,
 ) {
-    let current = scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
-    let traversal = index.traversal.as_ref().map(|t| &t.context_fingerprint);
-    let origin = index
-        .claude_stale_family_carry
-        .origin
-        .as_ref()
-        .map(|origin| &origin.context_fingerprint);
-    if traversal.map_or(true, |t| *t == current) && origin.map_or(true, |o| *o == current) {
-        return;
-    }
-    let Some(closure) = index.upload_context_closure.clone() else {
-        return;
-    };
-    let adopted = closure
-        .active_forms()
-        .map(|context| {
-            scan_traversal_context_fingerprint_with(
-                source,
-                roots,
-                Some(context),
-                index.historical_replay_generation.as_deref(),
-                backfill_window_days,
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if let Some(traversal) = index
-        .traversal
-        .as_mut()
-        .filter(|t| adopted.contains(&t.context_fingerprint))
+    let legacy = scan_traversal_context_fingerprint_with(
+        source,
+        roots,
+        Some([
+            index.active_upload_context_fingerprint.as_deref(),
+            index.historical_replay_generation.as_deref(),
+        ]),
+        backfill_window_days,
+    );
+    let current = scan_traversal_context_fingerprint(source, roots, backfill_window_days);
+    for fingerprint in [
+        index.traversal.as_mut().map(|t| &mut t.context_fingerprint),
+        index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .map(|origin| &mut origin.context_fingerprint),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|fingerprint| **fingerprint == legacy)
     {
-        traversal.context_fingerprint.clone_from(&current);
-    }
-    if let Some(origin) = index
-        .claude_stale_family_carry
-        .origin
-        .as_mut()
-        .filter(|origin| adopted.contains(&origin.context_fingerprint))
-    {
-        origin.context_fingerprint = current;
+        fingerprint.clone_from(&current);
     }
 }
 
+/// The walk's identity: what decides which files are discovered and how a
+/// queue resumes. No setting, capability or replay directive is an input; a
+/// replay clears the traversal itself. `legacy` reproduces the earlier form,
+/// which bound the delivery context and the replay generation, for adoption.
 fn scan_traversal_context_fingerprint_with(
     source: SnapshotSource,
     roots: &[PathBuf],
-    acquisition_context: Option<&str>,
-    historical_replay_generation: Option<&str>,
+    legacy: Option<[Option<&str>; 2]>,
     backfill_window_days: u64,
 ) -> String {
     let mut digest = Sha256::new();
-    update_length_prefixed(&mut digest, b"ottto:snapshot-bounded-traversal:v1");
+    update_length_prefixed(
+        &mut digest,
+        if legacy.is_some() {
+            b"ottto:snapshot-bounded-traversal:v1"
+        } else {
+            b"ottto:snapshot-bounded-traversal:v2"
+        },
+    );
     update_length_prefixed(&mut digest, source.api_slug().as_bytes());
     // A persisted queue contains paths already consumed under the scanner that
     // created it. Resuming that queue after an upgrade without binding these
@@ -45465,14 +45434,9 @@ fn scan_traversal_context_fingerprint_with(
         JSONL_TERMINAL_DISPOSITION_GENERATION.as_bytes(),
     );
     update_length_prefixed(&mut digest, &backfill_window_days.to_be_bytes());
-    update_length_prefixed(
-        &mut digest,
-        acquisition_context.unwrap_or("none").as_bytes(),
-    );
-    update_length_prefixed(
-        &mut digest,
-        historical_replay_generation.unwrap_or("none").as_bytes(),
-    );
+    for value in legacy.into_iter().flatten() {
+        update_length_prefixed(&mut digest, value.unwrap_or("none").as_bytes());
+    }
     for root in roots {
         update_length_prefixed(&mut digest, root.to_string_lossy().as_bytes());
     }
@@ -45535,9 +45499,9 @@ fn ensure_bounded_traversal(
     if source == SnapshotSource::ClaudeCode {
         rearm_cause::retain(index);
     }
-    adopt_traversal_acquisition_context(source, roots, index, backfill_window_days);
+    adopt_legacy_traversal_fingerprint(source, roots, index, backfill_window_days);
     let context_fingerprint =
-        scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
+        scan_traversal_context_fingerprint(source, roots, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
         claude_contract::compare_context(claude_contract::TraversalContext {
             retained: index
@@ -49641,24 +49605,9 @@ impl ScanIndex {
             && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
     }
 
+    /// Delivery proofs only: no acquisition-reuse decision reads it.
     pub fn activate_upload_context(&mut self, fingerprint: String) {
-        self.activate_cycle_contexts(fingerprint.clone(), fingerprint);
-    }
-
-    /// The acquisition context a cycle-style activation bound, if any.
-    #[cfg(test)]
-    pub(crate) fn bound_acquisition_context_for_test(&self) -> Option<String> {
-        self.upload_context_closure
-            .as_ref()
-            .and(self.active_acquisition_context.clone())
-    }
-
-    /// Delivery proofs bind `delivery`; every acquisition-reuse decision binds
-    /// `acquisition`.
-    pub(crate) fn activate_cycle_contexts(&mut self, delivery: String, acquisition: String) {
-        self.hold_archive_corrections(Some(&acquisition));
-        self.active_upload_context_fingerprint = Some(delivery);
-        self.active_acquisition_context = Some(acquisition);
+        self.active_upload_context_fingerprint = Some(fingerprint);
     }
 
     /// Select before taking the committed baseline and scanning. Nonzero
@@ -51843,7 +51792,7 @@ impl ScanIndex {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return false;
         }
-        self.hold_archive_corrections(None);
+        self.hold_archive_corrections();
         self.historical_replay_generation = Some(generation);
         for (_, entry) in self.files.slots_mut() {
             if entry.upload_context_receipt.is_some() {
@@ -52139,7 +52088,6 @@ impl ScanIndex {
             context_fingerprint: scan_traversal_context_fingerprint(
                 source,
                 roots,
-                self,
                 backfill_window_days,
             ),
             census_window_end: "2026-09-01T03:27:03Z".to_string(),
@@ -54763,8 +54711,6 @@ impl ScanIndex {
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
-            active_acquisition_context: self.active_acquisition_context.clone(),
-            upload_context_closure: self.upload_context_closure.clone(),
             context_read_counts: self.context_read_counts.clone(),
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
@@ -61290,11 +61236,10 @@ mod tests {
         let started = "2026-09-03T00:00:00Z";
         let now = rfc3339_unix_seconds(started).expect("fixture clock");
         let stale_witness =
-            |index: &ScanIndex, attempt: u8, deadline: Option<u64>| ScanTraversalCheckpoint {
+            |_: &ScanIndex, attempt: u8, deadline: Option<u64>| ScanTraversalCheckpoint {
                 context_fingerprint: scan_traversal_context_fingerprint(
                     SnapshotSource::Pi,
                     &roots,
-                    index,
                     BACKFILL_WINDOW_DAYS,
                 ),
                 census_window_end: "2026-09-02T09:00:00Z".to_string(),

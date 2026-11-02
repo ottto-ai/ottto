@@ -246,12 +246,10 @@ pub(in crate::snapshots) enum StartPlan {
 }
 
 /// What the Stage 1 guard reads at a singleton's large start
-/// (`SharedCache::cursor_plan_paced`): the file as opened now, and the index
-/// whose receipt and replay scope keys its pace slot (`pace_key`).
+/// (`SharedCache::cursor_plan_paced`): the file as opened now.
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) struct PaceProbe<'a> {
     pub(in crate::snapshots) file: &'a File,
-    pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
 /// Why `cursor_start` did not start a job.
@@ -1189,24 +1187,16 @@ pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &Sca
     }
 }
 
-/// A group job's `scope_job`: the receipt scope (upload
-/// context), the historical replay generation, and the parser, identity and
-/// proof versions. Recorded at job start; a change at any resume or at
-/// emission invalidates the job (receipts must not mix scopes).
-pub(in crate::snapshots) fn group_scope(index: &ScanIndex) -> String {
+/// A group job's `scope_job`: the join-proof, parser and identity versions.
+/// Recorded at job start; a change at any resume or at emission invalidates
+/// the job (a paused group never mixes proofs). Settings, capabilities and the
+/// replay directive are no input: they apply after the scan.
+pub(in crate::snapshots) fn group_scope() -> String {
     sha256_hex(&[
-        "codex_group_scope:v1",
+        "codex_group_scope:v2",
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
-        index
-            .active_acquisition_context
-            .as_deref()
-            .unwrap_or("none"),
-        index
-            .historical_replay_generation
-            .as_deref()
-            .unwrap_or("none"),
     ])
 }
 
@@ -3604,7 +3594,7 @@ pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
 /// M-1 `scope_job` of a group, with its wake dependencies (§d.4): parser,
 /// identity and proof versions, owner, canonical member keys, every sealed
 /// member's opened identity and the live member's `{dev, ino}` (never its
-/// growing length), header digests, receipt scope, counting view, each
+/// growing length), header digests, counting view, each
 /// member's path reduction facts and the census flags.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn group_memo_digest(
@@ -3614,16 +3604,14 @@ pub(in crate::snapshots) fn group_memo_digest(
     digests: &[&str],
     index: &ScanIndex,
     codex: &CodexTitleMetadata,
-    receipt_scope: &str,
     identity: impl Fn(&CandidateFile) -> String,
 ) -> String {
     let mut parts = vec![
-        "codex_group_memo:v1".to_owned(),
+        "codex_group_memo:v2".to_owned(),
         CODEX_JOIN_PROOF_VERSION.to_owned(),
         SnapshotSource::Codex.parser_version().to_owned(),
         SnapshotSource::Codex.scan_identity_version().to_owned(),
         owner.to_owned(),
-        receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
         if members
@@ -5286,7 +5274,7 @@ impl SharedCache {
             .filter(|_| plan == StartPlan::Cursor && !page.continuation())
             .and_then(|probe| {
                 let rev = OpenStamp::capture(probe.file).ok()?;
-                Some((pace_key(&namespace.0, &group_scope(probe.index), key), rev))
+                Some((pace_key(&namespace.0, &group_scope(), key), rev))
             });
         let key = rotation_key(&namespace.0, key);
         self.with_cursor(|cursor| {
@@ -5403,7 +5391,7 @@ impl SharedCache {
         };
         // Stage 1 guard (§6): the attempt's slot is written with the claim.
         // It is accelerated only with known coverage and a recorded slot.
-        let pace_key = pace_key(&namespace.0, &group_scope(index), &key);
+        let pace_key = pace_key(&namespace.0, &group_scope(), &key);
         let now = pace_now();
         let (token, accelerate) = self
             .with_cursor(|cursor| {
@@ -5948,7 +5936,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.claude,
             context.support,
         )
-        .map(|dependency| sampling.file_scope(context.source, &job.candidate, &dependency, index))
+        .map(|dependency| sampling.file_scope(context.source, &job.candidate, &dependency))
     });
     // A group's counting view is built over every member.
     let counting = job_counting_view(&job, index);
@@ -5963,7 +5951,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             inventory: context.inventory,
             scope,
             counting,
-            group_scope: group_scope(index),
+            group_scope: group_scope(),
             census_complete: context.census_complete,
         },
     );
@@ -6763,13 +6751,12 @@ impl SingletonMemo {
 
 /// The memo key for a singleton: parser, identity and proof versions, the
 /// file's logical key and opened `{dev, ino}` (never its growing length),
-/// the receipt scope, the counting view, and the wake dependencies
-/// (path-scoped reduction facts and header witness, the path's conflicted
-/// candidate ids, the global sidecar census flags, and how many inventory
-/// members its owner has). The upload
-/// context and the census flags cannot cure most holds but are kept as
-/// conservative wake inputs (K3); their cost is one re-read per held file
-/// when they change.
+/// the counting view, and the wake dependencies (path-scoped reduction facts
+/// and header witness, the path's conflicted candidate ids, the global sidecar
+/// census flags, and how many inventory members its owner has). The census
+/// flags cannot cure most holds but are kept as conservative wake inputs
+/// (K3); their cost is one re-read per held file when they change. No setting
+/// or capability wakes a held file.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn memo_digest(
     index: &ScanIndex,
@@ -6782,17 +6769,13 @@ pub(in crate::snapshots) fn memo_digest(
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
-        "codex_singleton_memo:v3",
+        "codex_singleton_memo:v4",
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
         &local_index_key(&candidate.path),
         &stamp.dev.to_string(),
         &stamp.ino.to_string(),
-        index
-            .active_acquisition_context
-            .as_deref()
-            .unwrap_or("none"),
         counting,
         // PR-1: the tier receipt configures the parse
         // (`configure_tier_replay`), contents included.

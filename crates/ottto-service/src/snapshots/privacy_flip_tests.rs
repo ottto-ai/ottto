@@ -1,4 +1,5 @@
-//! A privacy flip is delivery debt, never a transcript read. Synthetic inputs.
+//! A setting or capability flip is delivery debt, never a transcript read.
+//! Synthetic inputs.
 use super::*;
 use sampled_scan::transition_fixture::{money_oracle::assert_equivalent, scan_money};
 use serde_json::Value;
@@ -8,8 +9,6 @@ const SOURCES: [SnapshotSource; 3] = [
     SnapshotSource::Codex,
     SnapshotSource::Pi,
 ];
-const KEY: &str = "synthetic-key-namespace";
-const OTHER_KEY: &str = "other-key-namespace";
 const RETAINED: [&str; 9] = [
     "session_display_name",
     "session_display_name_source",
@@ -21,14 +20,36 @@ const RETAINED: [&str; 9] = [
     "attribution_facts",
     "activity_summary",
 ];
-type Bit = (&'static str, fn(&mut SnapshotUploadPolicy) -> &mut bool);
-const BITS: [Bit; 5] = [
-    ("titles", |p| &mut p.session_titles_enabled),
-    ("workspace", |p| &mut p.workspace_labels_enabled),
-    ("links", |p| &mut p.session_artifacts_enabled),
-    ("attribution", |p| &mut p.session_attribution_enabled),
-    ("labels", |p| &mut p.session_attribution_labels_enabled),
+
+/// Every input of the delivery context: the five settings, the attribution
+/// key, the cache capability and the copy-unproven capability.
+#[derive(Clone, Copy)]
+struct Mode {
+    policy: SnapshotUploadPolicy,
+    key: u8,
+    cache: bool,
+    copy: bool,
+}
+type Flip = (&'static str, fn(&mut Mode));
+const FLIPS: [Flip; 8] = [
+    ("titles", |m| flip(&mut m.policy.session_titles_enabled)),
+    ("workspace", |m| {
+        flip(&mut m.policy.workspace_labels_enabled)
+    }),
+    ("links", |m| flip(&mut m.policy.session_artifacts_enabled)),
+    ("attribution", |m| {
+        flip(&mut m.policy.session_attribution_enabled)
+    }),
+    ("labels", |m| {
+        flip(&mut m.policy.session_attribution_labels_enabled)
+    }),
+    ("key", |m| m.key ^= 1),
+    ("cache", |m| flip(&mut m.cache)),
+    ("copy", |m| flip(&mut m.copy)),
 ];
+fn flip(value: &mut bool) {
+    *value = !*value;
+}
 
 fn all(value: bool) -> SnapshotUploadPolicy {
     SnapshotUploadPolicy {
@@ -39,13 +60,33 @@ fn all(value: bool) -> SnapshotUploadPolicy {
         session_attribution_labels_enabled: value,
     }
 }
-fn flipped(mut policy: SnapshotUploadPolicy, bit: &Bit) -> SnapshotUploadPolicy {
-    let field = (bit.1)(&mut policy);
-    *field = !*field;
-    policy
+fn mode(value: bool) -> Mode {
+    Mode {
+        policy: all(value),
+        key: 0,
+        cache: value,
+        copy: value,
+    }
 }
-fn namespace(policy: SnapshotUploadPolicy) -> Option<&'static str> {
-    policy.session_attribution_enabled.then_some(KEY)
+fn flipped(mut mode: Mode, flip: &Flip) -> Mode {
+    (flip.1)(&mut mode);
+    mode
+}
+/// The attribution context for key epoch `key`.
+fn attribution(
+    source: SnapshotSource,
+    root: &Path,
+    key: u8,
+) -> crate::session_attribution::SessionAttributionContext {
+    use base64::Engine;
+    crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        source,
+        root,
+        true,
+        Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13 + key; 32])),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap()
 }
 
 struct Walked {
@@ -57,23 +98,34 @@ struct Walked {
 
 impl Fixture {
     fn flip(&mut self, policy: SnapshotUploadPolicy) {
-        self.flip_to(policy, namespace(policy), false, false);
+        self.flip_to(Mode {
+            policy,
+            ..mode(false)
+        });
     }
-    fn flip_to(
-        &mut self,
-        policy: SnapshotUploadPolicy,
-        namespace: Option<&str>,
-        cache: bool,
-        copy: bool,
-    ) {
+    /// The service prepare's activation under `mode`: copy-unproven is a
+    /// Claude capability, the key namespace exists only with attribution on.
+    fn flip_to(&mut self, mode: Mode) {
+        let namespace = mode
+            .policy
+            .session_attribution_enabled
+            .then(|| attribution(self.source, &self.root, mode.key).checkpoint_namespace());
         self.uploader.activate_like_prepare(
             self.source,
             &mut self.index,
-            policy,
-            namespace,
-            cache,
-            copy,
+            mode.policy,
+            namespace.as_deref(),
+            mode.cache,
+            mode.copy && self.source == SnapshotSource::ClaudeCode,
         );
+    }
+    fn attribution_for(
+        &self,
+        mode: Mode,
+    ) -> Option<crate::session_attribution::SessionAttributionContext> {
+        mode.policy
+            .session_attribution_enabled
+            .then(|| attribution(self.source, &self.root, mode.key))
     }
     /// A walk under `policy`, as the service runs it: the scan first, then the
     /// upload filter, then finalization. `retained` is what the scan kept.
@@ -163,16 +215,20 @@ impl Fixture {
         self.index
             .file_upload_context_requires_adoption(&self.key())
     }
-    fn attribution(&self) -> crate::session_attribution::SessionAttributionContext {
-        use base64::Engine;
-        crate::session_attribution::SessionAttributionContext::from_activity_hint(
-            self.source,
-            &self.root,
-            true,
-            Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32])),
-            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-        )
-        .unwrap()
+    /// A restart: the index reloads, RAM checkpoints and the cache are gone,
+    /// the upload ledger reloads, and the prepare activates `mode` again.
+    fn restart(&mut self, mode: Mode) {
+        let path = self._scratch.join("restart-index.json");
+        self.index.save(&path).unwrap();
+        self.index = ScanIndex::load(&path).unwrap();
+        self.cache = Arc::default();
+        self.flip_to(mode);
+        let context = self
+            .index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap();
+        self.uploader.restart(self.source, &context);
     }
 }
 
@@ -203,53 +259,72 @@ fn growth(source: SnapshotSource) -> Vec<Value> {
         ],
     }
 }
-/// A fixture whose file was uploaded and exactly acknowledged under `policy`.
-fn settled(source: SnapshotSource, policy: SnapshotUploadPolicy) -> Fixture {
+/// A fixture whose file was uploaded and exactly acknowledged under `mode`.
+fn settled(source: SnapshotSource, mode: Mode) -> Fixture {
     let mut f = Fixture::new(source);
     f.append(&material(source));
-    f.flip(policy);
+    f.flip_to(mode);
     assert_eq!(f.adopt().files, 1);
     assert!(!f.debt());
     f
 }
+fn settled_policy(source: SnapshotSource, policy: SnapshotUploadPolicy) -> Fixture {
+    settled(
+        source,
+        Mode {
+            policy,
+            ..mode(false)
+        },
+    )
+}
 
-/// [money] T1, the gate: for every source and policy bit in both directions, a
-/// Tail under B after a parse under A equals a Full under B: money, placement
-/// and everything the scan retains for titles, links and attribution.
+/// [money] T1, the gate: for every source and every setting or capability
+/// bit in both directions, a Tail under B after a parse under A equals a Full
+/// under B: money, placement, everything the scan retains for titles, links
+/// and attribution, and the bodies POSTed. Attribution is under the key at
+/// send: the whole session re-keys, as a cold Full under B.
 #[test]
-fn tail_under_flipped_policy_equals_full_for_every_bit() {
+fn tail_under_flipped_mode_equals_full_for_every_bit() {
     for source in SOURCES {
-        for bit in &BITS {
+        for bit in &FLIPS {
             for start in [false, true] {
-                let before = all(start);
+                let before = mode(start);
                 let after = flipped(before, bit);
                 let label = format!("{source:?}/{}/{start}", bit.0);
                 let mut f = Fixture::new(source);
                 f.append(&material(source));
-                let attribution = f.attribution();
-                let context = after.session_attribution_enabled.then_some(&attribution);
-                f.flip(before);
+                f.flip_to(before);
                 let committed = f.index.clone();
-                let parsed = f.flip_walk(
-                    before,
-                    before.session_attribution_enabled.then_some(&attribution),
-                );
+                let parsed = f.flip_walk(before.policy, f.attribution_for(before).as_ref());
                 f.send_all(&committed, &parsed.scan);
                 assert!(!f.debt(), "{label}: parsed and acknowledged under A");
-                f.flip(after);
+                f.flip_to(after);
                 f.append(&growth(source));
-                let tail = f.flip_walk(after, context);
+                let committed = f.index.clone();
+                let tail = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
                 assert_eq!(tail.modes, (0, 1, 0), "{label}");
+                assert!(tail.bytes > 0, "{label}: the append is read");
+                let tail_money = scan_money(source, &f.index, &tail.scan);
+                let posted = f.uploader.posts.len();
+                f.send_all(&committed, &tail.scan);
+                let tail_posts = f.uploader.posts[posted..].concat();
+                assert!(!f.debt(), "{label}: the send pays the debt");
 
-                let warm = std::mem::take(&mut f.index);
+                f.index = ScanIndex::default();
                 f.cache = Arc::default();
-                f.flip(after);
-                let cold = f.flip_walk(after, context);
+                f.uploader =
+                    crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source);
+                f.flip_to(after);
+                let committed = f.index.clone();
+                let cold = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
                 assert_eq!(cold.modes.0, 1, "{label}: the control is a Full");
                 assert_eq!(cold.retained, tail.retained, "{label}");
                 let cold_money = scan_money(source, &f.index, &cold.scan);
-                let tail_money = scan_money(source, &warm, &tail.scan);
                 assert_equivalent(&cold_money, &tail_money);
+                f.send_all(&committed, &cold.scan);
+                let cold_posts = f.uploader.posts.concat();
+                assert!(!cold_posts.is_empty(), "{label}: the control posts");
+                assert_eq!(tail_posts, cold_posts, "{label}: POSTed bodies");
 
                 if source == SnapshotSource::ClaudeCode {
                     let kept = cold.retained[0].to_string();
@@ -259,7 +334,7 @@ fn tail_under_flipped_policy_equals_full_for_every_bit() {
                 }
                 let mut tampered = tail.scan;
                 tampered.snapshots[0].input_tokens += 1;
-                let tampered = scan_money(source, &warm, &tampered);
+                let tampered = scan_money(source, &f.index, &tampered);
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         assert_equivalent(&cold_money, &tampered)
@@ -272,45 +347,61 @@ fn tail_under_flipped_policy_equals_full_for_every_bit() {
     }
 }
 
-/// [behaviour] T2: every bit, every source, unchanged file: debt, zero bytes.
+/// [behaviour] T2: every bit, every source, unchanged file: zero bytes read
+/// and nothing POSTed, also after a restart. A settings or key change is owed
+/// delivery, paid on the next ordinary read; a copy-mode change of an
+/// unaffected file is already proven by its mode-free receipt.
 #[test]
-fn flip_reads_no_transcript_bytes_on_unchanged_files() {
+fn flip_reads_and_sends_nothing_on_unchanged_files() {
     for source in SOURCES {
-        for bit in &BITS {
-            let mut f = settled(source, all(false));
-            f.flip(flipped(all(false), bit));
-            assert!(f.debt(), "{source:?}/{}: the flip owes delivery", bit.0);
-            assert!(!f.read_owed(), "{source:?}/{}", bit.0);
-            f.assert_quiet();
+        for bit in &FLIPS {
+            for start in [false, true] {
+                let label = format!("{source:?}/{}/{start}", bit.0);
+                let before = mode(start);
+                let after = flipped(before, bit);
+                let mut f = settled(source, before);
+                let context = f.index.active_upload_context_fingerprint.clone();
+                f.flip_to(after);
+                let changed = f.index.active_upload_context_fingerprint != context;
+                if changed && bit.0 != "copy" {
+                    assert!(f.debt(), "{label}: the flip owes delivery");
+                }
+                assert!(!f.read_owed(), "{label}");
+                f.assert_quiet();
+                f.restart(after);
+                assert!(!f.read_owed(), "{label}: after a restart");
+                f.assert_quiet();
+            }
         }
     }
 }
 
-/// [behaviour] T3: growth after a flip tails and resends the one body.
+/// [money] T6: the operator's scoped copy-prefix re-read still owes its read
+/// when only the copy mode moved; the broadened gate does not swallow it.
 #[test]
-fn flip_plus_growth_is_tail_and_one_resend() {
-    for source in SOURCES {
-        let mut f = settled(source, all(false));
-        let after = flipped(all(false), &BITS[0]);
-        f.flip(after);
-        f.append(&growth(source));
-        let committed = f.index.clone();
-        let posts = f.uploader.posts.len();
-        let walked = f.flip_walk(after, None);
-        assert_eq!(walked.modes, (0, 1, 0), "{source:?}");
-        assert!(walked.bytes > 0, "{source:?}");
-        f.send_all(&committed, &walked.scan);
-        assert_eq!(f.uploader.posts.len(), posts + 1, "{source:?}");
-        assert!(!f.debt(), "{source:?}: the send pays the debt");
-        f.assert_quiet();
-    }
+fn copy_prefix_reread_mode_debt_still_selects() {
+    let mut f = settled(SnapshotSource::ClaudeCode, mode(false));
+    f.flip_to(Mode {
+        copy: true,
+        ..mode(false)
+    });
+    assert!(!f.read_owed(), "an unaffected file");
+    let key = f.key();
+    let marks = f
+        .index
+        .claude_money_birth_store
+        .money_marks(claude_money_birth_store::location_key(&key));
+    f.index
+        .claude_money_birth_store
+        .set_money_marks(&key, marks | claude_copy_prefix_reread::REOWED);
+    assert!(f.read_owed(), "a requested re-read under another mode");
 }
 
 /// [behaviour] T4: A -> B -> A with no upload under B is simply current again.
 #[test]
 fn flip_and_back_without_upload_is_current() {
-    let mut f = settled(SnapshotSource::Codex, all(false));
-    f.flip(flipped(all(false), &BITS[0]));
+    let mut f = settled_policy(SnapshotSource::Codex, all(false));
+    f.flip(flipped(mode(false), &FLIPS[0]).policy);
     f.assert_quiet();
     f.flip(all(false));
     assert!(!f.debt());
@@ -321,8 +412,8 @@ fn flip_and_back_without_upload_is_current() {
 /// acquisition resends under A; until then the server keeps B's form.
 #[test]
 fn flip_back_after_acknowledged_upload_resends_on_next_read() {
-    let mut f = settled(SnapshotSource::Codex, all(false));
-    let b = flipped(all(false), &BITS[0]);
+    let mut f = settled_policy(SnapshotSource::Codex, all(false));
+    let b = flipped(mode(false), &FLIPS[0]).policy;
     f.flip(b);
     f.append(&growth(f.source));
     let committed = f.index.clone();
@@ -362,7 +453,7 @@ fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
         1
     );
     assert!(!f.debt());
-    f.flip(flipped(all(false), &BITS[0]));
+    f.flip(flipped(mode(false), &FLIPS[0]).policy);
     assert!(f.debt() && !f.read_owed());
     let committed = f.index.clone();
     let b = f.index.active_upload_context_fingerprint.clone().unwrap();
@@ -474,7 +565,7 @@ fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
     }
 
     // Under B the alias is read and acknowledged; the untouched file is not.
-    f.flip(flipped(all(false), &BITS[0]));
+    f.flip(flipped(mode(false), &FLIPS[0]).policy);
     assert!(!f.index.file_context_read_owed(&untouched));
     let committed = f.index.clone();
     let b = f.index.active_upload_context_fingerprint.clone().unwrap();
@@ -500,45 +591,37 @@ fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
     );
 }
 
-/// [behaviour] T5: values persisted by the previous binary, bound to the delivery
-/// context of a policy other than the first active one, cause no read or hold.
+/// [behaviour] T5: values persisted by the previous binary. A traversal and
+/// carry origin bound to the active delivery context and replay generation
+/// are rewritten to the new form; one bound to another context keeps today's
+/// mismatch, which starts the walk. Tier receipts and archive contexts are
+/// never compared, so neither reads nor holds. Nothing is read or sent.
 #[test]
 fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
     for source in SOURCES {
-        let stored = flipped(all(false), &BITS[1]);
-        let delivery = {
-            let mut probe = Fixture::new(source);
-            probe.flip(stored);
-            probe.index.active_upload_context_fingerprint.unwrap()
-        };
         let mut f = Fixture::new(source);
-        // The previous binary bound every reuse decision to the delivery context.
-        f.index
-            .activate_file_upload_context(source, delivery.clone());
+        f.flip(all(false));
+        let delivery = f.index.active_upload_context_fingerprint.clone().unwrap();
+        // The previous binary wrote every value under the delivery context.
         assert_eq!(f.adopt().files, 1);
-        f.index.archives.insert(
-            "synthetic-archive".into(),
-            codex_compressed_input::ArchiveEvidence {
-                context: Some(delivery.clone()),
-                owner: None,
-                stamp: None,
-                disposition: codex_compressed_input::ArchiveDisposition::Acquired,
-                work: None,
-            },
-        );
-        f.index.archives.insert(
-            "other-archive".into(),
-            codex_compressed_input::ArchiveEvidence {
-                context: Some("not-a-privacy-difference".into()),
-                owner: None,
-                stamp: None,
-                disposition: codex_compressed_input::ArchiveDisposition::Acquired,
-                work: None,
-            },
-        );
+        for (name, context) in [
+            ("synthetic-archive", delivery.clone()),
+            ("other-archive", "another-delivery-context".to_owned()),
+        ] {
+            f.index.archives.insert(
+                name.into(),
+                codex_compressed_input::ArchiveEvidence {
+                    context: Some(context),
+                    owner: None,
+                    stamp: None,
+                    disposition: codex_compressed_input::ArchiveDisposition::Acquired,
+                    work: None,
+                },
+            );
+        }
         let tier_receipt = || {
             serde_json::from_value::<codex_file_join::AppliedTierReceipt>(json!({
-                "version": 1, "derivation": "synthetic", "scope": delivery,
+                "version": 1, "derivation": "synthetic", "scope": "another-delivery-context",
                 "records": 1, "prefix_digest": "synthetic", "tiers": {}
             }))
             .unwrap()
@@ -548,122 +631,90 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         entry.codex_captured_tier_receipt = Some(tier_receipt());
         entry.codex_applied_tier_receipt = Some(tier_receipt());
         let roots = [f.root.clone()];
-        let stored_traversal = scan_traversal_context_fingerprint_with(
-            source,
-            &roots,
-            Some(&delivery),
-            f.index.historical_replay_generation.as_deref(),
-            BACKFILL_WINDOW_DAYS,
-        );
-        let mut traversal = claude_family_census_shadow_tests::traversal();
-        traversal.context_fingerprint = stored_traversal.clone();
-        f.index.traversal = Some(traversal);
-        f.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-            context_fingerprint: stored_traversal,
-            process: 0,
-            full_rearm_window: false,
-            admission: None,
-        });
+        let legacy = |context: &str| {
+            scan_traversal_context_fingerprint_with(
+                source,
+                &roots,
+                Some([
+                    Some(context),
+                    f.index.historical_replay_generation.as_deref(),
+                ]),
+                BACKFILL_WINDOW_DAYS,
+            )
+        };
+        let current = scan_traversal_context_fingerprint(source, &roots, BACKFILL_WINDOW_DAYS);
+        for (stored, adopted) in [(legacy(&delivery), true), (legacy("another"), false)] {
+            let mut traversal = claude_family_census_shadow_tests::traversal();
+            traversal.context_fingerprint = stored.clone();
+            f.index.traversal = Some(traversal);
+            f.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+                context_fingerprint: stored.clone(),
+                process: 0,
+                full_rearm_window: false,
+                admission: None,
+            });
+            adopt_legacy_traversal_fingerprint(source, &roots, &mut f.index, BACKFILL_WINDOW_DAYS);
+            let expected = if adopted { &current } else { &stored };
+            assert_eq!(
+                &f.index.traversal.as_ref().unwrap().context_fingerprint,
+                expected,
+                "{source:?}/{adopted}"
+            );
+            assert_eq!(
+                &f.index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .unwrap()
+                    .context_fingerprint,
+                expected,
+                "{source:?}/{adopted}"
+            );
+        }
+        f.index.traversal = None;
+        f.index.claude_stale_family_carry.origin = None;
 
         f.flip(all(false));
-        let acquisition = f.index.active_acquisition_context.clone().unwrap();
-        let archive = &f.index.archives["synthetic-archive"];
-        assert_eq!(archive.context.as_ref(), Some(&acquisition), "{source:?}");
-        assert!(matches!(
-            archive.disposition,
-            codex_compressed_input::ArchiveDisposition::Acquired
-        ));
-        assert!(
-            !matches!(
-                f.index.archives["other-archive"].disposition,
-                codex_compressed_input::ArchiveDisposition::Acquired
-            ),
-            "{source:?}: a real difference is still held"
-        );
+        for name in ["synthetic-archive", "other-archive"] {
+            assert!(
+                matches!(
+                    f.index.archives[name].disposition,
+                    codex_compressed_input::ArchiveDisposition::Acquired
+                ),
+                "{source:?}/{name}: no correction is held"
+            );
+        }
         f.index.archives.clear();
-        let key = f.key();
         let entry = f.index.files.get_mut(&key).unwrap();
         for receipt in [
             entry.codex_captured_tier_receipt.take(),
             entry.codex_applied_tier_receipt.take(),
         ] {
-            let receipt = serde_json::to_value(receipt.unwrap()).unwrap();
-            assert_eq!(receipt["scope"], json!(acquisition), "{source:?}");
+            assert_eq!(receipt, Some(tier_receipt()), "{source:?}: untouched");
         }
-        adopt_traversal_acquisition_context(source, &roots, &mut f.index, BACKFILL_WINDOW_DAYS);
-        let current =
-            scan_traversal_context_fingerprint(source, &roots, &f.index, BACKFILL_WINDOW_DAYS);
-        assert_eq!(
-            f.index.traversal.as_ref().unwrap().context_fingerprint,
-            current
-        );
-        assert_eq!(
-            f.index
-                .claude_stale_family_carry
-                .origin
-                .as_ref()
-                .unwrap()
-                .context_fingerprint,
-            current
-        );
-        f.index.traversal = None;
-        f.index.claude_stale_family_carry.origin = None;
         assert!(!f.read_owed(), "{source:?}");
         f.assert_quiet();
     }
 }
 
-/// [behaviour] T6: key rotation, cache and copy changes are not privacy.
+/// [money] T7: context-only debt leaves a member independently accepted for
+/// every flip; an entity sent since under another context does not.
 #[test]
-fn key_cache_and_copy_changes_still_select() {
-    let on = all(true);
-    let mut f = settled(SnapshotSource::ClaudeCode, on);
-    f.flip_to(on, Some(OTHER_KEY), false, false);
-    assert!(f.read_owed(), "a different active key");
-
-    // The key is remembered while attribution is off; only it comes back free.
-    let mut f = settled(SnapshotSource::ClaudeCode, on);
-    f.flip(all(false));
-    assert!(!f.read_owed(), "attribution off hides the key");
-    f.assert_quiet();
-    f.flip(on);
-    assert!(!f.debt(), "the same key is current again");
-    f.flip(all(false));
-    f.flip_to(on, Some(OTHER_KEY), false, false);
-    assert!(f.read_owed(), "a different key after attribution off");
-
-    let mut f = settled(SnapshotSource::ClaudeCode, on);
-    f.flip_to(on, namespace(on), true, false);
-    assert!(f.read_owed(), "cache evidence admitted");
-    let (scan, _) = f.walk(true);
-    assert_eq!(scan.scanned_file_count, 1);
-
-    let mut f = settled(SnapshotSource::ClaudeCode, on);
-    f.flip_to(on, namespace(on), false, true);
-    // An unaffected file keeps its mode-free proof, as before; the closure adds
-    // nothing to it.
-    assert_eq!(f.read_owed(), f.debt(), "copy-unproven mode");
-
-    let mut f = settled(SnapshotSource::Codex, on);
-    f.flip_to(on, namespace(on), true, false);
-    assert!(f.read_owed(), "cache evidence admitted, Codex");
-}
-
-/// [money] T7: a privacy-only debt leaves a member independently accepted; a
-/// real context change does not.
-#[test]
-fn privacy_only_debt_keeps_consumers_current() {
-    let mut f = settled(SnapshotSource::ClaudeCode, all(false));
-    let key = f.key();
-    let accepted = |f: &Fixture| {
-        claude_stale_member_independently_accepted(&f.index, &key, &f.index.files[&key])
-    };
-    assert!(accepted(&f), "positive control: exact ACK");
-    f.flip(flipped(all(false), &BITS[0]));
-    assert!(f.debt());
-    assert!(accepted(&f), "a privacy flip");
-    f.flip_to(all(false), None, true, false);
-    assert!(!accepted(&f), "cache evidence");
+fn context_only_debt_keeps_consumers_current() {
+    for bit in &FLIPS {
+        let mut f = settled(SnapshotSource::ClaudeCode, mode(false));
+        let key = f.key();
+        let accepted = |f: &Fixture| {
+            claude_stale_member_independently_accepted(&f.index, &key, &f.index.files[&key])
+        };
+        assert!(accepted(&f), "{}: positive control, exact ACK", bit.0);
+        f.flip_to(flipped(mode(false), bit));
+        assert!(accepted(&f), "{}", bit.0);
+        for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
+            stamp.context_fingerprint = "f".repeat(64);
+        }
+        assert!(!accepted(&f), "{}: sent since under another context", bit.0);
+    }
 }
 
 /// [behaviour] T9: links are collected whatever the toggle says, and the toggle
@@ -680,7 +731,14 @@ fn links_are_scraped_with_links_off_and_absent_on_the_wire() {
     let wire = serde_json::to_string(&walked.scan.snapshots).unwrap();
     assert!(!wire.contains("pull/0"));
 
-    let on = flipped(off, &BITS[2]);
+    let on = flipped(
+        Mode {
+            policy: off,
+            ..mode(false)
+        },
+        &FLIPS[2],
+    )
+    .policy;
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.append(&material(f.source));
     f.flip(on);

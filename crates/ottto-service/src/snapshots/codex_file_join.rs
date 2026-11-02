@@ -946,6 +946,8 @@ pub(super) const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 pub struct AppliedTierReceipt {
     version: u16,
     derivation: String,
+    /// The delivery context it was written under, kept for older readers. Never
+    /// compared: no setting or capability changes which tier a record carries.
     scope: String,
     records: usize,
     prefix_digest: String,
@@ -989,18 +991,9 @@ impl AppliedTierReceipt {
         }
         bytes.0
     }
-    /// A privacy-only scope difference: the record digests and tiers it proves
-    /// have no policy input, so only the scope moves to the acquisition context.
-    pub(super) fn scope_in(&self, closure: &upload_context_receipt::ContextClosure) -> bool {
-        closure.admits_active(&self.scope)
-    }
-    pub(super) fn adopt_scope(&mut self, acquisition: &str) {
-        self.scope = acquisition.to_owned();
-    }
     pub(super) fn covered_by(&self, previous: &Self) -> bool {
         self.version == previous.version
             && self.derivation == previous.derivation
-            && self.scope == previous.scope
             && self
                 .tiers
                 .iter()
@@ -1050,7 +1043,6 @@ impl TierReplay {
         let invalid = previous.as_ref().is_some_and(|receipt| {
             receipt.version != RECEIPT_VERSION
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
-                || receipt.scope != scope
                 || receipt.records == 0
                 || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
                 || receipt.tiers.len() > MAX_APPLIED_TIERS
@@ -3504,7 +3496,7 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn missing_protected_receipt_rewrite_scope_change_or_cap_holds_correction() {
+    fn missing_protected_receipt_rewrite_or_cap_holds_correction_but_scope_does_not() {
         let rows = member("owner", "r", 100, 100);
         let mut replay = TierReplay::new(None, false, "scope".into());
         for row in &rows {
@@ -3517,16 +3509,16 @@ pub(super) mod tests {
             .is_err());
         let mut changed = rows.clone();
         changed[0]["payload"]["id"] = json!("other");
-        for (rows, scope) in [
-            (changed.as_slice(), "scope"),
-            (rows.as_slice(), "other-scope"),
+        for (rows, scope, holds) in [
+            (changed.as_slice(), "scope", true),
+            (rows.as_slice(), "other-scope", false),
         ] {
             let mut replay = TierReplay::new(Some(receipt.clone()), true, scope.into());
             for row in rows {
                 replay.observe(row);
             }
             replay.admitted(Some(("a".repeat(64), "derived_from_logs_2".into())));
-            assert!(replay.finish().is_err());
+            assert_eq!(replay.finish().is_err(), holds, "{scope}");
         }
         let mut replay = TierReplay::new(None, false, "scope".into());
         for i in 0..=MAX_APPLIED_TIERS {

@@ -17,6 +17,14 @@ struct Fixture {
     uploader: crate::snapshot_sync::upload_context_receipt_tests::Uploader,
 }
 impl Fixture {
+    /// Model entities whose stamps are gone from the index and the ACK
+    /// ledger (dropped by an older decoder, or retired). A delivery context
+    /// change alone reads nothing, so these fixtures use this still-owed
+    /// population to drive the context catch-up.
+    fn drop_entity_stamps(&mut self) {
+        self.index.upload_context_proof.entity_stamps.clear();
+        self.uploader.drop_body_contexts();
+    }
     fn new(source: SnapshotSource) -> Self {
         let scratch = crate::test_scratch::ScratchDir::new("upload-context-receipt");
         let root = scratch.join(match source {
@@ -277,7 +285,11 @@ fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
         old,
         "activation does not rewrite receipts"
     );
-    assert_eq!(f.adopt().files, 1);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    assert!(
+        !f.index.file_context_read_owed(&f.key()),
+        "a context reads nothing"
+    );
     f.assert_quiet();
 }
 #[test]
@@ -678,6 +690,7 @@ fn local_budget_deferral_completes_the_page_and_stays_owed() {
     let previous = f.index.clone();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     let (scan, _) = f.walk(true);
     assert!(!scan.snapshots.is_empty());
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
@@ -704,6 +717,7 @@ fn context_change_is_owed_once_then_stamped_and_equals_a_full() {
     let context = "e".repeat(64);
     f.index
         .activate_file_upload_context(f.source, context.clone());
+    f.drop_entity_stamps();
     assert!(f.index.file_upload_context_requires_adoption(&f.key()));
     let (scan, _) = f.walk(true);
     assert_eq!(scan.scanned_file_count, 1, "owed once");
@@ -1074,7 +1088,7 @@ fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
 }
 
 #[test]
-fn upload_context_policy_suppressed_file_rearms_on_context_change() {
+fn upload_context_policy_suppressed_file_stays_quiet_on_context_change() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.index
         .activate_file_upload_context(f.source, "c".repeat(64));
@@ -1091,7 +1105,8 @@ fn upload_context_policy_suppressed_file_rearms_on_context_change() {
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert!(f.index.file_upload_context_requires_adoption(&key));
-    assert_eq!(f.walk(true).0.scanned_file_count, 1);
+    assert!(!f.index.file_context_read_owed(&key), "it covers nothing");
+    assert_eq!(f.walk(true).0.scanned_file_count, 0);
 }
 
 #[test]
@@ -1101,6 +1116,7 @@ fn real_uploader_identical_context_change_resends_once_then_three_quiet_relists(
         f.adopt();
         let accepted = f.uploader.posts.last().unwrap().clone();
         f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
         assert_eq!(f.adopt().files, 1);
         assert_eq!(f.uploader.posts.len(), 2);
         assert_eq!(
@@ -1253,6 +1269,7 @@ fn real_uploader_new_usage_precedes_pending_context_catchup() {
     let previous = f.index.clone();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     let (mut scan, _) = f.walk(false);
     let mut new_usage = scan.snapshots[0].clone();
     new_usage.source_session_id = "zz-new-usage".into();
@@ -1276,6 +1293,7 @@ fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
     f.adopt();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     let previous = f.index.clone();
     let (_, items) = f.pending();
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
@@ -1324,6 +1342,7 @@ fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
     f.adopt();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     let previous = f.index.clone();
     let (_, items) = f.pending();
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
@@ -1405,6 +1424,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
         f.uploader.send(source, &mut f.index, &empty, &old).unwrap();
         let previous = f.index.clone();
         f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
         let (mut scan, _) = f.walk(false);
         let mut usage = old[0].clone();
         usage.source_session_id = "zz-new-usage".into();
@@ -1568,6 +1588,7 @@ fn terminal_census_context_deferral_stays_owed_after_restart() {
     let context = "e".repeat(64);
     f.index
         .activate_file_upload_context(source, context.clone());
+    f.drop_entity_stamps();
     let previous = f.index.clone();
     let (mut scan, _) = f.walk_with_file_limit(false, 10, true);
     assert!(scan.census_complete, "the actual scanner closes its census");
@@ -1652,6 +1673,7 @@ fn real_scan_reads_forty_small_context_files_in_one_page() {
     }
     assert_eq!(receipted(&f.index, &"d".repeat(64)), 40);
     f.index.activate_file_upload_context(source, "e".repeat(64));
+    f.drop_entity_stamps();
     f.cache = Arc::default(); // force cold Full reads
     let previous = f.index.clone();
     let ((scan, _), per_file) =
@@ -1751,11 +1773,11 @@ fn cursor_resume_leaves_context_read_room_for_census_members() {
             }
             assert!(fs::metadata(&large).unwrap().len() > 3 * limit);
             // Under "e" the members (and a receipted large file) are
-            // unchanged context-only reads; none keeps a retained copy.
+            // unchanged owed reads. A flip resets no cursor pace or fence, so
+            // a fresh cache (a restart) lets the receipted large file start.
             f.index.activate_file_upload_context(source, "e".repeat(64));
-            for path in members.iter().chain([&large]) {
-                let _ = f.cache.take(&local_index_key(path));
-            }
+            f.drop_entity_stamps();
+            f.cache = Arc::default();
             ensure_bounded_traversal(
                 source,
                 std::slice::from_ref(&f.root),
@@ -1891,6 +1913,7 @@ fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
             .unwrap();
         let read_limit = changed_bytes + max_other;
         f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
         let mut parses = BTreeMap::<PathBuf, usize>::new();
         let mut passes = 0;
         let mut local_bytes = 0;
@@ -2009,7 +2032,14 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
     );
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     f.cache = Arc::default();
+    for name in ["a", "b"] {
+        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+        assert!(f.index.file_context_read_owed(&key), "{name} owes its read");
+    }
+    // A flip re-arms no traversal: the next census generation lists the group.
+    f.index.traversal = None;
     let previous = f.index.clone();
     let ((scan, _), group_bytes) = terminal_contract_retry::group_body_bytes(|| f.walk(true));
     assert!(
@@ -2084,6 +2114,7 @@ fn real_scan_oversized_context_unit_splits_bounded_and_progresses() {
     );
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
     {
         // Other traffic spent the whole allowance: nothing advances, so the
         // owed file waits instead of being re-queued (no pressure loop).
@@ -2222,6 +2253,9 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
         .sum();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    // A flip re-arms no traversal: the next census generation lists both groups.
+    f.index.traversal = None;
     f.cache = Arc::default();
     let previous = f.index.clone();
     let ((scan, _), order) =
@@ -2324,6 +2358,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         }
         f.index
             .activate_file_upload_context(f.source, "e".repeat(64));
+        f.drop_entity_stamps();
+        // A flip re-arms no traversal: start the next census generation.
+        f.index.traversal = None;
         // Use the scanner's real discovery, then place the reachable traversal
         // shape from the review at the front: one context alias and an unhinted
         // ordinary singleton. Inventory still supplies the remaining aliases.

@@ -246,6 +246,12 @@ hours, and reprocesses only files whose size or modification time changed.
 Missing or ambiguous evidence produces no attribution label; it is never
 reclassified as human activity.
 
+Upload settings apply going forward. Turning a setting on applies to sessions
+that are active after it is turned on: a session that has already ended keeps
+what it uploaded before, and the daemon reads no transcript again to fill it
+in. Turning a setting off takes effect on the server for data already uploaded,
+and on every later upload.
+
 For Codex Desktop tasks created by another task, the daemon may also inspect
 the child row's first-user-message field in memory only when Codex itself marks
 that row `agent_created_thread`. It accepts only the exact machine-generated

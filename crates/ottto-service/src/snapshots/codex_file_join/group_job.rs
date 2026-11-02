@@ -229,7 +229,10 @@ crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wak
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
-        let receipt_scope = index.active_acquisition_context.clone().unwrap_or_default();
+        let receipt_scope = index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap_or_default();
         let mut previous_receipts = BTreeMap::new();
         let mut legacy_expected = BTreeMap::new();
         for member in &group.members {
@@ -458,7 +461,6 @@ impl GroupBoot {
                         && receipt.as_ref().map_or(true, |receipt| {
                             receipt.version == RECEIPT_VERSION
                                 && receipt.derivation == SnapshotSource::Codex.parser_version()
-                                && receipt.scope == self.receipt_scope
                                 && receipt.tiers.len() <= MAX_APPLIED_TIERS
                         })
                 })
@@ -559,7 +561,6 @@ impl GroupBoot {
                 .collect::<Vec<_>>(),
             index,
             codex,
-            &self.receipt_scope,
             |member| self.wake_identity(member),
         ))
     }
@@ -696,7 +697,7 @@ impl GroupBoot {
                 own_page,
                 dependencies,
                 memo_digest,
-                scope: cursor::group_scope(index),
+                scope: cursor::group_scope(),
                 walked: None,
                 consumed_before: 0,
             })),

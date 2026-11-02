@@ -1,8 +1,6 @@
 #[cfg(test)]
 use crate::snapshots::snapshot_quarantine_witness;
 #[cfg(test)]
-mod privacy_closure_tests;
-#[cfg(test)]
 pub(crate) mod upload_context_receipt_tests;
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
@@ -6295,83 +6293,17 @@ fn cycle_upload_context(
     checkpoint_namespace: Option<&str>,
     cache_observations_enabled: bool,
 ) -> String {
-    cache_observations_upload_context(
-        snapshot_upload_context_fingerprint(upload_policy, checkpoint_namespace),
-        cache_observations_enabled,
-    )
-}
-
-/// Reuse the existing per-file upload context invalidation when a backend
-/// upgrade admits cache evidence from previously scanned files.
-fn cache_observations_upload_context(context: String, enabled: bool) -> String {
-    if enabled {
+    let upload_context = snapshot_upload_context_fingerprint(upload_policy, checkpoint_namespace);
+    if cache_observations_enabled {
+        // Reuse the existing per-file upload context invalidation when a
+        // backend upgrade admits cache evidence from previously scanned files.
         format!(
             "{:x}",
-            Sha256::digest(format!("{context}:session_cache_observations:v1"))
+            Sha256::digest(format!("{upload_context}:session_cache_observations:v1"))
         )
     } else {
-        context
+        upload_context
     }
-}
-
-/// The context of every acquisition-reuse decision: the upload context's money
-/// modes without its privacy inputs. Neither the policy (a filter after the
-/// scan) nor the attribution key (used at finish) changes what parsing keeps.
-fn cycle_acquisition_context(
-    cache_observations_enabled: bool,
-    claude: bool,
-    copy_unproven_enabled: bool,
-) -> String {
-    let context = format!(
-        "{:x}",
-        Sha256::digest(b"ottto:snapshot-acquisition-context:v1\0")
-    );
-    copy_unproven_upload_context(
-        resumed_prefix_upload_context(
-            cache_observations_upload_context(context, cache_observations_enabled),
-            claude,
-        ),
-        copy_unproven_enabled,
-    )
-}
-
-/// Every policy the five toggles can express, reachable or not.
-fn all_upload_policies() -> impl Iterator<Item = SnapshotUploadPolicy> {
-    (0_u8..32).map(|bits| SnapshotUploadPolicy {
-        session_titles_enabled: bits & 1 != 0,
-        workspace_labels_enabled: bits & 2 != 0,
-        session_artifacts_enabled: bits & 4 != 0,
-        session_attribution_enabled: bits & 8 != 0,
-        session_attribution_labels_enabled: bits & 16 != 0,
-    })
-}
-
-/// Delivery contexts differing from this pass's only by privacy. Non-privacy
-/// inputs stay fixed. The last key counts only while no key is active, since
-/// attribution off is the one toggle that hides it; a different active key is
-/// a real change.
-fn cycle_context_closure(
-    checkpoint_namespace: Option<&str>,
-    last_namespace: Option<&str>,
-    cache_observations_enabled: bool,
-    claude: bool,
-    copy_unproven_enabled: bool,
-) -> crate::snapshots::UploadContextClosure {
-    let namespaces = match checkpoint_namespace {
-        Some(active) => [Some(active), None],
-        None => [None, last_namespace],
-    };
-    let mut closure = crate::snapshots::UploadContextClosure::default();
-    for policy in all_upload_policies() {
-        for namespace in namespaces {
-            closure.add_base(
-                cycle_upload_context(policy, namespace, cache_observations_enabled),
-                claude,
-                copy_unproven_enabled,
-            );
-        }
-    }
-    closure
 }
 
 /// Bind persisted retry pages to the Claude copy-prefix money mode; pages
@@ -6827,25 +6759,7 @@ fn prepare_sync_source_inner(
         );
     }
     continuation::observe(source, &upload_context, upload_policy);
-    let acquisition_context =
-        cycle_acquisition_context(cache_observations_enabled, claude, copy_unproven_enabled);
-    let context_closure = cycle_context_closure(
-        checkpoint_namespace.as_deref(),
-        index.last_attribution_namespace(),
-        cache_observations_enabled,
-        claude,
-        copy_unproven_enabled,
-    );
-    index.adopt_acquisition_context(&context_closure, &acquisition_context);
-    index.set_upload_context_closure(std::sync::Arc::new(context_closure));
-    activate_source_contexts(
-        source,
-        upload_context,
-        acquisition_context,
-        &mut index,
-        &mut upload_progress,
-    );
-    index.note_attribution_namespace(checkpoint_namespace.as_deref());
+    activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
     index.set_copy_prefix_base_upload_context(claude.then_some(base_upload_context));
     index.note_upload_context_inputs(
@@ -7423,21 +7337,7 @@ fn prepare_continuation_source(
     // except that the outage gate is read, never reset (C-1).
     let codex_side_pass =
         crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
-    let context_closure = cycle_context_closure(
-        checkpoint_namespace.as_deref(),
-        index.last_attribution_namespace(),
-        inputs.cache_observations_enabled,
-        false,
-        false,
-    );
-    index.set_upload_context_closure(std::sync::Arc::new(context_closure));
-    activate_source_contexts(
-        source,
-        upload_context,
-        cycle_acquisition_context(inputs.cache_observations_enabled, false, false),
-        &mut index,
-        &mut upload_progress,
-    );
+    activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -9308,29 +9208,18 @@ fn prepare_upload_progress_for_cycle(
     )
 }
 
-#[cfg(test)]
+/// Ordinary and continuation prepares bind both runtime witnesses together.
+/// Neither retained body ACKs nor receipt candidates acquire new authority here.
 fn activate_source_upload_context(
     source: SnapshotSource,
     context: String,
     index: &mut ScanIndex,
     progress: &mut SnapshotUploadProgress,
 ) {
-    activate_source_contexts(source, context.clone(), context, index, progress);
-}
-
-/// Ordinary and continuation prepares bind both runtime witnesses together.
-/// Neither retained body ACKs nor receipt candidates acquire new authority here.
-fn activate_source_contexts(
-    source: SnapshotSource,
-    context: String,
-    acquisition_context: String,
-    index: &mut ScanIndex,
-    progress: &mut SnapshotUploadProgress,
-) {
     progress.active_quarantine_witness = Some(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
-    index.activate_file_contexts(source, context.clone(), acquisition_context);
+    index.activate_file_upload_context(source, context.clone());
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
@@ -12883,10 +12772,10 @@ fn snapshot_upload_context_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-/// One destination-scoped index is shared by every privacy policy. The durable
-/// upload-context witness inside the index forces a complete correction pass
-/// whenever policy changes, including A→B→A. Keeping one file per policy made
-/// the second transition reuse an old settled checkpoint and skip correction.
+/// One destination-scoped index is shared by every privacy policy. A policy
+/// change reads nothing: it applies to bodies acquired from then on, and the
+/// per-entity proofs inside the index keep each delivery bound to the context
+/// it was sent under.
 fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("snapshots")
@@ -14621,7 +14510,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_effective_wire_unchanged_capability_enable_survives_finalization() {
+    fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
@@ -14848,38 +14737,10 @@ mod tests {
             scan(&mut index).snapshots.is_empty(),
             "next unchanged source is settled"
         );
+        // A capability flip reads nothing on an unchanged file: it applies
+        // from the next body on.
         index.activate_upload_context("cache-on-same-effective-projection".into());
-        let mut repeated = scan(&mut index);
-        assert_eq!(repeated.snapshots.len(), 1);
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut repeated.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::Codex,
-            &mut repeated,
-            &mut index,
-            |item| {
-                effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
-            },
-        );
-        // A new context owes even an equal effective body once: finalization
-        // keeps it; its exact ACK earns the receipt and the file is quiet.
-        assert_eq!(
-            repeated.snapshots.len(),
-            1,
-            "owed once under the new context"
-        );
-        for item in &mut repeated.snapshots {
-            prepare_snapshot_cache_for_upload(item, &progress, true, false, &legacy);
-        }
-        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
-            &mut index,
-            &repeated.snapshots,
-            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&repeated.snapshots),
-        );
-        assert!(scan(&mut index).snapshots.is_empty(), "then quiet");
+        assert!(scan(&mut index).snapshots.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -19137,6 +18998,40 @@ mod tests {
         assert_ne!(
             stable,
             snapshot_upload_context_fingerprint(SnapshotUploadPolicy::default(), None)
+        );
+    }
+
+    /// [money] The delivery context stays byte-identical while receipts,
+    /// stamps and ACK contexts still bind it: a changed formula would owe every
+    /// proven file again. Values computed independently of this code.
+    #[test]
+    fn upload_context_formula_is_pinned() {
+        let off = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            workspace_labels_enabled: false,
+            session_artifacts_enabled: false,
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        };
+        let on = SnapshotUploadPolicy {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            session_artifacts_enabled: true,
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+        };
+        assert_eq!(
+            cycle_upload_context(off, None, false),
+            "e69b3670ac30103faba7f9dadcff9acc5138dad509fb7ed49b52dff1668cbd4e"
+        );
+        let cached = cycle_upload_context(on, Some("stable-key-epoch"), true);
+        assert_eq!(
+            cached,
+            "ee323545020e97a574089c2e4e03176ad17917d6d78658abb9f39494487581df"
+        );
+        assert_eq!(
+            copy_unproven_upload_context(resumed_prefix_upload_context(cached, true), true),
+            "ca93839676f7beb9078f01550cb3f0b77fca81c318f222f39ffabda0095302d7"
         );
     }
 
