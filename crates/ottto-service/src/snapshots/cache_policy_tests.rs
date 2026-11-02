@@ -763,6 +763,7 @@ fn measure(resident: Option<usize>, active: Option<usize>) -> sampled_scan::Step
         resident,
         active,
         used: active,
+        ..Default::default()
     }
 }
 

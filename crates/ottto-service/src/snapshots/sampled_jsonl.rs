@@ -1,6 +1,7 @@
 //! Native reduction adapter for the shared acquisition/cache mechanism. The
 //! existing parser step and finish remain the only semantic implementation.
 use super::*;
+use crate::heap_layout_bound::WalkStop;
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{AuditDebt, Checkpoint, FullReason, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
@@ -582,14 +583,11 @@ impl OwnedJsonlParser {
             true
         } else {
             record(Event::RetentionBoundRefused);
-            #[cfg(test)]
-            {
-                let charge = self.retention_bound(usize::MAX);
-                sampled_scan::test_hooks::record_bucket(classify_refusal(
-                    RefusalView::of(&budget),
-                    Refusal::Admission { charge },
-                ));
-            }
+            let charge = self.retention_bound(usize::MAX);
+            record(classify_refusal(
+                RefusalView::of(&budget),
+                Refusal::Admission { charge },
+            ));
             false
         };
         let Some(plan) = self.reader.acquisition.take() else {
@@ -617,9 +615,8 @@ impl OwnedJsonlParser {
         let limit = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
         let reduction = self.reduction_copy();
         let charge = crate::heap_layout_bound::bound(&reduction, limit);
-        #[cfg(test)]
         if charge.is_none() {
-            sampled_scan::test_hooks::record_bucket(classify_refusal(
+            record(classify_refusal(
                 RefusalView::of(&budget),
                 Refusal::Clone {
                     charge: crate::heap_layout_bound::bound(&reduction, usize::MAX),
@@ -724,14 +721,11 @@ impl OwnedJsonlParser {
         let limit = budget_after.min(release.entry_limit);
         if self.certified_charge(&checkpoint, limit).is_none() {
             record(Event::RetentionBoundRefused);
-            #[cfg(test)]
-            {
-                let charge = self.certified_charge(&checkpoint, usize::MAX);
-                sampled_scan::test_hooks::record_bucket(classify_refusal(
-                    RefusalView::deferred(budget_after, release.entry_limit),
-                    Refusal::Admission { charge },
-                ));
-            }
+            let charge = self.certified_charge(&checkpoint, usize::MAX);
+            record(classify_refusal(
+                RefusalView::deferred(budget_after, release.entry_limit),
+                Refusal::Admission { charge },
+            ));
             return declined(checkpoint, self.completed_durable());
         }
         #[cfg(test)]
@@ -745,14 +739,12 @@ impl OwnedJsonlParser {
             record(Event::RetentionUnsealedEof);
             return declined(checkpoint, self.completed_durable());
         }
-        #[cfg(test)]
         let entry_limit = release.entry_limit;
         let rank = release.rank;
         let outcome = release.execute();
         if outcome != sampled_scan::ReleaseOutcome::Released {
             record(Event::RetentionBoundRefused);
-            #[cfg(test)]
-            sampled_scan::test_hooks::record_bucket(classify_refusal(
+            record(classify_refusal(
                 RefusalView::deferred(budget_after, entry_limit),
                 Refusal::Release(outcome),
             ));
@@ -760,9 +752,8 @@ impl OwnedJsonlParser {
         }
         let reduction = self.reduction_copy();
         let charge = crate::heap_layout_bound::bound(&reduction, limit);
-        #[cfg(test)]
         if charge.is_none() {
-            sampled_scan::test_hooks::record_bucket(classify_refusal(
+            record(classify_refusal(
                 RefusalView::deferred(budget_after, entry_limit),
                 Refusal::Clone {
                     charge: crate::heap_layout_bound::bound(&reduction, usize::MAX),
@@ -912,36 +903,17 @@ impl OwnedJsonlParser {
     }
 }
 
-/// The packet's refusal buckets: disjoint, and together every refused
-/// singleton retention (`RetentionBoundRefused` or `RetentionCloneBoundRefused`).
-/// No production counter reads them; C2 may adopt them.
-#[cfg(test)] // C2's buckets; tests only for now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Bucket {
-    /// Both walks measured, and no room.
-    BudgetZero,
-    /// A walk did not measure (layout, visit limit, overflow, lock).
-    Walk,
-    /// The charge exceeds the budget.
-    OverBudget,
-    /// The charge fits the budget but not the entry limit.
-    OverEntry,
-}
-
 /// The budget a refused pass was admitted against.
-#[cfg(test)] // C2's buckets; tests only for now.
 #[derive(Clone, Copy)]
 pub(super) struct RefusalView {
-    granted: bool,
-    resident_measured: bool,
-    active_measured: bool,
+    /// What stopped the walk behind the budget; `None`: it measured.
+    unmeasured: Option<WalkStop>,
     /// `budget` for `Granted`, `budget_after` for `Deferred`.
     budget: usize,
     /// `ENTRY_BYTES` for `Granted`, the release's `entry_limit` for
     /// `Deferred`.
     entry_limit: usize,
 }
-#[cfg(test)] // C2's buckets; tests only for now.
 impl RefusalView {
     pub(super) fn of(budget: &sampled_scan::RetainBudget) -> Self {
         match budget {
@@ -949,10 +921,9 @@ impl RefusalView {
                 budget,
                 resident_measured,
                 active_measured,
+                walk_stop,
             } => Self {
-                granted: true,
-                resident_measured: *resident_measured,
-                active_measured: *active_measured,
+                unmeasured: (!*resident_measured || !*active_measured).then_some(*walk_stop),
                 budget: *budget,
                 entry_limit: crate::transcript_cache::ENTRY_BYTES,
             },
@@ -964,9 +935,7 @@ impl RefusalView {
             // Never classified (packet §2.1); a zero budget files as such.
             sampled_scan::RetainBudget::TierOrJoinExcluded { .. }
             | sampled_scan::RetainBudget::Unsealed { .. } => Self {
-                granted: true,
-                resident_measured: true,
-                active_measured: true,
+                unmeasured: None,
                 budget: 0,
                 entry_limit: crate::transcript_cache::ENTRY_BYTES,
             },
@@ -974,9 +943,7 @@ impl RefusalView {
     }
     pub(super) fn deferred(budget_after: usize, entry_limit: usize) -> Self {
         Self {
-            granted: false,
-            resident_measured: true,
-            active_measured: true,
+            unmeasured: None,
             budget: budget_after,
             entry_limit,
         }
@@ -984,7 +951,6 @@ impl RefusalView {
 }
 
 /// What refused the pass.
-#[cfg(test)] // C2's buckets; tests only for now.
 #[derive(Clone, Copy)]
 pub(super) enum Refusal {
     /// The admission check refused; `charge` is one walk at `usize::MAX`,
@@ -996,29 +962,34 @@ pub(super) enum Refusal {
     Clone { charge: Option<usize> },
 }
 
-/// One bucket per refused pass (packet §2.2). Pure.
-#[cfg(test)] // C2's buckets; tests only for now.
-pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Bucket {
+/// One disjoint cause per refused singleton retention (`RetentionBoundRefused`
+/// or `RetentionCloneBoundRefused`). Pure; a counter, never a decision.
+pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Event {
     let by_charge = |charge: Option<usize>| {
         // A refused charge that fits both limits cannot happen; in a release
-        // build it files as `Walk`.
+        // build it files as a walk stop. So does an unmeasured charge, whose
+        // walk had no byte limit.
         debug_assert!(
             charge.map_or(true, |charge| charge > view.budget.min(view.entry_limit)),
             "a refused charge fits its budget and entry limit"
         );
         match charge {
-            Some(charge) if charge > view.budget => Bucket::OverBudget,
-            Some(charge) if charge > view.entry_limit => Bucket::OverEntry,
-            _ => Bucket::Walk,
+            Some(charge) if charge > view.budget => Event::RetentionRefusedOverBudget,
+            Some(charge) if charge > view.entry_limit => Event::RetentionRefusedOverEntry,
+            _ => Event::RetentionRefusedWalkVisitLimit,
         }
     };
-    match refusal {
-        Refusal::Clone { charge } => by_charge(charge),
-        _ if view.granted && !view.resident_measured => Bucket::Walk,
-        _ if view.granted && !view.active_measured => Bucket::Walk,
-        _ if view.budget == 0 => Bucket::BudgetZero,
-        Refusal::Release(sampled_scan::ReleaseOutcome::Race) => Bucket::OverBudget,
-        Refusal::Release(_) => Bucket::Walk,
-        Refusal::Admission { charge } => by_charge(charge),
+    match (refusal, view.unmeasured) {
+        (Refusal::Clone { charge }, _) => by_charge(charge),
+        (_, Some(WalkStop::LockBusy)) => Event::RetentionRefusedWalkLock,
+        (_, Some(WalkStop::VisitLimit)) => Event::RetentionRefusedWalkVisitLimit,
+        // The walk stopped at the state budget, so there is no room.
+        (_, Some(WalkStop::NoRoom)) => Event::RetentionRefusedBudgetZero,
+        _ if view.budget == 0 => Event::RetentionRefusedBudgetZero,
+        (Refusal::Release(sampled_scan::ReleaseOutcome::Race), None) => {
+            Event::RetentionRefusedOverBudget
+        }
+        (Refusal::Release(_), None) => Event::RetentionRefusedWalkVisitLimit,
+        (Refusal::Admission { charge }, None) => by_charge(charge),
     }
 }

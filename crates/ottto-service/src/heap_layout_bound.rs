@@ -3,7 +3,23 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::{align_of, size_of, size_of_val};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+
+/// Why this thread's latest walks stopped early, for refusal counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WalkStop {
+    /// No lock or visit stop: the byte limit (a poisoned lock also lands here).
+    #[default]
+    NoRoom,
+    LockBusy,
+    VisitLimit,
+}
+thread_local! { static WALK_STOP: std::cell::Cell<WalkStop> = const { std::cell::Cell::new(WalkStop::NoRoom) }; }
+
+/// Read and reset this thread's stop; a later stop replaces an earlier one.
+pub(crate) fn take_walk_stop() -> WalkStop {
+    WALK_STOP.with(std::cell::Cell::take)
+}
 
 pub(crate) struct Counter {
     pub(crate) bytes: usize,
@@ -25,6 +41,7 @@ impl Counter {
     pub(crate) fn add(&mut self, bytes: usize) -> Option<()> {
         self.visits = self.visits.checked_add(1)?;
         if self.visits > 4096 {
+            WALK_STOP.with(|stop| stop.set(WalkStop::VisitLimit));
             return None;
         }
         self.charge(bytes)
@@ -331,7 +348,14 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Arc<T> {
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Mutex<T> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.try_lock().ok()?.heap_bound(c)
+        match self.try_lock() {
+            Ok(guard) => guard.heap_bound(c),
+            Err(TryLockError::WouldBlock) => {
+                WALK_STOP.with(|stop| stop.set(WalkStop::LockBusy));
+                None
+            }
+            Err(TryLockError::Poisoned(_)) => None,
+        }
     }
     fn completed_heap_bound(&self, _: &mut Counter) -> Option<()> {
         None
