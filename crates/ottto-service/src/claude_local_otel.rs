@@ -1562,23 +1562,9 @@ pub fn load_claude_effort_by_request(
 /// transcript's final write still re-selects that transcript. The fingerprint
 /// exposes neither the session id nor any sidecar content.
 pub fn claude_effort_sidecar_fingerprint(support_dir: &Path, session_id: &str) -> String {
-    let path = evidence_path(support_dir, session_id);
-    let Ok(metadata) = fs::metadata(path) else {
-        return String::new();
-    };
-    if !metadata.is_file() {
-        return String::new();
-    }
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let token = format!("{}:{modified_nanos}", metadata.len());
-    format!(
-        "{:x}",
-        Sha256::digest(format!("claude_effort_sidecar:v1:{token}").as_bytes())
+    sidecar_fingerprint(
+        evidence_path(support_dir, session_id),
+        "claude_effort_sidecar:v1",
     )
 }
 

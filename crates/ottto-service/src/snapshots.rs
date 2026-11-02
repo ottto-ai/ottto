@@ -27097,41 +27097,6 @@ impl OwnedSourceScan {
         watcher_overflowed: bool,
         claude_request_identity_capture: bool,
     ) -> Self {
-        Self::new_with_identity_capture_and_recovery_priority(
-            source,
-            roots,
-            owned_index,
-            collected_at,
-            requested_backfill_window_days,
-            file_limit,
-            artifacts_enabled,
-            claude_effort_support_dir,
-            hinted_paths,
-            watcher_overflowed,
-            claude_request_identity_capture,
-            &[],
-        )
-    }
-
-    /// Inactive source seam for already queued, durably rearmed recovery paths.
-    /// This only changes native selection order, never ownership or settlement.
-    /// The controller must still bind its process/source/destination scope and
-    /// prove selected-save/restart liveness before using it.
-    #[allow(dead_code, clippy::too_many_arguments)]
-    pub(crate) fn new_with_identity_capture_and_recovery_priority(
-        source: SnapshotSource,
-        roots: &[PathBuf],
-        owned_index: ScanIndex,
-        collected_at: &str,
-        requested_backfill_window_days: u64,
-        file_limit: usize,
-        artifacts_enabled: bool,
-        claude_effort_support_dir: Option<&Path>,
-        hinted_paths: &[PathBuf],
-        watcher_overflowed: bool,
-        claude_request_identity_capture: bool,
-        recovery_priority: &[PathBuf],
-    ) -> Self {
         Self::new_selecting(
             source,
             roots,
@@ -27144,7 +27109,7 @@ impl OwnedSourceScan {
             hinted_paths,
             watcher_overflowed,
             claude_request_identity_capture,
-            recovery_priority,
+            &[],
             None,
         )
     }
@@ -27294,6 +27259,7 @@ impl OwnedSourceScan {
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
         claude_request_identity_capture: bool,
+        // Only changes native selection order, never ownership or settlement.
         recovery_priority: &[PathBuf],
         durable_cache: Option<&sampled_scan::SharedCache>,
     ) -> Self {
@@ -55788,63 +55754,63 @@ impl ScanIndex {
             .and_then(|entry| entry.last_upload_body_witness.clone())
     }
 
+    /// A fresh entry for `candidate` that carries `key`'s upload witness,
+    /// counting state and upload-context receipt from the entry it replaces.
+    /// Callers decide the snapshot fingerprint, identity version and owed
+    /// evidence.
+    fn carried(
+        &self,
+        key: &str,
+        candidate: CandidateFile,
+        last_snapshot_fingerprint: Option<String>,
+        scan_identity_version: String,
+        evidence_owed: bool,
+    ) -> ScanIndexEntry {
+        let old = self.files.get(key);
+        ScanIndexEntry {
+            codex_fragment: None,
+            size_bytes: candidate.size_bytes,
+            modified_unix_seconds: candidate.modified_unix_seconds,
+            modified_unix_nanos: Some(candidate.modified_unix_nanos),
+            source_file_fingerprint: candidate.source_file_fingerprint,
+            last_snapshot_fingerprint,
+            last_upload_body_witness: old.and_then(|entry| entry.last_upload_body_witness.clone()),
+            effective_upload_body_witness_revision: old
+                .map_or(0, |entry| entry.effective_upload_body_witness_revision),
+            scan_identity_version: Some(scan_identity_version),
+            codex_joined_member_set: None,
+            codex_captured_joined_member_set: None,
+            codex_protected_owner: None,
+            codex_applied_tier_receipt: None,
+            codex_applied_tier_receipt_required: false,
+            codex_captured_tier_receipt: None,
+            codex_captured_tier_receipt_required: false,
+            codex_captured_uncommitted: false,
+            codex_counting_v2: old.is_some_and(|entry| entry.codex_counting_v2),
+            codex_counting_owner: old.and_then(|entry| entry.codex_counting_owner.clone()),
+            opened_changed_nanos: candidate.fingerprint_changed_nanos,
+            opened_birth_nanos: candidate.fingerprint_birth_nanos,
+            upload_context_receipt: old.and_then(|entry| entry.upload_context_receipt.clone()),
+            evidence_owed,
+        }
+    }
+
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
         rearm_cause::reproven(&key);
-        let last_snapshot_fingerprint = self
-            .files
-            .get(&key)
-            .and_then(|entry| entry.last_snapshot_fingerprint.clone());
-        let last_upload_body_witness = self
-            .files
-            .get(&key)
-            .and_then(|entry| entry.last_upload_body_witness.clone());
-        let effective_upload_body_witness_revision = self
-            .files
-            .get(&key)
-            .map_or(0, |entry| entry.effective_upload_body_witness_revision);
-        let codex_counting_v2 = self
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.codex_counting_v2);
-        self.files.insert(
-            key.clone(),
-            ScanIndexEntry {
-                codex_fragment: None,
-                size_bytes: candidate.size_bytes,
-                modified_unix_seconds: candidate.modified_unix_seconds,
-                modified_unix_nanos: Some(candidate.modified_unix_nanos),
-                source_file_fingerprint: candidate.source_file_fingerprint,
-                last_snapshot_fingerprint,
-                last_upload_body_witness,
-                effective_upload_body_witness_revision,
-                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
-                codex_joined_member_set: None,
-                codex_captured_joined_member_set: None,
-                codex_protected_owner: None,
-                codex_applied_tier_receipt: None,
-                codex_applied_tier_receipt_required: false,
-                codex_captured_tier_receipt: None,
-                codex_captured_tier_receipt_required: false,
-                codex_captured_uncommitted: false,
-                codex_counting_v2,
-                codex_counting_owner: self
-                    .files
-                    .get(&key)
-                    .and_then(|entry| entry.codex_counting_owner.clone()),
-                opened_changed_nanos: candidate.fingerprint_changed_nanos,
-                opened_birth_nanos: candidate.fingerprint_birth_nanos,
-                upload_context_receipt: self
-                    .files
-                    .get(&key)
-                    .and_then(|entry| entry.upload_context_receipt.clone()),
-                // An identity migration reads nothing: owed evidence stays owed.
-                evidence_owed: self
-                    .files
-                    .get(&key)
-                    .is_some_and(|entry| entry.evidence_owed),
-            },
+        let old = self.files.get(&key);
+        let last_snapshot_fingerprint =
+            old.and_then(|entry| entry.last_snapshot_fingerprint.clone());
+        // An identity migration reads nothing: owed evidence stays owed.
+        let evidence_owed = old.is_some_and(|entry| entry.evidence_owed);
+        let entry = self.carried(
+            &key,
+            candidate,
+            last_snapshot_fingerprint,
+            LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string(),
+            evidence_owed,
         );
+        self.files.insert(key, entry);
     }
 
     fn record(
@@ -55855,59 +55821,21 @@ impl ScanIndex {
     ) {
         let key = local_index_key(&candidate.path);
         rearm_cause::reproven(&key);
-        let last_upload_body_witness = self
-            .files
-            .get(&key)
-            .and_then(|entry| entry.last_upload_body_witness.clone());
-        let effective_upload_body_witness_revision = self
-            .files
-            .get(&key)
-            .map_or(0, |entry| entry.effective_upload_body_witness_revision);
         let scan_identity_version = self
             .files
             .get(&key)
             .map(ScanIndexEntry::carried_audit_version)
             .unwrap_or_else(|| LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        // Carried like the body witness; a configured singleton parse then
-        // sets it to that parse's decided version.
-        let codex_counting_v2 = self
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.codex_counting_v2);
-        self.files.insert(
-            key.clone(),
-            ScanIndexEntry {
-                codex_fragment: None,
-                size_bytes: candidate.size_bytes,
-                modified_unix_seconds: candidate.modified_unix_seconds,
-                modified_unix_nanos: Some(candidate.modified_unix_nanos),
-                source_file_fingerprint: candidate.source_file_fingerprint,
-                last_snapshot_fingerprint,
-                last_upload_body_witness,
-                effective_upload_body_witness_revision,
-                scan_identity_version: Some(scan_identity_version),
-                codex_joined_member_set: None,
-                codex_captured_joined_member_set: None,
-                codex_protected_owner: None,
-                codex_applied_tier_receipt: None,
-                codex_applied_tier_receipt_required: false,
-                codex_captured_tier_receipt: None,
-                codex_captured_tier_receipt_required: false,
-                codex_captured_uncommitted: false,
-                codex_counting_v2,
-                codex_counting_owner: self
-                    .files
-                    .get(&key)
-                    .and_then(|entry| entry.codex_counting_owner.clone()),
-                opened_changed_nanos: candidate.fingerprint_changed_nanos,
-                opened_birth_nanos: candidate.fingerprint_birth_nanos,
-                upload_context_receipt: self
-                    .files
-                    .get(&key)
-                    .and_then(|entry| entry.upload_context_receipt.clone()),
-                evidence_owed: false,
-            },
+        // The body witness and `codex_counting_v2` are carried; a configured
+        // singleton parse then sets the latter to that parse's decided version.
+        let entry = self.carried(
+            &key,
+            candidate,
+            last_snapshot_fingerprint,
+            scan_identity_version,
+            false,
         );
+        self.files.insert(key.clone(), entry);
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
                 self.claude_copy_removals

@@ -501,20 +501,8 @@ fn claude_prior_history(
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
-        // An unreadable directory fails closed; a missing one is empty.
-        let holds_claude_state = |directory: &Path| {
-            Some(directory) != own
-                && match std::fs::read_dir(directory) {
-                    Ok(mut entries) => entries.any(|entry| match entry {
-                        Ok(entry) => entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name.starts_with(&prefix)),
-                        Err(_) => true,
-                    }),
-                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-                }
-        };
+        let holds_claude_state =
+            |directory: &Path| Some(directory) != own && dir_holds_prefixed(directory, &prefix);
         match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
             Ok(mut destinations) => destinations.any(|destination| match destination {
                 Ok(destination) => holds_claude_state(&destination.path()),
@@ -553,20 +541,12 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
-    // A pre-scoping daemon's unscoped index. An unreadable
-    // directory fails closed; a missing one is empty.
+    // A pre-scoping daemon's unscoped index.
     let unscoped_legacy_index = || {
-        let prefix = format!("{slug}-scan-index");
-        match std::fs::read_dir(support_dir.join("snapshots")) {
-            Ok(mut entries) => entries.any(|entry| match entry {
-                Ok(entry) => entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix)),
-                Err(_) => true,
-            }),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
+        dir_holds_prefixed(
+            &support_dir.join("snapshots"),
+            &format!("{slug}-scan-index"),
+        )
     };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
@@ -574,6 +554,21 @@ fn claude_prior_history(
         PriorHistory::Here
     } else {
         PriorHistory::None
+    }
+}
+
+/// True when `directory` holds an entry named `{prefix}*`. An unreadable
+/// directory or entry fails closed; a missing directory is empty.
+fn dir_holds_prefixed(directory: &Path, prefix: &str) -> bool {
+    match std::fs::read_dir(directory) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix)),
+            Err(_) => true,
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -6598,17 +6593,11 @@ fn prepare_sync_source_inner(
         activity_hint.local_usage_reconciliation_enabled,
     );
     if receipt_window_days == 0 {
-        let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
-        withdraw_source_manifest(&destination_namespace, source);
-        let _ =
-            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
-        report_status_with_fresh_relay_token(
+        withdraw_and_report_policy_stop(
             client,
             device,
             device_secret,
             support_dir,
-            source,
-            TerminalManifestSource::Withdraw,
             CollectorStatus {
                 source,
                 machine_id,
@@ -6616,7 +6605,6 @@ fn prepare_sync_source_inner(
                 counts: SyncCounts::for_policy(0),
                 state: CollectorState::PolicyTombstone,
             },
-            None,
         )?;
         return Ok(None);
     }
@@ -6650,19 +6638,11 @@ fn prepare_sync_source_inner(
     // re-POST unchanged inventories 12×/hour. See `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
-        withdraw_source_manifest(
-            &snapshot_upload_destination_namespace(device, device_secret),
-            source,
-        );
-        let _ =
-            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
-        report_status_with_fresh_relay_token(
+        withdraw_and_report_policy_stop(
             client,
             device,
             device_secret,
             support_dir,
-            source,
-            TerminalManifestSource::Withdraw,
             CollectorStatus {
                 source,
                 machine_id,
@@ -6670,7 +6650,6 @@ fn prepare_sync_source_inner(
                 counts: SyncCounts::for_policy(receipt_window_days),
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
-            None,
         )?;
         return Ok(None);
     }
@@ -12441,6 +12420,34 @@ fn report_status_with_fresh_relay_token(
     }
     client.report_status(&relay_token, &request)?;
     Ok(())
+}
+
+/// A policy stop before scanning: withdraw this source's manifest, clear its
+/// active sessions, then report `status` with the manifest withdrawn.
+fn withdraw_and_report_policy_stop(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    support_dir: &Path,
+    status: CollectorStatus<'_>,
+) -> Result<()> {
+    let source = status.source;
+    withdraw_source_manifest(
+        &snapshot_upload_destination_namespace(device, device_secret),
+        source,
+    );
+    let _ =
+        crate::active_sessions::clear_active_sessions(support_dir, source, status.scan_started_at);
+    report_status_with_fresh_relay_token(
+        client,
+        device,
+        device_secret,
+        support_dir,
+        source,
+        TerminalManifestSource::Withdraw,
+        status,
+        None,
+    )
 }
 
 /// Post a non-terminal collector check-in receipt.
