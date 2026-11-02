@@ -81,11 +81,6 @@ impl CachedJsonlReduction {
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
-    /// The copy's source.
-    #[cfg(test)]
-    pub(super) fn source(&self) -> SnapshotSource {
-        self.accumulator.source
-    }
     /// The borrowed PRE-finalization fields, for tests.
     #[cfg(test)]
     pub(super) fn finish_view(

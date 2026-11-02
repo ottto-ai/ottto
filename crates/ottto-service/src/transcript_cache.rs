@@ -352,11 +352,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .get(key)
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
-    /// Borrow resident keys under the existing retained lock (at most CACHE_ENTRIES).
-    #[cfg(test)]
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
-        self.entries.keys()
-    }
     /// A retained entry without taking it (the durable write after an index
     /// save encodes it in place under the retained lock; deletion diagnostics).
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {

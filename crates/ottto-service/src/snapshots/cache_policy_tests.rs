@@ -159,7 +159,7 @@ impl Drop for ScanFixture {
 /// as `transcript_acquisition_tests::acquire` builds one. Its checkpoint
 /// carries the file's current mtime as its eviction rank.
 fn retained_reduction(fixture: &ScanFixture) -> Retained<sampled_jsonl::CachedJsonlReduction> {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::ClaudeCode;
     let mut file = File::open(&fixture.path).unwrap();
     opened_object_identity(source, &mut file).unwrap();
     let metadata = CodexTitleMetadata::default();
@@ -331,7 +331,7 @@ fn filler_key(number: usize) -> String {
 /// The charge one retained reduction of a `records`-response file adds to an
 /// empty shared cache. Its lifecycle events are kept out of any caller's.
 fn filler_charge_for(records: usize) -> usize {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::ClaudeCode;
     let filler = ScanFixture::new(source);
     filler.append_usage(source, 0..records);
     observe(|| {
@@ -387,7 +387,7 @@ fn filler_records() -> usize {
 /// Insert `FILLERS` real retained reductions of one `filler_records` file
 /// under unrelated keys, as #653 T3 does. `modified` pins the fillers' rank.
 fn insert_fillers(cache: &Arc<sampled_scan::SharedCache>, modified: Option<u64>) {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::ClaudeCode;
     let filler = ScanFixture::new(source);
     filler.append_usage(source, 0..filler_records());
     if let Some(modified) = modified {
@@ -1133,8 +1133,8 @@ fn m_a_tail_with(
         ..
     } = full_cache_in(source, false, Some(fillers_modified));
     for (key, modified) in extra {
-        let entry = ScanFixture::new(SnapshotSource::Codex);
-        entry.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
+        let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
+        entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
         entry.set_modified(*modified);
         let retained = retained_reduction(&entry);
         assert!(
@@ -1485,15 +1485,16 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
-    for source in [SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         for grew in [false, true] {
             for idle_modified in [now - OLD_SECONDS, file_modified, newer_modified] {
                 let releases =
                     grew && idle_modified < file_modified && source == SnapshotSource::ClaudeCode;
                 let label = format!("{source:?} grew={grew} idle_modified={idle_modified}");
                 let cache = Arc::new(sampled_scan::SharedCache::default());
-                let idle = ScanFixture::new(SnapshotSource::Codex);
-                idle.append_usage(SnapshotSource::Codex, 0..filler_records() / 10);
+                let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
+                idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
                 idle.set_modified(idle_modified);
                 let mut residents_inserted = 0;
                 observe(|| {
@@ -1513,8 +1514,8 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
                     ("cache-policy-equal", file_modified),
                     ("cache-policy-newer", newer_modified),
                 ] {
-                    let entry = ScanFixture::new(SnapshotSource::Codex);
-                    entry.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
+                    let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
+                    entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
                     entry.set_modified(modified);
                     let retained = retained_reduction(&entry);
                     assert!(

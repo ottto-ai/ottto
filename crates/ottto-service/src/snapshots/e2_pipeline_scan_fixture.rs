@@ -36,18 +36,24 @@ pub(crate) fn routed_for_test(
     dir: &Path,
 ) -> ScanIndex {
     let on = route_of(&index);
+    // The runtime-only paused list a sync cycle reloads onto every index.
+    let exclusions = index.claude_reemission_exclusions.clone();
+    let carry = |mut loaded: ScanIndex| {
+        loaded.claude_reemission_exclusions = exclusions.clone();
+        loaded
+    };
     let mut own = cache.test_route.lock().unwrap();
     if let Some(route) = own.as_ref() {
         if route.caller_commits {
             return match on {
                 Some(_) => index,
-                None => ScanIndex::load(&route.path).unwrap(),
+                None => carry(ScanIndex::load(&route.path).unwrap()),
             };
         }
         if on.as_deref() == Some(route.path.as_path()) {
             let mut page = index.clone();
             if page.save(&route.path).is_ok() {
-                return ScanIndex::load(&route.path).unwrap();
+                return carry(ScanIndex::load(&route.path).unwrap());
             }
         }
     }
@@ -77,7 +83,7 @@ pub(crate) fn routed_for_test(
         path,
         caller_commits: false,
     });
-    cold
+    carry(cold)
 }
 
 /// A scan fixture's Claude page continues from its owner's route. Other
@@ -110,6 +116,9 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
     index.save(&route).unwrap();
     let mut copy = state_v2::money_test_support::resident(index);
     copy.v2_mut().persistence_v2 = None;
+    // A fresh copy each save: its generation is the route's, not this file's.
+    let _ = fs::remove_file(path);
+    copy.generation = 0;
     copy.save(path).unwrap();
 }
 
