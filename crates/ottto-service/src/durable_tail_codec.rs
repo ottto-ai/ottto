@@ -11,6 +11,12 @@
 //! - `L` a provider-minted opaque id (request, response, message, tool-use,
 //!   call or MCP call id). Persisted only in the local 0600 durable-tail store;
 //!   never logged, never in diagnostics or counters, never uploaded from it;
+//! - `PL` private local literal: exactly the uploaded wire value, or the
+//!   explicitly approved bounded native state from which that upload is derived
+//!   (PL-retained). Consent-gated; never stored while consent is off and purged
+//!   at the next save on revocation. Dropped on identity failure and erased with
+//!   its record. Never exposed in logs, diagnostics, status, support bundles or
+//!   error text; single use, restoring only the same approved upload/state.
 //! - `X` content (text, paths). Never encoded. Restored by re-derivation from
 //!   the file itself and verified by hash, else the entry reads in Full;
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
@@ -30,6 +36,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +49,8 @@ pub(crate) enum Refuse {
     UnknownLabel,
     /// The encoded body outgrew the record cap.
     TooLarge,
+    /// The output sink could not accept the encoded bytes.
+    WriteFailed,
     /// An `X` field cannot be re-derived from the file under the bound.
     NotRederivable(&'static str),
     /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
@@ -53,24 +62,86 @@ pub(crate) enum Refuse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Corrupt;
 
-enum Sink {
-    Bytes { out: Vec<u8>, limit: usize },
+/// Resource refusal never authorizes corrupt-record recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeFailure {
+    Integrity,
+    Budget,
+}
+
+enum Sink<'a> {
+    Write {
+        out: &'a mut dyn Write,
+        len: usize,
+        limit: usize,
+    },
+    Bytes {
+        out: Vec<u8>,
+        limit: usize,
+    },
+    Count {
+        len: usize,
+        limit: usize,
+    },
     Hash(Box<Sha256>),
 }
 
 /// Encoder. In hash mode it also feeds `X` fields, so a re-derived value can
 /// be checked against the digest without storing it.
-pub(crate) struct Enc {
-    sink: Sink,
+pub(crate) struct Enc<'a> {
+    sink: Sink<'a>,
 }
 
-impl Enc {
+impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             sink: Sink::Bytes {
-                out: Vec::new(),
+                out: Vec::with_capacity(limit),
                 limit,
             },
+        }
+    }
+    /// Count and emit through the same field walk. The body allocation is
+    /// exact and only happens after every admission/size check succeeds.
+    pub(crate) fn count_write(
+        limit: usize,
+        put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
+    ) -> Result<Vec<u8>, Refuse> {
+        let mut count = Enc::count(limit);
+        put(&mut count)?;
+        let len = count.counted();
+        let mut out = Vec::with_capacity(len);
+        let mut writer = Enc::writer(&mut out, len);
+        put(&mut writer)?;
+        writer.finish_written()?;
+        Ok(out)
+    }
+    /// Borrow a sink after counting. Both overrun and underrun refuse the record.
+    pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
+        Self {
+            sink: Sink::Write {
+                out,
+                len: 0,
+                limit: exact_len,
+            },
+        }
+    }
+    pub(crate) fn finish_written(self) -> Result<usize, Refuse> {
+        match self.sink {
+            Sink::Write { len, limit, .. } if len == limit => Ok(len),
+            Sink::Write { .. } => Err(Refuse::WriteFailed),
+            _ => unreachable!("only a writer has an emitted length"),
+        }
+    }
+    pub(crate) fn count(limit: usize) -> Self {
+        Self {
+            sink: Sink::Count { len: 0, limit },
+        }
+    }
+    pub(crate) fn counted(&self) -> usize {
+        match &self.sink {
+            Sink::Count { len, .. } => *len,
+            _ => unreachable!("only a count sink has a counted length"),
         }
     }
     pub(crate) fn hash(domain: &str) -> Self {
@@ -84,16 +155,25 @@ impl Enc {
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
     }
-    /// Bytes written so far; `None` in hash mode. Tests only.
+    /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
-            Sink::Hash(_) => None,
+            Sink::Write { len, .. } => Some(*len),
+            Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
         match &mut self.sink {
+            Sink::Write { out, len, limit } => {
+                let end = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if end > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+                out.write_all(bytes).map_err(|_| Refuse::WriteFailed)?;
+                *len = end;
+            }
             Sink::Bytes { out, limit } => {
                 if out.len().saturating_add(bytes.len()) > *limit {
                     return Err(Refuse::TooLarge);
@@ -101,6 +181,12 @@ impl Enc {
                 out.extend_from_slice(bytes);
             }
             Sink::Hash(hasher) => hasher.update(bytes),
+            Sink::Count { len, limit } => {
+                *len = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if *len > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+            }
         }
         Ok(())
     }
@@ -128,7 +214,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } | Sink::Write { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -136,6 +222,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
+            Sink::Count { .. } | Sink::Write { .. } => unreachable!("sink is not hashing"),
         }
     }
 }
@@ -144,11 +231,57 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     bytes: &'a [u8],
     at: usize,
+    allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
+    refused: bool,
+    pl_labels_nonempty: bool,
 }
 
 impl<'a> Dec<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            allowance: None,
+            refused: false,
+            pl_labels_nonempty: false,
+        }
+    }
+    pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            allowance: Some(allowance),
+            refused: false,
+            pl_labels_nonempty: false,
+        }
+    }
+    fn reserve(&mut self, bytes: Option<usize>) -> Result<(), Corrupt> {
+        if self.allowance.is_none() {
+            return Ok(());
+        }
+        let granted = bytes
+            .and_then(|n| u64::try_from(n).ok())
+            .is_some_and(|n| self.allowance.as_mut().is_some_and(|grant| grant(n)));
+        self.refused |= !granted;
+        granted.then_some(()).ok_or(Corrupt)
+    }
+    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(len.checked_mul(std::mem::size_of::<T>()))
+    }
+    pub(crate) fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(
+            len.checked_add(1)
+                .and_then(|n| n.checked_mul(crate::heap_layout_bound::tree_node_bytes::<K, V>()?)),
+        )
+    }
+    pub(crate) fn outcome<T>(&self, value: Result<T, Corrupt>) -> Result<T, DecodeFailure> {
+        value.map_err(|_| {
+            if self.refused {
+                DecodeFailure::Budget
+            } else {
+                DecodeFailure::Integrity
+            }
+        })
     }
     pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8], Corrupt> {
         let end = self.at.checked_add(len).ok_or(Corrupt)?;
@@ -185,6 +318,25 @@ impl<'a> Dec<'a> {
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
+    }
+    /// Check the field bound and UTF-8 before requesting allocation credit.
+    pub(crate) fn bounded_text(&mut self, cap: usize) -> Result<String, Corrupt> {
+        let bytes = self.bounded_text_bytes(cap)?;
+        self.slots::<u8>(bytes.len())?;
+        Ok(bytes.to_owned())
+    }
+    pub(crate) fn bounded_text_bytes(&mut self, cap: usize) -> Result<&'a str, Corrupt> {
+        let len = self.take_len()?;
+        if len > cap {
+            return Err(Corrupt);
+        }
+        std::str::from_utf8(self.raw(len)?).map_err(|_| Corrupt)
+    }
+    pub(crate) fn note_pl_labels(&mut self, len: usize) {
+        self.pl_labels_nonempty |= len != 0;
+    }
+    pub(crate) fn has_pl_labels(&self) -> bool {
+        self.pl_labels_nonempty
     }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
@@ -239,6 +391,24 @@ pub(crate) trait Durable: Sized {
     fn shape(s: &mut Shape);
 }
 
+/// Only private literal wrappers implement this class. In particular, ordinary
+/// String and arbitrary Durable values cannot be labelled PL by the macro.
+/// Each use still needs its field-specific consent, lifetime and single-use rule.
+pub(crate) trait PlLiteral: Durable {
+    fn put_pl(&self, e: &mut Enc, _path: &'static str) -> Result<(), Refuse> {
+        self.put(e)
+    }
+    fn take_pl(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        Self::take(d)
+    }
+    fn verify_pl(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::verify(d)
+    }
+    fn shape_pl(s: &mut Shape) {
+        Self::shape(s);
+    }
+}
+
 /// `H` is a type, not a label: only fixed 32-byte values (a raw
 /// `[u8; 32]`, or exactly 64 lower-case hex text, stored as its 32 bytes)
 /// and collections of them implement this, so a non-cryptographic digest
@@ -288,10 +458,15 @@ impl HDigest for String {
         e.raw(&bytes)
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Ok(d.raw(32)?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        let bytes = d.raw(32)?;
+        d.slots::<u8>(64)?;
+        let mut out = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        Ok(out)
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         d.raw(32).map(|_| ())
@@ -343,6 +518,7 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take_h(d)?) {
@@ -380,6 +556,7 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take_h(d)?);
@@ -497,10 +674,8 @@ fn verify_entries<'a, K: Ord>(
             sorted &= p < &current;
         }
         if !sorted {
-            let mut earlier = Dec {
-                bytes: d.bytes,
-                at: start,
-            };
+            let mut earlier = Dec::new(d.bytes);
+            earlier.at = start;
             for _ in 0..i {
                 if key(&mut earlier)? == current {
                     return Err(Corrupt);
@@ -701,6 +876,7 @@ impl Durable for String {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let bytes = d.len_prefixed()?;
+        d.slots::<u8>(bytes.len())?;
         std::str::from_utf8(bytes)
             .map(str::to_string)
             .map_err(|_| Corrupt)
@@ -732,7 +908,9 @@ impl Durable for std::path::PathBuf {
         e.len_prefixed(self.as_os_str().as_encoded_bytes())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        String::take(d).map(Self::from)
+        let value = String::take(d)?;
+        d.slots::<u8>(value.len())?; // Conservative conversion overlap, including non-Unix.
+        Ok(Self::from(value))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         String::verify(d)
@@ -823,6 +1001,7 @@ impl<T: Durable> Durable for Box<T> {
         (**self).put(e)
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(1)?;
         T::take(d).map(Box::new)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
@@ -851,6 +1030,7 @@ impl<T: Durable> Durable for Vec<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take(d)?);
@@ -877,7 +1057,10 @@ impl<T: Durable> Durable for VecDeque<T> {
         put_seq(e, self.len(), self.iter())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Vec::<T>::take(d).map(VecDeque::from)
+        let values = Vec::<T>::take(d)?;
+        // Fund both allocations even if the native conversion transfers storage.
+        d.slots::<T>(values.capacity())?;
+        Ok(VecDeque::from(values))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         Vec::<T>::verify(d)
@@ -897,6 +1080,7 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
         Ok(())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(N)?;
         let mut out = Vec::with_capacity(N);
         for _ in 0..N {
             out.push(T::take(d)?);
@@ -921,6 +1105,7 @@ impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take(d)?) {
@@ -963,6 +1148,7 @@ impl<K: DurableKey + Ord, V: Durable> Durable for BTreeMap<K, V> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = BTreeMap::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1023,6 +1209,7 @@ where
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = Self::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1109,6 +1296,10 @@ macro_rules! durable_field {
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put PL, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::PlLiteral::put_pl(value, $e, $path)?;
+    }};
     (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
         #[cfg(test)]
@@ -1147,6 +1338,9 @@ macro_rules! durable_field {
     (take U, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take PL, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::PlLiteral>::take_pl($d)?
+    };
     (take L, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
@@ -1159,6 +1353,7 @@ macro_rules! durable_field {
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
+    (verify PL, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::PlLiteral>::verify_pl($d)? };
     (verify H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigest>::verify_h($d)? };
     (verify X, $d:ident, $ty:ty) => {};
     (verify E, $d:ident, $ty:ty) => {};
@@ -1169,6 +1364,8 @@ macro_rules! durable_field {
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
+    (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL fields cannot appear in durable keys") };
+    (key PL, $d:ident, $ty:ty) => { compile_error!("PL fields cannot appear in durable keys") };
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
@@ -1179,6 +1376,10 @@ macro_rules! durable_field {
     (key_type $c:ident, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<$lt> };
     (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
     (key $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::key($d)? };
+    (shape PL, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("PL ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::PlLiteral>::shape_pl($s);
+    }};
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
@@ -1464,7 +1665,188 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// [format] count write matches bytes and refuses before output.
+    #[test]
+    fn count_write_matches_bytes_and_refuses_before_output() {
+        let put = |e: &mut Enc<'_>| {
+            e.varint(300)?;
+            e.len_prefixed(b"synthetic")
+        };
+        let mut legacy = Enc::bytes(64);
+        put(&mut legacy).unwrap();
+        let expected = legacy.into_bytes();
+        let actual = Enc::count_write(expected.len(), put).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            Enc::count_write(expected.len() - 1, |e| {
+                calls.set(calls.get() + 1);
+                put(e)
+            }),
+            Err(Refuse::TooLarge)
+        );
+        assert_eq!(calls.get(), 1, "count refusal never starts the output pass");
+    }
+
+    /// [format] write sink handles short writes limits and io errors.
+    #[test]
+    fn write_sink_handles_short_writes_limits_and_io_errors() {
+        struct Short(Vec<u8>);
+        impl std::io::Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(1);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Short(Vec::new());
+        {
+            let mut e = Enc {
+                sink: Sink::Write {
+                    out: &mut out,
+                    len: 0,
+                    limit: 3,
+                },
+            };
+            e.raw(b"abc").unwrap();
+            assert_eq!(e.position(), Some(3));
+            assert_eq!(e.raw(b"d"), Err(Refuse::TooLarge));
+        }
+        assert_eq!(out.0, b"abc");
+        let mut empty = &mut [][..];
+        let mut e = Enc {
+            sink: Sink::Write {
+                out: &mut empty,
+                len: 0,
+                limit: 1,
+            },
+        };
+        assert_eq!(e.raw(b"x"), Err(Refuse::WriteFailed));
+        assert_eq!(e.position(), Some(0));
+    }
     use super::*;
+
+    // Direct codec fixtures: the actual allocator proves the first refused
+    // constructor allocates nothing; paid successful peaks include overlap.
+    fn budget_probe<T>(bytes: &[u8], take: fn(&mut Dec<'_>) -> Result<T, Corrupt>) {
+        let mut calls = 0;
+        let mut paid = 0u64;
+        let mut grant = |bytes: u64| {
+            calls += 1;
+            paid = paid.checked_add(bytes).unwrap();
+            true
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert_eq!(d.remaining(), 0);
+            d.outcome(result)
+        });
+        assert!(result.is_ok());
+        drop(result);
+        assert!(calls > 0, "allocation hook missing");
+        assert!(
+            stats.requested_peak_with_overlap as u64 <= paid,
+            "{stats:?}, paid={paid}"
+        );
+        let mut refused = 0;
+        let mut deny = |_: u64| {
+            refused += 1;
+            false
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut deny);
+            let result = take(&mut d);
+            d.outcome(result)
+        });
+        assert!(matches!(result, Err(DecodeFailure::Budget)));
+        assert_eq!(refused, 1);
+        assert_eq!(
+            stats.allocations, 0,
+            "allocation before allowance: {stats:?}"
+        );
+        // Stop at each later hook too; already-funded children must be dropped.
+        for cutoff in 1..calls {
+            let mut seen = 0;
+            let mut grant = |_: u64| {
+                seen += 1;
+                seen <= cutoff
+            };
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert!(matches!(d.outcome(result), Err(DecodeFailure::Budget)));
+            assert_eq!(seen, cutoff + 1);
+        }
+    }
+    fn budget_round<T: Durable>(value: T) {
+        let mut e = Enc::bytes(1 << 20);
+        value.put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), T::take);
+    }
+    /// [format] bounded decode funds every scalar sequence ordered and owned constructor.
+    #[test]
+    fn bounded_decode_funds_every_scalar_sequence_ordered_and_owned_constructor() {
+        budget_round(String::from("scalar"));
+        budget_round(Box::new(String::from("boxed")));
+        budget_round(vec![String::from("one"), String::from("two")]);
+        budget_round(VecDeque::from([String::from("deque")]));
+        budget_round([String::from("array")]);
+        budget_round(BTreeSet::from([String::from("set")]));
+        budget_round(BTreeMap::from([(
+            String::from("key"),
+            String::from("value"),
+        )]));
+        budget_round(crate::owned_heap::OwnedVec::from(vec![String::from(
+            "owned",
+        )]));
+        let mut map = crate::owned_heap::OwnedMap::new();
+        map.insert(String::from("key"), String::from("owned value"));
+        budget_round(map);
+        let digest = "ab".repeat(32);
+        let mut e = Enc::bytes(1 << 20);
+        <String as HDigest>::put_h(&digest, &mut e, "fixture").unwrap();
+        budget_probe(&e.into_bytes(), <String as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <BTreeSet<String> as HDigest>::put_h(&BTreeSet::from([digest.clone()]), &mut e, "fixture")
+            .unwrap();
+        budget_probe(&e.into_bytes(), <BTreeSet<String> as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <crate::owned_heap::OwnedVec<String> as HDigest>::put_h(
+            &crate::owned_heap::OwnedVec::from(vec![digest]),
+            &mut e,
+            "fixture",
+        )
+        .unwrap();
+        budget_probe(
+            &e.into_bytes(),
+            <crate::owned_heap::OwnedVec<String> as HDigest>::take_h,
+        );
+        // PathBuf is never persisted as X, but its trait conversion is funded.
+        let mut e = Enc::bytes(32);
+        String::from("path").put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), std::path::PathBuf::take);
+    }
+    /// [format] bounded decode keeps integrity distinct and checks budget arithmetic.
+    #[test]
+    fn bounded_decode_keeps_integrity_distinct_and_checks_budget_arithmetic() {
+        let mut deny = |_: u64| false;
+        let mut d = Dec::bounded(&[2], &mut deny);
+        let result = bool::take(&mut d);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Integrity));
+        let mut d = Dec::bounded(&[7], &mut deny);
+        assert_eq!(u64::take(&mut d), Ok(7)); // Inline scalar needs no heap.
+        let mut d = Dec::bounded(&[], &mut deny);
+        let result = d.tree::<u128, u128>(usize::MAX);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Budget));
+        let mut d = Dec::bounded(&[127], &mut deny);
+        let result = Vec::<String>::take(&mut d);
+        assert!(matches!(d.outcome(result), Err(DecodeFailure::Integrity)));
+    }
 
     fn round_bytes<T: Durable>(value: T) {
         let mut e = Enc::bytes(1 << 20);

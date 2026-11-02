@@ -1333,6 +1333,7 @@ impl ClaudeRequestCensus {
         &mut self,
         files: &SharedMap<String, ScanIndexEntry>,
         cutoff: u64,
+        held: &dyn Fn(&str) -> bool,
         fits: &dyn Fn(usize, usize) -> bool,
         all_or_none: bool,
         excluded: &dyn Fn(&str) -> bool,
@@ -1348,7 +1349,8 @@ impl ClaudeRequestCensus {
                 )
                 && memo.suspects.iter().all(|key| {
                     self.records.get(key).map_or(true, |record| {
-                        excluded(key)
+                        held(key)
+                            || excluded(key)
                             || transcript_retirement_age(files, cutoff, key, record).is_none()
                     })
                 })
@@ -1373,7 +1375,7 @@ impl ClaudeRequestCensus {
             if all_or_none && excluded && age.is_some() {
                 crate::local_resource_diagnostics::census_retire_skipped_grown();
             }
-            let modified = age.filter(|_| !excluded);
+            let modified = age.filter(|_| !held(key) && !excluded);
             let Some(modified) = modified else {
                 suspects = suspects
                     .filter(|suspects: &Vec<String>| suspects.len() < MAX_RELEASE_MEMO_SUSPECTS)
@@ -2883,6 +2885,8 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) index_key: &'a str,
     pub(crate) source_file_fingerprint: &'a str,
     pub(crate) census_window_end: &'a str,
+    /// This page's residue: unread growth its aged records still answer for.
+    pub(crate) held_index_keys: &'a BTreeSet<String>,
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
@@ -3020,7 +3024,13 @@ pub(crate) fn record_claude_request_census(
             record.retire();
         }
     }
-    let _ = insert_transcript_record(index, parse.index_key, record, window);
+    let _ = insert_transcript_record(
+        index,
+        parse.index_key,
+        record,
+        window,
+        parse.held_index_keys,
+    );
     if let Some(stored) = index.claude_request_census.get(parse.index_key) {
         note_identity_incomplete_hold(
             !was_held && stored.identity_incomplete_hold(),
@@ -3039,6 +3049,31 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A2 metadata proof for the currently opened object, independent of optional
+/// RAM/disk restore. A verified census must bind the exact committed fingerprint,
+/// mtime and physical object. Missing/stale/unknown evidence grants nothing.
+pub(super) fn proves_indexed_shrink(
+    index: &ScanIndex,
+    key: &str,
+    length: u64,
+    physical: Option<[u64; 2]>,
+) -> bool {
+    let (Some(record), Some(entry)) = (index.claude_request_census.get(key), index.files.get(key))
+    else {
+        return false;
+    };
+    length < entry.size_bytes
+        && !record.unverified
+        && !record.is_birth_stub()
+        && !entry.source_file_fingerprint.is_empty()
+        && decode_fingerprint(&entry.source_file_fingerprint)
+            == Some(record.source_file_fingerprint)
+        && record.modified == Some(entry.modified_unix_seconds)
+        && record
+            .birth
+            .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
+}
+
 /// Stores a transcript parse's record. E7 stopgap (#920 round 3): a record
 /// that does not fit whole first releases what the retirement rule would
 /// retire at this window (`release_aged`), counted as admission overflow.
@@ -3054,6 +3089,7 @@ fn insert_transcript_record(
     key: &str,
     record: ClaudeRequestCensusRecord,
     window: u64,
+    page_held: &BTreeSet<String>,
 ) -> ClaudeRequestCensusInsert {
     let census = &index.claude_request_census;
     if census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
@@ -3085,6 +3121,18 @@ fn insert_transcript_record(
         if window > 0 {
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
+            let held = |key: &str| {
+                super::restart_restore::enabled()
+                    && (page_held.contains(key)
+                        || index
+                            .traversal
+                            .as_ref()
+                            .is_some_and(|walk| walk.residue.index_keys.contains(key))
+                        || index
+                            .scan_residue_witness
+                            .as_ref()
+                            .is_some_and(|witness| witness.index_keys.contains(key)))
+            };
             let excluded = |key: &str| {
                 active
                     && super::sampled_audit::growth_excluded_parts(
@@ -3095,7 +3143,7 @@ fn insert_transcript_record(
                     )
             };
             released = census
-                .release_aged(&index.files, cutoff, fits, true, &excluded)
+                .release_aged(&index.files, cutoff, &held, fits, true, &excluded)
                 .0;
         }
     });
@@ -3401,14 +3449,20 @@ fn retire_claude_transcript_records_excluding(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
-    let excluded = |key: &str| {
+    let held = |key: &str| {
+        super::restart_restore::enabled() && terminal_residue.is_some_and(|held| held.contains(key))
+    };
+    let growth_excluded = |key: &str| {
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
     };
+    let excluded = |key: &str| held(key) || growth_excluded(key);
     let files = &index.files;
     let census = &mut owned_census;
     if active {
         for (key, record) in &census.records {
-            if excluded(key) && transcript_retirement_age(files, cutoff, key, record).is_some() {
+            if growth_excluded(key)
+                && transcript_retirement_age(files, cutoff, key, record).is_some()
+            {
                 crate::local_resource_diagnostics::census_retire_skipped_grown();
             }
         }
@@ -3460,15 +3514,16 @@ fn retire_claude_transcript_records_excluding(
     // Above 90% occupancy, the kept records (now the only unretired aged
     // ones) retire oldest first until it is back at 90%.
     let excluded_charge = if active {
-        census.records.iter().filter(|(key, _)| excluded(key)).fold(
-            (0_usize, 0_usize),
-            |(hashes, bytes), (key, record)| {
+        census
+            .records
+            .iter()
+            .filter(|(key, _)| growth_excluded(key))
+            .fold((0_usize, 0_usize), |(hashes, bytes), (key, record)| {
                 (
                     hashes + record.hash_count(),
                     bytes + entry_serialized_bytes(key, record),
                 )
-            },
-        )
+            })
     } else {
         (0, 0)
     };
@@ -3479,7 +3534,8 @@ fn retire_claude_transcript_records_excluding(
         )
     };
     if retirement.kept_overlap_records > 0 && !fits(census.hash_total, census.serialized_total) {
-        let (records, hashes) = census.release_aged(files, cutoff, &fits, false, &excluded);
+        let (records, hashes) =
+            census.release_aged(files, cutoff, &held, &fits, false, &growth_excluded);
         retirement.overflow_occupancy = records;
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;
@@ -4167,7 +4223,18 @@ impl ScanIndex {
         record: ClaudeRequestCensusRecord,
         window: u64,
     ) -> ClaudeRequestCensusInsert {
-        insert_transcript_record(self, key, record, window)
+        insert_transcript_record(self, key, record, window, &BTreeSet::new())
+    }
+
+    /// The same insert with this page's residue held.
+    pub(crate) fn insert_held_transcript_record_for_test(
+        &mut self,
+        key: &str,
+        record: ClaudeRequestCensusRecord,
+        window: u64,
+        page_held: &BTreeSet<String>,
+    ) -> ClaudeRequestCensusInsert {
+        insert_transcript_record(self, key, record, window, page_held)
     }
 
     /// The terminal's production retirement step alone: (aged, kept records,
