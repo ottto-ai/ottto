@@ -19,7 +19,9 @@ use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-const WARM_CAP: usize = 12;
+/// Warm and cold run until a pass reads nothing (0 Full, 0 Tail); a fresh
+/// index needs its first Full plus the identity contract's one re-read.
+const WARM_CAP: usize = 24;
 const GROWTH_PAGES: u64 = 6;
 
 fn report(arm: &str, mut row: Value) {
@@ -86,7 +88,7 @@ struct Lane {
 }
 
 impl Lane {
-    /// One daemon pass: begin, scan, finish, upload with ACK, commit.
+    /// One daemon pass: begin, scan, finish, upload with ACK, settle, commit.
     fn pass(&mut self, c: &Corpus, run: &Path) -> Value {
         let (source, claude) = (self.source, self.source == SnapshotSource::ClaudeCode);
         let scope = crate::transcript_acquisition::Scope("on-proof".into());
@@ -113,9 +115,10 @@ impl Lane {
             index.adopt_effective_upload_body_witness_revision_monotonically();
             index.load_claude_reemission_exclusions(&c.support);
         }
-        let (((mut index, scan, wires), records), high) = peak(|| {
+        let (((mut index, scan, wires, rejected, upload_failed), records), high) = peak(|| {
             crate::local_resource_diagnostics::capture(|| {
-                let committed = claude.then(|| index.clone());
+                // The page's prior: settlement reads it as production does.
+                let committed = index.clone();
                 let owned = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
                     source,
                     &roots,
@@ -134,7 +137,7 @@ impl Lane {
                 )
                 .with_sampled_acquisition(cache.clone(), scope.clone());
                 let (mut index, mut scan, modes, _) = native_cold::scan(owned, usize::MAX);
-                if let Some(committed) = committed {
+                if claude {
                     let mut page = Page {
                         cache: cache.clone(),
                         committed,
@@ -146,13 +149,21 @@ impl Lane {
                         unhealthy: Default::default(),
                     };
                     page.enrich(c);
-                    page.finish();
-                    let wires = if page.scan.snapshots.is_empty() {
-                        Vec::new()
-                    } else {
-                        upload(&page.scan.snapshots, &mut e2_progress(), ack).1
-                    };
-                    return (page.index, page.scan, wires);
+                    let holds = page.finish();
+                    let mut progress = e2_progress();
+                    let (wires, rejected, failed) = send(&page.scan.snapshots, &mut progress);
+                    if failed {
+                        // The daemon fails this cycle after a partial
+                        // checkpoint; keeping the prior index is stricter
+                        // (the next pass retries all of it) and is counted.
+                        return (page.committed, page.scan, wires, rejected, true);
+                    }
+                    // The Completed settlement, then the upload ledger fold.
+                    let mut index =
+                        settle_completed_upload(page.index, &page.committed, &progress, &holds)
+                            .index;
+                    settle_index_after_upload(&mut index, &page.committed, &progress);
+                    return (index, page.scan, wires, rejected, failed);
                 }
                 index.bind_session_accounts(
                     source,
@@ -163,38 +174,70 @@ impl Lane {
                 apply_upload_policy(source, &mut scan.snapshots, policy);
                 finalize_scan_after_policy(source, &mut scan, &mut index);
                 scan.finish_codex_capture_boundary(&mut index);
-                let wires = scan
+                let mut progress = SnapshotUploadProgress::new(
+                    format!("{:064x}", 99),
+                    snapshot_quarantine_witness(source),
+                );
+                let mut rejected = 0;
+                let wires: Vec<Vec<u8>> = scan
                     .snapshots
                     .chunks(crate::snapshot_sync::SNAPSHOT_BATCH_LIMIT)
-                    .map(|chunk| {
+                    .filter_map(|chunk| {
                         let mut wire = request(chunk);
                         wire.source = source.api_slug().into();
-                        validate_snapshot_batch_request(&wire).unwrap();
-                        canonical(&wire)
+                        if validate_snapshot_batch_request(&wire).is_err() {
+                            rejected += chunk.len();
+                            return None;
+                        }
+                        progress
+                            .accepted_fingerprints
+                            .extend(chunk.iter().map(|item| item.snapshot_fingerprint.clone()));
+                        Some(canonical(&wire))
                     })
                     .collect();
-                (index, scan, wires)
+                if rejected > 0 {
+                    // As above: a failed cycle keeps the prior index.
+                    return (committed, scan, wires, rejected, true);
+                }
+                // Production folds the ACKs into the index after every upload
+                // outcome; this clears settled Codex capture facts, without
+                // which those files re-parse (`codex_capture`) every pass.
+                settle_index_after_upload(&mut index, &committed, &progress);
+                (index, scan, wires, rejected, false)
             })
         });
-        // Bodies the fake server ACKed, keyed by entity as the money oracle is.
-        let sent: BTreeSet<String> = wires
+        // Bodies the fake server ACKed, keyed by entity as the money oracle
+        // is. Production upload coalesces items that share a fingerprint
+        // (first offer wins), so the wire, not the item list, is the emission.
+        let wire_items: Vec<Value> = wires
             .iter()
             .flat_map(|wire| {
-                let wire: Value = serde_json::from_slice(wire).unwrap();
-                wire["snapshots"].as_array().cloned().unwrap_or_default()
+                let mut wire: Value = serde_json::from_slice(wire).unwrap();
+                match wire["snapshots"].take() {
+                    Value::Array(items) => items,
+                    _ => Vec::new(),
+                }
             })
-            .filter_map(|item| item["snapshot_fingerprint"].as_str().map(str::to_owned))
             .collect();
-        let items: Vec<SnapshotItem> = scan
+        let sent: BTreeSet<&str> = wire_items
+            .iter()
+            .filter_map(|item| item["snapshot_fingerprint"].as_str())
+            .collect();
+        let coalesced = scan
             .snapshots
             .iter()
-            .filter(|item| sent.contains(&item.snapshot_fingerprint))
-            .cloned()
-            .collect();
-        let emitted = items.len();
-        self.bodies
-            .extend(RouteResult::emitted(Mode::Restart, source, wires, &items).snapshots);
-        index.record_accepted_snapshot_fingerprints(&sent);
+            .filter(|item| sent.contains(item.snapshot_fingerprint.as_str()))
+            .count()
+            .saturating_sub(sent.len());
+        let mut entities = BTreeSet::new();
+        let mut duplicate_entities = 0;
+        for item in &wire_items {
+            let entity = item["source_session_id"].as_str().unwrap_or_default();
+            duplicate_entities += usize::from(!entities.insert(entity.to_owned()));
+            self.bodies.insert(entity.to_owned(), item.clone());
+        }
+        let emitted = wire_items.len();
+        drop(wire_items);
         self.index = self.disk.commit(&cache, source, &mut index);
         drop(index);
         if source == SnapshotSource::Codex {
@@ -204,10 +247,24 @@ impl Lane {
         let steady = footprint();
         let (c1, s1) = cache.durable_counters(source).unwrap_or_default();
         let mut page = Value::Null;
+        let mut alarms = json!({});
         for record in &records {
-            if record["stage"] == "native_collection_page" && record["source"] == source.api_slug()
-            {
-                merge(&mut page, &record["counts"]);
+            if record["source"] != source.api_slug() {
+                continue;
+            }
+            match record["stage"].as_str() {
+                Some("native_collection_page") => merge(&mut page, &record["counts"]),
+                // Restore-path alarms, e.g. a restored graph whose prepare
+                // was refused (`returned_original_full.<reason>`).
+                Some(stage) if stage.starts_with("durable_tail") => merge(
+                    alarms
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(stage)
+                        .or_insert(Value::Null),
+                    &record["counts"],
+                ),
+                _ => {}
             }
         }
         let n = |value: &Value| value.as_u64().unwrap_or(0);
@@ -254,6 +311,9 @@ impl Lane {
                 "ineligible": ineligible,
                 "resource_full": resource_full,
             },
+            // prepare_started/prepare_failed, including restored graphs.
+            "acquisition_admission": read["acquisition_admission"],
+            "alarms": alarms,
             "read_bytes": native + guard + rederive + store_read,
             "native_bytes": native,
             "guard_bytes": guard,
@@ -266,10 +326,55 @@ impl Lane {
             "gc_records_deleted": s1.gc_records_deleted.saturating_sub(s0.gc_records_deleted),
             "not_persisted": delta(&c1.not_persisted, &c0.not_persisted),
             "emitted": emitted,
+            "coalesced_duplicates": coalesced,
+            "duplicate_entities": duplicate_entities,
+            "preflight_rejected": rejected,
+            "upload_failed": upload_failed,
             "footprint_peak": high,
             "footprint_steady": steady,
         })
     }
+}
+
+/// The fixture `upload` through the production resumable uploader and the
+/// fake ACK, except that a batch failing wire preflight is refused as the
+/// daemon refuses it (an error, counted) instead of panicking the arm.
+fn send(
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
+) -> (Vec<Vec<u8>>, usize, bool) {
+    let (mut wires, mut rejected, mut accepted) = (Vec::new(), 0, 0);
+    if items.is_empty() {
+        return (wires, rejected, false);
+    }
+    let result = upload_resumable_batches_with_literal_families(
+        items,
+        &unique_poison_scope(),
+        progress,
+        &mut accepted,
+        |s| s.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |s| Some(s.source_session_id.as_str()),
+        |_| false,
+        crate::snapshots::claude_request_money::request_owned_family_root,
+        &mut InplaceRetryBudget::default(),
+        |batch| {
+            let wire = request(&batch);
+            if let Err(reason) = validate_snapshot_batch_request(&wire) {
+                rejected += batch.len();
+                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                    reason,
+                }));
+            }
+            wires.push(canonical(&wire));
+            let owned = batch.iter().map(|s| (*s).clone()).collect::<Vec<_>>();
+            let response = ack(&owned)?;
+            response.validate_entity_ack(&wire)?;
+            Ok(response)
+        },
+        |_| Ok(()),
+    );
+    (wires, rejected, result.is_err())
 }
 
 /// One pass per source; true when every source read nothing (0 Full, 0 Tail).
@@ -280,6 +385,7 @@ fn round(
     lanes: &mut [Lane],
     c: &Corpus,
     appended: &[u64],
+    held: &[u64],
 ) -> bool {
     let mut quiet = true;
     for (i, lane) in lanes.iter_mut().enumerate() {
@@ -296,6 +402,7 @@ fn round(
                 *total += add;
             }
             row["appended_bytes"] = json!(appended[i]);
+            row["partial_line_bytes_held"] = json!(held[i]);
         }
         row["phase"] = json!(phase);
         row["pass"] = json!(pass);
@@ -352,21 +459,50 @@ fn is_prefix(t0: &Path, t1: &Path) -> bool {
     }
 }
 
+/// The end of the last complete line in `[start, cut)`, or `start`: growth
+/// never delivers a partial last line, which a writer may still be finishing.
+fn line_end(file: &mut std::fs::File, start: u64, cut: u64) -> u64 {
+    let mut buf = vec![0; 1 << 16];
+    let mut end = cut;
+    while end > start {
+        let len = (end - start).min(buf.len() as u64);
+        file.seek(SeekFrom::Start(end - len)).unwrap();
+        file.read_exact(&mut buf[..len as usize]).unwrap();
+        if let Some(i) = buf[..len as usize].iter().rposition(|b| *b == b'\n') {
+            return end - len + i as u64 + 1;
+        }
+        end -= len;
+    }
+    start
+}
+
 /// T1 minus T0: appendable (T0 is a byte prefix of T1) and new files as
-/// (lane, T1 file, run file, first byte, end), and rewritten files.
+/// (lane, T1 file, run file, first byte, end), rewritten files, and files
+/// T1 no longer has (removed from the run on page 1, as T1 shows them).
 struct Growth {
     appends: Vec<(usize, PathBuf, PathBuf, u64, u64)>,
     rewritten: Vec<(usize, PathBuf, PathBuf)>,
+    removed: Vec<PathBuf>,
 }
 impl Growth {
     fn plan(dir: &Path, arm: &str, lanes: &[Lane]) -> Self {
         let mut growth = Self {
             appends: Vec::new(),
             rewritten: Vec::new(),
+            removed: Vec::new(),
         };
         for (i, lane) in lanes.iter().enumerate() {
-            let mut counts = [0u64; 4]; // grown, new, rewritten, unchanged
+            let mut counts = [0u64; 5]; // grown, new, rewritten, unchanged, removed
             for root in &lane.roots {
+                let mut before = Vec::new();
+                files(&dir.join("t0").join(root), &mut before);
+                for t0 in before {
+                    let relative = t0.strip_prefix(dir.join("t0")).unwrap();
+                    if !dir.join("t1").join(relative).exists() {
+                        counts[4] += 1;
+                        growth.removed.push(dir.join("run").join(relative));
+                    }
+                }
                 let mut found = Vec::new();
                 files(&dir.join("t1").join(root), &mut found);
                 for t1 in found {
@@ -397,19 +533,24 @@ impl Growth {
             report(
                 arm,
                 json!({"phase": "growth_plan", "source": lane.source.api_slug(),
-                "grown": counts[0], "new": counts[1], "rewritten": counts[2], "unchanged": counts[3]}),
+                "grown": counts[0], "new": counts[1], "rewritten": counts[2], "unchanged": counts[3],
+                "removed": counts[4]}),
             );
         }
         growth
     }
 
     /// Delivers slice `page` of GROWTH_PAGES, cut at line ends; returns the
-    /// bytes delivered per lane. Rewritten files are replaced on page 1.
-    fn apply(&self, page: u64, lanes: usize) -> Vec<u64> {
-        let mut delivered = vec![0; lanes];
+    /// bytes delivered per lane, and on the last page the partial-line bytes
+    /// held back. Rewritten files are replaced, removed ones deleted, on page 1.
+    fn apply(&self, page: u64, lanes: usize) -> (Vec<u64>, Vec<u64>) {
+        let (mut delivered, mut held) = (vec![0; lanes], vec![0; lanes]);
         if page == 1 {
             for (i, t1, run) in &self.rewritten {
                 delivered[*i] += std::fs::copy(t1, run).unwrap();
+            }
+            for run in &self.removed {
+                std::fs::remove_file(run).unwrap();
             }
         }
         for (i, t1, run, start, end) in &self.appends {
@@ -425,6 +566,12 @@ impl Growth {
                         .read_until(b'\n', &mut line)
                         .unwrap() as u64;
             }
+            // read_until stops at EOF without a newline: cut back to the
+            // last complete line, on every page.
+            cut = line_end(&mut source, *start, cut);
+            if page == GROWTH_PAGES {
+                held[*i] += end - cut;
+            }
             if cut <= have {
                 continue;
             }
@@ -438,7 +585,7 @@ impl Growth {
             source.seek(SeekFrom::Start(have)).unwrap();
             delivered[*i] += std::io::copy(&mut source.take(cut - have), &mut out).unwrap();
         }
-        delivered
+        (delivered, held)
     }
 }
 
@@ -480,9 +627,34 @@ fn oracle(dir: &Path, lanes: &[Lane]) {
                 route.snapshots = bodies;
                 route
             };
-            let cold = route(Mode::ColdFull, lane.bodies.clone(), &lane.tier_replay);
-            let bodies = serde_json::from_value(saved[slug]["bodies"].clone()).unwrap_or_default();
-            let other = route(Mode::Restart, bodies, &saved[slug]["tier_replay"]);
+            // Compare the entities both runs emitted; count the rest.
+            let saved_bodies: BTreeMap<String, Value> =
+                serde_json::from_value(saved[slug]["bodies"].clone()).unwrap_or_default();
+            let common = |from: &BTreeMap<String, Value>, other: &BTreeMap<String, Value>| {
+                from.iter()
+                    .filter(|(id, _)| other.contains_key(*id))
+                    .map(|(id, b)| (id.clone(), b.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let only_cold = lane
+                .bodies
+                .keys()
+                .filter(|id| !saved_bodies.contains_key(*id))
+                .count();
+            let only_arm = saved_bodies
+                .keys()
+                .filter(|id| !lane.bodies.contains_key(*id))
+                .count();
+            let cold = route(
+                Mode::ColdFull,
+                common(&lane.bodies, &saved_bodies),
+                &lane.tier_replay,
+            );
+            let other = route(
+                Mode::Restart,
+                common(&saved_bodies, &lane.bodies),
+                &saved[slug]["tier_replay"],
+            );
             let equivalent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 money_oracle::assert_equivalent(&cold, &other)
             }))
@@ -500,7 +672,8 @@ fn oracle(dir: &Path, lanes: &[Lane]) {
             report(
                 "cold",
                 json!({"phase": "oracle", "against": against, "source": slug,
-                "entities": entities.len(), "equivalent": equivalent, "differences": differences}),
+                "entities": entities.len(), "only_cold": only_cold, "only_arm": only_arm,
+                "equivalent": equivalent, "differences": differences}),
             );
         }
     }
@@ -541,6 +714,10 @@ fn run(arm: &str, dir: &Path) {
             continue;
         };
         let state = index.parent().unwrap().to_path_buf();
+        // A fresh support copy has no index yet: the daemon's first start.
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&state)
+            .unwrap();
         lanes.push(Lane {
             source,
             roots: pick("root"),
@@ -557,13 +734,19 @@ fn run(arm: &str, dir: &Path) {
         json!({"phase": "load", "sources": lanes.len(), "footprint_floor": footprint()}),
     );
     let phase = if arm == "cold" { "cold" } else { "warm" };
+    let mut quiet_at = None;
     for pass in 1..=WARM_CAP as u64 {
-        let quiet = round(arm, phase, pass, &mut lanes, &c, &[]);
+        let quiet = round(arm, phase, pass, &mut lanes, &c, &[], &[]);
         save(dir, arm, &lanes);
         if quiet {
+            quiet_at = Some(pass);
             break;
         }
     }
+    report(
+        arm,
+        json!({"phase": format!("{phase}_quiet"), "quiet_at_pass": quiet_at, "cap": WARM_CAP}),
+    );
     if arm == "cold" {
         oracle(dir, &lanes);
     } else {
@@ -575,14 +758,14 @@ fn run(arm: &str, dir: &Path) {
             }
         };
         restart(&mut lanes);
-        round(arm, "restart", 1, &mut lanes, &c, &[]);
+        round(arm, "restart", 1, &mut lanes, &c, &[], &[]);
         let growth = Growth::plan(dir, arm, &lanes);
         for page in 1..=GROWTH_PAGES {
             if page == GROWTH_PAGES.div_ceil(2) + 1 {
                 restart(&mut lanes);
             }
-            let delivered = growth.apply(page, lanes.len());
-            round(arm, "growth", page, &mut lanes, &c, &delivered);
+            let (delivered, held) = growth.apply(page, lanes.len());
+            round(arm, "growth", page, &mut lanes, &c, &delivered, &held);
             save(dir, arm, &lanes);
         }
     }
@@ -613,9 +796,19 @@ fn restart_restore_real_copy() {
     if !["on", "off", "cold"].contains(&arm.as_str()) {
         return;
     }
-    // Panic text can name paths or entities: print a count instead.
+    // Panic text can name paths or entities: print only the panic site, its
+    // last three path components and line (a crate source file), never the
+    // payload. The oracle's caught non-equivalence also prints one.
     let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    let tag = arm.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        let at = info.location().map(|at| {
+            let mut parts: Vec<&str> = at.file().rsplit('/').take(3).collect();
+            parts.reverse();
+            format!("{}:{}", parts.join("/"), at.line())
+        });
+        report(&tag, json!({"phase": "panic", "at": at}));
+    }));
     let result = std::panic::catch_unwind(|| run(&arm, Path::new(&dir)));
     std::panic::set_hook(hook);
     if result.is_err() {
