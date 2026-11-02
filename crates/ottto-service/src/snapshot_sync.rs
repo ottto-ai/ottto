@@ -5062,10 +5062,7 @@ fn sync_once_with_retry(
     );
     crate::net_resilience::note_sync_cycle_transport(transport_cycle);
     if !failed_sources.is_empty() {
-        return Err(anyhow!(
-            "local snapshot sync failed for {} source(s)",
-            failed_sources.len()
-        ));
+        return Err(SourcesFailed(failed_sources).into());
     }
     continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
@@ -10607,6 +10604,22 @@ fn require_normal_write_ack_for_legacy_reconciliation(
     Ok(())
 }
 
+/// A cycle's summary. Each source's cause is on its own "skipped for" line.
+#[derive(Debug)]
+struct SourcesFailed(Vec<&'static str>);
+
+impl std::fmt::Display for SourcesFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "local snapshot sync failed for {}",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for SourcesFailed {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityDeferred {
     count: usize,
@@ -13224,6 +13237,13 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
 }
 
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    // A state v2 hold is a fixed content-free code: no text, no paths.
+    if let Some(hold) = error.downcast_ref::<crate::snapshots::state_v2::Hold>() {
+        return format!("local state store held: {hold}");
+    }
+    if let Some(failed) = error.downcast_ref::<SourcesFailed>() {
+        return failed.to_string();
+    }
     if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
         return settlement.to_string();
     }
@@ -19420,6 +19440,17 @@ mod tests {
                 status: 401
             })),
             "local health authorization rejected"
+        );
+        assert_eq!(
+            safe_error(
+                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
+                    .context("scan local snapshots /synthetic/private/path")
+            ),
+            "local state store held: state_v2_save_ceiling"
+        );
+        assert_eq!(
+            safe_error(&SourcesFailed(vec!["claude_code", "codex"]).into()),
+            "local snapshot sync failed for claude_code, codex"
         );
     }
 
