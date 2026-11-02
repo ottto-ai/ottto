@@ -133,16 +133,17 @@ struct PiPage {
     diagnostics: Vec<Value>,
 }
 
-type Records = BTreeMap<PathBuf, Vec<u8>>;
+/// Record files by name: a restarted owner works on a copy of the committed
+/// store in another directory, so paths are not stable across routes.
+type Records = BTreeMap<std::ffi::OsString, Vec<u8>>;
 
 /// Every file in the source's store, or none before its first record.
 fn store_records(disk: &Disk) -> Records {
     match std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&disk.index)) {
         Ok(entries) => entries
             .map(|entry| {
-                let path = entry.unwrap().path();
-                let bytes = std::fs::read(&path).unwrap();
-                (path, bytes)
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
             })
             .collect(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Records::new(),
@@ -204,15 +205,17 @@ impl PiDriver {
         }
     }
 
-    /// Puts the store back to `to` in place (same paths keep their modes).
+    /// Puts the current store back to `to` in place (same files keep their modes).
     fn reset_store(&self, to: &Records) {
-        for path in store_records(&self.disk).into_keys() {
-            if !to.contains_key(&path) {
-                std::fs::remove_file(path).unwrap();
+        let dir = crate::durable_tail_store::store_dir_for_index(&self.disk.index);
+        for name in store_records(&self.disk).into_keys() {
+            if !to.contains_key(&name) {
+                std::fs::remove_file(dir.join(name)).unwrap();
             }
         }
-        for (path, bytes) in to {
-            if std::fs::read(path).ok().as_ref() != Some(bytes) {
+        for (name, bytes) in to {
+            let path = dir.join(name);
+            if std::fs::read(&path).ok().as_ref() != Some(bytes) {
                 std::fs::write(path, bytes).unwrap();
             }
         }
@@ -378,7 +381,11 @@ impl super::durable_transition_tests::SharedSource for PiDriver {
 fn only_record(disk: &Disk) -> (PathBuf, Vec<u8>) {
     let records = store_records(disk);
     assert_eq!(records.len(), 1);
-    records.into_iter().next().unwrap()
+    let (name, bytes) = records.into_iter().next().unwrap();
+    (
+        crate::durable_tail_store::store_dir_for_index(&disk.index).join(name),
+        bytes,
+    )
 }
 
 /// One route's page counts: (Full selections, Tail selections, completed
@@ -418,7 +425,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
         return;
     }
     let mut f = PiDriver::warm("transition-pi-quiet", &pi_seed());
-    let record = f.disk.record_bytes();
+    let record = store_records(&f.disk);
     let bodies = stored_bodies(&f.prior);
     for restart in 0..2 {
         f.restart();
@@ -441,7 +448,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
         );
         f.save_gc(Mode::Restart);
         assert_eq!(
-            f.disk.record_bytes(),
+            store_records(&f.disk),
             record,
             "{restart}: quiet save rewrote"
         );
@@ -469,7 +476,7 @@ fn pi_smaller_extent_routes_publish_the_cold_body() {
             Mode::Restart
         };
         let mut f = PiDriver::warm(&format!("transition-pi-smaller-{arm}"), &pi_seed());
-        let older = f.disk.record_bytes();
+        let older = store_records(&f.disk);
         let sealed = std::fs::read(&f.path).unwrap();
         if arm == "unchanged" {
             f.grow(&[pi_turn(
@@ -499,7 +506,7 @@ fn pi_smaller_extent_routes_publish_the_cold_body() {
         let key = fixture::local_key(&f.path);
         let accepted_size = f.prior.files[&key].size_bytes;
         assert_eq!(
-            f.disk.record_bytes().keys().collect::<Vec<_>>(),
+            store_records(&f.disk).keys().collect::<Vec<_>>(),
             older.keys().collect::<Vec<_>>()
         );
         if arm != "ram" {
@@ -601,7 +608,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
     for arm in ["ram", "restart"] {
         let name = format!("transition-pi-survivor-{arm}");
         let mut f = PiDriver::warm(&name, &pi_seed());
-        let survivor = f.disk.record_bytes();
+        let survivor = store_records(&f.disk);
         let bodies = stored_bodies(&f.prior);
         f.grow(&[pi_turn(
             "message",
@@ -626,7 +633,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
             "{arm}: the double fault is counted"
         );
         f.save_gc(Mode::Ram);
-        assert_eq!(f.disk.record_bytes(), survivor, "{arm}: survivor kept");
+        assert_eq!(store_records(&f.disk), survivor, "{arm}: survivor kept");
         assert_eq!(stored_bodies(&f.prior), bodies, "{arm}: accepted kept");
 
         let (mode, read_from, restored) = if arm == "ram" {
@@ -656,7 +663,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
         money_oracle::assert_equivalent(&cold, &resolved);
         whole_body(&cold, &resolved);
         f.save_gc(mode);
-        assert_ne!(f.disk.record_bytes(), survivor, "{arm}: survivor replaced");
+        assert_ne!(store_records(&f.disk), survivor, "{arm}: survivor replaced");
         assert_ne!(stored_bodies(&f.prior), bodies, "{arm}: accepted advanced");
         f.restart();
         let quiet = f.emit_bodies(Mode::Restart);
@@ -686,7 +693,7 @@ fn pi_native_lifecycle_rewrite_and_reupgrade_preserve_cold_bodies() {
         let stored = format!("\"version\":{version}");
         let initial = pi_seed().replacen("\"version\":3", &stored, 1);
         let mut f = PiDriver::warm(&format!("transition-pi-lifecycle-{arm}"), &initial);
-        let record = f.disk.record_bytes();
+        let record = store_records(&f.disk);
         f.restart();
         let tail = if arm == "downgrade" {
             f.grow(&[pi_turn(
@@ -705,7 +712,7 @@ fn pi_native_lifecycle_rewrite_and_reupgrade_preserve_cold_bodies() {
             money_oracle::assert_equivalent(&cold, &down);
             index.save(&f.disk.index).unwrap(); // Index only: no record write or GC.
             f.accepted.extend(emitted);
-            assert_eq!(f.disk.record_bytes(), record, "downgrade keeps the record");
+            assert_eq!(store_records(&f.disk), record, "downgrade keeps the record");
             f.restart();
             f.grow(&[pi_turn(
                 "message",
@@ -766,7 +773,7 @@ fn pi_native_lifecycle_rewrite_and_reupgrade_preserve_cold_bodies() {
         money_oracle::assert_equivalent(&cold, &route);
         whole_body(&cold, &route);
         f.save_gc(Mode::Restart);
-        assert_ne!(f.disk.record_bytes(), record, "{arm}: new receipt");
+        assert_ne!(store_records(&f.disk), record, "{arm}: new receipt");
         if arm != "downgrade" {
             f.restart();
             let quiet = f.emit_bodies(Mode::Restart);
@@ -871,6 +878,18 @@ fn pi_mixed_with_claude_keeps_each_source_cold_equivalent() {
                 assert_eq!(std::fs::read(&path).unwrap(), unknown, "Pi U kept");
                 assert_ne!(disk.record_bytes(), claude_record, "Claude advanced");
                 std::fs::write(&path, valid).unwrap();
+                // The held U record leaves the Pi pass terminal-unhealthy, paced
+                // by its retry deadline; make that retry due for the next pass.
+                let mut paced = serde_json::to_value(&f.prior).unwrap();
+                let traversal = paced["traversal"]
+                    .as_object_mut()
+                    .expect("held pass keeps its traversal");
+                assert!(
+                    traversal["unhealthy_retry_not_before_unix_seconds"].is_u64(),
+                    "held pass is paced"
+                );
+                traversal.insert("unhealthy_retry_not_before_unix_seconds".into(), json!(0));
+                f.prior = serde_json::from_value(paced).unwrap();
             } else {
                 assert_eq!((pi.modes, pi.restored), ((0, 1, 0), 1));
                 money_oracle::assert_equivalent(&pi_cold, &pi);
@@ -967,7 +986,7 @@ fn canary_session() -> String {
 
 /// Every record file, plus this route's store counters and summary line.
 fn assert_store_private(f: &PiDriver, mode: Mode) {
-    let records = f.disk.record_bytes();
+    let records = store_records(&f.disk);
     assert!(!records.is_empty(), "{mode:?}: a native Pi record exists");
     for bytes in records.values() {
         assert_private(&format!("{mode:?} record"), bytes);
@@ -1008,7 +1027,7 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
         json!(2),
         "the canary turn and the compaction usage both count"
     );
-    for bytes in f.disk.record_bytes().values() {
+    for bytes in store_records(&f.disk).values() {
         assert_private("warm record", bytes);
     }
     f.restart();
@@ -1052,7 +1071,7 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
         }
     }
     f.save_gc(Mode::Restart);
-    for bytes in f.disk.record_bytes().values() {
+    for bytes in store_records(&f.disk).values() {
         assert_private("re-receipted record", bytes);
     }
 }
@@ -1143,7 +1162,7 @@ fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
         })
         .collect();
     let mut f = PiDriver::warm("transition-pi-content-fence", &initial);
-    let before = f.disk.record_bytes();
+    let before = store_records(&f.disk);
     let rewritten = initial.replacen("Synthetic first prompt.", "Synthetic other prompt.", 1);
     assert_ne!(initial, rewritten);
     assert_eq!(initial.len(), rewritten.len());
@@ -1168,7 +1187,7 @@ fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
     whole_body(&cold, &edited);
     f.save_gc(Mode::Restart);
     assert_ne!(
-        f.disk.record_bytes(),
+        store_records(&f.disk),
         before,
         "denied predecessor is replaced by the Full receipt"
     );
@@ -1252,7 +1271,8 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
             if mode != Mode::Ram {
                 assert_eq!(route.restored, 1);
             }
-            assert_eq!(route.io.consumed, tail + route.io.rederive_head);
+            // Pi re-derives the restored head by pread, outside consumed bytes.
+            assert_eq!(route.io.consumed, tail);
             money_oracle::assert_equivalent(&cold, &route);
             whole_body(&cold, &route);
             assert_eq!(route.snapshots[&f.entity]["session_display_name"], title);
@@ -1262,7 +1282,7 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
             }
         }
         f.save_gc(Mode::EvictRetry);
-        for bytes in f.disk.record_bytes().values() {
+        for bytes in store_records(&f.disk).values() {
             assert_private("fork record", bytes);
         }
         f.restart();
@@ -1296,9 +1316,9 @@ fn pi_fork_pre_header_copies_reduce_double_counted_money() {
             inflated.replacen(&pi_header("synthetic-pi-session", 3, None), &fork_header, 1);
         std::fs::write(&f.path, corrected).unwrap();
         input_clock(&f.path);
-        let ((route, events), counts) = cache_lifecycle::observe(|| {
-            crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Ram))
-        });
+        // emit_bodies already captures the route's diagnostics; capture does not nest.
+        let (route, counts) = cache_lifecycle::observe(|| f.emit_bodies(Mode::Ram));
+        let events = f.pages[&Mode::Ram].diagnostics.clone();
         assert_eq!(
             counts.pi_fork_copies_skipped_entries,
             if all_copied { 2 } else { 1 }
