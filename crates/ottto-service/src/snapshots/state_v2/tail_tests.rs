@@ -872,7 +872,7 @@ fn debt_survives_reset_and_retire_until_disposed() {
         tail_set_aside(&index, FILE).unwrap().is_some(),
         "unknown id"
     );
-    assert!(revisions(&index, FILE).is_empty());
+    assert!(load_head(&index, FILE, REVISION).unwrap().is_none());
     with_session_db(&index, |db| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let error = tail::retire_future_head_for_test(&mut tx, FILE.as_bytes()).unwrap_err();
