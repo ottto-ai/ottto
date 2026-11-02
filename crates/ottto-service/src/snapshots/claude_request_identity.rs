@@ -1033,6 +1033,12 @@ fn apply_grouped_with_accepted(
     }
 
     protect_accepted_shares(&mut grouping, accepted);
+    crate::local_resource_diagnostics::change_reason::claude_placement(
+        &item.source_session_id,
+        accepted.filter(|known| !known.incomplete).map(|_| {
+            !grouping.accepted_share_changed.is_empty() || grouping.accepted_rows_vanished > 0
+        }),
+    );
     let prior_refusals = item.request_identity_refusals;
     let mut refusals = prior_refusals;
     let mut over_cap = BTreeSet::new();

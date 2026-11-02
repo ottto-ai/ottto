@@ -146,6 +146,7 @@ pub(crate) mod cache_observations;
 pub(crate) mod cache_overcap_tests;
 #[cfg(test)]
 mod cache_policy_tests;
+mod change_reason;
 mod claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
@@ -14182,7 +14183,13 @@ fn apply_claude_effort_evidence_with_families(
             continue;
         };
         let identity_changed = veto_claude_original_identity(item, evidence);
-        if apply_claude_account_evidence(item, evidence) || identity_changed {
+        let account_applied = apply_claude_account_evidence(item, evidence);
+        if account_applied {
+            crate::local_resource_diagnostics::change_reason::claude_account_evidence_applied(
+                &item.source_session_id,
+            );
+        }
+        if account_applied || identity_changed {
             rebuild_retagged_model_usage(item);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
@@ -29948,6 +29955,13 @@ impl OwnedSourceScan {
                             0,
                             plan.metrics().native_bytes,
                         );
+                        crate::local_resource_diagnostics::change_reason::read(
+                            source.api_slug(),
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                            plan.metrics().sample_bytes as u64,
+                        );
                         #[cfg(unix)]
                         context.cache.durable_acquisition_completed(
                             &local_index_key(&active.candidate.path),
@@ -35672,6 +35686,9 @@ impl OwnedSourceScan {
             {
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
+            }
+            if side_origin.is_none() {
+                index.note_change_reason_selected(source, &candidate, parse_reason);
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,

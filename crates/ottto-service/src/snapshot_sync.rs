@@ -2696,6 +2696,49 @@ impl SnapshotUploadProgress {
         self.active_reason_reoffers.remove(fingerprint);
     }
 
+    /// Counts only: the delivery cause when this exact body is already held,
+    /// quarantined, refused, re-offered or owed only a stamp catch-up here;
+    /// `None` for a changed body, which keeps its selection cause.
+    fn change_reason_resend(
+        &self,
+        fingerprint: &str,
+        session_id: Option<&str>,
+        body_witness: impl FnOnce() -> String,
+    ) -> Option<crate::local_resource_diagnostics::change_reason::Token> {
+        use crate::local_resource_diagnostics::change_reason::Token;
+        if self.context_resend.is_catchup(fingerprint) {
+            return Some(Token::AckRecovery);
+        }
+        let held = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .map(|record| record.upload_body_witness.as_deref());
+        let refused = self
+            .permanent_rejections
+            .get(fingerprint)
+            .map(|record| record.body_witness.as_str());
+        let reoffer = self.active_reason_reoffers.get(fingerprint);
+        if held.is_none() && refused.is_none() && reoffer.is_none() {
+            return None;
+        }
+        let body = body_witness();
+        if reoffer == Some(&body) {
+            return Some(Token::AdminOther);
+        }
+        if held.flatten() != Some(body.as_str()) && refused != Some(body.as_str()) {
+            return None;
+        }
+        let conflict = session_id.is_some_and(|session| {
+            self.head_conflict_challenges
+                .contains_key(&cache_session_key(session))
+        });
+        Some(if conflict {
+            Token::HeadConflict
+        } else {
+            Token::AckRecovery
+        })
+    }
+
     /// The server answered `unchanged` with an `unchanged_basis`: it did not
     /// store this body. Hold the exact body terminally, like a permanent
     /// refusal of the same body before that answer existed, but record no
@@ -6771,6 +6814,7 @@ fn prepare_sync_source_inner(
             copy_unproven_enabled,
             claude,
         ),
+        upload_policy,
     );
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
@@ -6789,6 +6833,11 @@ fn prepare_sync_source_inner(
             prior == crate::snapshots::PriorHistory::Unverified,
         );
     }
+    crate::local_resource_diagnostics::change_reason::index_loaded(
+        source.api_slug(),
+        claude_index_loaded_fresh,
+        prior_claude_history,
+    );
     let replay_generation = cycle_replay_generation(source, &upload_destination_namespace);
     // An unreadable backfill state arms no Claude replay and no replay-wide
     // scan window (StateMissing H1, N2).
@@ -8168,6 +8217,7 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     upload_progress.freeze_custody_page(&scan_result.snapshots);
+    crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
     let probes = scan_result
         .snapshots
         .iter()
@@ -10859,10 +10909,19 @@ where
     }
     for index in indices {
         let item = &items[*index];
-        progress.context_resend.note_attempt(
+        let bytes = snapshot_packing_json_length(item)? as u64;
+        // Counts only; on the sync path `poison_scope` is the source slug.
+        crate::local_resource_diagnostics::change_reason::attempted(
+            poison_scope,
             fingerprint(item),
-            snapshot_packing_json_length(item)? as u64,
+            session_id(item),
+            progress
+                .change_reason_resend(fingerprint(item), session_id(item), || body_witness(item)),
+            bytes,
         );
+        progress
+            .context_resend
+            .note_attempt(fingerprint(item), bytes);
     }
     let mut replaced_retained_proof = false;
     // Only proof the ledger holds can be replaced, whatever the capability.
@@ -11029,6 +11088,17 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
+        for entity in response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+        {
+            crate::local_resource_diagnostics::change_reason::settled(
+                poison_scope,
+                &entity.snapshot_fingerprint,
+                entity.unchanged_basis.as_deref() == Some("usage_identical"),
+            );
+        }
         for index in indices {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
@@ -24872,6 +24942,10 @@ mod usage_decrease_hold_tests;
 #[cfg(test)]
 #[path = "snapshot_sync/head_conflict_answer_tests.rs"]
 mod head_conflict_answer_tests;
+
+#[cfg(test)]
+#[path = "snapshot_sync/change_reason_tests.rs"]
+mod change_reason_tests;
 
 #[cfg(test)]
 #[path = "snapshot_sync/head_conflict_released_progress_fixture.rs"]

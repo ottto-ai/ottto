@@ -87,6 +87,9 @@ pub(super) struct RevisionPolicy {
     /// Before the list was ever installed, history born before this second,
     /// or at an unknown time, is held under this revision (F4b).
     pub(super) no_list_birth_cutoff_unix_seconds: u64,
+    /// The revision changes uploaded money, so owing it is a finalizer
+    /// revision rather than a format change. Counts only.
+    pub(super) money_rule: bool,
 }
 
 /// The per-revision policy table. An unknown revision, or one above
@@ -101,12 +104,14 @@ pub(super) fn revision_policy(revision: u64) -> Option<RevisionPolicy> {
             listed_emission: ListedEmission::Ordinary,
             no_list_birth_cutoff_unix_seconds:
                 super::claude_reemission_exclusions::NO_LIST_HOLD_BEFORE_UNIX_SECONDS,
+            money_rule: false,
         }),
         // Until owner B dates revision 3's no-list cutoff, no history born
         // at any time is upgraded to it without an installed list.
         3 => Some(RevisionPolicy {
             listed_emission: ListedEmission::WithoutRequestOwnedLiteral,
             no_list_birth_cutoff_unix_seconds: u64::MAX,
+            money_rule: true,
         }),
         _ => None,
     }
