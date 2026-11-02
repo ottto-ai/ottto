@@ -2816,12 +2816,24 @@ where
             historical_organization_hash.as_deref(),
             Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
         )
+    } else if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation {
+        // No verified account yet (an owner switch arrives as
+        // `IdentityMismatch` above): keep waiting without asking for /login.
+        store.transition_setup_operation_with_binding(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
+            ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            None,
+            None,
+            Some("Ottto could not confirm this login yet; it will check it again."),
+        )
     } else if matches!(
         direct_slot_status.state,
         ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
             | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
             | ClaudeConfigSlotCollectionStateV1::Unverified
-            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
     ) {
         store.transition_setup_operation_with_binding(
             schema_version,
@@ -20956,6 +20968,28 @@ for line in sys.stdin:
                 &captured_at,
             )
         };
+        // [regress] A race with no verified account (approval lookup failed,
+        // no prior binding) keeps setup waiting without a /login prompt.
+        let unbound =
+            check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                    observed_at: Some("2026-08-04T09:59:00Z".to_string()),
+                    ..Default::default()
+                }
+            })
+            .expect("unbound race");
+        assert_eq!(
+            unbound.setup_operation.state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
+        assert!(!unbound
+            .setup_operation
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/login"));
+
         write_identity("account-a");
         let full =
             check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
