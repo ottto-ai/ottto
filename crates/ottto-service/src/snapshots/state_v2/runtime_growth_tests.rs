@@ -796,7 +796,10 @@ fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
         .expect("the scan's fence names its page-one file");
 
     let mut index = f.load();
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut held = f.load();
     assert!(save_oversize_active(&held).unwrap());
