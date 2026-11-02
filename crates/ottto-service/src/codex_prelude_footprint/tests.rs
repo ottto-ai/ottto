@@ -2,6 +2,7 @@ use super::*;
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
 };
+use crate::snapshots::SnapshotUploadPolicy;
 use crate::test_scratch::ScratchDir;
 use crate::transcript_acquisition::FileObject;
 use serde_json::json;

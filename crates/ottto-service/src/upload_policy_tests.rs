@@ -78,6 +78,14 @@ fn request(agent_source: &str, counter_source: &str) -> ContextFootprintIngestRe
                 }],
             },
         }),
+        names_withheld: None,
+    }
+}
+
+fn rules(policy: SnapshotUploadPolicy, names_withheld: bool) -> FootprintRules {
+    FootprintRules {
+        policy,
+        names_withheld,
     }
 }
 
@@ -121,36 +129,50 @@ fn capture_one_post() -> (String, mpsc::Receiver<String>) {
 }
 
 fn posted_claude(policy: SnapshotUploadPolicy) -> String {
+    post_claude(
+        request("claude-code", "claude_code_context_v1"),
+        rules(policy, false),
+    )
+}
+
+fn post_claude(mut footprint: ContextFootprintIngestRequest, rules: FootprintRules) -> String {
     let support = crate::test_scratch::unique_path("ottto-footprint-filter-claude");
     let (base, body) = capture_one_post();
-    let mut footprint = request("claude-code", "claude_code_context_v1");
     assert!(crate::context_footprint::upload_if_changed(
         &SnapshotApiClient::new(base),
         "relay-token",
         &support,
         "destination",
         &mut footprint,
-        policy,
+        rules,
     )
     .unwrap());
     let _ = fs::remove_dir_all(&support);
     body.recv().unwrap()
 }
 
-fn posted_codex(policy: SnapshotUploadPolicy) -> String {
-    let support = crate::test_scratch::unique_path("ottto-footprint-filter-codex");
-    let (base, body) = capture_one_post();
+fn codex_request() -> ContextFootprintIngestRequest {
     let mut footprint = request("codex", "codex_rollout_prelude_chars_v1");
     footprint.instruction_inventory = None;
     footprint.custom_agents.clear();
     footprint.mcp_tools.clear();
+    footprint
+}
+
+fn posted_codex(policy: SnapshotUploadPolicy) -> String {
+    post_codex(codex_request(), rules(policy, false))
+}
+
+fn post_codex(mut footprint: ContextFootprintIngestRequest, rules: FootprintRules) -> String {
+    let support = crate::test_scratch::unique_path("ottto-footprint-filter-codex");
+    let (base, body) = capture_one_post();
     assert!(crate::codex_prelude_footprint::upload_if_changed(
         &SnapshotApiClient::new(base),
         "relay-token",
         &support,
         "destination",
         &mut footprint,
-        policy,
+        rules,
         Some(1),
     )
     .unwrap());
@@ -209,13 +231,118 @@ fn footprint_labels_on_body_is_unchanged() {
         posted_claude(LABELS_ON),
         serde_json::to_value(&claude).unwrap().to_string()
     );
-    let mut codex = request("codex", "codex_rollout_prelude_chars_v1");
-    codex.instruction_inventory = None;
-    codex.custom_agents.clear();
-    codex.mcp_tools.clear();
     assert_eq!(
         posted_codex(LABELS_ON),
-        serde_json::to_value(&codex).unwrap().to_string()
+        serde_json::to_value(codex_request()).unwrap().to_string()
+    );
+    assert_eq!(
+        post_claude(claude, rules(LABELS_ON, true)),
+        posted_claude(LABELS_ON),
+        "the capability changes nothing while names are on"
+    );
+}
+
+/// Rows with distinct sizes, so a swapped or truncated sum cannot pass.
+fn many_rows(mut footprint: ContextFootprintIngestRequest) -> ContextFootprintIngestRequest {
+    footprint.memory_files.push(ContextFootprintItemInput {
+        tokens: 11,
+        source: Some("AutoMem".to_string()),
+        ..item("memory_file")
+    });
+    footprint.skills.push(ContextFootprintItemInput {
+        tokens: 13,
+        ..item("skill")
+    });
+    if !footprint.custom_agents.is_empty() {
+        footprint.custom_agents.push(ContextFootprintItemInput {
+            tokens: 17,
+            ..item("custom_agent")
+        });
+        for (server, tokens) in [(NAME, 19), ("SENTINEL-NAME-2", 23)] {
+            footprint.mcp_tools.push(ContextFootprintMcpToolInput {
+                name: NAME.to_string(),
+                server: server.to_string(),
+                tokens,
+            });
+        }
+    }
+    footprint
+}
+
+fn tokens(rows: &[ContextFootprintItemInput]) -> u64 {
+    rows.iter().map(|row| row.tokens).sum()
+}
+
+#[test]
+fn names_withheld_equals_the_unfiltered_sums_for_claude_and_codex() {
+    let claude = many_rows(request("claude-code", "claude_code_context_v1"));
+    let mcp_tokens: u64 = claude.mcp_tools.iter().map(|tool| tool.tokens).sum();
+    assert_eq!(mcp_tokens, 49);
+    let expected = json!({
+        "skills": {"count": 2, "tokens": tokens(&claude.skills)},
+        "custom_agents": {"count": 2, "tokens": tokens(&claude.custom_agents)},
+        "memory_files": {
+            "count": 2, "tokens": tokens(&claude.memory_files), "auto_memory_count": 1,
+        },
+        "mcp": {"servers": 2, "tools": 3, "tokens": mcp_tokens},
+    });
+    let body = post_claude(claude, rules(SnapshotUploadPolicy::MOST_PRIVATE, true));
+    assert!(!body.contains(NAME));
+    let sent: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(sent["names_withheld"], expected);
+    assert_eq!(sent["skills"], json!([]), "real totals, never a fake row");
+
+    let codex = many_rows(codex_request());
+    let expected = json!({
+        "skills": {"count": 2, "tokens": tokens(&codex.skills)},
+        "custom_agents": {"count": 0, "tokens": 0},
+        "memory_files": {
+            "count": 2, "tokens": tokens(&codex.memory_files), "auto_memory_count": 1,
+        },
+        "mcp": {"servers": 0, "tools": 0, "tokens": 0},
+    });
+    let body = post_codex(codex, rules(SnapshotUploadPolicy::MOST_PRIVATE, true));
+    assert!(!body.contains(NAME));
+    let sent: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(sent["names_withheld"], expected);
+}
+
+#[test]
+fn names_withheld_needs_the_exact_capability() {
+    let sent: Value =
+        serde_json::from_str(&posted_claude(SnapshotUploadPolicy::MOST_PRIVATE)).unwrap();
+    assert!(sent.get("names_withheld").is_none());
+    let sent: Value =
+        serde_json::from_str(&posted_codex(SnapshotUploadPolicy::MOST_PRIVATE)).unwrap();
+    assert!(sent.get("names_withheld").is_none());
+
+    assert!(!names_withheld_accepted(None));
+    assert!(!names_withheld_accepted(Some(&hint(false))));
+    let mut raw = raw_hint(false);
+    for (token, accepted) in [
+        (Value::Null, false),
+        (json!("v2"), false),
+        (json!("V1"), false),
+        (json!("v1"), true),
+    ] {
+        raw["names_withheld_contract"] = token;
+        let decoded = decode_activity_hint(raw.clone()).unwrap();
+        assert_eq!(names_withheld_accepted(Some(&decoded)), accepted);
+    }
+}
+
+#[test]
+fn the_capability_alone_changes_the_footprint_upload_hash() {
+    let mut without = request("claude-code", "claude_code_context_v1");
+    filter_footprint(
+        &mut without,
+        rules(SnapshotUploadPolicy::MOST_PRIVATE, false),
+    );
+    let mut with = request("claude-code", "claude_code_context_v1");
+    filter_footprint(&mut with, rules(SnapshotUploadPolicy::MOST_PRIVATE, true));
+    assert_ne!(
+        crate::context_footprint::request_content_hash_for_request(&without).unwrap(),
+        crate::context_footprint::request_content_hash_for_request(&with).unwrap(),
     );
 }
 
@@ -226,19 +353,25 @@ fn a_footprint_without_names_keeps_its_config_hash() {
     footprint.skills.clear();
     footprint.custom_agents.clear();
     footprint.mcp_tools.clear();
-    filter_footprint(&mut footprint, SnapshotUploadPolicy::MOST_PRIVATE);
+    filter_footprint(
+        &mut footprint,
+        rules(SnapshotUploadPolicy::MOST_PRIVATE, false),
+    );
     assert_eq!(footprint.config_hash, "built-over-names");
 }
 
-fn hint(labels: bool) -> ActivityHintResponse {
-    decode_activity_hint(json!({
+fn raw_hint(labels: bool) -> Value {
+    json!({
         "source": "claude_code", "server_time": "2026-11-02T00:00:00Z",
         "record_count_15m": 0, "record_count_24h": 0,
         "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
         "session_titles_enabled": labels, "workspace_labels_enabled": labels,
         "recommended_scan_after": "2026-11-02T00:05:00Z",
-    }))
-    .unwrap()
+    })
+}
+
+fn hint(labels: bool) -> ActivityHintResponse {
+    decode_activity_hint(raw_hint(labels)).unwrap()
 }
 
 #[test]
@@ -321,4 +454,24 @@ fn label_free_bodies_have_only_their_allowlisted_fields() {
     only_fields!(DailyReferenceRow;
         provider_day, surface, model, credits_used, uncached_input_tokens, cached_input_tokens,
         output_tokens, total_tokens, thread_count, turn_count);
+    // A JSON literal, so its keys are checked at run time. The nickname is the
+    // user's own chosen text for the account row, sent only when they save one.
+    let nickname = crate::account_nicknames::save_body("machine", &Default::default(), None);
+    let mut keys: Vec<&str> = nickname
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "account_identifier_hash",
+            "machine_id",
+            "nickname",
+            "organization_identifier_hash",
+            "source",
+        ]
+    );
 }

@@ -17,6 +17,7 @@ pub(super) fn payload(scope: &Scope, enabled: bool, labels: bool) -> Value {
             ..SnapshotUploadPolicy::default()
         },
         details_enabled: enabled,
+        names_withheld: false,
     };
     let now = base_now();
     let (request, _) = build_request(
@@ -288,6 +289,7 @@ fn actual_reader_stored_state_and_wire_agree_on_session_winner() {
         destination: "test-destination",
         policy: SnapshotUploadPolicy::default(),
         details_enabled: true,
+        names_withheld: false,
     };
     let now = base_now();
     let result = super::super::upload::upload_scope(
@@ -332,6 +334,7 @@ fn capability_change_refreshes_acked_scope_without_transcript_changes() {
             destination: "test-destination",
             policy: SnapshotUploadPolicy::default(),
             details_enabled: enabled,
+            names_withheld: false,
         };
         assert_eq!(
             upload_scope(&dir, Source::Claude, &scope, &mut target, now, window).outcome,

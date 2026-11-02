@@ -12796,19 +12796,39 @@ pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: Snaps
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
-fn erase_source_files(
-    support_dir: &Path,
-    source: SnapshotSource,
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let others: Vec<PathBuf> = [
+/// A source's caches outside `snapshots`, with their temp copies.
+fn source_cache_files(support_dir: &Path, source: SnapshotSource) -> Vec<PathBuf> {
+    [
         crate::active_sessions::active_session_cache_path(support_dir, source),
         detected_uses_cache_path(support_dir, source),
         crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
     .flat_map(|path| [path.with_extension("json.tmp"), path])
-    .collect();
+    .collect()
+}
+
+/// Forget: every source's caches. The opt-out markers beside them stay.
+pub(crate) fn erase_all_source_caches(support_dir: &Path) -> std::io::Result<()> {
+    for path in SNAPSHOT_SOURCES
+        .into_iter()
+        .flat_map(|source| source_cache_files(support_dir, source))
+    {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn erase_source_files(
+    support_dir: &Path,
+    source: SnapshotSource,
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::context_composition::erase_source_state(support_dir, source)?;
+    let others = source_cache_files(support_dir, source);
     let stable = snapshot_index_path(support_dir, source);
     let destinations = support_dir.join("snapshots/destinations");
     // Every parent exists, so an fsync of it fails only on a real I/O error.

@@ -15,7 +15,9 @@
 //! after building": ranking and merging into "other add-ons" happen while that
 //! request is built, so its builder asks these rules (`context_composition/v2`).
 
-use crate::context_footprint::{sha256_hex, ContextFootprintIngestRequest};
+use crate::context_footprint::{
+    sha256_hex, ContextFootprintIngestRequest, ContextFootprintItemInput,
+};
 use crate::instruction_inventory::withheld_files;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::ActivityHintResponse;
@@ -23,6 +25,8 @@ use crate::snapshots::{
     snapshot_fingerprint, SnapshotActivityCount, SnapshotItem, SnapshotSource, SnapshotToolUsage,
     SnapshotUploadPolicy,
 };
+use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +49,9 @@ const PROVIDER_AGENT_KINDS: [&str; 9] = [
 ];
 /// Codex's built-in subagent roles.
 const PROVIDER_AGENT_ROLES: [&str; 3] = ["default", "explorer", "worker"];
+/// `names_withheld_contract` from a server that accepts the withheld totals. Its
+/// request schemas refuse unknown fields, so nothing else may send them.
+const NAMES_WITHHELD_CONTRACT: &str = "v1";
 
 impl SnapshotUploadPolicy {
     /// Nothing optional leaves the Mac: no fetched or remembered policy exists.
@@ -119,6 +126,98 @@ fn remembered_policy_path(support_dir: &Path, destination: &str) -> PathBuf {
     support_dir
         .join("upload_policy")
         .join(format!("{}.json", sha256_hex(&[destination])))
+}
+
+/// Whether this pass's server accepts withheld totals. A failed hint says no.
+pub(crate) fn names_withheld_accepted(hint: Option<&ActivityHintResponse>) -> bool {
+    hint.and_then(|hint| hint.names_withheld_contract.as_deref()) == Some(NAMES_WITHHELD_CONTRACT)
+}
+
+/// What one footprint pass may send.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FootprintRules {
+    pub(crate) policy: SnapshotUploadPolicy,
+    pub(crate) names_withheld: bool,
+}
+
+impl FootprintRules {
+    pub(crate) fn for_pass(
+        support_dir: &Path,
+        destination: &str,
+        hint: Option<&ActivityHintResponse>,
+    ) -> Self {
+        Self {
+            policy: remembered_policy(support_dir, destination, hint),
+            names_withheld: names_withheld_accepted(hint),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ItemsWithheld {
+    pub(crate) count: u64,
+    pub(crate) tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct MemoryWithheld {
+    pub(crate) count: u64,
+    pub(crate) tokens: u64,
+    pub(crate) auto_memory_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct McpWithheld {
+    pub(crate) servers: u64,
+    pub(crate) tools: u64,
+    pub(crate) tokens: u64,
+}
+
+/// A footprint's real counts and sizes while its named rows are not sent, so a
+/// reader never takes the empty lists for zero. Sizes and counts, not names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct NamesWithheld {
+    pub(crate) skills: ItemsWithheld,
+    pub(crate) custom_agents: ItemsWithheld,
+    pub(crate) memory_files: MemoryWithheld,
+    pub(crate) mcp: McpWithheld,
+}
+
+impl NamesWithheld {
+    fn of(request: &ContextFootprintIngestRequest) -> Self {
+        let items = |rows: &[ContextFootprintItemInput]| ItemsWithheld {
+            count: rows.len() as u64,
+            tokens: rows.iter().map(|row| row.tokens).sum(),
+        };
+        let memory = items(&request.memory_files);
+        let servers: BTreeSet<&str> = request
+            .mcp_tools
+            .iter()
+            .map(|tool| tool.server.as_str())
+            .collect();
+        Self {
+            skills: items(&request.skills),
+            custom_agents: items(&request.custom_agents),
+            memory_files: MemoryWithheld {
+                count: memory.count,
+                tokens: memory.tokens,
+                auto_memory_count: request
+                    .memory_files
+                    .iter()
+                    .filter(|row| {
+                        row.source
+                            .as_deref()
+                            .is_some_and(|source| source.eq_ignore_ascii_case("AutoMem"))
+                    })
+                    .count() as u64,
+            },
+            mcp: McpWithheld {
+                servers: servers.len() as u64,
+                tools: request.mcp_tools.len() as u64,
+                tokens: request.mcp_tools.iter().map(|tool| tool.tokens).sum(),
+            },
+        }
+    }
 }
 
 /// Filters snapshots for upload. Runs before the first consumer of a body's
@@ -220,6 +319,12 @@ fn hide_names(item: &mut SnapshotItem) -> bool {
             },
         );
     }
+    // One opaque id per skill. Prompt and template group ids are a grouping class,
+    // not a name list, so they stay.
+    let facts = item.attribution_facts.len();
+    item.attribution_facts
+        .retain(|fact| fact.field != "skill_id");
+    changed |= item.attribution_facts.len() != facts;
     for fact in &mut item.attribution_facts {
         if fact.field == "agent_kind" && !PROVIDER_AGENT_KINDS.contains(&fact.value.as_str()) {
             changed |= fact.value != CUSTOM;
@@ -299,10 +404,8 @@ fn merge_mcp_rows<T>(
 /// Filters a Claude or Codex footprint for upload. Category totals stay, so "MCP
 /// tools use 12k tokens" survives without naming a tool. `config_hash` hashed the
 /// names, so it is recomputed over what is sent, only when names were removed.
-pub(crate) fn filter_footprint(
-    request: &mut ContextFootprintIngestRequest,
-    policy: SnapshotUploadPolicy,
-) {
+pub(crate) fn filter_footprint(request: &mut ContextFootprintIngestRequest, rules: FootprintRules) {
+    let policy = rules.policy;
     if !policy.workspace() {
         request.workspace_label = None;
         request.workspace_label_source = None;
@@ -315,6 +418,9 @@ pub(crate) fn filter_footprint(
     if let Some(inventory) = request.instruction_inventory.as_mut() {
         inventory.files = withheld_files();
     }
+    if rules.names_withheld {
+        request.names_withheld = Some(NamesWithheld::of(request));
+    }
     let had_names = !request.memory_files.is_empty()
         || !request.skills.is_empty()
         || !request.custom_agents.is_empty()
@@ -325,7 +431,12 @@ pub(crate) fn filter_footprint(
         request.custom_agents.clear();
         request.mcp_tools.clear();
         let categories = serde_json::to_string(&request.categories).unwrap_or_default();
-        request.config_hash = sha256_hex(&[request.counter_source.as_str(), categories.as_str()]);
+        let withheld = serde_json::to_string(&request.names_withheld).unwrap_or_default();
+        request.config_hash = sha256_hex(&[
+            request.counter_source.as_str(),
+            categories.as_str(),
+            withheld.as_str(),
+        ]);
     }
 }
 

@@ -881,6 +881,7 @@ impl Env {
             destination: "device|machine|api",
             policy: crate::snapshots::SnapshotUploadPolicy::default(),
             details_enabled: false,
+            names_withheld: false,
         });
         fs::create_dir_all(&self.root).unwrap();
         run_source(&mut run, source, std::slice::from_ref(&self.root), target)
@@ -3171,6 +3172,7 @@ fn upload_labels_need_a_fetched_hint_that_allows_them() {
             destination: "device|machine|api",
             policy,
             details_enabled: false,
+            names_withheld: false,
         };
         let (request, _) =
             super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
@@ -3355,6 +3357,7 @@ fn a_maximal_upload_meets_the_server_field_rules() {
         destination: "device|machine|api",
         policy: crate::snapshots::SnapshotUploadPolicy::default(),
         details_enabled: false,
+        names_withheld: false,
     };
     let (request, dropped) =
         super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);

@@ -21,7 +21,7 @@ use crate::snapshots::line_delivery::{
 };
 use crate::snapshots::{SnapshotSource, SnapshotUploadPolicy};
 use crate::transcript_acquisition::FileObject;
-use crate::upload_policy::{filter_footprint, remembered_policy};
+use crate::upload_policy::{filter_footprint, FootprintRules, NamesWithheld};
 use anyhow::{anyhow, Result};
 use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,8 @@ pub(crate) struct ContextFootprintIngestRequest {
     /// Claude Code only; see `instruction_inventory`. Absent means unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) instruction_inventory: Option<InstructionInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) names_withheld: Option<NamesWithheld>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,7 +321,7 @@ fn harvest_source(
                 &identity,
                 home,
                 machine_id,
-                remembered_policy(support_dir, &identity, Some(&hint)),
+                FootprintRules::for_pass(support_dir, &identity, Some(&hint)),
                 inventory_paths(Some(&hint)),
                 projection,
             );
@@ -337,7 +339,7 @@ fn harvest_source(
         &identity,
         home,
         machine_id,
-        remembered_policy(support_dir, &identity, None),
+        FootprintRules::for_pass(support_dir, &identity, None),
         inventory_paths(None),
         projection,
     )
@@ -366,7 +368,7 @@ fn harvest_recent_workspaces(
     identity: &str,
     home: &Path,
     machine_id: &str,
-    policy: SnapshotUploadPolicy,
+    rules: FootprintRules,
     inventory_paths: Option<InventoryPaths>,
     projection: &CwdProjection,
 ) -> Result<ContextHarvestOutcome> {
@@ -401,7 +403,7 @@ fn harvest_recent_workspaces(
             &workspace.path,
             machine_id,
             &env,
-            policy.workspace(),
+            rules.policy.workspace(),
             inventory_paths,
             include_mcp_servers,
             home,
@@ -414,7 +416,7 @@ fn harvest_recent_workspaces(
                     support_dir,
                     identity,
                     &mut request,
-                    policy,
+                    rules,
                 ) {
                     Ok(true) => uploaded += 1,
                     Ok(false) => skipped += 1,
@@ -529,6 +531,7 @@ fn build_request_for_workspace(
         custom_agents: parsed.custom_agents,
         mcp_tools: parsed.mcp_tools,
         instruction_inventory,
+        names_withheld: None,
     })
 }
 
@@ -1535,9 +1538,9 @@ pub(crate) fn upload_if_changed(
     support_dir: &Path,
     identity: &str,
     request: &mut ContextFootprintIngestRequest,
-    policy: SnapshotUploadPolicy,
+    rules: FootprintRules,
 ) -> Result<bool> {
-    filter_footprint(request, policy);
+    filter_footprint(request, rules);
     let hash = request_content_hash_for_request(request)?;
     let path = cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();
@@ -1613,6 +1616,10 @@ pub(crate) fn request_content_hash_for_request(
     // (Codex footprints included) and a new block alone forces one upload.
     if let Some(inventory) = &request.instruction_inventory {
         canonical["instruction_inventory"] = serde_json::to_value(inventory)
+            .map_err(|error| anyhow!("hash encode failed: {error}"))?;
+    }
+    if let Some(withheld) = &request.names_withheld {
+        canonical["names_withheld"] = serde_json::to_value(withheld)
             .map_err(|error| anyhow!("hash encode failed: {error}"))?;
     }
     let canonical =
@@ -2742,6 +2749,7 @@ mod tests {
             custom_agents: Vec::new(),
             mcp_tools: Vec::new(),
             instruction_inventory: None,
+            names_withheld: None,
         }
     }
 

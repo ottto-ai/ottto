@@ -77,6 +77,26 @@ impl Fixture {
                 paths.push(path);
             }
         }
+        let label = match source {
+            SnapshotSource::ClaudeCode => "claude-code",
+            _ => "codex",
+        };
+        let composition = self.support.join("context_composition/v2");
+        for name in [
+            format!("index-{label}.json"),
+            format!("index-{label}.json.1.2.tmp"),
+            format!("install-{label}.json"),
+            format!("scopes/{label}-scope.json"),
+            format!("scopes/{label}-scope.upload.json"),
+            format!("scopes/{label}-scope.totals.1.zst"),
+            format!("quarantined-scopes/{label}-scope.json"),
+            format!("quarantine/{label}-scope-1/{label}-scope.json"),
+        ] {
+            let path = composition.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, CANARY).unwrap();
+            paths.push(path);
+        }
         paths
     }
     /// One Claude session with two priced requests; the source already on v2.
@@ -165,6 +185,14 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
     let codex = f.canaries(SnapshotSource::Codex);
     let claude = f.canaries(SnapshotSource::ClaudeCode);
     let rows = f.destination.join("claude_code-rows-scan-index.json");
+    let composition = f.support.join("context_composition");
+    let shared = [
+        composition.join("v2/run.json"),
+        composition.join("disabled"),
+    ];
+    for path in &shared {
+        fs::write(path, CANARY).unwrap();
+    }
     let (root, now) = f.transcript();
     let (index, _) = cold_full(&root, &now, ScanIndex::default());
     let live = state_v2::money_test_support::publish(&index, &rows, &progress_bytes());
@@ -183,6 +211,7 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
     assert_eq!(f.erase(SnapshotSource::Codex), 0);
     assert_gone(&codex);
     assert_kept(&claude);
+    assert_kept(&shared);
     let marker = source_marker(&f.support, SnapshotSource::Codex);
     assert_eq!(marker.as_deref(), Some("done"));
     assert_eq!(source_marker(&f.support, SnapshotSource::ClaudeCode), None);

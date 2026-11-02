@@ -322,7 +322,10 @@ With Readable labels off:
 - Per-item names are not uploaded: skills, custom agents, memory and instruction
   files, MCP servers and tools, and the files that entered a session's context.
   Token totals per category still upload, so "MCP tools use 12k tokens" stays
-  visible without naming a tool.
+  visible without naming a tool. Once the server accepts them, unnamed counts and
+  token totals per kind upload too: sizes and counts, not names, and not anonymity.
+- Per-skill attribution identifiers are not uploaded. Prompt and template grouping
+  identifiers still are, so repeated workflows keep grouping.
 - Tool activity keeps its call counts, with every MCP tool counted under one
   hidden name. Agent roles outside the providers' built-in set are sent as
   `custom`.
@@ -333,6 +336,27 @@ group a user's sessions, and an unchanged path always gives the same hash.
 
 Turning the setting off applies going forward; names uploaded earlier are not
 recalled by the daemon.
+
+The filter **always sends**: it never refuses, drops or delays a body because a
+toggle is off. Transport errors, authentication, money and proof validation, source
+authorization and the server's stale-policy check can still reject a request; that
+is not the filter. A retry inside one upload pass can carry the earlier policy's
+bytes once after a setting changes, and the server rejects those bytes.
+
+## Local Erasure
+
+**Removing a source** erases, for that source only: its scan indexes and durable
+state in `snapshots`, and its active-session, detected-use, MCP inventory and
+context composition state.
+
+**Forget installation** erases, for every source: the whole `snapshots` folder,
+backfill state and upload receipts, the same active-session, detected-use and MCP
+inventory caches, and all context composition state. It also clears the installation
+identity and credentials.
+
+Neither erases your agents' own transcripts or source data, opt-out markers, or
+label-free bookkeeping: counts-only composition run records, footprint upload hashes
+and the remembered privacy settings.
 
 ## Live Telemetry
 

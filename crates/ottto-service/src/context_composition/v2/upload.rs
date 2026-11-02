@@ -66,6 +66,15 @@ pub(super) struct UploadTarget<'a> {
     pub(super) destination: &'a str,
     pub(super) policy: SnapshotUploadPolicy,
     pub(super) details_enabled: bool,
+    /// The server accepts withheld totals.
+    pub(super) names_withheld: bool,
+}
+
+impl UploadTarget<'_> {
+    /// Whether this upload replaces its file rows with `top_files_withheld`.
+    fn sends_files_withheld(&self) -> bool {
+        self.names_withheld && !self.policy.names()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +85,8 @@ pub(super) struct UploadAck {
     /// upgrade alone does not resend every scope.
     #[serde(default)]
     pub(super) names_enabled: Option<bool>,
+    #[serde(default)]
+    pub(super) files_withheld: bool,
     pub(super) generation: u64,
     pub(super) state_sha: String,
     pub(super) posted_at: i64,
@@ -86,6 +97,7 @@ impl UploadAck {
     /// Whether the same totals would now upload differently.
     pub(super) fn upload_shape_changed(&self, target: &UploadTarget) -> bool {
         self.details_enabled != target.details_enabled
+            || self.files_withheld != target.sends_files_withheld()
             || self
                 .names_enabled
                 .is_some_and(|names| names != target.policy.names())
@@ -165,7 +177,12 @@ pub(super) fn upload_scope(
     if !stale && !changed && !shape_changed {
         return UploadResult::only(UploadOutcome::Unchanged);
     }
-    let state_sha = state_sha(scope, target.policy.names(), target.details_enabled);
+    let state_sha = state_sha(
+        scope,
+        target.policy.names(),
+        target.details_enabled,
+        target.sends_files_withheld(),
+    );
     if let Some(ack) = ack
         .as_ref()
         .filter(|ack| !stale && ack.state_sha == state_sha)
@@ -202,6 +219,7 @@ pub(super) fn upload_scope(
     let ack = UploadAck {
         details_enabled: target.details_enabled,
         names_enabled: Some(target.policy.names()),
+        files_withheld: target.sends_files_withheld(),
         generation: scope.generation,
         state_sha,
         posted_at: now_secs,
@@ -216,7 +234,12 @@ pub(super) fn upload_scope(
 /// Hash of everything an upload is built from (not the commit generations),
 /// written straight into the hash. The same value as `sha256_hex` over the
 /// stored totals, the scope info and the labels setting.
-fn state_sha(scope: &Scope, labels_enabled: bool, details_enabled: bool) -> String {
+fn state_sha(
+    scope: &Scope,
+    labels_enabled: bool,
+    details_enabled: bool,
+    files_withheld: bool,
+) -> String {
     use sha2::{Digest, Sha256};
     struct Hashing(Sha256);
     impl std::io::Write for Hashing {
@@ -246,6 +269,9 @@ fn state_sha(scope: &Scope, labels_enabled: bool, details_enabled: bool) -> Stri
     hashing.0.update([0]);
     if details_enabled {
         hashing.0.update(DETAILS_CONTRACT.as_bytes());
+    }
+    if files_withheld {
+        hashing.0.update(b"\0top_files_withheld");
     }
     format!("{:x}", hashing.0.finalize())
 }
@@ -343,6 +369,15 @@ pub(super) struct ToolRow {
     pub(super) tokens_entered_est: u64,
 }
 
+/// Every kept file's totals while their names are not sent. No session count:
+/// distinct sessions do not add up across files.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub(super) struct TopFilesWithheld {
+    pub(super) files: u64,
+    pub(super) events: u64,
+    pub(super) tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct RequestV2 {
     pub(super) agent_source: String,
@@ -373,6 +408,8 @@ pub(super) struct RequestV2 {
     /// Omitted, not empty, while names are hidden: `[]` means measured empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) top_files: Option<Vec<FileRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_files_withheld: Option<TopFilesWithheld>,
     pub(super) sessions: Vec<SessionRow>,
     pub(super) kinds_version: u8,
     pub(super) parts: Vec<PartRow>,
@@ -587,6 +624,9 @@ pub(super) fn build_request(
         counter_source: COUNTER_SOURCE.to_string(),
         daily_aggregates,
         top_files: names.then(|| build_files(scope, window, false, &mut dropped)),
+        top_files_withheld: target
+            .sends_files_withheld()
+            .then(|| files_withheld(scope, window)),
         sessions,
         kinds_version: 2,
         parts: build_parts(scope, window, names, &mut dropped),
@@ -812,6 +852,28 @@ fn build_files(
     recent_only: bool,
     dropped: &mut Dropped,
 ) -> Vec<FileRow> {
+    let mut rows = all_file_rows(scope, window, recent_only, dropped);
+    rows.truncate(UPLOAD_TOP_FILES);
+    count_file_sessions(scope, window, &mut rows);
+    rows
+}
+
+/// Summed before the top-file cut, over the rows names-on would rank.
+fn files_withheld(scope: &Scope, window: Window) -> TopFilesWithheld {
+    let rows = all_file_rows(scope, window, false, &mut Dropped::default());
+    TopFilesWithheld {
+        files: rows.len() as u64,
+        events: rows.iter().map(|row| row.events).sum(),
+        tokens: rows.iter().map(|row| row.tokens_entered_est).sum(),
+    }
+}
+
+fn all_file_rows(
+    scope: &Scope,
+    window: Window,
+    recent_only: bool,
+    dropped: &mut Dropped,
+) -> Vec<FileRow> {
     let agg = &scope.agg;
     // Names were resolved when their lines were read; this only keeps the
     // server's rules. A top file is a file read (a `files_read` part).
@@ -901,8 +963,6 @@ fn build_files(
             .cmp(&a.tokens_entered_est)
             .then_with(|| a.relative_path_or_name.cmp(&b.relative_path_or_name))
     });
-    rows.truncate(UPLOAD_TOP_FILES);
-    count_file_sessions(scope, window, &mut rows);
     rows
 }
 

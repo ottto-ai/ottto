@@ -173,6 +173,40 @@ fn names_off_merges_mcp_names_and_keeps_totals_and_provider_vocabulary() {
 }
 
 #[test]
+fn names_off_drops_skill_ids_and_keeps_template_group_ids() {
+    let facts = |policy: SnapshotUploadPolicy| {
+        let mut item = seeded();
+        let mut fact = item.attribution_facts.remove(0);
+        fact.display_label = None;
+        fact.display_label_source = None;
+        for field in ["skill_id", "template_group_id"] {
+            fact.field = field.to_string();
+            fact.value = format!("hmac-sha256:v1:{field}");
+            item.attribution_facts.push(fact.clone());
+        }
+        let mut items = vec![item];
+        apply_upload_policy(SnapshotSource::ClaudeCode, &mut items, policy);
+        items.remove(0).attribution_facts
+    };
+    let off = facts(SnapshotUploadPolicy {
+        session_attribution_enabled: true,
+        ..SnapshotUploadPolicy::MOST_PRIVATE
+    });
+    assert_eq!(off.len(), 1);
+    assert_eq!(off[0].field, "template_group_id");
+    let on = facts(SnapshotUploadPolicy {
+        session_titles_enabled: true,
+        workspace_labels_enabled: true,
+        session_attribution_enabled: true,
+        ..SnapshotUploadPolicy::MOST_PRIVATE
+    });
+    assert_eq!(on.len(), 2);
+    assert_eq!(on[0].field, "skill_id");
+    assert_eq!(on[0].value, "hmac-sha256:v1:skill_id");
+    assert_eq!(on[1], off[0], "template ids are the same either way");
+}
+
+#[test]
 fn each_gated_label_follows_its_rule_on_the_wire() {
     let link = seeded().session_artifacts[0].value.clone();
     for policy in every_policy() {

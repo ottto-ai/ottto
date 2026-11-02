@@ -59,7 +59,7 @@ use super::{
 use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
-use crate::upload_policy::remembered_policy;
+use crate::upload_policy::{names_withheld_accepted, remembered_policy};
 use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +72,53 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
     support_dir.join("context_composition").join(STATE_DIR)
+}
+
+/// Source removal: every file this source owns in the composition state, shared
+/// counts-only run records and opt-out markers kept. A running worker holds the
+/// lease and is finishing its run, so busy is an error the erase turn retries.
+pub(crate) fn erase_source_state(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let dir = state_dir(support_dir);
+    let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
+    let label = agent_source_label(source);
+    let prefixes = [
+        format!("{label}-"),
+        format!("index-{label}."),
+        format!("install-{label}."),
+    ];
+    for folder in [
+        dir.join("scopes"),
+        dir.join("quarantined-scopes"),
+        dir.join("quarantine"),
+        dir,
+    ] {
+        if !folder.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&folder)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        super::checkpoint::sync_dir(&folder)?;
+    }
+    Ok(())
+}
+
+/// Forget: the whole composition state. Opt-out markers live one folder up.
+pub(crate) fn erase_all_state(support_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(state_dir(support_dir)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -554,6 +601,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
         let mut hint_policy = None;
         let mut details_enabled = false;
+        let mut names_withheld = false;
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
@@ -567,6 +615,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                     details_enabled = super::upload::details_enabled(
                         hint.context_composition_details_contract.as_deref(),
                     );
+                    names_withheld = names_withheld_accepted(Some(&hint));
                 }
                 Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
                     health.remove(agent_source_label(snapshot_source));
@@ -590,6 +639,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             destination: &destination,
             policy,
             details_enabled,
+            names_withheld,
         });
         let agent = agent_source_label(snapshot_source);
         health.set(HealthEntry::started(agent, OffsetDateTime::now_utc()));
