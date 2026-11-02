@@ -488,7 +488,6 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 /// invalidated, and its family is marked `contract_unproven` (counted).
 #[test]
 fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
-    let _on = evidence_owed::EvidenceOwedForTest::on();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -633,7 +632,7 @@ fn record_read(index: &mut ScanIndex, key: &str, source: &str) {
     entry.evidence_owed = false;
 }
 
-/// [behaviour] Evidence owed ON, the identity-contract re-arm owes and paces:
+/// [behaviour] The identity-contract re-arm owes and paces:
 /// every family file keeps its revision, owed and counted, instead of main's
 /// clear, and older-contract pending never re-stamps. Here one owed read
 /// fits a page, so the family files drain one per page, each read once,
@@ -642,7 +641,6 @@ fn record_read(index: &mut ScanIndex, key: &str, source: &str) {
 /// room). Every family file is read exactly once, as a cold Full reads it.
 #[test]
 fn identity_contract_rearm_owes_and_drains_to_a_full() {
-    let _on = evidence_owed::EvidenceOwedForTest::on();
     for held in [false, true] {
         let mut rearm = Rearm::new();
         let mut index = rearm.index();
@@ -767,7 +765,6 @@ fn hex_sources(rearm: &mut Rearm, index: &mut ScanIndex) {
 fn identity_owed_member_is_read_once_under_the_latch() {
     const NEXT: &str = "2026-08-02T07:11:00Z";
     const LATER: &str = "2026-08-02T07:12:00Z";
-    let _on = evidence_owed::EvidenceOwedForTest::on();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -839,7 +836,6 @@ fn contract_change_inside_a_window_reads_its_records_once() {
     const W: &str = "2026-08-02T07:09:00Z";
     const NEXT: &str = "2026-08-02T07:11:00Z";
     const LATER: &str = "2026-08-02T07:12:00Z";
-    let _on = evidence_owed::EvidenceOwedForTest::on();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -917,26 +913,22 @@ fn contract_change_inside_a_window_reads_its_records_once() {
     );
 }
 
-/// [regress] The first complete census's full re-arm clears every family
-/// file, again on a 1-24 h backoff while the fence stays closed. OFF the fold
-/// clears exactly as main; ON it owes the same files, keeping
-/// their fingerprints, so the owed resolver (re-stamp, restore, paced Full)
-/// decides each one at the next walk.
+/// [regress] The first complete census's full re-arm cleared every family
+/// file, again on a 1-24 h backoff while the fence stays closed. It owes the
+/// same files instead, keeping their fingerprints, so the owed resolver
+/// (re-stamp, restore, paced Full) decides each one at the next walk.
 #[test]
 fn evidence_owed_first_census_fold_owes_instead_of_clearing() {
-    for on in [false, true] {
-        let _on = on.then(evidence_owed::EvidenceOwedForTest::on);
-        let rearm = Rearm::new();
-        let mut index = rearm.index();
-        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let first = rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
-        assert!(first.duplicate_census.full_rearm, "on={on}");
-        for key in rearm.sources.keys() {
-            let entry = &index.files[key];
-            assert!(entry.rearmed(), "on={on} {key}");
-            assert_eq!(entry.evidence_owed, on, "{key}");
-            assert_eq!(entry.source_file_fingerprint.is_empty(), !on, "{key}");
-        }
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+    let first = rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    assert!(first.duplicate_census.full_rearm);
+    for key in rearm.sources.keys() {
+        let entry = &index.files[key];
+        assert!(entry.rearmed(), "{key}");
+        assert!(entry.evidence_owed, "{key}");
+        assert!(!entry.source_file_fingerprint.is_empty(), "{key}");
     }
 }
 

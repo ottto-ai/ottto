@@ -70,23 +70,23 @@ pub(super) struct Starting {
     pub(super) stale_rearm_capped_families: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) stale_rearm_capped_files: usize,
-    /// Evidence owed ON: an unfinished retry admission this start dropped,
+    /// An unfinished retry admission this start dropped,
     /// and one kept as its due cursor only. Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) admissions_dropped: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) due_retained: usize,
-    /// Evidence owed ON: a context change that only added roots, changed the
+    /// A context change that only added roots, changed the
     /// backfill or the active upload context owes evidence instead of
     /// clearing (1). Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) context_change_owed: usize,
-    /// Evidence owed ON: families exempted from an identity-contract latch
+    /// Families exempted from an identity-contract latch
     /// clear while quarantined, still waiting to prove their contract.
     /// Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) contract_unproven_families: usize,
-    /// Evidence owed ON: request occurrences of pending kept from earlier
+    /// Request occurrences of pending kept from earlier
     /// windows at this start. They use the shared pending occurrence cap a new
     /// window's families and owed cap-room reads also need. Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -95,7 +95,7 @@ pub(super) struct Starting {
 }
 
 impl Starting {
-    /// This start's re-arm owes evidence (keeps the fingerprint) under ON.
+    /// This start's re-arm owes evidence (keeps the fingerprint).
     pub(super) fn owes(&self) -> bool {
         super::evidence_owed::owes(self.rearm_cause()) || self.context_change_owed != 0
     }
@@ -132,7 +132,6 @@ impl Starting {
                 .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
                 .flatten(),
         );
-        let owed = super::evidence_owed::enabled();
         Self {
             prior_held_family_roots,
             prior_held_family_set_digest,
@@ -164,25 +163,17 @@ impl Starting {
             admissions_dropped: 0,
             due_retained: 0,
             context_change_owed: 0,
-            contract_unproven_families: if owed {
-                index
-                    .claude_usage_family_pending
-                    .views()
-                    .filter(|(_, pending)| pending.contract_unproven())
-                    .count()
-            } else {
-                0
-            },
-            stale_pending_occurrences: if owed {
-                index
-                    .claude_usage_family_pending
-                    .views()
-                    .filter(|(_, pending)| pending.window() != now)
-                    .map(|(_, pending)| pending.occurrences())
-                    .fold(0, usize::saturating_add)
-            } else {
-                0
-            },
+            contract_unproven_families: index
+                .claude_usage_family_pending
+                .views()
+                .filter(|(_, pending)| pending.contract_unproven())
+                .count(),
+            stale_pending_occurrences: index
+                .claude_usage_family_pending
+                .views()
+                .filter(|(_, pending)| pending.window() != now)
+                .map(|(_, pending)| pending.occurrences())
+                .fold(0, usize::saturating_add),
         }
     }
 

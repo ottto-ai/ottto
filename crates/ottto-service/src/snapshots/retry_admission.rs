@@ -1,5 +1,5 @@
-// Bounded scheduling for a history whose whole cancellation reserve cannot fit.
-// Uncovered families are deferred, not rearmed or promoted into census proof.
+// Service of a retry admission an earlier build saved: a start keeps only its
+// unoffered due cursor (`evidence_owed::due_only`) and no start makes a new one.
 const CLAUDE_RETRY_ADMISSION_ROOTS: usize = 128;
 const CLAUDE_RETRY_DUE_PATHS: usize = 64;
 
@@ -17,175 +17,11 @@ fn claude_retry_record_due(
             .is_some_and(|correction| !correction.owed_member_ids.is_empty())
 }
 
-fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
-    if !index.persistence_available() {
-        return false;
-    }
-
-    let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-    let served = index
-        .traversal
-        .as_ref()
-        .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
-        .unwrap_or_default();
-    index
-        .claude_usage_authority_quarantine
-        .values()
-        .any(|record| claude_retry_record_due(record, now, served))
-}
-
-#[cfg(test)]
-fn claude_retry_admit_batch(
-    index: &ScanIndex,
-    stale: &BTreeSet<String>,
-    previous: Option<&ClaudeRetryAdmission>,
-    collected_at: &str,
-) -> (
-    ClaudeStaleFamilyCarry,
-    BTreeSet<String>,
-    ClaudeRetryAdmission,
-) {
-    claude_retry_admit_batch_observed(
-        index,
-        stale,
-        previous,
-        collected_at,
-        &mut Default::default(),
-        claude_contract_debt_scope(index),
-    )
-}
-
-fn claude_retry_admit_batch_observed(
-    index: &ScanIndex,
-    stale: &BTreeSet<String>,
-    previous: Option<&ClaudeRetryAdmission>,
-    collected_at: &str,
-    diagnostics: &mut StaleCarryRejectionCounts,
-    debt_scope: Option<&BTreeSet<String>>,
-) -> (
-    ClaudeStaleFamilyCarry,
-    BTreeSet<String>,
-    ClaudeRetryAdmission,
-) {
-    *diagnostics = StaleCarryRejectionCounts::default();
-    let mut state = previous
-        .filter(|state| {
-            !(state.complete
-                || (state.roots_complete
-                    && state.storage_deferred
-                    && state.oversized_root.is_none()
-                    && state.due_complete))
-        })
-        .cloned()
-        .unwrap_or_else(|| claude_retry_admission_start(index, stale, collected_at, previous));
-    if !index.persistence_available() {
-        state.complete = false;
-        state.roots_complete = false;
-        state.storage_deferred = true;
-        state.progressed = false;
-        return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
-    }
-    state.progressed = false;
-    let lower = state
-        .after_root
-        .clone()
-        .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    let mut batch = stale
-        .range((lower, std::ops::Bound::Included(state.upper_root.clone())))
-        .take(CLAUDE_RETRY_ADMISSION_ROOTS)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    loop {
-        if batch.is_empty() {
-            state.roots_complete = true;
-            state.complete =
-                state.oversized_root.is_none() && state.due_complete && !state.storage_deferred;
-            state.progressed = true;
-            return (ClaudeStaleFamilyCarry::default(), batch, state);
-        }
-        let mut attempt = StaleCarryRejectionCounts::default();
-        match claude_stream_accepted_retry_carry_observed(index, &batch, &mut attempt, debt_scope) {
-            Ok(carry) => {
-                *diagnostics = attempt;
-                state.after_root = batch.last().cloned();
-                state.roots_complete = state.after_root.as_ref().is_some_and(|after| {
-                    !stale
-                        .iter()
-                        .any(|root| root > after && root <= &state.upper_root)
-                });
-                state.complete = state.roots_complete
-                    && state.oversized_root.is_none()
-                    && state.due_complete
-                    && !state.storage_deferred;
-                state.progressed = true;
-                eprintln!("local snapshot census advanced bounded Claude retry admission: covered_families={} carried_families={} complete={}; uncovered pending remains unchanged", batch.len(), carry.roots.len(), state.complete);
-                return (carry, batch, state);
-            }
-            Err(ClaudeRetryAdmissionRefusal::Structure) if batch.len() > 1 => {
-                let keep = batch.len().div_ceil(2);
-                while batch.len() > keep {
-                    batch.pop_last();
-                }
-            }
-            Err(ClaudeRetryAdmissionRefusal::Structure) => {
-                *diagnostics = attempt;
-                // One bounded, durable fallback at a time. Later fitting roots
-                // can advance while it is served; another oversized root waits
-                // here instead of losing its obligation or growing a debt map.
-                let root = batch.first().expect("singleton");
-                if claude_retry_singleton_storage_only_scoped(index, root, debt_scope) {
-                    // Structural refusal alone is no read obligation. Retain
-                    // uncovered custody and let later roots make progress.
-                    // The boolean is scheduling debt, never carry eligibility.
-                    if index.claude_request_identity_contract_changed {
-                        claude_contract::note(|counts| counts.deferred_by_contract_debt += 1);
-                    }
-                    state.storage_deferred = true;
-                    state.after_root = Some(root.clone());
-                    state.roots_complete = !stale
-                        .iter()
-                        .any(|later| later > root && later <= &state.upper_root);
-                    state.complete = false;
-                    state.progressed = true;
-                    return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
-                }
-                if state
-                    .oversized_root
-                    .as_ref()
-                    .is_some_and(|owed| owed != root)
-                {
-                    return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
-                }
-                state.oversized_root = Some(root.clone());
-                state.after_root = Some(root.clone());
-                state.roots_complete = !stale
-                    .iter()
-                    .any(|later| later > root && later <= &state.upper_root);
-                state.complete = false;
-                state.progressed = true;
-                eprintln!("local snapshot census retained one oversized Claude retry family for bounded ordinary service; coverage remains incomplete");
-                return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
-            }
-            Err(_) => {
-                *diagnostics = attempt;
-                return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
-            }
-        }
-    }
-}
-
 // Recheck the existing accepted-family predicates without allocating its
 // all-member carry/cancellation buffers. A fixed 128-identity stack page sorts
 // borrowed identities, counts duplicate occurrences and validates pending keys.
 // Rescans are finite (ceil(members / 128)), with no heap growth or proof grant.
 fn claude_retry_singleton_storage_only(index: &ScanIndex, root: &str) -> bool {
-    claude_retry_singleton_storage_only_scoped(index, root, None)
-}
-fn claude_retry_singleton_storage_only_scoped(
-    index: &ScanIndex,
-    root: &str,
-    debt_scope: Option<&BTreeSet<String>>,
-) -> bool {
     let Some(pending) = index.claude_usage_family_pending.view(root) else {
         return false;
     };
@@ -204,7 +40,7 @@ fn claude_retry_singleton_storage_only_scoped(
         };
         count += 1;
         root_present |= member.subagent_stem.is_none();
-        if !claude_stale_member_accepted_retry_evidence(index, key, entry, pending, debt_scope) {
+        if !claude_stale_member_accepted_retry_evidence(index, key, entry, pending, None) {
             return false;
         }
     }
@@ -539,43 +375,5 @@ fn claude_retry_note_offered(
     }
     if oversized_after.is_some() {
         state.oversized_after_path = oversized_after;
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static RETRY_ADMISSION_REFUSE_MULTI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-fn retry_admission_tests_refuse_multi() -> bool {
-    RETRY_ADMISSION_REFUSE_MULTI.with(std::cell::Cell::get)
-}
-
-fn claude_retry_admission_start(
-    index: &ScanIndex,
-    stale: &BTreeSet<String>,
-    collected_at: &str,
-    previous: Option<&ClaudeRetryAdmission>,
-) -> ClaudeRetryAdmission {
-    ClaudeRetryAdmission {
-        after_root: None,
-        upper_root: stale.last().cloned().unwrap_or_default(),
-        complete: false,
-        roots_complete: false,
-        progressed: false,
-        served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
-            index
-                .traversal
-                .as_ref()
-                .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
-                .unwrap_or_default()
-        }),
-        due_through: rfc3339_unix_seconds(collected_at).unwrap_or_default(),
-        due_after_path: None,
-        due_upper_path: index.files.keys().next_back().cloned(),
-        due_complete: false,
-        oversized_root: None,
-        oversized_after_path: None,
-        storage_deferred: false,
     }
 }

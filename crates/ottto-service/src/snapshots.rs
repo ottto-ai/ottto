@@ -2412,7 +2412,7 @@ struct ClaudeFullRearmProgress {
     /// The `""` cutover's latch re-arms at one terminal.
     #[serde(skip_serializing_if = "is_zero_u8")]
     contract_cutover: u8,
-    /// Evidence owed ON: census window (unix seconds) of the first traversal
+    /// Evidence owed: census window (unix seconds) of the first traversal
     /// started under the recorded identity contract. A change inside a
     /// window records a placeholder, so this is the next window: a census
     /// record of this window or later was parsed under the recorded contract.
@@ -2771,7 +2771,7 @@ struct ScanTraversalCheckpoint {
     /// counts name their files instead of silently folding them into totals.
     #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
     residue: ScanTraversalResidue,
-    /// Claude with evidence owed ON: what this traversal started under (no
+    /// Claude: what this traversal started under (no
     /// root paths), so the next start can tell a context change that owes
     /// evidence from one that must clear. Read only by evidence owed.
     #[serde(
@@ -4648,10 +4648,10 @@ pub struct ScanIndexEntry {
     /// Local-only exact current-context acceptance. Appended for old readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upload_context_receipt: Option<upload_context_receipt::Receipt>,
-    /// Evidence owed ON: a census re-arm kept `source_file_fingerprint` and
+    /// Evidence owed: a census re-arm kept `source_file_fingerprint` and
     /// owes this file's request evidence to the current census window. Only
     /// census-window debt is kept this way; a read the file really needs
-    /// clears the fingerprint as main does. Never set while the switch is OFF.
+    /// clears the fingerprint as main does.
     /// An older v1 binary drops the bit and treats such entries as observed;
     /// debt that keeps main's clear stays visible to it as an empty
     /// fingerprint, owed debt (the identity-contract re-arm included) does
@@ -5166,7 +5166,7 @@ struct ClaudeUsageFamilyPending {
         deserialize_with = "deserialize_lenient_default"
     )]
     identity_contract: Option<evidence_owed::EvidenceContract>,
-    /// Evidence owed ON: the identity-contract latch cleared while this family
+    /// Evidence owed: the identity-contract latch cleared while this family
     /// was held in authority quarantine, which keeps its older-contract pending
     /// on purpose. It may re-stamp only through its own contract stamp, never
     /// through the cleared latch; cleared when its pending is rebuilt. Bounded
@@ -6146,12 +6146,6 @@ fn claude_stream_accepted_retry_carry_inner(
     .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(path_bytes)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
-    // Tests may refuse an otherwise priced multi-root start; the actual
-    // structural math above still runs unchanged before this scheduling seam.
-    #[cfg(test)]
-    if stale.len() > 1 && retry_admission_tests_refuse_multi() {
-        return Err(ClaudeRetryAdmissionRefusal::Structure);
-    }
     if !claude_family_carry_cancellation_admitted(
         0,
         0,
@@ -9524,7 +9518,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             index.claude_usage_family_pending.loaded_all(),
             legacy_request_owners.as_ref(),
         );
-        // Evidence owed ON: owed evidence, including a re-stamp under the
+        // Owed evidence, including a re-stamp under the
         // identity-contract latch, proves nothing until it resolves.
         let owed_roots = evidence_owed::owed_roots(index);
         for (root_session_id, members) in &complete_families {
@@ -10317,12 +10311,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
-        // Evidence owed ON: a mid-walk contract change records
-        // a placeholder, so a recorded current contract means this window's
-        // evidence was parsed under it. With no older evidence left there is
-        // nothing to mix; the latch clears before its full re-arm. Counted.
-        if let Some(exempt) = (evidence_owed::enabled()
-            && index.claude_request_identity_contract_changed
+        // A mid-walk contract change records a placeholder, so a recorded
+        // current contract means this window's evidence was parsed under it.
+        // With no older evidence left there is nothing to mix; the latch
+        // clears before its full re-arm. Counted.
+        if let Some(exempt) = (index.claude_request_identity_contract_changed
             && index.claude_request_identity_contract.as_deref() == Some(contract))
         .then(|| {
             evidence_owed::latch_clearable(index, census_window_end, &indexed_claude_family_ids)
@@ -10601,7 +10594,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ..Default::default()
         };
         let mut preserved = 0;
-        let guard = evidence_owed::enabled();
         let census_window = rfc3339_unix_seconds(census_window_end);
         let contract_window = index.claude_full_rearm_progress.identity_contract_window;
         for (index_key, entry) in index.files.slots_mut() {
@@ -10635,24 +10627,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     .is_some_and(|request_hashes| {
                         !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                     });
-            // Evidence owed ON: a revision read in this window, or in any
-            // window from the first one started under the recorded contract,
-            // was read under that contract (a change within a walk leaves it
-            // unrecorded and this re-arm off). The identity-contract re-arm
+            // A revision read in this window, or in any window from the first
+            // one started under the recorded contract, was read under that
+            // contract (a change within a walk leaves it unrecorded and this
+            // re-arm off). The identity-contract re-arm
             // does not owe it again, so one read clears that debt even when
             // its family stays cap-invalid.
             let record = index.claude_request_census.get(index_key);
             let identity_contract_rearm = identity_contract_rearm
-                && !(guard
-                    && census_window.is_some_and(|window| {
-                        record.is_some_and(|record| {
-                            record.reproduces_since(
-                                &entry.source_file_fingerprint,
-                                window,
-                                contract_window,
-                            )
-                        })
-                    }));
+                && !census_window.is_some_and(|window| {
+                    record.is_some_and(|record| {
+                        record.reproduces_since(
+                            &entry.source_file_fingerprint,
+                            window,
+                            contract_window,
+                        )
+                    })
+                });
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
@@ -10694,15 +10685,14 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 // once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
-                // Evidence owed ON: a census-only re-arm owes instead of
-                // clearing and is resolved by a bound re-stamp. A changed
-                // witness or duplicate owner must be read: main's clear, so an
-                // older reader still sees the debt. The identity-contract
+                // A census-only re-arm owes instead of clearing and is
+                // resolved by a bound re-stamp. A changed witness or duplicate
+                // owner must be read: main's clear, so an older reader still
+                // sees the debt. The identity-contract
                 // re-arm is owed and paced too: older-contract pending is
                 // marked `contract_unproven` at the latch clear (or stays
                 // under the latch), so it never re-stamps and is read.
-                if (identity_contract_rearm && !guard)
-                    || invalidated_witness_roots.contains(&root_session_id)
+                if invalidated_witness_roots.contains(&root_session_id)
                     || changed_duplicate_owner
                     || current_member_owns_changed_request
                 {
@@ -10750,22 +10740,20 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
-        // Evidence owed ON: completion retires only families
-        // with a completed family proof; every other indexed family stays owed.
+        // Completion retires only families with a completed family proof;
+        // every other indexed family stays owed.
         index
             .claude_usage_family_pending
             .loaded_all_mut()
             .retain(|root_session_id, pending| {
-                (guard
-                    && evidence_owed::owed_at_completion(
-                        root_session_id,
-                        pending,
-                        proven.contains_key(root_session_id),
-                        &indexed_claude_family_ids,
-                    ))
-                    || index
-                        .claude_usage_authority_quarantine
-                        .contains_key(root_session_id)
+                evidence_owed::owed_at_completion(
+                    root_session_id,
+                    pending,
+                    proven.contains_key(root_session_id),
+                    &indexed_claude_family_ids,
+                ) || index
+                    .claude_usage_authority_quarantine
+                    .contains_key(root_session_id)
             });
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
@@ -31961,7 +31949,7 @@ impl OwnedSourceScan {
                             .origin
                             .as_ref()
                             .and_then(|origin| origin.admission.as_ref())
-                            .map_or(true, |state| state.complete && evidence_owed::enabled()));
+                            .map_or(true, |state| state.complete));
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
@@ -43185,77 +43173,26 @@ fn ensure_bounded_traversal(
         let streaming_carry = streaming_carry
             && !KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get)
             && !REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get);
-        let mut admission = None;
-        let mut covered_roots = None;
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
-        let owed_route = evidence_owed::enabled();
         let carry = if streaming_carry {
-            // Existing scheduling debt survives even if the whole set now fits.
-            // Re-price its batch, but do not discard unoffered service cursors.
-            // Evidence owed ON: an unfinished admission no longer forces the
-            // batch path. The owed resolver pages the stale set instead.
-            let whole = if prior_admission
-                .as_ref()
-                .is_some_and(|state| !state.complete)
-                && !owed_route
-            {
-                Err(ClaudeRetryAdmissionRefusal::Structure)
-            } else {
-                claude_stream_accepted_retry_carry_observed(
-                    index,
-                    &stale_pending_roots,
-                    &mut stale_carry_rejection_counts,
-                    debt_scope,
-                )
-            };
-            match whole {
+            // No batch admission: an unfinished admission keeps only its due
+            // cursor (below), and the owed resolver pages the stale set.
+            match claude_stream_accepted_retry_carry_observed(
+                index,
+                &stale_pending_roots,
+                &mut stale_carry_rejection_counts,
+                debt_scope,
+            ) {
                 Ok(carry) => carry,
-                Err(refusal) if owed_route => {
-                    // No new batch admission: every stale root returns to the
-                    // re-arm below and the resolver; carry credits nothing.
+                Err(refusal) => {
+                    // Every stale root returns to the re-arm below and the
+                    // resolver; carry credits nothing.
                     let accounted = stale_carry_rejection_counts.rejected() as usize;
                     stale_carry_rejection_counts.reject(
                         refusal.into(),
                         stale_pending_roots.len().saturating_sub(accounted),
                     );
                     ClaudeStaleFamilyCarry::default()
-                }
-                Err(refusal) => {
-                    let due = claude_retry_due_family_exists(index, collected_at);
-                    if matches!(refusal, ClaudeRetryAdmissionRefusal::Structure)
-                        || due
-                        || prior_admission.is_some()
-                    {
-                        let (carry, covered, state) = claude_retry_admit_batch_observed(
-                            index,
-                            &stale_pending_roots,
-                            prior_admission.as_ref(),
-                            collected_at,
-                            &mut stale_carry_rejection_counts,
-                            debt_scope,
-                        );
-                        // Discard failed speculative whole/batch attempts. Roots
-                        // outside the selected batch retain its first whole-set
-                        // capacity refusal, never a fabricated evidence failure.
-                        let accounted = stale_carry_rejection_counts
-                            .rejected()
-                            .saturating_add(carry.roots.len() as u64);
-                        stale_carry_rejection_counts.reject(
-                            refusal.into(),
-                            stale_pending_roots.len().saturating_sub(accounted as usize),
-                        );
-                        covered_roots = Some(covered);
-                        admission = Some(state);
-                        carry
-                    } else {
-                        index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
-                        index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
-                        index.claude_full_rearm_progress.held_family_roots =
-                            prior_held_family_roots;
-                        eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
-                        state_v2::settle_usage(index, &BTreeSet::new());
-                        return TraversalProgress::Resumed;
-                    }
                 }
             }
         } else if !window_scratch_admitted {
@@ -43373,11 +43310,7 @@ fn ensure_bounded_traversal(
             else {
                 continue;
             };
-            if entry.rearmed()
-                || covered_roots
-                    .as_ref()
-                    .is_some_and(|covered| !covered.contains(&root))
-            {
+            if entry.rearmed() {
                 continue;
             }
             if carried_roots.contains(&root) {
@@ -43429,11 +43362,7 @@ fn ensure_bounded_traversal(
                 carried_roots.len(),
                 stale_pending_roots
                     .iter()
-                    .filter(|root| !carried_roots.contains(*root)
-                        && !capped_roots.contains(*root)
-                        && covered_roots
-                            .as_ref()
-                            .map_or(true, |covered| covered.contains(*root)))
+                    .filter(|root| !carried_roots.contains(*root) && !capped_roots.contains(*root))
                     .count(),
                 stale_carry_rejection_counts.json(),
             );
@@ -43450,16 +43379,15 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
-        if owed_route {
-            // An unfinished admission keeps only its unoffered due cursor
-            // (its existing owner serves it); otherwise it is dropped.
-            if let Some(state) = prior_admission.as_ref().filter(|state| !state.complete) {
-                if evidence_owed::due_unoffered(index, state, collected_at) {
-                    admission = Some(evidence_owed::due_only(state));
-                    transition.due_retained = 1;
-                } else {
-                    transition.admissions_dropped = 1;
-                }
+        // An unfinished admission keeps only its unoffered due cursor (its
+        // existing owner serves it); otherwise it is dropped.
+        let mut admission = None;
+        if let Some(state) = prior_admission.as_ref().filter(|state| !state.complete) {
+            if evidence_owed::due_unoffered(index, state, collected_at) {
+                admission = Some(evidence_owed::due_only(state));
+                transition.due_retained = 1;
+            } else {
+                transition.admissions_dropped = 1;
             }
         }
         index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
@@ -43627,9 +43555,9 @@ fn ensure_bounded_traversal(
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
         residue: ScanTraversalResidue::default(),
-        context_inputs: (source == SnapshotSource::ClaudeCode && evidence_owed::enabled()).then(
-            || evidence_owed::TraversalContextInputs::capture(index, roots, backfill_window_days),
-        ),
+        context_inputs: (source == SnapshotSource::ClaudeCode).then(|| {
+            evidence_owed::TraversalContextInputs::capture(index, roots, backfill_window_days)
+        }),
         listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
         listing_owed_requeued_unix_seconds: Default::default(),
     });
@@ -47981,52 +47909,6 @@ impl ScanIndex {
     #[cfg(test)]
     pub(crate) fn scan_traversal_in_progress_for_test(&self) -> bool {
         self.traversal.is_some()
-    }
-
-    /// Cheap in-memory custody oracle. No JSON, index clone or disk IO.
-    #[cfg(test)]
-    pub(crate) fn healthy_custody_digest_for_test<'a>(
-        &self,
-        keys: impl Iterator<Item = &'a str>,
-    ) -> [u8; 32] {
-        fn option(digest: &mut Sha256, value: Option<&str>) {
-            digest.update([u8::from(value.is_some())]);
-            if let Some(value) = value {
-                update_length_prefixed(digest, value.as_bytes());
-            }
-        }
-        let mut digest = Sha256::new();
-        update_length_prefixed(&mut digest, b"test:healthy-committed-custody:v1");
-        for key in keys {
-            update_length_prefixed(&mut digest, key.as_bytes());
-            let entry = self.files.get(key).expect("healthy file retains custody");
-            assert!(
-                !entry.source_file_fingerprint.is_empty(),
-                "healthy fingerprint never cleared: {key}"
-            );
-            update_length_prefixed(&mut digest, entry.source_file_fingerprint.as_bytes());
-            option(&mut digest, entry.last_snapshot_fingerprint.as_deref());
-            option(&mut digest, entry.last_upload_body_witness.as_deref());
-            option(&mut digest, entry.scan_identity_version.as_deref());
-            let entities = self
-                .file_snapshot_fingerprints
-                .get(key)
-                .expect("healthy entity set retained");
-            digest.update((entities.len() as u64).to_le_bytes());
-            for entity in entities {
-                update_length_prefixed(&mut digest, entity.as_bytes());
-                let accepted = self.accepted_snapshot_fingerprint_recorded(entity);
-                assert!(accepted, "healthy ACK membership retained: {key}");
-                digest.update([u8::from(accepted)]);
-            }
-            let binding = self.session_account_bindings.get(key);
-            digest.update([u8::from(binding.is_some())]);
-            if let Some(binding) = binding {
-                update_length_prefixed(&mut digest, binding.account_identifier_hash.as_bytes());
-                option(&mut digest, binding.workspace_identifier_hash.as_deref());
-            }
-        }
-        digest.finalize().into()
     }
 
     #[cfg(test)]
@@ -81852,7 +81734,6 @@ mod tests {
     /// with today's values, and copies no entry its carry leaves equal.
     #[test]
     fn held_page_subset_applies_debt_and_audit_carries() {
-        let _on = evidence_owed::EvidenceOwedForTest::on();
         let mut previous = ScanIndex::default();
         let mut add = |key: &str, version: String| {
             let mut entry = manifest_index_entry(Some(format!("{key}-entity").as_str()));

@@ -420,7 +420,6 @@ fn e2_pipeline_admission_drop_drains_to_the_cold_full() {
     assert!(!failed);
     assert_eq!(cold.len(), 2);
 
-    let _owed = evidence_owed::EvidenceOwedForTest::on();
     let mut index = ScanIndex::default();
     let (first, _, _) = e2_page(roots, &support, &mut index);
     index.record_accepted_snapshot_fingerprints(
@@ -433,13 +432,17 @@ fn e2_pipeline_admission_drop_drains_to_the_cold_full() {
         .into_iter()
         .map(|item| (item.source_session_id.clone(), item))
         .collect::<BTreeMap<_, _>>();
-    // Older-window evidence, an unfinished admission main's builder would
+    // Older-window evidence, an unfinished admission an earlier build would
     // persist for it, and a member that must be read again after the drop.
     for pending in index.claude_usage_family_pending.values_mut() {
         pending.census_window_end = "2026-08-01T07:10:00Z".into();
     }
     let stale = index.claude_usage_family_pending.keys().cloned().collect();
-    let admission = claude_retry_admission_start(&index, &stale, "2026-08-02T07:10:00Z", None);
+    let admission = super::stale_family_carry_tests::claude_retry_admission_start(
+        &index,
+        &stale,
+        "2026-08-02T07:10:00Z",
+    );
     assert!(!admission.complete);
     index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
         context_fingerprint: scan_traversal_context_fingerprint(
