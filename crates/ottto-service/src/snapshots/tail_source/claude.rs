@@ -10,7 +10,8 @@
 //! opening call's file paths by call id. Skill labels are stored as they are.
 use super::{
     capability_hour_entry, capability_hour_pages, encode, fixed_pages, page_bytes, read_page,
-    slot_start, CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource,
+    slot_start, CollectionSpec, DecodedHead, HeadIdentity, LiveInputs, LiveLoadError,
+    ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
@@ -476,6 +477,18 @@ impl TailSource for Claude {
         } else {
             Err(ReconstructCause::Corrupt)
         }
+    }
+
+    /// Claude has no reuse decision of its own here: the file-birth inputs
+    /// come from the opened file.
+    fn install_live(
+        stored: &mut SnapshotAccumulator,
+        fresh: &LiveInputs<'_>,
+    ) -> Result<(), LiveLoadError> {
+        stored
+            .claude_file_birth
+            .refresh_opened(&fresh.accumulator.claude_file_birth);
+        Ok(())
     }
 }
 

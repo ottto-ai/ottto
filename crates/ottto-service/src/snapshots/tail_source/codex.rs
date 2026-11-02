@@ -13,7 +13,8 @@
 
 use super::{
     capability_hour_entry, capability_hour_pages, encode, fixed_pages, hour_page, page_bytes,
-    read_page, slot_start, CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource,
+    read_page, slot_start, CollectionSpec, DecodedHead, HeadIdentity, LiveInputs, LiveLoadError,
+    ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{
     durable_enum, durable_field, durable_struct, Corrupt, Dec, Durable, DurableEmpty, Enc, HDigest,
@@ -21,6 +22,7 @@ use crate::durable_tail_codec::{
 };
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
 use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
+use crate::snapshots::sampled_scan::codex_cursor::{priority_decisions, PriorityDecisions};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -754,5 +756,71 @@ impl TailSource for Codex {
         } else {
             Err(ReconstructCause::Corrupt)
         }
+    }
+
+    /// The reuse decision, then this cycle's inputs. A real group or a
+    /// protected receipt has no stored continuation (D168: a counted replay).
+    /// Otherwise the stored state continues only under the counting rule this
+    /// cycle selects and with every prior priority decision still holding.
+    /// Absent or incomplete evidence waits; evidence that disagrees rebuilds.
+    /// The fresh accumulator keeps its own inputs: preparing the read still
+    /// compares against them.
+    fn install_live(
+        stored: &mut SnapshotAccumulator,
+        fresh: &LiveInputs<'_>,
+    ) -> Result<(), LiveLoadError> {
+        let live = fresh.accumulator;
+        if fresh.group_members > 1 {
+            return Err(LiveLoadError::Reconstruct(ReconstructCause::GroupReplay));
+        }
+        if live
+            .codex_tier_replay
+            .as_ref()
+            .is_some_and(codex_file_join::TierReplay::needs_prior_prefix)
+        {
+            return Err(LiveLoadError::Reconstruct(
+                ReconstructCause::TierPrefixReplay,
+            ));
+        }
+        if !codex_counting_version::reusable(
+            stored.codex_counting.as_deref(),
+            live.codex_counting.as_deref(),
+        ) {
+            return Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible));
+        }
+        let Some(observed) = stored.codex_observed_priority_turns.as_ref() else {
+            return Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible));
+        };
+        match priority_decisions(observed, live.codex_turn_traces.as_ref()) {
+            PriorityDecisions::Hold => {}
+            PriorityDecisions::Unavailable => return Err(LiveLoadError::Unavailable),
+            PriorityDecisions::Changed => {
+                return Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible))
+            }
+        }
+        // A child still waiting on its parent cannot continue before the parent
+        // evidence exists. Once it does, the parent's prefix has to be consumed
+        // from the file start by a read that sees it.
+        if stored.codex_parent_resolution_pending() {
+            return Err(
+                if live.codex_parent_signatures.is_none()
+                    && live.codex_parent_prefix_proof.is_none()
+                {
+                    LiveLoadError::Unavailable
+                } else {
+                    LiveLoadError::Reconstruct(ReconstructCause::Incompatible)
+                },
+            );
+        }
+        stored
+            .claude_file_birth
+            .refresh_opened(&live.claude_file_birth);
+        stored.codex_turn_traces = live.codex_turn_traces.clone();
+        stored.codex_parent_ownership_ledgers = live.codex_parent_ownership_ledgers.clone();
+        stored.codex_sidecar_projected_next_ordinal = live.codex_sidecar_projected_next_ordinal;
+        stored.codex_parent_signatures = live.codex_parent_signatures.clone();
+        stored.codex_parent_prefix_proof = live.codex_parent_prefix_proof.clone();
+        stored.codex_tier_replay = live.codex_tier_replay.clone();
+        Ok(())
     }
 }

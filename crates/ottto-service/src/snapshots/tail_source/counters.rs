@@ -45,6 +45,42 @@ pub(in crate::snapshots) fn max(name: &'static str, label: &'static str, n: u64)
     });
 }
 
+/// One executed D168 replay on the existing read-cause record: dropped when the
+/// replay ends however it ends, so interrupted work counts too. `add` the bytes
+/// actually read as they are read; a file's metadata length is not its replay.
+/// Ordinary suffix bytes stay ordinary acquisition bytes. It raises no alarm.
+#[cfg_attr(not(test), allow(dead_code))] // Held by the group and prefix replays through the shared dispatch.
+pub(in crate::snapshots) struct ReplayCharge {
+    slug: &'static str,
+    cause: super::ReconstructCause,
+    bytes: u64,
+}
+#[cfg_attr(not(test), allow(dead_code))] // Held by the group and prefix replays through the shared dispatch.
+impl ReplayCharge {
+    pub(in crate::snapshots) fn begin(slug: &'static str, cause: super::ReconstructCause) -> Self {
+        Self {
+            slug,
+            cause,
+            bytes: 0,
+        }
+    }
+    pub(in crate::snapshots) fn add(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+impl Drop for ReplayCharge {
+    fn drop(&mut self) {
+        let cause = self.cause.label();
+        bump("tail_reconstruct", cause);
+        add("tail_reconstruct_bytes", cause, self.bytes);
+        crate::local_resource_diagnostics::traversal_point(
+            "tail_reconstruct",
+            self.slug,
+            &serde_json::json!({ "cause": cause, "after_head": true, "bytes": self.bytes }),
+        );
+    }
+}
+
 /// At most once per 24 h while reconstructions after a head persist. RAM only:
 /// a restart alarms again.
 pub(in crate::snapshots) fn restart_full_alarm_due() -> bool {

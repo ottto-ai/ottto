@@ -63,6 +63,12 @@ pub(in crate::snapshots) enum ReconstructCause {
     Identity,
     /// A re-derived content field no longer matches its stored digest.
     NotRederivable,
+    /// A real multi-file target: the existing group parser reads every member
+    /// once. D168: temporary, counted, no group Tail claim.
+    GroupReplay,
+    /// A protected receipt needs the file's physical prefix replayed to rebuild
+    /// its transient tier evidence. D168: temporary and counted.
+    TierPrefixReplay,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -73,6 +79,8 @@ impl ReconstructCause {
             Self::Revision => "revision",
             Self::Identity => "identity",
             Self::NotRederivable => "not_rederivable",
+            Self::GroupReplay => "group_replay",
+            Self::TierPrefixReplay => "tier_prefix_replay",
         }
     }
 }
@@ -170,6 +178,26 @@ crate::durable_tail_codec::durable_struct!(DurableCertificate {
     N audit_debt_unix_seconds: Option<u64>,
 });
 
+/// Why a decoded reduction cannot take this cycle's live inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Built by the shared loader's `install_live` call.
+pub(in crate::snapshots) enum LiveLoadError {
+    /// Required evidence is absent or incomplete now: the file waits, with its
+    /// debt kept.
+    Unavailable,
+    /// The evidence says the stored state cannot continue: a counted
+    /// reconstruction.
+    Reconstruct(ReconstructCause),
+}
+
+/// This cycle's live inputs for one file: the fresh parser's configured
+/// accumulator, and how many members the file's read target joins.
+#[cfg_attr(not(test), allow(dead_code))] // Built by the shared loader's `install_live` call.
+pub(in crate::snapshots) struct LiveInputs<'a> {
+    pub(in crate::snapshots) accumulator: &'a SnapshotAccumulator,
+    pub(in crate::snapshots) group_members: usize,
+}
+
 /// One source's Tail codec. Generic code iterates `collections()`, never a
 /// fixed list.
 pub(in crate::snapshots) trait TailSource {
@@ -213,6 +241,14 @@ pub(in crate::snapshots) trait TailSource {
     ) -> Result<(), ReconstructCause>;
     /// Facts the decoded state must satisfy beyond its counts.
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
+    /// Validates the decoded reduction against this cycle's live inputs, then
+    /// installs them. Called before the loader publishes `Reused`; an error
+    /// leaves the reduction to be discarded.
+    #[cfg_attr(not(test), allow(dead_code))] // Called by the shared loader.
+    fn install_live(
+        stored: &mut SnapshotAccumulator,
+        fresh: &LiveInputs<'_>,
+    ) -> Result<(), LiveLoadError>;
 
     /// After every page: each declared collection's stored geometry and
     /// element count against the decoded state, then the source's facts.
