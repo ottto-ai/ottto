@@ -1693,7 +1693,7 @@ const H_AUDIT: &[(&str, &str)] = &[
     ),
     (
         "Rederive.session_start",
-        "Enc::hash(\"ottto-dt-rederive:session_start:v2\")",
+        "Enc::hash(\"ottto-dt-rederive:session_start:v3\")",
     ),
     (
         "Rederive.title",

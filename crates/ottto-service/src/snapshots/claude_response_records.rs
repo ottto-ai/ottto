@@ -56,6 +56,19 @@ impl ClaudeResponseBook {
         self.responses.iter()
     }
 
+    /// Each slot's response key: the index inverted. Tail pages store a key
+    /// beside its response, so the index re-derives from the pages.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the Tail codec calls this"))]
+    pub(super) fn slot_keys(&self) -> Vec<&str> {
+        let mut keys = vec![""; self.responses.len()];
+        for (key, slot) in self.index.iter() {
+            if let Some(at) = keys.get_mut(*slot as usize) {
+                *at = key.as_str();
+            }
+        }
+        keys
+    }
+
     pub(super) fn get_mut(
         &mut self,
         key: &str,

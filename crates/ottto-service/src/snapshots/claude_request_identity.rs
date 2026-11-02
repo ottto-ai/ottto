@@ -2960,6 +2960,22 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Every recorded response position: each is the file's response count
+    /// when its line was read.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the Tail codec calls this"))]
+    pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .chain(&self.starting_marker)
+            .map(|marker| marker.position)
+            .chain(self.context_position)
+            .chain(self.context_flip_position)
+    }
+    /// The status-coverage key is bound at item build, never by the parser.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the Tail codec calls this"))]
+    pub(crate) fn home_bound(&self) -> bool {
+        self.home.is_some()
+    }
     /// Binds the registered-folder key once the item's path is known.
     pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
         if self.context_position.is_some() {

@@ -661,6 +661,7 @@ impl SessionStartState {
                 .claude_blobs
                 .values()
                 .all(|blob| blob.config_digest.is_none())
+            && self.calls.values().all(|call| call.files.is_empty())
         {
             return Ok(None);
         }
@@ -677,7 +678,7 @@ impl SessionStartState {
         &self,
     ) -> Result<[u8; 32], crate::durable_tail_codec::Refuse> {
         use crate::durable_tail_codec::{Durable, Enc};
-        let mut e = Enc::hash("ottto-dt-rederive:session_start:v2");
+        let mut e = Enc::hash("ottto-dt-rederive:session_start:v3");
         self.instructions.put(&mut e)?;
         self.codex_prelude.put(&mut e)?;
         self.files.put(&mut e)?;
@@ -686,6 +687,14 @@ impl SessionStartState {
         e.varint(self.claude_blobs.len() as u64)?;
         for blob in self.claude_blobs.values() {
             blob.config_digest.put(&mut e)?;
+        }
+        // Each opening call's file paths, by call id (the ids are stored).
+        e.varint(self.calls.len() as u64)?;
+        for call in self.calls.values() {
+            e.varint(call.files.len() as u64)?;
+            for file in &call.files {
+                e.len_prefixed(file.as_bytes())?;
+            }
         }
         Ok(e.finish_hash())
     }
@@ -702,6 +711,27 @@ impl SessionStartState {
                 .get_mut(key)
                 .and_then(|from| from.config_digest.take());
         }
+        for (id, call) in &mut self.calls {
+            call.files = from
+                .calls
+                .get_mut(id)
+                .map(|from| std::mem::take(&mut from.files))
+                .unwrap_or_default();
+        }
+    }
+
+    /// An opening call holding `files`, as a read in the window records it.
+    #[cfg(test)]
+    pub(super) fn open_call_for_test(&mut self, id: &str, files: &[&str]) {
+        let call = OpeningCall {
+            files: files.iter().map(|file| file.to_string()).collect(),
+            ..OpeningCall::default()
+        };
+        self.calls.insert(OpeningCallId { id: id.into() }, call);
+    }
+    #[cfg(test)]
+    pub(super) fn call_files_for_test(&self, id: &str) -> Option<&[String]> {
+        self.calls.get(id).map(|call| call.files.as_slice())
     }
 
     /// Where the opening content is final (`content_end`), when known.

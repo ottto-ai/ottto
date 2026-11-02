@@ -107,33 +107,48 @@ pub(crate) fn shape_text() -> String {
     shape.text().to_string()
 }
 
-/// A mark within the head bound, or the field is not re-derivable.
-fn head_mark(mark: Option<u64>, field: &'static str) -> Result<u64, Refuse> {
-    mark.filter(|end| *end <= HEAD_BOUND)
+/// A mark within `bound`, or the field is not re-derivable.
+fn head_mark(mark: Option<u64>, bound: u64, field: &'static str) -> Result<u64, Refuse> {
+    mark.filter(|end| *end <= bound)
         .ok_or(Refuse::NotRederivable(field))
 }
 
-fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive, Refuse> {
+/// The digests of the re-derived fields. Each needs a known mark within
+/// `head_bound` (`line_cap` for the title line); Tail state passes no bound.
+pub(in crate::snapshots) fn rederive_digests(
+    acc: &SnapshotAccumulator,
+    head_bound: u64,
+    line_cap: u64,
+) -> Result<Rederive, Refuse> {
     let marks = acc.durable_marks;
     let mut out = Rederive::default();
     if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
         head_mark(
             marks.first_prompt,
+            head_bound,
             "SnapshotAccumulator.first_prompt_material",
         )?;
         out.first_prompt = Some(first_prompt_digest(acc)?);
     }
     if acc.workspace_path.is_some() {
-        head_mark(marks.workspace, "SnapshotAccumulator.workspace_path")?;
+        head_mark(
+            marks.workspace,
+            head_bound,
+            "SnapshotAccumulator.workspace_path",
+        )?;
         out.workspace = Some(workspace_digest(acc)?);
     }
     if acc.codex_agent_label.is_some() {
-        head_mark(marks.agent_label, "SnapshotAccumulator.codex_agent_label")?;
+        head_mark(
+            marks.agent_label,
+            head_bound,
+            "SnapshotAccumulator.codex_agent_label",
+        )?;
         out.agent_label = Some(agent_label_digest(acc)?);
     }
     out.session_start = acc
         .session_start
-        .durable_content_digest(HEAD_BOUND)?
+        .durable_content_digest(head_bound)?
         .map(|(digest, _)| digest);
     if acc.title.is_some() {
         marks
@@ -242,7 +257,7 @@ impl<'a> BodyEncoding<'a> {
             accumulator,
             report,
             scalars,
-            rederive: rederive_digests(accumulator, line_cap)?,
+            rederive: rederive_digests(accumulator, HEAD_BOUND, line_cap)?,
         })
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
@@ -502,24 +517,28 @@ impl Decoded {
         if self.rederive.first_prompt.is_some() {
             end = end.max(head_mark(
                 marks.first_prompt,
+                HEAD_BOUND,
                 "SnapshotAccumulator.first_prompt_material",
             )?);
         }
         if self.rederive.workspace.is_some() {
             end = end.max(head_mark(
                 marks.workspace,
+                HEAD_BOUND,
                 "SnapshotAccumulator.workspace_path",
             )?);
         }
         if self.rederive.agent_label.is_some() {
             end = end.max(head_mark(
                 marks.agent_label,
+                HEAD_BOUND,
                 "SnapshotAccumulator.codex_agent_label",
             )?);
         }
         if self.rederive.session_start.is_some() {
             end = end.max(head_mark(
                 acc.session_start.durable_content_end(),
+                HEAD_BOUND,
                 "SessionStartState.content_end",
             )?);
         }

@@ -258,6 +258,13 @@ mod claude_thinking_tokens_tests;
 mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
+/// Tail state codecs: each source's head and pages in the state database.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail seam and load call these")
+)]
+mod tail_source;
 pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
