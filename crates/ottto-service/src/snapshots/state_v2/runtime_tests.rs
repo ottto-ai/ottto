@@ -725,8 +725,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     for (source, keys) in [
         (Source::Claude, Some(DurableSource::ClaudeCode)),
         (Source::Codex, Some(DurableSource::Codex)),
-        // Pi has no key mapping: never an empty complete set that a sweep could erase by.
-        (Source::Pi, None),
+        (Source::Pi, Some(DurableSource::Pi)),
     ] {
         f6_forget(source, keys);
     }

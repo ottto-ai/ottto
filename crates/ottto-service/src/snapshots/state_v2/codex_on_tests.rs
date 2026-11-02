@@ -11,18 +11,78 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 type FixtureRow = (Source, fn() -> ScanIndex);
-fn fixtures() -> [FixtureRow; 2] {
+fn fixtures() -> [FixtureRow; 3] {
     [
         (Source::Claude, kinds::tests::fixture),
         (Source::Codex, codex_fixture),
+        (Source::Pi, pi_fixture),
     ]
 }
 fn snapshot_source_of(source: Source) -> SnapshotSource {
     match source {
         Source::Claude => SnapshotSource::ClaudeCode,
         Source::Codex => SnapshotSource::Codex,
-        Source::Pi => unreachable!("Pi is not served by the store yet"),
+        Source::Pi => SnapshotSource::Pi,
     }
+}
+
+const PI_ACTIVE: &str =
+    "/synthetic/.pi/agent/sessions/--synthetic-work--/2026-10-27T06-00-00-000Z_a.jsonl";
+const PI_OWED: &str =
+    "/synthetic/.pi/agent/sessions/--synthetic-work--/2026-10-27T07-00-00-000Z_b.jsonl";
+const PI_EMPTY: &str =
+    "/synthetic/.pi/agent/sessions/--synthetic-work--/2026-10-27T08-00-00-000Z_c.jsonl";
+
+/// Pi has no Pi-only kind (its fork ledger lives in the durable tail record):
+/// every shared file-owned and accepted kind non-default, with each optional
+/// entry field present once, one owed file and one confirmed-empty file.
+fn pi_fixture() -> ScanIndex {
+    let receipt = json!({
+        "context_fingerprint": "1".repeat(64),
+        "replay_generation": 3,
+        "source_witness": "2".repeat(64),
+        "body_witness": "3".repeat(64),
+    });
+    serde_json::from_value(json!({
+        "schema_version": crate::snapshots::SCAN_INDEX_SCHEMA_VERSION,
+        "generation": 0,
+        "files": {
+            PI_ACTIVE: {
+                "size_bytes": 4096,
+                "modified_unix_seconds": 1_793_084_400_u64,
+                "modified_unix_nanos": 1_793_084_400_123_456_789_u64,
+                "source_file_fingerprint": "a".repeat(64),
+                "last_snapshot_fingerprint": "b".repeat(64),
+                "last_upload_body_witness": "c".repeat(64),
+                "effective_upload_body_witness_revision": 2,
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+                "opened_changed_nanos": 1_793_084_401_000_000_000_u64,
+                "opened_birth_nanos": 1_793_080_800_000_000_000_u64,
+                "upload_context_receipt": receipt,
+            },
+            PI_OWED: {
+                "size_bytes": 512,
+                "modified_unix_seconds": 1_793_088_000_u64,
+                "source_file_fingerprint": "",
+                "last_snapshot_fingerprint": null,
+                "evidence_owed": true,
+            },
+        },
+        "terminal_jsonl_dispositions": {
+            PI_ACTIVE: {
+                "source_file_fingerprint": "a".repeat(64),
+                "parser_generation": "pi:1",
+                "loss": {"over_line_cap_count": 1, "recognized_usage_drop_count": 0,
+                    "dropped_usage_record_count": 0},
+            },
+        },
+        "confirmed_empty_files": [PI_EMPTY],
+        "file_snapshot_fingerprints": {PI_ACTIVE: ["pi-accepted"], PI_OWED: []},
+        // Missing activity is not empty: keep one known and one unknown.
+        "snapshot_activity_at": {PI_ACTIVE: "2026-10-27T06:00:01Z", PI_OWED: null},
+        "accepted_snapshot_fingerprints": ["pi-accepted"],
+    }))
+    .unwrap()
 }
 
 /// Every persisted Codex field non-default, beside a Codex-bearing file.
