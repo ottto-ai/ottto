@@ -23,9 +23,7 @@ use super::claude_history_upgrade::{
     HISTORY_UPGRADE_BYTES_PER_PAGE, HISTORY_UPGRADE_FILES_PER_PAGE,
 };
 use super::claude_money_birth_store::location_key;
-use super::claude_request_identity::{
-    complete_org, marker_email_digest, valid_login, AcceptedBuckets, RecordedLogin,
-};
+use super::claude_request_identity::{complete_org, valid_login, AcceptedBuckets, RecordedLogin};
 use super::{local_index_key, ScanIndex, SnapshotItem, SoleLoginWitness};
 use crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 use crate::claude_status_coverage as coverage;
@@ -59,11 +57,6 @@ fn hex(bytes: &[u8; 32]) -> String {
 /// The ledger and status key of one config folder.
 pub(crate) fn folder_key(config_dir: &Path) -> String {
     hex(&coverage::home_key(config_dir))
-}
-
-/// The in-memory form of the login's email: what `OrgMarkers` keeps of an address.
-pub(crate) fn address_digest(address: &str) -> String {
-    marker_email_digest(&address.trim().to_ascii_lowercase())
 }
 
 /// Which file a fold read and whether it is its session's own, set when the

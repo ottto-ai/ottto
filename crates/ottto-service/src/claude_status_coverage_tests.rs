@@ -22,3 +22,68 @@ fn transcript_paths_map_to_their_config_dir_key() {
         None
     );
 }
+
+const KEY: [u8; 32] = [0x42; 32];
+const ADDRESS: &str = "one@example.test";
+
+fn bind(key: [u8; 32]) -> bool {
+    bind_address_key(Some(Zeroizing::new(key)))
+}
+
+/// [privacy] Without the key nothing can be tested against the digest.
+#[test]
+fn the_address_digest_is_keyed_and_has_its_own_domain() {
+    bind(KEY);
+    let digest = address_digest(" One@Example.test ").unwrap();
+    assert_eq!(digest.len(), 64);
+    assert_eq!(digest, keyed_text_digest(&KEY, ADDRESS_DOMAIN, ADDRESS));
+    assert_ne!(digest, format!("{:x}", Sha256::digest(ADDRESS.as_bytes())));
+    assert_ne!(
+        digest,
+        crate::snapshots::claude_request_identity::marker_email_digest(ADDRESS)
+    );
+    assert_ne!(
+        digest,
+        keyed_text_digest(&KEY, ADDRESS_SCOPE_DOMAIN, ADDRESS)
+    );
+    assert_ne!(
+        digest,
+        keyed_text_digest(&KEY, "claude_accepted_key_epoch:v2", ADDRESS)
+    );
+    assert_ne!(
+        digest,
+        keyed_text_digest(&[0x43; 32], ADDRESS_DOMAIN, ADDRESS)
+    );
+}
+
+/// [privacy] No key: no digest, no report email, no scope bytes.
+#[test]
+fn no_key_gives_no_field() {
+    forget_addresses();
+    assert_eq!(address_digest(ADDRESS), None);
+    assert_eq!(address_scope(), None);
+    observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
+    assert_eq!(snapshot()["folder"].email, None);
+}
+
+/// [regress] A digest under another key is never compared, and forgetting ends both.
+#[test]
+fn a_key_change_drops_every_report_email_and_forgetting_drops_the_key() {
+    forget_addresses();
+    assert!(!bind(KEY), "nothing was held");
+    observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
+    assert_eq!(snapshot()["folder"].email, address_digest(ADDRESS));
+    let scope = address_scope().unwrap();
+    assert!(!bind(KEY), "the same key changes nothing");
+    assert_eq!(snapshot()["folder"].email, address_digest(ADDRESS));
+
+    assert!(bind([0x43; 32]));
+    assert_eq!(snapshot()["folder"].email, None);
+    assert_ne!(address_scope().unwrap(), scope);
+
+    observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
+    forget_addresses();
+    assert_eq!(snapshot()["folder"].email, None);
+    assert_eq!(address_digest(ADDRESS), None);
+    assert_eq!(address_scope(), None);
+}

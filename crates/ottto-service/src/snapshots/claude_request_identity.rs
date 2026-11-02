@@ -40,6 +40,7 @@ mod accepted;
 mod budget;
 use super::claude_folder_login::{FolderTrace, QualifiedFolder};
 pub(crate) use accepted::digest_hex;
+pub(crate) use accepted::keyed_text_digest;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -2878,9 +2879,10 @@ pub(crate) struct OrgMarkers {
     /// of the first later `session_context` naming a different one.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
-    /// `marker_email_digest` of the one address the sentences name, and whether
-    /// a later one named another. A sentence without exactly one well-formed
-    /// address answers nothing.
+    /// The keyed digest (`claude_status_coverage::address_digest`) of the one
+    /// address the sentences name, and whether a later one named another. A
+    /// sentence without exactly one well-formed address answers nothing, and
+    /// without the key there is no field.
     address: Option<String>,
     other_address: bool,
 }
@@ -2967,7 +2969,9 @@ pub(crate) fn note_marker_line(
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
             }
-            if let Some(address) = recorded_address(&text).map(marker_email_digest) {
+            if let Some(address) =
+                recorded_address(&text).and_then(crate::claude_status_coverage::address_digest)
+            {
                 state.other_address |= state
                     .address
                     .as_ref()

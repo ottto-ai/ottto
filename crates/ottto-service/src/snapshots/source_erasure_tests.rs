@@ -386,3 +386,84 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
         vec![SnapshotSource::ClaudeCode],
     );
 }
+
+const LOGIN_ADDRESS: &str = "one@example.test";
+
+/// A held key, one report email under it and one retained parse.
+fn hold_login_address_state(f: &Fixture) {
+    use crate::claude_status_coverage as coverage;
+    coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    coverage::observe_with_email(
+        "folder".into(),
+        coverage::OwnerReport::default(),
+        Some(LOGIN_ADDRESS),
+    );
+    assert!(coverage::snapshot()["folder"].email.is_some());
+    let (root, _) = f.transcript();
+    let (retained, _, _) = crate::snapshots::claude_response_compaction_tests::acquire_items(
+        &root.join(format!("{SESSION}.jsonl")),
+        None,
+        100,
+    );
+    assert!(f
+        .cache
+        .retained()
+        .unwrap()
+        .insert("retained".into(), retained.unwrap()));
+}
+
+fn assert_login_address_state_gone(f: &Fixture) {
+    use crate::claude_status_coverage as coverage;
+    assert_eq!(coverage::address_digest(LOGIN_ADDRESS), None);
+    assert_eq!(coverage::snapshot()["folder"].email, None);
+    assert!(f.cache.retained().unwrap().victims().is_empty());
+}
+
+/// [privacy] Source-off ends everything kept of a recorded login address.
+#[test]
+fn source_off_erase_clears_the_login_address() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    hold_login_address_state(&f);
+    let kept = f.canaries(SnapshotSource::ClaudeCode);
+    disable_snapshot_source(&f.support, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert_gone(&kept);
+    assert_login_address_state_gone(&f);
+}
+
+/// [privacy] Account removal erases the durable records, with no live device,
+/// and keeps the rest of the index so history is not replayed. Once only.
+#[test]
+fn account_removal_erase_clears_the_login_address_only() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    hold_login_address_state(&f);
+    let stable = f
+        .support
+        .join("snapshots/claude_code-scan-index-v3.durable-tail");
+    fs::create_dir_all(&stable).unwrap();
+    fs::write(stable.join("record.rec"), CANARY).unwrap();
+    let (mut tails, kept): (Vec<_>, Vec<_>) = f
+        .canaries(SnapshotSource::ClaudeCode)
+        .into_iter()
+        .partition(|path| path.to_string_lossy().ends_with(".durable-tail"));
+    assert_eq!(tails.len(), 1);
+    tails.push(stable);
+    let other = f.canaries(SnapshotSource::Codex);
+
+    crate::snapshot_sync::owe_login_address_erase(&f.support).unwrap();
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert_gone(&tails);
+    assert_kept(&kept);
+    assert_kept(&other);
+    assert_login_address_state_gone(&f);
+
+    hold_login_address_state(&f);
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert!(crate::claude_status_coverage::address_digest(LOGIN_ADDRESS).is_some());
+}

@@ -1,7 +1,9 @@
 // Recorded-login naming per folder. Synthetic hashes and addresses only; the
 // sentence and the line keys follow the real transcript shape.
 use super::*;
-use crate::claude_status_coverage::{observe, proof_wanted};
+use crate::claude_status_coverage::{
+    address_digest, bind_address_key, forget_addresses, observe, proof_wanted,
+};
 use crate::snapshots::claude_request_identity::marker_org_hash;
 use crate::snapshots::claude_request_money::e2::with_fixture_birth;
 use crate::snapshots::claude_response_compaction_tests::acquire_items;
@@ -66,7 +68,7 @@ fn folder_report() -> OwnerReport {
         slot: false,
         pair: Some(pair.clone()),
         proven: Some(pair),
-        email: Some(address_digest(ADDRESS)),
+        email: address_digest(ADDRESS),
         other_account: false,
     }
 }
@@ -85,6 +87,7 @@ struct Folder {
 }
 
 fn folder(name: &str) -> Folder {
+    bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
     let dir = crate::test_scratch::private_dir(name);
     let root = dir.join("cfg/projects");
     std::fs::create_dir_all(root.join("p")).unwrap();
@@ -586,7 +589,7 @@ fn a_tail_read_after_a_restart_stays_named() {
     );
     assert!(!serde_json::to_string(&index.claude_folder_login_ledger)
         .unwrap()
-        .contains(&address_digest(ADDRESS)));
+        .contains(&address_digest(ADDRESS).unwrap()));
 }
 
 /// [regress]
@@ -779,4 +782,24 @@ fn a_revision_change_keeps_a_sticky_folders_files_owed() {
     apply_reoffers(&mut index, true, NOW + 300);
     assert_eq!(owed(&index).len(), 1);
     assert!(f.record(&index).reoffer_owed.is_empty());
+}
+
+/// [privacy] No key: the file keeps no address, and the folder gets no verdict.
+#[test]
+fn without_the_key_there_is_no_address_and_no_verdict() {
+    let f = folder("recorded-no-key");
+    let mut index = ScanIndex::default();
+    f.begin(&mut index, folder_report());
+    forget_addresses();
+    let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_1"));
+    for item in &items {
+        if let Some(markers) = item.claude_org_markers.as_deref() {
+            let seen = markers.recorded_login();
+            assert_eq!(seen.email, None);
+            assert!(!seen.contradicted);
+        }
+    }
+    page(&mut index, &mut items, true);
+    assert_eq!(witness(&items), None);
+    assert!(index.claude_folder_login_ledger.values().all(|r| !r.mixed));
 }

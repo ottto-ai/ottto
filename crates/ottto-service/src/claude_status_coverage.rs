@@ -6,9 +6,11 @@
 //! only means "no report yet". Process-local on purpose: a restart starts
 //! over, and only the sync pass's own ledger persists.
 
+use crate::snapshots::claude_request_identity::keyed_text_digest;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Opaque config-folder key: SHA-256 over the normalized config dir.
 pub(crate) type HomeKey = [u8; 32];
@@ -22,7 +24,7 @@ pub(crate) struct OwnerReport {
     pub(crate) pair: Option<(String, String)>,
     /// The pair a completed proof named for the default folder's current token.
     pub(crate) proven: Option<(String, String)>,
-    /// `marker_email_digest` of the login's own email.
+    /// `address_digest` of the login's own email; none without the key.
     pub(crate) email: Option<String>,
     /// A registered slot now holds another account.
     pub(crate) other_account: bool,
@@ -34,6 +36,16 @@ struct Ledger {
     /// Sticky folders: no profile call is worth making.
     stopped: BTreeSet<String>,
     reports: BTreeMap<String, OwnerReport>,
+    /// The attribution key, while the capability is on. Never serialized or
+    /// logged; this type has no `Debug`.
+    address_key: Option<Zeroizing<[u8; 32]>>,
+}
+
+const ADDRESS_DOMAIN: &str = "claude_folder_login_address:v1";
+const ADDRESS_SCOPE_DOMAIN: &str = "claude_folder_login_address_scope:v1";
+
+fn keyed_address(key: &[u8; 32], address: &str) -> String {
+    keyed_text_digest(key, ADDRESS_DOMAIN, &address.trim().to_ascii_lowercase())
 }
 
 #[cfg(not(test))]
@@ -69,6 +81,71 @@ pub(crate) fn observe(home: String, mut report: OwnerReport) {
             .is_some_and(|known| known.other_account);
         ledger.reports.insert(home, report);
     });
+}
+
+/// The status pass's form of `observe`: the email is digested under the lock
+/// that swaps the key, so a stored report never mixes two keys.
+pub(crate) fn observe_with_email(home: String, mut report: OwnerReport, email: Option<&str>) {
+    with_ledger(|ledger| {
+        report.email = ledger
+            .address_key
+            .as_ref()
+            .zip(email)
+            .map(|(key, email)| keyed_address(key, email));
+        report.other_account |= ledger
+            .reports
+            .get(&home)
+            .is_some_and(|known| known.other_account);
+        ledger.reports.insert(home, report);
+    });
+}
+
+/// Sync pass: the attribution key for this capability, or none. A digest under
+/// another key can never be compared, so a change drops every report's email.
+/// True when a held key went away: values under it may still be retained.
+pub(crate) fn bind_address_key(key: Option<Zeroizing<[u8; 32]>>) -> bool {
+    with_ledger(|ledger| {
+        let unchanged = match (&ledger.address_key, &key) {
+            (None, None) => true,
+            (Some(held), Some(next)) => **held == **next,
+            _ => false,
+        };
+        if unchanged {
+            return false;
+        }
+        let replaced = ledger.address_key.is_some();
+        ledger.address_key = key;
+        for report in ledger.reports.values_mut() {
+            report.email = None;
+        }
+        replaced
+    })
+}
+
+/// Source-off erase and account removal.
+pub(crate) fn forget_addresses() {
+    bind_address_key(None);
+}
+
+/// The keyed, domain-separated digest of an address. No key, no digest.
+pub(crate) fn address_digest(address: &str) -> Option<String> {
+    with_ledger(|ledger| {
+        ledger
+            .address_key
+            .as_ref()
+            .map(|key| keyed_address(key, address))
+    })
+}
+
+/// A retained parse holds digests under the key it was read with, so it never
+/// crosses keys. None while no key is bound: those scope bytes are unchanged.
+pub(crate) fn address_scope() -> Option<String> {
+    with_ledger(|ledger| {
+        ledger
+            .address_key
+            .as_ref()
+            .map(|key| keyed_text_digest(key, ADDRESS_SCOPE_DOMAIN, "")[..16].to_string())
+    })
 }
 
 pub(crate) fn snapshot() -> BTreeMap<String, OwnerReport> {

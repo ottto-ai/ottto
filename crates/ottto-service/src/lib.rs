@@ -378,6 +378,7 @@ impl DaemonState {
         }
         self.source_first_seen.clear();
         self.source_reconciliation.clear();
+        claude_status_coverage::forget_addresses();
     }
 }
 
@@ -7722,6 +7723,23 @@ mod tests {
             .expect("candidate");
         daemon.reset_account_for_authorized_client().expect("reset");
         assert!(daemon.take_staged_account_switch("claim_two").is_err());
+    }
+
+    #[test]
+    fn account_reset_forgets_the_login_address_key() {
+        let daemon = daemon();
+        claude_status_coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+        claude_status_coverage::observe_with_email(
+            "folder".into(),
+            claude_status_coverage::OwnerReport::default(),
+            Some("one@example.test"),
+        );
+        daemon.reset_account_for_authorized_client().expect("reset");
+        assert_eq!(
+            claude_status_coverage::address_digest("one@example.test"),
+            None
+        );
+        assert_eq!(claude_status_coverage::snapshot()["folder"].email, None);
     }
 
     #[test]

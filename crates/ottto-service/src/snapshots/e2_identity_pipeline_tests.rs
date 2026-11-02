@@ -1577,6 +1577,9 @@ fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotIt
             &[projects.to_path_buf()],
             on,
         );
+        crate::claude_status_coverage::bind_address_key(
+            on.then(|| zeroize::Zeroizing::new([0x42; 32])),
+        );
         let org = ottto_core::billing_identity_hash("anthropic", "organization", RECORDED_ORG_UUID)
             .unwrap();
         let pair = (e2_account(), org);
@@ -1586,7 +1589,7 @@ fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotIt
                 slot: false,
                 pair: Some(pair.clone()),
                 proven: Some(pair),
-                email: Some(folder::address_digest(RECORDED_ADDRESS)),
+                email: crate::claude_status_coverage::address_digest(RECORDED_ADDRESS),
                 other_account: false,
             },
         );

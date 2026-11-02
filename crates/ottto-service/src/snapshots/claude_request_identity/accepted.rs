@@ -228,6 +228,21 @@ fn digest(key: &FingerprintKey, value: Value) -> [u8; 32] {
     mac.update(&serde_json::to_vec(&value).expect("JSON fingerprint"));
     mac.finalize().into_bytes().into()
 }
+/// HMAC-SHA-256 of local text under the attribution key, in the caller's own
+/// domain. A SHA-256 of the same text is a different value, by design: without
+/// the key nothing can be tested against this one.
+pub(crate) fn keyed_text_digest(key: &[u8; 32], domain: &str, text: &str) -> String {
+    let key = FingerprintKey(Zeroizing::new(*key));
+    let bytes = digest(
+        &key,
+        json!([
+            domain,
+            crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
+            text
+        ]),
+    );
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn key_epoch(key: &FingerprintKey) -> [u8; 32] {
     digest(
         key,

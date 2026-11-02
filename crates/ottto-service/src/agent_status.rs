@@ -6651,8 +6651,7 @@ fn note_claude_folder_owner(
         .as_ref()
         .and(local.final_oauth_account.as_ref())
         .and_then(|account| account.email_address.as_deref())
-        .filter(|email| !email.trim().is_empty())
-        .map(folder::address_digest);
+        .filter(|email| !email.trim().is_empty());
     let report = match registered {
         Some(binding) => {
             let pair = (
@@ -6664,7 +6663,7 @@ fn note_claude_folder_owner(
                 other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
                 pair: cached.is_some().then_some(pair),
                 proven: None,
-                email,
+                email: None,
             }
         }
         None => {
@@ -6681,12 +6680,12 @@ fn note_claude_folder_owner(
                 proven: token
                     .and_then(|token| claude_token_owner::proven_owner(token, may_call))
                     .map(|owner| (owner.account_hash, owner.organization_hash)),
-                email,
+                email: None,
                 other_account: false,
             }
         }
     };
-    coverage::observe(home, report);
+    coverage::observe_with_email(home, report, email);
 }
 
 /// A refused slot: only another strong account in it reaches the ledger. An

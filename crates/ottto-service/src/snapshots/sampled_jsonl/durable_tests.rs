@@ -953,8 +953,9 @@ fn instruction_text_and_its_config_digest_never_reach_the_body() {
     }
 }
 
-/// F4: an email context is stored only as its domain-separated SHA-256 (32
-/// bytes, once), never as the address or its plain SHA-256.
+/// F4: an email context is stored only as its sentence's domain-separated
+/// SHA-256 (32 bytes, once), never as the address or its plain SHA-256. The
+/// address digest is keyed, so with no key there is no address field at all.
 #[test]
 fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     use sha2::Digest as _;
@@ -976,8 +977,7 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert!(occurrences(&body, &plain).is_empty());
     assert!(occurrences(&body, hex(plain).as_bytes()).is_empty());
     assert!(occurrences(&body, hex(separated).as_bytes()).is_empty());
-    // The sentence's digest and its one address's: here the sentence is the address.
-    assert_eq!(occurrences(&body, &separated).len(), 2);
+    assert_eq!(occurrences(&body, &separated).len(), 1);
 }
 
 /// Other E content still refuses; the approved mid-file skill label now persists.
@@ -1662,7 +1662,7 @@ const H_AUDIT: &[(&str, &str)] = &[
     ),
     (
         "OrgMarkers.address",
-        "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased address)",
+        "HMAC-SHA-256(attribution key, \"ottto:session-attribution:\" || JSON [\"claude_folder_login_address:v1\", key version, lowercased address])",
     ),
     (
         "OrgMarkers.context_digest",
@@ -3285,4 +3285,33 @@ fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {
         // the reduction bytes happen to equal the predecessor's body.
         index.generation += 1;
     }
+}
+
+/// [privacy] With the key, the address is stored once, as its keyed digest only.
+#[test]
+fn org_marker_address_is_stored_only_as_its_keyed_digest() {
+    use sha2::Digest as _;
+    crate::claude_status_coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    let scratch = Scratch::new("org-keyed");
+    let path = scratch.write("t.jsonl", &claude_org_lines());
+    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let digest = crate::claude_status_coverage::address_digest(CANARY_EMAIL).unwrap();
+    let keyed: Vec<u8> = (0..digest.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&digest[at..at + 2], 16).unwrap())
+        .collect();
+    let separated: [u8; 32] = sha2::Sha256::new()
+        .chain_update(b"ottto-claude-org-marker-context:v1\0")
+        .chain_update(CANARY_EMAIL.as_bytes())
+        .finalize()
+        .into();
+    assert_eq!(occurrences(&body, &keyed).len(), 1);
+    assert_eq!(occurrences(&body, &separated).len(), 1, "the sentence only");
+    assert!(occurrences(&body, CANARY_EMAIL.as_bytes()).is_empty());
 }
