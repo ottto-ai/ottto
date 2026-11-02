@@ -105,12 +105,11 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
   variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
   explicitly documented changes. When retired, the feature is either on by default with the OFF
   path deleted, or deleted.
-- **Restart restore** (`snapshots/restart_restore.rs`) defaults OFF. Its process-fixed policy
-  requires the `restart_restore_enabled` marker and `DISCOVERY_DEPENDENCY_READY`. That constant is
-  false in this build, so the marker cannot turn it ON until the discovery dependency is implemented
-  and the constant flips. OFF disables ordinary record reads, writes, repair and GC; consent/source
-  erasure and counted deletion of outgrown v1 records remain active. The former v1 warm-restore
-  route is removed: files use no-record acquisition, with a paced Full on growth when needed.
+- **Restart restore** (`snapshots/restart_restore.rs`) is ON in production; no marker changes it.
+  Test fixtures opt in per thread, and the OFF path goes with that opt-in in the next release. OFF
+  disables ordinary record reads, writes, repair and GC; consent/source erasure and counted deletion
+  of outgrown v1 records remain active. The former v1 warm-restore route is removed: files use
+  no-record acquisition, with a paced Full on growth when needed.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.

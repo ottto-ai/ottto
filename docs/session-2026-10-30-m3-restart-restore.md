@@ -6,10 +6,8 @@ its source, scope, file certificate and committed index evidence, then replays
 bounded content and reads the appended suffix. Local receipts never substitute
 for exact upload acknowledgement. Byte budgets defer work without dropping usage.
 
-Restart restore defaults OFF. The `restart_restore_enabled` support-directory
-marker also requires `DISCOVERY_DEPENDENCY_READY`, which is false in this build.
-Enabling it requires implementing the discovery dependency and flipping that
-constant; the marker alone cannot enable this build. OFF disables ordinary store
+Restart restore is ON in production; the old support-directory marker has no
+effect. Test fixtures opt in per thread. OFF disables ordinary store
 reads, writes, repair and GC. Consent/source erasure and counted deletion of
 outgrown v1 records remain active, with failed deletions retried. The former v1
 warm-restore route is removed; growth can require a paced Full read.

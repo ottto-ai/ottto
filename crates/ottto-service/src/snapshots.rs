@@ -35173,7 +35173,7 @@ impl OwnedSourceScan {
                                     {
                                         // Restore grants no input. This existing explicit
                                         // selection may take its ordinary Full after the
-                                        // history gate and shared six-hour pace below.
+                                        // history gate and shared Full pace below.
                                         resource_full_pending = Some("rederive_quiet");
                                         (None, taken_admission, debt)
                                     }

@@ -100,30 +100,30 @@ fn m3_p4b_q11_n10_physical_byte_budget() {
     );
     assert!(matches!(f.begin(now), Err(RetailHold::Exhausted)));
     let almost = now
-        .checked_add(RETAIL_DAILY - Duration::from_nanos(1))
+        .checked_add(RETAIL_INTERVAL - Duration::from_nanos(1))
         .unwrap();
     assert!(matches!(f.begin(almost), Err(RetailHold::Exhausted)));
-    let tomorrow = now.checked_add(RETAIL_DAILY).unwrap();
-    let mut daily = f.begin(tomorrow).unwrap();
-    assert_eq!(daily.grant(), RetailGrant::Daily);
+    let next = now.checked_add(RETAIL_INTERVAL).unwrap();
+    let mut repeat = f.begin(next).unwrap();
+    assert_eq!(repeat.grant(), RetailGrant::Interval);
     f.file
         .seek(SeekFrom::Start(f.checkpoint.sealed_offset()))
         .unwrap();
     let mut bytes = [0; 4096];
     assert_eq!(
-        daily.read(&mut f.file, &mut bytes).unwrap(),
+        repeat.read(&mut f.file, &mut bytes).unwrap(),
         suffix as usize
     );
-    daily.finish();
+    repeat.finish();
     assert_eq!(
         physical(),
         vec![(
-            RetailGrant::Daily,
+            RetailGrant::Interval,
             f.checkpoint.sealed_offset(),
             suffix as usize
         )]
     );
-    assert!(matches!(f.begin(tomorrow), Err(RetailHold::Exhausted)));
+    assert!(matches!(f.begin(next), Err(RetailHold::Exhausted)));
 }
 
 /// [money] n10 pacing eviction allows growth without evicting spent authority.

@@ -125,9 +125,6 @@ pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut(
 /// Pacing cause of a Codex refused stale record's Full.
 const STALE_SELECTION_CAUSE: usize = 5;
 
-const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
-const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
-
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
@@ -284,7 +281,7 @@ impl RetirementEdge {
     }
 }
 
-const PACE_SECS: u64 = 6 * 3600;
+const PACE_SECS: u64 = 3600;
 // Sleep and implausible clock changes must fail toward reading.
 const PACE_SANITY_SECS: u64 = 7 * 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
@@ -820,7 +817,7 @@ impl Stores {
     /// A restore owing no old bytes spends a bounded pending grant, never
     /// an A0-h custody node. `Ok(None)` hands over to the spent custody: old
     /// bytes owed, or a re-read behind the pending high water, which is
-    /// promoted with its original grant time so the Daily gate stays exact.
+    /// promoted with its original grant time so the interval gate stays exact.
     fn pending_retail(
         &mut self,
         key: store::Digest32,
@@ -853,12 +850,12 @@ impl Stores {
             return Err(RetailHold::Ineligible);
         }
         if prior.is_none() && self.restore_pending.len() >= RESTORE_PENDING_KEYS {
-            // A grant a full day old gates nothing the Daily grant would not
+            // A grant one interval old gates nothing the Interval grant would not
             // also allow: reclaim those, never a younger high water.
             let before = self.restore_pending.len();
             self.restore_pending.retain(|_, p| {
                 now.checked_duration_since(p.at)
-                    .map_or(true, |age| age < RETAIL_DAILY)
+                    .map_or(true, |age| age < RETAIL_INTERVAL)
             });
             let expired = (before - self.restore_pending.len()) as u64;
             if expired > 0 {
@@ -1325,9 +1322,9 @@ pub(crate) enum RetailHold {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetailGrant {
     Process,
-    Daily,
+    Interval,
 }
-const RETAIL_DAILY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const RETAIL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 pub(crate) struct RetailAttempt {
     source: DurableSource,
     grant: RetailGrant,
@@ -1505,7 +1502,7 @@ impl RetailAttempt {
     fn count(&mut self, offset: u64, n: usize) {
         let metric = match self.grant() {
             RetailGrant::Process => 2,
-            RetailGrant::Daily => 3,
+            RetailGrant::Interval => 3,
         };
         RETAIL_BYTES[self.source as usize][metric].fetch_add(n as u64, Ordering::Relaxed);
         #[cfg(test)]
@@ -1586,7 +1583,7 @@ impl SharedCache {
                 return Err(RetailHold::AccountingLost);
             }
             if c.length < *high || accepted_end > c.length {
-                let Some(deadline) = spent.checked_add(RETAIL_DAILY) else {
+                let Some(deadline) = spent.checked_add(RETAIL_INTERVAL) else {
                     Counters::bump(&mut stores.counters.ineligible, "retail_clock_overflow");
                     return Err(RetailHold::AccountingLost);
                 };
@@ -1617,7 +1614,7 @@ impl SharedCache {
         let prior = stores.retail_spent[&key].spent;
         let first = prior.is_none();
         let grant = if prior.is_some_and(|(high, _)| c.length < high || accepted_end > c.length) {
-            RetailGrant::Daily
+            RetailGrant::Interval
         } else {
             RetailGrant::Process
         };
@@ -3509,7 +3506,7 @@ impl SharedCache {
     }
 
     /// Re-derive failures share the cross-cause Full stamp, with at most one
-    /// extra near-cap read per six-hour window (rotation can remove discovery).
+    /// extra near-cap read per pace window (rotation can remove discovery).
     fn rederive_full(
         &self,
         source: SnapshotSource,

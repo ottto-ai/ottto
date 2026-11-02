@@ -8875,7 +8875,7 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
 }
 
 /// [behaviour] Retired records are missing reductions: quiet input is zero,
-/// and rebuild admission shares the normal history page and six-hour pace.
+/// and rebuild admission shares the normal history page and Full pace.
 #[test]
 fn retired_missing_uses_shared_history_page_and_growth_pace() {
     if !crate::test_isolation::run_here() {

@@ -396,7 +396,7 @@ alarm when nonzero: `old_binding_no_match` (an unprovable original binding),
 `context`, `restore_semantics` and `revision_adoption_required` (stale holds),
 `retail_exhausted` (the Tail re-read allowance is spent or its accounting was
 lost). Each is one counted Full, taken only on growth past the accepted end and
-paced to one per key per six hours through one shared RAM map;
+paced to one per key per hour through one shared RAM map;
 `retail_exhausted_paced` counts growth skipped by that pace. On map overflow the
 oldest key is evicted and the read allowed; `pace_evicted` counts it and alarms
 separately from the growth counts. `t14_rebuild_full_started` is the process
@@ -1818,7 +1818,7 @@ backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
 
-The shared six-hour Full pace also owns structural active-budget fallback.
+The shared one-hour Full pace also owns structural active-budget fallback.
 `degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
 `[event delta, source process total]` on the same alarm carrier. The source
 leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
@@ -1864,10 +1864,10 @@ do not add the two byte counters together.
 
 A replay attempt is remembered by predecessor extent, not exact generation.
 A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours, plus at
+Re-derive failures take at most one growth Full per key per hour, plus at
 most one extra near the source cap, counted `rederive_failure_full.near_cap`.
 This exception avoids losing discovery when a held file grows beyond its source
-cap. Budget contention waits without a Full; after six hours its counted
+cap. Budget contention waits without a Full; after one hour its counted
 `rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
 overflow permits at most one extra head per evicted extent and alarms
 `pace_evicted`. Discovery custody survives pace eviction independently.
@@ -1942,7 +1942,7 @@ overwrite; backend authority rules independently govern successor acceptance.
 An exact retired v1 pin is a missing reduction, never decoded as current.
 Quiet files consume zero transcript bytes. A grown file takes the existing
 missing-record Full path, counted under `resource_full.repin`, and shares the
-six-hour per-key pace. Admission uses the existing history-upgrade page:
+one-hour per-key pace. Admission uses the existing history-upgrade page:
 2,000 files / 1 GiB total, at most 512 MiB for one file, with no first-file
 escape. Other history reservations consume the same page, not a second budget.
 No repin custody map, carry/age counters or private per-pass cap remains.

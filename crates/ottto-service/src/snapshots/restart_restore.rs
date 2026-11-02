@@ -1,10 +1,7 @@
-//! Machine-local restart-restore opt-in. Policy is fixed for the lifetime of the process.
-use std::path::Path;
+//! Restart-restore policy: ON in production, opt-in per thread in test fixtures.
 
-const NAME: &str = "restart_restore_enabled";
-// Enable this dependency only when held grown files remain discoverable.
-// The sentinel alone can never bypass this release dependency.
-const DISCOVERY_DEPENDENCY_READY: bool = false;
+// Held grown files remain discoverable.
+const DISCOVERY_DEPENDENCY_READY: bool = true;
 
 #[derive(Clone, Copy, Default)]
 struct Policy {
@@ -19,25 +16,18 @@ impl Policy {
         }
     }
 }
-fn requested_at(support: &Path) -> bool {
-    std::fs::symlink_metadata(support.join(NAME))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+fn production() -> Policy {
+    Policy::resolve(true, DISCOVERY_DEPENDENCY_READY)
 }
 fn policy() -> Policy {
     #[cfg(test)]
     {
-        // Fixtures never consult the host sentinel. Guards are thread-local.
+        // Guards are thread-local.
         POLICY.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
-        static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
-        *POLICY.get_or_init(|| {
-            Policy::resolve(
-                requested_at(&ottto_core::default_support_dir()),
-                DISCOVERY_DEPENDENCY_READY,
-            )
-        })
+        production()
     }
 }
 pub(super) fn enabled() -> bool {
@@ -65,7 +55,7 @@ impl RestartRestoreForTest {
         Self::set(false, false)
     }
     pub(crate) fn requested_without_dependency() -> Self {
-        Self::set(true, DISCOVERY_DEPENDENCY_READY)
+        Self::set(true, false)
     }
     fn set(requested: bool, discovery_ready: bool) -> Self {
         Self {
@@ -84,27 +74,16 @@ impl Drop for RestartRestoreForTest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [behaviour] sentinel requires regular file and defaults off.
+    /// [behaviour] production policy is on with nothing refused.
     #[test]
-    fn sentinel_requires_regular_file_and_defaults_off() {
-        let scratch = crate::test_scratch::ScratchDir::new("restart-restore-policy");
-        assert!(!requested_at(&scratch));
-        std::fs::write(scratch.join(NAME), b"").unwrap();
-        assert!(requested_at(&scratch));
-        std::fs::remove_file(scratch.join(NAME)).unwrap();
-        std::fs::create_dir(scratch.join(NAME)).unwrap();
-        assert!(!requested_at(&scratch));
-        std::fs::remove_dir(scratch.join(NAME)).unwrap();
-        #[cfg(unix)]
-        {
-            std::fs::write(scratch.join("target"), b"").unwrap();
-            std::os::unix::fs::symlink(scratch.join("target"), scratch.join(NAME)).unwrap();
-            assert!(!requested_at(&scratch));
-        }
+    fn production_policy_is_on() {
+        let policy = production();
+        assert!(policy.effective);
+        assert_eq!(policy.on_refused, 0);
     }
-    /// [behaviour] dependency is hard and thread guards never read host or propagate.
+    /// [behaviour] dependency is hard and thread guards never propagate.
     #[test]
-    fn dependency_is_hard_and_thread_guards_never_read_host_or_propagate() {
+    fn dependency_is_hard_and_thread_guards_never_propagate() {
         assert!(!enabled());
         let refused = RestartRestoreForTest::requested_without_dependency();
         assert!(!enabled());
