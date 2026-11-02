@@ -173,6 +173,7 @@ pub(crate) struct FolderRecord {
     /// Contradictions after the census finished. Earlier names stay inferred.
     late_contradictions: u64,
 }
+crate::heap_layout_bound::fields!(FolderRecord; fresh, disqualified, sole_login, sole_org, first_slot_digest, census_complete, covered_from, email_digest, seen_login, seen_org, late_contradictions);
 
 impl FolderRecord {
     fn disqualify(&mut self, bit: u16) {
