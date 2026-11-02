@@ -8428,6 +8428,61 @@ fn finish_sync_source(
                 .map(String::as_str)
         });
     }
+    // Shed and upload-error partial checkpoint: save wholly settled files,
+    // then release adopted ACK capacity against the full scan's references
+    // (#778 R2-2). A failed save is logged and yields `None`; a failed
+    // release fails the pass.
+    let mut partial_checkpoint =
+        |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {
+            let side_mark = codex_side_save_mark(daemon, source, &index_path);
+            match checkpoint_partial_snapshot_index_with_audit_release(
+                &index,
+                &committed_index,
+                &upload_progress,
+                &scan_result.snapshots,
+                Some(&scan_result),
+                locally_held_fingerprints,
+                &index_path,
+                &upload_progress_path,
+                || {
+                    ensure_authority()?;
+                    scan_result.validate_codex_checkpoint()
+                },
+                None,
+                comparison_completion
+                    .as_mut()
+                    .map(NativeSelectedRestore::Paid),
+                Some(cause),
+                (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &daemon.transcript_cache,
+                    roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                    backfill_window_days: receipt_window_days,
+                }),
+                std::mem::take(&mut claude_proof_body_drains),
+            ) {
+                Ok(committable) => {
+                    note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    upload_progress.release_acks_after_partial_index_save_with_scan(
+                        &upload_progress_path,
+                        &committed_index,
+                        &committable,
+                        &ack_scan_referenced,
+                        locally_held_fingerprints,
+                        keep_adopted_for_retry,
+                    )?;
+                    Ok(Some(committable))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "local snapshot partial scan checkpoint failed for {}: {}",
+                        source.api_slug(),
+                        safe_error(&error)
+                    );
+                    Ok(None)
+                }
+            }
+        };
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -8500,56 +8555,11 @@ fn finish_sync_source(
             let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let mut checkpoint_succeeded = true;
-            let side_mark = codex_side_save_mark(daemon, source, &index_path);
-            let committable = match checkpoint_partial_snapshot_index_with_audit_release(
-                &index,
-                &committed_index,
-                &upload_progress,
-                &scan_result.snapshots,
-                Some(&scan_result),
-                locally_held_fingerprints,
-                &index_path,
-                &upload_progress_path,
-                || {
-                    ensure_authority()?;
-                    scan_result.validate_codex_checkpoint()
-                },
-                None,
-                comparison_completion
-                    .as_mut()
-                    .map(NativeSelectedRestore::Paid),
-                Some(UnsettledUploadCause::Shed),
-                (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-                    previous: &committed_index,
-                    cache: &daemon.transcript_cache,
-                    roots: claude_scan_roots.as_deref().unwrap_or_default(),
-                    backfill_window_days: receipt_window_days,
-                }),
-                std::mem::take(&mut claude_proof_body_drains),
-            ) {
-                Ok(committable) => {
-                    note_codex_side_saved(daemon, &index_path, false, side_mark);
-                    upload_progress.release_acks_after_partial_index_save_with_scan(
-                        &upload_progress_path,
-                        &committed_index,
-                        &committable,
-                        &ack_scan_referenced,
-                        locally_held_fingerprints,
-                        true,
-                    )?;
-                    committable
-                }
-                Err(error) => {
-                    checkpoint_succeeded = false;
-                    eprintln!(
-                        "local snapshot partial scan checkpoint failed for {}: {}",
-                        source.api_slug(),
-                        safe_error(&error)
-                    );
-                    committed_index
-                }
-            };
+            let (checkpoint_succeeded, committable) =
+                match partial_checkpoint(UnsettledUploadCause::Shed, true)? {
+                    Some(committable) => (true, committable),
+                    None => (false, committed_index),
+                };
             if retry.enabled()
                 && checkpoint_succeeded
                 && locally_held_fingerprints.is_empty()
@@ -8637,51 +8647,10 @@ fn finish_sync_source(
             // capacity. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
-                let side_mark = codex_side_save_mark(daemon, source, &index_path);
-                match checkpoint_partial_snapshot_index_with_audit_release(
-                    &index,
-                    &committed_index,
-                    &upload_progress,
-                    &scan_result.snapshots,
-                    Some(&scan_result),
-                    locally_held_fingerprints,
-                    &index_path,
-                    &upload_progress_path,
-                    || {
-                        ensure_authority()?;
-                        scan_result.validate_codex_checkpoint()
-                    },
-                    None,
-                    comparison_completion
-                        .as_mut()
-                        .map(NativeSelectedRestore::Paid),
-                    Some(UnsettledUploadCause::UploadError),
-                    (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-                        previous: &committed_index,
-                        cache: &daemon.transcript_cache,
-                        roots: claude_scan_roots.as_deref().unwrap_or_default(),
-                        backfill_window_days: receipt_window_days,
-                    }),
-                    std::mem::take(&mut claude_proof_body_drains),
-                ) {
-                    Ok(committable) => {
-                        note_codex_side_saved(daemon, &index_path, false, side_mark);
-                        // Release against the full scan's references (#778 R2-2).
-                        upload_progress.release_acks_after_partial_index_save_with_scan(
-                            &upload_progress_path,
-                            &committed_index,
-                            &committable,
-                            &ack_scan_referenced,
-                            locally_held_fingerprints,
-                            false,
-                        )?;
-                        index = committable;
-                    }
-                    Err(checkpoint_error) => eprintln!(
-                        "local snapshot partial scan checkpoint failed for {}: {}",
-                        source.api_slug(),
-                        safe_error(&checkpoint_error)
-                    ),
+                if let Some(committable) =
+                    partial_checkpoint(UnsettledUploadCause::UploadError, false)?
+                {
+                    index = committable;
                 }
             }
             if snapshot_upload_error_class(&error).is_some() {
