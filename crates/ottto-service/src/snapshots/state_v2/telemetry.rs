@@ -4,7 +4,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 #[derive(Default, Serialize)]
 struct Stats {
@@ -108,7 +108,6 @@ pub(super) enum Kind {
 pub(super) struct Stage {
     kind: Kind,
     probe: crate::local_resource_diagnostics::StateV2Probe,
-    started: Instant,
     finished: bool,
 }
 impl Stage {
@@ -125,7 +124,6 @@ impl Stage {
         Self {
             kind,
             probe: crate::local_resource_diagnostics::StateV2Probe::begin(),
-            started: Instant::now(),
             finished: false,
         }
     }
@@ -157,7 +155,7 @@ impl Stage {
                         current,
                         peak,
                         cpu_us: cpu,
-                        wall_us: u64::try_from(self.started.elapsed().as_micros()).ok(),
+                        wall_us: Some(self.probe.wall_us()),
                     },
                 );
             }
@@ -399,7 +397,7 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 struct MemoryWindow {
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
-    /// Save and hydrate only: process CPU and wall across the stage.
+    /// Process CPU and wall across the stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,6 +422,7 @@ impl Window {
 }
 impl Drop for Window {
     fn drop(&mut self) {
+        let (cpu, _, _) = self.probe.finish();
         let (current, peak) = self.probe.memory();
         if let Ok(mut stats) = stats().lock() {
             stats.stage_memory.insert(
@@ -431,8 +430,8 @@ impl Drop for Window {
                 MemoryWindow {
                     current,
                     peak,
-                    cpu_us: None,
-                    wall_us: None,
+                    cpu_us: cpu,
+                    wall_us: Some(self.probe.wall_us()),
                 },
             );
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -538,11 +537,25 @@ mod ops_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [behaviour] Save/hydrate and summed evidence windows carry CPU and wall.
+    /// [regress] The outer save window preserves CPU/wall in later records.
     #[test]
     fn stage_windows_carry_cpu_and_wall() {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            drop(Stage::new(Kind::Save));
+            let previous = PASS.with(|pass| {
+                std::mem::replace(
+                    &mut *pass.borrow_mut(),
+                    Pass {
+                        active: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            {
+                let _window = Window::begin("save").unwrap();
+                drop(Stage::new(Kind::Save));
+            }
+            save_work(1, 1);
+            PASS.with(|pass| *pass.borrow_mut() = previous);
             let mut window = crate::local_resource_diagnostics::StageSum::begin(
                 "claude_code",
                 "evidence_cross_root",
