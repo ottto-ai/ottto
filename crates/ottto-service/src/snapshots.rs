@@ -8853,7 +8853,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get_mut(&pending.index_key)
             .and_then(|a| a.work.as_mut())
         {
-            w.body_witness = final_upload_body_witness.clone();
+            w.record_body_witness(final_upload_body_witness.clone());
         }
         let stamped = index.stamp_effective_upload_body_witness_revision(
             &pending.index_key,
