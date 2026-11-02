@@ -59,7 +59,7 @@ fn write_row(writer: &mut impl Write, value: &Value) -> u64 {
     bytes.len() as u64 + 1
 }
 // Every ~9 KiB contains a unique usage-bearing response, text, and a tool
-// result. Both sizes stay below the existing 65,536 response-record cap.
+// result.
 #[cfg(target_os = "macos")]
 fn write_mixed(fixture: &Fixture, target: u64) -> (u64, u64) {
     let mut writer = BufWriter::new(File::create(fixture.path()).unwrap());
@@ -82,7 +82,6 @@ fn write_mixed(fixture: &Fixture, target: u64) -> (u64, u64) {
         requests += 1;
     }
     writer.flush().unwrap();
-    assert!(requests < MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE as u64);
     assert_eq!(fs::metadata(fixture.path()).unwrap().len(), bytes);
     (bytes, requests)
 }
@@ -99,6 +98,39 @@ fn assert_native(scan: &SourceScanResult, requests: u64) {
     assert_eq!(scan.snapshots[0].input_tokens, requests * 100);
     assert_eq!(scan.snapshots[0].output_tokens, requests * 10);
     assert_eq!(scan.snapshots[0].cache_read_tokens, requests * 20);
+}
+
+/// [regress] A file past the old 65,536-record limit, holding a response past the
+/// old 4,096-record limit, keeps all its usage and is not retryable. Before the
+/// limits went, the usage was omitted and every re-read hit the same limit.
+#[test]
+fn claude_file_past_the_old_record_limits_keeps_all_usage() {
+    let fixture = Fixture::new();
+    let mut writer = BufWriter::new(File::create(fixture.path()).unwrap());
+    let singles = CLAUDE_RECORDS_PER_FILE_ALARM as u64 + 1;
+    for n in 0..singles {
+        write_row(&mut writer, &usage(n));
+    }
+    // One response's progressive blocks: only its last output count is money.
+    let blocks = 4_097_u64;
+    let mut block = usage(singles);
+    for output_tokens in 1..=blocks {
+        block["message"]["usage"]["output_tokens"] = json!(output_tokens);
+        write_row(&mut writer, &block);
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    let mut index = ScanIndex::default();
+    let scan = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 9);
+    assert_eq!(scan.dropped_usage_record_count, 0);
+    assert_eq!(scan.recognized_usage_drop_count, 0);
+    assert!(scan.census_complete);
+    assert_eq!(scan.snapshots.len(), 1);
+    let snapshot = &scan.snapshots[0];
+    assert_eq!(snapshot.request_count, singles + 1);
+    assert_eq!(snapshot.input_tokens, (singles + 1) * 100);
+    assert_eq!(snapshot.output_tokens, singles * 10 + blocks);
+    assert_eq!(snapshot.cache_read_tokens, (singles + 1) * 20);
 }
 
 #[cfg(target_os = "macos")]

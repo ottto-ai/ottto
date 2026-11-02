@@ -1757,7 +1757,7 @@ fn retry_case(conflict: bool) {
         let progress_path = c.base.join("progress.json");
         progress.save(&progress_path).unwrap();
         let index_path = c.base.join("scan-index.json");
-        checkpoint_partial_snapshot_index_with_comparison(
+        checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &committed,
             &progress,
@@ -1770,6 +1770,8 @@ fn retry_case(conflict: bool) {
             None,
             None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
+            None,
+            Default::default(),
         )
         .unwrap();
         let prior = ScanIndex::load(&index_path).unwrap();
@@ -3089,6 +3091,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     #[cfg(unix)]
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
+    }
+    #[cfg(unix)]
+    mod durable_transition_pi_tests {
+        include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
     }
 }
 

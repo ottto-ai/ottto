@@ -304,6 +304,8 @@ fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
 /// A complete hydrate folds each usage row into its head, seeds its digest
 /// and drops the value: one decoded family at a time.
 fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<UsagePending> {
+    let _window =
+        crate::local_resource_diagnostics::StageWindow::begin("claude_code", "hydrate_usage_heads");
     let manifest = tx
         .get(&mapper::key("usage.pending", "", 0)?)?
         .context("state_v2_missing_manifest")?;

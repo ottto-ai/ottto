@@ -49,6 +49,9 @@ sparse_lifetime_counters! {
     // Pi source-field parsing observations, independent of retention decisions.
     pi_cost_refused_overflow: PiCostRefusedOverflow,
     pi_cost_precision_rounded: PiCostPrecisionRounded,
+    // Pi fork copies stamped before the fork header: fixed content-free totals.
+    pi_fork_copies_skipped_entries: PiForkCopiesSkippedEntries,
+    pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
     // Codex thread-settings snapshots asking for a non-default tier.
     codex_non_default_thread_tier: CodexNonDefaultThreadTier,
 }

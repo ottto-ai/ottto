@@ -224,10 +224,7 @@ impl ScanIndex {
                 Err(change) => self.archive_transition(&c.path, change),
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
-                    if a.work
-                        .as_ref()
-                        .is_some_and(|w| sampled_scan::now_seconds() < w.retry_after)
-                    {
+                    if a.full_paced() {
                         continue;
                     }
                     a.transition(ArchiveTransition::Reserve);

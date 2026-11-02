@@ -1,8 +1,5 @@
-use super::super::local_switch::ThreadSwitchForTest;
-use super::super::tests::manifest_index_entry;
-use super::super::*;
-
-const MARKER: &str = "claude_admission_reoffer_window_enabled";
+use super::tests::manifest_index_entry;
+use super::*;
 
 fn fixture() -> (crate::test_scratch::ScratchDir, ScanIndex) {
     let scratch = crate::test_scratch::ScratchDir::new("admission-reoffer-window");
@@ -39,34 +36,10 @@ fn window_and_context(index: &ScanIndex) -> (u64, String) {
     )
 }
 
-/// [off=main] Absent/non-file marker preserves main's query and serialized state.
-#[test]
-fn admission_window_off_matches_main() {
-    let (support, index) = fixture();
-    let before = serde_json::to_vec(&index).unwrap();
-    assert!(index.snapshot_admission_reoffer_pending());
-    assert!(!super::enabled_at(&support));
-    fs::create_dir(support.join(MARKER)).unwrap();
-    assert!(!super::enabled_at(&support));
-    assert_eq!(window_and_context(&index).0, u64::MAX);
-    assert_eq!(serde_json::to_vec(&index).unwrap(), before);
-    fs::remove_dir(support.join(MARKER)).unwrap();
-    fs::write(support.join(MARKER), b"").unwrap();
-    assert!(super::enabled_at(&support));
-    let _on = ThreadSwitchForTest::set(&super::ENABLED, true);
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        assert_eq!(
-            index.snapshot_admission_reoffer_pending_for_scan(source, 183),
-            index.snapshot_admission_reoffer_pending(),
-        );
-    }
-}
-
 /// [regress] Any in-window current-limit hold must not flip the context twice.
 #[test]
 fn admission_window_in_window_holds_keep_window_and_context() {
     let (_support, mut index) = fixture();
-    let _on = ThreadSwitchForTest::set(&super::ENABLED, true);
     let ordinary = index
         .quarantined_snapshot_fingerprints
         .remove("entity")
@@ -105,7 +78,6 @@ fn admission_window_in_window_holds_keep_window_and_context() {
 #[test]
 fn admission_window_outside_or_unknown_holds_stay_wide() {
     let (support, mut index) = fixture();
-    let _on = ThreadSwitchForTest::set(&super::ENABLED, true);
     let member = support.join("member.jsonl");
     assert_eq!(window_and_context(&index).0, 183);
     fs::File::open(&member)
