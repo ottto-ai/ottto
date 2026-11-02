@@ -33707,8 +33707,7 @@ impl OwnedSourceScan {
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
-            if source == SnapshotSource::ClaudeCode
-                && sampled_audit::growth_active(index)
+            if sampled_audit::growth_active(index)
                 && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
             {
                 sampled_audit::queue_growth_retry(index, &candidate);
@@ -52624,10 +52623,7 @@ impl ScanIndex {
             }
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
-        index.settle_claude_index_load(path, load_origin);
-        if sampled_audit::growth_active(&index) {
-            sampled_audit::bind_growth_claims(&mut index, path);
-        }
+        index.settle_loaded_index(path, load_origin);
         let first_load_in_process = index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::Codex && first_load_in_process {
             requeue_unindexed_codex_observed(&mut index);
@@ -52660,12 +52656,18 @@ impl ScanIndex {
     fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
         let (mut index, origin) =
             Self::load_inner_with_probe(path, source, None, SystemTime::now(), None)?;
-        index.settle_claude_index_load(path, ScanIndexLoadOrigin::from(&origin));
-        if sampled_audit::growth_active(&index) {
-            sampled_audit::bind_growth_claims(&mut index, path);
-        }
+        index.settle_loaded_index(path, ScanIndexLoadOrigin::from(&origin));
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         Ok(index)
+    }
+
+    /// The one post-load step of both load entry points. Growth-claim lineage
+    /// binds here for every v2-active source, so the two cannot drift apart.
+    fn settle_loaded_index(&mut self, path: &Path, load_origin: ScanIndexLoadOrigin) {
+        self.settle_claude_index_load(path, load_origin);
+        if sampled_audit::growth_active(self) {
+            sampled_audit::bind_growth_claims(self, path);
+        }
     }
 
     /// Both load entry points repair tombstones and retain guard (b) from
