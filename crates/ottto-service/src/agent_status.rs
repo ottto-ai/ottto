@@ -7600,13 +7600,59 @@ fn retain_verified_claude_slot_binding(
     retain_verified_claude_binding(slot_id, current_binding, status);
 }
 
+/// Whether [`retain_verified_claude_binding`] kept the slot's last verified
+/// account, or why it did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeBindingRetention {
+    /// The current login is the last verified account; it was kept.
+    Retained,
+    /// The current login is proven to be a different account.
+    OtherOwner,
+    /// No last verified account, or the current login names none.
+    OwnerUnknown,
+}
+
 /// [`retain_verified_claude_slot_binding`] against a binding the caller
 /// already resolved (the default home's proven token owner).
+///
+/// A `ConcurrentMutation` is a benign retry only while the slot keeps its last
+/// verified account. When the account file now names a different owner (A
+/// read first, B read last) the race is reported as `IdentityMismatch`, and
+/// with no provable owner as `IdentityUnknown`; B is never adopted. Every
+/// consumer (attention, setup check, companion) then keys on the state alone.
 fn retain_verified_claude_binding(
     slot_id: &str,
     current_binding: Option<(String, String)>,
     status: &mut ClaudeConfigSlotCollectionStatusV1,
 ) {
+    let retention = retain_or_clear_verified_claude_binding(slot_id, current_binding, status);
+    if status.state != ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        || retention == ClaudeBindingRetention::Retained
+    {
+        return;
+    }
+    let failure = if retention == ClaudeBindingRetention::OtherOwner {
+        ClaudeSlotProbeFailure::IdentityMismatch
+    } else {
+        ClaudeSlotProbeFailure::IdentityUnknown
+    };
+    let replacement = failure.status(status.observed_at.as_deref().unwrap_or_default());
+    status.state = replacement.state;
+    // Swap only the race diagnostic; upkeep diagnostics already on the
+    // status stay.
+    status.diagnostics.retain(|diagnostic| {
+        diagnostic.code != ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation
+    });
+    let mut diagnostics = replacement.diagnostics;
+    diagnostics.append(&mut status.diagnostics);
+    status.diagnostics = diagnostics;
+}
+
+fn retain_or_clear_verified_claude_binding(
+    slot_id: &str,
+    current_binding: Option<(String, String)>,
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+) -> ClaudeBindingRetention {
     let Some(previous) = read_persisted_claude_slot_collection_state()
         .slots
         .get(slot_id)
@@ -7622,22 +7668,26 @@ fn retain_verified_claude_binding(
         {
             clear_claude_slot_binding(status);
         }
-        return;
+        return if claude_slot_status_binding(status).is_some() {
+            ClaudeBindingRetention::Retained
+        } else {
+            ClaudeBindingRetention::OwnerUnknown
+        };
     };
     let (Some(previous_account), Some(previous_organization)) = (
         previous.account_identifier_hash.as_deref(),
         previous.organization_identifier_hash.as_deref(),
     ) else {
         clear_claude_slot_binding(status);
-        return;
+        return ClaudeBindingRetention::OwnerUnknown;
     };
     let Some((current_account, current_organization)) = current_binding else {
         clear_claude_slot_binding(status);
-        return;
+        return ClaudeBindingRetention::OwnerUnknown;
     };
     if current_account != previous_account || current_organization != previous_organization {
         clear_claude_slot_binding(status);
-        return;
+        return ClaudeBindingRetention::OtherOwner;
     }
     if status
         .account_identifier_hash
@@ -7649,11 +7699,12 @@ fn retain_verified_claude_binding(
             .is_some_and(|organization| organization != current_organization)
     {
         clear_claude_slot_binding(status);
-        return;
+        return ClaudeBindingRetention::OtherOwner;
     }
     retain_exact_claude_slot_binding(status, &current_account, &current_organization);
     inherit_claude_slot_account_profile(status, Some(&previous));
     retain_previous_complete_claude_read(status, previous);
+    ClaudeBindingRetention::Retained
 }
 
 /// Keep the same account's last complete reading, marked stale, when the
@@ -8589,6 +8640,32 @@ fn append_claude_upkeep_result_receipt(
                 .as_deref()
                 .unwrap_or_default(),
         ));
+}
+
+/// The registered-slot `ConcurrentMutation` outcome exactly as collection
+/// stops with it, for the setup-check tests in `control`.
+#[cfg(test)]
+pub(crate) fn registered_claude_race_status_for_test(
+    slot_id: &str,
+    config_dir: &str,
+    observed_at: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let descriptor = ClaudeConfigDirSlot::registered(config_dir.to_string())
+        .expect("registered slot")
+        .descriptor(slot_id.to_string(), ClaudeConfigSlotOwnership::Managed);
+    registered_claude_failure_status(
+        &descriptor,
+        ClaudeSlotProbeFailure::ConcurrentMutation,
+        observed_at,
+        ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
+            due_access_expires_at: None,
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        },
+    )
 }
 
 fn registered_claude_failure_status(
@@ -22446,14 +22523,22 @@ exit 44
             .iter()
             .all(|window| window.account_identifier_hash.is_none()));
         let status = annotate_claude_accounts_status(store.load().expect("load rotating slots"));
+        // Both logins rotated to another account and neither slot had a
+        // verified account to keep, so the race is not a benign retry: it
+        // fails closed as an unknown owner, with no account adopted.
         assert_eq!(
             status.default_slot.collection.state,
-            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
         );
+        assert_eq!(status.default_slot.collection.account_identifier_hash, None);
         assert_eq!(status.external_slots.len(), 1);
         assert_eq!(
             status.external_slots[0].collection.state,
-            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+        );
+        assert_eq!(
+            status.external_slots[0].collection.account_identifier_hash,
+            None
         );
         let persisted = fs::read_to_string(claude_slot_collection_state_path())
             .expect("read rotation local state");
@@ -33826,13 +33911,78 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             &raced.state
         ));
 
+        // Through the collection boundary that stops a registered slot on a
+        // failed probe: the same owner still only retries.
+        let descriptor = slot.descriptor(slot_id.to_string(), ClaudeConfigSlotOwnership::Managed);
+        let upkeep = ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
+            due_access_expires_at: None,
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        };
+        let collected = registered_claude_failure_status(
+            &descriptor,
+            ClaudeSlotProbeFailure::ConcurrentMutation,
+            "2026-08-12T10:00:30Z",
+            upkeep.clone(),
+        );
+        assert_eq!(
+            collected.state,
+            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        );
+        assert_eq!(
+            collected.account_identifier_hash.as_deref(),
+            Some(account_hash.as_str())
+        );
+
+        // Approved A, first read A, last read B: a switch, not a retry. It
+        // stays actionable as a mismatch and B is never adopted.
         write_identity("account-other");
         let mut other = ClaudeSlotProbeFailure::ConcurrentMutation.status("2026-08-12T10:01:00Z");
         retain_verified_claude_slot_binding(slot_id, &slot, &mut other);
+        assert_eq!(
+            other.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(
+            other.diagnostics.first().map(|diagnostic| diagnostic.code),
+            Some(ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch)
+        );
         assert_eq!(other.account_identifier_hash, None);
         assert_eq!(other.organization_identifier_hash, None);
         assert_eq!(other.display_label, None);
         assert_eq!(other.account_profile, None);
+        assert!(claude_custom_slot_needs_attention(&other.state));
+        let switched = registered_claude_failure_status(
+            &descriptor,
+            ClaudeSlotProbeFailure::ConcurrentMutation,
+            "2026-08-12T10:01:30Z",
+            upkeep.clone(),
+        );
+        assert_eq!(
+            switched.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(switched.account_identifier_hash, None);
+        assert_eq!(switched.organization_identifier_hash, None);
+        assert!(claude_custom_slot_needs_attention(&switched.state));
+
+        // A race that leaves no provable owner is unknown, also actionable.
+        fs::write(config_dir.join(".claude.json"), b"{}").expect("write ownerless identity");
+        let ownerless = registered_claude_failure_status(
+            &descriptor,
+            ClaudeSlotProbeFailure::ConcurrentMutation,
+            "2026-08-12T10:02:00Z",
+            upkeep,
+        );
+        assert_eq!(
+            ownerless.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+        );
+        assert_eq!(ownerless.account_identifier_hash, None);
+        assert!(claude_custom_slot_needs_attention(&ownerless.state));
         let _ = fs::remove_dir_all(root);
     }
 
