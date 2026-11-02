@@ -2105,10 +2105,11 @@ on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records the
-charged bytes of a save refused as save pressure, with `save_ceiling_cause`:
-`charged_work` above 256 MiB or `value_admission` for one row over its cap; at page size one,
-`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
+charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
+the complete valid save commits; `value_admission` for one row over its cap still
+refuses the save. At page size one, a value-admission failure raises
+`save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires

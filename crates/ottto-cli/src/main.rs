@@ -123,7 +123,9 @@ struct UninstallArgs {
     #[arg(
         long,
         value_name = "DIRECTORY",
-        help = "Copy local sync receipts and first-sweep progress here before uninstalling"
+        help = "Copy local sync receipts and first-sweep progress here before uninstalling; \
+                the backup contains local session titles, prompts and workspace paths, so keep \
+                it private"
     )]
     backup_state: Option<PathBuf>,
     #[arg(
@@ -2008,14 +2010,47 @@ fn backup_uninstall_state(home: &Path, destination: &Path) -> std::io::Result<()
             ));
         }
     }
-    std::fs::create_dir_all(&destination)?;
+    create_private_directory(&destination)?;
     if snapshots.is_dir() {
         copy_directory(&snapshots, &destination.join("snapshots"))?;
     }
     let backfill = support.join("snapshot_backfill_state.json");
     if backfill.is_file() {
-        std::fs::copy(backfill, destination.join("snapshot_backfill_state.json"))?;
+        copy_private_file(&backfill, &destination.join("snapshot_backfill_state.json"))?;
     }
+    Ok(())
+}
+
+// Backups hold local session titles, prompts and workspace paths. Set the
+// modes explicitly so they never depend on the source modes or the umask.
+const BACKUP_DIRECTORY_MODE: u32 = 0o700;
+const BACKUP_FILE_MODE: u32 = 0o600;
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(BACKUP_DIRECTORY_MODE);
+    }
+    builder.create(path)?;
+    set_private_mode(path, BACKUP_DIRECTORY_MODE)
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::copy(source, destination)?;
+    set_private_mode(destination, BACKUP_FILE_MODE)
+}
+
+#[cfg(unix)]
+fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_private_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2034,14 +2069,14 @@ fn canonical_new_directory_path(destination: &Path) -> std::io::Result<PathBuf> 
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
+    create_private_directory(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let target = destination.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_directory(&entry.path(), &target)?;
         } else {
-            std::fs::copy(entry.path(), target)?;
+            copy_private_file(&entry.path(), &target)?;
         }
     }
     Ok(())
@@ -5116,6 +5151,56 @@ mod tests {
         );
         assert!(!destination.join("account.json").exists());
         assert!(!destination.join("relay-device.json").exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_backup_writes_private_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ottto-uninstall-backup-modes-{suffix}"));
+        let home = root.join("home");
+        let support = home.join("Library/Application Support/Ottto/support");
+        let nested = support.join("snapshots/state_v2");
+        std::fs::create_dir_all(&nested).expect("snapshot directory");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
+            .expect("open source directory");
+        let db = nested.join("state.sqlite");
+        std::fs::write(&db, b"db").expect("db");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644))
+            .expect("open source file");
+        let backfill = support.join("snapshot_backfill_state.json");
+        std::fs::write(&backfill, b"progress").expect("backfill progress");
+        std::fs::set_permissions(&backfill, std::fs::Permissions::from_mode(0o666))
+            .expect("open backfill file");
+        let destination = root.join("backup");
+
+        backup_uninstall_state(&home, &destination).expect("backup");
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        }
+        for directory in [
+            destination.clone(),
+            destination.join("snapshots"),
+            destination.join("snapshots/state_v2"),
+        ] {
+            assert_eq!(mode(&directory), 0o700, "{}", directory.display());
+        }
+        for file in [
+            destination.join("snapshots/state_v2/state.sqlite"),
+            destination.join("snapshot_backfill_state.json"),
+        ] {
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        }
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

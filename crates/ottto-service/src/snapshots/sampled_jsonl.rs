@@ -72,6 +72,18 @@ pub(super) mod preparation_tests {
 }
 
 impl CachedJsonlReduction {
+    /// Only Claude parses hold markers; Codex and Pi have none to change.
+    pub(super) fn scrub_context_digest(&mut self) {
+        if let Some(markers) = self.accumulator.claude_org_markers.as_deref_mut() {
+            markers.scrub_context_digest();
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::snapshots) fn org_markers_for_test(
+        &self,
+    ) -> Option<&super::claude_request_identity::OrgMarkers> {
+        self.accumulator.claude_org_markers.as_deref()
+    }
     #[cfg(test)]
     pub(in crate::snapshots) fn accumulator_for_test(&mut self) -> &mut SnapshotAccumulator {
         &mut self.accumulator
