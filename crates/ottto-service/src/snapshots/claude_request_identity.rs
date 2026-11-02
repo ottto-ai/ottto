@@ -190,9 +190,12 @@ const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
 
 pub(crate) const TELEMETRY: &str = "telemetry";
 pub(crate) const TELEMETRY_LOGIN: &str = "telemetry_login";
-/// A request with no telemetry in a folder proven to hold only one login: the
-/// folder's evidence names it, never the request's own. Placement, never proof.
-pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
+/// Retired basis: no build ever emitted it. Still parsed, unchanged, so an
+/// older body or accepted record that names it never fails to decode.
+pub(crate) const LEGACY_TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
+/// A request with no telemetry whose own session recorded its folder's known
+/// login. Placement, never proof.
+pub(crate) const TRANSCRIPT_RECORDED_LOGIN: &str = "transcript_recorded_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
@@ -216,9 +219,9 @@ impl AuthorityKey {
     }
 
     /// Placement that never proves or freezes a row: a carried account, or one
-    /// named by the folder rather than the request.
+    /// named from the session's recorded login.
     fn placement_only(&self) -> bool {
-        self.account_source.is_some() || self.basis == TRANSCRIPT_SOLE_LOGIN
+        self.account_source.is_some() || self.basis == TRANSCRIPT_RECORDED_LOGIN
     }
 }
 
@@ -2009,7 +2012,8 @@ fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
                                 TELEMETRY => TELEMETRY,
                                 TELEMETRY_LOGIN => TELEMETRY_LOGIN,
                                 TRANSCRIPT_ORG => TRANSCRIPT_ORG,
-                                TRANSCRIPT_SOLE_LOGIN => TRANSCRIPT_SOLE_LOGIN,
+                                TRANSCRIPT_RECORDED_LOGIN => TRANSCRIPT_RECORDED_LOGIN,
+                                LEGACY_TRANSCRIPT_SOLE_LOGIN => LEGACY_TRANSCRIPT_SOLE_LOGIN,
                                 _ => return None,
                             };
                             IdentityRef::Tagged(KeyRef {
@@ -2067,8 +2071,8 @@ fn withdrawn(key: AuthorityKey) -> Option<AuthorityKey> {
     match key.basis {
         TELEMETRY => Some(key),
         TELEMETRY_LOGIN => Some(AuthorityKey { org: None, ..key }),
-        // Rests on the folder's evidence, not on the file's copied markers.
-        TRANSCRIPT_SOLE_LOGIN => Some(key),
+        // Rests on the folder's verdict, not on the file's copied markers.
+        TRANSCRIPT_RECORDED_LOGIN => Some(key),
         _ => None,
     }
 }
@@ -2287,12 +2291,12 @@ fn install(
         .map(|(position, entry)| (entry.clone(), position as u16))
         .collect::<BTreeMap<_, _>>();
     // A side run re-installs an already tagged item that has no fold.
-    let sole_witness = item
+    let recorded_witness = item
         .claude_money
         .as_deref()
         .and_then(|fold| fold.folder_trace.as_deref())
-        .and_then(FolderTrace::sole)
-        .map(|sole| sole.witness.clone())
+        .and_then(FolderTrace::qualified)
+        .map(|qualified| qualified.witness.clone())
         .or_else(|| {
             item.request_evidence
                 .iter()
@@ -2300,8 +2304,8 @@ fn install(
         });
     item.request_evidence = evidence.iter().map(EvidenceKey::wire).collect();
     for entry in &mut item.request_evidence {
-        if entry.identity_basis == TRANSCRIPT_SOLE_LOGIN {
-            entry.sole_login_witness = sole_witness.clone();
+        if entry.identity_basis == TRANSCRIPT_RECORDED_LOGIN {
+            entry.sole_login_witness = recorded_witness.clone();
         }
     }
     item.request_identity_refusals = refusals;
@@ -2894,7 +2898,6 @@ pub(crate) struct OrgMarkers {
     home: Option<crate::claude_status_coverage::HomeKey>,
 }
 
-/// Field check on an already-decoded, owned (non-inherited) Claude line.
 /// Domain-separated SHA-256 of a trimmed, lowercased `session_context` email
 /// (an H value in the durable store).
 pub(crate) fn marker_email_digest(text: &str) -> String {
@@ -2917,6 +2920,7 @@ pub(super) fn marker_org_hash(attachment: &Value) -> Option<String> {
         .and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "organization", &uuid))
 }
 
+/// Field check on an already-decoded, owned (non-inherited) Claude line.
 pub(crate) fn note_marker_line(
     markers: &mut Option<Box<OrgMarkers>>,
     value: &Value,
@@ -2991,16 +2995,6 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
-    /// Every organization this file's own markers name; `None` for a blank or
-    /// malformed one, or for markers no longer listed after an overflow.
-    pub(super) fn folder_orgs(&self) -> impl Iterator<Item = Option<&str>> {
-        self.entries
-            .iter()
-            .chain(&self.starting_marker)
-            .map(|marker| marker.org.as_deref())
-            .chain(self.overflowed.then_some(None))
-    }
-
     /// Binds the registered-folder key once the item's path is known.
     pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
         if self.context_position.is_some() {
@@ -3789,16 +3783,16 @@ pub(crate) fn reconcile_request_accounts(
         accounts.inherited = accounts.inherited.saturating_sub(old_identified);
         let mut earlier: Option<(u64, AccountPartition)> = None;
         let mut keys: Vec<Arc<AuthorityKey>> = Vec::new();
-        let sole_folder = fold
+        let recorded_folder = fold
             .folder_trace
             .as_deref()
-            .and_then(FolderTrace::sole)
+            .and_then(FolderTrace::qualified)
             .cloned();
-        let sole_key = sole_folder.as_ref().map(|sole| {
+        let recorded_key = recorded_folder.as_ref().map(|folder| {
             Arc::new(AuthorityKey {
-                login: Some(sole.login.clone()),
-                org: Some(sole.org.clone()),
-                basis: TRANSCRIPT_SOLE_LOGIN,
+                login: Some(folder.login.clone()),
+                org: Some(folder.org.clone()),
+                basis: TRANSCRIPT_RECORDED_LOGIN,
                 account_source: None,
             })
         });
@@ -3818,13 +3812,18 @@ pub(crate) fn reconcile_request_accounts(
                 .requests
                 .get(&(root, request.as_str()))
                 .and_then(|row| *row);
-            let identity =
-                request_occurrence_facts(item, request, occurrence, false, sole_folder.as_ref())
-                    .map(|facts| classify_ref(evidence, &facts));
-            let sole_fill = matches!(
+            let identity = request_occurrence_facts(
+                item,
+                request,
+                occurrence,
+                false,
+                recorded_folder.as_ref(),
+            )
+            .map(|facts| classify_ref(evidence, &facts));
+            let recorded_fill = matches!(
                 identity,
                 Some(IdentityRef::Tagged(KeyRef {
-                    basis: TRANSCRIPT_SOLE_LOGIN,
+                    basis: TRANSCRIPT_RECORDED_LOGIN,
                     ..
                 }))
             );
@@ -3952,8 +3951,9 @@ pub(crate) fn reconcile_request_accounts(
                 };
                 // The last arm. A marker fill is org-only and this key names
                 // the same org, so it completes the fill instead of losing it.
-                let fills = sole_fill && account.as_ref().map_or(true, |key| key.login.is_none());
-                let account = if fills { sole_key.clone() } else { account };
+                let fills =
+                    recorded_fill && account.as_ref().map_or(true, |key| key.login.is_none());
+                let account = if fills { recorded_key.clone() } else { account };
                 if own_marker.is_none() && account.is_some() {
                     accounts.inherited = accounts
                         .inherited
@@ -4855,8 +4855,8 @@ pub(crate) struct RequestFacts<'a> {
     /// Another transcript also carries this request (the pass's duplicate
     /// witness): it is not this transcript's alone.
     pub(crate) duplicated_elsewhere: bool,
-    /// This own-session file's qualified folder, when there is one.
-    pub(crate) sole_login: Option<&'a QualifiedFolder>,
+    /// This matched own file's qualified folder, when there is one.
+    pub(crate) recorded_login: Option<&'a QualifiedFolder>,
 }
 
 impl RequestFacts<'_> {
@@ -5071,7 +5071,7 @@ fn transcript_identity<'k>(
     facts: &RequestFacts<'k>,
 ) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
-        MarkerVerdict::None => return facts.sole_login.map(sole_login_identity),
+        MarkerVerdict::None => return None,
         MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
         MarkerVerdict::UntrustedFlip => return Some(IdentityRef::Refused(Refusal::UntrustedFlip)),
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
@@ -5080,8 +5080,18 @@ fn transcript_identity<'k>(
     if let Some(refusal) = email_refusal(evidence, facts, org) {
         return Some(IdentityRef::Refused(refusal));
     }
-    if let Some(sole) = facts.sole_login.filter(|sole| sole.org == org) {
-        return Some(sole_login_identity(sole));
+    // Both recorded before this request, in this file, unchanged. Desktop stays
+    // pair-only.
+    if let Some(folder) = facts
+        .recorded_login
+        .filter(|folder| folder.org == org && facts.email_home.is_some() && !facts.desktop)
+    {
+        return Some(IdentityRef::Tagged(KeyRef {
+            login: Some(&folder.login),
+            org: Some(&folder.org),
+            basis: TRANSCRIPT_RECORDED_LOGIN,
+            account_source: None,
+        }));
     }
     Some(IdentityRef::Tagged(KeyRef {
         login: None,
@@ -5089,15 +5099,6 @@ fn transcript_identity<'k>(
         basis: TRANSCRIPT_ORG,
         account_source: None,
     }))
-}
-
-fn sole_login_identity(sole: &QualifiedFolder) -> IdentityRef<'_> {
-    IdentityRef::Tagged(KeyRef {
-        login: Some(&sole.login),
-        org: Some(&sole.org),
-        basis: TRANSCRIPT_SOLE_LOGIN,
-        account_source: None,
-    })
 }
 
 /// `transcript_email` never binds a login. No qualified join from a recorded
@@ -5303,11 +5304,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             },
             session_start_unix_seconds: self.session_start_unix_seconds,
             duplicated_elsewhere,
-            sole_login: item
+            recorded_login: item
                 .claude_money
                 .as_deref()
                 .and_then(|fold| fold.folder_trace.as_deref())
-                .and_then(FolderTrace::sole),
+                .and_then(FolderTrace::qualified),
         };
         let identity = classify_ref(self.evidence, &facts);
         // Activity never overrides stronger request identity. A later Desktop
@@ -5732,7 +5733,7 @@ fn request_occurrence_facts<'a>(
     request_id: &'a str,
     occurrence: &'a super::ClaudeTranscriptUsageOccurrence,
     duplicated_elsewhere: bool,
-    sole_login: Option<&'a QualifiedFolder>,
+    recorded_login: Option<&'a QualifiedFolder>,
 ) -> Option<RequestFacts<'a>> {
     let root = owner_root(item)?;
     let timestamp = occurrence.timestamp.as_deref()?;
@@ -5764,7 +5765,7 @@ fn request_occurrence_facts<'a>(
             .as_deref()
             .and_then(rfc3339_unix_seconds),
         duplicated_elsewhere,
-        sole_login,
+        recorded_login,
     })
 }
 
@@ -5796,12 +5797,12 @@ fn collect_request_owned_activity(
         let Some(timestamp) = occurrence.timestamp.as_deref() else {
             continue;
         };
-        let sole = item
+        let recorded = item
             .claude_money
             .as_deref()
             .and_then(|fold| fold.folder_trace.as_deref())
-            .and_then(FolderTrace::sole);
-        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false, sole)
+            .and_then(FolderTrace::qualified);
+        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false, recorded)
         else {
             continue;
         };

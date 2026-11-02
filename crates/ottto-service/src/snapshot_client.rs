@@ -757,7 +757,7 @@ pub struct ActivityHintResponse {
     /// so older servers never receive the field.
     #[serde(default)]
     pub session_request_account_source_contract: Option<String>,
-    /// Server capability for `transcript_sole_login` and its witness. Anything
+    /// Server capability for `transcript_recorded_login` and its witness. Anything
     /// but the exact token computes no tag and sends no new byte.
     #[serde(default)]
     pub session_request_sole_login_witness_contract: Option<String>,

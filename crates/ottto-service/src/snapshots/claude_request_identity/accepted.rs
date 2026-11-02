@@ -290,15 +290,16 @@ fn basis_token(basis: &str) -> Option<&'static str> {
     match basis {
         TELEMETRY => Some(TELEMETRY),
         TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_SOLE_LOGIN => Some(TRANSCRIPT_SOLE_LOGIN),
+        TRANSCRIPT_RECORDED_LOGIN => Some(TRANSCRIPT_RECORDED_LOGIN),
+        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
         TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
         _ => None,
     }
 }
-/// A carried or folder-named share: placement, never proof of its row.
+/// A carried or recorded-login share: placement, never proof of its row.
 fn placement_only_entry(entry: &Value) -> bool {
     entry.get("account_source").is_some()
-        || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_SOLE_LOGIN)
+        || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
     digest(key, json!(["claude_accepted_identity_buckets:v2", session]))
@@ -781,7 +782,7 @@ impl AcceptedBuckets {
     pub(crate) fn account_source_enabled(&self) -> bool {
         self.5
     }
-    /// Sole-login tagging for this cycle: only the server's exact capability
+    /// Recorded-login tagging for this cycle: only the server's exact capability
     /// token turns it on; absent keeps every byte and writes no ledger.
     pub(crate) fn set_sole_login_enabled(&mut self, enabled: bool) {
         self.6 = enabled;

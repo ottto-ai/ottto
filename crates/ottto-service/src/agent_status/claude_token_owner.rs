@@ -11,7 +11,6 @@
 //! memory, keyed by a fingerprint of the token itself: one call per token,
 //! with back-off after a failure.
 
-use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -36,17 +35,13 @@ enum Verdict {
     Failed { retry_at: Instant, failures: u32 },
 }
 
-/// Each slot's latest token and its verdict: one entry per slot, since a slot
-/// holds one token at a time. Tests keep one map per test thread.
-type Memo = BTreeMap<String, (String, Verdict)>;
-/// Past this many slots the memo restarts, costing at most repeated calls.
-const MAX_MEMOIZED_SLOTS: usize = 32;
+/// The latest default-home token and its verdict. One entry: the default home
+/// holds one token at a time. Tests keep one per test thread.
+#[cfg(not(test))]
+static LAST: Mutex<Option<(String, Verdict)>> = Mutex::new(None);
 
 #[cfg(not(test))]
-static LAST: Mutex<Memo> = Mutex::new(BTreeMap::new());
-
-#[cfg(not(test))]
-fn with_last<R>(use_last: impl FnOnce(&mut Memo) -> R) -> R {
+fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
     use_last(
         &mut LAST
             .lock()
@@ -56,16 +51,17 @@ fn with_last<R>(use_last: impl FnOnce(&mut Memo) -> R) -> R {
 
 #[cfg(test)]
 thread_local! {
-    static LAST: std::cell::RefCell<Memo> = const { std::cell::RefCell::new(BTreeMap::new()) };
+    static LAST: std::cell::RefCell<Option<(String, Verdict)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn with_last<R>(use_last: impl FnOnce(&mut Memo) -> R) -> R {
+fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
     LAST.with(|last| use_last(&mut last.borrow_mut()))
 }
 
 /// A content fingerprint of the stored token (never a file time).
-pub(super) fn credential_fingerprint(access_token: &str) -> String {
+fn credential_fingerprint(access_token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ottto:claude-credential-fingerprint:v1\0");
     hasher.update(access_token.as_bytes());
@@ -77,17 +73,8 @@ pub(super) fn credential_fingerprint(access_token: &str) -> String {
 /// back-off has passed; `may_call` false serves the remembered verdict only.
 /// No lock is held during the call.
 pub(super) fn proven_owner(access_token: &str, may_call: bool) -> Option<ProvenOwner> {
-    proven_slot_owner("default", access_token, may_call)
-}
-
-/// `proven_owner` for one slot's token.
-pub(super) fn proven_slot_owner(
-    slot_id: &str,
-    access_token: &str,
-    may_call: bool,
-) -> Option<ProvenOwner> {
     let fingerprint = credential_fingerprint(access_token);
-    let failures = with_last(|last| match last.get(slot_id) {
+    let failures = with_last(|last| match last.as_ref() {
         Some((known, verdict)) if *known == fingerprint => match verdict {
             Verdict::Proven(owner) => Err(Some(owner.clone())),
             Verdict::Failed { retry_at, .. } if Instant::now() < *retry_at => Err(None),
@@ -117,12 +104,7 @@ pub(super) fn proven_slot_owner(
         Verdict::Proven(owner) => Some(owner.clone()),
         Verdict::Failed { .. } => None,
     };
-    with_last(|last| {
-        if last.len() >= MAX_MEMOIZED_SLOTS && !last.contains_key(slot_id) {
-            last.clear();
-        }
-        last.insert(slot_id.to_owned(), (fingerprint, verdict));
-    });
+    with_last(|last| *last = Some((fingerprint, verdict)));
     owner
 }
 
@@ -211,80 +193,4 @@ fn default_home_profile() -> Result<Value, u16> {
         "account": {"uuid": account.account_uuid},
         "organization": {"uuid": account.organization_uuid},
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn profile(account: &str) -> Result<Value, u16> {
-        Ok(json!({
-            "account": {"uuid": account},
-            "organization": {"uuid": "11111111-1111-4111-8111-111111111111"},
-        }))
-    }
-    fn first_owner() -> Result<Value, u16> {
-        profile("22222222-2222-4222-8222-222222222222")
-    }
-    fn second_owner() -> Result<Value, u16> {
-        profile("33333333-3333-4333-8333-333333333333")
-    }
-    fn unavailable() -> Result<Value, u16> {
-        Err(503)
-    }
-    fn panics() -> Result<Value, u16> {
-        panic!("this token's verdict is memoized")
-    }
-    fn answer(responder: ProfileResponder) {
-        PROFILE_TEST_RESPONSE.with(|cell| cell.set(Some(responder)));
-    }
-
-    #[test]
-    fn no_call_means_not_yet_and_asks_nothing() {
-        answer(panics);
-        assert_eq!(proven_slot_owner("slot-a", "token-none", false), None);
-    }
-
-    #[test]
-    fn a_failed_call_means_not_yet_and_waits_for_its_back_off() {
-        answer(unavailable);
-        assert_eq!(proven_slot_owner("slot-a", "token-failed", true), None);
-        answer(panics);
-        assert_eq!(proven_slot_owner("slot-a", "token-failed", true), None);
-    }
-
-    #[test]
-    fn one_call_per_token_per_slot_and_other_owners_are_told_apart() {
-        answer(first_owner);
-        let first = proven_slot_owner("slot-a", "token-1", true).unwrap();
-        answer(second_owner);
-        let other = proven_slot_owner("slot-b", "token-2", true).unwrap();
-        assert_ne!(first.account_hash, other.account_hash);
-        assert_eq!(first.organization_hash, other.organization_hash);
-        // Same owner: each slot's verdict is memoized side by side.
-        answer(panics);
-        assert_eq!(
-            proven_slot_owner("slot-a", "token-1", true).as_ref(),
-            Some(&first)
-        );
-        assert_eq!(
-            proven_slot_owner("slot-b", "token-2", false).as_ref(),
-            Some(&other)
-        );
-        // A new token in the same slot is a new question.
-        answer(second_owner);
-        assert_eq!(
-            proven_slot_owner("slot-a", "token-3", true).map(|owner| owner.account_hash),
-            Some(other.account_hash)
-        );
-    }
-
-    #[test]
-    fn the_default_home_shares_the_slot_memo() {
-        answer(first_owner);
-        let default = proven_owner("token-d", true).unwrap();
-        answer(panics);
-        assert_eq!(proven_slot_owner("default", "token-d", true), Some(default));
-    }
 }

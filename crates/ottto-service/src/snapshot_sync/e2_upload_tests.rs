@@ -345,7 +345,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
 /// No exact capability token: nothing new reaches the wire and no ledger is
 /// written, so the persisted index and the body stay byte-identical.
 #[test]
-fn sole_login_capability_off_keeps_every_byte() {
+fn recorded_login_capability_off_keeps_every_byte() {
     let entry = crate::snapshots::SnapshotRequestEvidence {
         identity_basis: "transcript_org".to_string(),
         provider_workspace_hash: Some("d".repeat(64)),

@@ -4285,7 +4285,7 @@ fn folder_login_ledger_old_state_loads_empty_and_damage_never_refuses() {
             .is_empty(),
         "damage only loses the ledger, so the folder stays owed"
     );
-    let kept = read(br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"disqualified":32768}}}"#);
+    let kept = read(br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":true}}}"#);
     assert_eq!(kept.claude_folder_login_ledger.len(), 1);
     assert!(kept.claude_folder_login_ledger.contains_key("folder"));
 }

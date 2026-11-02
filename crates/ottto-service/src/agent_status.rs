@@ -4183,7 +4183,7 @@ fn collect_claude_status(
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
-    note_claude_folder_owner("default", &ClaudeConfigDirSlot::Default, &local);
+    note_claude_folder_owner(&ClaudeConfigDirSlot::Default, &local, None);
     let mut login_state = local.state;
     let default_live = local.live_login();
     // "Keep my Claude accounts signed in": the default login gets the same
@@ -5975,7 +5975,7 @@ fn collect_registered_claude_slot_step(
             claude_oauth_end_slot_run(slot_id);
             note_coverage(CoverageObservation::Unavailable);
             // Another account here is exactly what the folder ledger records.
-            note_registered_claude_folder_owner(descriptor, None);
+            note_refused_claude_slot(descriptor);
             return ClaudeSlotCollectionStep::PreGateRefused(status);
         }
     };
@@ -5988,7 +5988,13 @@ fn collect_registered_claude_slot_step(
     let local = network_enabled
         .then(|| read_registered_claude_slot_locally(descriptor))
         .flatten();
-    note_registered_claude_folder_owner(descriptor, local.as_ref());
+    if let (Some(local), Some(binding), Some(slot)) = (
+        local.as_ref(),
+        expected_binding.as_ref(),
+        claude_config_slot_for_descriptor(descriptor),
+    ) {
+        note_claude_folder_owner(&slot, local, Some(binding));
+    }
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
@@ -6654,24 +6660,20 @@ fn registered_slot_refresh(
     }
 }
 
-/// Reports one folder's owner to the sole-login ledger, for candidates only: no
-/// candidate list exists until the server advertises the capability. At most one
-/// profile call per token, never a login change, and it obeys the same
-/// background gates as every other Claude read.
+/// Reports one folder's login to the recorded-login ledger, in memory. Reads no
+/// extra file. At most one profile call per token on the default folder, only
+/// while the capability is on and the folder can still qualify, never a login
+/// change, and under the same background gates as every other Claude read.
 fn note_claude_folder_owner(
-    slot_id: &str,
     slot: &ClaudeConfigDirSlot,
     local: &ClaudeSlotLocalRead,
+    registered: Option<&ClaudeSlotAccountBinding>,
 ) {
     use crate::snapshots::claude_folder_login as folder;
-    let home_path = home_dir();
     let config_dir = slot
         .config_dir()
-        .map_or_else(|| home_path.join(".claude"), PathBuf::from);
+        .map_or_else(|| home_dir().join(".claude"), PathBuf::from);
     let home = folder::folder_key(&config_dir);
-    if !folder::is_candidate(&home) {
-        return;
-    }
     let strong = |account: &Option<ClaudeCliOauthAccount>| {
         account
             .as_ref()
@@ -6679,88 +6681,69 @@ fn note_claude_folder_owner(
     };
     let cached = strong(&local.initial_oauth_account)
         .filter(|pair| strong(&local.final_oauth_account).as_ref() == Some(pair));
-    let token = match &local.credential {
-        ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
-        _ => None,
-    };
-    let may_call = matches!(local.state, ClaudeLocalLoginState::AccessValid)
-        && !claude_oauth_usage_network_disabled()
-        && !claude_pass_saved_only()
-        && !claude_background_read_withheld();
-    let proven = token
-        .and_then(|token| claude_token_owner::proven_slot_owner(slot_id, token, may_call))
-        .map(|owner| (owner.account_hash, owner.organization_hash));
-    let identity_path = slot.identity_path(&home_path);
-    let foreign_backup = cached.as_ref().is_some_and(|cached| {
-        token.is_some_and(|token| {
-            folder::backups_due(&home, &claude_token_owner::credential_fingerprint(token))
-        }) && claude_identity_backups_name_another(&identity_path, &config_dir, cached)
-    });
-    let email_digest = cached
+    let email = cached
         .as_ref()
         .and(local.final_oauth_account.as_ref())
         .and_then(|account| account.email_address.as_deref())
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| !email.is_empty())
-        .map(|email| crate::snapshots::claude_request_identity::marker_email_digest(&email));
-    folder::observe_owner(
-        home,
-        folder::OwnerReport {
-            slot_digest: folder::slot_key(slot_id),
-            cached,
-            proven,
-            email_digest,
-            foreign_backup,
-        },
-    );
-}
-
-fn note_registered_claude_folder_owner(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-    local: Option<&ClaudeSlotLocalRead>,
-) {
-    let Some(slot) = claude_config_slot_for_descriptor(descriptor) else {
-        return;
-    };
-    let Some(config_dir) = slot.config_dir() else {
-        return;
-    };
-    let home = crate::snapshots::claude_folder_login::folder_key(Path::new(config_dir));
-    if !crate::snapshots::claude_folder_login::is_candidate(&home) {
-        return;
-    }
-    match local {
-        Some(local) => note_claude_folder_owner(&descriptor.slot_id, &slot, local),
-        None => {
-            if let Some(local) = read_registered_claude_slot_locally(descriptor) {
-                note_claude_folder_owner(&descriptor.slot_id, &slot, &local);
+        .filter(|email| !email.trim().is_empty())
+        .map(folder::address_digest);
+    let report = match registered {
+        Some(binding) => {
+            let pair = (
+                binding.account_identifier_hash.clone(),
+                binding.organization_identifier_hash.clone(),
+            );
+            folder::OwnerReport {
+                slot: true,
+                other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
+                pair: cached.is_some().then_some(pair),
+                proven: None,
+                email,
             }
         }
-    }
+        None => {
+            let token = match &local.credential {
+                ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
+                _ => None,
+            };
+            let may_call = folder::proof_wanted(&home)
+                && matches!(local.state, ClaudeLocalLoginState::AccessValid)
+                && !claude_oauth_usage_network_disabled()
+                && !claude_pass_saved_only()
+                && !claude_background_read_withheld();
+            folder::OwnerReport {
+                slot: false,
+                pair: cached,
+                proven: token
+                    .and_then(|token| claude_token_owner::proven_owner(token, may_call))
+                    .map(|owner| (owner.account_hash, owner.organization_hash)),
+                email,
+                other_account: false,
+            }
+        }
+    };
+    folder::observe_owner(home, report);
 }
 
-/// Whether an identity backup Claude Code left beside this folder names another
-/// strong pair. Bounded: only backup-named files, at most 64 per directory.
-fn claude_identity_backups_name_another(
-    identity_path: &Path,
-    config_dir: &Path,
-    cached: &(String, String),
-) -> bool {
-    identity_path
-        .parent()
-        .into_iter()
-        .chain([config_dir.join("backups").as_path()])
-        .filter_map(|directory| fs::read_dir(directory).ok())
-        .flat_map(|entries| entries.flatten().take(64))
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".claude.json.backup")
-        })
-        .filter_map(|entry| read_claude_cli_oauth_account(&entry.path()))
-        .filter_map(|account| claude_strong_oauth_identity_hashes(&account))
-        .any(|pair| pair != *cached)
+/// A refused slot: only another strong account in it reaches the ledger. An
+/// unreadable login or approval proves nothing.
+fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
+    use crate::snapshots::claude_folder_login as folder;
+    if !claude_slot_login_unapproved(descriptor) || claude_slot_local_login(descriptor).is_none() {
+        return;
+    }
+    if let Some(config_dir) = claude_config_slot_for_descriptor(descriptor)
+        .and_then(|slot| slot.config_dir().map(PathBuf::from))
+    {
+        folder::observe_owner(
+            folder::folder_key(&config_dir),
+            folder::OwnerReport {
+                slot: true,
+                other_account: true,
+                ..folder::OwnerReport::default()
+            },
+        );
+    }
 }
 
 fn read_registered_claude_slot_locally(

@@ -1535,21 +1535,28 @@ fn e2_pipeline_listed_family_accepted_cap_discard_is_held_then_keeps_tags() {
     e2_bound_trace_case("cap", true, "subscription", true, true);
 }
 
-const SOLE_ORG_UUID: &str = "11111111-1111-4111-8111-111111111111";
+const RECORDED_ORG_UUID: &str = "11111111-1111-4111-8111-111111111111";
+const RECORDED_ADDRESS: &str = "one.login@example.test";
 
-/// The family fixture under `<dir>/cfg/projects/p`, with an org marker and no
-/// telemetry row at all. Returns the transcript root and the session.
-fn sole_login_transcripts() -> (PathBuf, PathBuf, String) {
+/// The family fixture under `<dir>/cfg/projects/p`, starting with the recorded
+/// email sentence and org marker, and no telemetry row at all. Returns the
+/// transcript root and the session.
+fn recorded_login_transcripts() -> (PathBuf, PathBuf, String) {
     let (dir, root, _) = claude_account_family_fixture(false);
     let project = dir.join("cfg/projects/p");
     fs::create_dir_all(&project).unwrap();
     let native = fs::read_to_string(dir.join(format!("{root}.jsonl"))).unwrap();
+    let email = json!({"type":"attachment", "sessionId":root,
+        "timestamp":"2026-08-02T06:59:58Z", "attachment":{
+            "type":"session_context", "context":{"userEmail":format!(
+                "The user's email address is {RECORDED_ADDRESS}. Use it only to identify the user, such as for authorship, attribution, or filtering their own work. Never send it to an unrelated service, such as in a request header, URL, or payload, unless the user explicitly asks."
+            )}}});
     let start = json!({"type":"attachment", "sessionId":root,
         "timestamp":"2026-08-02T06:59:59Z", "attachment":{
-            "type":"credential_org", "organizationUuid":SOLE_ORG_UUID}});
+            "type":"credential_org", "organizationUuid":RECORDED_ORG_UUID}});
     fs::write(
         project.join(format!("{root}.jsonl")),
-        format!("{start}\n{native}"),
+        format!("{email}\n{start}\n{native}"),
     )
     .unwrap();
     fs::remove_file(dir.join(format!("{root}.jsonl"))).unwrap();
@@ -1558,7 +1565,7 @@ fn sole_login_transcripts() -> (PathBuf, PathBuf, String) {
     (dir, projects, root)
 }
 
-fn sole_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotItem>, ScanIndex) {
+fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotItem>, ScanIndex) {
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         use crate::snapshots::claude_folder_login as folder;
         let mut index = ScanIndex::default();
@@ -1570,17 +1577,17 @@ fn sole_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotItem>,
             &[projects.to_path_buf()],
             on,
         );
-        let org =
-            ottto_core::billing_identity_hash("anthropic", "organization", SOLE_ORG_UUID).unwrap();
+        let org = ottto_core::billing_identity_hash("anthropic", "organization", RECORDED_ORG_UUID)
+            .unwrap();
         let pair = (e2_account(), org);
         folder::observe_owner(
             folder::folder_key(projects.parent().unwrap()),
             folder::OwnerReport {
-                slot_digest: folder::slot_key("default"),
-                cached: Some(pair.clone()),
+                slot: false,
+                pair: Some(pair.clone()),
                 proven: Some(pair),
-                email_digest: None,
-                foreign_backup: false,
+                email: Some(folder::address_digest(RECORDED_ADDRESS)),
+                other_account: false,
             },
         );
         let (items, _, failed, _) = e2_page_counted_with(
@@ -1595,7 +1602,7 @@ fn sole_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotItem>,
 }
 
 /// Totals one item conserves whatever its rows are labelled.
-fn sole_login_totals(items: &[SnapshotItem]) -> Vec<(String, u64, u64, u64, Option<String>)> {
+fn recorded_login_totals(items: &[SnapshotItem]) -> Vec<(String, u64, u64, u64, Option<String>)> {
     let mut totals = items
         .iter()
         .map(|item| {
@@ -1614,7 +1621,7 @@ fn sole_login_totals(items: &[SnapshotItem]) -> Vec<(String, u64, u64, u64, Opti
     totals
 }
 
-fn sole_login_row_shares(items: &[SnapshotItem]) -> u64 {
+fn recorded_login_row_shares(items: &[SnapshotItem]) -> u64 {
     items
         .iter()
         .flat_map(e2_rows)
@@ -1629,19 +1636,24 @@ fn sole_login_row_shares(items: &[SnapshotItem]) -> u64 {
 }
 
 /// Oracle: the same transcripts tagged and untagged. Totals, costs and rows'
-/// request counts are equal; only the placement differs.
+/// request counts are equal; only the placement differs, and that difference is
+/// what a re-offered read uploads. A subagent file stands on its own record.
 #[test]
-fn sole_login_tag_conserves_totals_and_changes_only_placement() {
-    let (dir, projects, root) = sole_login_transcripts();
-    let (off, off_index) = sole_login_page(&dir, &projects, false);
-    let (on, on_index) = sole_login_page(&dir, &projects, true);
+fn recorded_login_tag_conserves_totals_and_changes_only_placement() {
+    let (dir, projects, root) = recorded_login_transcripts();
+    let (off, off_index) = recorded_login_page(&dir, &projects, false);
+    let (on, on_index) = recorded_login_page(&dir, &projects, true);
     assert!(off_index.claude_folder_login_ledger.is_empty());
     assert_eq!(on_index.claude_folder_login_ledger.len(), 1);
 
-    assert_eq!(sole_login_totals(&off), sole_login_totals(&on));
-    assert_eq!(sole_login_row_shares(&off), sole_login_row_shares(&on));
-    assert!(sole_login_totals(&on).iter().any(|total| total.1 > 0));
+    assert_eq!(recorded_login_totals(&off), recorded_login_totals(&on));
+    assert_eq!(
+        recorded_login_row_shares(&off),
+        recorded_login_row_shares(&on)
+    );
+    assert!(recorded_login_totals(&on).iter().any(|total| total.1 > 0));
 
+    let basis = claude_request_identity::TRANSCRIPT_RECORDED_LOGIN;
     let tagged = on
         .iter()
         .find(|item| item.source_session_id == root)
@@ -1649,10 +1661,11 @@ fn sole_login_tag_conserves_totals_and_changes_only_placement() {
     let entry = tagged
         .request_evidence
         .iter()
-        .find(|entry| entry.identity_basis == claude_request_identity::TRANSCRIPT_SOLE_LOGIN)
-        .expect("a qualified own session is named");
+        .find(|entry| entry.identity_basis == basis)
+        .expect("a matched own session is named");
     let witness = entry.sole_login_witness.as_ref().unwrap();
     assert_eq!(witness.v, 1);
+    assert_eq!(witness.kind, "folder");
     assert_eq!(witness.folder.len(), 8);
     assert_eq!(witness.covered_from, "2026-08-02T07:00:00Z");
     assert!(
@@ -1664,15 +1677,29 @@ fn sole_login_tag_conserves_totals_and_changes_only_placement() {
                     |part| part.account_identifier_hash.as_deref() == Some(e2_account().as_str())
                 )))
     );
+    assert!(
+        on.iter()
+            .filter(|item| item.source_session_id != root)
+            .all(|item| item
+                .request_evidence
+                .iter()
+                .all(|entry| entry.identity_basis != basis)),
+        "a file with no recorded login of its own stays untagged"
+    );
     let untagged = off
         .iter()
         .find(|item| item.source_session_id == root)
         .unwrap();
+    assert_ne!(
+        untagged.snapshot_fingerprint, tagged.snapshot_fingerprint,
+        "the tag reaches the upload decision"
+    );
     assert!(untagged
         .request_evidence
         .iter()
-        .all(|entry| entry.identity_basis != claude_request_identity::TRANSCRIPT_SOLE_LOGIN));
-    assert!(!serde_json::to_string(untagged)
-        .unwrap()
-        .contains("sole_login_witness"));
+        .all(|entry| entry.identity_basis != basis));
+    let body = serde_json::to_string(untagged).unwrap();
+    assert!(!body.contains("sole_login_witness"));
+    let tagged_body = serde_json::to_string(tagged).unwrap();
+    assert!(!tagged_body.contains(RECORDED_ADDRESS));
 }

@@ -463,10 +463,10 @@ mod alias_tests {
         .is_err());
     }
 
-    /// [format] A folder ledger with an unknown disqualifying bit stays
-    /// unqualified, and an index from before the ledger imports empty.
+    /// [format] A sticky folder ledger stays unqualified across a reopen, and an
+    /// index from before the ledger imports empty.
     #[test]
-    fn folder_login_ledger_unknown_bits_stay_unqualified() {
+    fn folder_login_ledger_sticky_stays_unqualified() {
         use crate::snapshots::claude_folder_login::{qualify, OwnerReport};
         let old = br#"{"files":{}}"#;
         assert_eq!(inventory(old.as_slice()), Ok(()));
@@ -474,22 +474,22 @@ mod alias_tests {
             .unwrap()
             .claude_folder_login_ledger
             .is_empty());
-        let record = |bits: u16| {
+        let record = |mixed: bool| {
             serde_json::json!({"files":{},"claude_folder_login_ledger":{"folder":{
-                "fresh":true,"disqualified":bits,"sole_login":"a","sole_org":"o",
-                "census_complete":true,"covered_from":3600,"seen_org":"o"}}})
+                "fresh":true,"mixed":mixed,"login":"a","org":"o","owner_proven":true,
+                "census_complete":true,"covered_from":3600,"matched":[7]}}})
         };
         let owner = OwnerReport {
-            cached: Some(("a".to_string(), "o".to_string())),
-            proven: Some(("a".to_string(), "o".to_string())),
+            pair: Some(("a".to_string(), "o".to_string())),
+            email: Some("e".to_string()),
             ..OwnerReport::default()
         };
-        for (bits, qualifies) in [(0_u16, true), (1 << 15, false)] {
-            let raw = serde_json::to_vec(&record(bits)).unwrap();
+        for (mixed, qualifies) in [(false, true), (true, false)] {
+            let raw = serde_json::to_vec(&record(mixed)).unwrap();
             assert_eq!(inventory(raw.as_slice()), Ok(()));
             let index = strict_json::<ScanIndex>(&raw).unwrap();
             let folder = &index.claude_folder_login_ledger["folder"];
-            assert_eq!(qualify(folder, true, Some(&owner)).is_some(), qualifies);
+            assert_eq!(qualify(folder, &owner).is_some(), qualifies);
         }
     }
 

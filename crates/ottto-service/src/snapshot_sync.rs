@@ -6952,6 +6952,13 @@ fn prepare_sync_source_inner(
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        crate::snapshots::claude_folder_login::step_reoffers(
+            &mut index,
+            activity_hint
+                .session_request_sole_login_witness_contract
+                .as_deref()
+                == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT),
+        );
         // Observe the always-on contract BEFORE the committed baseline, so an
         // unaccepted/shed page keeps it and its latch. It re-owes no history.
         index.observe_claude_request_identity_contract(true);
@@ -10298,7 +10305,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             index,
             &scan_result.snapshots,
             &api_report,
-            &originals,
             census_clean,
         );
         crate::snapshots::claude_folder_login::stamp_page(

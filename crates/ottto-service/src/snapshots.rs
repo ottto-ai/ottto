@@ -2274,21 +2274,23 @@ pub struct SnapshotRequestEvidence {
     /// never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
-    /// Present only on `transcript_sole_login`, under its capability. Outside
+    /// Present only on `transcript_recorded_login`, under its capability. Outside
     /// the semantic leaf: a witness-only change causes no upload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sole_login_witness: Option<SoleLoginWitness>,
 }
 
-/// Why a folder-named request was named: a count key and how far back the
-/// folder's census reaches. No path, email, plan or org type.
+/// Why a recorded-login request was named: the folder's kind, a count key and
+/// how far back the folder's evidence reaches. No path, email, plan or org type.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SoleLoginWitness {
     pub v: u8,
+    /// `folder` or `slot`.
+    pub kind: String,
     pub folder: String,
     pub covered_from: String,
 }
-crate::heap_layout_bound::fields!(SoleLoginWitness; v, folder, covered_from);
+crate::heap_layout_bound::fields!(SoleLoginWitness; v, kind, folder, covered_from);
 
 /// Exact shared activity-hint capability for carried-account provenance.
 /// Missing/null/unknown keeps existing wire bytes for every source.
@@ -4291,7 +4293,7 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
-    /// Per-config-folder sole-login evidence, written only under its capability.
+    /// Per-config-folder login evidence, written only under its capability.
     #[serde(default)]
     pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
     /// Accepted intent members still owing revision debt; rebuilt each prepare.
@@ -14666,11 +14668,11 @@ fn set_claude_account_hash(item: &mut SnapshotItem, target: Option<String>) -> b
 }
 
 fn exact_session_account_hash(item: &SnapshotItem) -> Option<String> {
-    // A carried or folder-named account is placement, never a session-wide
+    // A carried or recorded-login account is placement, never a session-wide
     // login proof.
     if item.request_evidence.iter().any(|entry| {
         entry.account_source.is_some()
-            || entry.identity_basis == claude_request_identity::TRANSCRIPT_SOLE_LOGIN
+            || entry.identity_basis == claude_request_identity::TRANSCRIPT_RECORDED_LOGIN
     }) {
         return None;
     }
@@ -36912,7 +36914,7 @@ struct ParserPending {
     owed_full_after_lossy_shrink: bool,
     pending_taken: Option<Box<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>>,
     pending_returns: u8,
-    /// Organizations and emails this read saw, inherited lines included.
+    /// Organizations and addresses this read saw, inherited lines included.
     folder_trace: Option<Box<claude_folder_login::FolderTrace>>,
     // Drop the original graph before releasing its funding.
     #[cfg(unix)]
@@ -37387,6 +37389,11 @@ impl OwnedJsonlParser {
             .pending
             .as_mut()
             .and_then(|pending| pending.folder_trace.take());
+        let whole_read = self
+            .reader
+            .acquisition
+            .as_ref()
+            .map_or(true, |plan| plan.start_offset() == 0);
         let Self {
             reader: bounded,
             mut accumulator,
@@ -37652,7 +37659,7 @@ impl OwnedJsonlParser {
             )
         });
         if source == SnapshotSource::ClaudeCode {
-            claude_folder_login::attach_trace(&mut snapshots, path, folder_trace);
+            claude_folder_login::attach_trace(&mut snapshots, path, folder_trace, whole_read);
         }
         // A syntactically valid, positive provider usage record that yields no
         // entity is still loss. Typical causes are an absent/unparseable activity

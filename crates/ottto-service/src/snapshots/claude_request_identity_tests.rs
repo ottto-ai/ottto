@@ -358,7 +358,8 @@ fn basis_token(token: &str) -> Option<&'static str> {
     [
         identity::TELEMETRY,
         identity::TELEMETRY_LOGIN,
-        identity::TRANSCRIPT_SOLE_LOGIN,
+        identity::TRANSCRIPT_RECORDED_LOGIN,
+        identity::LEGACY_TRANSCRIPT_SOLE_LOGIN,
         identity::TRANSCRIPT_ORG,
         "transcript_email",
     ]
@@ -1011,7 +1012,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         desktop: false,
         scan_unix_seconds: Some(1_000_000),
         email_home: None,
-        sole_login: None,
+        recorded_login: None,
         session_start_unix_seconds: None,
         duplicated_elsewhere: false,
     }
@@ -5140,90 +5141,96 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
 
-fn sole_folder() -> crate::snapshots::claude_folder_login::QualifiedFolder {
+fn recorded_folder() -> crate::snapshots::claude_folder_login::QualifiedFolder {
     crate::snapshots::claude_folder_login::QualifiedFolder {
         login: "a".repeat(64),
         org: "d".repeat(64),
         witness: crate::snapshots::SoleLoginWitness {
             v: 1,
+            kind: "folder".to_string(),
             folder: "0a1b2c3d".to_string(),
             covered_from: "2026-08-02T07:00:00Z".to_string(),
         },
     }
 }
 
-/// A forked session's file is never stamped, so it stays untagged while a
-/// sibling in the same qualified folder is named.
+/// Only an unchanged recorded email and a trusted marker of the folder's own
+/// org, both before the request, name it. Anything less keeps today's answer.
 #[test]
-fn sole_login_names_an_own_session_request_and_nothing_stronger() {
+fn recorded_login_needs_the_request_own_email_and_org() {
     let (api, trace) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new());
-    let sole = sole_folder();
+    let folder = recorded_folder();
     let at = Some(900_000);
+    let home = crate::claude_status_coverage::home_key(std::path::Path::new("/synthetic/cfg"));
+    let org = folder.org.clone();
     let named = RequestIdentity::Tagged(AuthorityKey {
-        login: Some(sole.login.clone()),
-        org: Some(sole.org.clone()),
-        basis: identity::TRANSCRIPT_SOLE_LOGIN,
+        login: Some(folder.login.clone()),
+        org: Some(folder.org.clone()),
+        basis: identity::TRANSCRIPT_RECORDED_LOGIN,
         account_source: None,
     });
-    fn stamped<'a>(
-        sole: &'a crate::snapshots::claude_folder_login::QualifiedFolder,
-        at: Option<u64>,
-        marker: MarkerVerdict<'a>,
-    ) -> RequestFacts<'a> {
-        RequestFacts {
-            sole_login: Some(sole),
-            ..facts("req_own", at, marker)
-        }
-    }
+    let org_only = |org: &str| {
+        RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(org.to_string()),
+            basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
+        })
+    };
+    let stamped = |marker| RequestFacts {
+        recorded_login: Some(&folder),
+        email_home: Some(&home),
+        ..facts("req_own", at, marker)
+    };
     assert_eq!(
-        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::None)),
+        identity::classify(&evidence, &stamped(MarkerVerdict::Trusted(&org))),
         named
     );
     assert_eq!(
-        identity::classify(&evidence, &facts("req_fork", at, MarkerVerdict::None)),
+        identity::classify(&evidence, &stamped(MarkerVerdict::None)),
         RequestIdentity::Missing,
-        "a forked session stays wholly untagged"
+        "no recorded org before the request: no own evidence"
     );
-    let org = sole.org.clone();
+    let before_email = RequestFacts {
+        email_home: None,
+        ..stamped(MarkerVerdict::Trusted(&org))
+    };
+    assert_eq!(identity::classify(&evidence, &before_email), org_only(&org));
+    let desktop = RequestFacts {
+        desktop: true,
+        ..stamped(MarkerVerdict::Trusted(&org))
+    };
     assert_eq!(
-        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::Trusted(&org))),
-        named,
-        "its own marker confirms the folder's pair"
+        identity::classify(&evidence, &desktop),
+        org_only(&org),
+        "Desktop stays pair-only"
     );
     let other = "e".repeat(64);
     assert_eq!(
-        identity::classify(
-            &evidence,
-            &stamped(&sole, at, MarkerVerdict::Trusted(&other))
-        ),
-        RequestIdentity::Tagged(AuthorityKey {
-            login: None,
-            org: Some(other.clone()),
-            basis: identity::TRANSCRIPT_ORG,
-            account_source: None,
-        }),
+        identity::classify(&evidence, &stamped(MarkerVerdict::Trusted(&other))),
+        org_only(&other),
         "another org is never given this login"
     );
     assert_eq!(
-        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::Overflow)),
+        identity::classify(&evidence, &stamped(MarkerVerdict::Overflow)),
         RequestIdentity::Refused(Refusal::MarkerOverflow)
     );
     assert_eq!(
-        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::BadOrg)),
+        identity::classify(&evidence, &stamped(MarkerVerdict::BadOrg)),
         RequestIdentity::Refused(Refusal::ContradictoryOrg)
     );
-    let unclocked = RequestFacts {
-        sole_login: Some(&sole),
-        ..facts("req_own", None, MarkerVerdict::None)
-    };
     assert_eq!(
-        identity::classify(&evidence, &unclocked),
-        RequestIdentity::Refused(Refusal::BadClock)
+        identity::classify(
+            &evidence,
+            &facts("req_fork", at, MarkerVerdict::Trusted(&org))
+        ),
+        org_only(&org),
+        "a file the folder did not stamp keeps today's answer"
     );
     let duplicated = RequestFacts {
         duplicated_elsewhere: true,
-        ..stamped(&sole, at, MarkerVerdict::None)
+        ..stamped(MarkerVerdict::Trusted(&org))
     };
     assert_eq!(
         identity::classify(&evidence, &duplicated),
