@@ -6,6 +6,38 @@ use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::ReadPlan;
 use std::io::Read;
 
+impl SharedCache {
+    /// Raw restore fixtures own their transfer outside an active scan. Native
+    /// scanner fixtures use the production reservation callback instead.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "raw fixtures preserve the existing restore API"
+    )]
+    pub(crate) fn durable_restore(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        index: &ScanIndex,
+        interpretation: &Interpretation<'_>,
+    ) -> RestoreOutcome {
+        self.durable_restore_reserved(
+            RestoreRequest {
+                source,
+                key,
+                path,
+                scope,
+                index,
+                interpretation,
+            },
+            held,
+            |_| true,
+        )
+    }
+}
+
 const INDEX_KEYS: usize = 20_000;
 
 pub(super) use fixture::acquisition as fixture_acquisition;
@@ -222,18 +254,10 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
     let _clear = ClearPreparationFault;
     let source = SnapshotSource::ClaudeCode;
     for phase in ["guard", "decode", "rederive", "cache"] {
-        let limit = match phase {
-            "guard" => 0,
-            "decode" => {
-                store::RESTORE_INPUT_BYTES
-                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-            }
-            "rederive" => {
-                store::RESTORE_INPUT_BYTES
-                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-                    + 8 * 1024 * 1024
-            }
-            _ => store::ACTIVE_BYTES,
+        let limit = if phase == "guard" {
+            0
+        } else {
+            store::ACTIVE_BYTES
         };
         let root = crate::test_scratch::ScratchDir::new("cold-decode-budget");
         let lock = test_locks::hold(&root);
@@ -292,15 +316,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             1,
             "native settlement wrote each record once before effects"
         );
-        let limit = if phase == "decode" {
-            // Cold restore funds its key copies and certificate scope before
-            // asking the decoder for credit. Refuse the decoder itself.
-            limit
-                + 4 * key.len() as u64
-                + cache.retained_checkpoint(&key).unwrap().scope().0.len() as u64
-        } else {
-            limit
-        };
         cache.retained().unwrap().clear();
         let entry = serde_json::to_value(&index.files[&key]).unwrap();
         use std::io::Write;
@@ -316,10 +331,25 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         let before = cache.durable_counters(source).unwrap();
         let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
         store::active::set_active_budget_for_test(Some(limit));
+        if let Some(point) = match phase {
+            "decode" => Some(super::super::test_hooks::Point::BeforeRestoreDecode),
+            "rederive" => Some(super::super::test_hooks::Point::BeforeRestoreRederive),
+            _ => None,
+        } {
+            // Refuse that phase's charge; the ordinary Full read is funded again.
+            use super::super::test_hooks::{set, Point};
+            set(point, || store::active::set_active_budget_for_test(Some(0)));
+            set(Point::AfterRetain, move || {
+                store::active::set_active_budget_for_test(Some(limit))
+            });
+        }
         sampled_jsonl::preparation_tests::refuse_heap(phase == "cache");
+        if phase == "cache" {
+            super::super::test_hooks::active_restore_room(Some(0));
+        }
         let cause = match phase {
             "rederive" => "rederive_unfunded",
-            "cache" => "cache_transit",
+            "cache" => "active_restore_no_room",
             other => other,
         };
         let mut entry = entry;
@@ -373,6 +403,7 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         }
         store::active::set_active_budget_for_test(None);
         sampled_jsonl::preparation_tests::refuse_heap(false);
+        super::super::test_hooks::clear();
         if phase != "guard" {
             assert_eq!(
                 (after.0.rederive_head_bytes, after.0.rederive_line_bytes),
@@ -401,10 +432,9 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
     }
 }
 
-// Direct bounded snapshot API, with real encoded native Claude and Codex graphs.
-// Actual production caller, not the direct API fixtures above. The accepted
-// frontier is the record's frontier: this fixture's exact old-byte overlap is0;
-// its positive Tail and physical guarded bytes discriminate the lost-guard bug.
+// Actual production caller, not the direct API fixtures above. A pending
+// transfer keeps Q11 for the next pass's Tail; a refused restored graph is
+// dropped under its credit and its growth reads by the granted Full.
 /// [money] production cold pending and prepare error next pass tail obeys q11.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
@@ -415,18 +445,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _clear = ClearPreparationFault;
-    for return_mode in [
-        "accept",
-        "capacity",
-        "poison",
-        "persistent_capacity",
-        "spent",
-        "funding",
-        "funding_spent",
-        "audit_cap",
-        "prepare_io",
-    ] {
-        let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
+    for return_mode in ["funding", "funding_spent", "audit_cap", "prepare_io"] {
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
         let lock = test_locks::hold(&root);
         let sessions = root.join("sessions");
@@ -722,298 +741,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 panic!("Pending or spent refusal leaked transfer funding")
             };
             lease.release();
-            continue;
         }
-        let other_restore = other_source_restore_after_return_release(&root, lock);
-        let original_record = store_snapshot(&store::store_dir_for_index(&index_path));
-        let granted = Arc::new(Mutex::new(None));
-        let observation = granted.clone();
-        let pressure = cache.clone();
-        sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
-            let guard = taken
-                .durable
-                .state
-                .as_ref()
-                .expect("custody state")
-                .retail
-                .as_ref()
-                .expect("guard BEFORE owned prepare");
-            let facts = (
-                guard.object,
-                guard.next,
-                guard.end,
-                guard.old_end,
-                taken.modified_hint,
-                taken.finalization_charge,
-                taken.e2_held_new_file,
-                taken as *const _ as usize,
-                guard as *const _ as usize,
-            );
-            *observation.lock().unwrap() = Some(facts);
-            if return_mode == "poison" {
-                pressure.poison_retained();
-            } else if refuse_return {
-                *pressure.retained().unwrap() =
-                    crate::transcript_cache::TranscriptCache::with_byte_limit(0);
-            }
-            anyhow::bail!("injected native prepare failure")
-        })));
-        let before = (retail_bytes(source, 0), retail_bytes(source, 1));
-        let mut scan = start(index);
-        for _ in 0..10_000 {
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                _ => panic!("error must retain a pending pass"),
-            };
-            if granted.lock().unwrap().is_some() {
-                break;
-            }
-        }
-        let facts = granted
-            .lock()
-            .unwrap()
-            .expect("real cold path reached hook");
-        assert_eq!(facts.1, record_end);
-        assert_eq!(facts.2, record_end + suffix.len() as u64);
-        assert_eq!(facts.3, record_end);
-        assert_eq!(
-            (retail_bytes(source, 0), retail_bytes(source, 1)),
-            before,
-            "prepare failure reads no suffix"
-        );
-        assert_eq!(cache.durable().unwrap().restore_pending.len(), 1);
-        assert!(cache.durable().unwrap().retail_spent.is_empty());
-        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
-        assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
-        assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-        if matches!(return_mode, "poison" | "persistent_capacity") {
-            let active = scan.active_file.as_ref().expect("funded persistent hold");
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_taken
-                .as_ref()
-                .unwrap()
-                .durable
-                .state
-                .as_ref()
-                .expect("custody state")
-                .retail
-                .is_some());
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_funding
-                .is_some());
-            assert_eq!(
-                cache.lock_poisoned_for_test(super::super::TestLock::Retained),
-                return_mode == "poison"
-            );
-            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
-            assert!(matches!(
-                cache.acquire_active(SnapshotSource::Codex, 0),
-                store::LeaseWait::Busy
-            ));
-            let (scan, events) = crate::local_resource_diagnostics::capture(|| {
-                for attempt in 2..=RETURN_ADMISSION_ATTEMPTS {
-                    scan = match scan.step(None) {
-                        OwnedSourceScanStep::Pending(next) => next,
-                        _ => panic!("return retries must remain cooperative"),
-                    };
-                    assert_eq!(
-                        scan.active_file.is_some(),
-                        attempt < RETURN_ADMISSION_ATTEMPTS
-                    );
-                }
-                scan
-            });
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["counts"]["prepared_return_dropped"] == 1)
-                    .count(),
-                1
-            );
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| event["counts"]["active_drop_release"] == 1),
-                "terminal release is explicit"
-            );
-            assert!(scan.active_file.is_none());
-            assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-            assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
-            drop(scan);
-            sampled_jsonl::preparation_tests::set(None);
-            other_restore(); // Real other-source cold restore now acquires the owner.
-            assert_eq!(
-                store_snapshot(&store::store_dir_for_index(&index_path)),
-                original_record
-            );
-
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("cancel leaked funding")
-            };
-            lease.release();
-            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
-            assert_eq!(
-                {
-                    let stores = cache.durable().unwrap();
-                    stores.restore_pending.len() + stores.retail_spent.len()
-                },
-                1
-            );
-            sampled_jsonl::preparation_tests::set(None);
-            continue;
-        }
-        if refuse_return {
-            let active = scan
-                .active_file
-                .as_deref_mut()
-                .expect("funded actual native owner");
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_funding
-                .is_some());
-            let taken = active
-                .parser
-                .pending
-                .as_mut()
-                .expect("M3 parser state")
-                .pending_taken
-                .as_mut()
-                .expect("original held");
-            assert_eq!(
-                &**taken as *const _ as usize, facts.7,
-                "same original through refused return"
-            );
-            assert_eq!(
-                taken.durable.retail_mut().unwrap() as *mut _ as usize,
-                facts.8,
-                "same one guard"
-            );
-            assert!(
-                active.parser.step().is_err(),
-                "held original cannot read through parser"
-            );
-            *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::default();
-        } else {
-            assert!(cache.retained().unwrap().peek(&key).is_some());
-        }
-        sampled_jsonl::preparation_tests::set(None);
-        let index = if refuse_return {
-            // Return to RAM before reading, then re-offer the same candidate.
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                _ => panic!("return is a continuation"),
-            };
-            assert!(scan.active_file.is_none());
-            assert!(cache.retained().unwrap().peek(&key).is_some());
-            let (index, result, modes) = finish(scan);
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].input_tokens, 125);
-            assert_eq!(modes.0, 0);
-            assert_eq!(modes.1, 1);
-            index
-        } else {
-            let (index, result, modes) = finish(scan);
-            assert!(
-                result.snapshots.is_empty(),
-                "failed attempt publishes nothing"
-            );
-            assert_eq!(modes.0, 0);
-            index
-        };
-        if return_mode == "spent" {
-            let mut old = cache.take(&key).expect("returned original");
-            old.durable.take_retail().expect("one grant").finish();
-            drop(old); // Model cancellation: never reinsert an explicitly ended guard.
-                       // Keep the five passes inside a granted recovery's pacing window.
-            assert!(cache.retail_full(
-                &key,
-                &File::open(&path).unwrap(),
-                record_end,
-                SystemTime::now()
-            ));
-            let mut index = index;
-            for _ in 0..5 {
-                let (next, result, modes) = finish(start(index));
-                assert!(result.snapshots.is_empty());
-                assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
-                assert!(
-                    cache.retained().unwrap().peek(&key).is_none(),
-                    "spent guard cannot leave reusable A"
-                );
-                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
-                index = next;
-            }
-            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("denied grant leaked funding")
-            };
-            lease.release();
-            continue;
-        }
-        if !refuse_return {
-            let (_, result, modes) = finish(start(index));
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].input_tokens, 125);
-            assert_eq!(modes.0, 0);
-            assert_eq!(modes.1, 1);
-        }
-        assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
-        assert_eq!(
-            retail_bytes(source, 1) - before.1,
-            0,
-            "exact old accepted overlap"
-        );
-        assert!(
-            cache.durable().unwrap().restore_pending.is_empty(),
-            "native receipt consumed the pending grant"
-        );
-        assert!(
-            cache.durable().unwrap().retail_spent.is_empty(),
-            "zero old bytes needed no spent custody"
-        );
-        assert_eq!(
-            cache.durable_counters(source).unwrap().1.records_written,
-            2,
-            "initial and exact successor native receipts"
-        );
-        let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
-        let record =
-            store::tests::found(disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)));
-        assert_eq!(
-            record.record.certificate.sealed_offset,
-            record_end + suffix.len() as u64
-        );
-        assert_eq!(
-            cache.durable().unwrap().counters.retail_attempts,
-            1,
-            "no second Q11 grant"
-        );
-        let (_, events) = crate::local_resource_diagnostics::capture(|| {
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("lease leaked")
-            };
-            lease.release();
-        });
-        assert!(!events
-            .iter()
-            .any(|event| event["counts"]["active_drop_release"] == 1));
     }
 }
 
@@ -4099,104 +3827,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         .files
         .get(&key)
         .is_some_and(ScanIndexEntry::has_unverified_source));
-}
-
-/// Seeds an actual no-content Codex record before the Claude owner is parked.
-/// The returned action drives the ordinary cold caller after bounded release.
-fn other_source_restore_after_return_release(
-    root: &Path,
-    lock: &crate::locked_state_dir::LockedStateDir,
-) -> impl FnOnce() {
-    let source = SnapshotSource::Codex;
-    let ds = DurableSource::Codex;
-    let path = root.join("019fa111-2222-7333-8444-555555555555.jsonl");
-    std::fs::write(&path, b"{}\n").unwrap();
-    let key = local_index_key(&path);
-    let namespace = Scope("other-owner".into());
-    let scope = Scope("other-file".into());
-    let index_path = root.join("other-index.json");
-    let mut index = ScanIndex::default();
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "other-fp"
-        }))
-        .unwrap(),
-    );
-    index.save(&index_path).unwrap();
-    let cache = fixture::cache(source, &index_path, &namespace, false);
-    let interp = Interpretation::of(source, &key, &index, false, &namespace);
-    let (reduction, _) = counted_codex_record_of(&path, &scope);
-    let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
-        .unwrap()
-        .binding;
-    // Format-3 scope binds the body's immutable (configured) counting.
-    binding.scope = v3_replay_scope(
-        source,
-        &scope,
-        &index,
-        &interp,
-        effective_revision(source),
-        &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
-    );
-    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
-    let mut disk = fixture::store(&index_path, ds);
-    assert_eq!(
-        disk.write_after_save(
-            lock,
-            index.generation,
-            0,
-            vec![PendingRecord {
-                acquisition: fixture_acquisition(source),
-                binding,
-                certificate: certificate(&path, &scope),
-                body: body.clone(),
-                allowlist: codec::allowlist_digest(source)
-            }]
-        )
-        .unwrap()
-        .written,
-        1
-    );
-    move || {
-        // Scoped restore requires real growth; a quiet file is a zero-input hold.
-        std::io::Write::write_all(
-            &mut std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap(),
-            b"{}\n",
-        )
-        .unwrap();
-        let interp = Interpretation::of(source, &key, &index, false, &namespace);
-        let restored = cache
-            .durable_restore(
-                source,
-                &key,
-                &path,
-                &scope,
-                &mut File::open(&path).unwrap(),
-                &index,
-                &interp,
-            )
-            .into_test_option()
-            .expect("other-source actual cold restore after terminal release");
-        assert_eq!(
-            codec::encode(
-                &restored.retained.state,
-                store::BODY_BYTES,
-                jsonl_line_cap() as u64
-            )
-            .unwrap(),
-            body
-        );
-        drop(restored);
-        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
-        else {
-            panic!("other restore leaked the released owner")
-        };
-        lease.release();
-    }
 }
 
 /// Existing MAIN/S2 leaves: a real resident take is losslessly returned, then
@@ -7293,11 +6923,12 @@ fn b4_structural_transition(near_cap: bool) {
     let end = std::fs::metadata(&path).unwrap().len();
     let now = std::time::SystemTime::now();
     cache.durable().unwrap().retail_full_now = Some(now);
-    // Exactly enough for input + transferred graph reserve, but not typed
-    // decode. This is structural even when the global FIFO is idle.
+    // One byte below cold input admission, with its real acquisition scratch.
+    // This is structural even when the global FIFO is idle.
     let limit = store::RESTORE_INPUT_BYTES
-        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-        + 4 * key.len() as u64;
+        + super::super::AUDIT_AND_SCRATCH_BYTES as u64
+        + 4 * key.len() as u64
+        - 1;
     store::active::set_active_budget_for_test(Some(limit));
     let oracle_prior = index.clone();
     let (((mut next, mut caught, modes), reads), selector) = native_restore_selection(|| {
@@ -7789,8 +7420,8 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     );
 }
 
-/// Real inventory -> disk restore -> native Tail. The scaled cache keeps the
-/// same admission mechanism; optional facts must lose before a usable record.
+/// Real inventory -> reserved disk restore -> native Tail: optional facts
+/// yield only when doing so can fund the active graph.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -7802,7 +7433,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     use crate::snapshots::codex_file_join::header_cache_tests::{page, READ_CALLS};
     use crate::snapshots::sampled_scan::{codex_cursor, state_bytes};
     use crate::transcript_acquisition::ReadMode;
-    use crate::transcript_cache::{FrozenCacheState, Retained, TranscriptCache};
+    use crate::transcript_cache::{FrozenCacheState, Retained};
     const INVENTORY_LIMIT: usize = 256 * 1024;
     let root = crate::test_scratch::private_dir("ottto-header-restore");
     let lock = test_locks::hold(&root);
@@ -7908,22 +7539,10 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         RestoreOutcome::Restored(taken, lease) => (taken, lease),
         _ => panic!("unscaled sizing restore must succeed"),
     };
-    let custody_bytes = incoming
-        .durable
-        .retained_bytes(crate::transcript_cache::ENTRY_BYTES)
-        .unwrap();
-    let incoming_heap = bound(&incoming.retained, crate::transcript_cache::ENTRY_BYTES).unwrap()
-        - std::mem::size_of_val(&incoming.retained);
-    let incoming_slot =
-        crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key.capacity()).unwrap();
-    let rank = crate::transcript_cache::admission_rank(
-        incoming.retained.checkpoint.modified_hint(),
-        crate::transcript_cache::admission_now(),
-    );
-    // Size both admission arms while this graph still owns its one process
-    // lease, then dispose of it before any subsequent durable restore.
-    let trials = [true, false].map(|fits| {
-        let cache = fixture::cache(source, &index_path, &namespace, false);
+    drop(incoming);
+    sizing_lease.release();
+    for fits in [true, false] {
+        let cache = Arc::new(fixture::cache(source, &index_path, &namespace, false));
         READ_CALLS.with(|count| count.set(0));
         let inventory =
             codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || page(&root, &paths, &cache));
@@ -7933,77 +7552,76 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         let before = cache
             .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
             .unwrap();
-        assert!(before > 0, "real inventory retains header facts");
-        {
-            let mut retained = cache.retained().unwrap();
-            cache
-                .with_cursor(|cursor| {
-                    let headers = std::mem::take(&mut cursor.headers);
-                    let cursor_bytes = bound(cursor, state_bytes()).unwrap();
-                    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
-                    let empty_retained = bound(&*retained, state_bytes()).unwrap();
-                    // The empty retained root and the incoming entry's node
-                    // are both charged; the incoming inline state lives in
-                    // that node, and only its heap is added separately.
-                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap
-                        + retained.custody_extra(&key, custody_bytes).unwrap();
-                    assert!(minimum < state_bytes());
-                    let one_byte_short = TranscriptCache::with_byte_limit(minimum - 1);
-                    assert!(!one_byte_short.insertion_fits(
-                        &key,
-                        &incoming.retained,
-                        custody_bytes,
-                        cursor_bytes + side,
-                        rank,
-                        true
-                    ));
-                    *retained = TranscriptCache::with_byte_limit(if fits { minimum } else { 1 });
-                    println!(
-                        "header_restore_layout: cursor={cursor_bytes} side={side} \
-                         empty_retained={empty_retained} slot={incoming_slot} \
-                         incoming_heap={incoming_heap} minimum={minimum} headers={before} fits={fits}"
-                    );
-                    assert_eq!(
-                        retained.insertion_fits(&key, &incoming.retained, custody_bytes, cursor_bytes + side, rank, true),
-                        fits,
-                        "derived minimum must discriminate the header-free arm"
-                    );
-                    cursor.headers = headers;
-                    let reserved = bound(cursor, state_bytes()).unwrap() + side;
-                    assert!(!retained.insertion_fits(&key, &incoming.retained, custody_bytes, reserved, rank, true));
-                })
-                .unwrap();
-        }
-        (fits, cache, before)
-    });
-    drop(incoming);
-    sizing_lease.release();
-    for (fits, cache, before) in trials {
-        let restored = cache.durable_restore(
+        assert!(before > 0);
+        let headers = cache
+            .with_cursor(|cursor| std::mem::take(&mut cursor.headers))
+            .unwrap();
+        let cursor_without = cache.cursor_resident_for_main();
+        cache.with_cursor(|cursor| cursor.headers = headers);
+        let empty = bound(&*cache.retained().unwrap(), state_bytes()).unwrap();
+        let scan = OwnedSourceScan::new_with_identity_capture(
             source,
-            &key,
-            &path,
-            &scope,
+            std::slice::from_ref(&sessions),
+            index.clone(),
+            "2026-10-20T12:00:00Z",
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .with_sampled_acquisition(cache.clone(), namespace.clone());
+        let context = scan.sampling.as_ref().unwrap();
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: std::fs::metadata(&path).unwrap().len(),
+            modified_unix_seconds: 1,
+            modified_unix_nanos: 1_000_000_000,
+            scan_root: sessions.clone(),
+            physical_identity: None,
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        // Scale only the pre-existing active charge. Admission uses the actual
+        // production reservation and header-reclaim path on the real inventory.
+        let restored = cache.durable_restore_reserved(
+            RestoreRequest {
+                source,
+                key: &key,
+                path: &path,
+                scope: &scope,
+                index: &index,
+                interpretation: &interpretation,
+            },
             &mut File::open(&path).unwrap(),
-            &index,
-            &interpretation,
+            |bytes| {
+                let pinned = if fits {
+                    state_bytes() - cursor_without - empty
+                } else {
+                    state_bytes() - empty + 1
+                };
+                let step = super::super::StepMeasure {
+                    used: pinned
+                        .checked_sub(super::super::context_overhead(context).unwrap())
+                        .and_then(|n| n.checked_sub(bytes)),
+                    ..Default::default()
+                };
+                super::super::release_older_for(context, &candidate, step, bytes)
+            },
         );
         if fits {
             let (taken, lease) = match restored {
                 RestoreOutcome::Restored(taken, lease) => (taken, lease),
-                _ => panic!("fitting durable record must restore, never miss or hold"),
+                _ => panic!("fundable graph must restore"),
             };
-            let mut parser = OwnedJsonlParser::new(
-                File::open(&path).unwrap(),
-                &path,
-                source,
-                apply_codex_line,
-                None,
-                None,
-                None,
-                false,
-            )
-            .unwrap();
+            let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
             codex_counting_version::configure_group_once(
                 &mut parser.accumulator,
                 codex_counting_version::AckEvidence::None,
@@ -8011,27 +7629,23 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             assert_eq!(
                 parser
                     .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_001)
-                    .unwrap_or_else(|_| panic!("restored Tail must prepare")),
+                    .unwrap_or_else(|_| panic!("Tail must prepare")),
                 ReadMode::Tail
             );
             while !parser.step().unwrap() {}
             assert_eq!(parser.reader.consumed_bytes(), suffix.len() as u64);
             drop(parser);
             lease.release();
-            let next = codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || {
-                page(&root, &paths, &cache)
-            });
-            assert!(next.complete);
-            assert_eq!(next.reuse_hits, 0);
-            assert_eq!(next.reuse_misses, paths.len());
-            assert!(next.reuse_evictions > 0);
-            assert!(next.read_bytes <= paths.len() * (64 * 1024 + 1));
+            assert!(
+                cache
+                    .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+                    .unwrap()
+                    < before
+            );
         } else {
-            // M3 reports this grown, structurally unfundable admission through
-            // its existing paced resource path; restore itself performs no Full.
             assert!(matches!(
                 restored,
-                RestoreOutcome::Miss(MissClass::Resource("cache_transit"))
+                RestoreOutcome::Miss(MissClass::Resource("active_restore_no_room"))
             ));
             assert_eq!(
                 cache
@@ -8039,15 +7653,19 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                     .unwrap(),
                 before
             );
-            let next = codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || {
-                page(&root, &paths, &cache)
-            });
+        }
+        let next =
+            codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || page(&root, &paths, &cache));
+        assert!(next.complete);
+        if fits {
+            assert!(next.reuse_evictions > 0, "fundable restore releases facts");
+        } else {
             assert!(next.reuse_hits > 0);
             assert_eq!(next.reuse_evictions, 0, "hopeless restore preserves facts");
         }
+        assert!(cache.retained().unwrap().peek(&key).is_none());
         let (counts, _) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.restored, u64::from(fits));
-        assert_eq!(counts.budget_refused, 0);
         assert_eq!(records(), saved, "restore cannot change durable authority");
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -12094,5 +11712,287 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             );
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// [regress] nonresident native records Tail without cache admission, preserving cold-Full money.
+#[test]
+#[cfg(target_os = "macos")]
+fn nonresident_growth_tails_and_matches_cold_full() {
+    use crate::heap_layout_bound::bound;
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
+    use crate::snapshots::sampled_scan::{state_bytes, test_hooks};
+    use crate::transcript_cache::Retained;
+    use std::io::Write;
+
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            test_hooks::clear();
+        }
+    }
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _clear = ClearPreparationFault;
+    let _budget = ResetActiveBudget;
+    let _hooks = Reset;
+    let session = "11111111-2222-4333-8444-555555555555";
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for room in [
+            "empty",
+            "older_and_newer",
+            "only_newer",
+            "audit_cap",
+            "prepare_transient",
+        ] {
+            test_hooks::clear();
+            store::active::set_active_budget_for_test(None);
+            let mut owner = fixture::NativeColdStore::with_scope(
+                source,
+                "nonresident-growth",
+                Scope("nonresident-growth".into()),
+            );
+            let path = owner.path(session);
+            if source == SnapshotSource::ClaudeCode {
+                native_fixture(&path);
+            } else {
+                codex_budget_fixture(&path, session, None);
+                let rows = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                        row["payload"]["auth_mode"] = serde_json::json!("oauth");
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                std::fs::write(&path, fixture::jsonl(rows)).unwrap();
+            }
+            let roots = [owner.sessions.clone()];
+            let namespace = owner.namespace.clone();
+            let start = |cache: Arc<SharedCache>, index: ScanIndex| {
+                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    &roots,
+                    index,
+                    "2026-10-20T12:00:00Z",
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache, namespace.clone());
+                if room == "audit_cap" && !scan.index.files.is_empty() {
+                    scan.sampling.as_mut().unwrap().audit_slots = 0;
+                    for entry in scan.index.files.values_mut() {
+                        entry.scan_identity_version =
+                            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+                    }
+                }
+                scan
+            };
+            // The scaled retained-entry refusal applies to every insertion,
+            // including the old restore insert/take detour, but not the writer.
+            sampled_jsonl::preparation_tests::refuse_heap(true);
+            owner
+                .cache
+                .durable_begin_pass(source, &owner.index_path, &owner.namespace, true);
+            let (mut index, mut first, modes) =
+                fixture::scan_reads(start(owner.cache.clone(), ScanIndex::default()), 100_000);
+            finalize_scan_after_policy(source, &mut first, &mut index);
+            assert_eq!((modes.0, modes.1), (1, 0));
+            assert_eq!(first.snapshots.len(), 1);
+            let key = owner.key(session);
+            assert!(owner.cache.retained().unwrap().peek(&key).is_none());
+            index.save(&owner.index_path).unwrap();
+            owner
+                .cache
+                .durable_write_after_save(owner.writer, source, &index)
+                .unwrap();
+            let ds = durable_source(source).unwrap();
+            let mut disk = fixture::store(&owner.index_path, ds);
+            let record = store::tests::found(disk.read(&owner.digest(session)));
+            assert_eq!(record.format, store::FORMAT_V3);
+            assert_eq!(
+                record.record.certificate.length,
+                index.files[&key].size_bytes
+            );
+            codec::verify(&record.record.body).unwrap();
+            let scope = owner
+                .cache
+                .durable()
+                .unwrap()
+                .slot(ds)
+                .as_ref()
+                .unwrap()
+                .decided[&key]
+                .scope()
+                .unwrap()
+                .clone();
+            if matches!(room, "older_and_newer" | "only_newer") {
+                // Real small cached graphs, with a scaled StepMeasure.used to
+                // reproduce page pressure without allocating a huge transcript.
+                let (state, checkpoint) = native_record_of(&path, &scope, source);
+                let mut cache = owner.cache.retained().unwrap();
+                assert!(cache.insert_reserving_at_rank(
+                    "newer".into(),
+                    Retained { checkpoint, state },
+                    0,
+                    0,
+                    Some((i64::MAX, 0))
+                ));
+                let newer = bound(&*cache, state_bytes()).unwrap();
+                let (state, checkpoint) = native_record_of(&path, &scope, source);
+                assert!(cache.insert_reserving_at_rank(
+                    "other".into(),
+                    Retained { checkpoint, state },
+                    0,
+                    0,
+                    Some(if room == "older_and_newer" {
+                        (0, 0)
+                    } else {
+                        (i64::MAX, 0)
+                    })
+                ));
+                let all = bound(&*cache, state_bytes()).unwrap();
+                test_hooks::active_restore_room(Some(newer + (all - newer) / 2));
+            }
+            if room == "prepare_transient" {
+                sampled_jsonl::preparation_tests::reject_once(
+                    sampled_jsonl::PreparationRefusal::Transient,
+                );
+            }
+            for append in 1..=2 {
+                let suffix = if source == SnapshotSource::ClaudeCode {
+                    serde_json::json!({"type":"assistant","sessionId":session,
+                        "timestamp":"2026-10-07T10:01:00Z","requestId":format!("tail-{append}"),
+                        "message":{"id":format!("tail-{append}"),"model":"fixture-model",
+                        "usage":{"input_tokens":25,"output_tokens":3}}})
+                } else {
+                    let n = crate::snapshots::session_start::WINDOW_REQUESTS as u64;
+                    serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:01:00Z",
+                        "payload":{"type":"token_count","auth_mode":"oauth","info":{
+                        "total_token_usage":{"input_tokens":100*n+25*append,"cached_input_tokens":0,
+                            "output_tokens":10*n+3*append,"reasoning_output_tokens":0},
+                        "last_token_usage":{"input_tokens":25,"cached_input_tokens":0,
+                            "output_tokens":3,"reasoning_output_tokens":0},"model":"gpt-5.2"}}})
+                }
+                .to_string()
+                    + "\n";
+                File::options()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(suffix.as_bytes())
+                    .unwrap();
+                let before = index.clone();
+                owner
+                    .cache
+                    .durable_begin_pass(source, &owner.index_path, &owner.namespace, true);
+                let (mut next, mut scan, modes) =
+                    fixture::scan_reads(start(owner.cache.clone(), index), 100_000);
+                finalize_scan_after_policy(source, &mut scan, &mut next);
+                let refused = append == 1 && room == "only_newer";
+                let rejected = append == 1 && room == "prepare_transient";
+                if room == "audit_cap" || rejected {
+                    assert_eq!(
+                        modes,
+                        (1, 0, std::fs::metadata(&path).unwrap().len()),
+                        "granted audit-cap Full cannot depend on retained re-admission"
+                    );
+                    assert_eq!(owner.cache.durable_counters(source).unwrap().0.restored, 1);
+                } else if refused {
+                    assert_eq!(modes, (1, 0, std::fs::metadata(&path).unwrap().len()));
+                    let counts = owner.cache.durable_counters(source).unwrap().0;
+                    assert_eq!(counts.resource_full.get("active_restore_no_room"), Some(&1));
+                    assert_eq!(
+                        MissClass::Resource("active_restore_no_room").label(),
+                        "resource_full.active_restore_no_room"
+                    );
+                } else {
+                    assert_eq!(modes, (0, 1, suffix.len() as u64));
+                }
+                assert!(owner.cache.retained().unwrap().peek(&key).is_none());
+                if rejected {
+                    // The rejected graph drops under its credit: no second Q11
+                    // grant, and the transfer lease was released, not leaked.
+                    assert_eq!(
+                        owner.cache.durable().unwrap().counters.retail_attempts,
+                        u64::from(source == SnapshotSource::ClaudeCode),
+                        "no second Q11 grant"
+                    );
+                    let (_, events) = crate::local_resource_diagnostics::capture(|| {
+                        let store::LeaseWait::Granted(lease) =
+                            owner.cache.acquire_active(source, store::ACTIVE_BYTES)
+                        else {
+                            panic!("lease leaked")
+                        };
+                        lease.release();
+                    });
+                    assert!(!events
+                        .iter()
+                        .any(|event| event["counts"]["active_drop_release"] == 1));
+                }
+                if append == 1 && matches!(room, "older_and_newer" | "only_newer") {
+                    let cache = owner.cache.retained().unwrap();
+                    assert!(cache.peek("newer").is_some(), "newer resident never yields");
+                    assert_eq!(cache.peek("other").is_some(), room == "only_newer");
+                }
+                test_hooks::clear();
+                store::active::set_active_budget_for_test(None);
+                let (mut cold_index, mut cold, cold_modes) =
+                    fixture::scan_reads(start(Arc::new(SharedCache::default()), before), 100_000);
+                finalize_scan_after_policy(source, &mut cold, &mut cold_index);
+                assert_eq!((cold_modes.0, cold_modes.1), (1, 0));
+                assert!(!cold.snapshots.is_empty());
+                // Exercise the real account-binding stage with a persisted
+                // synthetic owner and native OAuth rows; never tag output by hand.
+                if source == SnapshotSource::Codex {
+                    for (idx, output) in [(&mut next, &mut scan), (&mut cold_index, &mut cold)] {
+                        idx.session_account_bindings.insert(
+                            sha256_hex(&["session_owner:v1", "fixture-machine", session]),
+                            SessionAccountBinding {
+                                account_identifier_hash: "a".repeat(64),
+                                workspace_identifier_hash: None,
+                            },
+                        );
+                        idx.bind_session_accounts(
+                            source,
+                            "fixture-machine",
+                            &mut output.snapshots,
+                            &[],
+                        );
+                        assert!(output
+                            .snapshots
+                            .iter()
+                            .flat_map(|item| &item.model_usage)
+                            .any(|row| row.account_identifier_hash.as_deref()
+                                == Some(&"a".repeat(64))));
+                    }
+                }
+                let expected =
+                    super::super::transition_fixture::scan_money(source, &cold_index, &cold);
+                let actual = super::super::transition_fixture::scan_money(source, &next, &scan);
+                money_oracle::assert_equivalent(&expected, &actual);
+                assert_eq!(
+                    serde_json::to_vec(&scan.snapshots).unwrap(),
+                    serde_json::to_vec(&cold.snapshots).unwrap(),
+                    "canonical body"
+                );
+                next.save(&owner.index_path).unwrap();
+                owner
+                    .cache
+                    .durable_write_after_save(owner.writer, source, &next)
+                    .unwrap();
+                // A fresh facade must decode again; no retained copy can help it.
+                owner.restart();
+                index = owner.index.clone();
+            }
+        }
     }
 }

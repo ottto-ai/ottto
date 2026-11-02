@@ -48,6 +48,7 @@ pub(super) mod preparation_tests {
     type Hook = Box<dyn FnMut(&crate::transcript_cache::Taken<CachedJsonlReduction>) -> Result<()>>;
     thread_local! {
         static FAULT: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+        static REJECTION: std::cell::Cell<Option<PreparationRefusal>> = const { std::cell::Cell::new(None) };
         pub(super) static HEAP_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     pub(super) fn check(
@@ -60,7 +61,18 @@ pub(super) mod preparation_tests {
                 .map_or(Ok(()), |fault| fault(taken))
         })
     }
+    // Its only caller is the macOS-only nonresident restore regression.
+    #[cfg(target_os = "macos")]
+    pub(in crate::snapshots) fn reject_once(refusal: PreparationRefusal) {
+        REJECTION.with(|slot| slot.set(Some(refusal)));
+    }
+    pub(super) fn rejection() -> Option<PreparationRefusal> {
+        REJECTION.with(|slot| slot.take())
+    }
     pub(in crate::snapshots) fn set(hook: Option<Hook>) {
+        if hook.is_none() {
+            REJECTION.with(|slot| slot.set(None));
+        }
         FAULT.with(|fault| *fault.borrow_mut() = hook);
     }
     pub(in crate::snapshots) fn refuse_heap(value: bool) {
@@ -137,6 +149,40 @@ pub(super) struct CompletedNativeAcquisition {
     pub(super) unsealed: bool,
 }
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; durable, checkpoint, reduction, released, unsealed);
+
+impl CompletedNativeAcquisition {
+    /// The retained copy this completion carries, at its deferred-release rank
+    /// or ranked now. Without a reduction the completion comes back unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal returns the original inline graph; boxing adds an unfunded allocation"
+    )]
+    pub(super) fn into_taken(
+        mut self,
+        live_bytes: usize,
+        held_new: bool,
+    ) -> std::result::Result<crate::transcript_cache::Taken<CachedJsonlReduction>, Self> {
+        let Some(state) = self.reduction.take() else {
+            return Err(self);
+        };
+        let rank = self.released.unwrap_or_else(|| {
+            crate::transcript_cache::admission_rank(
+                self.checkpoint.modified_hint(),
+                crate::transcript_cache::admission_now(),
+            )
+        });
+        Ok(crate::transcript_cache::Taken {
+            retained: crate::transcript_cache::Retained {
+                checkpoint: self.checkpoint,
+                state,
+            },
+            durable: self.durable,
+            modified_hint: rank,
+            finalization_charge: live_bytes,
+            e2_held_new_file: held_new,
+        })
+    }
+}
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
 #[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
@@ -248,6 +294,13 @@ impl OwnedJsonlParser {
     ) -> std::result::Result<ReadMode, PrepareRejected> {
         #[cfg(test)]
         if let Some(original) = taken.as_ref() {
+            if let Some(refusal) = preparation_tests::rejection() {
+                return Err(PrepareRejected {
+                    error: anyhow::anyhow!("fixture preparation refusal"),
+                    taken,
+                    refusal,
+                });
+            }
             if let Err(error) = preparation_tests::check(original) {
                 return Err(PrepareRejected {
                     error,

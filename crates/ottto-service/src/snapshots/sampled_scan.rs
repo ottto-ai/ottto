@@ -558,7 +558,7 @@ impl SharedCache {
     fn insert_with_custody(
         &self,
         key: String,
-        mut completed: sampled_jsonl::CompletedNativeAcquisition,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
         held_new: bool,
         write_candidate: bool,
@@ -567,33 +567,16 @@ impl SharedCache {
         Option<crate::transcript_cache::Taken<CachedJsonlReduction>>,
         sampled_jsonl::CompletedNativeAcquisition,
     > {
-        let Some(state) = completed.reduction.take() else {
-            return Err(completed);
-        };
-        let rank = completed.released.unwrap_or_else(|| {
-            crate::transcript_cache::admission_rank(
-                completed.checkpoint.modified_hint(),
-                crate::transcript_cache::admission_now(),
-            )
-        });
-        let taken = crate::transcript_cache::Taken {
-            retained: crate::transcript_cache::Retained {
-                checkpoint: completed.checkpoint,
-                state,
-            },
-            durable: completed.durable,
-            modified_hint: rank,
-            finalization_charge: live_bytes,
-            e2_held_new_file: held_new,
-        };
+        let (released, unsealed) = (completed.released, completed.unsealed);
+        let taken = completed.into_taken(live_bytes, held_new)?;
         match self.insert_taken(key, taken, write_candidate, take_back) {
             Ok(taken) => Ok(taken),
             Err(taken) => Err(sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 durable: taken.durable,
-                released: completed.released,
-                unsealed: completed.unsealed,
+                released,
+                unsealed,
             }),
         }
     }
@@ -1104,19 +1087,26 @@ fn admit_tail_copy(context: &Context, active: &OwnedActiveFile, step: StepMeasur
     if !tail || codex_cursor::byte_charged(active) || charge > ENTRY_BYTES {
         return;
     }
-    let pinned = step
-        .used
-        .zip(context_overhead(context))
-        .and_then(|(used, overhead)| {
-            overhead
-                .checked_add(used)?
-                .checked_add(charge.checked_mul(2)?)
-        });
-    if let Some(pinned) = pinned {
-        context
-            .cache
-            .release_older_to_fit(pinned, tail_rank(&active.candidate));
-    }
+    release_older_for(context, &active.candidate, step, charge.saturating_mul(2));
+}
+
+/// Fit `extra` beside the measured active walk by releasing only residents
+/// ranked strictly older than `candidate`; an unfundable fit evicts nothing.
+/// Also makes room for a verified restored graph before it enters the active file.
+pub(super) fn release_older_for(
+    context: &Context,
+    candidate: &CandidateFile,
+    step: StepMeasure,
+    extra: usize,
+) -> bool {
+    context_overhead(context)
+        .zip(step.used)
+        .and_then(|(overhead, used)| overhead.checked_add(used)?.checked_add(extra))
+        .is_some_and(|pinned| {
+            context
+                .cache
+                .release_older_to_fit(pinned, tail_rank(candidate))
+        })
 }
 
 /// The tailed file's eviction rank as its re-admission records it: its
@@ -2037,6 +2027,8 @@ pub(super) mod test_hooks {
         BeforeRetireWitness,
         /// A bounded restore is decoded, immediately before identity sampling.
         BeforeRestoredIdentity,
+        BeforeRestoreDecode,
+        BeforeRestoreRederive,
         /// The first opened-object identity sample has actually been read.
         AfterIdentityHead,
         /// Content replay succeeded, before its final accepted-floor check.
@@ -2116,6 +2108,29 @@ pub(super) mod test_hooks {
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         static X_OUT: std::cell::Cell<Option<super::XOut>> = const { std::cell::Cell::new(None) };
+        static ACTIVE_RESTORE_ROOM: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Scale the room beside a restore without allocating a large fixture graph.
+    pub(in crate::snapshots) fn active_restore_room(room: Option<usize>) {
+        ACTIVE_RESTORE_ROOM.with(|slot| slot.set(room));
+    }
+    pub(in crate::snapshots) fn active_restore_step(
+        context: &super::Context,
+        step: super::StepMeasure,
+        bytes: usize,
+    ) -> super::StepMeasure {
+        let Some(room) = ACTIVE_RESTORE_ROOM.with(|slot| slot.get()) else {
+            return step;
+        };
+        super::StepMeasure {
+            used: super::state_bytes()
+                .checked_sub(context.cache.cursor_resident_for_main())
+                .and_then(|n| n.checked_sub(room))
+                .and_then(|n| n.checked_sub(super::context_overhead(context)?))
+                .and_then(|n| n.checked_sub(bytes)),
+            ..step
+        }
     }
 
     /// Run `hook` each time this thread reaches `point`, until `clear`.
@@ -2162,6 +2177,7 @@ pub(super) mod test_hooks {
         FINISH_ERRORS.with(|errors| errors.borrow_mut().clear());
         INS_EXTRA.with(|term| term.set(None));
         X_OUT.with(|x_out| x_out.set(None));
+        ACTIVE_RESTORE_ROOM.with(|room| room.set(None));
     }
 
     pub(in crate::snapshots) fn fire(point: Point) {

@@ -6,9 +6,9 @@
 //!   context, scope with format, allowlist, identity contract and counting
 //!   view), its certificate must admit on the held FD, its body must decode
 //!   and any unfunded content re-derivation holds before input. A record
-//!   without content obligations is then charged through
-//!   the ordinary cache admission and taken like any retained copy, so the
-//!   existing `prepare_acquisition` decides Unchanged, Tail or Full. Any
+//!   with verified content moves directly into a funded active acquisition,
+//!   without retained-cache admission. The existing `prepare_acquisition`
+//!   decides Unchanged, Tail or Full. Any
 //!   resource refusal is Pending with no reusable guardless RAM entry; on
 //!   a file grown past its committed end, any but a busy lease is a Miss
 //!   (ordinary counted Full), so no hold drops growth. Restore advances no
@@ -942,6 +942,16 @@ impl AcceptedFloor {
     pub(crate) fn permits_real_edit(self) -> bool {
         effective_revision(SnapshotSource::ClaudeCode) >= self.revision
     }
+}
+
+/// What a durable restore verifies: the record's key and file, and how its body is read.
+pub(crate) struct RestoreRequest<'a> {
+    pub(crate) source: SnapshotSource,
+    pub(crate) key: &'a str,
+    pub(crate) path: &'a Path,
+    pub(crate) scope: &'a Scope,
+    pub(crate) index: &'a ScanIndex,
+    pub(crate) interpretation: &'a Interpretation<'a>,
 }
 
 /// The interpretation inputs a record binds to beyond the file scope.
@@ -2857,22 +2867,26 @@ impl SharedCache {
         }
     }
 
-    /// Restores `key` from the durable store into the RAM cache and takes it,
+    /// Restores `key` by move into a funded active acquisition,
     /// or a typed pending/integrity/missing outcome. `held` is
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
-    #[allow(clippy::too_many_arguments)]
+    /// `reserve` makes state room for the verified graph's bytes, or refuses.
     #[inline(never)]
-    pub(crate) fn durable_restore(
+    pub(crate) fn durable_restore_reserved(
         &self,
-        snapshot_source: SnapshotSource,
-        key: &str,
-        path: &Path,
-        scope: &Scope,
+        request: RestoreRequest<'_>,
         held: &mut File,
-        index: &ScanIndex,
-        interpretation: &Interpretation<'_>,
+        reserve: impl FnOnce(usize) -> bool,
     ) -> RestoreOutcome {
+        let RestoreRequest {
+            source: snapshot_source,
+            key,
+            path,
+            scope,
+            index,
+            interpretation,
+        } = request;
         if !restart_restore::enabled() {
             let Some(source) = durable_source(snapshot_source) else {
                 return RestoreOutcome::Miss(MissClass::Unavailable);
@@ -2946,27 +2960,28 @@ impl SharedCache {
         }
         #[cfg(test)]
         tests::before_cold_transfer();
-        let mut lease = match self.acquire_prepared_transfer(snapshot_source) {
-            store::LeaseWait::Granted(lease) => lease,
-            store::LeaseWait::Busy => {
-                return self.restore_resource_pending(
-                    snapshot_source,
-                    "active_wait",
-                    key,
-                    held,
-                    index,
-                )
-            }
-            store::LeaseWait::OverBudget => {
-                return if floor_behind {
-                    RestoreOutcome::FloorHeld
-                } else {
-                    self.restore_active_bound(snapshot_source, key, held, index)
-                };
-            }
-        };
-        // Incoming key, admission scratch/stored key and dirty-candidate key.
-        // The initial transfer reserve separately covers one <=8MiB victim key.
+        let mut lease =
+            match self.acquire_active(snapshot_source, super::AUDIT_AND_SCRATCH_BYTES as u64) {
+                store::LeaseWait::Granted(lease) => lease,
+                store::LeaseWait::Busy => {
+                    return self.restore_resource_pending(
+                        snapshot_source,
+                        "active_wait",
+                        key,
+                        held,
+                        index,
+                    )
+                }
+                store::LeaseWait::OverBudget => {
+                    return if floor_behind {
+                        RestoreOutcome::FloorHeld
+                    } else {
+                        self.restore_active_bound(snapshot_source, key, held, index)
+                    };
+                }
+            };
+        // Bounded acquisition/key scratch; cold graphs are paid by the decoder,
+        // not the retained-entry transfer reserve used by warm takes.
         if key
             .len()
             .checked_mul(4)
@@ -3017,37 +3032,41 @@ impl SharedCache {
         // The common guard held U/T14 before acquisition; this sees class changes since.
         let outcome = match result {
             Ok(Ok(completed)) => {
-                // Admission and take share one retained lock and this paid owner.
-                match self.insert_with_custody(key.to_string(), completed, 0, false, true, true) {
-                    Ok(Some(taken)) => {
-                        if let Some(mut stores) = self.durable() {
-                            stores.counters.restored += 1;
-                            #[cfg(test)]
-                            super::transition_fixture::reach(
-                                super::transition_fixture::CrashPoint::Restore,
-                            );
-                            stores.counters.durable_restore_after_selection_clear += u64::from(
-                                snapshot_source == SnapshotSource::ClaudeCode
-                                    && index
-                                        .files
-                                        .get(key)
-                                        .is_some_and(|e| e.source_file_fingerprint.is_empty()),
-                            );
-                        }
-                        RestoreOutcome::Restored(Box::new(taken), lease)
-                    }
-                    refused => {
-                        drop(refused); // Original graph/temporary custody before its credit.
-                        lease.release();
-                        self.restore_resource_pending(
-                            snapshot_source,
-                            "cache_transit",
-                            key,
-                            held,
-                            index,
-                        )
-                    }
+                // restore_known has dropped its input/decode/rederive temporaries
+                // and its decoder charged the graph to this lease. The active
+                // state budget must fit before transferring ownership;
+                // retained-entry bounds do not apply.
+                let bytes =
+                    crate::heap_layout_bound::completed_bound(&completed, super::state_bytes());
+                if !bytes.is_some_and(reserve) {
+                    drop(completed); // Drop the graph before its transfer credit.
+                    lease.release();
+                    return self.restore_resource_pending(
+                        snapshot_source,
+                        "active_restore_no_room",
+                        key,
+                        held,
+                        index,
+                    );
                 }
+                let Ok(taken) = completed.into_taken(0, false) else {
+                    unreachable!("verified restored reduction");
+                };
+                if let Some(mut stores) = self.durable() {
+                    stores.counters.restored += 1;
+                    #[cfg(test)]
+                    super::transition_fixture::reach(
+                        super::transition_fixture::CrashPoint::Restore,
+                    );
+                    stores.counters.durable_restore_after_selection_clear += u64::from(
+                        snapshot_source == SnapshotSource::ClaudeCode
+                            && index
+                                .files
+                                .get(key)
+                                .is_some_and(|e| e.source_file_fingerprint.is_empty()),
+                    );
+                }
+                RestoreOutcome::Restored(Box::new(taken), lease)
             }
             Ok(Err(phase)) => {
                 lease.release();
@@ -3830,6 +3849,18 @@ impl SharedCache {
             };
             expected = original;
         }
+        // The classifier/envelope copies are gone. Only this owned record's
+        // body remains while decoding; retain its actual capacity, not the
+        // three-envelope input peak, so the decoder can use the freed credit.
+        let input_bytes =
+            (record.record.body.capacity() + std::mem::size_of::<store::DurableRecord>()) as u64;
+        lease
+            .refund(
+                store::RESTORE_INPUT_BYTES
+                    .checked_sub(input_bytes)
+                    .ok_or(RestoreOutcome::Pending)?,
+            )
+            .map_err(|_| RestoreOutcome::Pending)?;
         let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
         let current = effective_revision(snapshot_source);
         if acquisition.acquired_revision != current {
@@ -3990,6 +4021,10 @@ impl SharedCache {
                 .put_chain(chain)
                 .unwrap_or_else(|_| unreachable!("fresh custody"));
         }
+        drop(record); // Encoded body must die before refunding its input credit.
+        lease
+            .refund(input_bytes)
+            .map_err(|_| RestoreOutcome::Pending)?;
         Ok(Ok(sampled_jsonl::CompletedNativeAcquisition {
             durable,
             checkpoint,
@@ -4136,6 +4171,8 @@ impl SharedCache {
             .restore_grown(held, scope.clone())
             .map_err(Failure::Certificate)?
             .0;
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRestoreDecode);
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
@@ -4185,6 +4222,8 @@ impl SharedCache {
             );
             Failure::Resource("rederive_unsupported")
         })?;
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRestoreRederive);
         lease
             .charge(plan.charge)
             .map_err(|_| Failure::Resource("rederive_unfunded"))?;
@@ -5810,7 +5849,7 @@ impl MissClass {
                 "resource_full.",
                 phase,
                 "decode",
-                "cache_transit",
+                "active_restore_no_room",
                 "stores_unavailable",
                 "input",
                 "cache_key",
