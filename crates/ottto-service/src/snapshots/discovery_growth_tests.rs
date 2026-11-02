@@ -1229,8 +1229,8 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
 
 /// [behaviour] A parsed file deleted before its body is ACKed is counted once
 /// on the retiring page with the resident copy's requests and tokens. Claude's
-/// copy folds its responses only at finish and Pi keeps no copy, so their
-/// totals are unknown. The same file deleted after its ACK counts nothing.
+/// copy folds its responses only at finish, so its totals are unknown. The
+/// same file deleted after its ACK counts nothing.
 /// Count only: the entry retires exactly as before.
 #[test]
 fn deleted_before_ack_counts_unacked_usage_lost() {
@@ -1256,7 +1256,8 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             let expected = match (unacked, source) {
                 (false, _) => Value::Null,
                 (true, SnapshotSource::Codex) => json!({"files": 1, "requests": 1, "tokens": 20}),
-                (true, SnapshotSource::ClaudeCode | SnapshotSource::Pi) => {
+                (true, SnapshotSource::Pi) => json!({"files": 1, "requests": 1, "tokens": 16}),
+                (true, SnapshotSource::ClaudeCode) => {
                     json!({"files": 1, "totals_unknown_files": 1})
                 }
             };
