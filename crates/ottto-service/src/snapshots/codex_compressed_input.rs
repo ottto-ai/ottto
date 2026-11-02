@@ -46,13 +46,15 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// Darwin receipt: zstd 1.5.7, WindowLogMax(23), 514 MiB decoded fixture,
-// Mac CI run 41213075990 decoder_allocation_receipt: actual-size peak
-// 13,156,560 bytes, plus 10%, rounded up to 64 KiB
-// = 14,483,456 bytes.
+// Darwin's large-block cache can return up to 2x a request, so no single peak
+// receipt bounds it (Mac CI run 41373345993 refused at 16,285,728 charged bytes).
+// Credit: zstd 1.5.7 WindowLogMax(23) requested peak 8,894,480 bytes (Mac CI run
+// 41213075990), doubled, plus 10%, rounded up to 64 KiB = 19,595,264 bytes.
 // Paid inside unchanged STATE_BYTES; admission preserves the primary Tail floor.
 #[cfg(target_os = "macos")]
-const COMPRESSED_INPUT_CREDIT: usize = 14_483_456;
+const COMPRESSED_INPUT_CREDIT: usize = (2 * 8_894_480 * 11_usize)
+    .div_ceil(10)
+    .next_multiple_of(64 * 1024);
 // Other platforms retain CI run 40774588149's 8,894,448-byte requested peak
 // plus 10%, rounded up to 64 KiB. No non-Darwin credit change.
 #[cfg(not(target_os = "macos"))]
@@ -511,6 +513,16 @@ impl<R: Read> BoundedDecoder<R> {
             }
         }
     }
+
+    // Zstd fails the stream on any refused allocation: a resource limit stays
+    // owed and retried, and only an unrefused failure can be structural.
+    fn classified(&self, error: io::Error) -> io::Error {
+        if self.context.allocation_refusals() > 0 {
+            io::Error::other(CodexZstCause::AdmissionRefused)
+        } else {
+            error
+        }
+    }
 }
 
 impl<R: Read> Read for BoundedDecoder<R> {
@@ -519,10 +531,12 @@ impl<R: Read> Read for BoundedDecoder<R> {
             return Ok(0);
         }
         if self.failed {
-            return Err(invalid("compressed rollout previously failed"));
+            return Err(self.classified(invalid("compressed rollout previously failed")));
         }
         let started = crate::context_composition::thread_cpu_micros();
-        let result = self.read_inner(output);
+        let result = self
+            .read_inner(output)
+            .map_err(|error| self.classified(error));
         if let Some((started, ended)) = started.zip(crate::context_composition::thread_cpu_micros())
         {
             self.cpu_micros = self
@@ -1073,16 +1087,57 @@ pub(in crate::snapshots) mod tests {
     fn decoder_credit_preserves_the_platform_receipt_and_margin() {
         #[cfg(target_os = "macos")]
         {
-            let measured_peak = 13_156_560_usize; // Mac run 41213075990, zstd 1.5.7.
+            let measured_peak = 16_285_728_usize; // Mac run 41373345993, zstd 1.5.7.
             assert!(
                 compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
             );
-            assert_eq!(compressed_input_credit().unwrap(), 14_483_456);
+            assert_eq!(compressed_input_credit().unwrap(), 19_595_264);
         }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(compressed_input_credit().unwrap(), 9_830_400);
         // The live large-window measurement below independently fails if an
         // upgraded decoder no longer fits its platform credit plus 10%.
+    }
+
+    /// [regress] An allocation refusal after partial decode was read as corrupt input and
+    /// quiet-latched valid data (Mac CI run 41373345993).
+    #[test]
+    fn allocation_refusal_after_partial_decode_stays_owed() {
+        let mut encoded = Vec::new();
+        for log in [17, WINDOW_LOG] {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut encoded, 1).unwrap();
+            encoder.window_log(log).unwrap();
+            encoder.write_all(&[b'a'; 64 * 1024]).unwrap();
+            encoder.finish().unwrap();
+        }
+        let mut decoder = BoundedDecoder::new(&encoded[..], u64::MAX).unwrap();
+        // Room for the first frame's 128 KiB window, not the second's 8 MiB.
+        decoder.context = DecoderContext::new(2 * 1024 * 1024).unwrap();
+        decoder.context.set_window_log(WINDOW_LOG).unwrap();
+        let error = std::io::copy(&mut decoder, &mut std::io::sink()).unwrap_err();
+        assert_eq!(decoder.decoded_bytes(), 64 * 1024);
+        assert_eq!(decoder.context.allocation_refusals(), 1);
+        let repeated = decoder.read(&mut [0; 1]).unwrap_err();
+        for failure in [&error, &repeated] {
+            assert_eq!(failure.kind(), io::ErrorKind::Other);
+        }
+
+        let f = fixture(&encoded, ".jsonl.zst");
+        let key = local_index_key(&f.0);
+        let retry_after = sampled_scan::now_seconds() + 21600;
+        let mut a = ArchiveEvidence::from_metadata(fs::metadata(&f.0).unwrap()).unwrap();
+        let w = a.work.as_mut().unwrap();
+        w.decoded = true;
+        w.retry_after = retry_after;
+        w.reservation = ArchiveReservation::FullReady;
+        let mut index = ScanIndex::default();
+        index.archives.insert(key.clone(), a);
+        index.archive_refusal(&f.0, &anyhow::Error::new(error));
+        let a = &index.archives[&key];
+        assert_eq!(a.owed_cause(), Some(CodexZstCause::AdmissionRefused));
+        assert!(!index.archive_quiet(&key), "owed, never quiet-latched");
+        assert_eq!(index.archive_owed_count(), 1);
+        assert_eq!(a.work.as_ref().unwrap().retry_after, retry_after, "paced");
     }
 
     /// [behaviour]
