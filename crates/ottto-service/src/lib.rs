@@ -82,7 +82,6 @@ pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_
 #[cfg(unix)]
 pub use ottto_core::state_dir_lock;
 
-
 // Library consumers retain System unless their binary explicitly opts in.
 #[cfg(target_os = "macos")]
 static JEMALLOC_SIZE_QUERIES: std::sync::atomic::AtomicBool =
