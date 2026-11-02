@@ -349,15 +349,13 @@ impl PreparedRetry {
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
                 &mut |snapshots| {
                     let lease = crate::client_report::lease();
-                    let request = SnapshotBatchRequest {
-                        schema_version: SNAPSHOT_SCHEMA_VERSION,
-                        source: source.api_slug().into(),
-                        machine_id: machine_id.clone(),
-                        collector_version: Some(collector_version()),
+                    let request = snapshot_batch_request(
+                        source,
+                        machine_id,
                         snapshots,
-                        upload_policy: policy,
-                        client_report: lease.report().clone(),
-                    };
+                        policy,
+                        lease.report().clone(),
+                    );
                     validate_snapshot_batch_request(&request).map_err(|reason| {
                         anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
                     })?;

@@ -7455,6 +7455,26 @@ fn capture_codex_recovery_evidence(
     scan_result.finish_codex_capture_boundary(index);
 }
 
+/// The batch request around `snapshots` for this collector's source,
+/// machine, version and upload policy.
+fn snapshot_batch_request(
+    source: SnapshotSource,
+    machine_id: &str,
+    snapshots: Vec<SnapshotItem>,
+    upload_policy: SnapshotUploadPolicy,
+    client_report: crate::client_report::ClientReport,
+) -> SnapshotBatchRequest {
+    SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: source.api_slug().to_string(),
+        machine_id: machine_id.to_string(),
+        collector_version: Some(collector_version()),
+        snapshots,
+        upload_policy,
+        client_report,
+    }
+}
+
 /// Codex only: read immediately before the call that
 /// assembles and writes the selected save; no side writer runs in between.
 fn codex_side_save_mark(
@@ -8142,6 +8162,32 @@ fn finish_sync_source(
     // stages and the main upload draw on it, so the page never waits more
     // than two resends and 10 s under the sync lock.
     let mut inplace_retry = InplaceRetryBudget::default();
+    // One page upload, probe or main: preflight at the identity item cap,
+    // authority around a fresh relay token, Codex joins, then the exact ACK.
+    let upload_checked = |request: &SnapshotBatchRequest,
+                          enforce_head_cas: bool|
+     -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+        if let Err(reason) = crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+            request,
+            identity_item_cap,
+        ) {
+            return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                reason,
+            }));
+        }
+        ensure_authority()?;
+        let token = client.issue_relay_token(device, device_secret, source)?;
+        ensure_authority()?;
+        validate_joined(&request.snapshots)?;
+        let response = client.upload_batch_with_item_cap(
+            &token,
+            request,
+            enforce_head_cas,
+            identity_item_cap,
+        )?;
+        response.validate_entity_ack_with_head_cas(request, enforce_head_cas)?;
+        Ok(response)
+    };
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only
         // the existing typed, content-free cause and the fixed failing role.
@@ -8167,37 +8213,14 @@ fn finish_sync_source(
             ordinary_bootstrap,
             &mut inplace_retry,
             |snapshots, enforce_head_cas| {
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: source.api_slug().to_string(),
-                    machine_id: machine_id.to_string(),
-                    collector_version: Some(collector_version()),
+                let request = snapshot_batch_request(
+                    source,
+                    machine_id,
                     snapshots,
                     upload_policy,
-                    client_report: crate::client_report::ClientReport::empty(),
-                };
-                if let Err(reason) =
-                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
-                        &request,
-                        identity_item_cap,
-                    )
-                {
-                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                        reason,
-                    }));
-                }
-                ensure_authority()?;
-                let token = client.issue_relay_token(device, device_secret, source)?;
-                ensure_authority()?;
-                validate_joined(&request.snapshots)?;
-                let response = client.upload_batch_with_item_cap(
-                    &token,
-                    &request,
-                    enforce_head_cas,
-                    identity_item_cap,
-                )?;
-                response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
-                Ok(response)
+                    crate::client_report::ClientReport::empty(),
+                );
+                upload_checked(&request, enforce_head_cas)
             },
             |progress| progress.save(&upload_progress_path),
         )
@@ -8287,15 +8310,13 @@ fn finish_sync_source(
                 // counters, and dropping the lease on any failure below leaves the
                 // losses owed instead of stranded.
                 let client_report = crate::client_report::lease();
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: source.api_slug().to_string(),
-                    machine_id: machine_id.to_string(),
-                    collector_version: Some(collector_version()),
+                let request = snapshot_batch_request(
+                    source,
+                    machine_id,
                     snapshots,
                     upload_policy,
-                    client_report: client_report.report().clone(),
-                };
+                    client_report.report().clone(),
+                );
                 let reconcile_class = request.snapshots.iter().all(|snapshot| {
                     legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
                 });
@@ -8306,27 +8327,7 @@ fn finish_sync_source(
                         }),
                     "legacy reconciliation must stay isolated at a batch boundary"
                 );
-                if let Err(reason) =
-                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
-                        &request,
-                        identity_item_cap,
-                    )
-                {
-                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                        reason,
-                    }));
-                }
-                ensure_authority()?;
-                let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-                ensure_authority()?;
-                validate_joined(&request.snapshots)?;
-                let mut response = client.upload_batch_with_item_cap(
-                    &upload_relay_token,
-                    &request,
-                    reconcile_class,
-                    identity_item_cap,
-                )?;
-                response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                let mut response = upload_checked(&request, reconcile_class)?;
                 response.bind_conflict_rescans(&request);
                 let request_fingerprints = request
                     .snapshots
