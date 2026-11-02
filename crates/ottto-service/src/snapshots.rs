@@ -35984,14 +35984,13 @@ impl OwnedSourceScan {
                 }
             }
             // There is one shared admission for this actual Full. Earlier
-            // grants and later structural/stale-selection owners take priority.
+            // grants and the later structural owner take priority.
             #[cfg(unix)]
-            let resource_full_pending =
-                if paced_full_granted || active_bound_degraded || stale_selection_pending {
-                    None
-                } else {
-                    resource_full_pending
-                };
+            let resource_full_pending = if paced_full_granted || active_bound_degraded {
+                None
+            } else {
+                resource_full_pending
+            };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -36036,7 +36035,20 @@ impl OwnedSourceScan {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
                 {
-                    context.cache.note_stale_selection_full();
+                    if source == SnapshotSource::Codex {
+                        let key = local_index_key(&active.candidate.path);
+                        if !context.cache.start_stale_selection_full(
+                            source,
+                            &key,
+                            active.parser.reader.reader.get_ref(),
+                        ) {
+                            residue_index_keys.insert(key);
+                            drop(codex_cursor_lease.take());
+                            pending!();
+                        }
+                    } else {
+                        context.cache.note_stale_selection_full();
+                    }
                 }
                 if let Some((mode, audit_due)) = planned_mode {
                     context.record_mode(mode, audit_due);

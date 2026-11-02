@@ -5583,6 +5583,31 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             assert_eq!(mio, (0, 0));
             assert_eq!(mi.files[&key].size_bytes, accepted);
             assert_eq!(mi.files[&key].last_upload_body_witness, witness);
+            // Re-armed, this reason keeps its route: only a no-match takes the
+            // immediate Full, so an unchanged file reads nothing here.
+            let mut cleared = prior.clone();
+            cleared
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+            let cleared_owner = E2ScanFixture::default();
+            cleared_owner.begin_durable(source, &root, &index_path);
+            let ((_, _, cleared_modes), cleared_io) =
+                a0h_observe(|| a0h_scan(&cleared_owner, &roots, &root, cleared.clone()));
+            assert_eq!(cleared_modes.0, 0, "{reason}: re-armed keeps its route");
+            assert_eq!(cleared_io, (0, 0));
+            assert_eq!(
+                cleared_owner
+                    .cache
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .ineligible
+                    .get("selection_cleared.stale_record_full"),
+                None
+            );
         }
         File::options()
             .write(true)
