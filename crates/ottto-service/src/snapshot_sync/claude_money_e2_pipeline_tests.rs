@@ -390,7 +390,13 @@ impl StreamedChecks {
             "bodies, contract-5 tags included"
         );
         assert_eq!(whole.scan.census_complete, streamed.scan.census_complete);
-        assert_eq!(canonical(&whole.index), canonical(&streamed.index), "index");
+        // A routed index compares its resident graph.
+        let resident = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test;
+        assert_eq!(
+            canonical(&resident(&whole.index)),
+            canonical(&resident(&streamed.index)),
+            "index"
+        );
         assert_eq!(canonical(&whole.stats), canonical(&streamed.stats), "stats");
         assert_eq!(whole.disposition, streamed.disposition, "holds and counts");
         assert_eq!(whole_accepted, accepted, "accepted buckets");
@@ -407,7 +413,7 @@ impl StreamedChecks {
                         &sent.scan.snapshots,
                     )
                 });
-                (canonical(&sent.index), (batches, route))
+                (canonical(&resident(&sent.index)), (batches, route))
             });
         assert_eq!(whole_index, index, "settled index");
         assert_eq!(whole_route.0, route.0, "wire bytes");

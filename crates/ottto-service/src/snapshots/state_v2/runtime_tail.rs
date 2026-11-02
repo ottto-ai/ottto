@@ -59,6 +59,11 @@ pub(in crate::snapshots) fn hold_floor(path: &Path, key: &str) -> Result<()> {
 pub(in crate::snapshots) fn release_floor(path: &Path, key: &str) -> bool {
     with_state(path, |state| Ok(state.tail_floor_held.remove(key))).unwrap_or(false)
 }
+/// The head this pass staged on `path` for `key`, not yet committed.
+#[cfg(test)]
+pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Option<(u32, Vec<u8>)> {
+    with_state(path, |state| Ok(state.tail.staged_head(key))).unwrap()
+}
 /// A process restart: the route's RAM notes are gone, the database stays.
 #[cfg(test)]
 pub(in crate::snapshots) fn forget_ram_for_test(path: &Path) {

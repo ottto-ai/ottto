@@ -170,6 +170,14 @@ pub(super) struct TailStage {
     peak_bytes: u64,
 }
 impl TailStage {
+    /// The head this pass staged for `key`, if any: (revision, head bytes).
+    #[cfg(test)]
+    pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
+        match self.files.get(key.as_bytes()) {
+            Some(Entry::File(file)) => Some((file.revision, file.head.clone())),
+            _ => None,
+        }
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.files.is_empty() && self.retire.is_empty()
     }

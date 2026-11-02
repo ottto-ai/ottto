@@ -2,6 +2,7 @@
 //! unsampled native oracle. No provider state, network or credentials.
 use super::*;
 use crate::claude_local_otel::{ClaudeLocalOtelEvidence, ClaudeTraceOwnershipEvidence};
+use crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test as continuation;
 use crate::transcript_acquisition::FullReason;
 use std::io::Write;
 
@@ -693,9 +694,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let key = local_index_key(&f.path);
     let debt = prior.files[&key].audit_obligation(now_seconds());
     assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
-    let old_full = cache
-        .retained_checkpoint(&key)
-        .map(|c| c.last_full_verified());
+    // Claude continues from its route's head; the RAM-era test read its copy.
+    let old_full = continuation(SOURCE, &cache, &prior, &key).map(|c| c.last_full_verified());
     f.write_rows(
         false,
         &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
@@ -708,13 +708,11 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let prior = settle(unchanged);
     assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
     assert_eq!(
-        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        continuation(SOURCE, &cache, &prior, &key).and_then(|c| c.audit_debt()),
         debt
     );
     assert_eq!(
-        cache
-            .retained_checkpoint(&key)
-            .map(|c| c.last_full_verified()),
+        continuation(SOURCE, &cache, &prior, &key).map(|c| c.last_full_verified()),
         old_full
     );
     let page = diagnostics
@@ -755,13 +753,11 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
         "only the due, sampled validation retires the obligation"
     );
     assert_eq!(
-        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        continuation(SOURCE, &cache, &audited.index, &key).and_then(|c| c.audit_debt()),
         None
     );
     assert_eq!(
-        cache
-            .retained_checkpoint(&key)
-            .map(|c| c.last_full_verified()),
+        continuation(SOURCE, &cache, &audited.index, &key).map(|c| c.last_full_verified()),
         old_full
     );
 }

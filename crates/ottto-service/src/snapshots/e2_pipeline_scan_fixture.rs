@@ -68,22 +68,104 @@ pub(crate) fn routed_for_test(
     } else {
         index
     };
+    let (path, cold) = publish_route(&prior, dir);
+    *own = Some(FixtureRoute {
+        path,
+        caller_commits: false,
+    });
+    carry(cold)
+}
+
+/// `prior` published on a new fixture route under `dir`: (route, cold graph).
+fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (session, cold) = StateV2ColdSession::publish(
         scan_index_persistence::Source::Claude,
-        &prior,
+        prior,
         &dir.canonicalize().unwrap().join(format!("route-{n}")),
     );
     let path = session.path().to_owned();
     // Other arms still read this route; the scratch dir owns it.
     std::mem::forget(session);
     E2ScanFixture::register_route_for_test(&path);
-    *own = Some(FixtureRoute {
-        path,
-        caller_commits: false,
-    });
-    carry(cold)
+    (path, cold)
+}
+
+/// A restart of `index` as its own install: its resident graph published on
+/// a new route, so another install's commits from the same prior never stale
+/// it. An unrouted index is returned as is.
+pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
+    if route_of(index).is_none() {
+        return index.clone();
+    }
+    let (_, mut cold) = publish_route(&state_v2::money_test_support::resident(index), dir);
+    cold.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+    cold
+}
+
+/// The certified checkpoint a key continues from, read back for assertions.
+pub(crate) struct Continuation {
+    audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
+    last_full_verified: u64,
+}
+impl Continuation {
+    pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
+        self.audit_debt
+    }
+    pub(crate) fn last_full_verified(&self) -> u64 {
+        self.last_full_verified
+    }
+}
+
+/// `key`'s continuation: for Claude its head on `index`'s route (this pass's
+/// staged head, else the committed one), as the RAM-era fixture read its
+/// retained checkpoint; any other source's retained copy.
+pub(crate) fn continuation_for_test(
+    source: SnapshotSource,
+    cache: &sampled_scan::SharedCache,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<Continuation> {
+    use tail_source::TailSource;
+    if source != SnapshotSource::ClaudeCode {
+        return cache
+            .retained_checkpoint(key)
+            .map(|checkpoint| Continuation {
+                audit_debt: checkpoint.audit_debt(),
+                last_full_verified: checkpoint.last_full_verified(),
+            });
+    }
+    let route = route_of(index)?;
+    let (revision, body) = match state_v2::staged_head_for_test(&route, key) {
+        Some(staged) => staged,
+        None => {
+            let head =
+                state_v2::load_head(index, key, tail_source::claude::Claude::REDUCTION_REVISION)
+                    .ok()??;
+            (head.revision, head.body)
+        }
+    };
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    let certificate = tail_source::claude::Claude::decode_head(revision, &body, &mut acc)
+        .ok()?
+        .certificate;
+    Some(Continuation {
+        audit_debt: certificate
+            .audit_debt_unix_seconds
+            .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
+        last_full_verified: certificate.verified_unix_seconds,
+    })
+}
+
+/// A routed graph read back resident, for byte comparisons; an unrouted one
+/// as is.
+pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
+    if route_of(index).is_some() {
+        state_v2::money_test_support::resident(index)
+    } else {
+        index.clone()
+    }
 }
 
 /// A scan fixture's Claude page continues from its owner's route; with no

@@ -1,5 +1,6 @@
 //! Synthetic paired-retirement/cap fixtures through the existing scan helper.
 use super::*;
+use crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test as continuation;
 
 const START: u64 = 1_700_000_000;
 struct Clock;
@@ -247,8 +248,7 @@ fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
                 "genuine complete-c seed"
             );
             assert_eq!(
-                cache
-                    .retained_checkpoint(&key)
+                continuation(source, &cache, &index, &key)
                     .unwrap()
                     .audit_debt()
                     .unwrap()
@@ -332,8 +332,7 @@ fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
                     "uncertified copy cannot retire"
                 );
             } else {
-                assert!(cache
-                    .retained_checkpoint(&key)
+                assert!(continuation(source, &cache, &next, &key)
                     .unwrap()
                     .audit_debt()
                     .is_some());
@@ -595,8 +594,7 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
         assert_eq!(modes, (0, 1, 0));
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
-        let verified = cache
-            .retained_checkpoint(&key)
+        let verified = continuation(source, &cache, &index, &key)
             .unwrap()
             .last_full_verified();
         for selected_at in [due - 1, due] {
@@ -1015,18 +1013,9 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(next.claude_account_deferred_holds.contains_key(&key));
         assert!(!next.files[&key].has_unverified_source());
-        assert!(cache
-            .retained_checkpoint(&key)
-            .unwrap()
-            .audit_debt()
-            .is_some());
-        assert_eq!(
-            cache
-                .retained_checkpoint(&key)
-                .unwrap()
-                .last_full_verified(),
-            START,
-        );
+        let continued = continuation(source, &cache, &next, &key).unwrap();
+        assert!(continued.audit_debt().is_some());
+        assert_eq!(continued.last_full_verified(), START);
         assert_eq!(
             next.files
                 .values()
@@ -1259,8 +1248,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             "changed accepted generation"
         );
         assert!(scanned.claude_account_deferred_holds.contains_key(&key));
-        assert!(cache
-            .retained_checkpoint(&key)
+        assert!(continuation(source, &cache, &scanned, &key)
             .unwrap()
             .audit_debt()
             .is_some());
