@@ -782,11 +782,8 @@ fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
         &[],
         false,
     );
-    loop {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { .. } => break,
-        }
+    while let OwnedSourceScanStep::Pending(next) = scan.step(None) {
+        scan = next;
     }
     let (key, read_at) = with_state(&f.path, |state| Ok(state.last_read.clone()))
         .unwrap()
