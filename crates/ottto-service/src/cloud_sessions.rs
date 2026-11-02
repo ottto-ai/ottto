@@ -803,6 +803,7 @@ impl CloudSessionGrantStore {
     /// raced the list. Preserve the tombstone and retry the same idempotent
     /// create until the exact backend grant id is bound, then delete that id if
     /// local consent was revoked.
+    #[cfg(test)]
     pub fn confirm_backend_grant_absent_after_reconciliation(&self) -> Result<()> {
         let _lock = self.lock()?;
         let state = self

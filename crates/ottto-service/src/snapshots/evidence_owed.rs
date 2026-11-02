@@ -1,67 +1,26 @@
-//! Evidence owed: a Claude census re-arm keeps the file's fingerprint and
-//! marks its request evidence owed (`ScanIndexEntry::evidence_owed`) instead
-//! of clearing the fingerprint. Machine-local opt-in marker
-//! `claude_evidence_owed_enabled` (`local_switch!`); absent marker = main (the
-//! re-arm clears).
+//! Evidence owed: the Claude terminal-retry re-arm
+//! (`TerminalUnhealthyRetry`) keeps the file's fingerprint and marks its
+//! request evidence owed (`ScanIndexEntry::evidence_owed`) instead of
+//! clearing the fingerprint. Every other re-arm cause clears it.
 //!
 //! The traversal resolves an owed, unchanged member at selection:
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
 //!   the current census window, no read; a confirmed-empty member whose
 //!   current census record holds no requests re-stamps from that record;
-//! - (c) cap-invalid family, unchanged, its occurrences still do not fit:
-//!   stays owed, no read, no credit;
 //! - otherwise one counted `Rearmed` parse, paced per page; with the
 //!   fingerprint kept the existing RAM/durable restore may serve it (b), else
 //!   it reads Full (d).
-//!
-//! Census completion retires only families with a completed family proof;
-//! every other indexed family stays owed.
-//!
-//! Real invalidations keep main's clear: an audit cap delay, an unACKed head
-//! re-offer, a held upload revert that must reparse, and a context change
-//! that is not only added roots, a backfill or an upload-context change.
+use super::usage_pending::UsageView;
 use super::*;
 
-super::local_switch::local_switch!(
-    "claude_evidence_owed_enabled",
-    marker_enables = true,
-    test_default = false
-);
-#[cfg(test)]
-pub(super) struct EvidenceOwedForTest {
-    _switch: super::local_switch::ThreadSwitchForTest,
-}
-#[cfg(test)]
-impl EvidenceOwedForTest {
-    pub(super) fn on() -> Self {
-        Self {
-            _switch: super::local_switch::ThreadSwitchForTest::set(&ENABLED, true),
-        }
-    }
-}
-
-/// ON: this re-arm cause owes evidence instead of clearing the fingerprint.
-/// A context change and an audit cap delay owe a real re-read.
+/// Only the terminal-retry re-arm owes evidence instead of clearing the
+/// fingerprint.
 pub(crate) fn owes(cause: rearm_cause::Cause) -> bool {
-    enabled()
-        && matches!(
-            cause,
-            rearm_cause::Cause::NoRetainedTraversal
-                | rearm_cause::Cause::TerminalUnhealthyRetry
-                | rearm_cause::Cause::CarryInvalidation
-        )
-}
-
-/// Every census-window fingerprint clear goes through here: debt a bound
-/// re-stamp can resolve. OFF (or an already cleared entry): main's clear. ON:
-/// keep the revision, owe it. A site that needs the revision read keeps
-/// main's clear instead, so an older reader still sees that debt.
-pub(super) fn clear(entry: &mut ScanIndexEntry) {
-    keep_or_clear(entry, enabled());
+    cause == rearm_cause::Cause::TerminalUnhealthyRetry
 }
 
 /// The one keep-or-clear rule: `owe` keeps a known revision and owes it;
-/// otherwise main's clear.
+/// otherwise the fingerprint is cleared.
 pub(crate) fn keep_or_clear(entry: &mut ScanIndexEntry, owe: bool) {
     if owe && !entry.source_file_fingerprint.is_empty() {
         entry.evidence_owed = true;
@@ -70,108 +29,18 @@ pub(crate) fn keep_or_clear(entry: &mut ScanIndexEntry, owe: bool) {
     }
 }
 
-/// What a Claude traversal started under, persisted on its checkpoint (ON
-/// only) so a later context change can be classified: the backfill days, the
-/// active upload-context fingerprint, the context fingerprint without roots
-/// (scanner identity, replay generation and both inputs above) and one key
-/// digest per configured root, never the root paths. Bounded by the root
-/// count. No `Debug` of the digests.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TraversalContextInputs {
-    backfill_window_days: u64,
-    active_upload_context: Option<String>,
-    rootless: String,
-    roots: BTreeSet<crate::durable_tail_store::Digest32>,
-}
-crate::heap_layout_bound::fields!(TraversalContextInputs; backfill_window_days, active_upload_context, rootless, roots);
-
-impl std::fmt::Debug for TraversalContextInputs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TraversalContextInputs")
-            .field("backfill_window_days", &self.backfill_window_days)
-            .field("roots", &self.roots.len())
-            .finish_non_exhaustive()
+/// Whether `keep_or_clear(entry, owe)` would change `entry`.
+fn keep_or_clear_changes(entry: &ScanIndexEntry, owe: bool) -> bool {
+    if owe && !entry.source_file_fingerprint.is_empty() {
+        !entry.evidence_owed
+    } else {
+        !entry.source_file_fingerprint.is_empty()
     }
 }
 
-impl TraversalContextInputs {
-    pub(super) fn capture(index: &ScanIndex, roots: &[PathBuf], backfill_window_days: u64) -> Self {
-        Self {
-            backfill_window_days,
-            active_upload_context: index.active_upload_context_fingerprint.clone(),
-            rootless: rootless_context(
-                index,
-                index.active_upload_context_fingerprint.as_deref(),
-                backfill_window_days,
-            ),
-            roots: root_digests(roots),
-        }
-    }
-}
-
-fn rootless_context(
-    index: &ScanIndex,
-    active_upload_context: Option<&str>,
-    backfill_window_days: u64,
-) -> String {
-    scan_traversal_context_fingerprint_with(
-        SnapshotSource::ClaudeCode,
-        &[],
-        active_upload_context,
-        index.historical_replay_generation.as_deref(),
-        backfill_window_days,
-    )
-}
-
-fn root_digests(roots: &[PathBuf]) -> BTreeSet<crate::durable_tail_store::Digest32> {
-    roots
-        .iter()
-        .map(|root| {
-            crate::durable_tail_store::key_digest(
-                crate::durable_tail_store::DurableSource::ClaudeCode,
-                &local_index_key(root),
-            )
-        })
-        .collect()
-}
-
-/// ON, context-changed start: the retained start's inputs, re-hashed with
-/// today's scanner identity and replay generation, still give its rootless
-/// fingerprint, and today's roots only add to its roots. Then only roots were
-/// added, the backfill changed or the active upload context (policy) changed,
-/// so unchanged files owe evidence (their upload receipts still own any
-/// upload-context read). A replay or scanner identity change, a removed root
-/// or a start without recorded inputs keeps main's clear.
-pub(super) fn context_change_owes(
-    source: SnapshotSource,
-    roots: &[PathBuf],
-    index: &ScanIndex,
-    backfill_window_days: u64,
-) -> bool {
-    let Some(inputs) = index
-        .traversal
-        .as_ref()
-        .and_then(|retained| retained.context_inputs.as_ref())
-    else {
-        return false;
-    };
-    let current = root_digests(roots);
-    enabled()
-        && source == SnapshotSource::ClaudeCode
-        && inputs.roots.is_subset(&current)
-        && (inputs.backfill_window_days != backfill_window_days
-            || inputs.active_upload_context != index.active_upload_context_fingerprint
-            || inputs.roots.len() != current.len())
-        && rootless_context(
-            index,
-            inputs.active_upload_context.as_deref(),
-            inputs.backfill_window_days,
-        ) == inputs.rootless
-}
-
-/// A reverted (held) entry keeps the working entry's re-arm debt: main clears
-/// the fingerprint, an owed working entry marks the retained one owed. Owed
-/// debt is census-window debt only (a needed read is main's clear), so the
+/// A reverted (held) entry keeps the working entry's re-arm debt: a cleared
+/// working entry clears it, an owed working entry marks it owed. Owed debt is
+/// census-window debt only (a needed read clears the fingerprint), so the
 /// retained entry may later re-stamp.
 pub(super) fn carry_debt(retained: &mut ScanIndexEntry, working: &ScanIndexEntry) {
     if working.rearmed() {
@@ -179,19 +48,14 @@ pub(super) fn carry_debt(retained: &mut ScanIndexEntry, working: &ScanIndexEntry
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Arm {
-    KeptOwed,
-    Read,
+/// Whether `carry_debt(retained, working)` would change `retained`.
+pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexEntry) -> bool {
+    working.rearmed()
+        && keep_or_clear_changes(retained, !working.source_file_fingerprint.is_empty())
 }
 
-/// Per page: one decision per family, and the pending occurrence count the
-/// cap-room rule admits against.
+/// Per page: the paced owed-read allowance.
 pub(super) struct Page {
-    pub(super) families: BTreeMap<String, Arm>,
-    pub(super) retained: Option<usize>,
-    /// The pending occurrence cap a kept family's re-read must fit.
-    pub(super) cap: usize,
     /// Owed Fulls this page already admitted, and the one
     /// per-page cap. It reuses the existing paced re-read page allowance
     /// (`BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE`); the rest wait in the
@@ -202,9 +66,6 @@ pub(super) struct Page {
 impl Default for Page {
     fn default() -> Self {
         Self {
-            families: BTreeMap::new(),
-            retained: None,
-            cap: MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             reads: 0,
             read_cap: BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE,
         }
@@ -247,8 +108,7 @@ impl EvidenceContract {
 /// Accumulate `snapshots` into the index's pending and stamp each touched
 /// family: the current contract only if its pending was empty before or
 /// already carried that same stamp; otherwise `None` (mixed), so a stamp is
-/// never laundered. Written with the switch OFF too (nothing reads it OFF),
-/// so the ON flip finds stamped evidence. A durable-tail
+/// never laundered. A durable-tail
 /// restore folds here as well: its record is keyed by the recorded contract
 /// (`Interpretation::identity_contract`), so it was built under `current`.
 pub(super) fn stamped<T>(
@@ -276,11 +136,9 @@ fn stamp_families<T>(
         .map(|root| {
             let before = index
                 .claude_usage_family_pending
-                .get(&root)
-                .filter(|pending| {
-                    pending.census_window_end == census_window_end && !evidence_free(pending)
-                })
-                .map(|pending| pending.identity_contract);
+                .view(&root)
+                .filter(|pending| pending.window() == census_window_end && !pending.evidence_free())
+                .map(|pending| pending.identity_contract());
             (root, before)
         })
         .collect::<BTreeMap<_, _>>();
@@ -288,13 +146,16 @@ fn stamp_families<T>(
     for (root, before) in prior {
         // A pending this accumulation left in another window was not rebuilt:
         // its stamp is not touched.
+        // An Unknown family accumulated nothing (the page refused): no stamp.
         if let Some(pending) = index
             .claude_usage_family_pending
-            .get_mut(&root)
+            .family_mut(&root)
+            .ok()
+            .flatten()
             .filter(|pending| pending.census_window_end == census_window_end)
         {
             pending.identity_contract = match before {
-                _ if pending.invalid || evidence_free(pending) => None,
+                _ if pending.invalid || UsageView::Full(pending).evidence_free() => None,
                 None => current,
                 Some(stamp) if stamp.is_some() && stamp == current => current,
                 Some(_) => None,
@@ -302,47 +163,6 @@ fn stamp_families<T>(
         }
     }
     result
-}
-
-fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
-    pending.member_occurrences.is_empty()
-        && pending
-            .member_request_id_hashes
-            .values()
-            .all(BTreeSet::is_empty)
-}
-
-/// Kept owed with no credit, per member: cap-invalid family, no stored
-/// evidence, no authority quarantine or decode hold, no identity-contract
-/// latch and a contract not left unproven by a latch clear (that member's
-/// body is read under the current contract, paced, never kept waiting for cap
-/// room), and this exact revision is the one its census record
-/// reproduced in the family's window, with an ACKed head.
-fn kept_member(
-    index: &ScanIndex,
-    key: &str,
-    entry: &ScanIndexEntry,
-    root: &str,
-    pending: &ClaudeUsageFamilyPending,
-) -> bool {
-    let Some(window) = rfc3339_unix_seconds(&pending.census_window_end) else {
-        return false;
-    };
-    index.persistence_available()
-        && index.claude_duplicate_request_witness_overflowed
-        && pending.invalid
-        && evidence_free(pending)
-        && !pending.contract_unproven
-        && !index.claude_request_identity_contract_changed
-        && !index.claude_usage_authority_quarantine.contains_key(root)
-        && !index.decode_holds_family(root)
-        && !index.claude_account_deferred_holds.contains_key(key)
-        && !index.effective_upload_body_witness_revision_requires_adoption(key)
-        && claude_stale_member_independently_accepted(index, key, entry)
-        && index
-            .claude_request_census
-            .retry_carry_record(key)
-            .is_some_and(|record| record.reproduces(&entry.source_file_fingerprint, window))
 }
 
 /// The indexed members of `root`'s family, by one ordered range over the
@@ -371,32 +191,6 @@ fn family<'a>(
     )
 }
 
-/// Cap room: the family's recorded requests fit the pending
-/// occurrence cap after what is already retained; admitted in selection order.
-fn cap_room(index: &ScanIndex, page: &mut Page, key: &str, root: &str) -> bool {
-    let retained = *page.retained.get_or_insert_with(|| {
-        index
-            .claude_usage_family_pending
-            .values()
-            .map(ClaudeUsageFamilyPending::occurrences)
-            .fold(0_usize, usize::saturating_add)
-    });
-    let Some(members) = family(index, key, root) else {
-        return false;
-    };
-    let requests = members
-        .filter_map(|(key, _)| index.claude_request_census.retry_carry_record(key))
-        .map(|record| record.request_hashes().len())
-        .fold(0_usize, usize::saturating_add);
-    match claude_pending_occurrence_count_after_replace(retained, 0, requests, page.cap) {
-        Some(next) => {
-            page.retained = Some(next);
-            true
-        }
-        None => false,
-    }
-}
-
 /// The traversal's selection of one candidate (`decision`, `reason` already
 /// decided by `candidate_decision_in_window`). Only an owed entry changes.
 pub(super) fn resolve(
@@ -408,7 +202,21 @@ pub(super) fn resolve(
     reason: &mut Option<CandidateParseReason>,
 ) {
     let key = local_index_key(&candidate.path);
-    // An owed entry main's clear later emptied is main's debt, read as main.
+    let family = claude_index_path_family_member(&candidate.path);
+    // Cold usage pending: an owed member's family is read and re-stamped
+    // below, so it is loaded first. Unknown (counted) leaves the member owed.
+    if let Some((root, _)) = family.as_ref().filter(|_| {
+        index
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.evidence_owed)
+    }) {
+        let roots = BTreeSet::from([root.clone()]);
+        if super::state_v2::load_usage(index, &roots).is_err() {
+            return;
+        }
+    }
+    // An owed entry a later clear emptied is read like any cleared entry.
     let Some(entry) = index
         .files
         .get(&key)
@@ -416,21 +224,21 @@ pub(super) fn resolve(
     else {
         return;
     };
-    let family = claude_index_path_family_member(&candidate.path);
-    if enabled() {
-        note_age(
-            index,
-            family.as_ref().map(|(root, _)| root.as_str()),
-            census_window_end,
-        );
-    }
+    note_age(
+        index,
+        family.as_ref().map(|(root, _)| root.as_str()),
+        census_window_end,
+    );
     if entry.source_file_fingerprint != candidate.source_file_fingerprint {
         // A real change parses fresh evidence, never against its carried copy.
-        if let Some((root, member)) = family.filter(|_| enabled()) {
+        if let Some((root, member)) = family {
             claude_contract::note(|c| c.evidence_owed.changed += 1);
+            // Loaded above.
             if let Some(pending) = index
                 .claude_usage_family_pending
-                .get_mut(&root)
+                .family_mut(&root)
+                .ok()
+                .flatten()
                 .filter(|pending| pending.census_window_end == census_window_end)
             {
                 pending.member_occurrences.remove(&member);
@@ -443,12 +251,10 @@ pub(super) fn resolve(
         // Selected by another obligation (forced family, authority, audit,
         // upload context, adoption): that selection owns the read, outside
         // this page's owed-read cap. The parse records a fresh entry.
-        if enabled() {
-            claude_contract::note(|c| c.evidence_owed.selected_by_other_reason += 1);
-        }
+        claude_contract::note(|c| c.evidence_owed.selected_by_other_reason += 1);
         return;
     }
-    if let Some((root, member)) = family.filter(|_| enabled()) {
+    if let Some((root, member)) = family {
         if empty_from_record(index, &key, &root) {
             claude_contract::note(|c| c.evidence_owed.restamped_from_record += 1);
             if let Some(entry) = index.files.get_mut(&key) {
@@ -457,18 +263,15 @@ pub(super) fn resolve(
             return;
         }
         match restamp(index, &key, &root, &member, census_window_end) {
-            Ok(Restamp::Observed) => {
+            Ok(()) => {
+                // Under the latch only a current-contract read gets here
+                // (`current_contract_read`): it equals a Full under the
+                // current contract. The latch itself clears only through its
+                // own routes.
                 claude_contract::note(|c| c.evidence_owed.restamped += 1);
                 if let Some(entry) = index.files.get_mut(&key) {
                     entry.evidence_owed = false;
                 }
-                return;
-            }
-            Ok(Restamp::UnderLatch) => {
-                // Window membership only. The entry stays owed, so fence
-                // coverage, family proof and retirement still see it
-                // unobserved until a re-stamp without the latch.
-                claude_contract::note(|c| c.evidence_owed.restamped_under_latch += 1);
                 return;
             }
             Err(refusal) => claude_contract::note(|c| {
@@ -486,97 +289,51 @@ pub(super) fn resolve(
             }),
         }
     }
-    let Some(entry) = index.files.get(&key) else {
+    if !index.files.contains_key(&key) {
         return;
-    };
-    let member = claude_index_path_member_ref(&candidate.path).map(|member| member.root);
-    let kept = enabled()
-        && member.is_some_and(|root| {
-            index
-                .claude_usage_family_pending
-                .get(root)
-                .is_some_and(|pending| kept_member(index, &key, entry, root, pending))
-        });
-    let arm = match member.filter(|_| kept) {
-        // Left by an ON process (switch now OFF), or not kept: main's debt.
-        None => Arm::Read,
-        Some(root) => match page.families.get(root) {
-            Some(arm) => *arm,
-            None => {
-                let arm = if cap_room(index, page, &key, root) {
-                    Arm::Read
-                } else {
-                    Arm::KeptOwed
-                };
-                page.families.insert(root.to_owned(), arm);
-                arm
-            }
-        },
-    };
-    if enabled() && arm == Arm::Read {
-        if page.reads >= page.read_cap {
-            // Paced: back into the walk's own queue as a re-read (not a
-            // census member, like a history-upgrade budget hold), still owed.
-            claude_contract::note(|c| c.evidence_owed.deferred_page_cap += 1);
-            if let Some(traversal) = index.traversal.as_mut() {
-                traversal.pending_candidates.push_back(ScanTraversalPath {
-                    scan_root: candidate.scan_root.clone(),
-                    path: candidate.path.clone(),
-                    census_member: false,
-                    watcher_hint: false,
-                });
-            }
-            return;
+    }
+    // Every owed member left here is read, paced per page; capacity never
+    // keeps one owed.
+    if page.reads >= page.read_cap {
+        // Paced: back into the walk's own queue as a re-read (not a
+        // census member, like a history-upgrade budget hold), still owed.
+        claude_contract::note(|c| c.evidence_owed.deferred_page_cap += 1);
+        if let Some(traversal) = index.traversal.as_mut() {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: false,
+                watcher_hint: false,
+            });
         }
-        page.reads += 1;
+        return;
     }
-    if enabled() {
-        let latched = index.claude_request_identity_contract_changed;
-        claude_contract::note(|c| match arm {
-            Arm::Read => {
-                c.evidence_owed.read += 1;
-                c.evidence_owed.identity_owed_read_under_latch += u64::from(latched);
-            }
-            // Re-examined at every visit: read once its requests fit the cap.
-            Arm::KeptOwed => c.evidence_owed.owed_waiting_cap += 1,
-        });
-    }
-    if arm == Arm::Read {
-        *decision = CandidateDecision::Parse;
-        *reason = Some(CandidateParseReason::Rearmed);
-    }
+    page.reads += 1;
+    let latched = index.claude_request_identity_contract_changed;
+    claude_contract::note(|c| {
+        c.evidence_owed.read += 1;
+        c.evidence_owed.identity_owed_read_under_latch += u64::from(latched);
+    });
+    *decision = CandidateDecision::Parse;
+    *reason = Some(CandidateParseReason::Rearmed);
 }
 
-/// ON, a traversal started under the recorded identity contract: its census
-/// window is the first whose records that contract wrote, unless an earlier
-/// one already is (a contract change clears it).
+/// A traversal started under the recorded identity contract: its census
+/// window is the first whose records that contract wrote (W1), unless an
+/// earlier one already is (a contract change clears it). Read only by an
+/// owed member's re-stamp under the latch (`current_contract_read`).
 pub(super) fn start_contract_window(index: &mut ScanIndex, census_window_end: &str) {
     let progress = &mut index.claude_full_rearm_progress;
-    if enabled() && progress.identity_contract_window.is_none() {
+    if progress.identity_contract_window.is_none() {
         progress.identity_contract_window = rfc3339_unix_seconds(census_window_end);
-    }
-}
-
-/// ON, identity-contract latch set: the walk's queue length at a page's
-/// start, summed per page, so the paced owed reads can be seen draining.
-pub(super) fn note_page_start(index: &ScanIndex, source: SnapshotSource) {
-    if source == SnapshotSource::ClaudeCode
-        && enabled()
-        && index.claude_request_identity_contract_changed
-    {
-        let queued = index
-            .traversal
-            .as_ref()
-            .map_or(0, |traversal| traversal.pending_candidates.len());
-        claude_contract::note(|c| c.evidence_owed.queue_at_page_start_under_latch += queued as u64);
     }
 }
 
 /// Age of this owed member's family evidence window against this census.
 fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
     let age = root
-        .and_then(|root| index.claude_usage_family_pending.get(root))
-        .and_then(|pending| rfc3339_unix_seconds(&pending.census_window_end))
+        .and_then(|root| index.claude_usage_family_pending.view(root))
+        .and_then(|pending| rfc3339_unix_seconds(pending.window()))
         .zip(rfc3339_unix_seconds(census_window_end))
         .map(|(stored, now)| now.saturating_sub(stored));
     claude_contract::note(|c| {
@@ -589,14 +346,6 @@ fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
             Some(_) => &mut owed.age_gt_7d,
         } += 1;
     });
-}
-
-/// A bound re-stamp: an observation, or (latch set, contract stamp current)
-/// window membership only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Restamp {
-    Observed,
-    UnderLatch,
 }
 
 /// Why a re-stamp did not count as an observation (counts only).
@@ -628,22 +377,28 @@ fn restamp(
     root: &str,
     member: &str,
     window: &str,
-) -> Result<Restamp, Refusal> {
+) -> Result<(), Refusal> {
     let (Some(entry), Some(pending)) = (
         index.files.get(key),
-        index.claude_usage_family_pending.get(root),
+        // Loaded by `resolve`; a cold family it could not load refused there.
+        index
+            .claude_usage_family_pending
+            .family(root)
+            .ok()
+            .flatten(),
     ) else {
         return Err(Refusal::NoPending);
     };
     // The contract is unchanged since storage (no latch), or this pending's
-    // stamp is the recorded, real contract this cycle runs under. A family
-    // exempted from the latch clear while quarantined proves its contract
-    // only through that stamp.
+    // stamp is the recorded, real contract this cycle runs under. A pending
+    // left `contract_unproven` by a latch clear proves its contract only
+    // through that stamp. Under the latch the member must also have been read
+    // under that contract (`current_contract_read`); otherwise one paced read.
     let latched = index.claude_request_identity_contract_changed;
     let stamped = pending
         .identity_contract
         .is_some_and(|stamp| Some(stamp) == EvidenceContract::current(index));
-    if latched && !stamped {
+    if latched && !(stamped && current_contract_read(index, key, entry)) {
         return Err(Refusal::ContractLatch);
     }
     if pending.contract_unproven && !stamped {
@@ -687,14 +442,26 @@ fn restamp(
         if !others_owed {
             return Err(Refusal::FamilyUnverified);
         }
-        if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+        if let Ok(Some(pending)) = index.claude_usage_family_pending.family_mut(root) {
             pending.census_window_end = window.to_owned();
         }
     }
-    Ok(if latched {
-        Restamp::UnderLatch
-    } else {
-        Restamp::Observed
+    Ok(())
+}
+
+/// The member's census record reproduces its revision from the first window
+/// started under the recorded identity contract on (W1; a change inside a
+/// window counts from the next one), and is loss-free: not lossy, over
+/// budget, unverified, a twin or retired. The record's ids must still equal
+/// the pending's (checked by `restamp`).
+fn current_contract_read(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
+    let Some(since) = index.claude_full_rearm_progress.identity_contract_window else {
+        return false;
+    };
+    index.claude_request_census.get(key).is_some_and(|record| {
+        record.reproduces_since(&entry.source_file_fingerprint, since, Some(since))
+            && !record.is_lossy()
+            && !record.over_budget()
     })
 }
 
@@ -725,13 +492,9 @@ fn empty_from_record(index: &ScanIndex, key: &str, root: &str) -> bool {
         })
 }
 
-/// Under ON a family with an owed member is not proven at completion: owed
-/// evidence (including a re-stamp under the latch) earns no credit,
-/// retirement or fence decision until it resolves.
+/// A family with an owed member is not proven at completion: owed evidence
+/// earns no credit, retirement or fence decision until it resolves.
 pub(super) fn owed_roots(index: &ScanIndex) -> BTreeSet<String> {
-    if !enabled() {
-        return BTreeSet::new();
-    }
     index
         .files
         .iter()
@@ -753,106 +516,25 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     Some(prefixes)
 }
 
-/// The identity-contract latch may clear at a complete census when no
-/// older-contract evidence can mix into proof: every valid pending with
-/// evidence is from this window, or belongs to a family this completion
-/// retires (unindexed), or is held in authority quarantine. Quarantine keeps
-/// that pending on purpose and it proves nothing while held, so it does not
-/// block the clear; those families are returned to be marked
-/// `contract_unproven`. Any other family with owed members blocks, with or
-/// without pending evidence, even one re-stamped under the latch: owed
-/// evidence never credits the clear. `None`:
-/// the latch stays and the identity-contract re-arm clears it as on main.
-pub(super) fn latch_clearable(
-    index: &ScanIndex,
-    census_window_end: &str,
-    indexed_claude_family_ids: &BTreeSet<String>,
-) -> Option<BTreeSet<String>> {
-    let owed = owed_roots(index);
-    let quarantined = |root: &String| index.claude_usage_authority_quarantine.contains_key(root);
-    if !owed.iter().all(quarantined) {
-        return None;
-    }
-    let mut exempt = BTreeSet::new();
-    for (root, pending) in &index.claude_usage_family_pending {
-        if pending.invalid || evidence_free(pending) {
-            continue;
-        }
-        if pending.census_window_end == census_window_end && !owed.contains(root) {
-            continue;
-        }
-        if quarantined(root) {
-            exempt.insert(root.clone());
-            continue;
-        }
-        if owed_at_completion(root, pending, false, indexed_claude_family_ids) {
-            return None;
-        }
-    }
-    Some(exempt)
-}
-
-/// Main's latch clear, by any route (its identity-contract re-arm, a
-/// completion whose fence opens, the identity upgrade, a spent cutover): kept
-/// pending from another window, or not stamped with the contract this cycle
-/// runs under, is marked `contract_unproven`, so it re-stamps only through its
-/// own stamp, never through the cleared latch.
+/// The latch clear, by any route (its identity-contract re-arm, a completion
+/// whose fence opens, the identity upgrade, a spent cutover): kept pending
+/// from another window, or not stamped with the contract this cycle runs
+/// under, is marked `contract_unproven`, so an owed member re-stamps only
+/// through its own stamp, never through the cleared latch. Only the owed
+/// resolver reads the mark.
 pub(super) fn mark_unproven_at_latch_clear(index: &mut ScanIndex, census_window_end: &str) {
-    if !enabled() {
-        return;
-    }
     let current = EvidenceContract::current(index);
-    for pending in index.claude_usage_family_pending.values_mut() {
-        if pending.census_window_end != census_window_end || pending.identity_contract != current {
-            pending.contract_unproven = true;
-        }
+    let usage = &mut index.claude_usage_family_pending;
+    let marked: Vec<String> = usage
+        .views()
+        .filter(|(_, family)| {
+            family.window() != census_window_end || family.identity_contract() != current
+        })
+        .map(|(root, _)| root.clone())
+        .collect();
+    for root in &marked {
+        usage.mark_unproven(root);
     }
-}
-
-/// The admission drop: an unfinished admission still owes
-/// due paths its existing selector has not offered.
-pub(super) fn due_unoffered(
-    index: &ScanIndex,
-    state: &ClaudeRetryAdmission,
-    collected_at: &str,
-) -> bool {
-    let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-    index
-        .files
-        .keys()
-        .any(|key| claude_retry_path_due(state, &index.claude_usage_authority_quarantine, key, now))
-}
-
-/// Only the due cursor stays: the root walk is settled, no root is carried.
-/// It completes when that service finishes; the next start then drops it.
-pub(super) fn due_only(state: &ClaudeRetryAdmission) -> ClaudeRetryAdmission {
-    ClaudeRetryAdmission {
-        after_root: Some(state.upper_root.clone()),
-        roots_complete: true,
-        complete: false,
-        progressed: false,
-        oversized_root: None,
-        oversized_after_path: None,
-        storage_deferred: false,
-        ..state.clone()
-    }
-}
-
-/// An indexed family this census did not prove stays owed; only a
-/// completed family proof retires pending.
-pub(super) fn owed_at_completion(
-    root_session_id: &str,
-    pending: &ClaudeUsageFamilyPending,
-    proven: bool,
-    indexed_claude_family_ids: &BTreeSet<String>,
-) -> bool {
-    !proven
-        && (indexed_claude_family_ids.contains(root_session_id)
-            || pending
-                .member_request_id_hashes
-                .keys()
-                .chain(pending.member_occurrences.keys())
-                .any(|member| indexed_claude_family_ids.contains(member)))
 }
 
 #[cfg(test)]
@@ -867,77 +549,51 @@ mod tests {
         .unwrap()
     }
 
-    /// [off=main] Default OFF: only a local regular marker enables it, and an
-    /// OFF re-arm or census clear site clears the fingerprint exactly as main,
-    /// owing nothing (ON both keep the revision owed).
+    /// [behaviour] Only the terminal-retry re-arm keeps the revision owed;
+    /// every other re-arm cause clears the fingerprint.
     #[test]
-    fn switch_defaults_off_and_off_rearm_clears_like_main() {
-        let scratch = crate::test_scratch::ScratchDir::new("evidence-owed-policy");
-        let marker = scratch.join("claude_evidence_owed_enabled");
-        assert!(!enabled_at(&scratch));
-        std::fs::write(&marker, b"").unwrap();
-        assert!(enabled_at(&scratch));
-        std::fs::remove_file(&marker).unwrap();
-        std::fs::create_dir(&marker).unwrap();
-        assert!(!enabled_at(&scratch));
-        assert!(!enabled(), "fixture process never consults host marker");
-        let mut off = entry();
-        clear(&mut off);
-        assert!(off.source_file_fingerprint.is_empty() && !off.evidence_owed);
-        {
-            let _on = EvidenceOwedForTest::on();
-            let mut on = entry();
-            clear(&mut on);
-            assert_eq!(on.source_file_fingerprint, "revision");
-            assert!(on.evidence_owed && on.rearmed());
-            assert_eq!(on.observed_fingerprint(), "");
-        }
+    fn only_the_terminal_retry_rearm_owes() {
+        let mut owed = entry();
+        rearm_cause::clear(
+            "/k.jsonl",
+            &mut owed,
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+        );
+        assert_eq!(
+            (owed.source_file_fingerprint.as_str(), owed.evidence_owed),
+            ("revision", true)
+        );
+        assert!(owed.rearmed());
+        assert_eq!(owed.observed_fingerprint(), "");
         for cause in [
             rearm_cause::Cause::NoRetainedTraversal,
-            rearm_cause::Cause::TerminalUnhealthyRetry,
             rearm_cause::Cause::CarryInvalidation,
-        ] {
-            let mut off = entry();
-            rearm_cause::clear("/k.jsonl", &mut off, cause);
-            assert!(off.source_file_fingerprint.is_empty() && !off.evidence_owed);
-            let _on = EvidenceOwedForTest::on();
-            let mut on = entry();
-            rearm_cause::clear("/k.jsonl", &mut on, cause);
-            assert_eq!(
-                (on.source_file_fingerprint.as_str(), on.evidence_owed),
-                ("revision", true)
-            );
-            assert!(on.rearmed());
-        }
-        let _on = EvidenceOwedForTest::on();
-        for cause in [
             rearm_cause::Cause::ContextChanged,
             rearm_cause::Cause::AuditCapDelay,
         ] {
-            let mut real = entry();
-            rearm_cause::clear("/k.jsonl", &mut real, cause);
-            assert!(real.source_file_fingerprint.is_empty() && !real.evidence_owed);
+            let mut cleared = entry();
+            rearm_cause::clear("/k.jsonl", &mut cleared, cause);
+            assert!(cleared.source_file_fingerprint.is_empty() && !cleared.evidence_owed);
         }
     }
 
     /// [money] Equality readers that stand for "observed" or feed a proof
     /// (`e2` copy proof, native credit, proof corrections, owned start, record
-    /// retirement, audits) see an owed revision exactly as main's cleared
-    /// one, until a re-stamp or read resolves it.
+    /// retirement, audits) see an owed revision exactly as a cleared one,
+    /// until a re-stamp or read resolves it.
     #[test]
     fn owed_revision_is_unobserved_for_proof_readers_until_resolved() {
-        let _on = EvidenceOwedForTest::on();
         let mut owed = entry();
         rearm_cause::clear(
             "/k.jsonl",
             &mut owed,
-            rearm_cause::Cause::NoRetainedTraversal,
+            rearm_cause::Cause::TerminalUnhealthyRetry,
         );
         assert_eq!(owed.source_file_fingerprint, "revision");
         assert_eq!(owed.observed_fingerprint(), "");
-        let mut main = entry();
-        main.source_file_fingerprint.clear();
-        assert_eq!(owed.observed_fingerprint(), main.observed_fingerprint());
+        let mut cleared = entry();
+        cleared.source_file_fingerprint.clear();
+        assert_eq!(owed.observed_fingerprint(), cleared.observed_fingerprint());
         owed.evidence_owed = false;
         assert_eq!(owed.observed_fingerprint(), "revision");
     }
@@ -962,7 +618,6 @@ mod tests {
     /// stampless restore gives `None`); invalid evidence is `None`.
     #[test]
     fn contract_stamp_is_written_on_accumulation_and_never_laundered() {
-        let _on = EvidenceOwedForTest::on();
         let mut index = ScanIndex {
             claude_request_identity_contract: Some(
                 claude_request_identity::cycle_contract(true).into(),
@@ -1064,62 +719,6 @@ mod tests {
         );
     }
 
-    /// [regress] A context-changed start that only added roots, changed the
-    /// backfill or the active upload context re-armed every unchanged file:
-    /// ON owes them instead. A replay change, a removed root, a start without
-    /// recorded inputs, a non-Claude source or OFF keep main's clear, and OFF
-    /// records no inputs.
-    #[test]
-    fn context_change_owes_only_for_added_roots_backfill_or_upload_context() {
-        let a = [PathBuf::from("/synthetic/root-a")];
-        let b = PathBuf::from("/synthetic/root-b");
-        let ab = [a[0].clone(), b.clone()];
-        let start = |index: &mut ScanIndex| {
-            ensure_bounded_traversal(
-                SnapshotSource::ClaudeCode,
-                &a,
-                index,
-                "2026-08-02T07:00:00Z",
-                30,
-            )
-        };
-        let mut off = ScanIndex::default();
-        start(&mut off);
-        assert!(off.traversal.as_ref().unwrap().context_inputs.is_none());
-        let mut index = ScanIndex::default();
-        {
-            let _on = EvidenceOwedForTest::on();
-            start(&mut index);
-        }
-        let inputs = index.traversal.as_ref().unwrap().context_inputs.clone();
-        assert!(inputs.is_some());
-        assert!(
-            !format!("{inputs:?}").contains("synthetic"),
-            "no root bytes"
-        );
-        let owes = |index: &ScanIndex, roots: &[PathBuf], days| {
-            context_change_owes(SnapshotSource::ClaudeCode, roots, index, days)
-        };
-        assert!(!owes(&index, &a, 60), "OFF: main");
-        let _on = EvidenceOwedForTest::on();
-        assert!(owes(&index, &a, 60), "backfill");
-        assert!(owes(&index, &ab, 30), "roots added");
-        let mut policy = index.clone();
-        policy.active_upload_context_fingerprint = Some("policy-b".into());
-        assert!(owes(&policy, &a, 30), "upload context");
-        assert!(!owes(&index, std::slice::from_ref(&b), 30), "roots removed");
-        let mut replay = index.clone();
-        replay.historical_replay_generation = Some("replay-b".into());
-        assert!(!owes(&replay, &a, 60), "replay");
-        let mut unrecorded = index.clone();
-        unrecorded.traversal.as_mut().unwrap().context_inputs = None;
-        assert!(!owes(&unrecorded, &a, 60), "unrecorded");
-        assert!(
-            !context_change_owes(SnapshotSource::Codex, &a, &index, 60),
-            "Claude only"
-        );
-    }
-
     /// [format] An index written before the field decodes not owed and
     /// re-encodes byte-identically; an owed entry round-trips.
     #[test]
@@ -1138,9 +737,8 @@ mod tests {
         assert!(back.evidence_owed && back.rearmed());
 
         // A read the file really needs (here an authority normalization of an
-        // unbound record) clears the fingerprint as main does, even on an owed
-        // entry: a reader that drops the new fields still selects it for a read.
-        let _on = EvidenceOwedForTest::on();
+        // unbound record) clears the fingerprint, even on an owed entry: a
+        // reader that drops the new fields still selects it for a read.
         let root = "d0000000-1111-4111-8111-111111111111";
         let path = PathBuf::from(format!("/synthetic/{root}.jsonl"));
         let key = local_index_key(&path);
@@ -1148,7 +746,7 @@ mod tests {
         let mut index = ScanIndex::default();
         let mut owed = entry();
         owed.source_file_fingerprint = revision.clone();
-        clear(&mut owed);
+        keep_or_clear(&mut owed, true);
         index.files.insert(key.clone(), owed);
         index.insert_unproven_terminal_claude_authority_for_test(root, &revision);
         index.claude_usage_family_witnesses.remove(root);

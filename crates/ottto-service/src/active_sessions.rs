@@ -2495,7 +2495,7 @@ mod tests {
 
     #[test]
     fn own_request_parts_gate_account_fallbacks() {
-        // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+        // Contract-5 transcript/reported classification; `e2` allocates final grains before tagging.
 
         use crate::claude_local_otel::{
             ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,

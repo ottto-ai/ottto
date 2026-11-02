@@ -114,7 +114,7 @@ pub(super) fn codex_parent_proof_step(
     }
     let side = Some((&*context.cache, pass.ns));
     let census_valid = identities.census_valid();
-    // R2-M1: a pass the side gate closes (the outage after a failed save;
+    // A pass the side gate closes (the outage after a failed save;
     // with Stage 1, a continuation page) starts and finishes no proof. A
     // held job only steps fd-only and suspends.
     let side_allowed = pass.gate.side_allowed;
@@ -206,15 +206,14 @@ pub(super) fn codex_parent_proof_step(
                 lease
             }
             ProofTake::Free => {
-                // Visit and start wait for a valid, side-allowed page (rev 9
-                // §6.2, R2-M1).
+                // Visit and start wait for a valid, side-allowed page.
                 if !census_valid || !side_allowed {
                     context.cache.note_proof_hook(&context.namespace, false);
                     return;
                 }
                 let leftover = page.singleton_remaining(Limits::current());
                 let visit = index.visit_codex_parent_proofs(identities, now, side, leftover);
-                // R1-M1: each re-fence is P's side fence and the proof seal.
+                // Each re-fence is P's side fence and the proof seal.
                 page.charge(false, visit.refenced.saturating_mul(PROOF_FENCE_READ_BYTES));
                 forget_proven_hold_memos(index, context, &visit.reproven);
                 let Some((parent, entries)) = visit.batch else {
@@ -228,7 +227,7 @@ pub(super) fn codex_parent_proof_step(
                     count(Event::ProofDrop);
                     return;
                 }
-                // R1-L4: P's side fence once (charged) before P is read; the
+                // P's side fence once (charged) before P is read; the
                 // finish fence stays authoritative.
                 page.charge(false, SIDE_FENCE_READ_BYTES);
                 if let Some((outcome, wake)) =
@@ -378,7 +377,7 @@ fn codex_proof_held_outcome(fenced: SideFence) -> ProofOutcome {
     }
 }
 
-/// R1-L4: P's side fence at P's current size, before P is read. `Some`:
+/// P's side fence at P's current size, before P is read. `Some`:
 /// the outcome and wake every entry records with no read, when P's record
 /// neither admits nor is only behind P's growth (`Stale`, which a main
 /// parse may cure before the finish). A P that does not locate is left to
@@ -552,7 +551,7 @@ fn codex_proof_parent_checks(
             .zip(held)
             .is_some_and(|(metadata, held)| (metadata.dev(), metadata.ino()) == held.dev_ino());
     let parser = &mut readers.parent.parser;
-    // P1's rule (cc `finish_job`); it contains PR-P's `ParentLossy` rule.
+    // Same rule as cc `finish_job`; it contains PR-P's `ParentLossy` rule.
     let lossy = parser.reader.lossy_prefix()
         || parser.reader.failure.is_some()
         || !sampled_jsonl::loss_free_source_report(
@@ -598,7 +597,7 @@ fn codex_proof_parent_checks(
 }
 
 /// The finish (rev 3 §2.6): P's checks decide the whole batch, then P's
-/// side record and each child's result. R2-M2 (owner choice (a)): a
+/// side record and each child's result. A
 /// `Held{lineage}` P owes nothing in 2a; the lineage owe is a 2b row with
 /// the proof memo wake, since no 2a path consumes P's own proof.
 fn finish_codex_proof_job(
@@ -875,7 +874,7 @@ impl ScanIndex {
     ) -> bool {
         let child_now = OpenStamp::of_path(Path::new(child_key));
         let parent_now = || p_key.and_then(|p_key| OpenStamp::of_path(Path::new(p_key)));
-        // Exact stamps (E1 S3, C1): raw path stamps carry no birth witness.
+        // Exact stamps: raw path stamps carry no birth witness.
         let grown = |then: &OpenStamp, now: Option<&OpenStamp>| {
             now.is_some_and(|now| then.wake_compatible(now))
         };

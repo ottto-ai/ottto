@@ -78,7 +78,7 @@ impl Fixture {
             &now,
             7,
         );
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
         let traversal = index.traversal.as_mut().unwrap();
         // This known member was already consumed. Saved retryable loss
         // elsewhere retains the roster; the retry is not due yet.
@@ -325,7 +325,7 @@ fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
     }
 }
 
-/// [behaviour] SOURCE's rewrite control: the same inode is truncated and rewritten past
+/// [behaviour] Rewrite control: the same inode is truncated and rewritten past
 /// the committed extent with a changed prefix. Growth retention discovers it;
 /// acquisition's existing prefix samples force the counted Full rebuild.
 #[test]
@@ -399,7 +399,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -781,7 +781,7 @@ fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> Sc
         &collected_at,
         7,
     );
-    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    advance_bounded_directory_traversal(source, &mut index, 7, None, None);
     let traversal = index.traversal.as_mut().unwrap();
     assert!(traversal.pending_directories.is_empty());
     traversal.pending_candidates.clear();
@@ -889,15 +889,9 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         let index = kept_generation(&f, source, false);
         change(&f);
         let without_pass = run_pages(&f, source, index);
-        // Acquisition keeps the read mode: Pi re-reads a grown session in
-        // Full; only what is queued is under test here.
-        let grown_mode = match source {
-            SnapshotSource::Pi => DeliveryMode::Full,
-            _ => growth_mode(),
-        };
         let mut expected = vec![
             format!("{:?}", DeliveryMode::Full),
-            format!("{grown_mode:?}"),
+            format!("{:?}", growth_mode()),
         ];
         expected.sort();
         for budget in [MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK, ROOT_ENTRIES] {
@@ -1002,7 +996,7 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
                 start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
-                advance_bounded_directory_traversal(source, &mut walked, 7, None);
+                advance_bounded_directory_traversal(source, &mut walked, 7, None, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
                     .iter()
@@ -1100,7 +1094,7 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
     start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
-    advance_bounded_directory_traversal(source, index, 7, None);
+    advance_bounded_directory_traversal(source, index, 7, None, None);
     assert!(index
         .traversal
         .as_ref()
@@ -1235,8 +1229,8 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
 
 /// [behaviour] A parsed file deleted before its body is ACKed is counted once
 /// on the retiring page with the resident copy's requests and tokens. Claude's
-/// copy folds its responses only at finish and Pi keeps no copy, so their
-/// totals are unknown. The same file deleted after its ACK counts nothing.
+/// copy folds its responses only at finish, so its totals are unknown. The
+/// same file deleted after its ACK counts nothing.
 /// Count only: the entry retires exactly as before.
 #[test]
 fn deleted_before_ack_counts_unacked_usage_lost() {
@@ -1262,7 +1256,8 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             let expected = match (unacked, source) {
                 (false, _) => Value::Null,
                 (true, SnapshotSource::Codex) => json!({"files": 1, "requests": 1, "tokens": 20}),
-                (true, SnapshotSource::ClaudeCode | SnapshotSource::Pi) => {
+                (true, SnapshotSource::Pi) => json!({"files": 1, "requests": 1, "tokens": 16}),
+                (true, SnapshotSource::ClaudeCode) => {
                     json!({"files": 1, "totals_unknown_files": 1})
                 }
             };
@@ -1273,3 +1268,5 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
         }
     }
 }
+
+mod codex_archive_tests;

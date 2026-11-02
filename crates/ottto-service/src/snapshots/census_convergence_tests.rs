@@ -11,7 +11,10 @@ fn hex64(seed: char) -> String {
     seed.to_string().repeat(64)
 }
 
-fn occurrence(sequence: u64, output_tokens: u64) -> ClaudeTranscriptUsageOccurrenceWitness {
+pub(super) fn occurrence(
+    sequence: u64,
+    output_tokens: u64,
+) -> ClaudeTranscriptUsageOccurrenceWitness {
     ClaudeTranscriptUsageOccurrenceWitness {
         sequence,
         input_tokens: 10,
@@ -161,32 +164,35 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     let family_root = claude_snapshot_family_root(&full);
 
     // An identical later page keeps the family valid.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     for _ in 0..2 {
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(&full),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
     }
     assert!(!pending[&family_root].invalid);
 
     // Growth or shrinkage on a later page of the same window invalidates.
     for pages in [[&prefix, &full], [&full, &prefix]] {
-        let mut pending = BTreeMap::new();
+        let mut pending = UsagePending::default();
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[0]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         let counts = accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[1]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         assert!(pending[&family_root].invalid);
         assert_eq!(
             counts,
@@ -198,19 +204,21 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     }
 
     // A new census window starts over.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&prefix),
         &mut pending,
         OLDER_WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     let counts = accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&full),
         &mut pending,
         WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     assert!(!pending[&family_root].invalid);
     assert_eq!(counts.page_invalidated_member_changed_count, 0);
     assert_eq!(pending[&family_root].census_window_end, WINDOW);
@@ -545,7 +553,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
     let _ = fs::remove_dir_all(root);
 }
 
-// SI P3 (path-(a) bridge): authority debt no longer marks the sweep, so the
+// With the path-(a) bridge, authority debt no longer marks the sweep, so the
 // unchanged-proof skip may run while a family is held. A root that still
 // carries a RetryPending record bound to its witness is never an
 // unchanged-proof root; the same family without the record is one.
@@ -591,6 +599,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
     let no_owners = BTreeSet::new();
     let no_hashes = BTreeSet::new();
     let unchanged = |index: &ScanIndex| {
+        let join = terminal_join::swept(index, WINDOW);
         claude_unchanged_proof_roots(
             index,
             &proven,
@@ -601,7 +610,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
             WINDOW,
             &BTreeSet::new(),
             (&no_owners, &no_hashes, &no_hashes),
-            None,
+            &join,
         )
         .map(|roots| roots.get(root.as_str()).copied())
     };
@@ -617,6 +626,106 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
         Some(Some(false)),
         "the held root is excluded"
     );
+
+    // [money] Cold under state v2: the same graph on a live session keeps
+    // the family as a head (Unknown, not absent), and the terminal join,
+    // streamed from the store, decides as the resident view does.
+    let dir = crate::test_scratch::canonical_private_dir("unchanged-proof-cold");
+    let (custody, cold) = state_v2::money_test_support::ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &held,
+        &dir,
+    );
+    assert!(cold.claude_usage_family_pending.family(&root).is_err());
+    let resident = state_v2::money_test_support::resident(&cold);
+    let release = |index: &ScanIndex| {
+        let mut index = index.clone();
+        index.claude_usage_authority_quarantine.remove(&root);
+        index
+    };
+    assert_eq!(unchanged(&release(&cold)), unchanged(&release(&resident)));
+    assert_eq!(unchanged(&release(&cold)), Some(Some(true)));
+    assert_eq!(unchanged(&cold), unchanged(&resident));
+    assert_eq!(unchanged(&cold), Some(Some(false)));
+    drop(custody);
+    let _ = fs::remove_dir_all(dir);
+}
+
+// [money] At a matching stamp: a stored usage row missing from the
+// session's own store (generation and data version unchanged) refuses the
+// whole page that names its family, counted. Nothing of the page is
+// installed, not even its readable family, and the missing family stays
+// discoverable. A healthy page through the same entry point loads both.
+#[test]
+fn cold_usage_row_missing_at_a_matching_stamp_refuses_the_whole_page() {
+    use state_v2::money_test_support as v2;
+    let (root, parent, items) = claude_account_family_fixture(false);
+    let mut other = items[0].clone();
+    other.source_session_id = "other-root".into();
+    other
+        .attribution_facts
+        .retain(|fact| fact.field != "root_session_ref");
+    assert_eq!(claude_snapshot_family_root(&other), "other-root");
+    assert_eq!(claude_snapshot_family_root(&items[0]), parent);
+    let pending = |member: &str| ClaudeUsageFamilyPending {
+        census_window_end: WINDOW.to_string(),
+        member_request_id_hashes: BTreeMap::from([(
+            member.to_string(),
+            BTreeSet::from([hex64('c')]),
+        )]),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+        idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
+    };
+    let mut index = ScanIndex::default();
+    for family in [parent.as_str(), "other-root"] {
+        index
+            .claude_usage_family_pending
+            .insert(family.to_string(), pending(family));
+    }
+    let scratch = crate::test_scratch::canonical_private_dir("usage-row-missing");
+    let (custody, cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
+    let page = |index: &mut ScanIndex| {
+        let mut snapshots = vec![items[0].clone(), other.clone()];
+        apply_claude_reported_usage_with_identity(
+            &mut snapshots,
+            &Default::default(),
+            &Default::default(),
+            index,
+            false,
+            WINDOW,
+            None,
+        )
+    };
+
+    // Positive control: the same entry point loads the page's families.
+    let mut healthy = cold.clone();
+    page(&mut healthy);
+    assert!(v2::usage_loaded(&healthy, &parent));
+    assert!(v2::usage_loaded(&healthy, "other-root"));
+
+    v2::delete_usage_row_in_session(&cold, &parent);
+    let mut refused = cold.clone();
+    let before = v2::usage_unknown_count();
+    let disposition = page(&mut refused);
+    assert!(v2::usage_unknown_count() > before, "counted");
+    for session in [items[0].source_session_id.as_str(), "other-root"] {
+        assert!(disposition.quarantined_source_session_ids.contains(session));
+    }
+    assert!(!v2::usage_loaded(&refused, &parent));
+    assert!(
+        !v2::usage_loaded(&refused, "other-root"),
+        "nothing installed"
+    );
+    let usage = &refused.claude_usage_family_pending;
+    assert!(usage.contains_key(&parent));
+    assert!(usage.family(&parent).is_err(), "Unknown, not absent");
+    drop(custody);
+    let _ = fs::remove_dir_all(scratch);
+    let _ = fs::remove_dir_all(root);
 }
 
 // A held key keeps its committed revision, its activity and accepted
@@ -990,7 +1099,7 @@ fn bound_terminal_hold_skips_until_family_changes() {
         (CandidateDecision::Skip, None)
     );
     let mut context_changed = index.clone();
-    context_changed.upload_context_fingerprint = Some("previous-context".to_string());
+    context_changed.activate_upload_context("next-context".to_string());
     assert_eq!(
         decision(&context_changed, &candidate),
         (CandidateDecision::Skip, None)
@@ -1443,7 +1552,7 @@ fn clean_terminal_traversal(observed: BTreeSet<String>) -> ScanTraversalCheckpoi
     }
 }
 
-/// SOURCE Round 15: the tombstone uncertainty fence comes down only at a
+/// The tombstone uncertainty fence comes down only at a
 /// complete healthy terminal. This one observed `observed` on disk.
 fn drain_fence_at_clean_terminal(
     index: &mut ScanIndex,
@@ -1452,7 +1561,7 @@ fn drain_fence_at_clean_terminal(
     index.drain_claude_retired_family_tombstone_fence(&clean_terminal_traversal(observed))
 }
 
-// SOURCE Round 11 guard (c): traversal counts carry no per-directory
+// Guard (c): traversal counts carry no per-directory
 // attribution, so any read, permission or symlink error, entry cap, or
 // unfinished directory or candidate page anywhere in the traversal keeps
 // every absent family. The clean control retires and tombstones it.
@@ -1539,7 +1648,7 @@ fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
     );
 }
 
-// SOURCE Round 11 guards (a) and (b) at the unit seam: the latch and an
+// Guards (a) and (b) at the unit seam: the latch and an
 // unverified-history index each refuse with their own reason.
 /// Saves `index` at a new `path` through ordinary compare-and-swap saves
 /// until the saved index carries `generation`; it never loads the path.
@@ -1549,7 +1658,7 @@ fn save_through_generation(index: &mut ScanIndex, path: &std::path::Path, genera
     }
 }
 
-// SOURCE Round 11 guard (b) at load: a missing, quarantined or empty
+// Guard (b) at load: a missing, quarantined or empty
 // generation-0 load marks its path unverified for the rest of the process;
 // a load with history does not, until a restart forgets the fresh load.
 // #705/#712 composition: both daemon and general loads share freshness,
@@ -1624,7 +1733,7 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
     assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     assert!(!origin.is_fresh(&repaired));
     assert!(!repaired.claude_history_unverified_in_process);
-    // Round 15: the source-aware load raises the fence; only a complete
+    // The source-aware load raises the fence; only a complete
     // healthy terminal lowers it.
     assert!(repaired.claude_retired_family_tombstones_uncertain);
     assert!(!repaired.claude_family_tombstoned_for_test("gone-00"));
@@ -1637,7 +1746,7 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 11 tombstone decode: malformed entries drop one by one, a
+// Tombstone decode: malformed entries drop one by one, a
 // wrong container type decodes as empty, each counted; the index and all its
 // other state still load, never quarantined.
 #[test]
@@ -1649,8 +1758,8 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
     let kept = claude_retired_family_digest("kept-root");
-    // Round 13: damage raises the uncertainty fence, and the next complete
-    // terminal (Round 15; never the load) replaces it with a tombstone for
+    // Damage raises the uncertainty fence, and the next complete
+    // terminal (never the load) replaces it with a tombstone for
     // every witnessed root it did not see on disk: here the held root.
     let held = claude_retired_family_digest("held-root");
     let mut index = ScanIndex::default();
@@ -1746,7 +1855,7 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 13 F2: a full tombstone set refuses the next retirement and
+// A full tombstone set refuses the next retirement and
 // never evicts. The refused family keeps its RetryPending record, pending
 // and witness, and the refusal is counted; the oldest tombstone stays. Both
 // the priced fast path and the bounded fallback reserve before removing, and
@@ -1869,11 +1978,11 @@ fn full_tombstone_set_refuses_retirement_and_keeps_the_family() {
 /// Edits a saved index's top-level JSON object.
 type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>) + 'a;
 
-// SOURCE Round 13 F1: the persisted marker separates an index from before
+// The persisted marker separates an index from before
 // the bridge (no marker: an empty set is safe, nothing ever retired) from a
 // marked index whose tombstone set was omitted, wrongly typed or damaged.
 // The latter raises the uncertainty fence; the next complete terminal
-// (Round 15) tombstones every absent witnessed root, so the retired family's returning
+// tombstones every absent witnessed root, so the retired family's returning
 // member is still read through the authority path, never as a new file, and
 // that survives a save and reload. An unwitnessed new root stays new.
 #[test]
@@ -1943,7 +2052,7 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     assert!(loaded.claude_authority_record_for_test("gone-00").is_some());
 
     // The same omission after the retirement is what an older writer leaves
-    // (SOURCE Round 14, downgrade): the retired root's witness has no record,
+    // (a downgrade): the retired root's witness has no record,
     // pending proof, indexed member or tombstone, so the load fails closed
     // and the next complete terminal re-tombstones it.
     write(&|object| {
@@ -2024,12 +2133,12 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 13 F1/F2: when the lost roots cannot all be tombstoned within
+// When the lost roots cannot all be tombstoned within
 // the cap (here an over-cap persisted set, trimmed at decode, dropped the
 // retired family's tombstone), the uncertainty fence stays up durably: every
 // unindexed Claude member, even an unwitnessed new root, is read through the
 // authority path, across saves, reloads and complete terminals. Once a
-// settled proof frees enough slots, the next complete terminal (Round 15)
+// settled proof frees enough slots, the next complete terminal
 // tombstones the absent witnessed roots and lowers it.
 #[test]
 #[cfg_attr(
@@ -2132,10 +2241,10 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 14 H729-1 control: a member that returns and parses empty is
+// Control: a member that returns and parses empty is
 // indexed (confirmed empty) while its family's proof is unsettled, so its
 // tombstone stays. If the set is then lost, that indexed member must not
-// waive the root's slot: the next complete terminal (Round 15), which does
+// waive the root's slot: the next complete terminal, which does
 // not see its file, re-tombstones the witnessed root, and once
 // the member is gone again its return is still read through the authority
 // path.
@@ -2181,7 +2290,7 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
     );
     assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
     // The walk does not see the indexed member's file: it counts as absent,
-    // and as aged out (SOURCE h733-2).
+    // and as aged out.
     let aged_out = claude_absence_counters_for_test().absent_family_tombstone_aged_out;
     drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     assert!(
@@ -2209,15 +2318,15 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 14 H729-2: the fence drain is bounded whatever the witness
+// The fence drain is bounded whatever the witness
 // count. It counts untombstoned witnessed roots only until one more than it
 // may tombstone, keeps nothing but the entries it inserts, and those are
 // priced first. Over capacity the fence stays up and nothing is inserted.
-// A refused scratch never lowers the fence (SOURCE h733-1), whatever it
+// A refused scratch never lowers the fence, whatever it
 // counts: zero, one, exactly the fixed-size fallback, or every witness
 // already tombstoned. It inserts nothing, counts the skip and raises the
 // kept-fence alarm; after save and reload the next admitted complete
-// terminal lowers it. Since Round 15 the drain runs at a complete terminal,
+// terminal lowers it. The drain runs at a complete terminal,
 // never at load; here every witnessed root is absent (the walk observed
 // nothing).
 #[test]
@@ -2270,9 +2379,8 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     );
     assert!(index.claude_retired_family_tombstones_for_test().is_empty());
 
-    // A refused scratch never lowers (SOURCE h733-1; this replaces the
-    // Round 15 oracle that a refused pass lowered exactly `fallback` roots,
-    // which that ruling makes wrong). Exactly the fallback size: Kept,
+    // A refused scratch never lowers (this replaces an earlier oracle that
+    // a refused pass lowered exactly `fallback` roots). Exactly the fallback size: Kept,
     // nothing inserted, the skip counted and the kept-fence alarm raised.
     let refuse = RefuseClaudeTombstoneRepairScratchForTest::new();
     let dir = temp_dir("patha-refused-tombstone-repair");
@@ -2458,10 +2566,10 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 14 (d): an older writer drops the marker, the set and the
+// An older writer drops the marker, the set and the
 // fence. A load that then finds a witnessed root with no record, pending
 // proof, indexed member or tombstone fails closed: the fence goes up, and
-// the next complete terminal (Round 15) re-tombstones the absent witnessed
+// the next complete terminal re-tombstones the absent witnessed
 // roots, or the fence stays durably when they cannot all be. The intermediate binary that kept the set but not the
 // marker (and could evict at its cap) is caught the same way. A healthy
 // unmarked index (the witnessed root is indexed) still starts empty.
@@ -2509,7 +2617,7 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     );
 
     // Refused repair scratch: the check fails closed and a refused drain
-    // never lowers (SOURCE h733-1), so the fence stays up across saves.
+    // never lowers, so the fence stays up across saves.
     write(&downgrade);
     {
         let _refuse = RefuseClaudeTombstoneRepairScratchForTest::new();
@@ -2618,12 +2726,12 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 15 bounded drain: the fence comes down at a complete healthy
+// Bounded drain: the fence comes down at a complete healthy
 // terminal once every witnessed root the walk did not see present is
 // tombstoned under the cap. Present roots (observed, every observed member
 // indexed) take no slot, so more of them than the cap never block it; they
 // stay indexed files, never new ones. An indexed entry whose file the walk
-// did not see is absent (H729-1), and a root the walk saw only through an
+// did not see is absent, and a root the walk saw only through an
 // unindexed or confirmed-empty member needs a tombstone too (the normal
 // retirement would not cover its later disappearance). More absent roots
 // than free slots keep the fence up, publish it and alarm at most hourly.
@@ -2679,7 +2787,7 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
 
     // Five free slots, five roots needing one, more than the cap present.
     // Of the five, only `absent-stale` is unobserved with an indexed member:
-    // it aged out of the walk (SOURCE h733-2) and is counted, still absent.
+    // it aged out of the walk and is counted, still absent.
     let aged_out = || claude_absence_counters_for_test().absent_family_tombstone_aged_out;
     let before = aged_out();
     let (mut index, observed) = fenced(2);
@@ -2794,7 +2902,7 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     assert_eq!(aged_out(), before + 2);
 }
 
-// SOURCE Round 15, checkpoint selection: the drain exempts a present root by
+// Checkpoint selection: the drain exempts a present root by
 // the working index. When a partial checkpoint then drops that root's new
 // entry (its body is not held by the server yet), the root would be
 // unindexed and untombstoned, so the checkpoint keeps the fence up. A
@@ -2845,7 +2953,7 @@ fn a_partial_checkpoint_that_drops_an_exempted_entry_keeps_the_fence() {
     assert!(!kept.claude_retired_family_tombstones_uncertain_for_test());
 }
 
-// SOURCE Round 15: the accepted upgrade false positive. A pre-bridge index
+// The accepted upgrade false positive. A pre-bridge index
 // whose removed family's witness outlived its entry looks like a downgrade,
 // so the load raises the fence and counts it, with no carve-out. The next
 // complete terminal bounds the cost: only the absent witnessed root takes a
@@ -3022,6 +3130,7 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
         SnapshotSource::Codex,
         &mut orphaned,
         BACKFILL_WINDOW_DAYS,
+        None,
         None,
     );
     let traversal = orphaned.traversal.as_mut().unwrap();

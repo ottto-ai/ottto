@@ -199,12 +199,13 @@ impl LiveRetryOwner {
     pub(super) fn allowance(&self) -> usize {
         self.retry.allowance()
     }
-    #[expect(clippy::too_many_arguments, reason = "15 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "16 args; no options struct yet")]
     pub(super) fn capture_after_shed(
         &mut self,
         live: LiveAuthority,
         home: &Path,
         source: SnapshotSource,
+        native_publication: Option<crate::snapshots::NativePublication>,
         machine: &str,
         policy: SnapshotUploadPolicy,
         account: [u8; 32],
@@ -219,6 +220,7 @@ impl LiveRetryOwner {
     ) -> bool {
         if !self.enabled
             || source != SnapshotSource::Pi
+            || native_publication.is_some_and(|completion| !completion.publishes())
             || working.legacy_settlement_ledger_needs_migration()
             || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash
@@ -269,13 +271,7 @@ impl LiveRetryOwner {
         self.retry.clear();
     }
 
-    pub(super) fn boundary(
-        &mut self,
-        busy: impl Iterator<Item = SnapshotSource>,
-        home: &Path,
-        support: &Path,
-        daemon: &LocalDaemon,
-    ) {
+    pub(super) fn boundary(&mut self, home: &Path, support: &Path, daemon: &LocalDaemon) {
         if !self.enabled {
             return;
         }
@@ -283,7 +279,7 @@ impl LiveRetryOwner {
             self.clear();
             return;
         }
-        self.retry.boundary(busy, Instant::now(), |page| {
+        self.retry.boundary(Instant::now(), |page| {
             // Fresh local credentials are scoped to this one turn. The page
             // owns only the hashed destination and account fence.
             let (device, secret) = load_snapshot_device_credentials()?;
@@ -307,7 +303,6 @@ impl LiveRetryOwner {
         &mut self,
         send: impl FnMut(&mut PreparedRetry) -> Result<SnapshotPageOutcome>,
     ) {
-        self.retry
-            .boundary(std::iter::empty(), Instant::now(), send);
+        self.retry.boundary(Instant::now(), send);
     }
 }

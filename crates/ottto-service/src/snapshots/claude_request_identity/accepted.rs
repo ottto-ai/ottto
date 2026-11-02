@@ -23,7 +23,7 @@ pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
 /// Definite "never accepted" tombstone for proof a copied marker lent
-/// (SOURCE 2026-10-31, #944 xPR F5): never a marker, refusal or replacement.
+/// (#944): never a marker, refusal or replacement.
 const INVALIDATED_PROOF: [u8; 16] = [0xff; 16];
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
 const MAX_PENDING_MISSING: usize = 64;
@@ -172,12 +172,12 @@ pub(super) struct AcceptedShare {
     #[serde(with = "optional_digest_hex")]
     authority: Option<[u8; 32]>,
 }
-mod digest_hex {
+pub(crate) mod digest_hex {
     use super::*;
-    pub(super) fn encode(value: &[u8; 32]) -> String {
+    pub(crate) fn encode(value: &[u8; 32]) -> String {
         value.iter().map(|byte| format!("{byte:02x}")).collect()
     }
-    pub(super) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
+    pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
         if !hash_is_valid(value) {
             return Err(E::custom("invalid fingerprint"));
         }
@@ -735,15 +735,6 @@ impl AcceptedBuckets {
         }
         self.1 = key;
     }
-    /// A copy reread from disk has no key, and may still hold hints this
-    /// cycle's bind discarded. Rebind it like the live ledger before comparing.
-    pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
-        self.bind_key(live.1.clone());
-        self.2 = live.2;
-        self.3 = live.3;
-        self.4 = live.4;
-        self.5 = live.5;
-    }
     /// Runtime-only receiver cap; never serialized as accepted proof.
     pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
         self.4 = item_cap;
@@ -1040,7 +1031,7 @@ impl AcceptedBuckets {
             });
         }
     }
-    /// Copy-prefix ENABLE guard (Lead B F3): whether a stored-body ACK
+    /// Copy-prefix ENABLE guard: whether a stored-body ACK
     /// may have frozen `session`'s bucket at `bucket_start`. Known hints
     /// answer exactly; incomplete hints (whole buckets evicted) or an
     /// unparsable start answer yes. Without hints for the session the answer

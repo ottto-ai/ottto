@@ -272,12 +272,8 @@ fn require_identity_mutation_reservation(
 
 fn load_local_identity_authority_snapshot() -> Result<LocalIdentityAuthoritySnapshot, LocalApiError>
 {
-    let account = FileAccountStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let device = FileDeviceStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let account = FileAccountStore::default().load().or_state_poisoned()?;
+    let device = FileDeviceStore::default().load().or_state_poisoned()?;
     Ok(LocalIdentityAuthoritySnapshot { account, device })
 }
 
@@ -894,7 +890,7 @@ fn handle_command(
         daemon
             .session_launch
             .lock()
-            .map_err(|_| LocalApiError::StatePoisoned)?
+            .or_state_poisoned()?
             .invalidate();
     }
     match command {
@@ -910,21 +906,17 @@ fn handle_command(
             require_authorized_local_client(daemon, &authorization)?;
             require_session_launch_schema(schema_version)?;
             to_value(
-                daemon
-                    .session_launch
-                    .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
-                    .prepare(
-                        provider,
-                        &slot_id,
-                        &expected_account_identifier_hash,
-                        expected_organization_identifier_hash
-                            .as_deref()
-                            .unwrap_or(""),
-                        folder,
-                        preferred_ottto_cli_path(),
-                        &default_support_dir(),
-                    ),
+                daemon.session_launch.lock().or_state_poisoned()?.prepare(
+                    provider,
+                    &slot_id,
+                    &expected_account_identifier_hash,
+                    expected_organization_identifier_hash
+                        .as_deref()
+                        .unwrap_or(""),
+                    folder,
+                    preferred_ottto_cli_path(),
+                    &default_support_dir(),
+                ),
             )
         }
         LocalControlCommand::SessionLaunchConsume {
@@ -943,7 +935,7 @@ fn handle_command(
                 daemon
                     .session_launch
                     .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .or_state_poisoned()?
                     .consume(&launch_id, secret.expose_secret()),
             )
         }
@@ -958,13 +950,11 @@ fn handle_command(
                 return Err(LocalApiError::Unauthorized);
             }
             require_session_launch_schema(schema_version)?;
-            to_value(
-                daemon
-                    .session_launch
-                    .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
-                    .report(&launch_id, attempt_id.expose_secret(), reason),
-            )
+            to_value(daemon.session_launch.lock().or_state_poisoned()?.report(
+                &launch_id,
+                attempt_id.expose_secret(),
+                reason,
+            ))
         }
         LocalControlCommand::SessionLaunchStatus {
             schema_version,
@@ -976,7 +966,7 @@ fn handle_command(
                 daemon
                     .session_launch
                     .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .or_state_poisoned()?
                     .status(&launch_id, false),
             )
         }
@@ -990,7 +980,7 @@ fn handle_command(
                 daemon
                     .session_launch
                     .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .or_state_poisoned()?
                     .status(&launch_id, true),
             )
         }
@@ -1002,18 +992,12 @@ fn handle_command(
         } => {
             require_authorized_local_client(daemon, &authorization)?;
             require_session_launch_schema(schema_version)?;
-            to_value(
-                daemon
-                    .session_launch
-                    .lock()
-                    .map_err(|_| LocalApiError::StatePoisoned)?
-                    .recent(
-                        provider,
-                        slot_id.as_deref(),
-                        usize::from(limit.unwrap_or(100)),
-                        &default_support_dir(),
-                    ),
-            )
+            to_value(daemon.session_launch.lock().or_state_poisoned()?.recent(
+                provider,
+                slot_id.as_deref(),
+                usize::from(limit.unwrap_or(100)),
+                &default_support_dir(),
+            ))
         }
         LocalControlCommand::AccountNicknames => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -1069,6 +1053,15 @@ fn handle_command(
             status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
+            // Doctor only: ordinary status polls must not walk the store.
+            #[cfg(unix)]
+            if retry_relay_authorization {
+                if let Ok((files, bytes)) =
+                    crate::claude_local_otel::support_health::store_size(&default_support_dir())
+                {
+                    value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
+            }
             Ok(value)
         }
         LocalControlCommand::Receipts {
@@ -1654,7 +1647,7 @@ fn handle_command(
             crate::snapshots::invalidate_claude_state_v2_sessions(
                 &home.join("Library/Application Support/Ottto"),
             )
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+            .or_state_poisoned()?;
             let mut result = execute_local_uninstall(&home, UninstallExecutionOptions::DAEMON);
             sweep_telemetry_keys_for_uninstall(&mut result);
             match &authorization {
@@ -1765,8 +1758,7 @@ pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>,
     if crate::agent_configs::claude_managed_settings::approved_relay_port(&body).is_none() {
         return Ok(None);
     }
-    let settings: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| LocalApiError::StatePoisoned)?;
+    let settings: serde_json::Value = serde_json::from_str(&body).or_state_poisoned()?;
     Ok(settings["env"]["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]
         .as_str()
         .map(str::to_owned))
@@ -2716,7 +2708,7 @@ where
         .ok_or(LocalApiError::StatePoisoned)?;
     let direct_slot_status = collector(slot_id, captured_at, expires_at);
     crate::agent_status::persist_one_claude_slot_collection_state(slot_id, &direct_slot_status)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     let refreshed = store
         .setup_operation(operation_id)
         .map_err(claude_config_slot_settings_error)?;
@@ -3352,13 +3344,11 @@ fn agent_context(
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto context",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_context_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
+        |api_base_url, connection| agent_context_url(api_base_url, connection, &query),
     )
 }
 
@@ -3368,13 +3358,11 @@ fn agent_costs(
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto costs",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_costs_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
+        |api_base_url, connection| agent_costs_url(api_base_url, connection, &query),
     )
 }
 
@@ -3384,13 +3372,11 @@ fn agent_sessions(
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto sessions",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_sessions_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
+        |api_base_url, connection| agent_sessions_url(api_base_url, connection, &query),
     )
 }
 
@@ -3399,18 +3385,11 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto recommendations",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_recommendations_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                &query,
-            )
-        },
+        |api_base_url, connection| agent_recommendations_url(api_base_url, connection, &query),
     )
 }
 
@@ -3419,17 +3398,28 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto provider-impact",
+        |api_base_url, connection| agent_provider_impact_url(api_base_url, connection, &query),
+    )
+}
+
+/// One observed agent read: the setup-run binding and its observation come
+/// from `observe_setup_run_read`, the request from `agent_read_with_refresh`.
+fn observe_agent_read(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    command: &str,
+    read_url: impl Fn(&str, &LocalConnectionBinding) -> String,
+) -> Result<serde_json::Value, LocalApiError> {
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        command,
         |api_base_url, connection, setup_run_token| {
-            get_agent_provider_impact_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                &query,
-            )
+            agent_read_with_refresh(api_base_url, connection, setup_run_token, &read_url)
         },
     )
 }
@@ -4434,11 +4424,7 @@ fn scan_index_rebuild_override_repair(
     if *authorization != RequestAuthorization::TrustedCompanionApp {
         return None;
     }
-    let snapshot_source = match source {
-        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
-    };
+    let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(source);
     let outcome = crate::snapshots::arm_scan_index_rebuild_manual_override(
         snapshot_source,
         SystemTime::now(),
@@ -4713,12 +4699,99 @@ fn validate_control_token_fresh_for(
         .ok_or(LocalApiError::LocalClientNotTrusted)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .as_secs();
     if exp <= now {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
     Ok(exp)
+}
+
+/// A Codex control token proven fresh, backend-valid and bound to the
+/// connected local account and Codex device.
+struct CodexControlTokenAuthority {
+    /// Keeps account/device authority stable through the grant transition.
+    identity_lifecycle_lock: MutexGuard<'static, ()>,
+    expires_at_unix: u64,
+    token_id: String,
+    device: LocalDeviceBinding,
+    local_user_id: String,
+    local_organization_id: String,
+}
+
+/// Shared prelude of the Codex cloud-sessions and provider-daily-reference
+/// bridges. Check order is part of the contract. `binding_label` names the
+/// bridge in the binding-load errors.
+fn authorize_codex_control_token(
+    control_token: &str,
+    action_slug: &str,
+    api_base_url: Option<&str>,
+    requires_mutation_reservation: bool,
+    binding_label: &str,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+) -> Result<CodexControlTokenAuthority, LocalApiError> {
+    let expires_at_unix = validate_control_token_fresh_for(control_token, action_slug, "codex")?;
+    let token_validation_base_url = control_token_validation_base_url(api_base_url)?;
+    let claims = validate_control_token_with_backend_for(
+        &token_validation_base_url,
+        control_token,
+        action_slug,
+        "codex",
+    )?;
+
+    // Identity reset/replacement paths acquire this same lock around their
+    // grant preflight and filesystem mutation.
+    let identity_lifecycle_lock = lock_setup_run_binding();
+    if requires_mutation_reservation {
+        require_identity_mutation_reservation(None)?;
+    }
+
+    let account = accounts.load().map_err(|_| {
+        LocalApiError::LocalOperationFailed(format!(
+            "{binding_label} account binding is unavailable"
+        ))
+    })?;
+    let device = devices
+        .load()
+        .map_err(|_| {
+            LocalApiError::LocalOperationFailed(format!(
+                "{binding_label} device binding is unavailable"
+            ))
+        })?
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    if account.state != LocalAccountState::Connected
+        || claims.user_id.as_deref() != Some(local_user_id)
+        || claims.organization_id.as_deref() != Some(local_organization_id)
+        || claims.device_id.as_deref() != Some(device.device_id.as_str())
+        || !device.sources.iter().any(|source| source == "codex")
+    {
+        return Err(LocalApiError::LocalClientNotTrusted);
+    }
+    let token_id = claims
+        .token_id
+        .as_deref()
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    Ok(CodexControlTokenAuthority {
+        identity_lifecycle_lock,
+        expires_at_unix,
+        token_id: token_id.to_string(),
+        local_user_id: local_user_id.to_string(),
+        local_organization_id: local_organization_id.to_string(),
+        device,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4778,65 +4851,22 @@ fn cloud_sessions_control_with_stores(
     checkpoints: &crate::cloud_sessions::CloudSessionCheckpointStore,
     token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
 ) -> Result<CloudSessionsControlResult, LocalApiError> {
-    let action_slug = cloud_sessions_action_slug(&action);
-    let control_token = control_token.expose_secret();
-    let expires_at_unix = validate_control_token_fresh_for(control_token, action_slug, "codex")?;
-    let token_validation_base_url = control_token_validation_base_url(api_base_url.as_deref())?;
-    let claims = validate_control_token_with_backend_for(
-        &token_validation_base_url,
-        control_token,
-        action_slug,
-        "codex",
+    let CodexControlTokenAuthority {
+        identity_lifecycle_lock,
+        expires_at_unix,
+        token_id,
+        device,
+        local_user_id,
+        local_organization_id,
+    } = authorize_codex_control_token(
+        control_token.expose_secret(),
+        cloud_sessions_action_slug(&action),
+        api_base_url.as_deref(),
+        action != CloudSessionsControlAction::Status,
+        "cloud-session",
+        accounts,
+        devices,
     )?;
-
-    // Keep exact account/device authority stable from local binding validation
-    // through the grant transition. Identity reset/replacement paths acquire
-    // this same lock around their grant preflight and filesystem mutation.
-    let identity_lifecycle_lock = lock_setup_run_binding();
-    if action != CloudSessionsControlAction::Status {
-        require_identity_mutation_reservation(None)?;
-    }
-
-    let account = accounts.load().map_err(|_| {
-        LocalApiError::LocalOperationFailed(
-            "cloud-session account binding is unavailable".to_string(),
-        )
-    })?;
-    let device = devices
-        .load()
-        .map_err(|_| {
-            LocalApiError::LocalOperationFailed(
-                "cloud-session device binding is unavailable".to_string(),
-            )
-        })?
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_user_id = account
-        .user
-        .as_ref()
-        .map(|user| user.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_organization_id = account
-        .organization
-        .as_ref()
-        .map(|organization| organization.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let expected_user_id = local_user_id.to_string();
-    let expected_organization_id = local_organization_id.to_string();
-    let expected_device_id = device.device_id.clone();
-    if account.state != LocalAccountState::Connected
-        || claims.user_id.as_deref() != Some(local_user_id)
-        || claims.organization_id.as_deref() != Some(local_organization_id)
-        || claims.device_id.as_deref() != Some(device.device_id.as_str())
-        || !device.sources.iter().any(|source| source == "codex")
-    {
-        return Err(LocalApiError::LocalClientNotTrusted);
-    }
-    let token_id = claims
-        .token_id
-        .as_deref()
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
 
     let backend_grant_allowed = matches!(
         action,
@@ -4858,12 +4888,12 @@ fn cloud_sessions_control_with_stores(
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .as_secs();
     // Atomic consumption happens after trusted-backend and exact local binding
     // validation, but before any local grant side effect.
     token_uses
-        .consume(token_id, expires_at_unix, now_unix)
+        .consume(&token_id, expires_at_unix, now_unix)
         .map_err(|_| LocalApiError::LocalClientNotTrusted)?;
 
     let mut backend_create_request = None;
@@ -4951,20 +4981,20 @@ fn cloud_sessions_control_with_stores(
         // Reacquire it and revalidate exact cleanup authority before binding a
         // raced POST response or returning the sole DELETE target.
         let _identity_lifecycle_lock = lock_setup_run_binding();
-        let current_account = accounts.load().map_err(|_| LocalApiError::StatePoisoned)?;
+        let current_account = accounts.load().or_state_poisoned()?;
         let current_device = devices
             .load()
-            .map_err(|_| LocalApiError::StatePoisoned)?
+            .or_state_poisoned()?
             .ok_or(LocalApiError::LocalClientNotTrusted)?;
         if current_account.state != LocalAccountState::Connected
             || current_account.user.as_ref().map(|user| user.id.as_str())
-                != Some(expected_user_id.as_str())
+                != Some(local_user_id.as_str())
             || current_account
                 .organization
                 .as_ref()
                 .map(|organization| organization.id.as_str())
-                != Some(expected_organization_id.as_str())
-            || current_device.device_id != expected_device_id
+                != Some(local_organization_id.as_str())
+            || current_device.device_id != device.device_id
             || !current_device
                 .sources
                 .iter()
@@ -4977,7 +5007,7 @@ fn cloud_sessions_control_with_stores(
                 // Completion-safe compensating cleanup: an authenticated POST
                 // response can arrive after rollout disabled bind. Bind only
                 // its exact identity into already-revoked local state.
-                grants.bind_backend_grant(response, &expected_device_id)?;
+                grants.bind_backend_grant(response, &device.device_id)?;
             }
             grants.grant_revoke_target()
         })();
@@ -5074,61 +5104,22 @@ fn provider_daily_reference_control_with_stores(
     provider_account_scope: Option<String>,
     network_disabled: bool,
 ) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
-    let action_slug = provider_daily_reference_action_slug(&action);
-    let control_token = control_token.expose_secret();
-    let expires_at_unix = validate_control_token_fresh_for(control_token, action_slug, "codex")?;
-    let token_validation_base_url = control_token_validation_base_url(api_base_url.as_deref())?;
-    let claims = validate_control_token_with_backend_for(
-        &token_validation_base_url,
-        control_token,
-        action_slug,
-        "codex",
+    let CodexControlTokenAuthority {
+        identity_lifecycle_lock,
+        expires_at_unix,
+        token_id,
+        device,
+        local_user_id,
+        local_organization_id,
+    } = authorize_codex_control_token(
+        control_token.expose_secret(),
+        provider_daily_reference_action_slug(&action),
+        api_base_url.as_deref(),
+        action != ProviderDailyReferenceControlAction::Status,
+        "codex daily aggregates",
+        accounts,
+        devices,
     )?;
-
-    // Hold exact account/device authority stable from local binding validation
-    // through the grant transition, the same way the cloud-sessions bridge does.
-    let identity_lifecycle_lock = lock_setup_run_binding();
-    if action != ProviderDailyReferenceControlAction::Status {
-        require_identity_mutation_reservation(None)?;
-    }
-
-    let account = accounts.load().map_err(|_| {
-        LocalApiError::LocalOperationFailed(
-            "codex daily aggregates account binding is unavailable".to_string(),
-        )
-    })?;
-    let device = devices
-        .load()
-        .map_err(|_| {
-            LocalApiError::LocalOperationFailed(
-                "codex daily aggregates device binding is unavailable".to_string(),
-            )
-        })?
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_user_id = account
-        .user
-        .as_ref()
-        .map(|user| user.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_organization_id = account
-        .organization
-        .as_ref()
-        .map(|organization| organization.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    if account.state != LocalAccountState::Connected
-        || claims.user_id.as_deref() != Some(local_user_id)
-        || claims.organization_id.as_deref() != Some(local_organization_id)
-        || claims.device_id.as_deref() != Some(device.device_id.as_str())
-        || !device.sources.iter().any(|source| source == "codex")
-    {
-        return Err(LocalApiError::LocalClientNotTrusted);
-    }
-    let token_id = claims
-        .token_id
-        .as_deref()
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
 
     let backend_grant_allowed = matches!(
         action,
@@ -5162,12 +5153,12 @@ fn provider_daily_reference_control_with_stores(
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .as_secs();
     // Consume after trusted-backend and exact local binding validation, but
     // before any local grant side effect.
     token_uses
-        .consume(token_id, expires_at_unix, now_unix)
+        .consume(&token_id, expires_at_unix, now_unix)
         .map_err(|_| LocalApiError::LocalClientNotTrusted)?;
 
     let mut backend_create_request = None;
@@ -5516,7 +5507,7 @@ fn auth_start(
     if !history_pending {
         discard_abandoned_unconfirmed_claim_credential()?;
     }
-    let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
+    let nonce = generate_control_token().or_state_poisoned()?;
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let nonce = claim.client_nonce.unwrap_or(nonce);
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
@@ -5550,7 +5541,7 @@ fn begin_durable_browser_claim(
     }
     history_account_store()
         .save(&persisted)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     Ok(response)
 }
 
@@ -5573,10 +5564,7 @@ fn retire_refused_registration_after_browser_answer_with_stores(
         return Ok(());
     }
     let pending_store = FilePendingDeviceCredentialStore::default();
-    let Some(pending) = pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    else {
+    let Some(pending) = pending_store.load().or_state_poisoned()? else {
         return Ok(());
     };
     if pending.claim_commit.is_some() {
@@ -5586,9 +5574,7 @@ fn retire_refused_registration_after_browser_answer_with_stores(
         return Err(LocalApiError::IdentityMutationInProgress);
     }
     let secret_store = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
-    let candidate = secret_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let candidate = secret_store.load().or_state_poisoned()?;
     match inspect_device_credential_preparation(&pending, &candidate) {
         Ok(status) if matches!(status.status.as_str(), "expired" | "superseded") => {
             discard_server_inactive_pending_device_credential(&pending_store, &secret_store)
@@ -5619,12 +5605,12 @@ fn local_history_recovery_expected() -> Result<bool, LocalApiError> {
     history_account_store()
         .load()
         .map(|account| registration_history_choice_account(&account))
-        .map_err(|_| LocalApiError::StatePoisoned)
+        .or_state_poisoned()
 }
 
 fn persist_local_release_expected() -> Result<(), LocalApiError> {
     ottto_core::write_owner_only_file_atomic(&history_recovery_indicator_path(), b"1")
-        .map_err(|_| LocalApiError::StatePoisoned)
+        .or_state_poisoned()
 }
 
 fn clear_local_release_expected() -> Result<(), LocalApiError> {
@@ -5657,15 +5643,13 @@ fn registration_history_choice_message() -> StableMessage {
 fn persist_registration_history_choice() -> Result<(), LocalApiError> {
     let _lock = lock_setup_run_binding();
     let store = history_account_store();
-    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    let mut account = store.load().or_state_poisoned()?;
     // Preserve the bound identity and all credential journals. This is a
     // durable user action, not an authority transition or a failed install.
     account.state = LocalAccountState::ReattachRequired;
     account.message = Some(registration_history_choice_message());
     account.can_reconnect = Some(true);
-    store
-        .save(&account)
-        .map_err(|_| LocalApiError::StatePoisoned)
+    store.save(&account).or_state_poisoned()
 }
 
 fn registration_history_choice_error(error: LocalApiError) -> LocalApiError {
@@ -5691,7 +5675,7 @@ fn reoffer_registration_browser_claim(
     if let Some(claim) = resume_history_browser_claim(machine, base)? {
         return begin_durable_browser_claim(daemon, claim);
     }
-    let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
+    let nonce = generate_control_token().or_state_poisoned()?;
     let claim = {
         let _lock = lock_history_recovery()?;
         create_setup_claim_with_history(
@@ -5722,10 +5706,7 @@ fn discard_abandoned_unconfirmed_claim_credential() -> Result<(), LocalApiError>
     let _identity_lifecycle_lock = lock_setup_run_binding();
     require_identity_mutation_reservation(None)?;
     let pending_store = FilePendingDeviceCredentialStore::default();
-    let Some(pending) = pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    else {
+    let Some(pending) = pending_store.load().or_state_poisoned()? else {
         return Ok(());
     };
     if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
@@ -5799,7 +5780,7 @@ fn complete_pending_auth_claim(
                 let account = daemon.account_for_trusted_client()?;
                 FileAccountStore::default()
                     .save(&account)
-                    .map_err(|_| LocalApiError::StatePoisoned)?;
+                    .or_state_poisoned()?;
             }
             return Err(error);
         }
@@ -5859,7 +5840,7 @@ fn complete_pending_auth_claim(
             stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
             let staged = FilePendingDeviceCredentialStore::default()
                 .load()
-                .map_err(|_| LocalApiError::StatePoisoned)?
+                .or_state_poisoned()?
                 .ok_or(LocalApiError::StatePoisoned)?;
             if staged.preparation_id != pending.preparation_id {
                 return Err(LocalApiError::StatePoisoned);
@@ -5988,7 +5969,7 @@ fn complete_pending_auth_claim(
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     let relay_credentials_persisted = match (&relay_credentials, confirmed_pending.as_ref()) {
         (ClaimRelayDeviceCredential::Legacy(device, secret), _) => {
             persist_relay_device_credentials_locked(device, secret, Some(&identity_reservation))?;
@@ -6007,7 +5988,7 @@ fn complete_pending_auth_claim(
     )?;
     FileAccountStore::default()
         .save(&account)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     FileConnectionStore::default()
         .save(&LocalConnectionBinding {
             setup_run_id: completed.setup_run_id,
@@ -6016,7 +5997,7 @@ fn complete_pending_auth_claim(
             claim_code: Some(pending.claim_code),
             api_base_url: validated_api_base_url(None)?,
         })
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     if relay_credentials_persisted {
         let _ = clear_prior_device_credential();
         request_snapshot_sync_after_device_registration(daemon);
@@ -6163,7 +6144,7 @@ fn install_staged_account_switch(
         let pending_store = FilePendingDeviceCredentialStore::default();
         let pending = pending_store
             .load()
-            .map_err(|_| LocalApiError::StatePoisoned)?
+            .or_state_poisoned()?
             .ok_or(LocalApiError::StatePoisoned)?;
         if pending.preparation_id != preparation_id {
             return Err(LocalApiError::StatePoisoned);
@@ -6172,7 +6153,7 @@ fn install_staged_account_switch(
         let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)?;
         let candidate_secret = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
             .load()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+            .or_state_poisoned()?;
         let confirmed_pending = if pending.confirmed_at.is_some() {
             pending
         } else {
@@ -6253,7 +6234,7 @@ fn install_staged_account_switch(
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     let relay_credentials_persisted = match (
         &staged.relay_device,
         &staged.relay_device_secret,
@@ -6276,7 +6257,7 @@ fn install_staged_account_switch(
     )?;
     FileAccountStore::default()
         .save(&staged.new_account)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     FileConnectionStore::default()
         .save(&LocalConnectionBinding {
             setup_run_id: staged.setup_run_id.clone(),
@@ -6285,7 +6266,7 @@ fn install_staged_account_switch(
             claim_code: Some(staged.claim_code.clone()),
             api_base_url: validated_api_base_url(None)?,
         })
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     if relay_credentials_persisted {
         request_snapshot_sync_after_device_registration(daemon);
     }
@@ -6456,9 +6437,7 @@ fn persist_relay_device_credentials_locked(
 ) -> Result<(), LocalApiError> {
     require_identity_mutation_reservation(reservation)?;
     let device_store = FileDeviceStore::default();
-    let current_device = device_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let current_device = device_store.load().or_state_poisoned()?;
     require_relay_device_binding_change_cleanup(current_device.as_ref(), device)?;
 
     let secret_store = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
@@ -6474,9 +6453,7 @@ fn persist_relay_device_credentials_locked(
         // are transiently unavailable.
         None => None,
     };
-    secret_store
-        .save(device_secret)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    secret_store.save(device_secret).or_state_poisoned()?;
     if device_store.save(device).is_ok() {
         return Ok(());
     }
@@ -6528,7 +6505,7 @@ fn authorize_pending_device_credential_confirmation(
     let store = FilePendingDeviceCredentialStore::default();
     let mut pending = store
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::StatePoisoned)?;
     if pending.preparation_id != preparation_id {
         return Err(LocalApiError::StatePoisoned);
@@ -6537,15 +6514,8 @@ fn authorize_pending_device_credential_confirmation(
         return Ok(pending);
     }
     pending.confirmation_authorized = true;
-    store
-        .save(&pending)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-        .as_ref()
-        != Some(&pending)
-    {
+    store.save(&pending).or_state_poisoned()?;
+    if store.load().or_state_poisoned()?.as_ref() != Some(&pending) {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(pending)
@@ -6567,22 +6537,15 @@ fn mark_pending_device_credential_guards_passed(
     }
     let current = pending_store
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::StatePoisoned)?;
     if current != *pending {
         return Err(LocalApiError::StatePoisoned);
     }
     let mut guarded = pending.clone();
     guarded.preconfirm_guards_passed = true;
-    pending_store
-        .save(&guarded)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-        .as_ref()
-        != Some(&guarded)
-    {
+    pending_store.save(&guarded).or_state_poisoned()?;
+    if pending_store.load().or_state_poisoned()?.as_ref() != Some(&guarded) {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(guarded)
@@ -6615,9 +6578,7 @@ fn stage_pending_device_credential_with_stores(
     {
         return Err(LocalApiError::StatePoisoned);
     }
-    let existing = pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let existing = pending_store.load().or_state_poisoned()?;
     let effective_pending = if let Some(current) = existing.as_ref() {
         // An idempotent server retry must reproduce the entire immutable
         // preparation and candidate. Never replace a same-ID candidate or
@@ -6642,7 +6603,7 @@ fn stage_pending_device_credential_with_stores(
 
     pending_secret_store
         .save(candidate_secret)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     if pending_store.save(effective_pending).is_err() {
         // A newly written orphan candidate is not active authority. Remove it
         // when possible; if deletion itself fails, the active credential and
@@ -6652,12 +6613,8 @@ fn stage_pending_device_credential_with_stores(
         }
         return Err(LocalApiError::StatePoisoned);
     }
-    let stored_secret = pending_secret_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let stored_pending = pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let stored_secret = pending_secret_store.load().or_state_poisoned()?;
+    let stored_pending = pending_store.load().or_state_poisoned()?;
     if stored_secret != candidate_secret || stored_pending.as_ref() != Some(effective_pending) {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6697,10 +6654,8 @@ fn stage_pending_setup_run_token_with_store<S: ControlTokenStore + ?Sized>(
         // this function succeeds.
         Ok(_) | Err(_) => {}
     }
-    store
-        .save(setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if store.load().map_err(|_| LocalApiError::StatePoisoned)? != setup_run_token {
+    store.save(setup_run_token).or_state_poisoned()?;
+    if store.load().or_state_poisoned()? != setup_run_token {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(())
@@ -6792,22 +6747,15 @@ fn mark_pending_device_credential_confirmed(
     }
     let current = pending_store
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::StatePoisoned)?;
     if current != *pending {
         return Err(LocalApiError::StatePoisoned);
     }
     let mut confirmed = pending.clone();
     confirmed.confirmed_at = Some(confirmed_at.to_string());
-    pending_store
-        .save(&confirmed)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-        .as_ref()
-        != Some(&confirmed)
-    {
+    pending_store.save(&confirmed).or_state_poisoned()?;
+    if pending_store.load().or_state_poisoned()?.as_ref() != Some(&confirmed) {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(confirmed)
@@ -6833,17 +6781,15 @@ fn write_and_verify_active_device_credential(
 
     active_secret_store
         .save(candidate_secret)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     device_store
         .save_with_credential_generation(&expected_binding)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
 
-    let active_secret = active_secret_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_secret = active_secret_store.load().or_state_poisoned()?;
     let active_binding = device_store
         .load_with_credential_generation()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     if active_secret != candidate_secret || active_binding.as_ref() != Some(&expected_binding) {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6854,15 +6800,13 @@ fn clear_pending_device_credential(
     pending_store: &FilePendingDeviceCredentialStore,
     pending_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
-    pending_store
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    pending_store.reset().or_state_poisoned()?;
     let _ = pending_secret_store.delete();
     let _ = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).delete();
     Ok(())
 }
 
-fn promote_pending_device_credential_with_stores(
+pub(crate) fn promote_pending_device_credential_with_stores(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
     pending_store: &FilePendingDeviceCredentialStore,
@@ -6870,6 +6814,15 @@ fn promote_pending_device_credential_with_stores(
     device_store: &FileDeviceStore,
     active_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
+    // A failed marker write keeps the candidate staged, so recovery retries both.
+    if let Ok(Some(current)) = device_store.load() {
+        crate::snapshot_sync::disable_sources_dropped_from_grant(
+            &default_support_dir(),
+            &current,
+            &pending.device,
+        )
+        .or_state_poisoned()?;
+    }
     // After server confirmation the old active secret may already be invalid.
     // Never roll it back on a file-side failure: keep the separately staged
     // candidate intact so restart recovery can finish the same generation.
@@ -6998,9 +6951,7 @@ fn write_and_verify_pending_claim_commit(
         return Err(LocalApiError::StatePoisoned);
     }
     let pending_setup_token_store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
-    let setup_run_token = pending_setup_token_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let setup_run_token = pending_setup_token_store.load().or_state_poisoned()?;
     if claim.setup_run_token_sha256 != secret_sha256(&setup_run_token) {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -7021,23 +6972,19 @@ fn write_and_verify_pending_claim_commit(
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     FileAccountStore::default()
         .save(&claim.account)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
     FileConnectionStore::default()
         .save(&claim.connection)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
 
     let active_setup_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let active_account = FileAccountStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let active_connection = FileConnectionStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+        .or_state_poisoned()?;
+    let active_account = FileAccountStore::default().load().or_state_poisoned()?;
+    let active_connection = FileConnectionStore::default().load().or_state_poisoned()?;
     if active_setup_token != setup_run_token
         || active_account != claim.account
         || active_connection.as_ref() != Some(&claim.connection)
@@ -7053,10 +7000,7 @@ fn write_and_verify_pending_claim_commit(
 pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiError> {
     let pending_store = FilePendingDeviceCredentialStore::default();
     let pending_secret_store = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
-    let Some(pending) = pending_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    else {
+    let Some(pending) = pending_store.load().or_state_poisoned()? else {
         return Ok(false);
     };
     if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
@@ -7067,9 +7011,7 @@ pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiEr
     {
         return Err(LocalApiError::StatePoisoned);
     }
-    let candidate_secret = pending_secret_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let candidate_secret = pending_secret_store.load().or_state_poisoned()?;
     validate_pending_candidate_secret(&pending, &candidate_secret)?;
     if pending.confirmed_at.is_none() && !pending.confirmation_authorized {
         return match inspect_device_credential_preparation(&pending, &candidate_secret) {
@@ -7204,9 +7146,9 @@ fn save_relay_device_binding_locked(
 ) -> Result<(), LocalApiError> {
     require_identity_mutation_reservation(reservation)?;
     let store = FileDeviceStore::default();
-    let current = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    let current = store.load().or_state_poisoned()?;
     require_relay_device_binding_change_cleanup(current.as_ref(), device)?;
-    store.save(device).map_err(|_| LocalApiError::StatePoisoned)
+    store.save(device).or_state_poisoned()
 }
 
 fn require_relay_device_binding_change_cleanup(
@@ -7233,9 +7175,7 @@ fn require_relay_device_binding_change_cleanup(
 fn require_cloud_session_cleanup_before_account_replacement(
     next: &LocalAccountBinding,
 ) -> Result<(), LocalApiError> {
-    let current = FileAccountStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let current = FileAccountStore::default().load().or_state_poisoned()?;
     let current_user = current.user.as_ref().map(|user| user.id.as_str());
     let current_org = current
         .organization
@@ -7465,28 +7405,22 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         let _history_lock = lock_history_recovery()?;
         let stores = history_stores();
         clear_local_release(&stores)?;
-        stores
-            .browser
-            .delete()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+        stores.browser.delete().or_state_poisoned()?;
     }
-    FileMachineStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileMachineStore::default().reset().or_state_poisoned()?;
     let support_dir = default_support_dir();
-    crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
+    crate::upload_receipts::clear(&support_dir).or_state_poisoned()?;
     // Closing registered native handles must not prevent the established
     // whole-tree privacy cleanup, including unregistered/legacy namespaces.
     let v2_erasure = crate::snapshots::erase_claude_state_v2_artifacts(&support_dir);
     let path = support_dir.join("snapshots");
     if path.is_dir() {
-        fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+        fs::remove_dir_all(&path).or_state_poisoned()?;
     } else if path.exists() {
-        fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+        fs::remove_file(&path).or_state_poisoned()?;
     }
-    crate::backfill::remove_backfill_state(&support_dir)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    v2_erasure.map_err(|_| LocalApiError::StatePoisoned)
+    crate::backfill::remove_backfill_state(&support_dir).or_state_poisoned()?;
+    v2_erasure.or_state_poisoned()
 }
 
 #[cfg(test)]
@@ -7502,15 +7436,9 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    FileAccountStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    FileConnectionStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    FileDeviceStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileAccountStore::default().reset().or_state_poisoned()?;
+    FileConnectionStore::default().reset().or_state_poisoned()?;
+    FileDeviceStore::default().reset().or_state_poisoned()?;
     Ok(())
 }
 
@@ -7656,9 +7584,7 @@ fn history_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 fn lock_history_recovery() -> Result<MutexGuard<'static, ()>, LocalApiError> {
-    REVOCATION_RECEIPT_LOCK
-        .lock()
-        .map_err(|_| LocalApiError::StatePoisoned)
+    REVOCATION_RECEIPT_LOCK.lock().or_state_poisoned()
 }
 
 struct HistoryStores {
@@ -7760,9 +7686,7 @@ fn history_load<T: DeserializeOwned>(
     store: &dyn ControlTokenStore,
 ) -> Result<Option<T>, LocalApiError> {
     match store.load() {
-        Ok(encoded) => serde_json::from_str(&encoded)
-            .map(Some)
-            .map_err(|_| LocalApiError::StatePoisoned),
+        Ok(encoded) => serde_json::from_str(&encoded).map(Some).or_state_poisoned(),
         Err(TokenStoreError::Missing) => Ok(None),
         Err(_) => Err(LocalApiError::StatePoisoned),
     }
@@ -7771,11 +7695,9 @@ fn history_save<T: Serialize>(
     store: &dyn ControlTokenStore,
     value: &T,
 ) -> Result<(), LocalApiError> {
-    let encoded = serde_json::to_string(value).map_err(|_| LocalApiError::StatePoisoned)?;
-    store
-        .save(&encoded)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if store.load().map_err(|_| LocalApiError::StatePoisoned)? != encoded {
+    let encoded = serde_json::to_string(value).or_state_poisoned()?;
+    store.save(&encoded).or_state_poisoned()?;
+    if store.load().or_state_poisoned()? != encoded {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(())
@@ -7799,14 +7721,8 @@ fn stage_local_release(
                 .is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age))
     });
     if !same_release {
-        stores
-            .receipt
-            .delete()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
-        stores
-            .browser
-            .delete()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+        stores.receipt.delete().or_state_poisoned()?;
+        stores.browser.delete().or_state_poisoned()?;
     }
     let released_at = existing
         .filter(|_| same_release)
@@ -7859,19 +7775,10 @@ fn clear_local_release(stores: &HistoryStores) -> Result<(), LocalApiError> {
         marker.ceremony_closed = true;
         history_save(stores.marker.as_ref(), &marker)?;
     }
-    stores
-        .receipt
-        .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    stores
-        .proof
-        .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    stores.receipt.delete().or_state_poisoned()?;
+    stores.proof.delete().or_state_poisoned()?;
     clear_local_release_expected()?;
-    stores
-        .marker
-        .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)
+    stores.marker.delete().or_state_poisoned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -8006,7 +7913,7 @@ fn persist_history_browser_claim(
             api_base_url: base.to_string(),
             setup_run_id: history_connection_store()
                 .load()
-                .map_err(|_| LocalApiError::StatePoisoned)?
+                .or_state_poisoned()?
                 .filter(|c| c.api_base_url == base)
                 .map(|c| c.setup_run_id),
             registration_pending: history_account_store()
@@ -8095,10 +8002,7 @@ fn create_setup_claim_with_history(
     } else if receipt.is_none() {
         // No released-local marker means an ordinary first/same-device claim.
         // A corrupt orphan receipt is purged, never logged or sent.
-        stores
-            .receipt
-            .delete()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+        stores.receipt.delete().or_state_poisoned()?;
     }
     let mut body = setup_claim_create_body(machine, nonce);
     if let Some(receipt) = &receipt {
@@ -8200,10 +8104,7 @@ fn finish_history_browser_claim_with_stores(
         return Ok(());
     }
     clear_local_release(stores)?;
-    stores
-        .browser
-        .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)
+    stores.browser.delete().or_state_poisoned()
 }
 
 fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json::Value {
@@ -8340,7 +8241,19 @@ fn append_nonce_to_claim_url(claim_url: &str, nonce: &str) -> String {
 }
 
 fn to_value(value: impl Serialize) -> Result<serde_json::Value, LocalApiError> {
-    serde_json::to_value(value).map_err(|_| LocalApiError::StatePoisoned)
+    serde_json::to_value(value).or_state_poisoned()
+}
+
+/// Maps any failure of a local state read or write to `StatePoisoned`; the
+/// cause is not reported.
+trait OrStatePoisoned<T> {
+    fn or_state_poisoned(self) -> Result<T, LocalApiError>;
+}
+
+impl<T, E> OrStatePoisoned<T> for Result<T, E> {
+    fn or_state_poisoned(self) -> Result<T, LocalApiError> {
+        self.map_err(|_| LocalApiError::StatePoisoned)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -9419,10 +9332,10 @@ fn setup_run(
         let _binding_lock = lock_setup_run_binding();
         KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .save(&attached.setup_run_token)
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+            .or_state_poisoned()?;
         FileConnectionStore::default()
             .save(&binding)
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+            .or_state_poisoned()?;
         daemon.bind_setup_run_for_authorized_client(binding.clone())?;
         connection = Some(binding);
         setup_run_token = Some(attached.setup_run_token);
@@ -9482,12 +9395,12 @@ fn clear_setup_run_connection_if_current(
 ) -> Result<(), LocalApiError> {
     let _binding_lock = lock_setup_run_binding();
     let store = FileConnectionStore::default();
-    let persisted = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    let persisted = store.load().or_state_poisoned()?;
     if persisted
         .as_ref()
         .is_some_and(|binding| setup_run_binding_matches(binding, failed_connection))
     {
-        store.reset().map_err(|_| LocalApiError::StatePoisoned)?;
+        store.reset().or_state_poisoned()?;
         let current_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load();
         if current_token
             .as_deref()
@@ -9520,9 +9433,7 @@ fn require_setup_run_still_bound(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let persisted = FileConnectionStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let persisted = FileConnectionStore::default().load().or_state_poisoned()?;
     let bound = daemon.connection_for_authorized_client()?;
     if [persisted, bound].iter().all(|binding| {
         binding
@@ -9553,6 +9464,17 @@ fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
     matches!(details.status, Some(401) | Some(403))
 }
 
+fn set_source_marker(
+    write: fn(&Path, crate::snapshots::SnapshotSource) -> anyhow::Result<()>,
+    source: &SourceKind,
+) -> Result<(), LocalApiError> {
+    write(
+        &default_support_dir(),
+        crate::snapshot_sync::snapshot_source_of_kind(source),
+    )
+    .or_state_poisoned()
+}
+
 fn setup_answer(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -9561,6 +9483,10 @@ fn setup_answer(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    // Before any connection or POST: collection stops even if the run is gone.
+    if answer_type.trim() == "disable_source" {
+        set_source_marker(crate::snapshot_sync::disable_snapshot_source, &source)?;
+    }
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
@@ -9614,6 +9540,9 @@ fn setup_action(
         }
     };
     let queued = queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    if action_type == "install_source" {
+        set_source_marker(crate::snapshot_sync::reconnect_snapshot_source, &source)?;
+    }
     let action_results =
         process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
@@ -10003,7 +9932,7 @@ fn refresh_setup_run_token_via_device_secret(
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
         .load()
@@ -10091,7 +10020,7 @@ fn commit_refreshed_setup_run_binding_locked(
 ) -> Result<LocalConnectionBinding, LocalApiError> {
     let persisted = connections
         .load_connection()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     if !setup_run_binding_matches(&persisted, expected)
         && !setup_run_binding_matches(&persisted, refreshed)
@@ -10104,9 +10033,7 @@ fn commit_refreshed_setup_run_binding_locked(
         ..persisted
     };
     let prior_token = tokens.load().ok();
-    tokens
-        .save(setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    tokens.save(setup_run_token).or_state_poisoned()?;
     if connections.save_connection(&committed).is_err() {
         let _ = match prior_token {
             Some(token) => tokens.save(&token),
@@ -10120,7 +10047,7 @@ fn commit_refreshed_setup_run_binding_locked(
 pub(crate) fn refresh_setup_run_token_for_persisted_connection() -> Result<(), LocalApiError> {
     let connection = FileConnectionStore::default()
         .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection).map(|_| ())
 }
@@ -10186,120 +10113,30 @@ fn is_setup_run_token_auth_error(error: &LocalApiError) -> bool {
         || body.contains("setup run companion token is invalid")
 }
 
-fn get_agent_context_with_refresh(
+/// Agent reads (context, costs, sessions, recommendations, provider impact)
+/// refresh the setup-run token and retry once only on a backend 401. Unlike
+/// `setup_run_request_with_refresh_mut`, a token-expiry body under another
+/// status does not refresh. `read_url` builds the URL for whichever connection
+/// is current, so the retry targets the refreshed run.
+fn agent_read_with_refresh(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
-    query: &AgentContextQuery,
+    read_url: impl Fn(&str, &LocalConnectionBinding) -> String,
 ) -> Result<serde_json::Value, LocalApiError> {
-    match get_agent_context_with_base(api_base_url, connection, setup_run_token, query) {
+    let read = |connection: &LocalConnectionBinding,
+                setup_run_token: &str|
+     -> Result<serde_json::Value, LocalApiError> {
+        let url = read_url(api_base_url, connection);
+        backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    };
+    match read(connection, setup_run_token) {
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
                 let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                return get_agent_context_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    query,
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn get_agent_costs_with_refresh(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentCostsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    match get_agent_costs_with_base(api_base_url, connection, setup_run_token, query) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                return get_agent_costs_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    query,
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn get_agent_sessions_with_refresh(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentSessionsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    match get_agent_sessions_with_base(api_base_url, connection, setup_run_token, query) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                return get_agent_sessions_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    query,
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn get_agent_recommendations_with_refresh(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentRecommendationsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    match get_agent_recommendations_with_base(api_base_url, connection, setup_run_token, query) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                return get_agent_recommendations_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    query,
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn get_agent_provider_impact_with_refresh(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentProviderImpactQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    match get_agent_provider_impact_with_base(api_base_url, connection, setup_run_token, query) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                return get_agent_provider_impact_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    query,
-                );
+                return read(&refreshed.connection, &refreshed.setup_run_token);
             }
             Err(error)
         }
@@ -11961,11 +11798,7 @@ struct PriorDeviceCredential {
 fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
 {
     let active_store = FileDeviceStore::default();
-    if active_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-        .is_some()
-    {
+    if active_store.load().or_state_poisoned()?.is_some() {
         return prior_device_credential_with_stores(
             &active_store,
             &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
@@ -11992,10 +11825,7 @@ fn retain_prior_device_credential_with_stores(
     prior_device_store: &FileDeviceStore,
     prior_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
-    let Some(device) = active_device_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    else {
+    let Some(device) = active_device_store.load().or_state_poisoned()? else {
         return Ok(());
     };
     let secret = match active_secret_store.load() {
@@ -12004,9 +11834,7 @@ fn retain_prior_device_credential_with_stores(
             // The active binding was already incomplete before logout. Do not
             // fail logout or reuse an unrelated older proof; the next claim
             // will surface the typed replacement path.
-            prior_device_store
-                .reset()
-                .map_err(|_| LocalApiError::StatePoisoned)?;
+            prior_device_store.reset().or_state_poisoned()?;
             // The public device-id half is the authority selector. Removing it
             // makes any orphaned secret unusable; secret deletion is best
             // effort because a locked Keychain must not block local logout.
@@ -12018,41 +11846,32 @@ fn retain_prior_device_credential_with_stores(
     if device.device_id.trim().is_empty() || secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
-    prior_secret_store
-        .save(&secret)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    prior_device_store
-        .save(&device)
-        .map_err(|_| LocalApiError::StatePoisoned)
+    prior_secret_store.save(&secret).or_state_poisoned()?;
+    prior_device_store.save(&device).or_state_poisoned()
 }
 
 fn clear_prior_device_credential() -> Result<(), LocalApiError> {
     clear_prior_device_selector()?;
     KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
         .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)
+        .or_state_poisoned()
 }
 
 fn clear_prior_device_selector() -> Result<(), LocalApiError> {
     FileDeviceStore::new(default_prior_device_path())
         .reset()
         .map(|_| ())
-        .map_err(|_| LocalApiError::StatePoisoned)
+        .or_state_poisoned()
 }
 
 fn prior_device_credential_with_stores(
     device_store: &FileDeviceStore,
     secret_store: &impl ControlTokenStore,
 ) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
-    let Some(device) = device_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    else {
+    let Some(device) = device_store.load().or_state_poisoned()? else {
         return Ok(None);
     };
-    let device_secret = secret_store
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let device_secret = secret_store.load().or_state_poisoned()?;
     if device.device_id.trim().is_empty() || device_secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -12176,9 +11995,7 @@ fn reconcile_codex_source_off_at(
     path: &Path,
     backup_root: &Path,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    let _write_guard = CODEX_CONFIG_WRITE_LOCK
-        .lock()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let _write_guard = CODEX_CONFIG_WRITE_LOCK.lock().or_state_poisoned()?;
     let existing = match fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -12199,7 +12016,7 @@ fn reconcile_codex_source_off_at(
         });
     }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
-    if fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)? != existing {
+    if fs::read_to_string(path).or_state_poisoned()? != existing {
         return Err(LocalApiError::InvalidRequest(
             "Codex config changed during telemetry cleanup; retry after the edit finishes"
                 .to_string(),
@@ -12226,22 +12043,17 @@ fn write_codex_source_off_body(
     #[cfg(unix)]
     options.mode(0o600);
     let result = (|| {
-        let mut file = options
-            .open(&temp)
-            .map_err(|_| LocalApiError::StatePoisoned)?;
-        let permissions = fs::metadata(path)
-            .map_err(|_| LocalApiError::StatePoisoned)?
-            .permissions();
-        fs::set_permissions(&temp, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
-        file.write_all(next.as_bytes())
-            .map_err(|_| LocalApiError::StatePoisoned)?;
-        file.sync_all().map_err(|_| LocalApiError::StatePoisoned)?;
-        if fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)? != expected {
+        let mut file = options.open(&temp).or_state_poisoned()?;
+        let permissions = fs::metadata(path).or_state_poisoned()?.permissions();
+        fs::set_permissions(&temp, permissions).or_state_poisoned()?;
+        file.write_all(next.as_bytes()).or_state_poisoned()?;
+        file.sync_all().or_state_poisoned()?;
+        if fs::read_to_string(path).or_state_poisoned()? != expected {
             return Err(LocalApiError::InvalidRequest(
                 "Codex config changed during cleanup; retry after the edit finishes".into(),
             ));
         }
-        fs::rename(&temp, path).map_err(|_| LocalApiError::StatePoisoned)
+        fs::rename(&temp, path).or_state_poisoned()
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -12257,9 +12069,7 @@ fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
     if let codex_toml::SourceOffFence::Recovered(next) = &fence {
         return Ok(next.clone());
     }
-    let mut document = existing
-        .parse::<DocumentMut>()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let mut document = existing.parse::<DocumentMut>().or_state_poisoned()?;
     let Some(otel) = document.get_mut("otel").and_then(Item::as_table_like_mut) else {
         return Ok(existing.to_string());
     };
@@ -12290,9 +12100,7 @@ fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
                 if generated_only && full_table_generated_only {
                     let mut next = existing.to_string();
                     next.replace_range(start.start..end.end, "");
-                    let mut remaining = next
-                        .parse::<DocumentMut>()
-                        .map_err(|_| LocalApiError::StatePoisoned)?;
+                    let mut remaining = next.parse::<DocumentMut>().or_state_poisoned()?;
                     if let Some(otel) = remaining.get_mut("otel").and_then(Item::as_table_like_mut)
                     {
                         if remove_owned_codex_exporters(otel) {
@@ -12538,7 +12346,7 @@ fn patch_claude_code_env_at(
     {
         if env_write.changed || env_write.created {
             let permissions = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(env_path, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
+            fs::set_permissions(env_path, permissions).or_state_poisoned()?;
         }
     }
 
@@ -12613,9 +12421,8 @@ fn patch_claude_code_settings_at_with_relay_base(
     let existing_settings = if created {
         json!({})
     } else {
-        let body = fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)?;
-        serde_json::from_str::<serde_json::Value>(&body)
-            .map_err(|_| LocalApiError::StatePoisoned)?
+        let body = fs::read_to_string(path).or_state_poisoned()?;
+        serde_json::from_str::<serde_json::Value>(&body).or_state_poisoned()?
     };
     let mut settings = existing_settings.clone();
     if !settings.is_object() {
@@ -12672,12 +12479,12 @@ fn patch_claude_code_settings_at_with_relay_base(
         });
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| LocalApiError::StatePoisoned)?;
+        fs::create_dir_all(parent).or_state_poisoned()?;
     }
-    let body = serde_json::to_vec_pretty(&settings).map_err(|_| LocalApiError::StatePoisoned)?;
+    let body = serde_json::to_vec_pretty(&settings).or_state_poisoned()?;
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, body).map_err(|_| LocalApiError::StatePoisoned)?;
-    fs::rename(tmp_path, path).map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::write(&tmp_path, body).or_state_poisoned()?;
+    fs::rename(tmp_path, path).or_state_poisoned()?;
     Ok(ConfigPatchResult {
         changed: true,
         created,
@@ -12833,7 +12640,7 @@ fn write_claude_statusline_wrapper(
     support_dir: &Path,
     delegated_command: Option<&str>,
 ) -> Result<(PathBuf, bool), LocalApiError> {
-    fs::create_dir_all(support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::create_dir_all(support_dir).or_state_poisoned()?;
     let path = claude_statusline_wrapper_path(support_dir);
     let cli_path = preferred_ottto_cli_path();
     let script = render_claude_statusline_wrapper(&cli_path, delegated_command);
@@ -12844,13 +12651,13 @@ fn write_claude_statusline_wrapper(
         Err(_) => return Err(LocalApiError::StatePoisoned),
     }
     let tmp_path = path.with_extension(format!("sh.tmp.{}", std::process::id()));
-    fs::write(&tmp_path, script).map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::write(&tmp_path, script).or_state_poisoned()?;
     #[cfg(unix)]
     {
         let permissions = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(&tmp_path, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
+        fs::set_permissions(&tmp_path, permissions).or_state_poisoned()?;
     }
-    fs::rename(&tmp_path, &path).map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::rename(&tmp_path, &path).or_state_poisoned()?;
     Ok((path, true))
 }
 
@@ -12925,7 +12732,7 @@ fn backup_existing_config(
     }
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .as_millis();
     let backup_id = format!("{}_config_{millis}", source_slug(&source));
     let extension = path
@@ -12936,9 +12743,8 @@ fn backup_existing_config(
     let backup_dir = backup_root
         .join("config-backups")
         .join(source_slug(&source));
-    fs::create_dir_all(&backup_dir).map_err(|_| LocalApiError::StatePoisoned)?;
-    fs::copy(path, backup_dir.join(format!("{backup_id}.{extension}")))
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::create_dir_all(&backup_dir).or_state_poisoned()?;
+    fs::copy(path, backup_dir.join(format!("{backup_id}.{extension}"))).or_state_poisoned()?;
     prune_config_backups(&backup_dir, config_backup_retention_limit())?;
     Ok(Some(ConfigBackupResult { backup_id }))
 }
@@ -12953,7 +12759,7 @@ fn config_backup_retention_limit() -> usize {
 
 fn prune_config_backups(backup_dir: &Path, keep: usize) -> Result<(), LocalApiError> {
     let mut entries = fs::read_dir(backup_dir)
-        .map_err(|_| LocalApiError::StatePoisoned)?
+        .or_state_poisoned()?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
@@ -15815,7 +15621,10 @@ where
     Ok((before_session_census, smoke_after, smoke))
 }
 
-fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerificationResult {
+/// Every Pi route result's route classification and billing identity hints,
+/// with the no-evidence defaults most results share: failed, nothing seen, no
+/// command run. Callers override only the fields that differ.
+fn pi_route_result_base(route: &PiModelRoute) -> SourceRouteVerificationResult {
     let identity = pi_route_billing_identity_hints(route);
     SourceRouteVerificationResult {
         provider: pi_route_provider(route),
@@ -15843,8 +15652,20 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
         exit_status: None,
         duration_ms: 0,
         diagnostic: None,
-        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
+        error_code: None,
         local_session_observed: None,
+        message: StableMessage {
+            code: String::new(),
+            text: String::new(),
+        },
+        check: None,
+    }
+}
+
+fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerificationResult {
+    let base = pi_route_result_base(route);
+    SourceRouteVerificationResult {
+        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
@@ -15852,7 +15673,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
                 pi_route_label(route)
             ),
         },
-        check: None,
+        ..base
     }
 }
 
@@ -15861,27 +15682,8 @@ fn pi_route_post_smoke_census_failure(
     smoke: &SmokeResult,
     smoke_after: String,
 ) -> SourceRouteVerificationResult {
-    let identity = pi_route_billing_identity_hints(route);
+    let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        provider: pi_route_provider(route),
-        model: pi_route_model(route),
-        model_provider: route.classification.model_provider.clone(),
-        billing_provider: route.classification.billing_provider.clone(),
-        billing_channel: route.classification.billing_channel.clone(),
-        auth_mode: route.classification.auth_mode.clone(),
-        gateway_provider: route.classification.gateway_provider.clone(),
-        subscription_product: route.classification.subscription_product.clone(),
-        source_category: route.classification.source_category.clone(),
-        account_identifier_hash: identity.account_identifier_hash,
-        organization_identifier_hash: identity.organization_identifier_hash,
-        credential_fingerprint_hash: identity.credential_fingerprint_hash,
-        billing_identity_evidence: identity.billing_identity_evidence,
-        billing_identity_confidence: identity.billing_identity_confidence,
-        status: SourceVerificationStatus::Failed,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after: Some(smoke_after),
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -15889,7 +15691,6 @@ fn pi_route_post_smoke_census_failure(
         duration_ms: smoke.duration_ms.try_into().unwrap_or(u64::MAX),
         diagnostic: smoke.diagnostic.clone(),
         error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
-        local_session_observed: None,
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
@@ -15897,7 +15698,7 @@ fn pi_route_post_smoke_census_failure(
                 pi_route_label(route)
             ),
         },
-        check: None,
+        ..base
     }
 }
 
@@ -16085,23 +15886,9 @@ fn pi_route_passive_result(
     text: String,
     local_session_observed: Option<bool>,
 ) -> SourceRouteVerificationResult {
-    let identity = pi_route_billing_identity_hints(route);
+    let base = pi_route_result_base(route);
     let code = error_code.clone().unwrap_or_else(|| "verified".to_string());
     SourceRouteVerificationResult {
-        provider: pi_route_provider(route),
-        model: pi_route_model(route),
-        model_provider: route.classification.model_provider.clone(),
-        billing_provider: route.classification.billing_provider.clone(),
-        billing_channel: route.classification.billing_channel.clone(),
-        auth_mode: route.classification.auth_mode.clone(),
-        gateway_provider: route.classification.gateway_provider.clone(),
-        subscription_product: route.classification.subscription_product.clone(),
-        source_category: route.classification.source_category.clone(),
-        account_identifier_hash: identity.account_identifier_hash,
-        organization_identifier_hash: identity.organization_identifier_hash,
-        credential_fingerprint_hash: identity.credential_fingerprint_hash,
-        billing_identity_evidence: identity.billing_identity_evidence,
-        billing_identity_confidence: identity.billing_identity_confidence,
         status,
         verified,
         records_seen,
@@ -16109,14 +15896,10 @@ fn pi_route_passive_result(
         last_received_at,
         smoke_after,
         command_found: true,
-        command_succeeded: false,
-        exit_status: None,
-        duration_ms: 0,
-        diagnostic: None,
         error_code,
         local_session_observed,
         message: StableMessage { code, text },
-        check: None,
+        ..base
     }
 }
 
@@ -16169,27 +15952,8 @@ fn pi_route_result_from_smoke(
     smoke: &SmokeResult,
     smoke_after: Option<String>,
 ) -> SourceRouteVerificationResult {
-    let identity = pi_route_billing_identity_hints(route);
+    let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        provider: pi_route_provider(route),
-        model: pi_route_model(route),
-        model_provider: route.classification.model_provider.clone(),
-        billing_provider: route.classification.billing_provider.clone(),
-        billing_channel: route.classification.billing_channel.clone(),
-        auth_mode: route.classification.auth_mode.clone(),
-        gateway_provider: route.classification.gateway_provider.clone(),
-        subscription_product: route.classification.subscription_product.clone(),
-        source_category: route.classification.source_category.clone(),
-        account_identifier_hash: identity.account_identifier_hash,
-        organization_identifier_hash: identity.organization_identifier_hash,
-        credential_fingerprint_hash: identity.credential_fingerprint_hash,
-        billing_identity_evidence: identity.billing_identity_evidence,
-        billing_identity_confidence: identity.billing_identity_confidence,
-        status: SourceVerificationStatus::Failed,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after,
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -16214,7 +15978,7 @@ fn pi_route_result_from_smoke(
                 smoke.message
             ),
         },
-        check: None,
+        ..base
     }
 }
 
@@ -16223,7 +15987,7 @@ fn pi_route_result_from_verification(
     smoke: &SmokeResult,
     verification: SetupRunVerificationResponse,
 ) -> SourceRouteVerificationResult {
-    let identity = pi_route_billing_identity_hints(route);
+    let base = pi_route_result_base(route);
     let local_only_verified = !verification.verified && smoke.local_session_observed == Some(true);
     let status = if verification.verified {
         SourceVerificationStatus::Verified
@@ -16253,20 +16017,6 @@ fn pi_route_result_from_verification(
         )
     };
     SourceRouteVerificationResult {
-        provider: pi_route_provider(route),
-        model: pi_route_model(route),
-        model_provider: route.classification.model_provider.clone(),
-        billing_provider: route.classification.billing_provider.clone(),
-        billing_channel: route.classification.billing_channel.clone(),
-        auth_mode: route.classification.auth_mode.clone(),
-        gateway_provider: route.classification.gateway_provider.clone(),
-        subscription_product: route.classification.subscription_product.clone(),
-        source_category: route.classification.source_category.clone(),
-        account_identifier_hash: identity.account_identifier_hash,
-        organization_identifier_hash: identity.organization_identifier_hash,
-        credential_fingerprint_hash: identity.credential_fingerprint_hash,
-        billing_identity_evidence: identity.billing_identity_evidence,
-        billing_identity_confidence: identity.billing_identity_confidence,
         status,
         verified: verification.verified || local_only_verified,
         records_seen: verification.records_seen,
@@ -16285,7 +16035,7 @@ fn pi_route_result_from_verification(
         },
         local_session_observed: smoke.local_session_observed,
         message: StableMessage { code, text },
-        check: None,
+        ..base
     }
 }
 
@@ -16297,27 +16047,9 @@ fn pi_route_result_from_backend_error(
 ) -> SourceRouteVerificationResult {
     let source_result =
         verification_result_for_backend_error(SourceKind::Pi, smoke_after.clone(), error);
-    let identity = pi_route_billing_identity_hints(route);
+    let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        provider: pi_route_provider(route),
-        model: pi_route_model(route),
-        model_provider: route.classification.model_provider.clone(),
-        billing_provider: route.classification.billing_provider.clone(),
-        billing_channel: route.classification.billing_channel.clone(),
-        auth_mode: route.classification.auth_mode.clone(),
-        gateway_provider: route.classification.gateway_provider.clone(),
-        subscription_product: route.classification.subscription_product.clone(),
-        source_category: route.classification.source_category.clone(),
-        account_identifier_hash: identity.account_identifier_hash,
-        organization_identifier_hash: identity.organization_identifier_hash,
-        credential_fingerprint_hash: identity.credential_fingerprint_hash,
-        billing_identity_evidence: identity.billing_identity_evidence,
-        billing_identity_confidence: identity.billing_identity_confidence,
         status: source_result.status,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after,
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -16334,7 +16066,7 @@ fn pi_route_result_from_backend_error(
                 source_result.message.text
             ),
         },
-        check: None,
+        ..base
     }
 }
 
@@ -16740,67 +16472,13 @@ fn get_setup_run_verification_with_base_timeout(
             params.push(("billing_provider", billing_provider.to_string()));
         }
     }
-    let query = params
-        .into_iter()
-        .map(|(key, value)| format!("{}={}", form_url_encode(key), form_url_encode(&value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let url = format!("{url}?{query}");
+    // `source` and `smoke_after` are always present, so the query is never empty.
+    let url = url_with_query_params(url, params);
     backend_get_json_with_timeout(
         &url,
         &[("X-Ottto-Setup-Run-Token", setup_run_token)],
         request_timeout,
     )
-}
-
-fn get_agent_context_with_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentContextQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    let url = agent_context_url(api_base_url, connection, query);
-    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
-}
-
-fn get_agent_costs_with_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentCostsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    let url = agent_costs_url(api_base_url, connection, query);
-    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
-}
-
-fn get_agent_sessions_with_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentSessionsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    let url = agent_sessions_url(api_base_url, connection, query);
-    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
-}
-
-fn get_agent_recommendations_with_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentRecommendationsQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    let url = agent_recommendations_url(api_base_url, connection, query);
-    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
-}
-
-fn get_agent_provider_impact_with_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    query: &AgentProviderImpactQuery,
-) -> Result<serde_json::Value, LocalApiError> {
-    let url = agent_provider_impact_url(api_base_url, connection, query);
-    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn agent_context_url(
@@ -16835,15 +16513,7 @@ fn agent_context_url(
     if query.all_machines {
         params.push(("all_machines", "true".to_string()));
     }
-    if params.is_empty() {
-        return url;
-    }
-    let query_string = params
-        .into_iter()
-        .map(|(key, value)| format!("{}={}", form_url_encode(key), form_url_encode(&value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{url}?{query_string}")
+    url_with_query_params(url, params)
 }
 
 fn agent_costs_url(
@@ -17740,7 +17410,7 @@ mod tests {
                 r#"#!/usr/bin/python3
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open({runs:?}, "a") as runs:
     runs.write("run\n")
@@ -17994,7 +17664,7 @@ if args == ["login"]:
     os.rename(path + ".tmp", path)
     sys.stderr.write("Successfully logged in\n")
     sys.exit(0)
-if args != ["app-server", "--stdio"]:
+if args[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 with open(os.path.join(BIN, "app-server-runs"), "a") as f:
     f.write("run\n")
@@ -22032,11 +21702,35 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
     fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
         fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        seed_private_literal_canary(&support_root.join("snapshots"));
+        for destination in ["old", "other"] {
+            for source in crate::snapshots::durable_sources::SOURCES {
+                let index = support_root
+                    .join("snapshots/destinations")
+                    .join(destination)
+                    .join(format!("{}-scan-index.json", source.snapshot.api_slug()));
+                let dir = crate::durable_tail_store::store_dir_for_index(&index);
+                fs::create_dir_all(&dir).unwrap();
+                // Whole-tree forget cannot depend on inventory or body decoding.
+                fs::write(
+                    dir.join(format!("{}.rec", "f".repeat(64))),
+                    b"opaque record",
+                )
+                .unwrap();
+                fs::write(dir.join("torn.tmp"), b"unfinished write").unwrap();
+                fs::create_dir_all(dir.join("temp/child")).unwrap();
+                fs::write(dir.join("temp/child/pending"), b"unfinished child").unwrap();
+                fs::write(dir.with_extension("private-labels"), b"opaque marker").unwrap();
+                assert!(dir.exists());
+            }
+        }
         fs::create_dir_all(&secret_root).unwrap();
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
@@ -24745,8 +24439,53 @@ for line in sys.stdin:
         );
     }
 
+    /// Seed the private record directory with codec bytes, so both diagnostic
+    /// paths must exclude stored literals rather than merely redact a Debug.
+    fn seed_private_literal_canary(support: &Path) -> &'static str {
+        use crate::durable_tail_codec::{Durable, Enc};
+        use crate::snapshots::PlText;
+        const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
+        let literal = PlText::<96>::new(CANARY.into()).unwrap();
+        let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();
+        assert!(body
+            .windows(CANARY.len())
+            .any(|bytes| bytes == CANARY.as_bytes()));
+        let dir =
+            crate::durable_tail_store::store_dir_for_index(&support.join("claude-scan-index.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = dir.join(format!("{}.rec", "0".repeat(64)));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record)
+            .unwrap();
+        file.write_all(&body).unwrap();
+        // F8: the support collector must also omit transient replay input,
+        // including raw-value magic keys and malformed-selector material.
+        std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
+            "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
+        )).unwrap();
+        let canaries =
+            crate::snapshots::test_replay_privacy_artifacts(&support.join("bounded-replay-input"));
+        assert_eq!(canaries[0], CANARY);
+        CANARY
+    }
+
     #[test]
+    #[serial]
     fn diagnostics_collect_is_local_only_without_upload() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-export");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -24765,6 +24504,14 @@ for line in sys.stdin:
 
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
+        assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!serde_json::to_string(&payload).unwrap().contains(private));
+        }
         assert!(payload
             .get("bundle_id")
             .and_then(|value| value.as_str())
@@ -24824,7 +24571,18 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-support-bundle");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let captured = Arc::new(Mutex::new(None));
         let api_base_url = diagnostics_upload_server(captured.clone());
         let response = handle_request(
@@ -24887,6 +24645,16 @@ for line in sys.stdin:
         assert!(body.contains("\"retention_disclosure_accepted\":true"));
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
+        assert!(!body.contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!body.contains(private));
+            assert!(!payload_json.contains(private));
+        }
+        assert!(!payload_json.contains(canary));
     }
 
     #[test]
@@ -27918,20 +27686,36 @@ X-API-Key = "otel_redacted"
     #[serial]
     #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
+        use crate::otlp_relay::tests::with_bind_plan;
+
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
-        let port = ports[1];
         write_startup_relay_settings(
             &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(port),
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
         );
-        let _busy_preferred = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let default_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(default_listener.local_addr().unwrap().port(), ports[0]);
-        // Keep default occupied too; the first fallback is the preferred busy
-        // port, so the next candidate must be selected.
-        let fallback_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(fallback_listener.local_addr().unwrap().port(), ports[2]);
+        // Plan the candidate binds: any real candidate number can be held by a
+        // parallel test's ephemeral port, so the free one is a held listener.
+        let busy = || -> std::io::Result<std::net::TcpListener> {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        };
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let default_listener = with_bind_plan([(ports[1], busy()), (ports[0], Ok(held))], || {
+            crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+        });
+        assert_eq!(default_listener.local_addr().unwrap(), addr);
+        // Default busy too: the preferred port is not retried as a fallback,
+        // so the next candidate is selected.
+        let fallback_listener = with_bind_plan(
+            [
+                (ports[1], busy()),
+                (ports[0], busy()),
+                (ports[2], Ok(default_listener)),
+            ],
+            || crate::otlp_relay::bind_startup_local_relay_listener().unwrap(),
+        );
+        assert_eq!(fallback_listener.local_addr().unwrap(), addr);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27941,17 +27725,24 @@ X-API-Key = "otel_redacted"
     fn startup_relay_ignores_unapproved_hosts_ports_and_settings() {
         let (root, _guards) = managed_claude_relay_fixture();
         let port = startup_relay_candidates()[1];
+        // The default port is the first bind attempted; a held listener stands
+        // in for it, since a parallel test's ephemeral port can hold 43119.
+        let binds_default_first = || {
+            let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = held.local_addr().unwrap();
+            let default = crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT;
+            let listener = crate::otlp_relay::tests::with_bind_plan([(default, Ok(held))], || {
+                crate::otlp_relay::bind_startup_local_relay_listener().unwrap()
+            });
+            assert_eq!(listener.local_addr().unwrap(), addr);
+        };
         for base in [
             format!("http://192.0.2.1:{port}"),
             format!("http://localhost:{port}"),
             "http://127.0.0.1:48123".to_string(),
         ] {
             write_startup_relay_settings(&root, &base);
-            let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-            assert_eq!(
-                listener.local_addr().unwrap().port(),
-                crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-            );
+            binds_default_first();
         }
         write_startup_relay_settings(
             &root,
@@ -27964,11 +27755,7 @@ X-API-Key = "otel_redacted"
                 sources: vec!["codex".into()],
             })
             .unwrap();
-        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().port(),
-            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-        );
+        binds_default_first();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27989,23 +27776,34 @@ X-API-Key = "otel_redacted"
         let settings = root.join(".claude/settings.json");
         let before = fs::read(&settings).unwrap();
         let _busy = std::net::TcpListener::bind(("127.0.0.1", approved)).unwrap();
+        // The approved binds hit the held busy listener. The old port is
+        // planned: a parallel test's ephemeral port can hold that number.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = held.local_addr().unwrap();
         let mut attempts = 0;
-        let listener = crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
-            attempts += 1;
-            assert!(attempt <= 3, "approved retry must be bounded");
-            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
-            if attempt < 3 {
-                assert!(result.is_err(), "approved port gets its retry budget first");
-            }
-            result
+        let listener = crate::otlp_relay::tests::with_bind_plan([(old, Ok(held))], || {
+            crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
+                attempts += 1;
+                assert!(attempt <= 3, "approved retry must be bounded");
+                let result =
+                    crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+                if attempt < 3 {
+                    assert!(result.is_err(), "approved port gets its retry budget first");
+                }
+                result
+            })
         });
         assert_eq!(attempts, 3);
-        let addr = listener.local_addr().unwrap();
-        assert_eq!(addr.port(), old, "old port precedes the free default port");
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            addr,
+            "old port precedes the free default port"
+        );
         let daemon = daemon().with_account(connected_account());
+        let endpoint = format!("http://127.0.0.1:{old}");
         let connected = ottto_protocol::RelayState {
             state: ottto_protocol::RelayRuntimeState::Connected,
-            endpoint: Some(format!("http://{addr}")),
+            endpoint: Some(endpoint.clone()),
             last_connected_at: None,
             last_error: None,
         };
@@ -28023,7 +27821,7 @@ X-API-Key = "otel_redacted"
         daemon
             .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
                 state: ottto_protocol::RelayRuntimeState::Failed,
-                endpoint: Some(format!("http://{addr}")),
+                endpoint: Some(endpoint),
                 last_connected_at: None,
                 last_error: Some(StableMessage {
                     code: "relay_listener_failed".into(),
@@ -29486,7 +29284,7 @@ X-API-Key = "otel_redacted"
         fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
             .expect("seed clean config");
         // Hold-budget damage: valid JSON whose session-identity fields an
-        // override can strictly recover (SI-718-O1); syntax damage cannot.
+        // override can strictly recover; syntax damage cannot.
         let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
         damage["files"]["excess-held"] =
             serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
@@ -30618,6 +30416,44 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
+    #[serial]
+    fn agent_read_refreshes_the_setup_run_token_only_on_401() {
+        const INVALID: &str = r#"{"detail":"Setup run companion token is invalid"}"#;
+        // A token-invalid body under 403 would refresh a setup-run request,
+        // but an agent read returns it after one request, without refreshing.
+        let _guard = lock_backend_test_env();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            read: (403, INVALID),
+            refresh: (0, ""),
+        }));
+        let api_base_url = expired_setup_run_read_server(calls.clone(), script);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_agent_read".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let error = agent_read_with_refresh(
+            &api_base_url,
+            &connection,
+            "otsr_agent_read",
+            |api_base_url, connection| {
+                agent_costs_url(api_base_url, connection, &AgentCostsQuery::default())
+            },
+        )
+        .expect_err("a refused read fails");
+        assert!(
+            matches!(&error, LocalApiError::Backend(details) if details.status == Some(403)),
+            "{error:?}"
+        );
+        let paths = calls.lock().expect("calls lock").clone();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].contains("/local-client/costs"), "{paths:?}");
+    }
+
+    #[test]
     fn backend_reason_code_drives_the_message_and_incidental_expiry_text_does_not() {
         let backend = |status: u16, body: &str| BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -30867,36 +30703,6 @@ X-API-Key = "otel_redacted"
 
         assert!(matches!(result, Err(LocalApiError::TimedOut(_))));
         assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn publish_scan_result_accepts_response_slower_than_generic_timeout() {
-        let api_base_url = delayed_setup_scan_result_server(
-            "setup_slow_scan",
-            BACKEND_REQUEST_TIMEOUT + Duration::from_secs(1),
-        );
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_slow_scan".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let mut credentials = SetupRunCredentials {
-            setup_run_token: "otsr_test".to_string(),
-            connection,
-        };
-
-        let started = Instant::now();
-        let detail = publish_scan_result(
-            &api_base_url,
-            &mut credentials,
-            &minimal_setup_scan_payload(),
-        )
-        .expect("scan-result POST should use setup-specific timeout");
-
-        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
-        assert_eq!(detail.run.id, "setup_slow_scan");
     }
 
     #[test]
@@ -31311,24 +31117,6 @@ X-API-Key = "otel_redacted"
 
     fn setup_run_cancelled_scan_server() -> String {
         setup_run_terminal_scan_server("setup_cancelled", "Setup run cancelled")
-    }
-
-    fn delayed_setup_scan_result_server(setup_run_id: &'static str, delay: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept setup scan");
-            let request = read_complete_http_request(&mut stream);
-            assert!(request.contains(&format!(
-                "/api/v1/setup-runs/{setup_run_id}/local-client/scan-result"
-            )));
-            thread::sleep(delay);
-            let body = format!(
-                r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
-            );
-            write_json_response(&mut stream, 200, "OK", &body);
-        });
-        format!("http://{address}")
     }
 
     fn delayed_setup_verification_server(setup_run_id: &'static str, delay: Duration) -> String {
@@ -31764,20 +31552,6 @@ X-API-Key = "otel_redacted"
             }
         }
         String::from_utf8_lossy(&request).to_string()
-    }
-
-    fn minimal_setup_scan_payload() -> SetupScanPayload {
-        SetupScanPayload {
-            machine: BTreeMap::from([
-                ("id".to_string(), json!("machine_test")),
-                ("name".to_string(), json!("Test Mac")),
-            ]),
-            companion: BTreeMap::from([("client_name".to_string(), json!(OTTTO_CLIENT_NAME))]),
-            relay_runtime: BTreeMap::from([("state".to_string(), json!("unknown"))]),
-            service: BTreeMap::from([("state".to_string(), json!("running"))]),
-            sources: Vec::new(),
-            missing_fields: Vec::new(),
-        }
     }
 
     fn http_request_complete(request: &[u8]) -> bool {

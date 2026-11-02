@@ -1,7 +1,6 @@
-//! Red-first cache-policy regression tests for Slice M1 (design report §2
-//! L1-L4 and §6 row M1): a copy refusal evicts only what is needed instead of
-//! wiping the resume cache. M1 (i) and G3 come from the M0 harness (#661);
-//! G1, G2 and M2 belong to later slices and are not here. Each test drives
+//! Red-first cache-policy regression tests: a copy refusal evicts only what is
+//! needed instead of wiping the resume cache. Test (i) and G3 come from an
+//! earlier harness (#661); G1 and G2 belong to later slices and are not here. Each test drives
 //! the real production scan step loop against one shared transcript cache, or
 //! calls the step-start release with injected measurements, and asserts the
 //! DESIRED retention policy, so it fails on main for the reason its doc
@@ -10,8 +9,8 @@
 //! `transcript_acquisition_tests` and the #653 retention baseline, so this
 //! module registers on its own.
 //!
-//! Round 2 (review of #666): M1 (i) and (ii) are restated for Path A, the
-//! owner-accepted admission bridge: a zero-budget tail makes room for its
+//! After review of #666, tests (i) and (ii) are restated for Path A, the
+//! admission bridge: a zero-budget tail makes room for its
 //! own copy from entries older than the tailed file only. Added: the hot-file
 //! model (no Full read of an actively tailed file), the visit-limited active
 //! (F1) and the exempt re-measure on the production path (F4). The decision
@@ -19,19 +18,19 @@
 //! Path A evicts nothing there and they pin evict-to-fit alone. F2 (a group
 //! job's overflow) is in `group_job_tests`, which reuses these fillers.
 //!
-//! P1-RETAIN R0 (Q-PR14, with the parent's B1 ruling 1): every tail here is
+//! Under R0, every tail here is
 //! a sampled Claude Tail singleton that borrows only its retained reduction
 //! (shape F, `borrows_only_retained_reduction`). Its step start gets neither
 //! evict-to-fit nor Path A; its only release is at completion, of residents
 //! ranked strictly below its copy's re-admission rank (its source mtime
 //! clipped to now once, the rank its copy is admitted at), not its taken
-//! hint. M1 (i), (ii) and the hot-file model are main's rows, unchanged
-//! (ruling 2): they are the acceptance controls. Their
+//! hint. Tests (i), (ii) and the hot-file model are main's rows, unchanged:
+//! they are the acceptance controls. Their
 //! `cache_policy_r0_diagnostic_m1_*` twins and the regime-B rows
 //! (`cache_policy_r0_regime_b_*`, fillers ranked two days back) are
 //! diagnostics, not acceptance: they print R0's probe and decision. A Claude
 //! tail proves its release with its measured X_out (M-a, without Q-PR15's
-//! guard); a Codex tail keeps `F_prev` and the guard (ruling 5). G3 is
+//! guard); a Codex tail keeps `F_prev` and the guard. G3 is
 //! unchanged. The decision matrix, the counters and
 //! the visit-limited active pin evict-to-fit on a non-F tail (a comparison
 //! target), each with a shape-F control that releases nothing;
@@ -44,6 +43,7 @@
 //! test limit, decide how many entries fit.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+use crate::snapshots::transcript_acquisition_tests::usage;
 use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
 use crate::transcript_cache::Retained;
 use std::fs::OpenOptions;
@@ -64,7 +64,7 @@ pub(super) const FILLERS: usize = 4;
 /// records (#653 T3: 27,664,691 B, 6,887,051 B each), leaving about 4.8 MB.
 /// `filler_records` sizes the filler file from measured charges, so a change
 /// to the per-response charge cannot leave the zero-budget steps unreached.
-// Keep M-a's 256 KiB prefix margin with E2's itemized finish term, main's
+// Keep the 256 KiB prefix margin with `e2`'s itemized finish term, main's
 // stored ctime/birth fields, and the longer Linux CI paths. This calibrates
 // fixture fill only; zero-budget and exact two-victim assertions stay intact.
 const FILLER_STATE_PERMILLE: usize = 210;
@@ -152,22 +152,6 @@ impl ScanFixture {
 impl Drop for ScanFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
-    let timestamp = format!("2026-10-07T{:02}:00:00Z", 10 + id % 3);
-    match source {
-        SnapshotSource::Codex => json!({"type":"event_msg", "timestamp":timestamp,
-            "payload":{"type":"token_count", "info":{"model":model,
-            "total_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10},
-            "last_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10}}}}),
-        SnapshotSource::ClaudeCode => {
-            json!({"type":"assistant", "sessionId":"native-tail-fixture", "timestamp":timestamp,
-            "requestId":format!("req-{id}"), "message":{"id":format!("response-{id}"), "model":model,
-            "usage":{"input_tokens":n,"cache_read_input_tokens":n/2,"output_tokens":n/10}}})
-        }
-        _ => unreachable!(),
     }
 }
 
@@ -639,7 +623,7 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
     );
 }
 
-/// Responses appended for M1 (ii): 13/14 of a filler's, as 1,300 beside
+/// Responses appended for test (ii): 13/14 of a filler's, as 1,300 beside
 /// 1,400 before compact Claude records. A tail's state is the same Claude
 /// reduction, charged per response as a filler is, so the borrowed state grows
 /// past the room the fillers leave (about 4.8 MB), yet below one filler's
@@ -648,14 +632,13 @@ fn tail_growth_records() -> usize {
     filler_records() * 13 / 14
 }
 
-/// The tailed file's append for M1 (ii): `tail_growth_records` ordinary
+/// The tailed file's append for test (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
     tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + tail_growth_records());
 }
 
-/// M1 test (ii), corrected (joint M1 (ii) disposition, Oct 22; StateMissing
-/// sign-off closed).
+/// Test (ii), corrected.
 ///
 /// The same full cache, but the tailed file's append is
 /// `tail_growth_records` ordinary responses: the borrowed tail state grows
@@ -783,7 +766,7 @@ fn measure(resident: Option<usize>, active: Option<usize>) -> sampled_scan::Step
     }
 }
 
-/// M1 test (iii), the refusal decision matrix (design §6 row M1; §2 L1-L3).
+/// Test (iii), the refusal decision matrix.
 ///
 /// A sampled tail is active beside four fillers that fill the cache. The
 /// step-start release is called directly with injected step measurements:
@@ -908,7 +891,7 @@ fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
     );
 }
 
-/// M1 Path A, the hot file (review §3b model, regime B).
+/// Path A, the hot file (regime B).
 ///
 /// One actively tailing session beside `FILLERS` idle entries that fill the
 /// cache and are older than it. On each of `HOT_PASSES` passes it gains an
@@ -969,7 +952,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     assert!(retained_after, "the hot file is not retained; {receipt}");
 }
 
-/// M1 F4, the #654 exemption on the production path.
+/// The #654 exemption on the production path.
 ///
 /// An unsampled native read (sidecar census incomplete) owns no optimization
 /// state. Its step-start release runs on this step's real measure, with the
@@ -1297,7 +1280,7 @@ fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
     }
 }
 
-/// Every copy-refusal count (the corrected M1 (ii) row's sum).
+/// Every copy-refusal count, summed.
 fn refusals(counts: &Counts) -> u64 {
     counts.retention_bound_refused
         + counts.retention_clone_bound_refused
@@ -1462,7 +1445,7 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
     assert_no_victims(&run, "failed stamp gate");
 }
 
-/// M-a T10, Codex's explicit residual (ruling 5): a Codex completion keeps
+/// M-a T10, Codex's explicit residual: a Codex completion keeps
 /// `K = max(C, F_prev)` and the Q-PR15 guard whatever X_out says; M-a's
 /// proof never runs for it.
 #[test]
@@ -1651,7 +1634,7 @@ fn unique_workspace(tag: &str) -> String {
     )
 }
 
-fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+pub(super) fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
     crate::context_footprint::RepositoryIdentity {
         repository_hash: Some(format!("hash-{tag}")),
         repository_label: Some(format!("label-{tag}")),

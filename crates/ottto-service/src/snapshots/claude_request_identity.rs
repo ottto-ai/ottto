@@ -11,7 +11,7 @@
 //! reproduces every row exactly; otherwise the item keeps today's path. It adds
 //! no transcript read or parse. Legacy transcript markers never authorize
 //! emitted tags; login-only telemetry keeps its login without a marker org.
-//! E2 partitions counted requests using bounded native marker runs before
+//! `e2` partitions counted requests using bounded native marker runs before
 //! aggregation, then feeds those exact final shares to this same tag installer.
 
 use super::claude_request_accounts::{local_subscription, normalize_activity};
@@ -38,6 +38,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -112,7 +113,7 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
 
 /// Every Claude sync cycle builds contract-5 evidence. A test may model a
 /// pre-cutover daemon's unpermitted page, or pin the legacy account path
-/// (D1 qualification, mixed bodies, owner holds) that production now
+/// (own-request account qualification, mixed bodies, owner holds) that production now
 /// reaches only for bodies contract 5 leaves untagged.
 pub(crate) fn builds_evidence() -> bool {
     #[cfg(test)]
@@ -160,13 +161,13 @@ pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, P1 `MAX_IDENTITY_PARTS_PER_ITEM`).
+/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`).
 /// The byte cap is the real limit; this stops construction early.
 pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
-pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
+pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
     advertised
@@ -509,8 +510,8 @@ pub(crate) struct Grouping {
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
     /// Bucket rows sent with `copy_invalidated`,
-    /// by bucket start. Empty unless the copy-prefix switch is on and the
-    /// receiver advertised option (ii) retention.
+    /// by bucket start. Empty unless the receiver advertised option (ii)
+    /// retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
@@ -1750,7 +1751,7 @@ pub(crate) struct CopyInvalidation {
 
 /// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
-/// markers lent to that very row's requests (ones the copy-prefix switch
+/// markers lent to that very row's requests (ones copy-prefix dedupe
 /// re-derived without them) is copy-derived: it is treated as never accepted
 /// (fresh own tags or untagged, never a refusal or marker). Other changed
 /// rows keep #909's refusal, and rows their own evidence still proves are
@@ -1891,7 +1892,7 @@ fn cap_counts(
 
 /// Pure measurement over a request-owned item's currently held native proof.
 /// It never reads accounts/transcripts, emits diagnostics or uploads a body.
-#[allow(dead_code, reason = "side-run/debug hook; not a runtime input")]
+#[cfg(test)] // Side-run/debug hook; deliberately not a runtime decision input.
 pub(crate) fn measure_identity_cap(
     item: &SnapshotItem,
     accepted: &AcceptedBuckets,
@@ -3000,7 +3001,7 @@ impl OrgMarkers {
     }
 }
 
-// E2 consumes this compact, native-sequence-ordered placement before any
+// `e2` consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 /// A counted request's grain slot (live key, origin), the account a copied
@@ -3020,7 +3021,7 @@ struct AccountRun {
     position: u64,
     account: AccountPartition,
     /// First nonzero usage following this marker: its response position and
-    /// E2 copy status. Zero-usage responses may separate it from the marker.
+    /// `e2` copy status. Zero-usage responses may separate it from the marker.
     copied: Option<(u64, bool)>,
 }
 crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
@@ -3070,10 +3071,12 @@ struct CarryCounts {
     no_seed: u64,
     /// Own telemetry that names no valid account (API key, cloud, placeholder).
     blocked_no_account: u64,
+    /// Transcripts where incomplete occurrence coverage disabled carry.
+    skipped_incomplete: u64,
     /// Runtime-only resource verdict, propagated into the existing item HOLD.
     keys_over_cap: bool,
 }
-crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, keys_over_cap);
+crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, skipped_incomplete, keys_over_cap);
 
 /// The carry rule under `session_request_account_source:v1`, within one
 /// transcript in native order: a gap (a request with no
@@ -3113,7 +3116,10 @@ impl Carry<'_> {
             run: 0,
             pending: Vec::new(),
             closed: 0,
-            counts: CarryCounts::default(),
+            counts: CarryCounts {
+                skipped_incomplete: u64::from(on && !complete),
+                ..CarryCounts::default()
+            },
         }
     }
 
@@ -3256,7 +3262,7 @@ impl Carry<'_> {
     }
 }
 
-/// One account policy for E2. Never use a later marker for an earlier request.
+/// One account policy for `e2`. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
 /// Subagents are assigned their root's starting account at page finalization.
 pub(crate) fn request_accounts(
@@ -3291,7 +3297,7 @@ pub(crate) fn request_accounts(
     let Some(first) = first_sequence else {
         return accounts;
     };
-    // Only E2 can exclude a request. Marker timestamps never decide identity.
+    // Only `e2` can exclude a request. Marker timestamps never decide identity.
     let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
     if markers.overflowed {
         if let Some(marker) = markers
@@ -3469,7 +3475,7 @@ impl RequestAccounts {
             *into = into.saturating_add(1);
         }
     }
-    /// The governing native marker run; E2 uses its own skipped ranges to
+    /// The governing native marker run; `e2` uses its own skipped ranges to
     /// stage inherited usage until its copy decision is final.
     pub(crate) fn copied_marker_position(&self, sequence: u64) -> Option<u64> {
         let end = self.runs.partition_point(|run| run.position <= sequence);
@@ -3615,7 +3621,7 @@ pub(crate) fn reconcile_request_accounts(
     items: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
 ) -> super::ClaudeUnhealthyRootNoFallbackCounts {
-    use super::claude_request_money::e2::place_request_identity;
+    use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
     let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
@@ -3700,11 +3706,26 @@ pub(crate) fn reconcile_request_accounts(
         }
         // Existing occurrence storage owns these requests. The temporary sort
         // is 16 bytes per resolved request, at most 1 MiB (native 65,536 cap).
-        // Check while the item's request map is still present; draining it
-        // first would make every nonempty transcript look incomplete.
+        // Carry covers identified occurrences, not census cardinality.
+        // Zero-usage responses have ids but no counted row; counts can also
+        // include responses without a usable id. Proven copies no longer
+        // count. Check before draining the occurrence map.
         let mut carry = Carry::new(
             evidence.carries_accounts(),
-            !evidence.carries_accounts() || !super::claude_member_invalidity_is_structural(item),
+            !evidence.carries_accounts()
+                || (item
+                    .claude_usage_occurrences
+                    .keys()
+                    .eq(item.claude_usage_request_ids.iter())
+                    && item
+                        .claude_usage_occurrences
+                        .values()
+                        .filter(|occurrence| {
+                            !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
+                        })
+                        .map(|occurrence| occurrence.usage.request_count)
+                        .try_fold(0_u64, u64::checked_add)
+                        .is_some_and(|requests| requests <= item.request_count)),
         );
         let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
         let mut requests = occurrences.iter_mut().collect::<Vec<_>>();
@@ -3892,6 +3913,7 @@ pub(crate) fn reconcile_request_accounts(
                 telemetry,
                 native.account(sequence),
                 account,
+                IdentityCaller::Request,
             );
             if backward {
                 carry.pending.push(occurrence);
@@ -3902,7 +3924,14 @@ pub(crate) fn reconcile_request_accounts(
                 .inherited
                 .saturating_add(occurrence.usage.request_count);
             occurrence.e2_inherited = Some(true);
-            place_request_identity(&mut fold, occurrence, None, None, account);
+            place_request_identity(
+                &mut fold,
+                occurrence,
+                None,
+                None,
+                account,
+                IdentityCaller::Carry,
+            );
         });
         item.claude_usage_occurrences = occurrences;
         accounts.reconciled = true;
@@ -4233,6 +4262,7 @@ pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
                 ambiguous_gap: most.ambiguous_gap.max(next.ambiguous_gap),
                 no_seed: most.no_seed.max(next.no_seed),
                 blocked_no_account: most.blocked_no_account.max(next.blocked_no_account),
+                skipped_incomplete: most.skipped_incomplete.max(next.skipped_incomplete),
                 keys_over_cap: most.keys_over_cap || next.keys_over_cap,
             });
         counts.claude_carried_forward_requests += carried.forward;
@@ -4240,6 +4270,7 @@ pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
         counts.claude_carry_ambiguous_gap_requests += carried.ambiguous_gap;
         counts.claude_carry_no_seed_requests += carried.no_seed;
         counts.claude_carry_blocked_no_account_requests += carried.blocked_no_account;
+        counts.claude_carry_skipped_incomplete_transcripts += carried.skipped_incomplete;
     }
     counts
 }
@@ -4261,6 +4292,7 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
         counts.claude_carry_ambiguous_gap_requests,
         counts.claude_carry_no_seed_requests,
         counts.claude_carry_blocked_no_account_requests,
+        counts.claude_carry_skipped_incomplete_transcripts,
     ]) {
         if value != 0 {
             counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
@@ -4268,8 +4300,8 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
     }
 }
 
-static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     // Current loaded-list inventory, not process-total sums across cycles.
@@ -4300,12 +4332,14 @@ pub(crate) struct IdentityCounts {
     claude_carry_no_seed_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_carry_blocked_no_account_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carry_skipped_incomplete_transcripts: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 pub(crate) fn take_identity_counts() -> IdentityCounts {
-    let [mixed, inherited, conflicts, families, files, forward, backward, ambiguous, no_seed, blocked] =
+    let [mixed, inherited, conflicts, families, files, forward, backward, ambiguous, no_seed, blocked, incomplete] =
         IDENTITY_COUNTS
             .each_ref()
             .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
@@ -4321,11 +4355,12 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_ambiguous_gap_requests: ambiguous,
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
+        claude_carry_skipped_incomplete_transcripts: incomplete,
     }
 }
 
-/// Exact final E2 rows, including copied exclusions and telemetry side calls.
-/// E2 owns placement; this owner supplies contract-5 keys and evidence only.
+/// Exact final `e2` rows, including copied exclusions and telemetry side calls.
+/// `e2` owns placement; this owner supplies contract-5 keys and evidence only.
 fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
     let mut grouping = Grouping::new(bucket_row_count(item));
     super::claude_request_money::e2::visit_identity_rows(
@@ -4401,13 +4436,13 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 pub(crate) struct ScanEvidence<'a> {
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
-    /// Each request id named by loaded API or trace rows, sorted, with the
-    /// one root holding them, or `None` when rows under several roots name
-    /// it. Rows are keyed by trace root, so this is how a fork or resume copy
-    /// under another root sees that the request already has an owner. Built
-    /// on the first request without rows of its own: a pass whose requests
-    /// all have their own rows never pays for it.
-    request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
+    /// The request roots of this pass's whole corpus, from the cross-root
+    /// evidence the strict read built root by root.
+    cross_request_roots: Option<&'a RequestRootIndex>,
+    /// Without cross-root evidence: the request roots of the loaded rows,
+    /// built on the first request without rows of its own, so a pass whose
+    /// requests all have their own rows never pays for it.
+    request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
     /// Why each unhealthy root failed, for its no-fallback counter only.
@@ -4418,7 +4453,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// load proves only what was already written, not a live writer, and no
     /// existing qualified current-writer witness exists; production therefore
     /// supplies none (pending is unproven; young missing requests stay missing)
-    /// until SESSION rules on one. Only tests can populate this.
+    /// until one exists. Only tests can populate this.
     pending_writer_witnesses: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the
@@ -4442,6 +4477,79 @@ pub(crate) struct ScanEvidence<'a> {
     wire_budget: WireBudget<'a>,
 }
 
+/// Each request id named by healthy API or trace rows, as its SHA-256, with
+/// the ordinal of the one root holding it, or `SEVERAL` when rows
+/// under several roots name it. Rows are keyed by trace root, so this is how a
+/// fork or resume copy under another root sees that the request already has
+/// an owner. A root's API and trace rows of one request are one claim: each
+/// root's ids are deduplicated as the root is added, before the collapse.
+#[derive(Default)]
+pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
+
+impl RequestRootIndex {
+    const SEVERAL: u32 = u32::MAX;
+
+    /// Adds one root's API and trace request ids, in any order. Call once per root.
+    pub(crate) fn add_root<'r>(&mut self, root: u32, request_ids: impl Iterator<Item = &'r str>) {
+        let mut ids = request_ids
+            .map(|id| <[u8; 32]>::from(sha2::Sha256::digest(id.as_bytes())))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        self.0.extend(ids.into_iter().map(|id| (id, root)));
+    }
+
+    /// Once every root is in: sort, then collapse ids held by several roots.
+    pub(crate) fn finish(&mut self) {
+        self.0.sort_unstable();
+        self.0.dedup_by(|later, kept| {
+            if later.0 != kept.0 {
+                return false;
+            }
+            kept.1 = Self::SEVERAL;
+            true
+        });
+        self.0.shrink_to_fit();
+    }
+
+    /// `Some(Some(root))`: one root's rows name `request_id`; `Some(None)`: several.
+    pub(crate) fn get(&self, request_id: &str) -> Option<Option<u32>> {
+        let id = <[u8; 32]>::from(sha2::Sha256::digest(request_id.as_bytes()));
+        let at = self.0.binary_search_by(|(known, _)| known.cmp(&id)).ok()?;
+        let root = self.0[at].1;
+        Some((root != Self::SEVERAL).then_some(root))
+    }
+}
+
+/// One root's API rows by request id: the row, or `None` when several name it.
+pub(crate) fn unique_by_request(
+    rows: &[ClaudeLocalOtelEvidence],
+) -> BTreeMap<&str, Option<&ClaudeLocalOtelEvidence>> {
+    let mut unique = BTreeMap::new();
+    for row in rows {
+        unique
+            .entry(row.request_id.as_str())
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(row));
+    }
+    unique
+}
+
+/// Only a unique row that passes the same integrity checks `classify` applies
+/// may establish a (login, org) pair. `false`: its login is invalid.
+pub(crate) fn prove_membership(
+    row: &ClaudeLocalOtelEvidence,
+    root: &str,
+    memberships: &mut BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let login = valid_login(row, root);
+    if let (Some(login), Some(org)) = (login, complete_org(row)) {
+        let orgs = memberships.entry(login.to_string()).or_default();
+        orgs.insert(org.to_string());
+    }
+    login.is_some()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DesktopCensus {
     pub(crate) completed_at_unix_seconds: u64,
@@ -4462,28 +4570,14 @@ impl<'a> ScanEvidence<'a> {
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
-            for row in rows {
-                evidence
-                    .requests
-                    .entry((root.as_str(), row.request_id.as_str()))
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some(row));
+            for (request_id, row) in unique_by_request(rows) {
+                evidence.requests.insert((root.as_str(), request_id), row);
             }
         }
-        // Only unique rows that pass the same integrity checks `classify`
-        // applies may establish a (login, org) pair.
         for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
-            let Some(login) = valid_login(row, key.0) else {
+            if !prove_membership(row, key.0, &mut evidence.memberships) {
                 evidence.invalid_logins.insert(key);
-                continue;
-            };
-            if let Some(org) = complete_org(row) {
-                evidence
-                    .memberships
-                    .entry(login.to_string())
-                    .or_default()
-                    .insert(org.to_string());
             }
         }
         for (root, rows) in &trace.evidence {
@@ -4496,6 +4590,17 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    /// The whole corpus's cross-root answers, for a pass whose reports hold
+    /// only the page roots: request roots and login memberships.
+    pub(crate) fn with_cross_root(
+        mut self,
+        cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
+    ) -> Self {
+        self.cross_request_roots = Some(&cross.request_roots);
+        self.memberships = cross.memberships.clone();
+        self
     }
 
     pub(crate) fn with_unhealthy_reasons(
@@ -4538,40 +4643,23 @@ impl<'a> ScanEvidence<'a> {
     }
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
-    fn request_root(&self, request_id: &str) -> Option<Option<&'a str>> {
-        let roots = self.request_roots.get_or_init(|| {
-            // Both maps are ordered by (root, request id); merging them
-            // yields each pair once.
-            let pairs = || {
-                let mut api = self.requests.keys().copied().peekable();
-                let mut trace = self.owners.keys().copied().peekable();
-                std::iter::from_fn(move || match (api.peek(), trace.peek()) {
-                    (Some(a), Some(t)) if a < t => api.next(),
-                    (Some(a), Some(t)) if a > t => trace.next(),
-                    (Some(_), Some(_)) => {
-                        trace.next();
-                        api.next()
-                    }
-                    (Some(_), None) => api.next(),
-                    (None, _) => trace.next(),
-                })
-            };
-            let mut roots = Vec::with_capacity(pairs().count());
-            roots.extend(pairs().map(|(root, request_id)| (request_id, Some(root))));
-            roots.sort_unstable();
-            roots.dedup_by(|later, kept| {
-                if later.0 != kept.0 {
-                    return false;
+    fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
+        let roots = match self.cross_request_roots {
+            Some(roots) => roots,
+            None => self.request_roots.get_or_init(|| {
+                let mut ids_by_root = BTreeMap::<&str, Vec<&str>>::new();
+                for &(root, id) in self.requests.keys().chain(self.owners.keys()) {
+                    ids_by_root.entry(root).or_default().push(id);
                 }
-                kept.1 = None;
-                true
-            });
-            roots
-        });
-        roots
-            .binary_search_by(|(known, _)| (*known).cmp(request_id))
-            .ok()
-            .map(|at| roots[at].1)
+                let mut roots = RequestRootIndex::default();
+                for (ordinal, ids) in (0..).zip(ids_by_root.into_values()) {
+                    roots.add_root(ordinal, ids.into_iter());
+                }
+                roots.finish();
+                roots
+            }),
+        };
+        roots.get(request_id)
     }
 
     /// Adds this scan's status-coverage copy: the `transcript_email` window
@@ -4655,7 +4743,7 @@ pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> Ac
     }))
 }
 
-/// The row's login when the row itself is intact: D1's capture, count,
+/// The row's login when the row itself is intact: the legacy account path's capture, count,
 /// fingerprint and account-origin checks. Ownership is checked separately.
 fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a str> {
     let login = row
@@ -4675,7 +4763,7 @@ fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a s
     .then_some(login)
 }
 
-/// D1's account check: each recorded origin must carry exactly this login.
+/// The legacy account path's check: each recorded origin must carry exactly this login.
 fn account_origin_matches(account: &ClaudeIdentityAttributeEvidence, login: &str) -> bool {
     let log = account.log_record_hash.as_deref();
     let resource = account.resource_hash.as_deref();
@@ -4810,7 +4898,7 @@ impl From<IdentityRef<'_>> for RequestIdentity {
     }
 }
 
-/// Owned classification, for the ruling tests.
+/// Owned classification, for the ownership tests.
 #[cfg(test)]
 pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) -> RequestIdentity {
     classify_ref(evidence, facts).into()
@@ -5230,7 +5318,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             request_id: request.request_id,
             // Auxiliary (telemetry-only) rows carry `observed_at`, which v2
             // OTLP capture may have taken from the observer clock and does not
-            // record which; as in D1 they cannot qualify. The trace span start
+            // record which; as in the legacy account path they cannot qualify. The trace span start
             // is event-origin but no existing rule qualifies it, and transcript
             // clocks are not theirs to borrow.
             terminal_unix_seconds: request
@@ -5464,7 +5552,7 @@ pub(super) fn full_rearm_requests_refused(
 /// request id) adds no row, token or money and is never placed, so its id
 /// neither counts nor refuses the item; it makes no claim. Any usage counted
 /// without an owned occurrence, or an occurrence the count skipped, still
-/// refuses. The census and D1 keep the plain request-id count guard.
+/// refuses. The census and the legacy account path keep the plain request-id count guard.
 fn transcript_requests_counted(item: &SnapshotItem) -> bool {
     let counted = item
         .claude_usage_occurrences
@@ -5476,8 +5564,8 @@ fn transcript_requests_counted(item: &SnapshotItem) -> bool {
         && u64::try_from(counted) == Ok(item.request_count)
 }
 
-/// The request-owner root for an item, as D1 derives it.
-fn owner_root(item: &SnapshotItem) -> Option<&str> {
+/// The request-owner root for an item, as the legacy account path derives it.
+pub(crate) fn owner_root(item: &SnapshotItem) -> Option<&str> {
     match item.source_session_id.split_once("_agent-") {
         Some((root, agent)) => (!root.is_empty() && !agent.is_empty()).then_some(root),
         None => {
@@ -5523,7 +5611,7 @@ pub(crate) fn apply_scan(
     outcome
 }
 
-/// Tag every eligible Claude item of this pass. Runs before D1, which leaves
+/// Tag every eligible Claude item of this pass. Runs before the legacy account path, which leaves
 /// new-collector items alone; ineligible items stay on today's path untouched.
 /// `reported` holds the groupings the reported rebuild produced this pass.
 pub(crate) fn apply_scan_with_ownership(
@@ -5801,7 +5889,7 @@ fn tag_item(
         {
             return None;
         }
-        // Single-account markerless bodies keep their established D1 wire
+        // Single-account markerless bodies keep their established account-path wire
         // shape. The account owner already tagged their final usage uniformly.
         if keeps_markerless_account(item) {
             return None;
@@ -5822,8 +5910,8 @@ fn tag_item(
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
         // Like `identity_retained`, only a receiver advertising option (ii)
         // retention mirrors the flag in its identity leaf (and only it holds
-        // proof to drop). Switch off sends no flag, so its bytes stay main's.
-        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+        // proof to drop).
+        if retained {
             grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
         }
         let invalidated = accepted
@@ -5894,9 +5982,9 @@ fn tag_item(
     // census nor an open fence makes those markers request-owned evidence.
     // Both grouping sources withdraw them before any identity is installed.
     grouping.withdraw_transcript_tags();
-    // D1 leaves new-collector items alone, so the backend UTC lifecycle
+    // The legacy account path leaves new-collector items alone, so the backend UTC lifecycle
     // spelling it applies to every item it qualifies happens here, inside the
-    // byte cap; an ineligible item returns to D1 exactly as it arrived.
+    // byte cap; an ineligible item returns to the legacy account path exactly as it arrived.
     let lifecycle = (
         item.source_started_at.clone(),
         item.source_ended_at.clone(),

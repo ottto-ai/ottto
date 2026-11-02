@@ -87,7 +87,7 @@ impl ClaudeProofCorrectionCandidate {
 
 /// Content-free counts of unbound Claude authority records dropped on load or
 /// save, of the indexed family members re-armed with them, and of demotions
-/// that found no current witness and so formed no record (SOURCE U3).
+/// that found no current witness and so formed no record.
 static CLAUDE_AUTHORITY_DROPS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static CLAUDE_AUTHORITY_DROP_REARMED_FILES: std::sync::atomic::AtomicUsize =
@@ -195,7 +195,7 @@ impl ScanIndex {
         }
     }
 
-    // SOURCE ruling: an unbound or ill-formed record fails closed alone, on
+    // An unbound or ill-formed record fails closed alone, on
     // load and on save, with its pending proof state. Terminal refusals and
     // the upload ledger stay. Its indexed members are re-armed, bounded by
     // family size, so the next pass re-reads the family and re-forms the
@@ -218,7 +218,7 @@ impl ScanIndex {
         }
         for root in &unbound {
             self.claude_usage_authority_quarantine.remove(root);
-            self.claude_usage_family_pending.remove(root);
+            self.claude_usage_family_pending.discard(root);
         }
         let mut rearmed = 0_usize;
         for (index_key, entry) in self.files.slots_mut() {
@@ -266,7 +266,7 @@ impl ScanIndex {
         );
     }
 
-    // M1: only the existing complete healthy census can retire absent grants.
+    // Only the existing complete healthy census can retire absent grants.
     fn retire_absent_claude_proof_corrections(
         &mut self,
         complete: &BTreeMap<String, BTreeSet<String>>,
@@ -302,7 +302,7 @@ impl ScanIndex {
         }
         for root in resolved {
             self.claude_usage_authority_quarantine.remove(&root);
-            self.claude_usage_family_pending.remove(&root);
+            self.claude_usage_family_pending.discard(&root);
         }
     }
 
@@ -449,7 +449,7 @@ impl ScanIndex {
         }
     }
 
-    // R2, the body-drain analogue of the A2 restore above: a drain certifies
+    // The body-drain analogue of the restore above: a drain certifies
     // only the revision and entity set the selected save keeps. Any other
     // selected entry leaves the member owed under the same proof with its
     // pre-drain pair. A record its last drain removed is re-bound with its
@@ -504,8 +504,7 @@ impl ScanIndex {
                 .insert(drain.root.clone(), record);
             if let Some(pending) = pending {
                 self.claude_usage_family_pending
-                    .entry(drain.root.clone())
-                    .or_insert(pending);
+                    .add_absent(drain.root.clone(), pending);
             }
         }
         let mut owed_again = false;
@@ -524,7 +523,7 @@ impl ScanIndex {
             owed_again = true;
             let previous = drain.previous.unwrap_or_else(|| {
                 // A valid record pairs every owed member; keep the debt with a
-                // domain-separated nonmatching revision, as A2 does.
+                // domain-separated nonmatching revision, as the restore does.
                 sha256_hex(&[
                     "claude_proof_body_drain_restore_missing_previous:v1",
                     &drain.revision,
@@ -594,12 +593,12 @@ impl ScanIndex {
                 .is_empty()
             {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
 
-    // M2 drains only local authority correction bookkeeping, never old entity
+    // This settlement drains only local authority correction bookkeeping, never old entity
     // or manifest debt. Partial checkpoint keeps its existing prior-entity rule.
     pub(crate) fn settle_empty_claude_proof_corrections(&mut self, result: &SourceScanResult) {
         if !result.census_complete || !self.claude_authority_proof_correction_pending() {
@@ -655,7 +654,7 @@ impl ScanIndex {
             correction.owed_member_ids.remove(&member);
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -695,7 +694,7 @@ impl ScanIndex {
             .collect::<BTreeMap<_, _>>();
         let mut candidates = Vec::new();
         for snapshot in &mut result.snapshots {
-            // E2 (gate on): an owed member's request-owned literal settles
+            // `e2` (gate on): an owed member's request-owned literal settles
             // its correction on the same exact ACK as a reported body.
             let settles = snapshot.usage_accounting_contract.as_deref()
                 == Some("session_exclusive_reported_usage:v1")
@@ -821,7 +820,7 @@ impl ScanIndex {
         });
     }
 
-    // D2: apply only after final file selection. Restoring a prior entity or
+    // Apply only after final file selection. Restoring a prior entity or
     // revision invalidates the current-page no-body evidence and keeps debt.
     pub(crate) fn settle_cutoff_claude_proof_corrections(
         &mut self,
@@ -862,7 +861,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
         }
@@ -986,18 +985,34 @@ impl ScanIndex {
             if !acked_or_rejected && !noop {
                 continue;
             }
-            for item in group.iter().filter(|item| rejected(item)) {
-                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
+            let rejected_bodies: Vec<&str> = group
+                .iter()
+                .filter(|item| rejected(item))
+                .map(|item| item.body_witness.as_str())
+                .collect();
+            // Cold: the drained family's pending is the preimage a revert
+            // restores, so it is loaded first. Unknown leaves this drain owed
+            // (counted); nothing of it is applied.
+            let roots = BTreeSet::from([candidate.root.clone()]);
+            if !drains.families.contains_key(&candidate.root)
+                && state_v2::load_usage(self, &roots).is_err()
+            {
+                continue;
+            }
+            let Ok(pending) = self.claude_usage_family_pending.family(&candidate.root) else {
+                continue;
+            };
+            let pending = pending.cloned();
+            for body_witness in rejected_bodies {
+                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={body_witness}");
             }
             drains
                 .families
                 .entry(candidate.root.clone())
                 .or_insert_with(|| {
                     (
-                        record.clone(),
-                        self.claude_usage_family_pending
-                            .get(&candidate.root)
-                            .cloned(),
+                        self.claude_usage_authority_quarantine[&candidate.root].clone(),
+                        pending,
                     )
                 });
             let record = self
@@ -1012,7 +1027,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             drains.drains.push(ClaudeProofBodyDrain {
                 root: candidate.root.clone(),

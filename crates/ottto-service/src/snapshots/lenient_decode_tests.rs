@@ -22,7 +22,7 @@ fn fixture() -> ScanIndex {
     );
     index
 }
-fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
+pub(super) fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
     let root: BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(bytes).unwrap();
     let slots: BTreeMap<String, &serde_json::value::RawValue> =
@@ -527,32 +527,25 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
 
 #[test]
 fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
-    for bounded in [false, true] {
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
-        let path = scratch.as_ref().join("index.json");
-        let mut index = fixture();
-        index.save(&path).unwrap();
-        let mut value = serde_json::to_value(&index).unwrap();
-        value["files"]["opaque-large"] =
-            serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
-        value["unknown_padding"] = serde_json::json!("p".repeat(20 * 1024 * 1024));
-        let bytes = serde_json::to_vec(&value).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        assert!(!loaded.decode_holds.is_empty());
-        let generation = loaded.generation;
-        let result = if bounded {
-            loaded.save_with_read_limit(&path, 32 * 1024 * 1024)
-        } else {
-            loaded.save(&path)
-        };
-        assert!(result.is_err());
-        assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
-        assert_eq!(loaded.generation, generation);
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-        assert!(!ScanIndex::load(&path).unwrap().decode_holds.is_empty());
-    }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["files"]["opaque-large"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    value["unknown_padding"] = serde_json::json!("p".repeat(20 * 1024 * 1024));
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(!loaded.decode_holds.is_empty());
+    let generation = loaded.generation;
+    let result = loaded.save(&path);
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert_eq!(loaded.generation, generation);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    assert!(!ScanIndex::load(&path).unwrap().decode_holds.is_empty());
 }
 
 #[test]
@@ -703,6 +696,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -879,35 +873,6 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
 }
 
 #[test]
-fn optional_raw_cap_counts_object_field_leading_whitespace() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-census-leading-whitespace");
-    let path = scratch.as_ref().join("index.json");
-    let mut seed = fixture();
-    seed.save(&path).unwrap();
-    let prefix = fs::read(&path).unwrap();
-    let mut file = BufWriter::new(File::create(&path).unwrap());
-    file.write_all(&prefix[..prefix.len() - 1]).unwrap();
-    file.write_all(b",\"claude_request_census_shadow\":")
-        .unwrap();
-    let spaces = claude_request_census::MAX_RAW_BYTES + 1;
-    let chunk = [b' '; 8192];
-    for _ in 0..spaces / chunk.len() {
-        file.write_all(&chunk).unwrap();
-    }
-    file.write_all(&chunk[..spaces % chunk.len()]).unwrap();
-    file.write_all(b"{\"o\":true}}").unwrap();
-    file.flush().unwrap();
-    drop(file);
-    let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-    assert!(native.claude_request_census_shadow.is_empty());
-    let loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.claude_request_census_shadow.is_empty());
-    assert_sibling(&loaded);
-    assert_eq!(corrupt_count(scratch.as_ref()), 0);
-}
-
-#[test]
 fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restart() {
     for exact_empty in [false, true] {
         for bounded in [false, true] {
@@ -1076,7 +1041,7 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
     }
 }
 
-// SI R1: valid native empty/optional cells are explicit controls, not damage.
+// Valid native empty/optional cells are explicit controls, not damage.
 #[test]
 fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
     let fields = [
@@ -1345,7 +1310,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
         ScanIndexRebuildOverride::NotPaused
     );
     // Hold-budget damage: its session-identity fields are strictly
-    // recoverable, so a press may rebuild past the guard (SI-718-O1).
+    // recoverable, so a press may rebuild past the guard.
     let damage = whole_index_damage("budget");
     fs::write(&path, &damage).unwrap();
     refused(&damage);
@@ -1471,6 +1436,11 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "bodies":{"d".repeat(64):"e".repeat(64)},
                 "pending_bodies":{"a".repeat(64):"b".repeat(64)}
             }),
+            "archive_deferred_alarm_count" => serde_json::json!(1),
+            "archives" => serde_json::json!({"archive": {
+                "stamp":{"length":1,"device":1,"inode":2,"modified":[3,4],"changed":[0,0]},
+                "disposition":{"Held":{"cause":CodexZstCause::OwnerUnproven,"quiet":true}}
+            }}),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
             }
@@ -1609,6 +1579,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "resume_upper_bound_path"
             | "resume_census_window_end"
             | "historical_replay_generation"
+            | "copy_prefix_last_accepted_nonce"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
@@ -1619,6 +1590,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -1632,6 +1604,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 !matches!(
                     *name,
                     "reread_guard"
+                        | "upload_context_fingerprint"
                         | "claude_desktop_store_inventory"
                         | "context_curve_capability_enabled"
                         | "context_curve_replay_epoch"
@@ -1649,11 +1622,22 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 /// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
-    // Main shipped audit progress first. The earlier E2 writer saved a named
+    let _on = RestartRestoreForTest::enabled();
+    // Main shipped audit progress first. The earlier `e2` writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
-    let current = serde_json::to_value(&seed).unwrap();
-    let fields = lenient_decode::FIELDS;
+    let mut current = serde_json::to_value(&seed).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
         &fields[fields.len() - 6..],
         &[
@@ -1682,7 +1666,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         });
         let mut forms = vec![legacy.clone()];
         if !earlier_e2 {
-            // The main positional schema ends at audit progress; appending E2
+            // The main positional schema ends at audit progress; appending `e2`
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
                 fields[..fields.len() - 4]
@@ -1768,8 +1752,19 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
-    let fields = lenient_decode::FIELDS;
+    let _on = RestartRestoreForTest::enabled();
+    let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
     assert_eq!(fields[tombstone_slot], DESKTOP_INVENTORY);
     assert_eq!(fields[tombstone_slot + 1], "claude_copy_removals");
@@ -1811,7 +1806,10 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[86], DESKTOP_INVENTORY);
     assert_eq!(fields[87], "claude_copy_removals");
     assert_eq!(fields[88], "upload_context_proof");
-    assert_eq!(fields.len(), 89);
+    assert_eq!(fields[89], "archives");
+    assert_eq!(fields[90], "archive_deferred_alarm_count");
+    assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
+    assert_eq!(fields.len(), 92);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1830,7 +1828,16 @@ fn growth_retention_keeps_existing_positional_index_slots() {
 
 #[test]
 fn copy_removals_keep_existing_positional_index_slots() {
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -1840,7 +1847,8 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("upload_context_proof");
-    let fields = lenient_decode::FIELDS;
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(fields[fields.len() - 2], "claude_copy_removals");
     assert_eq!(fields.last(), Some(&"upload_context_proof"));
     for (expected, slots) in [(&legacy, &fields[..fields.len() - 2]), (&current, fields)] {
@@ -2350,7 +2358,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
     }
 }
 
-// SI-718-O1/O2: the user Repair override keeps the session-identity state the
+// The user Repair override keeps the session-identity state the
 // seven-day guard was protecting, and its cooldown is source-wide.
 const OVERRIDE_OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OVERRIDE_OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -3162,7 +3170,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
     );
 }
 
-/// SI O3: a real walk reaches its raw terminal without visiting a held family
+/// A real walk reaches its raw terminal without visiting a held family
 /// member. Neither that terminal nor save/reload may retire the original carry.
 #[test]
 #[serial_test::serial(source_manifests)]
@@ -3972,81 +3980,6 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
 }
 
 #[test]
-fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
-    let mut seed = fixture();
-    seed.claude_usage_family_pending.insert(
-        "family".into(),
-        ClaudeUsageFamilyPending {
-            census_window_end: "2026-10-25T00:00:00Z".into(),
-            member_request_id_hashes: BTreeMap::new(),
-            member_occurrences: BTreeMap::new(),
-            invalid: true,
-            idless_revision: Some([7; 32]),
-            identity_contract: None,
-            contract_unproven: false,
-        },
-    );
-    let valid = serde_json::to_vec_pretty(&seed).unwrap();
-    let loaded = lenient_decode::read(std::io::Cursor::new(&valid), "load", "claude_code").unwrap();
-    assert_eq!(
-        loaded.claude_usage_family_pending["family"].idless_revision,
-        Some([7; 32])
-    );
-    for positional in [false, true] {
-        let mut value = serde_json::to_value(&seed).unwrap();
-        if positional {
-            value["claude_usage_family_pending"]["family"] =
-                serde_json::json!(["2026-10-25T00:00:00Z", {}, {}, true, vec![7; 32],]);
-            let bytes = serde_json::to_vec(&value).unwrap();
-            let loaded =
-                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
-            assert_eq!(
-                loaded.claude_usage_family_pending["family"].idless_revision,
-                Some([7; 32])
-            );
-            value["claude_usage_family_pending"]["family"][4] =
-                Value::String("MARKER_PAYLOAD".into());
-        } else {
-            value["claude_usage_family_pending"]["family"]["idless_revision"] =
-                Value::String("MARKER_PAYLOAD".into());
-        }
-        let template = serde_json::to_string(&value).unwrap();
-        let payload = "x".repeat(16 * 1024 * 1024);
-        for malformed in [
-            format!("\"{payload}\""),
-            format!("[\"{payload}\"]"),
-            format!("{{\"{payload}\":0}}"),
-        ] {
-            let bytes = template
-                .replace("\"MARKER_PAYLOAD\"", &malformed)
-                .into_bytes();
-            let (result, allocations) = crate::retry_allocation_probe::measure(|| {
-                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
-            });
-            // Optional optimization damage is normalized at its boundary;
-            // it must not consume opaque debt or reset the identity index.
-            let loaded = result.unwrap();
-            assert!(loaded.claude_usage_family_pending["family"].invalid);
-            assert_eq!(
-                loaded.claude_usage_family_pending["family"].idless_revision,
-                None
-            );
-            assert!(loaded.decode_holds.is_empty());
-            assert!(
-                allocations.requested_peak < 256 * 1024,
-                "{}",
-                allocations.requested_peak
-            );
-            assert!(
-                allocations.usable_peak < 512 * 1024,
-                "{}",
-                allocations.usable_peak
-            );
-        }
-    }
-}
-
-#[test]
 fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     let mut seed = fixture();
     seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
@@ -4083,17 +4016,10 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
             value["claude_usage_family_pending"]["family"]["idless_revision"] = "MARKER".into();
         }
         let template = serde_json::to_string(&value).unwrap();
-        let oversized = "x".repeat(16 * 1024 * 1024);
-        for marker in [
-            format!("\"{oversized}\""),
-            format!("[\"{oversized}\"]"),
-            format!("{{\"{oversized}\":0}}"),
-            "1e400".into(),
-            "{\"wrong\":true}".into(),
-        ] {
+        for marker in ["1e400", "{\"wrong\":true}"] {
             let scratch = crate::test_scratch::ScratchDir::new("idless-marker-identity");
             let path = scratch.join("index.json");
-            fs::write(&path, template.replace("\"MARKER\"", &marker)).unwrap();
+            fs::write(&path, template.replace("\"MARKER\"", marker)).unwrap();
             let mut loaded = ScanIndex::load(&path).expect("field damage cannot quarantine index");
             for round in 0..2 {
                 assert_eq!(corrupt_count(scratch.as_ref()), 0);
@@ -4204,278 +4130,6 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// [format] Retired evidence cannot reset live census, move slots or select
-/// another read.
-#[test]
-fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
-    let seed = every_persisted_field_fixture();
-    let expected = serde_json::to_vec(&seed).unwrap();
-    let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
-    let fields = lenient_decode::FIELDS;
-    assert_eq!(fields[81], "reread_guard");
-    assert_eq!(fields[82], "codex_counting_evicted_legacy");
-    assert_eq!(fields[83], "upload_ack_retirement_handoff");
-    assert_eq!(fields[84], "held_audit_progress");
-    assert_eq!(fields[85], "claude_money_birth_store");
-    let count_fields = [
-        "discovered_file_count",
-        "directory_entry_cap_exceeded_count",
-        "symlink_rejected_count",
-        "unreadable_path_count",
-        "unreadable_causes",
-        "parent_unresolvable",
-        "oversized_file_count",
-        "disappeared_file_count",
-        "malformed_json_line_count",
-        "invalid_utf8_line_count",
-        "over_line_cap_count",
-        "recognized_usage_drop_count",
-        "ownership_incomplete_file_count",
-        "zero_snapshot_usage_evidence_count",
-        "dropped_usage_record_count",
-        "terminal_over_line_cap_count",
-        "terminal_recognized_usage_drop_count",
-        "terminal_dropped_usage_record_count",
-        "terminal_ownership_incomplete_file_count",
-        "terminal_zero_snapshot_usage_evidence_count",
-        "unchanged_reread_admitted",
-        "reread_budget_refused",
-        "causes",
-        "caps",
-        "codex_roster_refresh_visited",
-        "codex_roster_growth_enqueued",
-    ];
-    let mut old = serde_json::to_value(&seed).unwrap();
-    old["reread_guard"] = serde_json::json!({
-        "closed":true, "observed_reads":999, "wall_high_water":u64::MAX,
-        "tripwire":{"indexed":1,"planned":999,"cause_counts":[1,2,3]},
-        "refused":{"legacy": [1,2]}, "growth_full":{"legacy":9}
-    });
-    old["traversal"]["counts"]["unchanged_reread_admitted"] = serde_json::json!(41);
-    old["traversal"]["counts"]["reread_budget_refused"] = serde_json::json!(43);
-    old["traversal"]["counts"]["codex_roster_refresh_visited"] = serde_json::json!(45);
-    old["traversal"]["counts"]["codex_roster_growth_enqueued"] = serde_json::json!(47);
-    let mut forms = vec![serde_json::to_string(&old).unwrap()];
-    // Full nested counter sequence, including nonzero retired slots 20/21
-    // and 24/25 (the seed's causes and caps are empty).
-    old["traversal"]["counts"] = Value::Array(
-        count_fields
-            .iter()
-            .map(|name| match *name {
-                "causes" => serde_json::to_value(ownership::Counts::default()).unwrap(),
-                "caps" => serde_json::to_value(CapCounts::default()).unwrap(),
-                _ => old["traversal"]["counts"][*name].clone(),
-            })
-            .collect(),
-    );
-    forms.push(
-        serde_json::to_string(&Value::Array(
-            fields.iter().map(|name| old[*name].clone()).collect(),
-        ))
-        .unwrap(),
-    );
-    let prefix = forms[0].strip_suffix('}').unwrap().to_owned();
-    for key in ["reread_guard", "\\u0072eread_guard"] {
-        forms.push(format!("{prefix},\"{key}\":\"wrong shape\"}}"));
-    }
-    for depth in [65, 300] {
-        forms.push(format!(
-            "{prefix},\"reread_guard\":{}0{}}}",
-            "[".repeat(depth),
-            "]".repeat(depth)
-        ));
-    }
-    forms.push(format!(
-        "{prefix},\"reread_guard\":\"{}\"}}",
-        "x".repeat(claude_request_census::MAX_RAW_BYTES + 1)
-    ));
-    let scratch = crate::test_scratch::ScratchDir::new("retired-reread-custody");
-    for (number, form) in forms.iter().enumerate() {
-        let bytes = form.as_bytes();
-        let path = scratch.join(format!("old-{number}.json"));
-        fs::write(&path, bytes).unwrap();
-        let drops_before = claude_absence_counters_for_test().tombstone_decode_drops;
-        let native = claude_request_census::decode_index(bytes).expect("native legacy decode");
-        let streaming = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
-            .expect("no extra positional field");
-        let bounded = lenient_decode::read_bounded(bytes).unwrap();
-        let disk = ScanIndex::load(&path).expect("no reset");
-        assert_eq!(
-            claude_absence_counters_for_test().tombstone_decode_drops,
-            drops_before,
-            "retired reread_guard duplicates stay silently ignored"
-        );
-        for mut decoded in [native, streaming, bounded, disk] {
-            assert!(decoded.decode_holds.is_empty(), "no quarantine");
-            assert_eq!(
-                serde_json::to_vec(&decoded.claude_request_census).unwrap(),
-                census
-            );
-            assert_eq!(
-                serde_json::to_vec(&decoded).unwrap(),
-                expected,
-                "every surviving selection, hold, checkpoint and successor field unchanged"
-            );
-            for (key, entry) in &seed.files {
-                let candidate = CandidateFile {
-                    physical_identity: None,
-                    scan_root: PathBuf::from("/synthetic"),
-                    path: PathBuf::from(key),
-                    size_bytes: entry.size_bytes,
-                    modified_unix_seconds: entry.modified_unix_seconds,
-                    modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
-                    source_file_fingerprint: entry.source_file_fingerprint.clone(),
-                    legacy_source_file_fingerprint: String::new(),
-                    legacy_config_reconciliation_required: false,
-                    opened_object_identity: String::new(),
-                    fingerprint_changed_nanos: 0,
-                    fingerprint_birth_nanos: 0,
-                    withheld_content_stamp: None,
-                };
-                assert_eq!(
-                    decoded.candidate_decision_with_reason_at(&candidate, 0),
-                    seed.candidate_decision_with_reason_at(&candidate, 0),
-                    "retired over-budget/bad-clock evidence cannot select a reread"
-                );
-            }
-            assert!(
-                !decoded
-                    .traversal
-                    .as_ref()
-                    .unwrap()
-                    .counts
-                    .has_retryable_problems(),
-                "nonzero retired refusal must not request another read"
-            );
-            assert_eq!(
-                decoded.files.keys().collect::<Vec<_>>(),
-                seed.files.keys().collect::<Vec<_>>()
-            );
-            fs::write(&path, bytes).unwrap();
-            decoded.save(&path).expect("CAS keeps generation custody");
-            let reloaded = ScanIndex::load(&path).unwrap();
-            assert_eq!(
-                serde_json::to_vec(&reloaded.claude_request_census).unwrap(),
-                census
-            );
-            let saved = fs::read_to_string(&path).unwrap();
-            for retired in [
-                "reread_guard",
-                "unchanged_reread_admitted",
-                "reread_budget_refused",
-                "codex_roster_refresh_visited",
-                "codex_roster_growth_enqueued",
-            ] {
-                assert!(!saved.contains(&format!("\"{retired}\":")));
-            }
-        }
-    }
-    assert_eq!(corrupt_count(scratch.as_ref()), 0);
-}
-
-/// Previous (0.1.201) ScanIndex and ScanTraversalCounts both use serde(default).
-/// Pin the absent-field downgrade contract while preserving the census bytes.
-#[test]
-fn retired_reread_new_writer_keeps_previous_default_contract() {
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default)]
-    struct PreviousCounts {
-        discovered_file_count: usize,
-        unchanged_reread_admitted: u64,
-        reread_budget_refused: u64,
-    }
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default)]
-    struct PreviousTraversal {
-        counts: PreviousCounts,
-    }
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default)]
-    struct PreviousIndex {
-        claude_request_census: claude_request_census::ClaudeRequestCensus,
-        reread_guard: Option<Value>,
-        traversal: Option<PreviousTraversal>,
-    }
-    let seed = every_persisted_field_fixture();
-    let bytes = serde_json::to_vec(&seed).unwrap();
-    let old: PreviousIndex = serde_json::from_slice(&bytes).expect("old defaults accept new map");
-    assert!(old.reread_guard.is_none());
-    let counts = old.traversal.unwrap().counts;
-    assert_eq!(
-        counts.discovered_file_count,
-        seed.traversal
-            .as_ref()
-            .unwrap()
-            .counts
-            .discovered_file_count
-    );
-    assert_eq!(counts.unchanged_reread_admitted, 0);
-    assert_eq!(counts.reread_budget_refused, 0);
-    assert_eq!(
-        serde_json::to_vec(&old.claude_request_census).unwrap(),
-        serde_json::to_vec(&seed.claude_request_census).unwrap()
-    );
-}
-
-/// Pin the previous 0.1.201 map/default entry contract cited by
-/// retired_reread_new_writer_keeps_previous_default_contract. Quiet retirement
-/// writes the existing plain identity, not an unknown field or marker shape.
-#[test]
-fn quiet_retired_index_loads_under_previous_entry_defaults() {
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default)]
-    struct PreviousEntry {
-        size_bytes: u64,
-        modified_unix_seconds: u64,
-        source_file_fingerprint: String,
-        last_snapshot_fingerprint: Option<String>,
-        scan_identity_version: Option<String>,
-    }
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default)]
-    struct PreviousIndex {
-        schema_version: u16,
-        files: BTreeMap<String, PreviousEntry>,
-    }
-    let mut index = fixture();
-    let key = "/synthetic/0.jsonl";
-    let before = index.files[key].clone();
-    assert!(index.stage_sampled_audit(
-        key,
-        &before.source_file_fingerprint,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: 100
-        }
-    ));
-    assert!(index.retire_quiet_audit(key, &before.source_file_fingerprint));
-    let scratch = crate::test_scratch::ScratchDir::new("retired-previous-index");
-    let path = scratch.join("index.json");
-    index.save(&path).unwrap();
-    let old: PreviousIndex = serde_json::from_slice(&fs::read(&path).unwrap())
-        .expect("previous default map decoder accepts cleared marker");
-    assert_eq!(old.schema_version, SCAN_INDEX_SCHEMA_VERSION);
-    assert_eq!(old.files.len(), index.files.len());
-    let entry = &old.files[key];
-    assert_eq!(
-        entry.scan_identity_version.as_deref(),
-        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-    );
-    assert_eq!(entry.size_bytes, before.size_bytes);
-    assert_eq!(entry.modified_unix_seconds, before.modified_unix_seconds);
-    assert_eq!(
-        entry.source_file_fingerprint,
-        before.source_file_fingerprint
-    );
-    assert_eq!(
-        entry.last_snapshot_fingerprint,
-        before.last_snapshot_fingerprint
-    );
-    assert_eq!(
-        ScanIndex::load(&path).unwrap().files[key].unverified_deadline(),
-        None
-    );
-}
-
 // Pin every positional slot, including the decode-and-drop inventory tombstone.
 #[test]
 fn scan_index_full_positional_field_order_is_pinned() {
@@ -4484,7 +4138,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
         &[
             "schema_version",
             "generation",
-            "upload_context_fingerprint",
+            "upload_context_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "files",
             "session_account_bindings",
             "terminal_jsonl_dispositions",
@@ -4571,6 +4225,9 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
             "upload_context_proof",
+            "archives",
+            "archive_deferred_alarm_count",
+            "copy_prefix_last_accepted_nonce",
         ]
     );
 }

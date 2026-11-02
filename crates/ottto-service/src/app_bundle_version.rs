@@ -220,16 +220,10 @@ mod tests {
     use super::*;
     use crate::test_scratch;
 
-    struct Scratch(PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct Scratch(test_scratch::ScratchDir);
 
     fn scratch() -> Scratch {
-        Scratch(test_scratch::private_dir("ottto-app-bundle-version"))
+        Scratch(test_scratch::ScratchDir::new("ottto-app-bundle-version"))
     }
 
     fn write_bundle(bundle: &Path, info_plist: &str) {

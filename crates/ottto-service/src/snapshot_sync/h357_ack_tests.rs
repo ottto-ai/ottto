@@ -348,7 +348,6 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: deferred_entity_state(false),
         },
         false,
-        false,
     )
     .unwrap();
     assert_eq!(partial.last_uploaded_count, 43);
@@ -367,7 +366,6 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             },
             state: CollectorState::Success,
         },
-        false,
         false,
     )
     .unwrap();
@@ -513,18 +511,15 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (ledger, outcome, accepted) = h359_all_rejected("invalid");
+    let (ledger, _, accepted) = h359_all_rejected("invalid");
     let now = Instant::now();
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
     for _ in 0..8 {
         cadence.record_scan_failure(now);
     }
-    record_finished_snapshot_cadence(
-        &mut cadence,
-        now,
-        accepted,
-        matches!(outcome, ResumableUploadResult::Deferred { .. }),
-    );
+    // Finish records every finished cycle this way (pinned end to end by the
+    // real-finish entity-conflict test).
+    cadence.record_scan_success(now, accepted);
     assert_eq!(cadence.state(), ottto_protocol::LocalCollectorState::Idle);
     let status = collector_status_request(
         "h359-synthetic",
@@ -536,7 +531,6 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
-        false,
     )
     .unwrap();
     assert_eq!(status.last_uploaded_count, 0);
@@ -844,7 +838,7 @@ fn h360_quarantined_probe_carries_exact_held_body_without_request() {
         let fp = probes[0].snapshot_fingerprint.clone();
         let body = snapshot_upload_body_witness(&probes[0]);
         let mut ledger = progress();
-        ledger.quarantine_retryable_body(&fp, &body);
+        ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
         let record = ledger.quarantined_fingerprints.get_mut(&fp).unwrap();
         record.disposition = disposition;
         if disposition != SnapshotQuarantineDisposition::RetryPending {
@@ -960,7 +954,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     std::fs::create_dir_all(&dir).unwrap();
     let progress_path = dir.join("progress.json");
     let mut ledger = progress();
-    ledger.quarantine_retryable_body(&held_fp, &held_body);
+    ledger.quarantine_retryable_body(&held_fp, &held_body, quarantine_retry_after(&held_fp));
     let mut calls = Vec::new();
     let deferred = bootstrap_cache_heads(
         &probes,
@@ -1442,14 +1436,18 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
     ] {
         let mut ledger = progress();
         match case {
-            "cache_bearing_body" => {
-                ledger.quarantine_retryable_body(&fp, &snapshot_upload_body_witness(&cache_bearing))
-            }
-            "older_body" => {
-                ledger.quarantine_retryable_body(&fp, &snapshot_upload_body_witness(&older))
-            }
+            "cache_bearing_body" => ledger.quarantine_retryable_body(
+                &fp,
+                &snapshot_upload_body_witness(&cache_bearing),
+                quarantine_retry_after(&fp),
+            ),
+            "older_body" => ledger.quarantine_retryable_body(
+                &fp,
+                &snapshot_upload_body_witness(&older),
+                quarantine_retry_after(&fp),
+            ),
             "witnessless" => {
-                ledger.quarantine_retryable_body(&fp, &body);
+                ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
                 ledger
                     .quarantined_fingerprints
                     .get_mut(&fp)
@@ -1457,7 +1455,7 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
                     .upload_body_witness = None;
             }
             "leased" => {
-                ledger.quarantine_retryable_body(&fp, &body);
+                ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
                 ledger
                     .quarantined_fingerprints
                     .get_mut(&fp)
@@ -1735,6 +1733,7 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
     restarted.quarantine_retryable_body(
         &probe.snapshot_fingerprint,
         &snapshot_upload_body_witness(&probe),
+        quarantine_retry_after(&probe.snapshot_fingerprint),
     );
     let mut carried = vec![item];
     assert_eq!(
@@ -1767,7 +1766,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     let index_path = dir.join("index.json");
     let progress_path = dir.join("progress.json");
     let mut ledger = progress();
-    ledger.quarantine_retryable_body(&fp, &body);
+    ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
     // Completed-cycle commit: the index keeps the exact record, the ledger retires.
     let mut index = ScanIndex::default();
     index
@@ -1888,6 +1887,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         &ledger,
         &holds,
         true,
+        None,
     );
     assert!(!settlement.fully_settled);
     let refusals = PermanentRefusalCounts::of(&ledger);
@@ -1922,7 +1922,11 @@ fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
 fn a_pending_newer_body_unbinds_its_dominated_refusal() {
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
-    ledger.quarantine_retryable_body(&format!("{:064x}", 0), "newer-body-0");
+    ledger.quarantine_retryable_body(
+        &format!("{:064x}", 0),
+        "newer-body-0",
+        quarantine_retry_after(&format!("{:064x}", 0)),
+    );
     let refusals = PermanentRefusalCounts::of(&ledger);
     assert_eq!(
         refusals,

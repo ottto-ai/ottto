@@ -1,12 +1,14 @@
-//! Committed, content-free membership for R1's restart-record erasure sweep.
+//! Committed, content-free membership for the restart-record erasure sweep.
 use super::*;
 use crate::durable_tail_store::DurableSource;
-use crate::snapshots::scan_index_persistence::Source;
 use std::collections::BTreeSet;
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "R1 consumes these staged sweep result fields")
+    expect(
+        dead_code,
+        reason = "the restart-record sweep consumes these staged result fields"
+    )
 )]
 #[derive(Debug)]
 pub(crate) struct LiveKeys {
@@ -41,7 +43,7 @@ impl LiveKeys {
     not(test),
     expect(
         dead_code,
-        reason = "R1 integrates this committed-membership seam in its sweep"
+        reason = "the restart-record sweep uses this store for committed membership"
     )
 )]
 pub(crate) fn live_key_digests(index_path: &Path) -> Result<LiveKeys> {
@@ -54,12 +56,13 @@ fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     else {
         return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
-    let source = match binding.source {
-        Source::Claude => DurableSource::ClaudeCode,
-        Source::Codex => DurableSource::Codex,
-        // No Pi key mapping yet: never vouch for an empty set (a sweep would
-        // erase every Pi record once Pi gains restart records). Map with Pi-ON.
-        Source::Pi => return Ok(LiveKeys::incomplete(IncompleteReason::Off)),
+    // A source the store does not serve (no row, or a row without `state_v2`)
+    // never vouches for an empty set: a sweep would erase every record it
+    // later gains.
+    let Some(source) = DurableSource::from_snapshot(binding.source.snapshot())
+        .filter(|source| source.properties().state_v2)
+    else {
+        return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
     let route = {
         let states = states().lock().map_err(|_| Hold::DbUnavailable)?;

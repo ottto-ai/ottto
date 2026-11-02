@@ -30,7 +30,7 @@ pub(in crate::snapshots) const SIDE_LEDGER_BYTES: usize = (MAX_SIDE_LEDGER + 1)
 const _: () = assert!(size_of::<LedgerKey>() == 48);
 const _: () = assert!(size_of::<LedgerEntry>() <= 96);
 const _: () = assert!(size_of::<Option<GateSlot>>() <= 48);
-/// D5′: the ledger's inline tables (gate slots, seen namespaces, the map
+/// The ledger's inline tables (gate slots, seen namespaces, the map
 /// head, counters) are inside `size_of::<SharedCache>()`, which every
 /// whole-cache bound charges beside `SIDE_LEDGER_BYTES`; this pins their size.
 const _: () = assert!(size_of::<SideLedger>() <= 576);
@@ -82,7 +82,7 @@ pub(in crate::snapshots) enum LedgerTag {
 pub(in crate::snapshots) struct LedgerEntry {
     pub(in crate::snapshots) tag: LedgerTag,
     pub(in crate::snapshots) attempts: u8,
-    /// D5′: the ledger's stamp for the last write (`SideLedger::next_wseq`;
+    /// The ledger's stamp for the last write (`SideLedger::next_wseq`;
     /// 0 = never stamped, which no save covers).
     pub(in crate::snapshots) wseq: u32,
     /// `Short` only.
@@ -186,10 +186,10 @@ pub(in crate::snapshots) struct GateSlot {
     saved: bool,
     last_pass_unix: u64,
     last_saved_unix: u64,
-    /// D5′ custody: the stamp this slot was placed with. A save mark binds
+    /// Custody: the stamp this slot was placed with. A save mark binds
     /// to it, so a callback for a replaced or re-placed slot moves nothing.
     incarnation: u32,
-    /// D5′: the highest save mark of a successful selected save (full or a
+    /// The highest save mark of a successful selected save (full or a
     /// partial checkpoint) of this slot; entries stamped at or below it are
     /// on disk. 0 = no proven save.
     saved_wseq: u32,
@@ -197,7 +197,7 @@ pub(in crate::snapshots) struct GateSlot {
     full_saved_wseq: u32,
 }
 
-/// D5′: what a selected save may later prove, read immediately before the
+/// What a selected save may later prove, read immediately before the
 /// call that assembles its content. Bound to the namespace and to its slot's
 /// incarnation; `wseq` is the last stamp issued (`None` once exhausted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,7 +235,7 @@ pub(in crate::snapshots) struct SideLedger {
     pass_seq: u32,
     /// Namespaces seen by this process (0 = empty).
     seen_ns: [u128; GATE_SLOTS],
-    /// D5′: the last stamp issued, for entry writes and slot placements.
+    /// The last stamp issued, for entry writes and slot placements.
     wseq: u32,
     /// Sticky: the stamp ran out; from then on no save covers anything.
     wseq_exhausted: bool,
@@ -285,7 +285,7 @@ impl SideLedger {
         self.gate.iter_mut().flatten().find(|slot| slot.ns == ns)
     }
 
-    /// D5′: a fresh stamp. Checked: once it runs out the ledger is
+    /// A fresh stamp. Checked: once it runs out the ledger is
     /// exhausted for the process and every later stamp is 0 (uncertain).
     fn next_wseq(&mut self) -> u32 {
         match self.wseq.checked_add(1) {
@@ -300,7 +300,7 @@ impl SideLedger {
         }
     }
 
-    /// D5′ C15 capture: read immediately before the call that assembles and
+    /// Capture: read immediately before the call that assembles and
     /// writes the selected save, so every entry stamped at or below it was
     /// written into the index that save serializes.
     pub(in crate::snapshots) fn save_mark(&self, ns: u128) -> SaveMark {
@@ -312,7 +312,7 @@ impl SideLedger {
         }
     }
 
-    /// D5′ (c): a successful selected save of this slot already holds the
+    /// A successful selected save of this slot already holds the
     /// entry. Exhaustion, an unstamped entry, no slot or no proven save: no.
     fn saved_covers(&self, ns: u128, entry: &LedgerEntry) -> bool {
         !self.wseq_exhausted
@@ -482,7 +482,7 @@ impl SideLedger {
     }
 
     fn evict_one(&mut self, caller: u128, now: u64) -> bool {
-        // D5′: lossless only when a full save of the slot proves the entry.
+        // Lossless only when a full save of the slot proves the entry.
         let lossless = self
             .entries
             .iter()
@@ -592,9 +592,9 @@ impl SideLedger {
         }
     }
 
-    /// D6(b) (row 32): the epoch prune may drop the request `key` names only
+    /// The epoch prune may drop the request `key` names only
     /// when no charge here is unproven: no entry, or one a successful
-    /// selected save of its slot holds (D5′). An in-flight read's G7 charge
+    /// selected save of its slot holds. An in-flight read's G7 charge
     /// is unsaved, so its request stays.
     pub(in crate::snapshots) fn prunable(&self, key: &LedgerKey) -> bool {
         self.entries
@@ -708,7 +708,7 @@ impl SideLedger {
     ) {
         let requests = &index.codex_parent_side_requests;
         let records = &index.codex_parent_side;
-        // D5′: the different-object terms prune only an entry a successful
+        // The different-object terms prune only an entry a successful
         // selected save of this slot proves; anything uncertain is kept and
         // hydrated (the kept entry is the pacing).
         let covered = self
@@ -777,7 +777,7 @@ impl SideLedger {
                 }
             }
             let entry = match entry.tag {
-                // D5′: this key's generation ended, so only this object's
+                // This key's generation ended, so only this object's
                 // request goes; a replacement's request (another key of the
                 // same P, hydrated in either key order) stays.
                 LedgerTag::Gone => {
@@ -805,7 +805,7 @@ impl SideLedger {
                 }
                 _ => entry,
             };
-            // D6(b): the loaded same-object request's epoch survives the
+            // The loaded same-object request's epoch survives the
             // hydrate; none (a lost save) is 0, unknown, never pruned.
             let epoch = index
                 .codex_parent_side_requests
@@ -873,7 +873,8 @@ mod tests {
         assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
         assert_eq!(bound(&empty, usize::MAX).is_some(), layout_supported());
         if layout_supported() {
-            // The term is exactly the constant: one visit, no walk.
+            // The ledger remains a constant, lock-free term. The optional
+            // store root also reserves main's inline bytes without a walk.
             let mut with = Counter::new(usize::MAX);
             crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty, &mut with).unwrap();
             let mut without = Counter::new(usize::MAX);
@@ -888,7 +889,10 @@ mod tests {
                 &mut without,
             )
             .unwrap();
-            assert_eq!(with.bytes, without.bytes + SIDE_LEDGER_BYTES);
+            assert_eq!(
+                with.bytes + size_of::<SharedCache>(),
+                without.bytes + SIDE_LEDGER_BYTES + super::super::OFF_MAIN_SHARED_BYTES
+            );
         }
         // Held lock: heap_bound still answers.
         let held = full.side_ledger();
@@ -1019,7 +1023,7 @@ mod tests {
             };
             let entry = LedgerEntry::of_request(&request);
             assert_eq!(entry.request((3, 4), 7), Some(request));
-            // D6(b): the epoch is index-only; the projection ignores it.
+            // The epoch is index-only; the projection ignores it.
             assert_eq!(
                 LedgerEntry::of_request(&SideRequest {
                     referenced_epoch: 0,
@@ -1289,7 +1293,7 @@ mod tests {
         .unwrap()
     }
 
-    /// D3: the record terms of C14. (dev, ino) equality is identity only:
+    /// The record terms. (dev, ino) equality is identity only:
     /// the stub moves onto a record, and (b) prunes, only when the record's
     /// seal also covers `needed_extent` (and, for (b), its pace covers the
     /// stub).
@@ -1397,7 +1401,7 @@ mod tests {
         assert!(!index.codex_parent_side_requests.contains_key("/cover"));
     }
 
-    /// D5′ controls: one parent `P` replaced between objects.
+    /// Controls: one parent `P` replaced between objects.
     const P: &str = "/p.jsonl";
 
     fn pkey(ns: u128, ino: u64) -> LedgerKey {
@@ -1466,7 +1470,7 @@ mod tests {
             .collect()
     }
 
-    /// D5′ (i), U-T60(d)(xvii): a replace before a failed save. The new
+    /// A replace before a failed save. The new
     /// key's charge is kept and hydrated with its attempts (no reset), and
     /// the old key's `Gone` removes nothing of the replacement's, in both
     /// key orders.
@@ -1501,7 +1505,7 @@ mod tests {
         }
     }
 
-    /// D5′ (ii), the parent's counterexample: a partial save, then a replace
+    /// The parent's counterexample: a partial save, then a replace
     /// and a charge in the same pass, then a failed full save. The partial
     /// save's mark does not cover the later charge.
     #[test]
@@ -1531,7 +1535,7 @@ mod tests {
         }
     }
 
-    /// D5′ (iii) and (iii′): a saved replacement prunes both keys; a later
+    /// A saved replacement prunes both keys; a later
     /// replace written after that save's mark, then a failure, is kept.
     #[test]
     fn d5_saved_replacement_prunes_and_a_later_unsaved_replace_is_kept() {
@@ -1569,7 +1573,7 @@ mod tests {
         }
     }
 
-    /// D5′ (iv): a namespace whose slot was replaced comes back with a fresh
+    /// A namespace whose slot was replaced comes back with a fresh
     /// slot and no proven save, so its mismatched entry is kept; the
     /// namespace that reused its slot index is never pruned by its marks.
     #[test]
@@ -1624,7 +1628,7 @@ mod tests {
         assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&stale));
     }
 
-    /// D5′ custody: a save callback with a mark read for a slot that was
+    /// Custody: a save callback with a mark read for a slot that was
     /// replaced and re-placed since, or for another namespace, moves no
     /// watermark and does not open the gate.
     #[test]
@@ -1659,7 +1663,7 @@ mod tests {
         );
     }
 
-    /// D5′ (vii): a write between the mark and the successful save's
+    /// A write between the mark and the successful save's
     /// callback is not covered by it.
     #[test]
     fn d5_a_write_after_the_mark_is_not_covered() {
@@ -1686,7 +1690,7 @@ mod tests {
         assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
     }
 
-    /// [behaviour] D5′ sizes: the entry and slot keep their cleared sizes. The
+    /// [behaviour] Sizes: the entry and slot keep their cleared sizes. The
     /// ledger's inline growth is inside `size_of::<SharedCache>()`; its fixed
     /// heap reservation and the memo's separate allocation header are each
     /// charged once beside that payload.
@@ -1711,7 +1715,7 @@ mod tests {
         cache.withheld_memo.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
-            size_of::<SharedCache>()
+            super::super::OFF_MAIN_SHARED_BYTES
                 + std::mem::align_of::<SharedCache>()
                 + 2 * size_of::<usize>()
                 + parts.bytes

@@ -154,10 +154,7 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 loaded.accepted_snapshot_fingerprints,
                 healthy.accepted_snapshot_fingerprints
             );
-            assert_eq!(
-                loaded.upload_context_fingerprint,
-                healthy.upload_context_fingerprint
-            );
+            assert_eq!(loaded.upload_context_proof, healthy.upload_context_proof);
             if map != 0 {
                 assert_eq!(
                     loaded.claude_account_family_pending,
@@ -516,7 +513,7 @@ fn recovery_emission_boundaries(
     use claude_request_money::e2;
     // Mirror ordinary preparation before the evidence/finalization seam. A
     // loaded index starts with active revision 0; S-726-1 intentionally vetoes
-    // E2's request-owned literal there, even for an undamaged control. This
+    // `e2`'s request-owned literal there, even for an undamaged control. This
     // activation is also done by snapshot_sync before any production scan.
     let revision =
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
@@ -568,6 +565,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -592,8 +590,6 @@ fn recovery_emission_boundaries(
 
 #[test]
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
-    let _resumed_prefix = e2::ResumedPrefixForTest::set(true);
-    use claude_request_money::e2;
     for map in 0..3 {
         let fixture = Fixture::new();
         let healthy = fixture.load();
@@ -621,10 +617,6 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         );
         let control_manifest = control_manifest.unwrap();
         assert!(control_manifest.entity_count > 0);
-        assert_eq!(
-            control.upload_context_fingerprint.as_deref(),
-            Some("r9-complete-context")
-        );
 
         let payload = fixture.bucket_path(map);
         let original = fs::read(&payload).unwrap();
@@ -635,7 +627,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             unknown.persistence_unavailable[map].unwrap().cause,
             scan_index_persistence::UnavailableCause::Digest
         );
-        let old_context = unknown.upload_context_fingerprint.clone();
+        let old_context = unknown.upload_context_proof.clone();
         let old_pending = unknown.claude_account_family_pending.clone();
         let old_release = unknown.claude_history_move_released;
         let old_files = serde_json::to_vec(&unknown.files).unwrap();
@@ -668,7 +660,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             .unwrap_err()
             .to_string()
             .contains("scan_index_map_unavailable"));
-        assert_eq!(unknown.upload_context_fingerprint, old_context);
+        assert_eq!(unknown.upload_context_proof, old_context);
         assert_eq!(unknown.claude_account_family_pending, old_pending);
         assert_eq!(unknown.claude_history_move_released, old_release);
         assert_eq!(serde_json::to_vec(&unknown.files).unwrap(), old_files);
@@ -704,10 +696,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             serde_json::to_vec(&resumed_manifest).unwrap(),
             serde_json::to_vec(&control_manifest).unwrap()
         );
-        assert_eq!(
-            restored.upload_context_fingerprint,
-            control.upload_context_fingerprint
-        );
+        assert_eq!(restored.upload_context_proof, control.upload_context_proof);
         assert_eq!(restored.generation, healthy.generation);
     }
 }
@@ -875,3 +864,7 @@ fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
     assert!(fixture.shards.is_dir());
     assert!(!fixture.root.exists());
 }
+
+// F10: count surviving complete offers at the real post-policy finalizer.
+// Parser completion and an equal body suppressed as a semantic noop are not
+// publication. This runs portably; Pi has no production durable source registration.

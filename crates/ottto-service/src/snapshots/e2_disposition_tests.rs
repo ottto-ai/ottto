@@ -1,6 +1,6 @@
-// E2 (T4): the authority disposition of request-owned bodies. A family whose
-// exclusive reported body was proven before E2 must reach upload with its
-// request-owned body; account and E2 withheld holds still apply.
+// `e2`: the authority disposition of request-owned bodies. A family whose
+// exclusive reported body was proven before `e2` must reach upload with its
+// request-owned body; account and `e2` withheld holds still apply.
 use super::*;
 
 const CHILD_AGENT: &str = "a4d1585d310070d0f";
@@ -87,8 +87,6 @@ fn child_page(
 
 #[test]
 fn e2_body_of_previously_proven_family_is_not_a_demotion() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     for healthy in [true, false] {
         // Today (gate off): an unreconstructable revision is a demotion and
         // is held; a healthy one rebuilds the exclusive body.
@@ -143,7 +141,7 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
             deferred.retain_uploadable(&mut uploadable);
             assert!(uploadable.is_empty(), "account hold survives");
 
-            // An E2 withheld entity (held twin, uncertified, unread
+            // An `e2` withheld entity (held twin, uncertified, unread
             // telemetry) is held, not dropped: its body stays on the page,
             // never uploads, and blocks progress so the file is read again.
             let mut withheld = disposition;

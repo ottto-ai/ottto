@@ -4,7 +4,7 @@
 //!
 //! This module owns the Claude provider field names for credits (quota
 //! contract v2.2 §11.1 kinds, §11.3 one-time pools, §11.7 C4 pinned names) and
-//! the Claude read cadence (design R7). Grant building, summaries,
+//! the Claude read cadence. Grant building, summaries,
 //! the one-time pool shape and section re-send stay in the model.
 
 use std::collections::BTreeMap;
@@ -55,9 +55,6 @@ pub(super) const ACTIVE_SLOT_SECONDS: u64 = 5 * 60;
 /// its spread. Bounds a stored "not before" hold (`claude_read_held`).
 const LONGEST_SLOT_SECONDS: u64 = super::CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS
     + super::CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS;
-/// While usage credits are off, the plain read runs about this often and the
-/// other slots take the saved-reset read.
-const PLAIN_WHILE_CREDITS_OFF_SECONDS: u64 = 6 * 60 * 60;
 /// Admission slack at the slot boundary (well under one 5-min pass).
 const SLOT_ADMISSION_SLACK_SECONDS: u64 = 60;
 /// A passive reading stamped further ahead of the local clock is not trusted.
@@ -66,8 +63,8 @@ const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
 /// counts as continuous observation of its sign-in (passes run every ~5 min).
 const CALLER_BINDING_MAX_GAP_SECONDS: u64 = 15 * 60;
 /// A window reset the stored reading predates earns one extra read this long
-/// after the reset, spread per account over the next minute (design R7
-/// amendment: reset read). The reading after it postdates the reset, so each
+/// after the reset, spread per account over the next minute. The reading
+/// after it postdates the reset, so each
 /// reset is read at most once.
 const RESET_READ_DELAY_SECONDS: u64 = 60;
 const RESET_READ_SPREAD_SECONDS: u64 = 60;
@@ -196,7 +193,7 @@ fn balance_section(balance: &AgentCreditBalance) -> Option<CreditSection> {
     }
 }
 
-/// The balances to send after a read (design R7b, contract v2.2 §11.5, C8/C9).
+/// The balances to send after a read (contract v2.2 §11.5, C8/C9).
 ///
 /// `previous` is the binding's last stored reading (same account and
 /// organization). Sections this read observed replace theirs; every other
@@ -276,14 +273,6 @@ fn keep_stored_grant_list(
         }
     }
     fresh
-}
-
-/// Whether the last observed usage-credit balance says credits are off.
-pub(super) fn claude_usage_credits_off(balances: &[AgentCreditBalance]) -> bool {
-    balances.iter().any(|balance| {
-        balance_section(balance) == Some(CreditSection::UsageCredits)
-            && balance.enabled == Some(false)
-    })
 }
 
 /// The usage-credit balance of a switched-off `spend` (or `extra_usage`)
@@ -621,7 +610,7 @@ pub(super) fn write_claude_read_schedule(
     )
 }
 
-/// The account's read slot (design R7: active-account freshness): the active
+/// The account's read slot (active-account freshness): the active
 /// slot while the account was active within the feed's last 30 min, else the default
 /// (unused-account) slot.
 pub(super) fn claude_usage_slot_seconds(
@@ -765,15 +754,14 @@ pub(super) fn claude_reading_due(
     })
 }
 
-/// Which read a due slot makes (design R7: no extra calls). `stored` is the
+/// Which read a due slot makes (no extra calls). `stored` is the
 /// binding's persisted reading.
 ///
 /// - While the variant is paused by its self-check every slot is plain.
 /// - A missing section is filled first: with plain data known but no stored
 ///   saved-reset section, the slot reads the variant; with saved resets stored
 ///   but no plain data known, it reads plain. Nothing known: plain.
-/// - Otherwise slots alternate plain and saved-reset reads; while usage
-///   credits are off the plain read runs only every ~6 h.
+/// - Otherwise slots alternate plain and saved-reset reads.
 pub(super) fn claude_usage_read_kind(
     schedule: &ClaudeReadSchedule,
     stored: &[AgentCreditBalance],
@@ -803,33 +791,11 @@ pub(super) fn claude_usage_read_kind(
             ClaudeUsageRead::SavedResets
         };
     };
-    if claude_usage_credits_off(stored) {
-        // A due threshold, serviced by the next eligible slot. Measured from
-        // the usage-credit section's own read, so a windows-only body (a
-        // passive reading without credit keys) never resets it.
-        let credits_read_at =
-            section_read_at(stored, CreditSection::UsageCredits).unwrap_or(plain_at);
-        return if now.saturating_sub(credits_read_at) >= PLAIN_WHILE_CREDITS_OFF_SECONDS {
-            ClaudeUsageRead::Plain
-        } else {
-            ClaudeUsageRead::SavedResets
-        };
-    }
     if saved_at >= plain_at {
         ClaudeUsageRead::Plain
     } else {
         ClaudeUsageRead::SavedResets
     }
-}
-
-/// When the stored `section` was observed (its newest balance's own
-/// `grants_observed_at`, else `observed_at`), as unix seconds.
-fn section_read_at(stored: &[AgentCreditBalance], section: CreditSection) -> Option<u64> {
-    stored
-        .iter()
-        .filter(|balance| balance_section(balance) == Some(section))
-        .filter_map(balance_read_at)
-        .max()
 }
 
 fn balance_read_at(balance: &AgentCreditBalance) -> Option<u64> {
@@ -844,10 +810,8 @@ fn balance_read_at(balance: &AgentCreditBalance) -> Option<u64> {
 /// Label each credit balance Fresh or Stale from its own read time, never
 /// from a newer windows or passive read of the same binding. Per-section ages,
 /// for a binding whose slot gate is `gate_seconds`:
-/// - saved resets, and usage credits while credits are on, are read once
-///   every two slots (plain/variant alternation): fresh for two gates;
-/// - usage credits while credits are off are re-read about every 6 h (a due
-///   threshold serviced at the next slot): fresh for 6 h plus one gate;
+/// - saved resets and usage credits are read once every two slots
+///   (plain/variant alternation): fresh for two gates;
 /// - one-time pools come with every full usage body: fresh for two gates;
 /// - a balance with no read time of its own (stored before read times
 ///   existed) falls back to the stored reading's time and one gate.
@@ -866,15 +830,6 @@ pub(super) fn label_credit_freshness(
         claude_mark_reader_unavailable(balance);
         let (read_at, max_age) = match balance_read_at(balance) {
             None => (stored_read_at, gate_seconds),
-            Some(read_at)
-                if balance_section(balance) == Some(CreditSection::UsageCredits)
-                    && balance.enabled == Some(false) =>
-            {
-                (
-                    read_at,
-                    PLAIN_WHILE_CREDITS_OFF_SECONDS.saturating_add(gate_seconds),
-                )
-            }
             Some(read_at) => (read_at, gate_seconds.saturating_mul(2)),
         };
         balance.freshness = if now.saturating_sub(read_at) <= max_age {
@@ -935,8 +890,8 @@ pub(super) struct ClaudePassiveConfig {
 /// Check a Claude Code `.claude.json` against a binding. Reads only
 /// `oauthAccount` and `cachedUsageUtilization`.
 ///
-/// Passive input from Claude Code's own `cachedUsageUtilization` (design R7:
-/// active-account freshness).
+/// Passive input from Claude Code's own `cachedUsageUtilization`
+/// (active-account freshness).
 /// Every collection pass records where each caller is signed in, and a
 /// registered slot's identity gate ends the caller's run when it refuses the
 /// slot, as does a pass that skips the collector (an unresolved default-login
@@ -1250,7 +1205,6 @@ mod tests {
         assert_eq!(usage[0].enabled, Some(false));
         assert_eq!(usage[0].status, AgentCreditBalanceStatus::Unknown);
         assert_eq!(usage[0].disabled_reason.as_deref(), Some("out_of_credits"));
-        assert!(claude_usage_credits_off(&usage));
         // Not a reason code: dropped, never sent as free text.
         body["spend"]["disabled_reason"] = json!("Out of credits!");
         let usage = super::super::claude_oauth_credit_balances(&body);
@@ -1269,7 +1223,7 @@ mod tests {
                       "used": {"amount_minor": 1, "exponent": 2}}
         }));
         assert_eq!(enabled[0].disabled_reason, None);
-        assert!(!claude_usage_credits_off(&enabled));
+        assert_eq!(enabled[0].enabled, Some(true));
     }
 
     #[test]
@@ -1766,7 +1720,10 @@ mod tests {
         label_credit_freshness(&mut balances, gate, now - 5, now);
         let fresh = |b: &AgentCreditBalance| b.freshness == AgentQuotaWindowFreshness::Fresh;
         assert!(fresh(&balances[0]), "alternated section: two gates");
-        assert!(fresh(&balances[1]), "credits off: 6 h plus one gate");
+        assert!(
+            !fresh(&balances[1]),
+            "credits off: alternated too, two gates"
+        );
         assert!(!fresh(&balances[2]), "grant list read 3 gates ago is stale");
         assert!(fresh(&balances[3]), "no own clock: the stored reading's");
     }
@@ -1793,7 +1750,10 @@ mod tests {
             "legacy usage row, fresh pool, saved resets"
         );
         assert_eq!(merged[0], legacy);
-        assert!(claude_usage_credits_off(&merged));
+        assert_eq!(
+            balance_section(&merged[0]),
+            Some(CreditSection::UsageCredits)
+        );
     }
 
     fn passive_config(
@@ -2269,30 +2229,6 @@ mod tests {
         // Passive bodies replace calls; never more than one reading per slot.
         assert!(simulation.calls().count() < run_day(false, &|_| None).calls().count());
         assert_eq!(simulation.passes_with_more_than_one_call, 0);
-    }
-
-    /// A windows-only passive body adopted in a plain slot never resets the
-    /// credits-off plain clock: it is measured from the usage-credit section.
-    #[test]
-    fn windows_only_passive_body_keeps_the_credits_off_clock() {
-        let now = 100_000;
-        let mut credits = stored(Some(true), true);
-        credits[0].observed_at = Some(rfc3339(now - 7 * HOUR));
-        let schedule = ClaudeReadSchedule {
-            // A passive windows-only body was adopted 10 min ago.
-            last_plain_read_at: Some(now - 600),
-            last_saved_resets_read_at: Some(now - 1_800),
-            ..ClaudeReadSchedule::default()
-        };
-        assert_eq!(
-            claude_usage_read_kind(&schedule, &credits, now),
-            ClaudeUsageRead::Plain
-        );
-        credits[0].observed_at = Some(rfc3339(now - HOUR));
-        assert_eq!(
-            claude_usage_read_kind(&schedule, &credits, now),
-            ClaudeUsageRead::SavedResets
-        );
     }
 
     #[test]
@@ -3279,13 +3215,13 @@ mod tests {
         assert_eq!(harness.shape_failures(), 0);
         assert!(!breaker_open(&harness));
 
-        // Next slot: one read again. Usage credits are off in this body, so
-        // the saved-reset variant takes the slots between ~6 h plain reads.
+        // Next slot: one read again, alternating back to plain even though
+        // usage credits are off in this body.
         harness.due_keeping_reading();
-        harness.collect(respond_recognized);
+        harness.collect(respond_plain);
         assert_eq!(
             REQUESTED.lock().unwrap().as_slice(),
-            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+            ["https://api.anthropic.com/api/oauth/usage"]
         );
     }
 

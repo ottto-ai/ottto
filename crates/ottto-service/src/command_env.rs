@@ -30,23 +30,18 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
     first_program_in(executable_search_dirs_for_program(program), program)
 }
 
-/// Interactive launches search the inherited daemon PATH before native/npm prefixes and
-/// finally Codex desktop bundles. Claude Desktop's private CLI is excluded.
+/// Interactive launches search in agent status's order: Codex desktop bundles,
+/// then the inherited daemon PATH and native/npm prefixes. Claude Desktop's
+/// private CLI is excluded.
 pub(crate) fn interactive_cli_path(program: &str, home: &Path) -> Option<PathBuf> {
     if program == "claude" {
         return claude_default_login_executable_path(home);
     }
-    let mut dirs = executable_search_dirs_from(
-        env::var_os(COMMAND_SEARCH_PATH_ENV).or_else(|| env::var_os("PATH")),
-        Some(home.as_os_str().to_owned()),
-        true,
-    );
-    if program == "codex" && env::var_os(COMMAND_SEARCH_PATH_ENV).is_none() {
-        dirs.extend(codex_desktop_bundle_dirs(&[
-            PathBuf::from("/Applications"),
-            home.join("Applications"),
-        ]));
-    }
+    let home = Some(home.as_os_str().to_owned());
+    let dirs = match env::var_os(COMMAND_SEARCH_PATH_ENV) {
+        Some(path_var) => executable_search_dirs_from(Some(path_var), home, true),
+        None => executable_search_dirs_for_program_with_home(program, home),
+    };
     dirs.into_iter()
         .map(|dir| dir.join(program))
         .find(|path| is_absolute_executable(path))
@@ -276,6 +271,30 @@ pub(crate) fn provider_env() -> BTreeMap<String, OsString> {
         .then(interactive_shell_provider_env)
         .flatten();
     provider_env_from_sources(&current, missing_shell_env.as_ref())
+}
+
+/// The environment a stdio MCP server or the Claude CLI is spawned with,
+/// resolved ONCE per harvest cycle. The daemon runs under launchd with a
+/// minimal `PATH` (`/usr/bin:/bin:…`), so a bare `Command::new("npx")` cannot
+/// find the common MCP launchers (`npx`/`uvx`/`node`) and every such server
+/// would falsely report `reachable:false`. We resolve a launchd-safe `PATH` and
+/// the user's provider env exactly as the daemon spawns its other agent
+/// subprocesses, so the harvest sees the same servers an interactive shell
+/// (and the reference harvester) does.
+#[derive(Clone)]
+pub(crate) struct SpawnEnv {
+    pub(crate) path: Option<OsString>,
+    pub(crate) provider: BTreeMap<String, OsString>,
+}
+
+impl SpawnEnv {
+    /// Resolve once per cycle (`provider_env` may briefly consult a login shell).
+    pub(crate) fn resolve() -> Self {
+        Self {
+            path: path_env(),
+            provider: provider_env(),
+        }
+    }
 }
 
 fn current_provider_env() -> BTreeMap<String, OsString> {

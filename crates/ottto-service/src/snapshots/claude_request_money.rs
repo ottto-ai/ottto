@@ -1,4 +1,4 @@
-//! Shared Claude request-money normalization and live E2 emission.
+//! Shared Claude request-money normalization and live `e2` emission.
 
 pub(crate) mod body;
 pub(crate) mod copy_removals;

@@ -43,7 +43,11 @@ fn hanging_command_is_bounded_killed_and_reaped() {
     let pid = child.id();
     let mut reap = Reap(child);
     let start = Instant::now();
-    assert!(complete(&mut reap.0, Duration::from_millis(50)).is_err());
+    let outcome = complete(&mut reap.0, Duration::from_millis(50));
+    assert!(
+        outcome.is_err(),
+        "busy-loop child ended before the deadline: {outcome:?}"
+    );
     assert!(start.elapsed() < Duration::from_secs(3));
     let mut status = 0;
     assert_eq!(

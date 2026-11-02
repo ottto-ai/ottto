@@ -22,6 +22,12 @@ impl Stamp {
             birth,
         })
     }
+    pub(super) fn matches_acquisition(
+        &self,
+        stamp: &crate::transcript_acquisition::FileStamp,
+    ) -> bool {
+        self.content.matches_acquisition(stamp)
+    }
     fn same_content(&self, other: &Self) -> bool {
         self.birth == other.birth && self.content.same_content(&other.content)
     }
@@ -70,7 +76,7 @@ pub(super) fn note_tail_repeat(
     now: Option<u64>,
     window: u64,
 ) {
-    // Fallback definition approved by Lead A: the revalidated Tail certificate
+    // Fallback definition: the revalidated Tail certificate
     // starts at the committed prefix, the unchanged sampled fingerprint binds
     // the previously observed EOF, and no terminated record advanced that prefix.
     if entry.codex_fragment.is_none()

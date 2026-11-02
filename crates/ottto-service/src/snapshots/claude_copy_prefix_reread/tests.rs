@@ -6,6 +6,7 @@ fn run(scope: &Path, support: &Path, apply: bool) -> Result<Estimate> {
         support,
         &scope.parent().unwrap().join("scan-index.json"),
         apply,
+        false,
         BACKFILL_WINDOW_DAYS,
     )
 }
@@ -18,11 +19,9 @@ fn prepare(index: &mut ScanIndex, support: &Path, roots: &[PathBuf]) -> Result<V
 
 fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     let (home, root, mut index) = super::super::claude_history_upgrade_tests::families(name, 3);
-    // The shared helper uses a partial-commit subset, which deliberately
-    // preserves the previous (None) source census context even after ACKs.
-    // This fixture models already delivered, fully adopted legacy history;
+    // This fixture models already delivered history with per-file receipts;
     // otherwise unrelated context debt exists BEFORE the switch changes.
-    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
+    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     let mut paths = index
         .files
         .keys()
@@ -41,11 +40,11 @@ fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     (home, root, index, paths)
 }
 
-fn activate_mode(index: &mut ScanIndex, base: &str, enabled: bool, wire: bool) {
-    let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.into(), enabled);
+fn activate_mode(index: &mut ScanIndex, base: &str, wire: bool) {
+    let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.into(), true);
     let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, mode);
-    index.set_copy_prefix_base_upload_context(Some(base.into()), enabled);
+    index.set_copy_prefix_base_upload_context(Some(base.into()));
 }
 
 /// Drive ordinary selection and its real reader, observing body opens rather
@@ -55,7 +54,7 @@ fn walk(
     index: ScanIndex,
     scope: &[PathBuf],
 ) -> (ScanIndex, SourceScanResult, Vec<PathBuf>) {
-    let mut scan = OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+    let mut scan = OwnedSourceScan::new_selecting(
         SnapshotSource::ClaudeCode,
         &[root.into()],
         index,
@@ -68,6 +67,7 @@ fn walk(
         false,
         true,
         scope,
+        None,
     );
     let mut opened = Vec::new();
     for _ in 0..100_000 {
@@ -87,15 +87,14 @@ fn walk(
 #[test]
 fn mode_changes_read_and_upload_zero_unaffected_files() {
     let (home, root, mut index, _) = setup("copy-prefix-context-unaffected");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let receipts = index
         .files
         .iter()
         .map(|(key, entry)| (key.clone(), entry.upload_context_receipt.clone()))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(receipts.len(), 6);
-    for (local, wire) in [(true, false), (true, true), (false, false)] {
-        activate_mode(&mut index, "ctx-1", local, wire);
+    for wire in [false, true] {
+        activate_mode(&mut index, "ctx-1", wire);
         let (next, scan, opened) = walk(&root, index, &[]);
         index = next;
         assert!(opened.is_empty(), "mode change opened unaffected bodies");
@@ -115,7 +114,7 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
     }
     // The exemption is only for mode variants of the SAME base, never a
     // destination, privacy-policy or attribution-context change.
-    activate_mode(&mut index, "different-policy", true, false);
+    activate_mode(&mut index, "different-policy", false);
     assert!(index
         .files
         .keys()
@@ -123,88 +122,12 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// After an ON launch adopted its mode context, OFF launches over unchanged
-/// files read and upload nothing; once the base is re-adopted, main's
-/// receipt path (no base) takes over.
-#[test]
-fn off_launch_after_on_reads_and_uploads_nothing() {
-    let (home, root, mut index, _) = setup("copy-prefix-on-then-off");
-    let on = claude_request_money::e2::ResumedPrefixForTest::set(true);
-    activate_mode(&mut index, "ctx-1", true, false);
-    let on_context = index.active_upload_context_fingerprint.clone().unwrap();
-    let (next, _, opened) = walk(&root, index, &[]);
-    index = next;
-    assert!(opened.is_empty());
-    drop(on);
-    let _off = claude_request_money::e2::ResumedPrefixForTest::set(false);
-    for (adopted, base_kept) in [(on_context.as_str(), true), ("ctx-1", false)] {
-        super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, adopted);
-        activate_mode(&mut index, "ctx-1", false, false);
-        assert_eq!(index.copy_prefix_base_upload_context.is_some(), base_kept);
-        let (next, scan, opened) = walk(&root, index, &[]);
-        index = next;
-        assert!(opened.is_empty(), "OFF after ON opened unchanged bodies");
-        assert_eq!(scan.scanned_file_count, 0);
-        assert!(scan.snapshots.is_empty(), "nothing can reach the uploader");
-        assert!(index
-            .files
-            .keys()
-            .all(|key| !index.file_upload_context_requires_adoption(key)));
-    }
-    fs::remove_dir_all(home).unwrap();
-}
-
-/// An apply intent persisted under ON is neither dropped nor re-armed by an
-/// OFF launch's preparation, and the next ON launch reads it exactly once.
-#[test]
-fn apply_intent_survives_an_off_launch_and_runs_once_on_the_next_on() {
-    let (home, root, mut index, _) = setup("copy-prefix-intent-off");
-    let support = home.join("support");
-    let on = claude_request_money::e2::ResumedPrefixForTest::set(true);
-    run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
-    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
-    assert_eq!(pending.len(), 3);
-    let intent = |index: &ScanIndex| {
-        pending
-            .iter()
-            .map(|path| {
-                let key = local_index_key(path);
-                (
-                    index
-                        .claude_money_birth_store
-                        .money_marks(claude_money_birth_store::location_key(&key))
-                        & REOWED,
-                    index.files[&key].effective_upload_body_witness_revision,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(intent(&index), vec![(REOWED, 2); 3]);
-    drop(on);
-    let off = claude_request_money::e2::ResumedPrefixForTest::set(false);
-    activate_mode(&mut index, "ctx-1", false, false);
-    assert!(prepare(&mut index, &support, std::slice::from_ref(&root))
-        .unwrap()
-        .is_empty());
-    assert_eq!(intent(&index), vec![(REOWED, 2); 3], "OFF keeps the intent");
-    drop(off);
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
-    activate_mode(&mut index, "ctx-1", true, false);
-    let again = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
-    assert_eq!(again, pending);
-    let (_, _, opened) = walk(&root, index, &again);
-    assert_eq!(opened, pending, "the next ON reads each member once");
-    fs::remove_dir_all(home).unwrap();
-}
-
 #[test]
 fn mode_context_reads_only_requested_set_and_matches_estimate() {
     let (home, root, mut index, paths) = setup("copy-prefix-context-scoped");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     let (index, scan, opened) = walk(&root, index, &pending);
     assert_eq!(opened, pending, "only affected files open, earlier first");
@@ -229,11 +152,15 @@ fn mode_context_reads_only_requested_set_and_matches_estimate() {
         .source_file_fingerprint
         .as_ref()
         .is_some_and(|source| scoped_sources.contains(source))));
+    // Unaffected files keep their base receipt and owe nothing.
     assert!(index
         .files
         .iter()
         .filter(|(key, _)| !paths.contains(&PathBuf::from(key.as_str())))
-        .all(|(key, entry)| entry.upload_context_receipt.is_none()
+        .all(|(key, entry)| entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.context_fingerprint == "ctx-1")
             && !index.file_upload_context_requires_adoption(key)));
     fs::remove_dir_all(home).unwrap();
 }
@@ -242,12 +169,11 @@ fn mode_context_reads_only_requested_set_and_matches_estimate() {
 #[test]
 fn configured_root_symlink_uses_the_same_resolved_scope_as_discovery() {
     let (home, root, mut index, _) = setup("copy-prefix-configured-symlink");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let configured = home.join("configured-project");
     std::os::unix::fs::symlink(&root, &configured).unwrap();
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&configured)).unwrap();
     let (_, scan, opened) = walk(&configured, index, &pending);
     assert_eq!(opened, pending);
@@ -265,10 +191,9 @@ fn configured_root_symlink_uses_the_same_resolved_scope_as_discovery() {
 #[test]
 fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
     let (home, root, mut index, _) = setup("copy-prefix-combined-budget");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     assert_eq!(pending.len(), 3);
     with_body_witness_adoption_page_budget(1, || {
@@ -295,10 +220,9 @@ fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
 #[test]
 fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
     let (home, root, mut index, _) = setup("copy-prefix-existing-replay");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     let counts = run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let roots = vec![root.clone()];
     let pending = prepare(&mut index, &support, &roots).unwrap();
     ensure_bounded_traversal(
@@ -335,17 +259,17 @@ fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
 #[test]
 fn scoped_mode_budget_preserves_independent_source_refresh() {
     let (home, root, mut index, _) = setup("copy-prefix-independent-source");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     let key = local_index_key(&pending[0]);
     // A different source witness models changed account/telemetry sidecars;
-    // transcript size and mtime remain exact. Both revision and context are owed.
+    // transcript size and mtime remain exact. The base receipt binds the old
+    // source bytes, so this is an independent refresh, not mode-only debt.
     let stale = "f".repeat(64);
     index.files.get_mut(&key).unwrap().source_file_fingerprint = stale.clone();
-    assert!(index.copy_prefix_base_context_proven(&key));
+    assert!(!index.copy_prefix_base_context_proven(&key));
     let (after, scan, opened) =
         with_body_witness_adoption_byte_budget(1, || walk(&root, index, &pending));
     assert_eq!(
@@ -356,7 +280,7 @@ fn scoped_mode_budget_preserves_independent_source_refresh() {
     assert_eq!(scan.scanned_file_count, 1);
     assert_ne!(after.files[&key].source_file_fingerprint, stale);
     let mut changed_policy = after;
-    activate_mode(&mut changed_policy, "new-policy", true, false);
+    activate_mode(&mut changed_policy, "new-policy", false);
     assert!(
         !changed_policy.copy_prefix_base_context_proven(&key),
         "real base changes are not mode-only debt"
@@ -412,7 +336,6 @@ fn estimate_refuses_native_oversize_below_the_history_page_budget() {
 #[test]
 fn aged_or_changed_scan_window_refuses_before_any_reowe() {
     let (home, root, mut index, _) = setup("copy-prefix-window-runtime");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
     let before = serde_json::to_value(&index).unwrap();
@@ -457,7 +380,6 @@ fn estimate_is_metadata_only_and_changes_no_files_or_index() {
 #[test]
 fn scheduled_set_matches_estimate_scoped_order_and_native_page_budget() {
     let (home, root, mut index, paths) = setup("copy-prefix-scheduled");
-    let _switch = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("new-parent/nested-support");
     let got = run(&home.join("scope.json"), &support, true).unwrap();
     let roots = vec![root.clone()];
@@ -541,18 +463,11 @@ fn scheduled_set_matches_estimate_scoped_order_and_native_page_budget() {
 }
 
 #[test]
-fn disabled_or_changed_scope_cannot_rearm() {
+fn changed_scope_cannot_rearm() {
     let (home, root, mut index, paths) = setup("copy-prefix-refused");
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
     let before = serde_json::to_value(&index).unwrap();
-    let off = claude_request_money::e2::ResumedPrefixForTest::set(false);
-    assert!(prepare(&mut index, &support, std::slice::from_ref(&root))
-        .unwrap()
-        .is_empty());
-    assert_eq!(serde_json::to_value(&index).unwrap(), before);
-    drop(off);
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     fs::write(&paths[0], "changed").unwrap();
     assert!(prepare(&mut index, &support, &[root]).is_err());
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
@@ -575,7 +490,7 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
         .map(|s| s.snapshot_fingerprint.clone())
         .collect();
     index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
-    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
+    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
@@ -601,7 +516,6 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
 #[test]
 fn one_listed_twin_estimates_and_reads_the_complete_native_family() {
     let (home, root, mut index, main, expected) = twin_setup("copy-prefix-twin-closure");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("twin-support");
     let counts = run(&home.join("scope.json"), &support, false).unwrap();
     assert_eq!(
@@ -630,7 +544,7 @@ fn one_listed_twin_estimates_and_reads_the_complete_native_family() {
         counts,
         run(&home.join("scope.json"), &support, true).unwrap()
     );
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     assert_eq!(pending.iter().cloned().collect::<BTreeSet<_>>(), expected);
     let (_, scan, opened) = walk(&root, index, &pending);
@@ -700,7 +614,6 @@ fn added_twin_family_member_blocks_apply_at_the_existing_native_file_cap() {
 #[test]
 fn closure_growth_refuses_preparation_before_reowing_any_member() {
     let (home, root, mut index, main, expected) = twin_setup("copy-prefix-twin-closure-growth");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
     // PathBuf orders components: a root's subagent directory can precede
@@ -735,10 +648,9 @@ fn closure_growth_refuses_preparation_before_reowing_any_member() {
 #[test]
 fn twin_closure_native_reader_keeps_the_existing_byte_budget() {
     let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
-    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    activate_mode(&mut index, "ctx-1", true, false);
+    activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     with_body_witness_adoption_byte_budget(1, || {
         let counts = run(&home.join("scope.json"), &home.join("absent-budget"), false).unwrap();
@@ -779,3 +691,6 @@ fn combined_twin_bytes_are_blocked_without_increasing_the_native_page_cap() {
     });
     fs::remove_dir_all(home).unwrap();
 }
+
+#[path = "proof_recovery_tests.rs"]
+mod proof_recovery_tests;

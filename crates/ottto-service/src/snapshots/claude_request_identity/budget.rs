@@ -53,10 +53,10 @@ pub(crate) struct Counts {
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) proved_rows_capped: u64,
     /// Copy-prefix switch on: accepted rows whose proof a copied marker lent
-    /// (SOURCE 2026-10-31, #944 xPR F5), tombstoned once per row.
+    /// (#944), tombstoned once per row.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) copy_derived_proof_invalidated: u64,
-    /// Lent rows kept on #909 per pass (Lead B Addendum 4): an OFF-era freeze
+    /// Lent rows kept on #909 per pass: an OFF-era freeze
     /// mixing lent and other shares, or lent requests whose own evidence this
     /// pass could not read.
     #[serde(skip_serializing_if = "is_zero")]

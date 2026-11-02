@@ -116,27 +116,31 @@ fn integrated_ack(
         .snapshots
         .iter()
         .map(|item| {
-            // Ordinary fixtures have no witness domain, so the backend's entity
-            // ACK carries no version and no digest.
-            let version = crate::snapshots::snapshot_upload_body_witness_version(item);
-            assert!(
-                matches!(
-                    version,
-                    None | Some(
-                        crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
-                            | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
-                    )
-                ),
-                "unexpected retained ordinary fixture witness: {version:?}"
-            );
-            serde_json::json!({
+            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
+            if version.is_none() {
+                // Ordinary fixtures have no witness domain, as on the backend.
+                let retained_version = crate::snapshots::snapshot_upload_body_witness_version(item);
+                assert!(
+                    matches!(
+                        retained_version,
+                        None | Some(
+                            crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
+                                | crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
+                        )
+                    ),
+                    "unexpected retained ordinary fixture witness: {retained_version:?}"
+                );
+            }
+            // Additive evidence uses the production public ACK version; the
+            // digest travels only with that version.
+            Ok(serde_json::json!({
                 "source_session_id":item.source_session_id,
                 "snapshot_fingerprint":item.snapshot_fingerprint,
-                "occurrence_count":1,"body_witness_version":null,
-                "body_witness_digest":null
-            })
+                "occurrence_count":1,"body_witness_version":version,
+                "body_witness_digest":version.map(|_| snapshot_upload_body_witness(item))
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let bytes = serde_json::to_vec(&serde_json::json!({
         "accepted":entities.len(),"sessions_reconciled":entities.len(),"session_ids":[],
         "disabled":false,"disabled_reason":null,
@@ -214,7 +218,10 @@ fn integrated_send(
                         .map_err(|e| anyhow!("preflight: {e}"))?;
                     let body = serde_json::to_vec(&request)?;
                     assert!(body.len() <= SNAPSHOT_BATCH_MAX_BYTES);
-                    let encoded = crate::snapshot_client::retention_gzip_probe(&body);
+                    let encoded = crate::snapshot_client::retention_gzip_probe(
+                        &body,
+                        crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+                    );
                     integrated_post(slot, now + 2_000, current, "main", trace)?;
                     match script {
                         IntegratedScript::FallbackShed => {
@@ -300,7 +307,7 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
     working.activate_effective_upload_body_witness_revision(
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
     );
-    // Ordinary transcripts: each file exists before its records (E2).
+    // Ordinary transcripts: each file exists before its records (`e2`).
     let mut scan = crate::snapshots::claude_request_money::e2::with_fixture_birth(
         start.unix_timestamp_nanos() as u64,
         || {
@@ -321,7 +328,7 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         item.cache_observations_state = None;
         item.session_account_evidence = None;
     }
-    // Production order: the local-evidence stage finishes the E2 bodies
+    // Production order: the local-evidence stage finishes the `e2` bodies
     // (gate on, they carry the hours) before policy finalization.
     let withheld = crate::snapshots::claude_request_money::e2::finish_page(
         &mut scan.snapshots,

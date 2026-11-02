@@ -24,7 +24,7 @@ fn fixture() -> ScanIndex {
     raw["claude_retired_family_tombstones"] = json!({"a".repeat(64):u64::MAX});
     raw["claude_retired_family_tombstones_initialized"] = json!(true);
     // MISC multi-segment scalar alongside FILES, ACCOUNTS and CENSUS owners.
-    raw["upload_context_fingerprint"] = json!("x".repeat(3 * 64 * 1024 + 17));
+    raw["historical_replay_generation"] = json!("x".repeat(3 * 64 * 1024 + 17));
     serde_json::from_value(raw).unwrap()
 }
 
@@ -35,7 +35,7 @@ impl Value for Bytes {
         Ok(())
     }
 }
-fn headers(tx: &mut impl Transaction, table: Table) -> Vec<Header> {
+pub(super) fn headers(tx: &mut impl Transaction, table: Table) -> Vec<Header> {
     let mut all = Vec::new();
     let mut after = None;
     loop {
@@ -105,6 +105,7 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
             ("accepted_snapshot_fingerprints".into(), true),
         ]);
         let mut db = money_test_support::populate(
+            Source::Claude,
             &scratch.join(format!("presence-{n}.v2.sqlite.import")),
             &index,
             presence.clone(),
@@ -134,16 +135,17 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         "usage.pending",
         "family.requests",
         "file.entities",
-        "setting.upload_context_fingerprint",
+        "setting.historical_replay_generation",
         "accepted.entity",
     ] {
         let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-owner");
         let mut db = money_test_support::populate(
+            Source::Claude,
             &scratch.join("missing.v2.sqlite.import"),
             &fixture(),
             BTreeMap::new(),
         );
-        assert!(import::Mapper.hydrate_context(&mut db).is_ok());
+        assert!(import::hydrate_context(&mut db).is_ok());
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let mut rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 64)
@@ -155,7 +157,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         assert!(tx.delete(&h.key).unwrap());
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         assert!(
-            import::Mapper.hydrate_context(&mut db).is_err(),
+            import::hydrate_context(&mut db).is_err(),
             "missing {kind} must not look like empty custody"
         );
     }
@@ -166,6 +168,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
 fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_membership() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-ref-diff");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("refs.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -219,6 +222,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
 fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-ref");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("missing-ref.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -247,7 +251,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
     let path = scratch.join("claude_code-scan-index.json");
     std::fs::write(&path, br#"{"schema_version":2,"files":{}}"#).unwrap();
     assert!(
-        import::Mapper.inventory_context(&path).is_ok(),
+        import::inventory_context(&path).is_ok(),
         "valid original must reach inventory"
     );
     // #915 has no mapper on this main: every prospective representation is
@@ -290,7 +294,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         let bytes = serde_json::to_vec(&raw).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(
-            import::Mapper.inventory_context(&path).map(|_| ()),
+            import::inventory_context(&path).map(|_| ()),
             expected,
             "{case} {field}"
         );
@@ -306,6 +310,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
 fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-unknown-kind");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("unknown.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -319,7 +324,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    assert!(import::Mapper.hydrate_context(&mut db).is_err());
+    assert!(import::hydrate_context(&mut db).is_err());
 }
 
 /// [money] money large memberships segment and preserve exact shared domains.
@@ -340,9 +345,10 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
         ["synthetic-file"] = json!(hashes);
     raw["file_snapshot_fingerprints"]["synthetic-file"] = json!(hashes);
-    raw["upload_context_fingerprint"] = json!(hashes.join(""));
+    raw["historical_replay_generation"] = json!(hashes.join(""));
     let index: ScanIndex = serde_json::from_value(raw).unwrap();
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("segments.v2.sqlite.import"),
         &index,
         BTreeMap::new(),
@@ -360,7 +366,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     for kind in [
         "account_window",
         "file.entities",
-        "setting.upload_context_fingerprint",
+        "setting.historical_replay_generation",
     ] {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let rows = tx

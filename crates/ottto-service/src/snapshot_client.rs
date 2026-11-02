@@ -8,9 +8,8 @@ use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ottto_core::{
-    compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
-    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalDeviceBinding,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, ControlTokenStore, FileDeviceStore, FilePendingDeviceCredentialStore,
+    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
@@ -24,8 +23,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
-// Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
-const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -34,29 +31,66 @@ const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbea
 const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
 const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
-/// The backend rejected a snapshot batch because the payload did not satisfy the
-/// strict daemon/backend contract. Carries the redacted response body so support
-/// can see the actual validator failure instead of guessing schema-version drift.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A payload rejection carries only validated request-local locations, never
+/// response text. Locations are transient and are not acknowledgement evidence.
+#[derive(Clone, PartialEq, Eq)]
 pub struct BatchRejected {
     pub status: u16,
-    pub body_excerpt: Option<String>,
+    pub snapshot_indexes: Option<Vec<usize>>,
+}
+
+impl BatchRejected {
+    pub(crate) fn from_response(status: u16, reader: impl std::io::Read, count: usize) -> Self {
+        let snapshot_indexes = if status == 422 {
+            serde_json::from_reader::<_, Value>(reader)
+                .ok()
+                .and_then(|body| snapshot_error_indexes(&body, count))
+        } else {
+            None
+        };
+        Self {
+            status,
+            snapshot_indexes,
+        }
+    }
+}
+
+/// The request-local items an error body names in `errors[].loc`
+/// (`["body", "snapshots", i, ...]`, three or more elements), deduplicated.
+/// `None` unless every entry names an index of this `count`-item request.
+fn snapshot_error_indexes(body: &Value, count: usize) -> Option<Vec<usize>> {
+    let errors = body.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let mut indexes = std::collections::BTreeSet::new();
+    for error in errors {
+        let loc = error.get("loc")?.as_array()?;
+        if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
+            return None;
+        }
+        let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
+        if index >= count {
+            return None;
+        }
+        indexes.insert(index);
+    }
+    Some(indexes.into_iter().collect())
 }
 
 impl std::fmt::Display for BatchRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.body_excerpt.as_deref() {
-            Some(body) => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {} body_excerpt={}",
-                self.status, body
-            ),
-            None => write!(
-                f,
-                "backend rejected snapshot batch payload: HTTP {}",
-                self.status
-            ),
+        write!(f, "reason=validation_reject status={}", self.status)?;
+        if let Some(indexes) = &self.snapshot_indexes {
+            write!(f, " count={}", indexes.len())?;
         }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -137,15 +171,21 @@ fn gzip(body: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-/// Keep encoded requests inside the backend's independent gzip budgets.
-/// Identity requests retain the existing exact 4 MiB preflight and packing.
-fn gzip_snapshot_batch(body: &[u8], enabled: bool) -> Option<Vec<u8>> {
-    const MAX_DECODED_BYTES: usize = 1024 * 1024;
-    const MAX_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
-    if !enabled || body.len() > MAX_DECODED_BYTES {
+/// Keep encoded requests inside the backend's independent gzip budgets. A
+/// receiver advertising items over 2 MiB decodes a whole request; an older one
+/// decodes 1 MiB, so larger bodies keep identity encoding and the exact preflight.
+fn gzip_snapshot_batch(body: &[u8], enabled: bool, item_cap: usize) -> Option<Vec<u8>> {
+    const OLDER_RECEIVER_ITEM_BYTES: usize = 2 * 1024 * 1024;
+    const OLDER_RECEIVER_DECODED_BYTES: usize = 1024 * 1024;
+    let max_decoded = if item_cap > OLDER_RECEIVER_ITEM_BYTES {
+        crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES
+    } else {
+        OLDER_RECEIVER_DECODED_BYTES
+    };
+    if !enabled || body.len() > max_decoded {
         return None;
     }
-    gzip(body).filter(|encoded| encoded.len() <= MAX_COMPRESSED_BYTES)
+    gzip(body).filter(|encoded| encoded.len() <= 2 * max_decoded)
 }
 
 /// A rejection that means "I could not read your encoding", as opposed to "your
@@ -169,8 +209,26 @@ pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
     /// The backend's error code when it is one the daemon recognizes. Only
-    /// this fixed name survives; the rest of the response body is discarded.
+    /// this fixed name and an identity deferral's named items
+    /// (`ShedSnapshotIndexes`) survive; the rest of the body is discarded.
     pub code: Option<UploadShedCode>,
+}
+
+/// The request-local items an identity-deferral shed names: only those wait
+/// for the identity. Carried as context on its `UploadShed` error; a shed
+/// without it keeps the whole-pass path.
+pub struct ShedSnapshotIndexes(pub Vec<usize>);
+
+impl std::fmt::Display for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reason=identity_deferred count={}", self.0.len())
+    }
+}
+
+impl std::fmt::Debug for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// The backend error code of the 503 that defers a batch while an original
@@ -261,30 +319,49 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
 /// envelope is a few hundred bytes; a longer body is not recognized.
 const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
 
-fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+fn shed_from_response(status: u16, response: ureq::Response, count: usize) -> anyhow::Error {
     let retry_after = response
         .header("Retry-After")
         .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
     let mut excerpt = Vec::new();
-    let code = response
+    let (code, named) = match response
         .into_reader()
         .take(SHED_BODY_EXCERPT_BYTES)
         .read_to_end(&mut excerpt)
-        .ok()
-        .and_then(|_| shed_code(&excerpt));
-    UploadShed {
+    {
+        Ok(_) => shed_body(&excerpt, count),
+        Err(_) => (None, None),
+    };
+    let shed = anyhow::Error::new(UploadShed {
         status,
         retry_after,
         code,
+    });
+    match named {
+        Some(indexes) => shed.context(ShedSnapshotIndexes(indexes)),
+        None => shed,
     }
 }
 
 /// The recognized top-level `code` of a backend error envelope, which must be
-/// a JSON object. Any other code, a malformed or truncated body, a non-object
-/// body or a non-string code is `None`; no body text outlives this call.
-fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
-    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
-    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
+/// a JSON object, and the items an identity deferral names (see
+/// `snapshot_error_indexes`). Any other code, a malformed or truncated body,
+/// a non-object body or a non-string code is `None`, as are the items of any
+/// other shed; no body text outlives this call.
+fn shed_body(excerpt: &[u8], count: usize) -> (Option<UploadShedCode>, Option<Vec<usize>>) {
+    let Ok(envelope @ Value::Object(_)) = serde_json::from_slice::<Value>(excerpt) else {
+        return (None, None);
+    };
+    let code = envelope
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(UploadShedCode::recognize);
+    let named = if code == Some(UploadShedCode::OriginalIdentityUnavailable) {
+        snapshot_error_indexes(&envelope, count)
+    } else {
+        None
+    };
+    (code, named)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
@@ -697,9 +774,6 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
-    /// Exact backend admission for non-terminal census progress/block status.
-    #[serde(default)]
-    pub census_status_contract: Option<String>,
     /// Retired per-account cohort token for contract-5 request identity rows.
     /// Contract 5 is always on for Claude Code, so this daemon decodes the
     /// field for compatibility and never reads it; the server keeps sending
@@ -1320,9 +1394,6 @@ pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
 /// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
 pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
 
-/// Activity-hint admission; unknown or absent tokens preserve legacy bytes.
-pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
-
 /// Content-free first failed census gate, in the shared receipt builder's order.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1432,7 +1503,7 @@ pub struct SnapshotStatusRequest {
     pub last_census_residue_archived_rollout_count: u64,
     #[serde(default)]
     pub last_census_residue_blocked_session_count: u64,
-    /// Census-member queue plus carry replay, only under census_status:v1.
+    /// Census-member queue plus carry replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_census_pending_file_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1783,6 +1854,54 @@ fn require_cloud_session_success(
     }
 }
 
+/// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
+/// error so the caller can refresh credentials; 400/422 means the `label`
+/// contract drifted.
+fn relay_token_upload_response(
+    sent: std::result::Result<ureq::Response, ureq::Error>,
+    label: &str,
+) -> Result<Value> {
+    match sent {
+        Ok(response) => response
+            .into_json()
+            .map_err(|error| anyhow!("parse {label} response failed: {error}")),
+        Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+            Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                status: code,
+                suppressed: false,
+            }))
+        }
+        Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+            Err(anyhow!("backend rejected {label}: HTTP {code}"))
+        }
+        Err(error) => Err(anyhow!("upload {label} failed: {error}")),
+    }
+}
+
+/// A failed cloud-session request: 401/403 is an authorization rejection,
+/// 400/404/409/422 a contract rejection; any other status or a transport
+/// failure carries upload diagnostics. Response bodies are never kept.
+fn cloud_session_request_error(
+    error: ureq::Error,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code @ (401 | 403), _response) => {
+            anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
+        }
+        ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response) => {
+            anyhow::Error::new(CloudSessionContractRejected { status: code })
+        }
+        ureq::Error::Status(code, response) => anyhow::Error::new(UploadFailureDiagnostics::http(
+            operation, endpoint, code, &response,
+        )),
+        error => anyhow::Error::new(UploadFailureDiagnostics::transport(
+            operation, endpoint, &error,
+        )),
+    }
+}
+
 type NicknameGenerations = std::sync::Arc<
     std::sync::Mutex<std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>>,
 >;
@@ -1816,13 +1935,6 @@ impl SnapshotApiClient {
     }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
-    }
-
-    pub fn from_env() -> Self {
-        Self::new(
-            std::env::var("OTTTO_API_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
-        )
     }
 
     pub fn new(api_base_url: impl Into<String>) -> Self {
@@ -2124,13 +2236,30 @@ impl SnapshotApiClient {
             .and_then(decode_activity_hint)
     }
 
+    #[cfg(test)]
     pub fn upload_batch(
         &self,
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, None)
+        self.upload_batch_with_item_cap(
+            relay_token,
+            request,
+            enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+        )
+    }
+
+    /// `item_cap` is this pass's receiver limit; it selects the gzip budget.
+    pub(crate) fn upload_batch_with_item_cap(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+        item_cap: usize,
+    ) -> Result<SnapshotBatchResponse> {
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, item_cap, None)
     }
 
     /// Optional retry transport: fresh authority at every physical POST, one
@@ -2150,6 +2279,7 @@ impl SnapshotApiClient {
             relay_token,
             request,
             enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
             Some((budget, validate)),
         )
     }
@@ -2159,6 +2289,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
+        item_cap: usize,
         mut retry: Option<(
             &mut crate::snapshot_retry::RetryBudget,
             &mut dyn FnMut() -> Result<()>,
@@ -2189,7 +2320,7 @@ impl SnapshotApiClient {
             .as_ref()
             .map(|(budget, _)| budget.gzip_enabled(default_gzip))
             .unwrap_or(default_gzip);
-        let compressed = gzip_snapshot_batch(&body, gzip_enabled);
+        let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
                 validate()?;
@@ -2288,16 +2419,18 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let shed = shed_from_response(code, response);
+                let shed = shed_from_response(code, response, request.snapshots.len());
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
                     code,
                     server_request_id.as_deref(),
-                    shed.retry_after.map(|retry_after| retry_after.as_secs()),
+                    shed.downcast_ref::<UploadShed>()
+                        .and_then(|shed| shed.retry_after)
+                        .map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(shed))
+                Err(shed)
             }
             // 401/403 means relay authorization failed, not schema drift.
             // Keep it typed and body-free so the caller can surface an auth
@@ -2315,10 +2448,8 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            // Validation-like statuses mean the backend refused the payload
-            // contract. Keep a redacted/truncated body excerpt so field logs show
-            // the exact validator failure (for example, missing usage_buckets)
-            // without leaking tokens, paths, account IDs, or machine IDs.
+            // A validation response supplies no ACK. Parse complete locations
+            // before discarding all backend text, which may contain user values.
             Err(ureq::Error::Status(code @ (400 | 422), response)) => {
                 self.record_batch_http_failure(
                     request,
@@ -2328,10 +2459,14 @@ impl SnapshotApiClient {
                     None,
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(BatchRejected {
-                    status: code,
-                    body_excerpt: response_body_excerpt(response),
-                }))
+                // Keep the HTTP client's existing complete-body size bound.
+                // A failed read has no usable locations and stays whole-batch.
+                let body = response.into_string().ok();
+                Err(anyhow::Error::new(BatchRejected::from_response(
+                    code,
+                    body.as_deref().unwrap_or_default().as_bytes(),
+                    request.snapshots.len(),
+                )))
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.record_batch_http_failure(
@@ -2678,64 +2813,30 @@ impl SnapshotApiClient {
     /// 401/403 surfaces as a relay-authorization error so the caller can refresh
     /// credentials; 400/422 means the inventory contract drifted.
     pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/mcp/inventory"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse mcp inventory response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected mcp inventory: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload mcp inventory failed: {error}")),
-        }
+        let sent = self
+            .relay_token_post("/api/v1/mcp/inventory", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "mcp inventory")
     }
 
     pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/context-footprint/snapshot"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse context footprint response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected context footprint: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload context footprint failed: {error}")),
-        }
+        let sent = self
+            .relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "context footprint")
     }
 
+    /// A POST with the source-scoped relay token; see
+    /// `relay_token_upload_response` for its outcome.
+    fn relay_token_post(&self, path: &str, relay_token: &str) -> ureq::Request {
+        self.agent
+            .post(&self.api_url(path))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
     /// Upload one bounded, content-free cloud-session batch using the same
     /// source-scoped relay principal as local snapshots. Response bodies are
     /// never retained on auth/contract failures.
-    pub fn upload_cloud_session_batch(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        self.upload_cloud_session_batch_with_timeout(
-            relay_token,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn upload_cloud_session_batch_with_timeout(
         &self,
         relay_token: &str,
@@ -2761,29 +2862,11 @@ impl SnapshotApiClient {
                 validate_cloud_session_heartbeat_receipt(request, &receipt)?;
                 Ok(receipt)
             }
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session upload",
-                    "cloud_session_batch",
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session upload",
                 "cloud_session_batch",
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -2817,33 +2900,16 @@ impl SnapshotApiClient {
             )?
             .into_json()
             .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session authority read",
-                    "cloud_session_authority",
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session authority read",
                 "cloud_session_authority",
-                &error,
-            ))),
+            )),
         }
     }
 
     /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
+    #[cfg(test)]
     pub fn upload_cloud_session_scan_chunk(
         &self,
         relay_token: &str,
@@ -2876,20 +2942,6 @@ impl SnapshotApiClient {
     }
 
     /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
-    pub fn finalize_cloud_session_scan(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        self.finalize_cloud_session_scan_with_timeout(
-            relay_token,
-            scan_id,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn finalize_cloud_session_scan_with_timeout(
         &self,
         relay_token: &str,
@@ -2943,29 +2995,11 @@ impl SnapshotApiClient {
                 validate_cloud_session_scan_receipt(action, request, &receipt)?;
                 Ok(receipt)
             }
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session scan upload",
-                    operation,
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session scan upload",
                 operation,
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -2978,28 +3012,11 @@ impl SnapshotApiClient {
     /// Sends the serialized body, so the bytes the run counts are the bytes
     /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/context-composition/snapshot"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
+        let sent = self
+            .relay_token_post("/api/v1/context-composition/snapshot", relay_token)
             .set("Content-Type", "application/json")
-            .send_bytes(body)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected context composition: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
-        }
+            .send_bytes(body);
+        relay_token_upload_response(sent, "context composition")
     }
 
     /// The daily composition run health: one request, never retried. A
@@ -3009,20 +3026,8 @@ impl SnapshotApiClient {
         relay_token: &str,
         body: &Value,
     ) -> Result<Value> {
-        self.post_context_composition_run_health_with_timeout(
-            relay_token,
-            body,
-            Duration::from_secs(10),
-        )
-    }
-
-    pub(crate) fn post_context_composition_run_health_with_timeout(
-        &self,
-        relay_token: &str,
-        body: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
-        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        let (agent, request_timeout) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(10))?;
         match agent
             .post(&self.api_url("/api/v1/context-composition/run-health"))
             .timeout(request_timeout)
@@ -3044,28 +3049,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &MachineRuntimeHeartbeatV1,
     ) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/apps/health/heartbeat"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse local health heartbeat response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow::Error::new(LocalHealthProjectionRejected {
-                    status: code,
-                }))
-            }
-            Err(error) => Err(anyhow!("upload local health heartbeat failed: {error}")),
-        }
+        self.upload_local_health(relay_token, "heartbeat", request)
     }
 
     pub fn upload_local_health_projection(
@@ -3073,16 +3057,26 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &LocalMachineHealthV1,
     ) -> Result<Value> {
+        self.upload_local_health(relay_token, "projection", request)
+    }
+
+    /// POST to `/api/v1/apps/health/{kind}` with the relay token.
+    fn upload_local_health(
+        &self,
+        relay_token: &str,
+        kind: &str,
+        request: &impl Serialize,
+    ) -> Result<Value> {
         match self
             .agent
-            .post(&self.api_url("/api/v1/apps/health/projection"))
+            .post(&self.api_url(&format!("/api/v1/apps/health/{kind}")))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
         {
             Ok(response) => response
                 .into_json()
-                .map_err(|error| anyhow!("parse local health projection response failed: {error}")),
+                .map_err(|error| anyhow!("parse local health {kind} response failed: {error}")),
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
                     status: code,
@@ -3093,7 +3087,7 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            Err(error) => Err(anyhow!("upload local health projection failed: {error}")),
+            Err(error) => Err(anyhow!("upload local health {kind} failed: {error}")),
         }
     }
 
@@ -3441,35 +3435,6 @@ fn response_has_request_id(response: &ureq::Response) -> bool {
     ]
     .iter()
     .any(|header| response.header(header).is_some())
-}
-
-fn response_body_excerpt(response: ureq::Response) -> Option<String> {
-    response
-        .into_string()
-        .ok()
-        .and_then(|body| safe_response_body_excerpt(&body))
-}
-
-fn safe_response_body_excerpt(body: &str) -> Option<String> {
-    let compact = body
-        .split_whitespace()
-        .take(80)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return None;
-    }
-    Some(truncate_diagnostic(&redact_inline(&compact)))
-}
-
-fn truncate_diagnostic(value: &str) -> String {
-    const MAX_DIAGNOSTIC_CHARS: usize = 500;
-    if value.chars().count() <= MAX_DIAGNOSTIC_CHARS {
-        return value.to_string();
-    }
-    let mut truncated = value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
-    truncated.push_str("...");
-    truncated
 }
 
 /// Fence relay admission once confirmation may have reached the server and
@@ -3891,27 +3856,63 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejection_body_excerpt_is_redacted_and_bounded() {
-        let token = format!("ghp_{}", "AbCdEf1234567890aaaaaaaaaaaaaaaaaa");
-        let body = format!(
-            "{{\"detail\":\"usage_buckets are required Authorization: Bearer {token} machine_id otm_1234567890abcdef path /Users/ron/.codex/sessions/a.jsonl\"}}"
+    fn snapshot_rejection_locations_require_a_complete_entity_local_set() {
+        for body in [
+            r#"{"detail":"synthetic validator text"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":[] }]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",2]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",-1]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","other"]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]}]"#,
+        ] {
+            assert!(BatchRejected::from_response(422, body.as_bytes(), 2)
+                .snapshot_indexes
+                .is_none());
+        }
+        let body = br#"{"errors":[{"loc":["body","snapshots",1,"session_artifacts",0]},{"loc":["body","snapshots",1,"session_artifacts",1]}]}"#;
+        assert_eq!(
+            BatchRejected::from_response(422, body.as_slice(), 2).snapshot_indexes,
+            Some(vec![1])
         );
-        let excerpt = safe_response_body_excerpt(&body).expect("excerpt");
-        assert!(excerpt.contains("usage_buckets"));
-        assert!(excerpt.contains("[REDACTED]"));
-        assert!(excerpt.contains("[machine_id]"));
-        assert!(excerpt.contains("[path]"));
-        assert!(!excerpt.contains("/Users/ron"));
-        assert!(excerpt.chars().count() <= 503);
+        assert!(BatchRejected::from_response(400, body.as_slice(), 2)
+            .snapshot_indexes
+            .is_none());
     }
 
+    /// [format] A shed keeps only a recognized code and, for the identity
+    /// deferral, the request items it names; anything else names none.
     #[test]
     fn shed_code_keeps_only_a_recognized_backend_code() {
         let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
         assert_eq!(
-            shed_code(identity),
-            Some(UploadShedCode::OriginalIdentityUnavailable)
+            shed_body(identity, 2),
+            (Some(UploadShedCode::OriginalIdentityUnavailable), None)
         );
+        let named = |code: &str, locs: &str| {
+            format!(r#"{{"error":"ServiceOverloadedError","code":"{code}","errors":[{locs}]}}"#)
+        };
+        let identity_code = SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE;
+        for (body, indexes) in [
+            // 3-element (this shed) and 4-element (422) locations; a
+            // duplicate occurrence names its item once.
+            (
+                named(
+                    identity_code,
+                    r#"{"loc":["body","snapshots",1]},{"loc":["body","snapshots",1]},{"loc":["body","snapshots",0,"x"]}"#,
+                ),
+                Some(vec![0, 1]),
+            ),
+            (
+                named(
+                    "cursor_allocation_timeout",
+                    r#"{"loc":["body","snapshots",0]}"#,
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(shed_body(body.as_bytes(), 2).1, indexes, "{body}");
+        }
         assert_eq!(
             UploadShedCode::OriginalIdentityUnavailable.as_str(),
             SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
@@ -3936,7 +3937,7 @@ mod tests {
         ];
         for body in bodies {
             assert_eq!(
-                shed_code(body),
+                shed_body(body, 2).0,
                 None,
                 "{}",
                 String::from_utf8_lossy(&body[..body.len().min(80)])
@@ -4024,21 +4025,27 @@ mod tests {
                     state as u8
                 })
                 .collect::<Vec<_>>();
-            let encoded = gzip_snapshot_batch(&body, true).expect("within budgets");
+            let encoded = gzip_snapshot_batch(&body, true, 655_360).expect("within budgets");
             assert!(encoded.len() <= 2 * 1024 * 1024);
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(encoded.as_slice())
                 .read_to_end(&mut decoded)
                 .unwrap();
             assert_eq!(decoded, body);
-            assert!(gzip_snapshot_batch(&body, false).is_none());
+            assert!(gzip_snapshot_batch(&body, false, 655_360).is_none());
         }
         for size in [1024 * 1024 + 1, 2 * 640 * 1024, 2 * 1024 * 1024] {
             assert!(
-                gzip_snapshot_batch(&vec![b'x'; size], true).is_none(),
+                gzip_snapshot_batch(&vec![b'x'; size], true, 2 * 1024 * 1024).is_none(),
                 "identity fallback preserves large packed requests without a gzip 413"
             );
         }
+        // Only a receiver advertising over 2 MiB gets a large encoded request.
+        let max = crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES;
+        let item_cap = 8 * 1024 * 1024;
+        assert!(gzip_snapshot_batch(&vec![b'x'; 1024 * 1024 + 1], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max + 1], true, item_cap).is_none());
     }
 
     #[test]
@@ -5172,7 +5179,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, census_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -5199,6 +5206,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 }
 
 #[cfg(test)]
-pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
-    gzip_snapshot_batch(body, true)
+pub(crate) fn retention_gzip_probe(body: &[u8], item_cap: usize) -> Option<Vec<u8>> {
+    gzip_snapshot_batch(body, true, item_cap)
 }

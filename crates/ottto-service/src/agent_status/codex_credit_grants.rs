@@ -1,6 +1,6 @@
 //! Codex credit adapter: maps Codex app-server credit fields into the shared
 //! credit model (`crate::quota_credit_model`) and owns the Codex detail-read
-//! cadence (design R1, R7; quota contract v2.1 §3-§6, v2.2 §11).
+//! cadence (quota contract v2.1 §3-§6, v2.2 §11).
 //!
 //! Codex field names are read here and nowhere else:
 //! - `rateLimitResetCredits.credits[]` rows become [`GrantInput`]s on the
@@ -12,7 +12,7 @@
 //! - A counts-only diagnostic over `rateLimitsByLimitId`
 //!   ([`rate_limit_pools_summary`]). Pools are not emitted as meters.
 //!
-//! # Cadence (R7)
+//! # Cadence
 //!
 //! Every detailed `account/rateLimits/read` costs Codex a second backend call
 //! for the reset-credit list. Every poll therefore first sends the routine
@@ -54,7 +54,7 @@
 //! disagreement or a server rejecting the parameter can cost more than before
 //! in that hour. There is never more than one escalation per session.
 //!
-//! # Sender stability (R7b)
+//! # Sender stability
 //!
 //! A reading without the list re-sends the binding's last observed list from
 //! the model's [`SectionCache`] unchanged (original `grants_observed_at`),
@@ -1288,7 +1288,7 @@ mod tests {
 import os
 import sys
 
-if sys.argv[1:] != ["app-server", "--stdio"]:
+if sys.argv[-2:] != ["app-server", "--stdio"]:
     sys.exit(1)
 mode = os.environ["FAKE_CODEX_MODE"]
 log = open(os.environ["FAKE_CODEX_LOG"], "a")

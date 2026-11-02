@@ -252,11 +252,7 @@ impl ReofferServer {
 
 impl Drop for ReofferServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        stop_server(&self.stop, &mut self.worker);
     }
 }
 
@@ -393,7 +389,7 @@ impl ReofferPipeline {
             .prepare_cycle(now)
             .unwrap()
             .expect("real due preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         assert_eq!(
             scan.census_complete, complete,
             "synthetic census is complete unless authority debt withholds it"
@@ -482,7 +478,7 @@ impl ReofferPipeline {
         (cycle, parsed, bytes)
     }
 
-    /// M1: deletes every durable warm-cache store under the support
+    /// Deletes every durable warm-cache store under the support
     /// directory, so the next restart also loses the store and reads cold.
     fn drop_durable_stores(&self) {
         fn walk(dir: &std::path::Path) {
@@ -501,7 +497,7 @@ impl ReofferPipeline {
         walk(&self.support);
     }
 
-    /// M1: this pipeline stands in for the daemon on its support directory,
+    /// This pipeline stands in for the daemon on its support directory,
     /// holding #801's single-writer lock there, so the post-save durable
     /// write runs.
     #[cfg(unix)]
@@ -509,7 +505,7 @@ impl ReofferPipeline {
         crate::locked_state_dir::test_locks::hold(&self.support);
     }
 
-    /// M1: durable warm-cache records on disk under the support directory.
+    /// Durable warm-cache records on disk under the support directory.
     #[cfg(unix)]
     fn durable_records(&self) -> usize {
         fn walk(dir: &std::path::Path, inside: bool) -> usize {
@@ -598,7 +594,7 @@ fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
     std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 }
 
-/// R1/R2/R7: an unchanged finished session refused for
+/// An unchanged finished session refused for
 /// `original_pair_candidate_unproved` is offered once a day, exactly, until
 /// the server accepts it. Repeat refusals settle the census while health
 /// stays red, and the clock restarts on each refusal.
@@ -691,7 +687,7 @@ fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
         );
     }
 
-    // Day 2: SOURCE is ready; the normal ACK clears the refusal.
+    // Day 2: the original pair is proven; the normal ACK clears the refusal.
     pipeline.server.answer(Answer::Accept);
     let t2 = t1 + DAY + 60;
     let day2 = pipeline.cycle(t2);
@@ -724,7 +720,7 @@ fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
     assert!(!after.index.bounded_sweep_had_unsettled_upload());
 }
 
-/// SOURCE ruling 6: a legacy `other` refusal, as every older daemon wrote
+/// A legacy `other` refusal, as every older daemon wrote
 /// this reason, is re-offered once. The server's answer re-classifies it:
 /// `other` again is final; the exact reason joins the daily cycle.
 #[test]
@@ -796,7 +792,7 @@ fn legacy_other_refusal_is_reclassified_by_one_offer() {
     }
 }
 
-/// COST (b): a validated `unchanged` answer that did not store the body
+/// A validated `unchanged` answer that did not store the body
 /// retires the old refusal and its schedule, keeps the unstored-body hold,
 /// and records no stored body.
 #[test]
@@ -939,7 +935,7 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     );
 }
 
-/// COST (a): once the session's head moved past the refused body, the old
+/// Once the session's head moved past the refused body, the old
 /// body is never re-offered and no re-admission raises the session's usage.
 #[test]
 #[serial]
@@ -1075,8 +1071,8 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
     std::fs::write(&path, rows).unwrap();
 }
 
-/// SI I-R1 (R12, capture on): between the refusal and the daily re-offer,
-/// SOURCE proves the original pair and a late API capture adds the session's
+/// With capture on, between the refusal and the daily re-offer,
+/// the original pair is proven and a late API capture adds the session's
 /// identity. The session's next offer is rebuilt from the current evidence,
 /// never from the refused body: the server accepts a body with the refused
 /// body's usage and the late rows' tags under R2-N2 (a request whose late row
@@ -1296,7 +1292,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     let mut accepted = 0;
     let mut budget = InplaceRetryBudget::default();
     let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
-        upload_resumable_batches_with_body_witness_partitioned(
+        upload_resumable_batches_with_literal_families(
             std::slice::from_ref(&fingerprint),
             &unique_poison_scope(),
             &mut progress,
@@ -1305,6 +1301,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             |_| body.clone(),
             |_| Some("synthetic-session"),
             |_| false,
+            |_| None,
             &mut budget,
             |items| {
                 assert_eq!(items, vec![fingerprint.clone()]);
@@ -1375,7 +1372,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     );
 }
 
-/// SOURCE condition 5 (Round 13): a protected root, named by the local
+/// A protected root, named by the local
 /// re-emission list, whose family a census retired as absent (tombstoned,
 /// witness kept) and whose member then returns, through the real
 /// prepare/finish pipeline and the recording server. The return re-enters
@@ -1470,13 +1467,22 @@ fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_j
 }
 
 /// `refused_then_conflicted`, optionally holding the state-directory lock
-/// from the first cycle on (M1).
+/// from the first cycle on.
 fn refused_then_conflicted_holding(
     name: &str,
     locked: bool,
 ) -> (ReofferPipeline, String, u64, serde_json::Value) {
     let t0 = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    // Keep this physical-read fixture larger than its bounded certificate
+    // samples, so total guard + suffix bytes can distinguish restore from Full.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+        .unwrap();
     #[cfg(unix)]
     if locked {
         pipeline.hold_state_dir_lock();
@@ -1502,7 +1508,7 @@ fn refused_then_conflicted_holding(
     (pipeline, fingerprint, t1, deadline)
 }
 
-/// M1 through the real sync caller, both ways. Without the daemon's
+/// [regress] The durable warm cache through the real sync caller, both ways. Without the daemon's
 /// single-writer lock (#801) on the support directory the post-save write
 /// writes nothing, and the due-day restart reads the file cold. Holding it,
 /// the earlier cycles write the retained copy after their saves, and the
@@ -1514,6 +1520,7 @@ fn refused_then_conflicted_holding(
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn durable_store_is_written_only_under_the_state_dir_lock() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("durable_store_is_written_only_under_the_state_dir_lock") {
         return;
     }
@@ -1527,6 +1534,15 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
             refused_then_conflicted_holding(name, locked);
         let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
         let records = pipeline.durable_records();
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         assert!(day2.result.is_ok(), "{name}: {:?}", day2.result);
@@ -1544,7 +1560,7 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
     }
 }
 
-/// E1 margin receipt for the scan workers' stack. The real prepare,
+/// Margin receipt for the scan workers' stack. The real prepare,
 /// rotation and finish cycle (a full scan, then a restart that restores the
 /// durable copy) completes in the optimized build on a thread with the
 /// 2 MiB spawn default, so the workers' larger explicit stack is headroom.
@@ -1570,10 +1586,20 @@ fn scan_worker_stack_margin_receipt() {
         .name("ottto-snapshot-sync".to_string())
         .stack_size(STACK_BYTES)
         .spawn(|| {
+            let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
             let (mut pipeline, _, _, deadline) =
                 refused_then_conflicted_holding("stack-margin", true);
             let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
             assert!(pipeline.durable_records() > 0, "written after the save");
+            // Scoped restore waits on a quiet file. Inert growth exercises the
+            // restore+Tail stack without changing the offered usage body.
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pipeline.transcript())
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
             let due = deadline.as_u64().unwrap() + 60;
             let (day2, _, bytes) = pipeline.measured_cycle(due, true);
             assert!(day2.result.is_ok(), "{:?}", day2.result);
@@ -1659,7 +1685,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
     }
 
     // The reserved day arrives: exactly one re-read and one offer. With the
-    // M1 durable warm cache a restart would restore this file and read no
+    // durable warm cache a restart would restore this file and read no
     // bytes; this cycle measures the cold reconstruction, so the restart
     // also loses the store.
     let due = deadline.as_u64().unwrap() + 60;
@@ -1682,7 +1708,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// SOURCE B1: the cooldown test's twin with the durable store present.
+/// [regress] The cooldown test's twin with the durable store present.
 /// Both arms hold the state-directory lock, so their earlier cycles write
 /// the retained copy; the cold arm then drops the store, the warm arm keeps
 /// it. Across restarts that could restore the file, the quiet cycles still
@@ -1695,6 +1721,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore") {
         return;
     }
@@ -1738,6 +1765,15 @@ fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
         if !warm {
             pipeline.drop_durable_stores();
         }
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         if warm {
@@ -2062,7 +2098,7 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     assert_eq!(pipeline.server.offered(), offered, "no history re-uploaded");
 }
 
-/// H727-1: the M4 incident shape, through real prepare/finish (including
+/// The incident shape, through real prepare/finish (including
 /// bootstrap completion and N2 clearing), after BOTH list and .seen are lost.
 #[test]
 #[serial]
@@ -2111,7 +2147,7 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
     );
     let seen = crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support);
     if set {
-        // Even an empty well-formed list sets independent intent (M1).
+        // Even an empty well-formed list sets independent intent.
         std::fs::write(
             reemission_list_path(&pipeline.support),
             "# installed empty list\n",
@@ -2220,7 +2256,7 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
 }
 
 /// #705's returning tombstoned member under #712's move hold, on the
-/// always-on path (E2 ruling on U10): (a) the E2 page clears the tombstone,
+/// always-on path: (a) the `e2` page clears the tombstone,
 /// whatever the proof's health; (b) the #712 hold still withholds the body,
 /// with nothing uploaded or stamped; (c) once the hold releases (an explicit
 /// `full` claim, then readable proof) the family's money is exactly its
@@ -2342,8 +2378,8 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         "the move hold stands"
     );
     assert!(saved.get("claude_history_move_released").is_none());
-    // (a) The E2 page settles the family's authority even with unhealthy
-    // proof: the tombstone clears (snapshots.rs fold, E2 ruling on U10).
+    // (a) The `e2` page settles the family's authority even with unhealthy
+    // proof: the tombstone clears (snapshots.rs fold).
     assert!(!returned.index.claude_family_tombstoned_for_test(root));
 
     // (c) Release the hold the production way: an explicit `full` claim

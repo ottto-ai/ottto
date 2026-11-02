@@ -4165,25 +4165,39 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
             })
             .arg("fixture")
             .arg(&pid_file);
-        let result: anyhow::Result<Value> = harvest::run_worker_process_timeout(
-            &mut command,
-            &"x".repeat(1024 * 1024),
-            Duration::from_millis(250),
-        );
         let expected = match phase {
             "input" | "work" => harvest::WorkerError::Timeout,
             "locked" => harvest::WorkerError::Locked,
             _ => harvest::WorkerError::Failed,
         };
+        // Only the timeout phases race the deadline. The others exit on
+        // their own, so their deadline is not under test: a short one lets
+        // a loaded runner (slow /bin/sh start, slow 1 MiB drain) turn their
+        // exit into a Timeout.
+        let timeout = if expected == harvest::WorkerError::Timeout {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(30)
+        };
+        let result: anyhow::Result<Value> =
+            harvest::run_worker_process_timeout(&mut command, &"x".repeat(1024 * 1024), timeout);
         assert_eq!(
             result.unwrap_err().downcast_ref::<harvest::WorkerError>(),
             Some(&expected)
         );
-        let pid: i32 = fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // The 250 ms timeout can kill /bin/sh before `echo $$` writes the
+        // pid (missing or empty file); that only happens in a timeout phase.
+        let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        else {
+            assert!(
+                matches!(phase, "input" | "work"),
+                "{phase}: worker exited without writing its pid"
+            );
+            fs::remove_dir_all(dir).unwrap();
+            continue;
+        };
         // The worker is reaped by its own thread, never by the caller:
         // once gone, it is not left as a zombie.
         let deadline = Instant::now() + Duration::from_secs(10);

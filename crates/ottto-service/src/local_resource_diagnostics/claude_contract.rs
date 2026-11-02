@@ -22,13 +22,8 @@ counters!(Transition {
     collector_e2_grouping,
     mid_traversal_placeholder
 });
-counters!(Latch {
-    set,
-    cleared,
-    cleared_with_quarantine_exempt,
-    quarantine_exempt_families
-});
-// Lead A ruling (a): the one cutover terminal (`runs`) and the files and bytes it re-armed.
+counters!(Latch { set, cleared });
+// The one cutover terminal (`runs`) and the files and bytes it re-armed.
 counters!(CutoverRearm { runs, files, bytes });
 counters!(ContextChange {
     backfill_changed,
@@ -40,17 +35,15 @@ counters!(ContextChange {
     replay_changed,
     roots_changed
 });
-// Evidence owed ON: each owed member the traversal's selection
+// Evidence owed (terminal-retry re-arm): each owed member the traversal's selection
 // visits, by outcome, by why a re-stamp was refused, and by the age of its
 // family's stored evidence window against this census window.
 counters!(EvidenceOwed {
     restamped,
     restamped_from_record,
-    restamped_under_latch,
     read,
     selected_by_other_reason,
     deferred_page_cap,
-    owed_waiting_cap,
     changed,
     refused_contract_latch,
     refused_contract_unproven,
@@ -65,10 +58,7 @@ counters!(EvidenceOwed {
     age_le_7d,
     age_gt_7d,
     age_unknown,
-    identity_contract_owed,
-    reowed_after_current_contract_read,
-    identity_owed_read_under_latch,
-    queue_at_page_start_under_latch
+    identity_owed_read_under_latch
 });
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {

@@ -40,7 +40,7 @@ fn hold_released(index: &ScanIndex, key: &str) -> bool {
         .unverified_or_twin()
 }
 
-/// GUARDRAILS rule 5 through the real open path: an unavailable held key
+/// Through the real open path: an unavailable held key
 /// backs off by pages (1, 2, 4), each wait capped at 6 h, and parks with
 /// one alarm after 8 failed opens, its due D still owed across save/reload.
 /// A healthy held key takes the page's single attempt in those same pages.

@@ -19,19 +19,43 @@ pub(super) fn rows(
     kind: &str,
     mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
 ) -> Result<()> {
-    let kind = RecordKind::parse(kind)?;
-    let mut after = None;
-    loop {
-        let page = tx.scan_kind(&kind, after.as_ref(), 128)?;
-        if page.is_empty() {
-            break;
-        }
-        after = page.last().map(|h| h.key.clone());
-        for h in page {
-            f(tx, h)?;
-        }
+    let mut rows = KeyRows::new(kind, None, 128)?;
+    while let Some(h) = rows.next(tx)? {
+        f(tx, h)?;
     }
     Ok(())
+}
+/// A record row's (key, position).
+fn record(h: &Header) -> Result<(&[u8], u64)> {
+    let RowKey::Record {
+        key_bytes,
+        position,
+        ..
+    } = &h.key
+    else {
+        anyhow::bail!("state_v2_record_key")
+    };
+    Ok((key_bytes, *position))
+}
+/// `h`, the first row of its key, must be the key's only row, at position 1;
+/// `more` says whether another row shares its key.
+fn only_row(h: &Header, more: impl FnOnce() -> Result<bool>) -> Result<()> {
+    ensure!(
+        matches!(h.key, RowKey::Record { position: 1, .. }) && !more()?,
+        "state_v2_member_position"
+    );
+    Ok(())
+}
+/// A per-family kind's row: `None` for its manifest (position 0, empty key),
+/// else the family key of the family's only row.
+pub(super) fn member(h: &Header) -> Result<Option<&[u8]>> {
+    let (key_bytes, position) = record(h)?;
+    if position == 0 {
+        ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+        return Ok(None);
+    }
+    only_row(h, || Ok(false))?;
+    Ok(Some(key_bytes))
 }
 // A key has few rows of a kind, usually one.
 const KEY_PAGE: usize = 8;
@@ -68,6 +92,89 @@ pub(super) fn visit(
     }
     Ok(())
 }
+/// One family's only row (position 1) of `kind`, decoded, with its row
+/// digest as stored. `None`: no row. Another row under the key errs.
+pub(super) fn read_row<T: DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    name: &str,
+) -> Result<Option<(T, [u8; 32])>> {
+    let page = tx.scan_record_key(&RecordKind::parse(kind)?, name.as_bytes(), None, 2)?;
+    let Some(h) = page.first() else {
+        return Ok(None);
+    };
+    only_row(h, || Ok(page.len() > 1))?;
+    read_digest(tx, h).map(Some)
+}
+/// One ascending header range read over a kind, paged, resumed past every
+/// row of `after`'s key and consumed in key order: every row (`next`), or a
+/// key's only row (`row`), as `read_row` reads it, passing over rows of keys
+/// it is not asked for.
+pub(super) struct KeyRows {
+    kind: RecordKind,
+    after: Option<RowKey>,
+    page: std::collections::VecDeque<Header>,
+    limit: usize,
+}
+impl KeyRows {
+    pub(super) fn new(kind: &str, after: Option<&str>, limit: usize) -> Result<Self> {
+        let after = after
+            .map(|name| key(kind, name, i64::MAX as u64))
+            .transpose()?;
+        Ok(Self {
+            kind: RecordKind::parse(kind)?,
+            after,
+            page: Default::default(),
+            limit,
+        })
+    }
+    /// The next row, reading the next page once this one is spent.
+    fn peek(&mut self, tx: &mut dyn Transaction) -> Result<Option<&Header>> {
+        if self.page.is_empty() {
+            self.page = tx
+                .scan_kind(&self.kind, self.after.as_ref(), self.limit)?
+                .into();
+            if let Some(h) = self.page.back() {
+                self.after = Some(h.key.clone());
+            }
+        }
+        Ok(self.page.front())
+    }
+    pub(super) fn next(&mut self, tx: &mut dyn Transaction) -> Result<Option<Header>> {
+        self.peek(tx)?;
+        Ok(self.page.pop_front())
+    }
+    /// `name`'s only row; `None`: it has none. Names must ascend.
+    pub(super) fn row(&mut self, tx: &mut dyn Transaction, name: &str) -> Result<Option<Header>> {
+        use std::cmp::Ordering;
+        while let Some(h) = self.peek(tx)? {
+            match record(h)?.0.cmp(name.as_bytes()) {
+                Ordering::Less => {}
+                Ordering::Greater => break,
+                Ordering::Equal => {
+                    let h = self.page.pop_front().context("state_v2_record_key")?;
+                    only_row(&h, || match self.peek(tx)? {
+                        Some(next) => Ok(record(next)?.0 == name.as_bytes()),
+                        None => Ok(false),
+                    })?;
+                    return Ok(Some(h));
+                }
+            }
+            self.page.pop_front();
+        }
+        Ok(None)
+    }
+}
+/// One row decoded, with its row digest as stored.
+pub(super) fn read_digest<T: DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    h: &Header,
+) -> Result<(T, [u8; 32])> {
+    let mut digests = Digests::new();
+    let value = read(tx, h, Some(&mut digests))?;
+    let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
+    Ok((value, digest))
+}
 pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<Vec<u8>> {
     ensure!(
         h.value_version == 1 && h.len <= value_cap(&h.key),
@@ -81,14 +188,31 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
     tx.read_value(h, &mut out)?;
     Ok(out.inner)
 }
+/// Shared-evidence kinds: (kind, field holding request-set references, class).
+/// `file.census` keeps one set in its field; the others keep a map of sets.
+const SHARED: [(&str, &str, &str); 4] = [
+    ("account_window", "r", "account"),
+    ("usage.pending", "member_request_id_hashes", "requests"),
+    (
+        "proof.usage",
+        "legacy_excluded_request_id_hashes",
+        "requests",
+    ),
+    ("file.census", "b", "census"),
+];
+/// The shared field and interning class of a shared-evidence kind.
+fn shared(kind: &str) -> Option<(&'static str, &'static str)> {
+    SHARED
+        .iter()
+        .find(|(name, ..)| *name == kind)
+        .map(|&(_, field, class)| (field, class))
+}
 fn evidence_map<'a>(
     kind: &str,
     value: &'a mut Json,
 ) -> Option<&'a mut serde_json::Map<String, Json>> {
-    let field = match kind {
-        "account_window" => "r",
-        "usage.pending" => "member_request_id_hashes",
-        "proof.usage" => "legacy_excluded_request_id_hashes",
+    let field = match shared(kind) {
+        Some((field, _)) if kind != "file.census" => field,
         _ => return None,
     };
     value.get_mut(field)?.as_object_mut()
@@ -123,23 +247,9 @@ struct Projection {
     refs: Vec<RowKey>,
     created: Vec<RowKey>,
 }
-fn evidence_class(kind: &str) -> &'static str {
-    match kind {
-        "account_window" => "account",
-        "file.census" => "census",
-        _ => "requests",
-    }
-}
 fn input_cap(key: &RowKey) -> u64 {
     match key {
-        RowKey::Record { kind, .. }
-            if matches!(
-                kind.name(),
-                "account_window" | "file.census" | "usage.pending" | "proof.usage"
-            ) =>
-        {
-            VALUE_BYTES
-        }
+        RowKey::Record { kind, .. } if shared(kind.name()).is_some() => VALUE_BYTES,
         _ => value_cap(key),
     }
 }
@@ -149,25 +259,15 @@ fn shared_json(
     json: &[u8],
     acquire: bool,
 ) -> Result<Projection> {
-    if !matches!(
-        kind,
-        "account_window" | "usage.pending" | "file.census" | "proof.usage"
-    ) || json.first() != Some(&b'{')
-    {
+    let Some((field, class)) = shared(kind).filter(|_| json.first() == Some(&b'{')) else {
         return Ok(Projection {
             json: json.to_vec(),
             refs: Vec::new(),
             created: Vec::new(),
         });
-    }
+    };
     let mut root: BTreeMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_slice(json)?;
-    let field = match kind {
-        "account_window" => "r",
-        "usage.pending" => "member_request_id_hashes",
-        "proof.usage" => "legacy_excluded_request_id_hashes",
-        _ => "b",
-    };
     let mut refs = Vec::new();
     let mut created = Vec::new();
     if let Some(raw) = root.get_mut(field) {
@@ -183,18 +283,15 @@ fn shared_json(
         };
         for value in values {
             if acquire {
-                let (id, new) = interning::resolve(tx, evidence_class(kind), value)?;
+                let (id, new) = interning::resolve(tx, class, value)?;
                 refs.push(RowKey::RequestSet(id));
                 if new {
                     created.push(RowKey::RequestSet(id));
                 }
                 *value = serde_json::json!({"$request_set":id});
             } else {
-                *value = interning::read(
-                    tx,
-                    evidence_class(kind),
-                    id(value).context("state_v2_shared_reference")?,
-                )?;
+                *value =
+                    interning::read(tx, class, id(value).context("state_v2_shared_reference")?)?;
             }
         }
         *raw = serde_json::value::RawValue::from_string(serde_json::to_string(&value)?)?;
@@ -250,11 +347,7 @@ pub(super) fn put<T: Serialize + ?Sized>(
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {
-        if !matches!(
-            kind,
-            "account_window" | "usage.pending" | "file.census" | "proof.usage"
-        ) && old.digest == codec::digest(&json)
-        {
+        if shared(kind).is_none() && old.digest == codec::digest(&json) {
             return Ok(old.clone());
         }
     }
@@ -438,25 +531,15 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     roots: Option<&BTreeSet<String>>,
     mut seed: Option<&mut Digests>,
 ) -> Result<BTreeMap<String, T>> {
-    let manifest = tx
-        .get(&key(kind, "", 0)?)?
-        .context("state_v2_missing_manifest")?;
+    let Some(manifest) = root(tx, kind)? else {
+        return Ok(BTreeMap::new());
+    };
     let expected = read::<usize>(tx, &manifest, seed.as_deref_mut())?;
     let mut result = BTreeMap::new();
     visit(tx, kind, roots, |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            anyhow::bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+        let Some(key_bytes) = member(&h)? else {
             return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
+        };
         result.insert(family(key_bytes)?, read(tx, &h, seed.as_deref_mut())?);
         Ok(())
     })?;
@@ -505,10 +588,7 @@ pub(super) fn references(
     let RowKey::Record { kind, .. } = &h.key else {
         return Ok(());
     };
-    if !matches!(
-        kind.name(),
-        "account_window" | "usage.pending" | "file.census" | "proof.usage"
-    ) {
+    if shared(kind.name()).is_none() {
         return Ok(());
     }
     let bytes = codec::capture(value, value_cap(&h.key))?;
@@ -544,14 +624,45 @@ pub(super) fn field_write<T: Serialize + ?Sized>(
     };
     rows.map(kind, &entries)
 }
+/// A recorded layout is authoritative. Unversioned stores use the authenticated
+/// original-field inventory to distinguish older writers from missing rows.
+pub(super) fn layout(tx: &mut dyn Transaction) -> Result<u32> {
+    let recorded = tx.get(&RowKey::Meta("catalogue_layout".into()))?;
+    let layout = if let Some(h) = recorded {
+        serde_json::from_slice::<u32>(&bytes(tx, &h)?)?
+    } else {
+        catalogue::legacy_layout(&kinds_misc::read_control("field_presence", tx)?)
+    };
+    ensure!(layout > 0, "state_v2_catalogue_layout");
+    ensure!(layout <= catalogue::LAYOUT, Hold::Future);
+    Ok(layout)
+}
+/// Only a kind unknown to the saved layout may lack its root. Orphan members
+/// still refuse: absence of a newly introduced kind means the entire kind.
+pub(super) fn root(tx: &mut dyn Transaction, kind: &str) -> Result<Option<Header>> {
+    if let Some(h) = tx.get(&key(kind, "", 0)?)? {
+        return Ok(Some(h));
+    }
+    ensure!(
+        catalogue::introduced(kind)? > layout(tx)?,
+        "state_v2_missing_field"
+    );
+    ensure!(
+        tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
+        "state_v2_missing_manifest"
+    );
+    Ok(None)
+}
 pub(super) fn field_read<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
     mode: Members,
     seed: Option<&mut Digests>,
+    default: impl FnOnce() -> T,
 ) -> Result<T> {
-    let root = key(kind, "", 0)?;
-    let h = tx.get(&root)?.context("state_v2_missing_field")?;
+    let Some(h) = root(tx, kind)? else {
+        return Ok(default());
+    };
     if matches!(mode, Members::Field) {
         return read(tx, &h, seed);
     }

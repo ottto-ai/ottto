@@ -1,4 +1,4 @@
-// Executed-shape regressions for the Claude history-upgrade gate (SOURCE P1).
+// Executed-shape regressions for the Claude history-upgrade gate.
 // At the 0.1.189 start the Claude index was empty after a quarantine, so every
 // file came back as a new file and was re-sent under body-witness revision 2
 // without the protected list, the no-list hold, the latch or the pacing.
@@ -9,10 +9,10 @@
 // in-process upload and settlement, then a durable save and reload.
 // Fixtures are synthetic; the cutoff seam makes every fixture birth "old".
 // Where no list is intended, only an unverified Mac (or a move under a claim
-// policy other than `full`) holds history; elsewhere it is paced (SOURCE
-// Amendment 16, StateMissing N1), so the held-shape tests corrupt the
-// backfill state.
+// policy other than `full`) holds history; elsewhere it is paced, so the
+// held-shape tests corrupt the backfill state.
 
+use super::pipeline_transcript_line as history_line;
 use super::*;
 
 const HISTORY_MACHINE_ID: &str = "machine-history-upgrade";
@@ -22,12 +22,6 @@ const HISTORY_SESSIONS: [&str; 3] = [
     "e5555555-5555-4555-8555-555555555555",
     "f6666666-6666-4666-8666-666666666666",
 ];
-
-fn history_line(session: &str, request: &str, second: u32) -> String {
-    format!(
-        "{{\"timestamp\":\"2026-08-02T07:00:{second:02}Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
-    )
-}
 
 fn history_digest(id: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
@@ -133,16 +127,6 @@ impl HistoryFixture {
         .expect("install synthetic list");
     }
 
-    fn key(index: &ScanIndex, session: &str) -> String {
-        let suffix = format!("{session}.jsonl");
-        index
-            .files
-            .keys()
-            .find(|key| key.ends_with(&suffix))
-            .cloned()
-            .expect("indexed synthetic transcript")
-    }
-
     /// Corrupt the saved index, as the 0.1.188 daemon's whole-index check
     /// left it; the next load quarantines it and starts empty.
     fn corrupt_index(&self) {
@@ -200,10 +184,6 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
-        // These history fixtures exercise the current request-owned reader;
-        // independent prefix-off proofs remain in e2_legacy/e2_pre_change_builder.
-        let _prefix = (cycle.revision >= 3)
-            .then(|| crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true));
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
         let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
@@ -392,17 +372,35 @@ impl HistoryFixture {
             index
         };
         let settlement = if cycle.shed_upload {
-            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
         } else {
             match cycle.upload {
-                PipelineUpload::ServerDeferred => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
-                }
+                PipelineUpload::ServerDeferred => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    false,
+                    None,
+                ),
                 _ => settle_completed_upload(index, &committed_index, &progress, &holds),
             }
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        // The service finish: each exact ACK of this page's sent bodies earns
+        // its file receipt under the active context. The synthetic responder
+        // accepts every sent body; a shed page ACKs none.
+        let acks: BTreeMap<String, String> =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
+                .into_iter()
+                .filter(|(entity, _)| progress.accepted_fingerprints.contains(entity))
+                .collect();
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &acks,
+        );
         index.save(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
@@ -442,7 +440,7 @@ impl HistoryFixture {
             .filter(|session| {
                 index
                     .claude_request_census_for_test()
-                    .get(&Self::key(index, session))
+                    .get(&PipelineFixture::key(index, session))
                     .is_some()
             })
             .count()
@@ -586,8 +584,9 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 
 /// Addendum 1 item 1 (secondary): existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
-/// list. Nothing is emitted, the old upload tuple stays, and the reason
-/// settles: the next cycle reads nothing.
+/// list. Nothing is emitted, the old upload tuple stays, and nothing is read:
+/// the gate would veto every body, so a read could not earn a per-file
+/// receipt. The context debt stays owed and is paid when the hold releases.
 #[test]
 fn upload_context_change_does_not_carry_history_past_the_gate() {
     // Positive control: the current reader uploads the same shape on a fresh destination.
@@ -611,11 +610,20 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(changed.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        // Was one read per held file: the retired global gate settled the
+        // context after that read. A per-file receipt needs an exact ACK of
+        // an emitted body, so the held files are skipped and stay owed.
+        assert_eq!(
+            changed.scan.scanned_file_count, 0,
+            "held history is not read"
+        );
         assert!(changed.uploaded.is_empty(), "{:?}", changed.uploaded);
         for (key, entry) in &changed.index.files {
             let before = &baseline.files[key];
             assert_eq!(entry.effective_upload_body_witness_revision, 1);
+            // Deferred, never credited: the held file keeps its old receipt,
+            // which does not prove it under the new context.
+            assert_eq!(entry.upload_context_receipt, before.upload_context_receipt);
             assert_eq!(
                 entry.last_snapshot_fingerprint,
                 before.last_snapshot_fingerprint
@@ -633,7 +641,10 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(again.scan.scanned_file_count, 0, "parsed at most once");
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "still not read while held"
+        );
         assert!(again.uploaded.is_empty());
     });
 }
@@ -672,10 +683,10 @@ fn rearmed_unchanged_history_is_held_and_settles() {
     });
 }
 
-/// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (a
+/// A genuinely fresh install (a
 /// positively empty support state: no backfill state, no quarantined index,
 /// no upload ledger, no seen-marker) ingests new files normally, even with
-/// old births. A quarantined index is prior history (SOURCE F1a), so this
+/// old births. A quarantined index is prior history, so this
 /// fixture no longer starts from one.
 #[test]
 fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
@@ -718,7 +729,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
             grown.uploaded,
             BTreeSet::from([HISTORY_SESSIONS[1].to_string()])
         );
-        let key = HistoryFixture::key(&grown.index, HISTORY_SESSIONS[1]);
+        let key = PipelineFixture::key(&grown.index, HISTORY_SESSIONS[1]);
         assert_eq!(
             grown.index.files[&key].effective_upload_body_witness_revision,
             3
@@ -726,7 +737,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     });
 }
 
-/// SI-718-O1: the override rebuild keeps the retained owner through a
+/// The override rebuild keeps the retained owner through a
 /// replacement cycle whose upload is only server-deferred (a partial
 /// settlement), and held history still uploads nothing.
 #[test]
@@ -823,7 +834,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
     });
 }
 
-/// MONEY P1: seed genuine accepted incidence immediately before the override,
+/// Seed genuine accepted incidence immediately before the override,
 /// not before a syntax rebuild that would already have erased the ACK ledger.
 /// Retain it through complete census and files held without further parses;
 /// release must reconstruct those files with zero re-offer of accepted history.
@@ -941,7 +952,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     });
 }
 
-/// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
+/// Vanished history releases only on a healthy complete terminal.
 #[test]
 fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     use crate::snapshots::ScanIndexRebuildOverride;
@@ -1013,7 +1024,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
         );
         // A vanished held file releases only at a healthy complete terminal;
         // the other history-held files keep their original carried incidence.
-        let vanished_key = HistoryFixture::key(&again.index, HISTORY_SESSIONS[0]);
+        let vanished_key = PipelineFixture::key(&again.index, HISTORY_SESSIONS[0]);
         let vanished_acks = state["file_snapshot_fingerprints"][&vanished_key]
             .as_array()
             .unwrap()
@@ -1047,7 +1058,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     });
 }
 
-/// SOURCE Amendment 14 (owner B ruling 1): under revision 3 a LISTED root's
+/// Under revision 3 a LISTED root's
 /// genuine transcript change emits its ORDINARY body; no request-owned
 /// literal item and no revision-3 stamp reaches that file, and
 /// `history_emission_denied{reason=listed_literal}` counts it. Unlisted
@@ -1086,13 +1097,13 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
                 .collect::<BTreeSet<_>>(),
             "no literal item of the listed root; unlisted history carries it"
         );
-        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        let listed = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[0]);
         assert_eq!(
             changed.index.files[&listed].effective_upload_body_witness_revision, 1,
             "no revision-3 stamp on the listed root"
         );
         for session in &HISTORY_SESSIONS[1..] {
-            let key = HistoryFixture::key(&changed.index, session);
+            let key = PipelineFixture::key(&changed.index, session);
             assert_eq!(
                 changed.index.files[&key].effective_upload_body_witness_revision,
                 3
@@ -1111,7 +1122,7 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
     });
 }
 
-/// Owner B ruling 3 through the pipeline: MONEY's census re-owes a stored 3
+/// Through the pipeline: a census re-owes a stored 3
 /// (as #699's selection-loss path will); the file is owed again, a listed
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
@@ -1132,7 +1143,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         index.activate_effective_upload_body_witness_revision(3);
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         for session in &HISTORY_SESSIONS[..2] {
-            let key = HistoryFixture::key(&index, session);
+            let key = PipelineFixture::key(&index, session);
             assert!(index.re_owe_effective_upload_body_witness_revision(&key, 2));
         }
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
@@ -1147,7 +1158,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
             "the listed re-owed root is held; the unlisted one upgrades"
         );
         for (session, revision) in HISTORY_SESSIONS.iter().zip([2, 3, 3]) {
-            let key = HistoryFixture::key(&again.index, session);
+            let key = PipelineFixture::key(&again.index, session);
             assert_eq!(
                 again.index.files[&key].effective_upload_body_witness_revision, revision,
                 "{session}"
@@ -1259,13 +1270,13 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
         assert!(!completed.uploaded.contains(HISTORY_SESSIONS[0]));
         assert!(!completed.uploaded.contains(HISTORY_SESSIONS[1]));
         for session in &HISTORY_SESSIONS[..2] {
-            let key = HistoryFixture::key(&completed.index, session);
+            let key = PipelineFixture::key(&completed.index, session);
             assert_eq!(
                 completed.index.files[&key].effective_upload_body_witness_revision,
                 1
             );
         }
-        let key = HistoryFixture::key(&completed.index, HISTORY_SESSIONS[2]);
+        let key = PipelineFixture::key(&completed.index, HISTORY_SESSIONS[2]);
         assert_eq!(
             completed.index.files[&key].effective_upload_body_witness_revision,
             3
@@ -1273,7 +1284,7 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     });
 }
 
-/// SOURCE F1a, StateMissing H1: an unreadable backfill state is prior
+/// An unreadable backfill state is prior
 /// history, not a fresh install. With a quarantined index, or with the index
 /// gone and no other evidence, no history is emitted; the state keeps its
 /// marker and arms no bootstrap.
@@ -1333,7 +1344,7 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
     }
 }
 
-/// SOURCE F1b and its cross-org move ruling: a re-pair to a new destination
+/// A re-pair to a new destination
 /// finds history born before the claim owed and gated, never re-sent
 /// ungated: the other destination's completed bootstrap is prior history.
 /// With no list and a claim policy other than an explicit `full` it is held
@@ -1380,7 +1391,7 @@ fn new_destination_holds_history_born_before_the_claim() {
     }
 }
 
-/// SOURCE ruling (cross-org `full` move, no list), the named policy row: the
+/// Cross-org `full` move, no list: the
 /// other destination's history is paced through the budget, counted, only
 /// because the last claim was an explicit `full`.
 #[test]
@@ -1424,7 +1435,7 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
     );
 }
 
-/// SOURCE F1b: on the destination of the claim that recorded a
+/// On the destination of the claim that recorded a
 /// different-user cutoff, the previous user's history stays excluded by the
 /// cutoff, as before, not by the history gate: a session with activity after
 /// the cutoff is still sent whole. The claim binds its own destination
@@ -1468,7 +1479,7 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
     );
 }
 
-/// SOURCE h695 N1: a same-user re-claim keeps the cutoff (the server answers
+/// A same-user re-claim keeps the cutoff (the server answers
 /// `full`) but mints a new destination. The cutoff belongs to the destination
 /// of the claim that set it, so on the new one the history already sent to
 /// that destination is prior history: gated and paced, never re-sent
@@ -1598,7 +1609,7 @@ fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
     );
 }
 
-/// SOURCE h695 N2: a quarantined ledger of this index, a quarantined legacy
+/// A quarantined ledger of this index, a quarantined legacy
 /// Claude index and an unreadable seen-marker path are prior history (fail
 /// closed); a clean support state is not.
 #[test]
@@ -1651,7 +1662,7 @@ fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
     );
 }
 
-/// SOURCE F1a, StateMissing N1: a server-attested record in this
+/// A server-attested record in this
 /// destination's ledger is prior history. A generation or replay claim alone
 /// is not: the ledger saves it before the scan, so a fresh install killed
 /// before its first index save would otherwise hold its own history.
@@ -1685,7 +1696,7 @@ fn only_server_attested_ledger_records_are_prior_history() {
     assert_eq!(prior(&progress), crate::snapshots::PriorHistory::Here);
 }
 
-/// SOURCE F1b, StateMissing M3 and N1 (a): a re-pair resuming a partial
+/// A re-pair resuming a partial
 /// index that a pre-gate daemon saved for the new destination loads as
 /// `Loaded`, drops no entries and has no cutoff. Another destination's
 /// completed bootstrap records the cutoff on this first gated load, at the
@@ -1760,7 +1771,7 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
     );
 }
 
-/// SOURCE F1b (AutoReview): a bootstrap interrupted before a re-pair leaves
+/// A bootstrap interrupted before a re-pair leaves
 /// only its own destination's Claude index or ledger. That is prior history
 /// for the new destination; the new destination's own files are not.
 #[test]
@@ -1799,7 +1810,7 @@ fn another_destinations_claude_state_is_prior_history() {
         crate::snapshots::PriorHistory::None,
         "a same-destination legacy leftover is not another destination"
     );
-    // SOURCE h732 C3: an unscoped pre-scoping index names no destination, so
+    // An unscoped pre-scoping index names no destination, so
     // it is not a move, but it is this Mac's history: Here, so a cutoff keeps
     // it owed, list-gated and paced.
     std::fs::write(
@@ -1861,7 +1872,7 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     );
 }
 
-/// SOURCE addendum 8, the incident M4 shape with the list intended: prior
+/// The incident shape with the list intended: prior
 /// uploads, the list installed (one family listed) and its seen-marker
 /// written, then the index quarantined. The rebuild latches (#700): nothing
 /// is emitted. After a restart, the listed family is never emitted and the
@@ -1953,7 +1964,7 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
             uploaded_history.extend(outcome.uploaded.iter().cloned());
             for session in HISTORY_SESSIONS {
-                let key = HistoryFixture::key(&outcome.index, session);
+                let key = PipelineFixture::key(&outcome.index, session);
                 let revision = outcome.index.files[&key].effective_upload_body_witness_revision;
                 if uploaded_history.contains(session) {
                     assert_eq!(revision, 3, "uploaded history settles: {session}");
@@ -2009,7 +2020,7 @@ fn family_closure_root_absent_excluded(lines: &[serde_json::Value]) -> u64 {
         .sum()
 }
 
-/// StateMissing M1 (SOURCE d680b524): the first family gets subagent files
+/// The first family gets subagent files
 /// `agents`, every file is sent at revision 1, then its root transcript is
 /// removed, `listed` is installed as the list and the index is quarantined.
 /// The rebuilt cycle runs the full prepare/finish path under the captured
@@ -2070,7 +2081,7 @@ fn assert_rootless_family_held(outcome: &HistoryOutcome) {
     }
 }
 
-/// SOURCE d680b524 (a): the list names only `R_agent-a`, `R.jsonl` is gone,
+/// The list names only `R_agent-a`, `R.jsonl` is gone,
 /// and the index is rebuilt. A sibling is not offered whether traversal
 /// decides it after agent-a (`agent-b`) or before it (`agent-0`), and each
 /// sibling counts once as held through the absent root. agent-a itself is
@@ -2099,8 +2110,6 @@ const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
 };
 
 fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     fixture.install_list(&[]);
     crate::snapshots::with_max_gated_claude_revision(3, f)
 }
@@ -2255,7 +2264,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
                 assert!(!outcome.index.confirmed_empty_files.contains(key));
             }
             for sibling in &HISTORY_SESSIONS[1..] {
-                let key = HistoryFixture::key(&outcome.index, sibling);
+                let key = PipelineFixture::key(&outcome.index, sibling);
                 assert_eq!(
                     outcome.index.files[&key].effective_upload_body_witness_revision,
                     3
@@ -2278,7 +2287,7 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
         let fixture = HistoryFixture::new(&format!("e2-history-{failure}"));
         let baseline = fixture.baseline();
         let root = HISTORY_SESSIONS[0];
-        let held_key = HistoryFixture::key(&baseline, root);
+        let held_key = PipelineFixture::key(&baseline, root);
         for (number, session) in HISTORY_SESSIONS.iter().enumerate() {
             e2_history_reported(&fixture, session, number);
         }
@@ -2447,7 +2456,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
                     .iter()
                     .zip([money_mark::DISCLOSED, estimated, estimated])
             {
-                let key = HistoryFixture::key(index, session);
+                let key = PipelineFixture::key(index, session);
                 assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
                 // The retired permit mark is never set (contract 5 always on).
                 assert_eq!(store.money_marks(location_key(&key)), marks, "{session}");
@@ -2478,7 +2487,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     });
 }
 
-/// The listed session's item on a page: read without an E2 fold, so it
+/// The listed session's item on a page: read without an `e2` fold, so it
 /// publishes exactly as gate off (native hours, no request-owned literal).
 impl HistoryFixture {
     /// The list as the cycle's load reads it. The returned index is reloaded
@@ -2508,9 +2517,9 @@ fn e2_assert_ordinary_body(outcome: &HistoryOutcome, session: &str) {
     }
 }
 
-/// Owner B (SOURCE Amendment 14) with the gate on: a listed family keeps
+/// With the gate on, a listed family keeps
 /// ordinary money. Its genuine change uploads its ordinary body once; an
-/// unlisted family changed on the same page uploads the E2 literal; the
+/// unlisted family changed on the same page uploads the `e2` literal; the
 /// listed file is never stamped 3 nor re-read by revision 3.
 #[test]
 fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
@@ -2525,8 +2534,8 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
         assert!(!changed.uploaded_literal.contains(HISTORY_SESSIONS[0]));
         assert!(changed.uploaded_literal.contains(HISTORY_SESSIONS[1]));
         e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[0]);
-        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
-        let unlisted = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[1]);
+        let listed = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        let unlisted = PipelineFixture::key(&changed.index, HISTORY_SESSIONS[1]);
         assert_eq!(
             changed.index.files[&listed].effective_upload_body_witness_revision, 2,
             "the listed file is never stamped 3"
@@ -2595,8 +2604,6 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// while the list pauses adoption), never the literal and never withheld.
 #[test]
 fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
     fixture.baseline_at(2);
     fixture.install_list(&[]);
@@ -2691,7 +2698,7 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
         e2_history_assert_prior_tuple(
             &baseline,
             &held.index,
-            &HistoryFixture::key(&baseline, root),
+            &PipelineFixture::key(&baseline, root),
         );
         let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(recovered.uploaded, BTreeSet::from([root.to_owned()]));
@@ -2714,7 +2721,7 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
     let fixture = HistoryFixture::new("e2-history-side-call-deadline");
     let baseline = fixture.baseline();
     let root = HISTORY_SESSIONS[0];
-    let held_key = HistoryFixture::key(&baseline, root);
+    let held_key = PipelineFixture::key(&baseline, root);
     for (number, session) in HISTORY_SESSIONS.iter().enumerate().skip(1) {
         e2_history_reported(&fixture, session, number);
     }
@@ -2848,7 +2855,7 @@ fn e2_unlisting_replays_the_legacy_money_mark_once() {
         fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         let listed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
-        let key = HistoryFixture::key(&listed.index, HISTORY_SESSIONS[0]);
+        let key = PipelineFixture::key(&listed.index, HISTORY_SESSIONS[0]);
         assert_ne!(
             listed
                 .index
@@ -2946,7 +2953,7 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
     });
 }
 
-/// Contract-5 cutover, first run after upgrade (SOURCE §B; card G (b)):
+/// Contract-5 cutover, first run after upgrade:
 /// revision-3 history stamped by a permit-era build without the permit
 /// (recorded contract `""`, no capture), some carrying #825's retired
 /// `STAMPED_WITHOUT_PERMIT` bit (64), meets the always-on contract. Nothing
@@ -2972,7 +2979,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
         // The permit-era record: contract `""`, and #825's bit on one file.
         let mut old = ScanIndex::load(&fixture.index_path).unwrap();
-        let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+        let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
         let kept = old
             .claude_money_birth_store
             .money_marks(location_key(&marked));
@@ -3057,7 +3064,7 @@ fn e2_restamp_carries_the_retired_permit_bit() {
                 fixture.cycle(&format!("2026-08-02T{at}:00Z"), cycle);
             }
             let mut old = ScanIndex::load(&fixture.index_path).unwrap();
-            let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+            let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
             assert_eq!(old.files[&marked].effective_upload_body_witness_revision, 3);
             let body_marks = old
                 .claude_money_birth_store

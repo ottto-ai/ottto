@@ -1,15 +1,17 @@
-//! Claude's private, default-off state store. Storage rows convey custody, never
-//! acquisition, acceptance, or retirement authority.
+//! Private state store for the sources `v2_on` names. Storage rows convey
+//! custody, never acquisition, acceptance, or retirement authority.
 //!
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
 //!
-//! Restart records are R1's; joined by key digest, never referenced here.
+//! Restart records live elsewhere; joined by key digest, never referenced here.
 use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
+
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
 
 mod fence;
 mod import;
@@ -22,21 +24,25 @@ mod runtime;
     )
 )]
 pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{IncompleteReason, LiveKeys};
+pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
+pub(super) use runtime::BaselineRelease;
+pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, published, recovery_save_guard, save_locked, save_oversize_active,
-    save_read_admitted, save_read_completed,
+    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
+    save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
+    visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
 };
-pub(super) use runtime::{BaselineRelease, Hold};
 mod catalogue;
 mod codec;
 mod ignored;
 mod interning;
 mod kinds;
+#[cfg(test)]
+pub(super) use kinds::tests::compact_reopened_for_test;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
@@ -112,12 +118,10 @@ struct Identity {
     fence_generation: u64,
 }
 
-/// Sources whose index routes through this store. The set only grows: a
-/// published route's custody wins, and dropping its source here would let v1
-/// load the frozen JSON. Removing a source needs an explicit export back to
-/// v1, never an edit to this set.
+/// Sources whose index routes through this store: their durable_sources row.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    matches!(source, super::scan_index_persistence::Source::Claude)
+    crate::durable_tail_store::DurableSource::from_snapshot(source.snapshot())
+        .is_some_and(|source| source.properties().state_v2)
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
@@ -302,14 +306,6 @@ pub(super) trait Transaction {
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
-pub(super) trait Store {
-    type Txn<'a>: Transaction
-    where
-        Self: 'a;
-    fn begin(&mut self, mode: TxnMode) -> Result<Self::Txn<'_>>;
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult;
-}
-
 const KEY_BYTES: usize = 4096;
 const HEADER_BYTES: usize = 512;
 const CONTROL_BYTES: u64 = 16 * 1024;
@@ -332,7 +328,7 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
-        // Measured on a copy of real M4 state (245,006 values): only these two
+        // Measured on a copy of a real state store (245,006 values): only these two
         // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
         // Bound logical JSON on both admission and decompression, before chunks.
         RowKey::Record { kind, .. }
@@ -493,6 +489,7 @@ fn control_name(name: &str) -> bool {
         name,
         "identity"
             | "schema_version"
+            | "catalogue_layout"
             | "generation"
             | "phase"
             | "erasure_success"
@@ -541,11 +538,13 @@ pub(crate) mod ack;
 pub(super) use runtime::before_collection;
 
 #[cfg(test)]
+mod codex_on_tests;
+#[cfg(test)]
 mod money_fault_tests;
 #[cfg(test)]
 pub(super) mod money_test_support;
 // Growth receipts attest confirmed DB custody, independently of the root fence.
-pub(super) use runtime::confirmed_growth_stamp;
+pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 
 pub(super) fn growth_claim_refused(reason: &'static str) {
     telemetry::event("growth_claim_refused", &reason);

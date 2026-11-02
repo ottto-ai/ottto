@@ -1,4 +1,4 @@
-// Slice D1 through the executed page pipeline of `finish_sync_source` (the
+// The request census through the executed page pipeline of `finish_sync_source` (the
 // `PipelineFixture` stages): request-census records survive held reverts and
 // partial commits as the working index's, and records change no decision.
 // Fixtures are synthetic.
@@ -154,7 +154,15 @@ fn census_pre_hold_bodies_born(
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
-    index.activate_upload_context(cycle.upload_context.to_owned());
+    // The same activation as `PipelineFixture::page`: the hashed context bound
+    // to the index and the ledger, so entity fingerprints match the page's.
+    let mut progress = test_upload_progress();
+    activate_source_upload_context(
+        SnapshotSource::ClaudeCode,
+        format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes())),
+        &mut index,
+        &mut progress,
+    );
     let mut reset_owed_members = 0;
     if cycle.historical_replay {
         let before = index.claude_authority_record_for_test(PIPELINE_SESSIONS[2]);
@@ -228,7 +236,6 @@ fn census_pre_hold_bodies_born(
         &mut scan.snapshots,
         SnapshotUploadPolicy::default(),
     );
-    let progress = test_upload_progress();
     exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
     finalize_scan_after_policy_with_body_witness(
         SnapshotSource::ClaudeCode,
@@ -274,7 +281,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
         crate::snapshots::claude_request_census::disable_records_under_for_test(&fixture.root);
     }
     fixture.baseline();
-    // The parity is pre-E2 (E2 reads census records as copy-holder evidence),
+    // The parity is pre-`e2` (`e2` reads census records as copy-holder evidence),
     // so every family whose body is compared reads ordinary money: list them
     // after the unlisted baseline. Each page loads the real list.
     let listed = [
@@ -377,7 +384,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[test]
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
-    // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
+    // Pre-`e2` invariant: `e2` reads census records as copy-holder evidence.
 
     let (records, records_held, records_reset_owed) =
         census_pre_hold_parity_arm("census-all-bodies-records", true);

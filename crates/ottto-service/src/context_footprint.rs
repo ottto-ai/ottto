@@ -7,6 +7,7 @@
 //! `AgentContextStatus`/`context_live`, which reflects active session load from
 //! statusLine `context_window`.
 
+use crate::command_env::SpawnEnv;
 use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
@@ -27,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -159,20 +159,7 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
-#[derive(Clone)]
-struct SpawnEnv {
-    path: Option<OsString>,
-    provider: BTreeMap<String, OsString>,
-}
-
 impl SpawnEnv {
-    fn resolve() -> Self {
-        Self {
-            path: crate::command_env::path_env(),
-            provider: crate::command_env::provider_env(),
-        }
-    }
-
     fn claude_command(&self) -> Result<Command> {
         let Some(program) = crate::command_env::executable_path("claude") else {
             return Err(anyhow!("Claude Code CLI was not found"));

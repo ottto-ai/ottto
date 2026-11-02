@@ -508,6 +508,7 @@ pub fn clear(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn append_success(
     state_dir: &Path,
     source: SourceKind,
@@ -756,6 +757,7 @@ pub(crate) fn append_http_failure_with_context_bounded(
     )
 }
 
+#[cfg(test)]
 pub fn append_transport_error(
     state_dir: &Path,
     source: SourceKind,
@@ -853,6 +855,17 @@ pub fn read(
         ring_capacity: UPLOAD_RECEIPT_RING_CAPACITY as u16,
         state_path_present,
     })
+}
+
+/// When `source` last had anything accepted, from the bounded ring.
+pub(crate) fn newest_accepted_unix_seconds(state_dir: &Path, source: SourceKind) -> Option<u64> {
+    let capacity = UPLOAD_RECEIPT_RING_CAPACITY as u16;
+    read(state_dir, capacity, None, Some(source))
+        .ok()?
+        .receipts
+        .iter()
+        .find(|receipt| receipt.accepted_count > 0)
+        .and_then(|receipt| crate::snapshots::rfc3339_unix_seconds(&receipt.uploaded_at))
 }
 
 fn empty_receipt(

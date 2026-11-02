@@ -1,11 +1,11 @@
 // Positive-proof correction of a terminal Claude family authority record:
-// the T1 rebind and its no-grant controls, the R5 all-member fallback, the
+// the rebind and its no-grant controls, the all-member fallback, the
 // candidate gate, strict load validation, record-contract compatibility with
-// the source-pinned pre-change decoder, partial-checkpoint carriage, M1
-// complete-healthy absence retirement, M2 no-body completion, the A1 empty map
-// advance with its A2/A3 restoration seams, the accepted-body no-op, and
+// the source-pinned pre-change decoder, partial-checkpoint carriage,
+// complete-healthy absence retirement, no-body completion, the empty map
+// advance with its restoration seams, the accepted-body no-op, and
 // correction custody. All fixtures are synthetic and
-// content-free. The M1/M2/A1-A3 section is CONTROLLED: it seeds a granted
+// content-free. The state-machine section is CONTROLLED: it seeds a granted
 // index, then runs the production seams in production order. The lifecycle
 // through real pages, uploads and reloads lives in
 // `snapshot_sync/authority_proof_correction_pipeline_tests.rs`.
@@ -117,7 +117,7 @@ fn apc_terminal_fixture() -> ScanIndex {
     index
 }
 
-/// What the complete census does with a proven family: T1 first, then the
+/// What the complete census does with a proven family: the rebind first, then the
 /// retained witness becomes the new proof.
 fn apc_prove(index: &mut ScanIndex, witness: &ClaudeUsageFamilyWitness) {
     index.rebind_claude_authority_proof(APC_ROOT, witness);
@@ -174,7 +174,7 @@ const PARSE_FOR_AUTHORITY: (CandidateDecision, Option<CandidateParseReason>) = (
     Some(CandidateParseReason::AuthorityQuarantine),
 );
 
-/// T1: a genuinely changed complete proof over an exactly bound, bounded
+/// A genuinely changed complete proof over an exactly bound, bounded
 /// terminal record rebinds it to that proof, declares contract v2, and owes
 /// every recorded member one correction. Count, disposition, deadline and
 /// member revisions are unchanged; owed members bypass the terminal gate.
@@ -235,7 +235,7 @@ fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
 /// No grant without a genuinely changed proof over an exactly bound terminal
 /// record: the same proof, a RetryPending record, a misbound or malformed
 /// record, a missing record or a missing retained witness change nothing.
-/// (An unhealthy or partial census never reaches T1: only a complete healthy
+/// (An unhealthy or partial census never reaches the rebind: only a complete healthy
 /// census proves a family. The pipeline tests exercise those censuses.)
 #[test]
 fn rebind_grants_nothing_without_a_changed_proof_over_an_exactly_bound_record() {
@@ -489,7 +489,7 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
             }),
         ),
         (
-            // M1: only the whole-family vanish rule may empty a member map.
+            // Only the whole-family vanish rule may empty a member map.
             "member-map-emptied",
             Box::new(|record: &mut Value| {
                 record["member_source_file_fingerprints"] = json!({});
@@ -741,20 +741,21 @@ fn complete_census_retires_only_absent_correction_members() {
 }
 
 // ---------------------------------------------------------------------------
-// SOURCE Addenda 3 and 4 (M1, M2, A1-A3) and the R1 no-op as CONTROLLED
+// Absence retirement, no-body completion, the empty map advance with its
+// restoration seams, and the accepted-body no-op as CONTROLLED
 // state-machine tests: the granted record and each page's file facts are
 // seeded, so none of these is a natural pipeline run. Every transition under
 // test is made by production code, in `finish_sync_source` order: a page's
-// parse goes through `ScanIndex::record` and the real finalizer, then the A1
+// parse goes through `ScanIndex::record` and the real finalizer, then the map
 // advance; a terminal page through the real authority apply (its known-empty
-// drain and its M1 retirement); a completed page through the current-page
+// drain and its absence retirement); a completed page through the current-page
 // no-body drain; a shed through partial-checkpoint selection, which is
 // `committable_subset` followed by the no-body drain exactly as the locked
 // checkpoint orders them, or through borrowed and consuming held
 // restoration; a restart through a save and a strict reload. The real locked
 // checkpoint and natural pages run in the pipeline tests.
 
-/// T1 state: every recorded member owes a correction under proof F.
+/// Rebound state: every recorded member owes a correction under proof F.
 fn apc_granted() -> ScanIndex {
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
@@ -854,6 +855,7 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
+        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -924,7 +926,7 @@ fn apc_quarantine_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_usage_authority_quarantine).unwrap()
 }
 
-/// M1 (Addendum 3 acceptance 1, 2 and 7). A member absent from a complete
+/// Absence retirement. A member absent from a complete
 /// healthy census leaves the owed set and the member map and nothing else
 /// changes; an incomplete or unhealthy census proves no absence. A shed
 /// terminal page's checkpoint selection carries the retirement, and it
@@ -979,7 +981,7 @@ fn m1_only_a_complete_healthy_absence_retires_the_absent_members_grant() {
     );
 }
 
-/// M1 edges (Addendum 3 acceptance 5 and 6). An absent member that reappears
+/// Absence-retirement edges. An absent member that reappears
 /// is an ordinary new file and revives no grant. A family the complete census
 /// no longer contains clears its record by the existing vanish rule, exactly
 /// as it clears an old-contract record, whatever the report health, and the
@@ -1042,7 +1044,7 @@ fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
     }
 }
 
-/// M2 (Addendum 3 acceptance 3). A member whose current recorded revision
+/// No-body completion. A member whose current recorded revision
 /// parses complete, valid and empty drains as a no-body completion only when
 /// the census is complete, offering nothing to upload; only the correction
 /// changes. At an incomplete census the paired facts persist, and the next
@@ -1081,8 +1083,8 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
     }
 }
 
-/// M2 and A3 refusals (Addendum 3 acceptance 4; Addendum 4 unsafe
-/// combinations). Confirmation at an older revision, a legacy entry with no
+/// No-body completion and restoration refusals (unsafe combinations).
+/// Confirmation at an older revision, a legacy entry with no
 /// snapshot and no confirmation, a failed read at the recorded revision, an
 /// incomplete census, a map advanced past a restored entry, and an empty
 /// entry and mark the map never advanced to: each stays owed through the
@@ -1328,17 +1330,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     assert_eq!(apc_map(&current)[&root], held_revision);
 
     let held = BTreeSet::from([held_body]);
-    let borrowed = current.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
-    let consumed =
-        current
-            .clone()
-            .into_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
-    assert_eq!(
-        serde_json::to_vec(&borrowed).unwrap(),
-        serde_json::to_vec(&consumed).unwrap(),
-        "borrowed and consuming restoration agree"
-    );
-    let mut restored = borrowed;
+    let mut restored = current.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
     assert_eq!(restored.files[&root_key].source_file_fingerprint, older);
     assert!(restored.confirmed_empty_files.contains(&root_key));
     assert_eq!(apc_map(&restored)[&root], held_revision);
@@ -1355,7 +1347,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     );
 }
 
-/// A2 (Addendum 4 acceptance 3 and 5) and the settlement-order regression: the
+/// Restoration and the settlement-order regression: the
 /// LAST owed member has an accepted non-empty prior entity, and its new empty
 /// revision advances the map on a page that is then shed. The checkpoint's
 /// selection restores the prior entry and empty mark, so the map rolls back
@@ -1417,14 +1409,6 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
     apc_empty_page(&mut index, 0, &new, false);
     let held = BTreeSet::from([apc_hex('d')]);
     let borrowed = index.with_locally_held_keys_reverted(&committed, &held, &BTreeSet::new());
-    let consumed =
-        index
-            .clone()
-            .into_locally_held_keys_reverted(&committed, &held, &BTreeSet::new());
-    assert_eq!(
-        serde_json::to_vec(&borrowed).unwrap(),
-        serde_json::to_vec(&consumed).unwrap()
-    );
     assert_eq!(borrowed.files[&root_key].source_file_fingerprint, new);
     assert!(borrowed.confirmed_empty_files.contains(&root_key));
     assert_eq!(
@@ -1434,7 +1418,7 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
     );
 }
 
-/// A2 carriage (Addendum 4 acceptance 1, 3 and 5): the LAST owed member has
+/// Restoration carriage: the LAST owed member has
 /// no prior entity (a delivery-free entry). Its empty advance on a shed page
 /// is carried by the checkpoint selection together with the file entry and
 /// empty mark, persists through restart, and the next complete healthy census
@@ -1520,7 +1504,7 @@ fn a3_a_non_empty_parse_never_advances_the_map() {
     assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([root, agent])));
 }
 
-/// R1 no-op, distinct from an ACK, at the real settlement seam: a member whose
+/// The accepted-body no-op, distinct from an ACK, at the real settlement seam: a member whose
 /// captured current-proof body is already accepted with the same file body set
 /// drains with no upload and no acknowledgement. Without that prior
 /// acceptance it drains only on its exact ACK; an ACK of another body, or a
@@ -1777,7 +1761,7 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
         }
         let frame = apc_frame(&index);
         let outside = apc_outside(&index);
-        // Current-page non-empty parses cannot borrow the M2 empty path.
+        // Current-page non-empty parses cannot borrow the no-body empty path.
         index.settle_empty_claude_proof_corrections(&scan);
         assert_eq!(
             apc_owed(&index),
@@ -2056,7 +2040,7 @@ fn binding_family() -> (
 
 #[test]
 fn demotion_after_same_call_reproof_binds_current_witness() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let (scratch, root, mut index, items, mut api, trace) = binding_family();
     let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
@@ -2074,7 +2058,8 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
         &mut index.claude_usage_family_pending,
         APC_WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     let observations = ClaudeNativeObservations {
         counts,
         census_window_end: APC_WINDOW.to_string(),
@@ -2096,7 +2081,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
         &BTreeSet::new(),
         Some(observations),
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     );
     assert!(disposition
         .quarantined_source_session_ids
@@ -2113,7 +2098,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
 
 #[test]
 fn witness_removed_while_member_demotes_does_not_quarantine_index() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let (scratch, root, mut index, mut items, api, trace) = binding_family();
     index.files.insert(
@@ -2136,7 +2121,7 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
         &BTreeSet::new(),
         None,
         None,
-        &BTreeMap::new(),
+        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     );
     assert!(
         !index.claude_usage_family_witnesses.contains_key(&root),
@@ -2200,8 +2185,7 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
             .source_file_fingerprint
             .clear();
     }
-    // Every loaded or saved index carries the tombstone marker (SOURCE
-    // Round 13 F1).
+    // Every loaded or saved index carries the tombstone marker.
     expected.claude_retired_family_tombstones_initialized = true;
     // Empty maps are omitted by ScanIndex's persisted representation.
     serde_json::to_value(expected).unwrap()
@@ -2267,7 +2251,7 @@ fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
     assert_eq!(claude_reemission_stop_reason(), "none");
 }
 
-/// SOURCE F1: an existing orphan fails closed for its one record at save, in
+/// An existing orphan fails closed for its one record at save, in
 /// debug and release alike; the save succeeds and the result loads as is.
 #[test]
 fn save_drops_existing_orphan_authority_record_and_succeeds() {

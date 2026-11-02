@@ -35,8 +35,6 @@ impl Scratch {
         ));
         fs::create_dir(&dir).unwrap();
         let mut db = sqlite::Sqlite::create_import(&dir.join("index.v2.sqlite.import")).unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         db.control(
             "identity",
             &Identity {
@@ -53,7 +51,7 @@ impl Scratch {
     fn live_store() -> (Self, sqlite::Sqlite) {
         let (scratch, db) = Self::store();
         db.finish_import().unwrap();
-        let mut db = sqlite::Sqlite::open(
+        let db = sqlite::Sqlite::open(
             &scratch.0.join("index.v2.sqlite.import"),
             &Identity {
                 format: FORMAT,
@@ -63,8 +61,6 @@ impl Scratch {
             },
         )
         .unwrap();
-        db.path_extractor(private_paths);
-        db.reference_extractor(references);
         (scratch, db)
     }
 }
@@ -89,14 +85,14 @@ fn assert_persisted(db: &mut sqlite::Sqlite, expected: &ScanIndex) {
         expected.v2().growth_retention
     );
 }
-fn fixture() -> ScanIndex {
+pub(in crate::snapshots::state_v2) fn fixture() -> ScanIndex {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/scan_index/real-shaped-v1.json"
     ))
     .unwrap();
     let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
     index.generation = 0;
-    index.upload_context_fingerprint = Some("/synthetic/exact-context".into());
+    index.historical_replay_generation = Some("/synthetic/exact-context".into());
     index
 }
 fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
@@ -108,6 +104,153 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
     populate(index, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
+/// [regress] previous-layout stores default only newly introduced kinds, then
+/// save them and their inventory atomically; damage in supported kinds refuses.
+#[test]
+fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damage() {
+    let previous_layout = 1;
+    // The released format has no layout control.
+    let (scratch, mut db) = Scratch::store();
+    let index = fixture();
+    commit_populate(&mut db, &index);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut presence: BTreeMap<String, bool> = db.read_control("field_presence").unwrap().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let mut v1 = serde_json::to_value(&index).unwrap();
+    for (kind, field, introduced) in catalogue::LAYOUTS {
+        if *introduced > previous_layout {
+            mapper::rows(&mut tx, kind, |tx, h| mapper::remove(tx, &h.key)).unwrap();
+            v1.as_object_mut().unwrap().remove(*field);
+            presence.remove(*field);
+        }
+    }
+    tx.delete(&RowKey::Meta("catalogue_layout".into())).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.control("field_presence", &presence).unwrap();
+    // Recreate the released writer capability, without the current commit
+    // hook advancing it again. Both controls retain their checksums.
+    sqlite::delete_row_for_test(&db, &RowKey::Meta("minimum_writer_capability".into()));
+    db.control("minimum_writer_capability", &1_u64).unwrap();
+    db.finish_import().unwrap();
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    db.path_extractor(private_paths);
+    db.reference_extractor(references);
+    let mut expected: ScanIndex = serde_json::from_value(v1).unwrap();
+    expected.generation = 2;
+    let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, previous_layout);
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert!(restored.decode_holds.same_as(&expected.decode_holds));
+    let baseline = baseline(&restored, &mut cx).unwrap();
+    assert!(!baseline
+        .rows
+        .contains_key(&RowKey::Meta("catalogue_layout".into())));
+    assert!(!baseline
+        .rows
+        .contains_key(&RowKey::Meta("field_presence".into())));
+    for (kind, _, introduced) in catalogue::LAYOUTS {
+        if *introduced > previous_layout {
+            assert!(!baseline
+                .rows
+                .contains_key(&mapper::key(kind, "", 0).unwrap()));
+        }
+    }
+    super::save_graph(&mut db, &identity, baseline, &mut restored, &mut cx).unwrap();
+    assert_eq!(
+        db.read_control::<u32>("catalogue_layout").unwrap(),
+        Some(catalogue::LAYOUT)
+    );
+    {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for (kind, _, introduced) in catalogue::LAYOUTS {
+            // Archive custody is written only while held; this fixture holds none.
+            if *introduced > previous_layout && !kinds_misc::ARCHIVE_KINDS.contains(kind) {
+                assert!(
+                    tx.get(&mapper::key(kind, "", 0).unwrap())
+                        .unwrap()
+                        .is_some(),
+                    "{kind}"
+                );
+            }
+        }
+    }
+    drop(db);
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    db.path_extractor(private_paths);
+    db.reference_extractor(references);
+    let (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+    assert!(cx.presence.contains_key("upload_context_proof"));
+    assert_persisted(&mut db, &restored);
+    assert_eq!(reopened.generation, 3);
+    // A root that the saved layout includes is still damage. An active
+    // layout-1 kind: the retired upload-context root is never required.
+    sqlite::delete_row_for_test(
+        &db,
+        &mapper::key("setting.historical_replay_generation", "", 0).unwrap(),
+    );
+    assert!(hydrate(&mut db, Scratch::binding()).is_err());
+}
+
+/// [format] An earlier store's retired `setting.upload_context_fingerprint`
+/// row (layout 1) is accepted and never read: it survives open, save and
+/// reopen, and no source-wide context reaches the model.
+#[test]
+fn retired_upload_context_row_is_kept_through_open_save_and_reopen() {
+    let row = mapper::key("setting.upload_context_fingerprint", "", 0).unwrap();
+    let (scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    mapper::put(&mut tx, &row, &"d".repeat(64)).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.finish_import().unwrap();
+    let reopen = || {
+        let mut db =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        db.path_extractor(private_paths);
+        db.reference_extractor(references);
+        db
+    };
+    let mut db = reopen();
+    let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+    assert!(restored.active_upload_context_fingerprint.is_none());
+    let baseline = baseline(&restored, &mut cx).unwrap();
+    super::save_graph(&mut db, &identity, baseline, &mut restored, &mut cx).unwrap();
+    {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx.get(&row).unwrap().is_some(), "the save keeps the row");
+    }
+    drop(db);
+    let mut db = reopen();
+    let (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+    assert!(reopened.active_upload_context_fingerprint.is_none());
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&row).unwrap().is_some(), "still kept after reopen");
+}
+
+/// [format] A store that never had the retired row opens at the current
+/// layout: the root is not required.
+#[test]
+fn store_without_the_retired_upload_context_row_opens_at_the_current_layout() {
+    let row = mapper::key("setting.upload_context_fingerprint", "", 0).unwrap();
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx.get(&row).unwrap().is_none(), "never written");
+    }
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+}
+
 /// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
 #[test]
 fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {
@@ -287,7 +430,7 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
     let mut next = prev.clone();
     next.generation += 1;
     assert_eq!(before.rows, baseline(&next, &mut cx).unwrap().rows);
-    next.upload_context_fingerprint = Some("different-context".into());
+    next.historical_replay_generation = Some("different-context".into());
     next.accepted_snapshot_fingerprints.insert("e".repeat(64));
     next.decode_holds
         .v2_insert(
@@ -311,7 +454,7 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
     assert_eq!(
         changed,
         BTreeSet::from([
-            mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
+            mapper::key("setting.historical_replay_generation", "", 0).unwrap(),
             mapper::key("accepted.entity", "", 0).unwrap(),
             mapper::key("accepted.entity", &"e".repeat(64), 1).unwrap(),
             mapper::key("v1_field.repair_provenance", "", 0).unwrap(),
@@ -620,8 +763,7 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
             next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
         }
         // Claim-only skips window retirement, so a clean family stays clean.
-        let saved = import::Mapper
-            .save(&mut db, &identity, committed, &mut next, &mut cx, true)
+        let saved = import::save(&mut db, &identity, committed, &mut next, &mut cx, true)
             .err()
             .map(|error| error.to_string());
         let generation = db.read_control::<u64>("generation").unwrap();
@@ -709,7 +851,7 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = prev.clone();
-    next.upload_context_fingerprint = Some("new-context".into());
+    next.historical_replay_generation = Some("new-context".into());
     let digests = baseline(&prev, &mut cx).unwrap();
     let digests = super::save_graph(&mut db, &identity, digests, &mut next, &mut cx).unwrap();
     assert_persisted(&mut db, &next);
@@ -729,11 +871,11 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     );
     let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
-        current.upload_context_fingerprint,
-        next.upload_context_fingerprint
+        current.historical_replay_generation,
+        next.historical_replay_generation
     );
     let mut retry = current.clone();
-    retry.upload_context_fingerprint = Some("never-committed".into());
+    retry.historical_replay_generation = Some("never-committed".into());
     // Enough new rows that the save must grow the file past SQLite's page cap.
     for n in 0..2048 {
         retry
@@ -748,8 +890,8 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
         hydrate(&mut db, Scratch::binding())
             .unwrap()
             .0
-            .upload_context_fingerprint,
-        current.upload_context_fingerprint
+            .historical_replay_generation,
+        current.historical_replay_generation
     );
 }
 
@@ -763,7 +905,7 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
         let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
         let mut next = current.clone();
-        next.upload_context_fingerprint = Some("never-committed".into());
+        next.historical_replay_generation = Some("never-committed".into());
         next.files.clear();
         next.claude_account_family_pending.clear();
         next.accepted_snapshot_fingerprints.insert("f".repeat(64));
@@ -787,18 +929,228 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
             current.generation + u64::from(after_commit)
         );
         assert_eq!(
-            hydrated.upload_context_fingerprint,
+            hydrated.historical_replay_generation,
             if after_commit {
-                next.upload_context_fingerprint.clone()
+                next.historical_replay_generation.clone()
             } else {
-                current.upload_context_fingerprint
+                current.historical_replay_generation
             }
         );
         let mut next = hydrated.clone();
-        next.upload_context_fingerprint = Some("committed".into());
+        next.historical_replay_generation = Some("committed".into());
         save_graph(&mut db, &identity, &hydrated, &mut next, &mut cx).unwrap();
         assert_persisted(&mut db, &next);
     }
+}
+
+/// Exercise the real cold mapper transaction before retirement can remove a
+/// positive fixture. Reopen the SQLite store, then materialize for comparisons.
+pub(in crate::snapshots) fn compact_reopened_for_test(
+    index: &ScanIndex,
+) -> (ScanIndex, serde_json::Value) {
+    let (scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, index);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut cold, mut cx) = import::hydrate_context(&mut db).unwrap();
+    let previous = baseline(&cold, &mut cx).unwrap();
+    cx.compact_allowance = Some(128);
+    cold.generation += 1;
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    delta(previous, &cold, &mut tx, &mut cx).unwrap();
+    assert_eq!(
+        tx.commit(cold.generation - 1, cold.generation),
+        DurableCommitOutcome::Committed(cold.generation)
+    );
+    let counts = serde_json::to_value(&cx.compaction.counts).unwrap();
+    db.validate_references().unwrap();
+    drop(db);
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    let restored = hydrate(&mut db, Scratch::binding()).unwrap().0;
+    (restored, counts)
+}
+
+/// [money] Whole-family work can exceed the allowance, but a save stops before
+/// the next family. Rollback grants no progress; restart rediscovers the rest.
+#[test]
+#[serial_test::serial]
+fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
+    let (scratch, mut db) = Scratch::live_store();
+    let mut original = fixture();
+    let pending = original
+        .claude_account_family_pending
+        .get_mut("synthetic-family")
+        .unwrap();
+    pending.current.census_complete = false;
+    pending.current.census_window_end = "2026-08-02T07:20:00Z".into();
+    *pending.previous_windows.resident_mut() = (0..163)
+        .map(|n| {
+            let mut w = pending.current.clone();
+            w.census_window_end = format!("2026-08-02T07:{:02}:{:02}Z", n / 60, n % 60);
+            w
+        })
+        .collect();
+    let second = pending.clone();
+    original
+        .claude_account_family_pending
+        .insert("z-family".into(), second);
+    commit_populate(&mut db, &original);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
+    let previous = baseline(&graph, &mut cx).unwrap();
+    let before = previous.rows.clone();
+    let positions = |db: &mut sqlite::Sqlite, family: &str| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let h = tx
+            .get(&mapper::key("account.current", family, 1).unwrap())
+            .unwrap()
+            .unwrap();
+        mapper::read::<(Option<u64>, u64, Vec<u64>)>(&mut tx, &h, None).unwrap()
+    };
+    let inventory = positions(&mut db, "synthetic-family");
+    let counters = telemetry::latest_for_test("account_windows_compacted");
+    sqlite::fence_commit_writing(&db, "generation");
+    assert!(import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).is_err());
+    assert_eq!(
+        graph.claude_account_family_pending["synthetic-family"]
+            .previous_windows
+            .uncollapsed(),
+        162
+    );
+    assert_eq!(
+        telemetry::latest_for_test("account_windows_compacted"),
+        counters
+    );
+    assert_eq!(positions(&mut db, "synthetic-family"), inventory);
+    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
+    let previous = baseline(&graph, &mut cx).unwrap();
+    import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
+    assert_eq!(
+        (
+            cx.compaction.counts.windows_removed,
+            cx.compaction.counts.families_done
+        ),
+        (162, 1)
+    );
+    assert_eq!(
+        graph.claude_account_family_pending["synthetic-family"]
+            .previous_windows
+            .uncollapsed(),
+        0
+    );
+    assert_eq!(
+        graph.claude_account_family_pending["z-family"]
+            .previous_windows
+            .uncollapsed(),
+        162
+    );
+    assert_eq!(
+        positions(&mut db, "synthetic-family"),
+        (inventory.0, inventory.1, vec![163, 164])
+    );
+    db.validate_references().unwrap();
+    db.validate_parts().unwrap();
+    drop(db);
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    db.path_extractor(private_paths);
+    db.reference_extractor(references);
+    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
+    assert_eq!(
+        graph.claude_account_family_pending["synthetic-family"]
+            .previous_windows
+            .uncollapsed(),
+        0
+    );
+    let previous = baseline(&graph, &mut cx).unwrap();
+    let final_rows =
+        import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
+    assert_eq!(
+        (
+            cx.compaction.counts.windows_removed,
+            cx.compaction.counts.families_done
+        ),
+        (162, 1)
+    );
+    assert_eq!(
+        positions(&mut db, "z-family"),
+        (inventory.0, inventory.1, vec![163, 164])
+    );
+    // Every surviving logical row, including both currents and unrelated rows,
+    // retains its exact commitment; only redundant archive keys disappeared.
+    for (key, digest) in &final_rows.rows {
+        assert_eq!(before.get(key), Some(digest), "{key:?}");
+    }
+    let attempts = db.save_row_attempts();
+    import::save(&mut db, &identity, final_rows, &mut graph, &mut cx, false).unwrap();
+    assert_eq!(db.save_row_attempts().1, attempts.1);
+    assert_eq!(
+        (
+            cx.compaction.counts.windows_removed,
+            cx.compaction.counts.families_done
+        ),
+        (0, 0)
+    );
+    db.validate_references().unwrap();
+    db.validate_parts().unwrap();
+    let restored = hydrate(&mut db, Scratch::binding()).unwrap().0;
+    for (root, family) in &restored.claude_account_family_pending {
+        assert_eq!(
+            family.current,
+            original.claude_account_family_pending[root].current
+        );
+        assert!(
+            family.history_summary()
+                == original.claude_account_family_pending[root].history_summary()
+        );
+        assert_eq!(family.previous_windows.resident().len(), 1);
+    }
+}
+
+/// [money] A family the checked summary refuses keeps every row and is
+/// settled for the session, so it cannot hold the allowance on every save.
+#[test]
+#[serial_test::serial]
+fn cold_compaction_settles_a_refused_family_for_the_session() {
+    let (_scratch, mut db) = Scratch::live_store();
+    let mut original = fixture();
+    let pending = original
+        .claude_account_family_pending
+        .get_mut("synthetic-family")
+        .unwrap();
+    pending.current.census_complete = false;
+    pending.current.census_window_end = "2026-08-02T07:20:00Z".into();
+    // Equal evidence, but the last boundary is not before the current's.
+    *pending.previous_windows.resident_mut() = ["07:00", "07:01", "07:20"]
+        .map(|at| {
+            let mut w = pending.current.clone();
+            w.census_window_end = format!("2026-08-02T{at}:00Z");
+            w
+        })
+        .into();
+    commit_populate(&mut db, &original);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
+    let uncollapsed = |graph: &ScanIndex| {
+        graph.claude_account_family_pending["synthetic-family"]
+            .previous_windows
+            .uncollapsed()
+    };
+    assert_eq!(uncollapsed(&graph), 2);
+    let previous = baseline(&graph, &mut cx).unwrap();
+    let before = previous.rows.clone();
+    let saved = import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
+    assert_eq!(
+        (
+            cx.compaction.counts.families_refused,
+            cx.compaction.counts.windows_removed
+        ),
+        (1, 0)
+    );
+    assert_eq!(saved.rows, before);
+    assert_eq!(uncollapsed(&graph), 0);
+    import::save(&mut db, &identity, saved, &mut graph, &mut cx, false).unwrap();
+    assert_eq!(cx.compaction.counts.families_refused, 0);
 }
 
 /// [format] stale generation or future writer refuses before saving.
@@ -921,9 +1273,8 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     }
 }
 
-/// [money] A cold archive replays the endpoint rule over at most its last two
-/// stored rows to the rows a resident save writes, replaced endpoints
-/// included. A stored tail that no longer matches the baseline is Unknown:
+/// [money] A cold archive replays the run rule over its last stored row to
+/// the rows a resident save writes, replaced windows included. A stored tail that no longer matches the baseline is Unknown:
 /// the save refuses, counted, and removes nothing. A stale base with no
 /// shared rollover refuses as a lineage miss, counted separately.
 #[test]
@@ -958,11 +1309,14 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         let previous = baseline(&graph, &mut cx).unwrap();
         graph.generation += 1;
         // Equal evidence at increasing boundaries: each rollover replaces the
-        // stored last endpoint.
+        // stored last window.
         roll(&mut graph, &at(4));
         roll(&mut graph, &at(5));
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(previous, &graph, &mut tx, &mut cx).unwrap();
+        // The save counts the store-only rollovers it replays: both replace.
+        let replayed = if cold { (2, 0) } else { (0, 0) };
+        assert_eq!((cx.archived.replaced, cx.archived.pushed), replayed);
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         let restored = hydrate(db, Scratch::binding()).unwrap().0;
         let archive = restored.claude_account_family_pending[FAMILY]
@@ -977,33 +1331,40 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     }
     assert_eq!(saved[0], saved[1]);
 
-    // Unknown arm: the stored last endpoint changes under the baseline.
-    let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-    let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-    drop(tx);
-    let previous = baseline(&graph, &mut cx).unwrap();
-    graph.generation += 1;
-    roll(&mut graph, &at(6));
-    let mut tx = cold_db.begin(TxnMode::Write).unwrap();
-    let control = mapper::key("account.current", FAMILY, 1).unwrap();
-    let h = tx.get(&control).unwrap().unwrap();
-    let (_, _, ids): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
-    let key = mapper::key("account_window", FAMILY, ids[ids.len() - 2]).unwrap();
-    let mut changed = graph.claude_account_family_pending[FAMILY].current.clone();
-    changed.evidence_request_count += 1;
-    mapper::put(&mut tx, &key, &changed).unwrap();
     let count = |name: &str| {
         telemetry::latest_for_test(name)
             .and_then(|count| count.as_u64())
             .unwrap_or(0)
     };
-    let before = count("cold_row_unknown");
-    let error = delta(previous, &graph, &mut tx, &mut cx).err().unwrap();
-    assert!(format!("{error:#}").contains("state_v2_cold_row_unknown"));
-    assert!(count("cold_row_unknown") > before);
-    drop(tx);
-    let restored = hydrate(&mut cold_db, Scratch::binding()).unwrap().0;
-    assert_eq!(serde_json::to_vec(&restored).unwrap(), saved[1]);
+    // Both queued replay and compaction refuse a row changed under baseline.
+    for compact in [false, true] {
+        let mut tx = cold_db.begin(TxnMode::Read).unwrap();
+        let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+        drop(tx);
+        let previous = baseline(&graph, &mut cx).unwrap();
+        graph.generation += 1;
+        cx.compact_allowance = compact.then_some(128);
+        if !compact {
+            roll(&mut graph, &at(6));
+        }
+        let mut tx = cold_db.begin(TxnMode::Write).unwrap();
+        let control = mapper::key("account.current", FAMILY, 1).unwrap();
+        let h = tx.get(&control).unwrap().unwrap();
+        let (_, _, ids): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
+        let key = mapper::key("account_window", FAMILY, ids[ids.len() - 2]).unwrap();
+        let mut changed = graph.claude_account_family_pending[FAMILY].current.clone();
+        changed.evidence_request_count += 1;
+        mapper::put(&mut tx, &key, &changed).unwrap();
+        let before = count("cold_row_unknown");
+        let error = delta(previous, &graph, &mut tx, &mut cx).err().unwrap();
+        assert!(format!("{error:#}").contains("state_v2_cold_row_unknown"));
+        assert!(count("cold_row_unknown") > before);
+        assert_eq!(cx.compaction.counts.windows_removed, 0);
+        assert_eq!(cx.compaction.counts.families_done, 0);
+        drop(tx);
+        let restored = hydrate(&mut cold_db, Scratch::binding()).unwrap().0;
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), saved[1]);
+    }
 
     // Lineage miss: a graph whose base predates a commit it shares no
     // rollover with refuses, counted apart from row damage.
@@ -1093,7 +1454,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
         bodies: BTreeMap::from([("unpublished".into(), "body".into())]),
         pending_bodies: BTreeMap::new(),
     });
-    next.upload_context_fingerprint = Some("independent-change".into());
+    next.historical_replay_generation = Some("independent-change".into());
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     sqlite::fence_commit_writing(&db, "generation");
     let error = save_graph(&mut db, &identity, &prev, &mut next, &mut cx).unwrap_err();
@@ -1107,7 +1468,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     );
     // Independent work can commit from a fresh durable graph on the next pass.
     let mut selected = restored.clone();
-    selected.upload_context_fingerprint = Some("independent-change".into());
+    selected.historical_replay_generation = Some("independent-change".into());
     selected.files.insert(
         "independent-file".into(),
         selected.files["synthetic-file"].clone(),
@@ -1117,7 +1478,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     let (reopened, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert!(reopened.files.contains_key("independent-file"));
     assert_eq!(
-        reopened.upload_context_fingerprint.as_deref(),
+        reopened.historical_replay_generation.as_deref(),
         Some("independent-change")
     );
     assert_eq!(
@@ -1222,3 +1583,6 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
         );
     }
 }
+
+#[path = "codex_archive_kinds_tests.rs"]
+mod codex_archive_tests;

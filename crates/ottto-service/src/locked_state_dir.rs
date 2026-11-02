@@ -2,7 +2,7 @@
 //!
 //! `serve` and `serve-xpc` take #801's `StateDirLock` before anything else
 //! and hand it here, where it stays for the life of the process. Writers of
-//! daemon-owned caches that must never have a second writer (the M1
+//! daemon-owned caches that must never have a second writer (the
 //! durable-tail store) ask for it with [`held_for`]; a process that does not
 //! hold it (a CLI command, a test) gets `None` and writes nothing.
 //!

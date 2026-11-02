@@ -15,7 +15,7 @@ use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
 /// A legacy-shape member's probe reads at most this many bytes looking for
 /// its first native record. Past it, or past the boot's probe allowance, the
 /// group keeps chronological order and the counter chain decides
-/// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder` (R1-M1).
+/// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder`.
 const PROBE_BYTES: usize = 1024 * 1024;
 
 /// The ONE accumulator creation point for group replay (§k.4): the group's
@@ -31,7 +31,7 @@ pub(in crate::snapshots) fn new_group_parser(
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
     evidence: codex_counting_version::AckEvidence,
-) -> Result<OwnedJsonlParser> {
+) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
         Some(&member.path),
         None,
@@ -48,7 +48,7 @@ pub(in crate::snapshots) fn new_group_parser(
         artifacts,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
-    Ok(parser)
+    Ok(Box::new(parser))
 }
 
 #[cfg(test)]
@@ -283,14 +283,14 @@ impl GroupBoot {
 
     /// Every member is identified and the group is neither unchanged nor
     /// receipt-strict, and no header was read yet: the boot's first read
-    /// (round 3, R2-M1: the cursor-slot check sits here).
+    /// (the cursor-slot check sits here).
     pub(in crate::snapshots) fn awaits_read(&self) -> bool {
         self.admitted && self.headers.is_empty()
     }
 
     /// Cap this boot's remaining probe reads (R2-N2). A probe cut by it ends
     /// probing like `PROBE_BYTES`: the group keeps chronological order, and
-    /// a refusal in that order is `ProbeBudgetOrder` (strict, R1-M1).
+    /// a refusal in that order is `ProbeBudgetOrder` (strict).
     pub(in crate::snapshots) fn allow_probe_bytes(&mut self, bytes: u64) {
         self.probe_allowance = bytes;
     }
@@ -344,7 +344,7 @@ impl GroupBoot {
                     Boot::Pending
                 }
                 // The inventory parsed this header: a failure now is a
-                // change under the read (TOCTOU), never proof debt (R1-M3).
+                // change under the read (TOCTOU), never proof debt.
                 None => Boot::Strict,
             };
         }
@@ -801,13 +801,13 @@ pub(in crate::snapshots) struct GroupJob {
     /// inputs (round 3).
     pub(in crate::snapshots) dependencies: Option<String>,
     pub(in crate::snapshots) memo_digest: Option<String>,
-    /// `cursor::group_scope` at job start (§p, R1-M1): every resume and the
+    /// `cursor::group_scope` at job start: every resume and the
     /// emission compare it with the current index.
     pub(in crate::snapshots) scope: String,
     /// The last walked copy-budget charge of a group read without the
-    /// cursor (E3, R2-M2; a cursor job keeps it in its `JobMeta`).
+    /// cursor (a cursor job keeps it in its `JobMeta`).
     pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
-    /// Bytes the completed members' readers consumed: E3 measures a group's
+    /// Bytes the completed members' readers consumed: the copy budget measures a group's
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
@@ -817,7 +817,7 @@ crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, recovered
     consumed_before);
 
 impl GroupJob {
-    /// A legacy tee takes every consumed record too (E3, R2-N5).
+    /// A legacy tee takes every consumed record too.
     pub(in crate::snapshots) fn has_tee(&self) -> bool {
         self.tee.is_some()
     }
@@ -906,7 +906,7 @@ pub(in crate::snapshots) struct StepInputs<'a> {
 /// The reader skipped a line (malformed, invalid UTF-8 or over the line
 /// cap) or failed: a refusal seen after that may be the loss's own effect
 /// (an ordinal jump, a broken chain), so it is strict, never settleable
-/// debt or a memo entry (R1-B1).
+/// debt or a memo entry.
 fn reader_lossy(parser: &OwnedJsonlParser) -> bool {
     !parser.reader.report.complete() || parser.reader.failure.is_some()
 }
@@ -1125,7 +1125,7 @@ fn member_eof(
         .charge
         .saturating_add(end.saturating_sub(active.charged_bytes));
     active.charged_bytes = 0;
-    // E3: the swap's retained state is charged, not walked (round 4, L3).
+    // The swap's retained state is charged, not walked.
     group.consumed_before = group
         .consumed_before
         .saturating_add(cursor::swap_charge(&retained));
@@ -1134,7 +1134,7 @@ fn member_eof(
     Ok(false)
 }
 
-/// E1 for a paged group's live member (R2-N1), at its genuine unchanged
+/// EOF-record handling for a paged group's live member, at its genuine unchanged
 /// EOF only (`cursor::group_eof_record_due`): the withheld final record is
 /// applied from the buffered bytes through the same line sink, the proof
 /// and the legacy tee included, before the member's proof ends. The job
@@ -1228,7 +1228,7 @@ fn open_member(
         .unwrap_or_default();
     let receipt_scope = group.receipt_scope.clone();
     group.tee = tee;
-    // E3 keeps counting across the swap (R2-N4, R2-L3): no walk per member.
+    // The copy budget keeps counting across the swap: no walk per member.
     group.consumed_before = group
         .consumed_before
         .saturating_add(active.parser.reader.consumed_bytes());
@@ -1266,7 +1266,7 @@ pub(in crate::snapshots) struct EndInputs<'a> {
 /// End a group job that did not complete. Terminal proof debt is disclosed
 /// through the one writer for every member (outcome R) and memoized; an
 /// append-curable refusal in the live member only while that member's stamp
-/// is exactly unchanged (§d.4, R2-M1). The attempt is fenced for the
+/// is exactly unchanged. The attempt is fenced for the
 /// generation.
 pub(in crate::snapshots) fn end_group(
     active: Box<OwnedActiveFile>,
@@ -1283,7 +1283,7 @@ pub(in crate::snapshots) fn end_group(
         return;
     };
     match end {
-        // R1-M1: the chronological fallback order may itself break the
+        // The chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
         // never settleable or memoized, named for S11. Per-member reasons
         // (UI balance, shape) do not depend on the order.
@@ -1296,7 +1296,7 @@ pub(in crate::snapshots) fn end_group(
                 context
                     .cache
                     .note_join_refusal(JoinRefusal::ProbeBudgetOrder);
-                // Round 3 (R1-L1, R2-L2): converge under stable inputs. An
+                // Converge under stable inputs. An
                 // order the page's remaining singleton budget forced gets a
                 // page of its own next; one `PROBE_BYTES` forced (or forced
                 // again on its own page) is the same every generation, so it
@@ -1320,7 +1320,7 @@ pub(in crate::snapshots) fn end_group(
                         .request_group_own_page(&context.namespace, &group.key);
                 }
             }
-            // Round 4 (L1): the attempt ends like every terminal group end,
+            // The attempt ends like every terminal group end,
             // completing its rotation (waiter removed, served, fenced).
             if let Some(lease) = lease {
                 cursor::end_group_lease(lease, &active);
@@ -1344,10 +1344,10 @@ pub(in crate::snapshots) fn end_group(
                 let growth_may_cure = reason.append_curable() && live_failed;
                 let held = active.parser.reader.reader.get_ref();
                 let anchor = if live_failed {
-                    // R1-H1: an exact-stamp entry never covers bytes the job
+                    // An exact-stamp entry never covers bytes the job
                     // did not read (growth past a paged cut): they may
                     // already cure it, so the next generation reads them.
-                    // Round-3 R1-M1: only a refusal raised at the read limit
+                    // Only a refusal raised at the read limit
                     // can be cured by those bytes; a mid-stream refusal is
                     // fixed by records already read, and any append still
                     // misses the exact stamp.

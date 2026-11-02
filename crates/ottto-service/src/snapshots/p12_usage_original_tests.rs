@@ -169,6 +169,7 @@ impl Family {
                     .expect("exact parsed member key");
                 let old = &previous.files[key];
                 PendingIndexFinalization {
+                    restored_behind_accepted: false,
                     withheld_content: None,
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
@@ -214,7 +215,7 @@ impl Family {
             &BTreeSet::new(),
             None,
             Some(completion.fold_view(Some(&lease))),
-            &BTreeMap::new(),
+            ClaudeEvidenceRows::Whole(&BTreeMap::new()),
         );
         items.clone_from_slice(&scan.snapshots);
         completion.capture_native_corrections(
@@ -505,7 +506,7 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();

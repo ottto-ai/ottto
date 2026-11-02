@@ -307,7 +307,7 @@ pub(super) struct Sqlite {
     last_collection_check: Option<(SystemTime, Instant)>,
     recovery_attempts_left: u8,
     paths: PathExtractor,
-    references: Option<ReferenceExtractor>,
+    references: ReferenceExtractor,
     // Keep DB identity separate from ownership: Darwin flock conflicts with
     // SQLite's fcntl locks on the same inode. Both fds outlive the connection.
     owner: File,
@@ -336,6 +336,7 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
+                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -389,13 +390,17 @@ fn lock_owner(path: &Path) -> Result<File> {
     let owned = file.metadata()?;
     let named = fs::symlink_metadata(&path)?;
     ensure!(
-        owned.dev() == named.dev() && owned.ino() == named.ino() && owned.nlink() == 1,
+        same_object(&owned, &named) && owned.nlink() == 1,
         "state_v2_object_changed"
     );
     private_file(&path)?;
     Ok(file)
 }
 
+/// Two metadata reads name the same filesystem object.
+fn same_object(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
 fn private_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
@@ -498,6 +503,27 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
 }
 
 impl Sqlite {
+    /// A store over a just-opened connection; only `import` differs by route.
+    fn fresh(conn: Connection, path: &Path, import: bool, owner: File, owner_lock: File) -> Self {
+        Self {
+            conn: Some(conn),
+            path: path.into(),
+            import,
+            debt: false,
+            reload: false,
+            purge_policy: PurgePolicy::default(),
+            stats: MaintenanceStats::default(),
+            last_purge_attempt: None,
+            last_collection_check: None,
+            recovery_attempts_left: 0,
+            paths: kinds::private_paths,
+            references: kinds::references,
+            owner,
+            _owner_lock: owner_lock,
+            clean: false,
+            save_failure: None,
+        }
+    }
     /// Journal OFF is confined to an unpublished O_EXCL .import database. A
     /// failed/partial import is discarded, never recovered or published.
     pub(super) fn create_import(path: &Path) -> Result<Self> {
@@ -526,28 +552,8 @@ impl Sqlite {
         private_file(path)?;
         let owned = file.metadata()?;
         let named = fs::symlink_metadata(path)?;
-        ensure!(
-            owned.dev() == named.dev() && owned.ino() == named.ino(),
-            "state_v2_object_changed"
-        );
-        let mut store = Self {
-            conn: Some(conn),
-            path: path.into(),
-            import: true,
-            debt: false,
-            reload: false,
-            purge_policy: PurgePolicy::default(),
-            stats: MaintenanceStats::default(),
-            last_purge_attempt: None,
-            last_collection_check: None,
-            recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
-            owner: file,
-            _owner_lock: owner_lock,
-            clean: false,
-            save_failure: None,
-        };
+        ensure!(same_object(&owned, &named), "state_v2_object_changed");
+        let mut store = Self::fresh(conn, path, true, file, owner_lock);
         store.control("limits", &StorageLimits::current())?;
         super::telemetry::event("schema_layout", &"four_tables");
         Ok(store)
@@ -572,10 +578,7 @@ impl Sqlite {
         migrations::writer_supported(self.conn()?)?;
         let named = fs::symlink_metadata(&self.path)?;
         let owned = self.owner.metadata()?;
-        ensure!(
-            named.dev() == owned.dev() && named.ino() == owned.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&named, &owned), "state_v2_object_changed");
         Ok((
             self.read_control::<u64>("generation")?
                 .context("state_v2_generation_missing")?,
@@ -636,18 +639,6 @@ impl Sqlite {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("state_v2_connection_unavailable"))
     }
-    /// Immutable identity probe must precede a read-write open, WAL recovery,
-    /// settings changes, and SHM creation. The expected identity comes from the
-    /// independently read fence, never from the candidate database.
-    #[cfg(test)]
-    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
-        Self::open_with_policy(
-            path,
-            identity,
-            Duration::from_secs(86400),
-            Duration::from_secs(2),
-        )
-    }
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
@@ -666,16 +657,10 @@ impl Sqlite {
         ensure!(actual == *identity, "state_v2_foreign_binding");
         Ok(())
     }
-    pub(super) fn open_with_policy(
-        path: &Path,
-        identity: &super::Identity,
-        deadline: Duration,
-        work: Duration,
-    ) -> Result<Self> {
-        ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
-            "state_v2_purge_policy"
-        );
+    /// Immutable identity probe must precede a read-write open, WAL recovery,
+    /// settings changes, and SHM creation. The expected identity comes from the
+    /// independently read fence, never from the candidate database.
+    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -701,10 +686,7 @@ impl Sqlite {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let after = fs::symlink_metadata(path)?;
-        ensure!(
-            before.dev() == after.dev() && before.ino() == after.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&before, &after), "state_v2_object_changed");
         migrations::supported(&conn)?;
         settings(&conn, false)?;
         migrations::run(&conn)?;
@@ -729,30 +711,14 @@ impl Sqlite {
                 maintenance::size_budget(before.len().max(pages.saturating_mul(4096)), 10),
             )?;
         }
-        let mut store = Self {
-            conn: Some(conn),
-            path: path.into(),
-            import: false,
-            debt: false,
-            reload: false,
-            purge_policy: PurgePolicy::default(),
-            stats: MaintenanceStats::default(),
-            last_purge_attempt: None,
-            last_collection_check: None,
-            recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
-            owner: file,
-            _owner_lock: owner_lock,
-            clean: false,
-            save_failure: None,
-        };
-        store.set_purge_policy(deadline, work)?;
+        let mut store = Self::fresh(conn, path, false, file, owner_lock);
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
         store.maintenance(false)?;
         store.control("phase", &1_u8)?;
+        // Runtime loads re-emit any separate save/custody hold after hydration.
+        super::telemetry::event("hold", &"none");
         Ok(store)
     }
     pub(super) fn finish_import(mut self) -> Result<()> {
@@ -818,6 +784,10 @@ impl Sqlite {
         }
     }
     #[cfg(test)]
+    pub(super) fn validate_references(&self) -> Result<()> {
+        references::verify_counts(self.conn()?, self.references)
+    }
+    #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
         let conn = self.conn()?;
         // A bounded row scan verifies all owner lengths/digests. The separate
@@ -851,9 +821,8 @@ impl Sqlite {
     }
 }
 
-impl Store for Sqlite {
-    type Txn<'a> = Txn<'a>;
-    fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
+impl Sqlite {
+    pub(super) fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
             telemetry::row_cap_reset();
             self.save_failure = None;
@@ -861,6 +830,7 @@ impl Store for Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
+            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -884,7 +854,7 @@ impl Store for Sqlite {
             dirty_rows: 0,
         })
     }
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
+    pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         if mode == CheckpointMode::Purge && self.vacuum().is_err() {
             self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
@@ -1016,14 +986,7 @@ fn scan_record_range(
         values.push(SqlValue::Integer(i64::try_from(*position)?));
         filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
     }
-    values.push(SqlValue::Integer(limit as i64));
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
-        projection(Table::Records),
-        values.len()
-    ))?;
-    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    record_headers(conn, &filter, values, "key_bytes,position", limit)
 }
 fn scan_record_key(
     conn: &Connection,
@@ -1042,15 +1005,25 @@ fn scan_record_key(
         values.push(SqlValue::Integer(i64::try_from(position)?));
         filter.push_str(" AND position>?3");
     }
+    record_headers(conn, &filter, values, "position", limit)
+}
+fn record_headers(
+    conn: &Connection,
+    filter: &str,
+    mut values: Vec<SqlValue>,
+    order: &str,
+    limit: usize,
+) -> Result<Vec<Header>> {
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
+        "SELECT {} FROM records WHERE {filter} ORDER BY {order} LIMIT ?{}",
         projection(Table::Records),
         values.len()
     ))?;
     let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
     ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
     if let RowKey::Meta(name) = &h.key {
@@ -1122,18 +1095,11 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
 /// The semantic encoder owns path classification, including paths inside raw
 /// holds and packed maps AND the primary key. Only actual PL strings are
 /// emitted, through a bounded sink before allocation. No table field knowledge
-/// belongs here. Missing extractors refuse mutations, never infer privacy.
+/// belongs here. The default extractors use the semantic encoder.
 pub(super) type PathExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
 pub(super) type ReferenceExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()>;
-fn missing_path_extractor(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    bail!("state_v2_private_path_extractor_required")
-}
 struct StoredValue<'a> {
     conn: &'a Connection,
     header: &'a Header,
@@ -1144,11 +1110,13 @@ impl Value for StoredValue<'_> {
     }
 }
 impl Sqlite {
+    #[cfg(test)]
     pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
         self.paths = paths;
     }
+    #[cfg(test)]
     pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
-        self.references = Some(refs);
+        self.references = refs;
     }
 }
 impl Sqlite {
@@ -1178,6 +1146,10 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
+    /// Charged bytes of the last refused save, for its ceiling alarm.
+    pub(super) fn refused_save_bytes(&self) -> u64 {
+        self.stats.refused_save_bytes
+    }
     fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
@@ -1185,13 +1157,6 @@ impl Sqlite {
         if disk_full(error) {
             self.save_failure = Some(Hold::SaveFull);
             telemetry::event("sqlite_full", &1);
-        } else if error.chain().any(|e| {
-            matches!(
-                e.to_string().as_str(),
-                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
-            )
-        }) {
-            self.save_failure = Some(Hold::SaveCeiling);
         }
     }
 }
@@ -1207,6 +1172,7 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
@@ -1223,7 +1189,6 @@ impl Txn<'_> {
         // exceed them. Only the hard charged-work ceiling refuses publication.
         if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
             anyhow::bail!(Hold::SaveCeiling);
         }
         Ok(())
@@ -1270,31 +1235,49 @@ impl Txn<'_> {
             self.shared_erasure = true;
             return Ok(());
         }
-        if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
+        // Once erasure is required, a remembered set cannot change the outcome.
+        if self.shared_erasure || !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
-        let mut bytes = self.path_bytes;
-        bytes = bytes
-            .checked_add(owner_key_bytes(&old.key)?.len() * 2 + 512)
-            .context("state_v2_path_diff_admission")?;
+        let budget = self.store.purge_policy.path_diff_budget;
+        let mut bytes = self
+            .path_bytes
+            .saturating_add(owner_key_bytes(&old.key)?.len().saturating_mul(2))
+            .saturating_add(512);
+        let mut over = bytes > budget;
         let mut paths = BTreeSet::new();
-        (self.store.paths)(
-            old,
-            &StoredValue {
-                conn: self.store.conn()?,
-                header: old,
-            },
-            &mut |path| {
-                if !paths.contains(path) {
-                    bytes = bytes
-                        .checked_add(path.len() + 64)
-                        .context("state_v2_path_diff_admission")?;
-                    ensure!(bytes <= 32 * 1024 * 1024, "state_v2_path_diff_admission");
-                    paths.insert(path.to_owned());
-                }
-                Ok(())
-            },
-        )?;
+        if !over {
+            (self.store.paths)(
+                old,
+                &StoredValue {
+                    conn: self.store.conn()?,
+                    header: old,
+                },
+                &mut |path| {
+                    if !over && !paths.contains(path) {
+                        bytes = bytes.saturating_add(path.len()).saturating_add(64);
+                        over = bytes > budget;
+                        if !over {
+                            paths.insert(path.to_owned());
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if over {
+            // The diff budget bounds memory, never the save. Stop buffering and
+            // require erasure as a detected removal would: over-erasing is safe.
+            let rows = self.original_paths.len().saturating_add(1);
+            self.shared_erasure = true;
+            self.original_paths = BTreeMap::new();
+            self.path_bytes = 0;
+            telemetry::event(
+                "path_diff_conservative",
+                &serde_json::json!({ "bytes": bytes, "rows": rows }),
+            );
+            return Ok(());
+        }
         // Remember empty sets too, so repeated changes extract at most once.
         self.path_bytes = bytes;
         self.original_paths.insert(old.key.clone(), paths);
@@ -1663,6 +1646,7 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
+            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;
@@ -1721,42 +1705,25 @@ fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
     );
     Ok(())
 }
-unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
-    // Callback is installed only for quick_check and removed before the stack
-    // deadline is dropped. No panic crosses the C boundary.
-    let deadline = unsafe { &*(raw.cast::<Instant>()) };
-    (Instant::now() >= *deadline) as std::ffi::c_int
-}
 fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
-    let mut deadline = Instant::now()
-        .checked_add(budget)
-        .context("state_v2_work_budget")?;
+    #[cfg(test)]
+    let budget = open_check_tests::budget(budget);
     super::telemetry::event("quick_check", &1);
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            conn.handle(),
-            1000,
-            Some(progress),
-            (&mut deadline as *mut Instant).cast(),
-        );
-    }
+    // An interrupted check starts over on every open. Finish the finite scan;
+    // the former deadline is an alarm threshold, never an ingestion gate.
+    let started = Instant::now();
     let result = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0));
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
-    }
-    let checked = result.map_err(|error| {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
-            anyhow::Error::from(super::Hold::IntegrityRetry)
-        } else {
-            error.into()
-        }
-    })?;
-    ensure!(
-        checked == "ok",
-        "state_v2_integrity_requires_explicit_repair"
-    );
+    let elapsed = started.elapsed();
+    super::telemetry::event("quick_check_ms", &elapsed.as_millis());
+    super::telemetry::event("quick_check_slow_alarm", &(elapsed > budget));
+    let checked = result?;
+    ensure!(checked == "ok", INTEGRITY_REPAIR);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sqlite/open_check_tests.rs"]
+mod open_check_tests;
 
 #[cfg(test)]
 #[path = "sqlite/fixtures.rs"]
@@ -1790,10 +1757,7 @@ impl Sqlite {
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .context("state_v2_generation_missing")?;
         let after = fs::symlink_metadata(path)?;
-        ensure!(
-            before.dev() == after.dev() && before.ino() == after.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&before, &after), "state_v2_object_changed");
         ensure!(
             generation >= identity.fence_generation,
             "state_v2_generation_rollback"
@@ -1831,21 +1795,12 @@ impl Sqlite {
         let mut digests = BTreeSet::new();
         let mut expected = None;
         super::mapper::rows(&mut tx, "file.progress", |tx, header| {
-            let RowKey::Record {
-                key_bytes,
-                position,
-                ..
-            } = &header.key
-            else {
-                bail!("state_v2_record_key");
-            };
-            if *position == 0 {
-                ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-                expected = Some(super::mapper::read::<usize>(tx, &header, None)?);
-            } else {
-                ensure!(*position == 1, "state_v2_member_position");
-                let path = super::mapper::family(key_bytes)?;
-                digests.insert(crate::durable_tail_store::key_digest(source, &path));
+            match super::mapper::member(&header)? {
+                None => expected = Some(super::mapper::read::<usize>(tx, &header, None)?),
+                Some(key_bytes) => {
+                    let path = super::mapper::family(key_bytes)?;
+                    digests.insert(crate::durable_tail_store::key_digest(source, &path));
+                }
             }
             Ok(())
         })?;

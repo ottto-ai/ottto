@@ -400,14 +400,28 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
+        // Cold usage pending: the page's families first; Unknown refuses.
+        let unknown = crate::source_rotation::LocalRefusal("usage_pending_unknown");
+        let roots = scan
+            .snapshots
+            .iter()
+            .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+            .collect();
+        super::super::state_v2::load_usage(index, &roots).map_err(|_| unknown)?;
         let counts = super::super::evidence_owed::stamped(
             index,
             &scan.snapshots,
             &scan.census_window_end,
             |index| {
-                accumulate_claude_usage_family_pending_with_credit(
+                let (families, retained) = claude_page_usage_families(
                     &scan.snapshots,
                     &mut index.claude_usage_family_pending,
+                )
+                .map_err(|_| unknown)?;
+                accumulate_claude_usage_family_pending_with_credit(
+                    &scan.snapshots,
+                    families,
+                    retained,
                     &scan.census_window_end,
                     MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
                     Some(&mut budget),
@@ -1298,7 +1312,7 @@ impl SelectedFallback {
                     index.terminal_jsonl_dispositions.remove(key);
                 }
             }
-            // Slice D1: fail closed, never a record of either revision. The
+            // Fail closed, never a record of either revision. The
             // first-seen birth of the same physical object stays (an in-place
             // stub every reader treats as no record; nothing is allocated).
             index.claude_request_census.invalidate_keeping_birth(key);

@@ -26,12 +26,34 @@ fn write_field<T: Serialize + ?Sized>(
     cx.presence.entry(slot.into()).or_insert(true);
     Ok(())
 }
+/// Codex archive custody is written only while held: archives non-empty or a
+/// deferred alarm owed. Stores without it (every Claude store) keep their exact
+/// rows and presence, and an absent root reads empty at any layout.
+pub(super) const ARCHIVE_KINDS: [&str; 2] =
+    ["v1_field.archives", "v1_field.archive_deferred_alarm_count"];
+fn read_archive_kind<T: serde::de::DeserializeOwned + Serialize + Default>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    mode: mapper::Members,
+    seed: &mut mapper::Digests,
+) -> Result<T> {
+    if tx.get(&mapper::key(kind, "", 0)?)?.is_none() {
+        // Members without their root are still damage.
+        ensure!(
+            tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
+            "state_v2_missing_manifest"
+        );
+        return Ok(T::default());
+    }
+    mapper::field_read(tx, kind, mode, Some(seed), T::default)
+}
 fn read_field<T: serde::de::DeserializeOwned + Serialize>(
     kind: &str,
     tx: &mut dyn Transaction,
     seed: Option<&mut mapper::Digests>,
+    default: impl FnOnce() -> T,
 ) -> Result<T> {
-    mapper::field_read(tx, kind, field_mode(kind), seed)
+    mapper::field_read(tx, kind, field_mode(kind), seed, default)
 }
 #[derive(Serialize, Deserialize, Default)]
 struct HoldMetadata {
@@ -77,7 +99,12 @@ fn read_holds(
     txn: &mut dyn Transaction,
     seed: Option<&mut mapper::Digests>,
 ) -> Result<()> {
-    let metadata: HoldMetadata = read_field("v1_field.repair_provenance", txn, seed)?;
+    let metadata: HoldMetadata = read_field(
+        "v1_field.repair_provenance",
+        txn,
+        seed,
+        HoldMetadata::default,
+    )?;
     let mut holds = super::super::lenient_decode::Holds::default();
     let mut expected = 0;
     for (field, slots) in metadata.entries {
@@ -132,7 +159,7 @@ fn read_holds(
     index.decode_holds = holds;
     Ok(())
 }
-fn read_control<T: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     name: &str,
     txn: &mut dyn Transaction,
 ) -> Result<T> {
@@ -170,6 +197,7 @@ pub(super) fn merge_cas_at(
         "v1_field.accepted_snapshot_fingerprint_ledger_version",
         tx,
         None,
+        || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
     )?;
     kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
@@ -332,6 +360,18 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
+    if !index.archives.is_empty() || index.archive_deferred_alarm_count != 0 {
+        let [archives, deferred] = ARCHIVE_KINDS;
+        mapper::field_write(rows, archives, &index.archives, mapper::Members::Map)?;
+        cx.presence.entry("archives".into()).or_insert(true);
+        write_field(
+            &index.archive_deferred_alarm_count,
+            "archive_deferred_alarm_count",
+            deferred,
+            rows,
+            cx,
+        )?;
+    }
     write_holds(index, rows)?;
     rows.raw(
         RowKey::Meta("field_presence".into()),
@@ -357,11 +397,15 @@ pub(super) fn hydrate_txn(
     );
     macro_rules! load {
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = read_field($kind, tx, Some(&mut cx.digests))?;
+            index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
+    let [archives, deferred] = ARCHIVE_KINDS;
+    index.archives = read_archive_kind(tx, archives, mapper::Members::Map, &mut cx.digests)?;
+    index.archive_deferred_alarm_count =
+        read_archive_kind(tx, deferred, mapper::Members::Field, &mut cx.digests)?;
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

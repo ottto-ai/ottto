@@ -282,7 +282,6 @@ pub struct LocalMachineHealthV1 {
     pub evidence: Vec<LocalHealthEvidenceRefV1>,
 }
 
-pub type LocalMachineHealth = LocalMachineHealthV1;
 pub type CanonicalLocalHealth = LocalMachineHealthV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3338,6 +3337,19 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// email, and is never uploaded. Older clients ignore this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_notice: Option<String>,
+    /// Default home only: the account and organization proven to own the
+    /// stored token, and the ones its `.claude.json` cache names. Hashes and
+    /// a time only; older clients ignore these additive fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_proven_at: Option<Rfc3339Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -80,7 +80,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
-    // S1 MISC: exact immutable custody access, without serializing HeldRaw.
+    // Exact immutable custody access, without serializing HeldRaw.
     pub(super) fn v2_provenance(&self) -> (u128, u64) {
         (self.1.sum, self.1.count)
     }
@@ -257,6 +257,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
+/// The record map a field's codec writes. A cold usage map keeps its
+/// families in the store only, so no codec may see it.
+trait Records {
+    type Value: Serialize;
+    fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
+}
+impl<T: Serialize> Records for BTreeMap<String, T> {
+    type Value = T;
+    fn records(&self) -> Option<&Self> {
+        Some(self)
+    }
+}
+impl<T: Serialize> Records for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn records(&self) -> Option<&BTreeMap<String, Shared<T>>> {
+        Some(self)
+    }
+}
+impl Records for UsagePending {
+    type Value = ClaudeUsageFamilyPending;
+    fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
+        self.resident()
+    }
+}
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
 impl<T: Serialize> Serialize for WireMap<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -292,20 +316,23 @@ impl Serialize for ScanIndex {
             };
             (held $name:ident) => {
                 if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
+                    let records = Records::records(&self.$name)
+                        .ok_or_else(|| serde::ser::Error::custom("usage_pending_cold"))?;
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(&self.$name, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(records, self.decode_holds.0.get(stringify!($name))),
                     )?;
                 }
             };
         }
         field!(schema_version);
         field!(generation);
-        field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
+        field!(archives, BTreeMap::is_empty);
+        field!(archive_deferred_alarm_count, is_zero_u64);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
@@ -417,6 +444,7 @@ impl Serialize for ScanIndex {
             upload_context_proof,
             upload_context_receipt::ProofState::is_empty
         );
+        field!(copy_prefix_last_accepted_nonce, Option::is_none);
         map.end()
     }
 }
@@ -424,7 +452,7 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
-    "upload_context_fingerprint",
+    "upload_context_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "files",
     "session_account_bindings",
     "terminal_jsonl_dispositions",
@@ -511,6 +539,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
     "upload_context_proof",
+    "archives",
+    "archive_deferred_alarm_count",
+    "copy_prefix_last_accepted_nonce",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -561,7 +592,7 @@ fn header_field(name: &str) -> bool {
             | "codex_proof_index_incarnation"
     )
 }
-/// SI-718-O1: the session-identity state a user Repair override rebuild
+/// The session-identity state a user Repair override rebuild
 /// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
 /// replay generations without which the rebuild would arm a replay the
 /// damaged index had completed (that replay clears carried state). Each uses
@@ -589,6 +620,9 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
+    // Exact-ACK stamps of the carried acknowledgements (P2). Damage only
+    // means owed, as on a load.
+    "upload_context_proof",
 ];
 #[derive(Default)]
 struct Counts {
@@ -1212,14 +1246,25 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
     }
     fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
         let roots = family_hold_roots(&self.holds.0);
+        // Only held roots are serialized. A cold usage map is refused only
+        // when a held root names one of its stored families; otherwise it
+        // contributes nothing, exactly as its resident entries would not.
+        if index.claude_usage_family_pending.cold().is_some()
+            && roots
+                .iter()
+                .any(|root| index.claude_usage_family_pending.contains_key(root))
+        {
+            return Err(Error::Refused("usage pending cold"));
+        }
         let mut input = HydrateInput(Vec::new());
         self.family_spans.clear();
         macro_rules! field {
             ($field:ident) => {{
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
+                let empty = BTreeMap::new();
                 let view = FamilyView {
-                    typed: &index.$field,
+                    typed: Records::records(&index.$field).unwrap_or(&empty),
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
@@ -1293,13 +1338,15 @@ pub(super) fn post_decode_hydrated(
     // records takes the field before the span and the debt flag after it.
     macro_rules! records {
         ($field:ident) => {
+            records!($field, index.$field)
+        };
+        ($field:ident, $records:expr) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
+                let records = &mut $records;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
-                    index.$field.remove(key);
+                    records.remove(key);
                 }
-                index
-                    .$field
-                    .extend(decoder.records(stringify!($field), span, true)?);
+                records.extend(decoder.records(stringify!($field), span, true)?);
             }
         };
     }
@@ -1317,7 +1364,14 @@ pub(super) fn post_decode_hydrated(
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
-    records!(claude_usage_family_pending);
+    // A cold usage map keeps its families in the store; no hold rewrites it.
+    records!(
+        claude_usage_family_pending,
+        *index
+            .claude_usage_family_pending
+            .resident_mut()
+            .ok_or(Error::Refused("usage pending cold"))?
+    );
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
             .original_holds
@@ -1384,7 +1438,7 @@ pub(super) fn read_file(
     }
     result
 }
-/// SI-718-O1: decode only the headers and `IDENTITY_CARRY_FIELDS` of an
+/// Decode only the headers and `IDENTITY_CARRY_FIELDS` of an
 /// index that cannot load whole (syntax, hold budget or a Codex key
 /// collision), with the same per-field decoders as a load. File records,
 /// holds and every other field are skipped unread, so damaged records spend
@@ -1824,7 +1878,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
-        self.records_checked(field, span, debt, |_| false)
+        self.records_checked(field, span, debt, |_| false, None)
     }
     fn records_checked<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -1832,9 +1886,16 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
         repaired: impl Fn(&T) -> bool,
+        unknown: Option<fn() -> T>,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
+            if let Some(unknown) = unknown {
+                return Ok(BTreeMap::from([(
+                    codex_compressed_input::UNKNOWN_ARCHIVE_SCOPE.to_owned(),
+                    unknown(),
+                )]));
+            }
             if debt {
                 return Err(Error::Refused("unkeyed negative collection"));
             }
@@ -1858,6 +1919,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             } else {
                 self.typed(value)
             };
+            let decoded = decoded.or_else(|error| unknown.map(|f| f()).ok_or(error));
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
@@ -1936,6 +1998,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             span,
             true,
             |record: &SnapshotQuarantineRecord| !snapshot_quarantine_deadline_is_bounded(record),
+            None,
         )?;
         self.repair_held(
             "quarantined_snapshot_fingerprints",
@@ -2093,11 +2156,26 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_ack_retirement_handoff =
                                 self.history_scalar(value, None)?
                         }
-                        "upload_context_fingerprint" => {
-                            index.upload_context_fingerprint = self.typed(value)?
-                        }
+                        "upload_context_fingerprint" => {} // TOMBSTONE: decode-and-drop.
                         "files" => {
                             index.files = self.records::<Shared<_>>("files", value, true)?.into()
+                        }
+                        "archive_deferred_alarm_count" => {
+                            index.archive_deferred_alarm_count =
+                                self.diagnostic_timestamp(value)?.unwrap_or(0)
+                        }
+                        "archives" => {
+                            index.archives = self
+                                .records_checked(
+                                    "archives",
+                                    value,
+                                    false,
+                                    |_| false,
+                                    Some(codex_compressed_input::ArchiveEvidence::unknown),
+                                )?
+                                .into_iter()
+                                .map(|(key, a)| (key, a.checked()))
+                                .collect()
                         }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
@@ -2185,7 +2263,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_family_pending" => {
                             index.claude_usage_family_pending =
-                                self.records("claude_usage_family_pending", value, true)?
+                                UsagePending::from(self.records::<ClaudeUsageFamilyPending>(
+                                    "claude_usage_family_pending",
+                                    value,
+                                    true,
+                                )?)
                         }
                         "claude_request_census" => {
                             index.claude_request_census = self
@@ -2350,6 +2432,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.codex_counting_evicted_legacy =
                                 self.history_scalar(value, Default::default())?
                         }
+                        "copy_prefix_last_accepted_nonce" => {
+                            index.copy_prefix_last_accepted_nonce = self.typed(value)?
+                        }
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never
                             // the index.
@@ -2496,7 +2581,7 @@ impl<R: BufRead + Seek> Decoder<R> {
 
         if pass == Pass::Full {
             // An empty undamaged store is never written: absence is an empty
-            // store, not lost metadata (Lead B F4). Damage is `missing`.
+            // store, not lost metadata. Damage is `missing`.
             if !seen.contains("claude_copy_removals") {
                 index.claude_copy_removals = Default::default();
             }
@@ -2600,7 +2685,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
                         "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending.remove(&key);
+                            index.claude_usage_family_pending.discard(&key);
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
@@ -3092,7 +3177,9 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repair_key(value: &str) -> [u8; 32] {
+/// A full 256-bit key over the exact string: equal strings give equal keys
+/// (spelling-sensitive), so a holder or join never keeps the strings.
+pub(super) fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 

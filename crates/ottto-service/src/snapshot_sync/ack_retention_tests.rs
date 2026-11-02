@@ -127,7 +127,9 @@ impl AckFixture {
     }
 }
 
-fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn exact_ack(
+    items: Vec<SnapshotItem>,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
@@ -713,8 +715,8 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     );
 }
 
-/// Every source binds the ledger each cycle. The reread copy has no key, and a
-/// rebind that discarded hints is unsaved until the next ACK page.
+/// [regress] (#909) A key rotation this cycle discards saved identity hints in
+/// memory only, until the next ACK page; the partial checkpoint still runs.
 #[test]
 fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
     let hint = serde_json::json!({
@@ -725,65 +727,38 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
             {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
         ]}],
     });
-    let cases = [
-        ("bound with a saved hint", Some([0x42; 32]), true, None),
-        ("bound with no hints", Some([0x42; 32]), false, None),
-        (
-            "rotated key, unsaved",
-            Some([0x41; 32]),
-            true,
-            Some(Some([0x42; 32])),
-        ),
-        (
-            "no key this cycle, unsaved",
-            Some([0x41; 32]),
-            true,
-            Some(None),
-        ),
-    ];
-    let mut refused = Vec::new();
-    for cause in [
-        UnsettledUploadCause::Shed,
-        UnsettledUploadCause::UploadError,
-    ] {
-        for (case, saved_key, record, rebind) in cases {
-            let f = AckFixture::new(true);
-            let (index, mut progress) = f.load();
-            progress.accepted_identity_buckets.bind_test_key(saved_key);
-            progress
-                .accepted_identity_buckets
-                .set_retained_enabled(true);
-            if record {
-                progress.accepted_identity_buckets.record(&hint);
-                assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");
-            }
-            progress.save(&f.progress_path).unwrap();
-            if let Some(key) = rebind {
-                progress.accepted_identity_buckets.bind_test_key(key);
-                assert!(progress.accepted_identity_buckets.is_empty(), "{case}");
-            }
-            if let Err(error) = checkpoint_partial_snapshot_index_with_comparison(
-                &index,
-                &index,
-                &progress,
-                std::slice::from_ref(&f.item),
-                None,
-                &BTreeSet::new(),
-                &f.index_path,
-                &f.progress_path,
-                || Ok(()),
-                None,
-                None,
-                Some(cause),
-            ) {
-                refused.push(format!("{cause:?}, {case}: {error:#}"));
-            }
-        }
-    }
-    assert!(
-        refused.is_empty(),
-        "partial checkpoints refused: {refused:#?}"
-    );
+    let f = AckFixture::new(true);
+    let (index, mut progress) = f.load();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x41; 32]));
+    progress
+        .accepted_identity_buckets
+        .set_retained_enabled(true);
+    progress.accepted_identity_buckets.record(&hint);
+    assert!(!progress.accepted_identity_buckets.is_empty());
+    progress.save(&f.progress_path).unwrap();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    assert!(progress.accepted_identity_buckets.is_empty());
+    checkpoint_partial_snapshot_index_with_audit_release(
+        &index,
+        &index,
+        &progress,
+        std::slice::from_ref(&f.item),
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+        None,
+        None,
+        Some(UnsettledUploadCause::Shed),
+        None,
+        Default::default(),
+    )
+    .expect("an unsaved ledger rebind does not refuse the partial checkpoint");
 }
 
 #[test]
@@ -1659,7 +1634,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
         "the retained exact ACK is not re-sent"
     );
 
-    // SOURCE h843 item 2: "kept" alone would allow a forever-kept ACK. The
+    // "kept" alone would allow a forever-kept ACK. The
     // pending obligation is persisted across recovery, and adopting the
     // settled containing file then retires the exact ACK.
     let (previous, mut progress) = f.load();
@@ -1801,7 +1776,7 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
         .unwrap();
     f.assert_ack(&f.load().1);
 
-    // SOURCE h843 item 2: the pending obligation is persisted across
+    // The pending obligation is persisted across
     // recovery; when the new file vanishes before it settled, a complete
     // census proves E absent and retires the exact ACK.
     let (previous, mut progress) = f.load();
@@ -1925,6 +1900,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &progress,
                 &holds,
                 other == "rejected",
+                None,
             ),
         };
         assert!(!settlement.fully_settled, "{outcome}");
@@ -2047,7 +2023,7 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
     assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
 }
 
-// M7: synthetic persisted ACKs only; no live source/provider/account state.
+// Synthetic persisted ACKs only; no live source/provider/account state.
 fn bound_progress(
     index_path: &Path,
     progress_path: &Path,
@@ -2288,6 +2264,86 @@ fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
+/// [regress] This pass's own unsaved progress merge no longer refuses a
+/// first-page-shed checkpoint; only a newer saved generation does, as in `save()`.
+#[test]
+fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
+    for concurrent_writer in [false, true] {
+        let f = AckFixture::new(false);
+        AckFixture::write_source(&f.sources, "owed");
+        let (committed, mut progress) = f.load();
+        let mut working = committed.clone();
+        let scan = AckFixture::scan(&f.sources, &mut working);
+        let acked = f.item.clone();
+        let owed = scan
+            .snapshots
+            .iter()
+            .find(|item| item.snapshot_fingerprint != acked.snapshot_fingerprint)
+            .unwrap()
+            .clone();
+        // An earlier pass saved this exact ACK before its index settled.
+        f.upload(&mut progress, std::slice::from_ref(&acked), exact_ack)
+            .unwrap();
+        // This pass adopts an index-only contract-1 quarantine record in
+        // memory and reports no change, so nothing saves it.
+        let merged = "e".repeat(64);
+        let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+        record.reconstruction_contract = 1;
+        assert!(!progress.prepare_quarantine_retries(&BTreeMap::from([(merged.clone(), record)])));
+        assert!(progress.quarantined_fingerprints.contains_key(&merged));
+        let stopped = f.upload(&mut progress, std::slice::from_ref(&owed), |_| {
+            Err(anyhow::Error::new(UploadShed {
+                status: 503,
+                retry_after: None,
+                code: None,
+            }))
+        });
+        assert_eq!(
+            stopped.unwrap(),
+            ResumableUploadResult::Shed { retry_after: None }
+        );
+        assert!(!f.load().1.quarantined_fingerprints.contains_key(&merged));
+        if concurrent_writer {
+            f.load().1.save(&f.progress_path).unwrap();
+        }
+        let index_before = std::fs::read(&f.index_path).unwrap();
+        let progress_before = std::fs::read(&f.progress_path).unwrap();
+        let result = checkpoint_partial_snapshot_index_with_audit_release(
+            &working,
+            &committed,
+            &progress,
+            &[acked.clone(), owed.clone()],
+            None,
+            &BTreeSet::new(),
+            &f.index_path,
+            &f.progress_path,
+            || Ok(()),
+            None,
+            None,
+            Some(UnsettledUploadCause::Shed),
+            None,
+            Default::default(),
+        );
+        assert_eq!(std::fs::read(&f.progress_path).unwrap(), progress_before);
+        if concurrent_writer {
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains("snapshot progress changed"));
+            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_before);
+            continue;
+        }
+        let saved = result.unwrap();
+        assert!(saved.generation > committed.generation);
+        let restored = ScanIndex::load(&f.index_path).unwrap();
+        assert_eq!(restored.generation, saved.generation);
+        assert!(restored.accepted_snapshot_fingerprint_recorded(&acked.snapshot_fingerprint));
+        assert!(!restored.accepted_snapshot_fingerprint_recorded(&owed.snapshot_fingerprint));
+        assert_eq!(
+            f.load().1.accepted_fingerprints,
+            BTreeSet::from([acked.snapshot_fingerprint.clone()])
+        );
+    }
+}
+
 /// [regress] published v2 partial checkpoint reuses progress owner through atomic save.
 #[test]
 fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
@@ -2334,7 +2390,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     .unwrap()
                     .map(Box::new);
             // Two exact sibling ACKs followed by a real uploader stop. No file
-            // publication changes: R1's activation/staging guard stays intact.
+            // publication changes: the activation/staging guard stays intact.
             let upload = |items: &[SnapshotItem],
                           progress: &mut SnapshotUploadProgress,
                           response: &mut dyn FnMut(
@@ -2385,7 +2441,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             }
             let persisted_progress = std::fs::read(&progress_path).unwrap();
             working.mark_bounded_sweep_unsettled();
-            let saved = checkpoint_partial_snapshot_index_with_comparison(
+            let saved = checkpoint_partial_snapshot_index_with_audit_release(
                 &working,
                 &committed,
                 &progress,
@@ -2404,6 +2460,8 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 read_limit,
                 None,
                 None,
+                None,
+                Default::default(),
             )
             .unwrap();
             assert!(saved.generation > committed.generation);

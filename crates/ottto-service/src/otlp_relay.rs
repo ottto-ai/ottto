@@ -23,7 +23,6 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
-pub const CLAUDE_CODE_RELAY_PORT: u16 = LOCAL_RELAY_DEFAULT_PORT;
 pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
 pub const CODEX_RELAY_SOURCE: &str = "codex";
 pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
@@ -131,10 +130,6 @@ struct HttpRequest {
 
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
-}
-
-pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
-    spawn_local_otlp_relay(daemon)
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
@@ -644,8 +639,7 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
     }
     let mut last_error = None;
     for port in ports {
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        match TcpListener::bind(bind_addr) {
+        match bind_relay_port(port) {
             Ok(listener) => {
                 if port != LOCAL_RELAY_DEFAULT_PORT {
                     relay_log!("local OTLP relay using per-user port {port}");
@@ -662,6 +656,14 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow!("no local OTLP relay ports were available"));
     Err(error).context("bind local OTLP relay")
+}
+
+fn bind_relay_port(port: u16) -> io::Result<TcpListener> {
+    #[cfg(test)]
+    if let Some(result) = tests::planned_bind(port) {
+        return result;
+    }
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 /// Apply the read and write timeout to an accepted relay stream. A best-effort
@@ -689,23 +691,6 @@ pub fn local_relay_port_from_endpoint(endpoint: &str) -> Option<u16> {
         .next()
         .and_then(|value| value.parse::<u16>().ok())?;
     Some(port)
-}
-
-pub fn local_relay_base_url_from_state(relay: &RelayState) -> String {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .map(local_relay_base_url_for_port)
-        .unwrap_or_else(default_local_relay_base_url)
-}
-
-pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
-    relay
-        .endpoint
-        .as_deref()
-        .and_then(local_relay_port_from_endpoint)
-        .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
 }
 
 pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {
@@ -982,14 +967,8 @@ fn handle_control_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto control"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "control") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = control_cors_headers(origin);
 
@@ -1051,14 +1030,8 @@ fn handle_whoami_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto identity"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "identity") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1110,14 +1083,8 @@ fn handle_local_health_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto health"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "health") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1185,6 +1152,20 @@ fn local_health_response_payload(
         "machine_id": status.machine.machine_id,
         "machine_name": status.machine.display_name,
         "health": health,
+    }))
+}
+
+/// The 403 body for a browser `Origin` outside the control allowlist, or `None`
+/// when the request has no `Origin` or an allowed one. `noun` names the
+/// endpoint in the message ("control", "identity", "health").
+fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
+    let origin = origin?;
+    if is_allowed_control_origin(origin) {
+        return None;
+    }
+    Some(json!({
+        "error": "origin_forbidden",
+        "message": format!("Origin is not allowed for local Ottto {noun}"),
     }))
 }
 
@@ -1626,7 +1607,7 @@ fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ControlToken;
     use ottto_protocol::{
@@ -1635,6 +1616,46 @@ mod tests {
     };
 
     const TOKEN: &str = "test-control-token";
+
+    // The relay candidates are fixed numbers inside the Linux ephemeral range,
+    // so a parallel test's ephemeral listener or outbound connection can hold
+    // one at any moment. A plan feeds each candidate bind its result in order.
+    type BindPlan = std::collections::VecDeque<(u16, io::Result<TcpListener>)>;
+
+    thread_local! {
+        static BIND_PLAN: std::cell::RefCell<Option<BindPlan>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn planned_bind(port: u16) -> Option<io::Result<TcpListener>> {
+        BIND_PLAN.with(|plan| {
+            let mut plan = plan.borrow_mut();
+            let (expected, result) = plan.as_mut()?.pop_front().expect("unexpected relay bind");
+            assert_eq!(port, expected, "relay binds follow the candidate order");
+            Some(result)
+        })
+    }
+
+    pub(crate) fn with_bind_plan<T>(
+        plan: impl IntoIterator<Item = (u16, io::Result<TcpListener>)>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<BindPlan>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BIND_PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+            }
+        }
+        let plan = plan.into_iter().collect();
+        let _reset = Reset(BIND_PLAN.with(|slot| slot.replace(Some(plan))));
+        let value = run();
+        BIND_PLAN.with(|plan| {
+            assert!(
+                plan.borrow().as_ref().unwrap().is_empty(),
+                "every planned relay bind must be attempted"
+            );
+        });
+        value
+    }
 
     pub(super) fn test_daemon() -> LocalDaemon {
         LocalDaemon::new(
@@ -1662,6 +1683,20 @@ mod tests {
         assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
         assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn forbidden_origin_body_keeps_each_message_verbatim() {
+        for (noun, message) in [
+            ("control", "Origin is not allowed for local Ottto control"),
+            ("identity", "Origin is not allowed for local Ottto identity"),
+            ("health", "Origin is not allowed for local Ottto health"),
+        ] {
+            assert_eq!(
+                forbidden_origin_body(Some("https://ottto.net.evil"), noun),
+                Some(json!({"error": "origin_forbidden", "message": message}))
+            );
+        }
     }
 
     #[test]
