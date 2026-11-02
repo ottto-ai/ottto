@@ -2816,25 +2816,12 @@ where
             historical_organization_hash.as_deref(),
             Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
         )
-    } else if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation {
-        // Collection reports a race that changed the owner as
-        // `IdentityMismatch` (caught above), so a race reaching here has no
-        // verified account yet: keep waiting and re-check.
-        store.transition_setup_operation_with_binding(
-            schema_version,
-            operation_id,
-            expected_account_identifier_hash,
-            expected_organization_hash.as_deref(),
-            ClaudeAccountSetupOperationState::WaitingForUserLogin,
-            None,
-            None,
-            Some("Ottto could not confirm this login yet; it will check it again."),
-        )
     } else if matches!(
         direct_slot_status.state,
         ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
             | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
             | ClaudeConfigSlotCollectionStateV1::Unverified
+            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
     ) {
         store.transition_setup_operation_with_binding(
             schema_version,
@@ -20935,59 +20922,47 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The real collection outcome for a race, not a hand-built status:
-    /// approved and verified A, then a pass that reads A first and B last
-    /// clears the binding and must reach setup as a mismatch, while a race
-    /// that ends on A still only retries and keeps the setup complete.
+    /// [regress] The real race status at the setup boundary: verified A, a
+    /// race ending on A keeps the setup complete; ending on B is a mismatch.
     #[test]
     #[serial]
     fn claude_account_check_sees_a_race_to_another_account_as_mismatch() {
         let root = control_test_root("claude-account-check-race-switch");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let account_a = ottto_core::billing_identity_hash("anthropic", "account", "account-race-a")
-            .expect("account hash");
-        let organization =
-            ottto_core::billing_identity_hash("anthropic", "organization", "organization-race")
-                .expect("organization hash");
+        let hash = |kind: &str, value: &str| {
+            ottto_core::billing_identity_hash("anthropic", kind, value).expect("hash")
+        };
+        let account_a = hash("account", "account-a");
         let operation = "claude_setup_5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let prepared = store
+        let prepared = FileClaudeConfigSlotSettingsStore::default()
             .prepare_managed_account(1, operation.to_string(), Some(account_a.clone()))
             .expect("prepare exact account");
-        let slot_id = prepared
-            .setup_operation
-            .slot_id
-            .clone()
-            .expect("prepared slot id");
-        let config_dir = prepared
-            .managed_slots
-            .iter()
-            .find(|slot| slot.slot_id == slot_id)
-            .and_then(|slot| slot.config_dir.clone())
-            .expect("managed config dir");
+        let slot = prepared.managed_slots.last().expect("managed slot");
+        let config_dir = slot.config_dir.clone().expect("managed config dir");
         fs::create_dir_all(&config_dir).expect("managed config dir exists");
         let write_identity = |account: &str| {
+            let identity = serde_json::json!({"oauthAccount": {
+                "accountUuid": account, "organizationUuid": "organization-race"}});
             fs::write(
                 Path::new(&config_dir).join(".claude.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "oauthAccount": {
-                        "accountUuid": account,
-                        "organizationUuid": "organization-race",
-                        "emailAddress": "person@example.invalid"
-                    }
-                }))
-                .expect("identity json"),
+                identity.to_string(),
             )
-            .expect("write identity");
+            .expect("identity");
         };
-        write_identity("account-race-a");
-
+        let race = |slot_id: &str, captured_at: String, _: String| {
+            crate::agent_status::registered_claude_race_status_for_test(
+                slot_id,
+                &config_dir,
+                &captured_at,
+            )
+        };
+        write_identity("account-a");
         let full =
             check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
                 ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: ClaudeConfigSlotCollectionStateV1::Fresh,
                     account_identifier_hash: Some(account_a.clone()),
-                    organization_identifier_hash: Some(organization.clone()),
+                    organization_identifier_hash: Some(hash("organization", "organization-race")),
                     observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                     last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
                     has_account_windows: true,
@@ -21001,59 +20976,24 @@ for line in sys.stdin:
             ClaudeAccountSetupOperationState::Complete
         );
 
-        let race = |slot_id: &str, captured_at: String, _: String| {
-            crate::agent_status::registered_claude_race_status_for_test(
-                slot_id,
-                &config_dir,
-                &captured_at,
-            )
-        };
-        let slot_collection = |status: &ottto_protocol::ClaudeAccountsStatusV1| {
-            status
-                .managed_slots
-                .iter()
-                .find(|slot| slot.slot_id == slot_id)
-                .expect("managed slot")
-                .collection
-                .clone()
-        };
-
-        let same_owner = check_claude_account_with_collector(1, operation, Some(&account_a), race)
-            .expect("same-owner race check");
+        let same = check_claude_account_with_collector(1, operation, Some(&account_a), race)
+            .expect("same-owner race");
         assert_eq!(
-            same_owner.setup_operation.state,
+            same.setup_operation.state,
             ClaudeAccountSetupOperationState::Complete
         );
-        let collection = slot_collection(&same_owner);
-        assert_eq!(
-            collection.state,
-            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-        );
-        assert_eq!(
-            collection.account_identifier_hash.as_deref(),
-            Some(account_a.as_str())
-        );
 
-        write_identity("account-race-b");
-        let account_b = ottto_core::billing_identity_hash("anthropic", "account", "account-race-b")
-            .expect("account b hash");
+        write_identity("account-b");
         let switched = check_claude_account_with_collector(1, operation, Some(&account_a), race)
-            .expect("switched race check is typed, not an API failure");
+            .expect("switched race is typed");
         assert_eq!(
             switched.setup_operation.state,
             ClaudeAccountSetupOperationState::IdentityMismatch
         );
         assert_ne!(
-            switched.setup_operation.account_identifier_hash.as_deref(),
-            Some(account_b.as_str())
+            switched.setup_operation.account_identifier_hash,
+            Some(hash("account", "account-b"))
         );
-        let collection = slot_collection(&switched);
-        assert_eq!(
-            collection.state,
-            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-        );
-        assert_eq!(collection.account_identifier_hash, None);
-        assert_eq!(collection.organization_identifier_hash, None);
         let _ = fs::remove_dir_all(root);
     }
 

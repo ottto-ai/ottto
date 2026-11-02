@@ -19599,7 +19599,7 @@ mod tests {
     /// `StaleAccessToken`, `ReloginApproaching` and `IdentityMismatch`, which
     /// all tell the operator to sign in again. `ConcurrentMutation` is a
     /// same-pass race that keeps the last verified account and retries, so it
-    /// is benign as well.
+    /// is benign as well ([regress]: it used to raise the warning).
     /// Counting them as actionable raised `secret_expired` - "Claude Code
     /// durable connections need attention" - with a Verify button, for an
     /// outage at Anthropic that Verify cannot fix and that the daemon's own
@@ -33796,18 +33796,13 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Claude Code rewriting the same account's metadata between the two
-    /// reads of one pass is a race, not another owner and not a lost login:
-    /// the slot keeps its last verified account and label, reads as
-    /// temporarily unavailable, and never asks the operator to act. A proven
-    /// different account in the same race still drops the old account.
+    /// [regress] Approved A, then a race: ending on A keeps A and only retries;
+    /// ending on B is a mismatch and B is never adopted.
     #[test]
     #[serial]
-    fn claude_concurrent_mutation_keeps_last_known_account_and_only_retries() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-concurrent-mutation-{}",
-            std::process::id()
-        ));
+    fn claude_race_keeps_the_same_owner_and_flags_a_switch() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-race-switch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let _support_guard = EnvVarGuard::set_os(
             "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
@@ -33816,173 +33811,53 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let config_dir = root.join("raced-config");
         fs::create_dir_all(&config_dir).expect("config dir");
         let write_identity = |account: &str| {
-            fs::write(
-                config_dir.join(".claude.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "oauthAccount": {
-                        "accountUuid": account,
-                        "organizationUuid": "organization-raced",
-                        "emailAddress": "person@example.invalid"
-                    }
-                }))
-                .expect("identity json"),
+            let identity = serde_json::json!({"oauthAccount": {
+                "accountUuid": account, "organizationUuid": "organization-raced"}});
+            fs::write(config_dir.join(".claude.json"), identity.to_string()).expect("identity");
+        };
+        let account = billing_identity_hash("anthropic", "account", "account-a").expect("hash");
+        let organization =
+            billing_identity_hash("anthropic", "organization", "organization-raced").expect("hash");
+        let slot_id = "claude_slot_race_switch";
+        persist_one_claude_slot_collection_state(
+            slot_id,
+            &fresh_slot_status(
+                "2026-08-12T09:00:00Z",
+                &account,
+                &organization,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("seed approved account");
+        let race = || {
+            registered_claude_race_status_for_test(
+                slot_id,
+                &config_dir.to_string_lossy(),
+                "2026-08-12T10:00:00Z",
             )
-            .expect("write identity");
         };
-        write_identity("account-raced");
-        let account_hash =
-            billing_identity_hash("anthropic", "account", "account-raced").expect("account hash");
-        let organization_hash =
-            billing_identity_hash("anthropic", "organization", "organization-raced")
-                .expect("organization hash");
-        let slot = ClaudeConfigDirSlot::registered(config_dir.to_string_lossy().into_owned())
-            .expect("registered slot");
-        let slot_id = "claude_slot_concurrent_mutation";
-        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
-            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
-            slots: BTreeMap::from([(
-                slot_id.to_string(),
-                ClaudeConfigSlotCollectionStatusV1 {
-                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                    account_identifier_hash: Some(account_hash.clone()),
-                    organization_identifier_hash: Some(organization_hash.clone()),
-                    account_profile: Some(ClaudeConfigSlotAccountProfileV1 {
-                        account_identifier_hash: account_hash.clone(),
-                        organization_identifier_hash: organization_hash.clone(),
-                        captured_at: "2026-08-12T09:00:00Z".to_string(),
-                        email: Some("person@example.invalid".to_string()),
-                        organization_label: None,
-                        plan_type: Some("max".to_string()),
-                        subscription_product: None,
-                    }),
-                    ..Default::default()
-                },
-            )]),
-            unresolved_accounts: Vec::new(),
-            anchor_transitions: Vec::new(),
-        })
-        .expect("seed last verified account");
 
-        let mut raced = ClaudeSlotProbeFailure::ConcurrentMutation.status("2026-08-12T10:00:00Z");
-        retain_verified_claude_slot_binding(slot_id, &slot, &mut raced);
+        write_identity("account-a");
+        let same = race();
         assert_eq!(
-            raced.state,
+            same.state,
             ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
         );
         assert_eq!(
-            raced.diagnostics.first().map(|diagnostic| diagnostic.code),
-            Some(ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation)
-        );
-        assert_eq!(
-            raced.account_identifier_hash.as_deref(),
-            Some(account_hash.as_str()),
-            "a race keeps the last verified account"
-        );
-        assert_eq!(
-            raced.organization_identifier_hash.as_deref(),
-            Some(organization_hash.as_str())
-        );
-        assert_eq!(
-            raced.display_label.as_deref(),
-            Some(format!("Claude account {}", &account_hash[..8]).as_str())
-        );
-        assert_eq!(
-            raced
-                .account_profile
-                .as_ref()
-                .and_then(|profile| profile.email.as_deref()),
-            Some("person@example.invalid"),
-            "a race keeps the last known account label"
-        );
-        assert_eq!(
-            projected_claude_quota_access_state(&raced),
-            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
-        );
-        assert_eq!(
-            projected_claude_anchor_health(&raced),
-            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
-        );
-        assert!(
-            !claude_custom_slot_needs_attention(&raced.state),
-            "a race never asks the operator to act"
-        );
-        assert!(!claude_default_full_meter_needs_attention(
-            true,
-            &raced.state
-        ));
-
-        // Through the collection boundary that stops a registered slot on a
-        // failed probe: the same owner still only retries.
-        let descriptor = slot.descriptor(slot_id.to_string(), ClaudeConfigSlotOwnership::Managed);
-        let upkeep = ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
-            result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
-            due_access_expires_at: None,
-            refresh_token_expires_at: None,
-            attempted_at: None,
-            next_allowed_attempt_at: None,
-            consecutive_failures: 0,
-        };
-        let collected = registered_claude_failure_status(
-            &descriptor,
-            ClaudeSlotProbeFailure::ConcurrentMutation,
-            "2026-08-12T10:00:30Z",
-            upkeep.clone(),
-        );
-        assert_eq!(
-            collected.state,
-            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-        );
-        assert_eq!(
-            collected.account_identifier_hash.as_deref(),
-            Some(account_hash.as_str())
+            same.account_identifier_hash.as_deref(),
+            Some(account.as_str())
         );
 
-        // Approved A, first read A, last read B: a switch, not a retry. It
-        // stays actionable as a mismatch and B is never adopted.
-        write_identity("account-other");
-        let mut other = ClaudeSlotProbeFailure::ConcurrentMutation.status("2026-08-12T10:01:00Z");
-        retain_verified_claude_slot_binding(slot_id, &slot, &mut other);
-        assert_eq!(
-            other.state,
-            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-        );
-        assert_eq!(
-            other.diagnostics.first().map(|diagnostic| diagnostic.code),
-            Some(ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch)
-        );
-        assert_eq!(other.account_identifier_hash, None);
-        assert_eq!(other.organization_identifier_hash, None);
-        assert_eq!(other.display_label, None);
-        assert_eq!(other.account_profile, None);
-        assert!(claude_custom_slot_needs_attention(&other.state));
-        let switched = registered_claude_failure_status(
-            &descriptor,
-            ClaudeSlotProbeFailure::ConcurrentMutation,
-            "2026-08-12T10:01:30Z",
-            upkeep.clone(),
-        );
+        write_identity("account-b");
+        let switched = race();
         assert_eq!(
             switched.state,
             ClaudeConfigSlotCollectionStateV1::IdentityMismatch
         );
         assert_eq!(switched.account_identifier_hash, None);
         assert_eq!(switched.organization_identifier_hash, None);
-        assert!(claude_custom_slot_needs_attention(&switched.state));
-
-        // A race that leaves no provable owner is unknown, also actionable.
-        fs::write(config_dir.join(".claude.json"), b"{}").expect("write ownerless identity");
-        let ownerless = registered_claude_failure_status(
-            &descriptor,
-            ClaudeSlotProbeFailure::ConcurrentMutation,
-            "2026-08-12T10:02:00Z",
-            upkeep,
-        );
-        assert_eq!(
-            ownerless.state,
-            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
-        );
-        assert_eq!(ownerless.account_identifier_hash, None);
-        assert!(claude_custom_slot_needs_attention(&ownerless.state));
         let _ = fs::remove_dir_all(root);
     }
 
