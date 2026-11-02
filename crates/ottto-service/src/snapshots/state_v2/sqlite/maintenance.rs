@@ -4,12 +4,10 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 const ERASURE_DEADLINE: Duration = Duration::from_secs(86400);
-const ERASURE_WORK_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
-    pub(in super::super) work: Duration,
     pub(super) space: fn(&Path) -> Option<u64>,
     /// Hard charged-work ceiling for one save.
     pub(super) save_ceiling: u64,
@@ -21,7 +19,6 @@ impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
             deadline: ERASURE_DEADLINE,
-            work: ERASURE_WORK_BUDGET,
             space: free_space,
             save_ceiling: SAVE_CEILING_BYTES,
             path_diff_budget: PATH_DIFF_BUDGET_BYTES,
@@ -260,18 +257,13 @@ fn free_space(path: &Path) -> Option<u64> {
 
 impl Sqlite {
     #[cfg(test)]
-    pub(in super::super) fn set_purge_policy(
-        &mut self,
-        deadline: Duration,
-        work: Duration,
-    ) -> Result<()> {
+    pub(in super::super) fn set_purge_policy(&mut self, deadline: Duration) -> Result<()> {
         ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
+            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600),
             "state_v2_purge_policy"
         );
         self.purge_policy = PurgePolicy {
             deadline,
-            work,
             ..self.purge_policy
         };
         Ok(())
@@ -300,7 +292,6 @@ impl Sqlite {
                     rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
                         "busy"
                     }
-                    rusqlite::ErrorCode::OperationInterrupted => "timeout",
                     rusqlite::ErrorCode::DiskFull => "disk_full",
                     _ => "engine",
                 })
@@ -339,12 +330,8 @@ impl Sqlite {
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
 
         // Interrupted VACUUM restarts from scratch and can block recovery on
-        // every pass. Keep the old allowance only as a slow-alarm threshold.
-        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
-        let budget = size_budget(logical.unwrap_or(0), 20)
-            .max(self.purge_policy.work)
-            .saturating_mul(1_u32 << failures.saturating_sub(1).min(5))
-            .min(Duration::from_secs(60));
+        // every pass. Use the size threshold only for a slow alarm.
+        let budget = size_budget(logical.unwrap_or(0), 20);
         let result = self.conn()?.execute_batch("VACUUM").map_err(Into::into);
         let elapsed = started.elapsed();
         super::super::telemetry::event("vacuum_slow_alarm", &(elapsed > budget));
@@ -513,8 +500,11 @@ impl Sqlite {
                 super::super::telemetry::event("erasure_deadline_breach", &1);
             }
             self.stats.erasure_overdue = true;
-            self.stats.erasure_resume_refusals =
-                self.stats.erasure_resume_refusals.saturating_add(1);
+            // Contention defers maintenance; other lock errors still refuse.
+            if reason == "lock_io" {
+                self.stats.erasure_resume_refusals =
+                    self.stats.erasure_resume_refusals.saturating_add(1);
+            }
             self.erasure_failed(reason);
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         }

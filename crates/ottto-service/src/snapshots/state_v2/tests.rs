@@ -520,11 +520,8 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     fs::rename(tmp.path(), &database).unwrap();
     let mut db = sqlite::Sqlite::open(&database, &tmp.identity()).unwrap();
     db.path_extractor(test_paths);
-    db.set_purge_policy(
-        std::time::Duration::from_secs(86400),
-        std::time::Duration::from_secs(5),
-    )
-    .unwrap();
+    db.set_purge_policy(std::time::Duration::from_secs(86400))
+        .unwrap();
     let markers: Vec<String> = (0..512)
         .map(|i| format!("synthetic-purge-marker-{i:06}-{}", "x".repeat(80 + i % 63)))
         .collect();
@@ -1737,6 +1734,7 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_breaches"], 1);
     assert_eq!(stats["erasure_vacuum_failed"]["external_lock"], 1);
+    assert_eq!(stats["erasure_resume_refusals"], 0);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
 }
 

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
+
 mod fence;
 mod import;
 mod runtime;
@@ -31,7 +33,7 @@ pub(super) use runtime::{
     guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
     save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
 };
-pub(super) use runtime::{BaselineRelease, Hold};
+pub(super) use runtime::{BaselineRelease, Hold, StorageCause};
 mod catalogue;
 mod codec;
 mod ignored;

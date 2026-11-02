@@ -85,7 +85,7 @@ fn quick_check_over_budget_still_opens() {
         (Hold::ForeignBinding, health::SHARD_CODE),
         (Hold::FenceLost, health::SHARD_CODE),
         (Hold::ReferenceDrift, health::SHARD_CODE),
-        (Hold::DbUnavailable, health::RETRY_CODE),
+        (Hold::DbUnavailable, health::SHARD_CODE),
         (Hold::MigrationFailed, health::RETRY_CODE),
         (Hold::ReloadRequired, health::RETRY_CODE),
         (Hold::SaveCeiling, health::RETRY_CODE),
@@ -114,15 +114,22 @@ fn quick_check_over_budget_still_opens() {
             assert_eq!(reason.action(), "retry_automatically");
         }
     }
-    let error = Hold::storage(
-        anyhow::anyhow!("state_v2_integrity_requires_explicit_repair").context("opaque context"),
-    );
-    assert_eq!(
-        error.to_string(),
-        "state_v2_integrity_requires_explicit_repair"
-    );
+    let error = Hold::storage(anyhow::anyhow!(INTEGRITY_REPAIR).context("opaque context"));
+    assert_eq!(error.to_string(), INTEGRITY_REPAIR);
     assert_eq!(
         health::state_v2_reason(&error).unwrap().code(),
+        health::SHARD_CODE
+    );
+    assert_eq!(
+        health::state_v2_reason(&Hold::storage(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            )
+            .into(),
+        ))
+        .unwrap()
+        .code(),
         health::SHARD_CODE
     );
     health::observe(crate::snapshots::SnapshotSource::ClaudeCode, &Err(error));

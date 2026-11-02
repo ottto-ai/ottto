@@ -65,6 +65,9 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
     }
     if let Ok(mut stats) = stats().lock() {
         if let Ok(value) = serde_json::to_value(value) {
+            if name == "hold" && stats.latest.get(name) == Some(&value) {
+                return;
+            }
             stats.latest.insert(name, value);
         }
         crate::local_resource_diagnostics::claude_state_v2(&*stats);

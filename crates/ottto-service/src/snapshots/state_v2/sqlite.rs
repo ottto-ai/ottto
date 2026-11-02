@@ -380,11 +380,10 @@ fn lock_owner(path: &Path) -> Result<File> {
     // busy for a moment; keep retrying for about BUSY before reporting it.
     let started = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        ensure!(
-            io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
-                && started.elapsed() < BUSY,
-            "state_v2_exclusive_owner_busy"
-        );
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock || started.elapsed() >= BUSY {
+            return Err(anyhow::Error::new(error).context("state_v2_exclusive_owner_busy"));
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     let owned = file.metadata()?;
@@ -1744,10 +1743,7 @@ fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
     super::telemetry::event("quick_check_ms", &elapsed.as_millis());
     super::telemetry::event("quick_check_slow_alarm", &(elapsed > budget));
     let checked = result?;
-    ensure!(
-        checked == "ok",
-        "state_v2_integrity_requires_explicit_repair"
-    );
+    ensure!(checked == "ok", INTEGRITY_REPAIR);
     Ok(())
 }
 

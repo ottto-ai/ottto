@@ -81,8 +81,9 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
 | `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure or live ACK-custody hold remains visible after hydration. This is current posture, not an occurrence counter. |
 | `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without a deadline; a slow scan never holds collection. |
-| `sqlite_busy_slow_alarm`, `vacuum_slow_alarm` | Required SQLite lock waits beyond 100 ms and VACUUM beyond its former work allowance alarm while work continues. |
-| `maintenance_lock_deferred_alarm`, `erasure_busy_deferred_alarm`, `wal_debt_alarm` | Maintenance lock contention or excess checkpoint debt defers maintenance with an alarm while collection continues. Erasure obligations remain pending until verified completion. |
+| `sqlite_busy_slow_alarm` | Historical alarm since process start: a required SQLite lock wait passed 100 ms. True stays in `latest` until restart; it does not distinguish an active stall from an old wait. |
+| `vacuum_slow_alarm` | Current completed VACUUM duration exceeded 2 seconds plus 20 ms per allocated MiB. The threshold does not escalate after failures, and work completes without a deadline. |
+| `maintenance_lock_deferred_alarm`, `erasure_busy_deferred_alarm`, `wal_debt_alarm` | Historical alarms since process start for maintenance lock contention or excess checkpoint debt. True stays in `latest` until restart, unlike current `hold` and `quick_check_slow_alarm`. Collection continues; erasure obligations remain pending until verified completion. |
 | `db_unavailable_cause` | Latest v2 storage-hold cause: `at` = outermost static `state_v2_*` code, `cause` = innermost static code, `io_<ErrorKind>` or `sqlite_<extended code>`. Never messages, paths, keys or values. |
 | `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
 | `ack_receipt_inventory` | Companion count/bytes/bounded inventory during maintenance; does not certify a recovery set or authorize GC. |
@@ -108,6 +109,13 @@ values, bindings, database IDs or hash commitments enter these measurements.
 
 SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
 
+This approved wording remains the policy target. The current implementation can
+resume collection before erasure when a maintenance lock or external reader
+prevents completion; debt and the overdue breach remain visible. This ordering
+exception requires explicit policy acknowledgement (and SOURCE approval where
+required); the quoted wording is not amended here. Previously, two failed
+recovery attempts could already allow collection to resume with overdue debt.
+
 The deadline defaults to 24 hours, may be shorter, and cannot exceed 72 hours or
 be disabled; a longer policy requires SOURCE approval. Ottto's own locks do not
 excuse delay: acquisition yields to maintenance by the forced pause, normally
@@ -127,21 +135,25 @@ Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,
 `erasure_overdue`, `erasure_breaches`, `maintenance_pauses`,
 `erasure_resume_refusals`, `erasure_late_completions`, and
 `erasure_vacuum.{runs,bytes,seconds}`. Fixed failure reasons appear in
-`erasure_vacuum_failed`, including busy, timeout, disk_full, space_or_io,
+`erasure_vacuum_failed`, including busy, disk_full, space_or_io,
 backup_io, own_lock, external_lock, lock_io, engine and truncate. The process events
 `erasure_deadline_breach` and `erasure_late_completion_alarm` alert overdue debt
 and late success respectively. Attempt/failure/deferred counts, `vacuum_latency_ms`,
 `vacuum_wal_peak_bytes`, and free-space available/required/admission gauges describe
 maintenance work. A pending age is null when no obligation exists or its clock
 is unavailable; `erasure_overdue` distinguishes conservative clock handling.
-Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
-by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+`erasure_resume_refusals` counts actual collection refusals, not deferred lock
+attempts. Debt clears only after VACUUM, successful TRUNCATE and measured empty
+WAL, followed by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
 
 Source health uses `index_retrying` and "local index busy, retrying" for
-retryable v2 storage, reload, migration and save-pressure holds. These do not
-increment repair-required counters or recommend support/repair. Unsupported
-formats still require an update. Explicit integrity repair, lost fences, foreign
-bindings and reference drift retain `index_shard_unavailable` repair advice.
+v2 storage holds with a known busy/locked or WouldBlock cause, plus explicit
+reload, migration and save-pressure holds. These do not increment repair-required
+counters or recommend support/repair. Unsupported
+formats still require an update. Other DbUnavailable causes, including missing
+or damaged control/row evidence and corrupt/not-a-database engine errors, retain
+`index_shard_unavailable` repair advice. Explicit integrity repair, lost fences,
+foreign bindings and reference drift retain that same repair classification.
 A successful compatible load clears retrying; a different current refusal
 replaces the old reason.
 
