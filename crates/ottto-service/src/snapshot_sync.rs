@@ -21317,7 +21317,7 @@ mod tests {
     #[serial(source_manifests)]
     fn unsettled_residue_and_an_incomplete_census_still_report_parse_error() {
         let _source_manifests = SourceManifestTestGuard::new();
-        let unsettled: [CountsMutation; 6] = [
+        let unsettled: [CountsMutation; 5] = [
             ("ownership_incomplete unsettled", |counts| {
                 counts.terminal_ownership_incomplete_file_count = 0
             }),
