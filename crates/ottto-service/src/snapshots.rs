@@ -3600,9 +3600,6 @@ pub struct ScanIndex {
     pub(crate) archive_pass: sampled_scan::ArchivePass,
     #[serde(skip)]
     withheld_memo: withheld_account::Memo,
-    /// Copy holds this page's decision ended, so a withheld body can owe them.
-    #[serde(skip)]
-    pub(crate) copy_holds_ended: BTreeSet<claude_money_birth_store::LocationKey>,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -4313,7 +4310,6 @@ impl Default for ScanIndex {
             archives: BTreeMap::new(),
             archive_deferred_alarm_count: 0,
             withheld_memo: Default::default(),
-            copy_holds_ended: Default::default(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
