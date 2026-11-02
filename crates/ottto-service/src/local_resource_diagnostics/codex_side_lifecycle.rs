@@ -45,8 +45,36 @@ lifetime_counters! {
     side_proof_release_drops: ProofReleaseDrop,
 }
 
-// Last measured side state, in `GAUGES` slot order.
-lifetime_gauges! {
+/// `Gauges` (one `u64` per field, in `GAUGES` slot order), `set_gauges` and
+/// `Gauges::current`; test-only `Gauges::maximum`.
+macro_rules! side_gauges {
+    ($($field:ident),+ $(,)?) => {
+        /// Last measured side state (`set_gauges` only), never a lifetime sum.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
+        pub(crate) struct Gauges { $(pub(crate) $field: u64),+ }
+        static GAUGES: [::std::sync::atomic::AtomicU64; [$(stringify!($field)),+].len()] =
+            [const { ::std::sync::atomic::AtomicU64::new(0) }; [$(stringify!($field)),+].len()];
+        pub(crate) fn set_gauges(gauges: Gauges) {
+            let Gauges { $($field),+ } = gauges;
+            for (slot, value) in GAUGES.iter().zip([$($field),+]) {
+                slot.store(value, ::std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        impl Gauges {
+            fn current() -> Self {
+                let [$($field),+] = ::std::array::from_fn(|i| {
+                    GAUGES[i].load(::std::sync::atomic::Ordering::Relaxed)
+                });
+                Self { $($field),+ }
+            }
+            #[cfg(test)]
+            fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
+        }
+    };
+}
+
+// In `GAUGES` slot order.
+side_gauges! {
     side_records,
     side_record_bytes,
     side_requests,

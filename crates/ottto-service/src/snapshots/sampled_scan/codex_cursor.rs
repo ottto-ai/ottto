@@ -5738,36 +5738,7 @@ pub(in crate::snapshots) fn requeue(
     flags: &BTreeMap<String, (bool, bool)>,
     candidate: &CandidateFile,
 ) {
-    let Some(traversal) = index.traversal.as_mut() else {
-        return;
-    };
-    if traversal
-        .pending_candidates
-        .iter()
-        .any(|pending| pending.path == candidate.path)
-    {
-        return;
-    }
-    push_requeued(&mut traversal.pending_candidates, flags, candidate);
-}
-
-/// Append `candidate`, which the caller found not pending, with the selection
-/// flags it had (unselected: a census member, no watcher hint).
-fn push_requeued(
-    pending: &mut VecDeque<ScanTraversalPath>,
-    flags: &BTreeMap<String, (bool, bool)>,
-    candidate: &CandidateFile,
-) {
-    let (census_member, watcher_hint) = flags
-        .get(&local_index_key(&candidate.path))
-        .copied()
-        .unwrap_or((true, false));
-    pending.push_back(ScanTraversalPath {
-        scan_root: candidate.scan_root.clone(),
-        path: candidate.path.clone(),
-        census_member,
-        watcher_hint,
-    });
+    requeue_members(index, flags, [candidate]);
 }
 
 /// The cursor attempt for this file ended in this page: remove the path that
@@ -5806,9 +5777,19 @@ pub(in crate::snapshots) fn requeue_members<'a>(
         absent.remove(pending.path.as_path());
     }
     for candidate in members {
-        if absent.remove(candidate.path.as_path()) {
-            push_requeued(&mut traversal.pending_candidates, flags, candidate);
+        if !absent.remove(candidate.path.as_path()) {
+            continue;
         }
+        let (census_member, watcher_hint) = flags
+            .get(&local_index_key(&candidate.path))
+            .copied()
+            .unwrap_or((true, false));
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: candidate.scan_root.clone(),
+            path: candidate.path.clone(),
+            census_member,
+            watcher_hint,
+        });
     }
 }
 

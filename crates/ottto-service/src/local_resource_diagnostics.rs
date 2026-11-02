@@ -98,35 +98,6 @@ macro_rules! sparse_lifetime_counters {
         }
     };
 }
-/// `lifetime_counters!`'s gauge sibling: `Gauges` (one `u64` per field, in
-/// `GAUGES` slot order), `set_gauges` and `Gauges::current`; test-only
-/// `Gauges::maximum`.
-macro_rules! lifetime_gauges {
-    ($($field:ident),+ $(,)?) => {
-        /// Last measured state (`set_gauges` only), never a lifetime sum.
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
-        pub(crate) struct Gauges { $(pub(crate) $field: u64),+ }
-        static GAUGES: [::std::sync::atomic::AtomicU64; [$(stringify!($field)),+].len()] =
-            [const { ::std::sync::atomic::AtomicU64::new(0) }; [$(stringify!($field)),+].len()];
-        pub(crate) fn set_gauges(gauges: Gauges) {
-            let Gauges { $($field),+ } = gauges;
-            for (slot, value) in GAUGES.iter().zip([$($field),+]) {
-                slot.store(value, ::std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        impl Gauges {
-            fn current() -> Self {
-                let [$($field),+] = ::std::array::from_fn(|i| {
-                    GAUGES[i].load(::std::sync::atomic::Ordering::Relaxed)
-                });
-                Self { $($field),+ }
-            }
-            #[cfg(test)]
-            fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
-        }
-    };
-}
-
 /// The Codex cursor's logged event counters, in log key order: the one name
 /// list behind `CodexCursorEvents` (fields and keys) and the cursor's RAM
 /// `Counters` and their projection. Expands to `$callback! { fields }`.
@@ -1788,11 +1759,7 @@ macro_rules! codex_cursor_events_struct {
         impl Serialize for CodexCursorEvents {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 let mut map = serializer.serialize_map(None)?;
-                for (key, count) in [$((stringify!($field), self.$field)),+] {
-                    if count != 0 {
-                        map.serialize_entry(key, &count)?;
-                    }
-                }
+                $(if self.$field != 0 { map.serialize_entry(stringify!($field), &self.$field)?; })+
                 map.end()
             }
         }
