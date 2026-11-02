@@ -444,6 +444,7 @@ impl Serialize for ScanIndex {
             upload_context_proof,
             upload_context_receipt::ProofState::is_empty
         );
+        field!(copy_prefix_last_accepted_nonce, Option::is_none);
         map.end()
     }
 }
@@ -540,6 +541,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_context_proof",
     "archives",
     "archive_deferred_alarm_count",
+    "copy_prefix_last_accepted_nonce",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2429,6 +2431,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "codex_counting_evicted_legacy" => {
                             index.codex_counting_evicted_legacy =
                                 self.history_scalar(value, Default::default())?
+                        }
+                        "copy_prefix_last_accepted_nonce" => {
+                            index.copy_prefix_last_accepted_nonce = self.typed(value)?
                         }
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never
