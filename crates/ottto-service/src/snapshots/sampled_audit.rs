@@ -944,7 +944,7 @@ mod tests {
             "growth stays discoverable, never dropped"
         );
         let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
-            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+            index.candidate_decision_in_window(candidate, at, Some(at), 7, &mut None)
         };
         let mut recent = candidate.clone();
         recent.modified_unix_seconds = now;
