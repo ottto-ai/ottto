@@ -1106,7 +1106,7 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
         assert_eq!(value(&mut tx, &header), b"evidence");
     }
 }
-/// [behaviour] over-threshold saves commit the complete delta and alarm.
+/// [behaviour] complete saves alarm only when crossing the threshold.
 #[test]
 fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
     let tmp = Scratch::new();
@@ -1159,7 +1159,27 @@ fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
         telemetry::take_thread_event_for_test("save_ceiling_cause"),
         Some(serde_json::json!("charged_work"))
     );
-    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(2));
+    // A second large save stays above; a small save re-arms the next crossing.
+    for (generation, above, alarm) in [(2, true, false), (3, false, false), (4, true, true)] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        if above {
+            put(&mut tx, &large, &bytes);
+        }
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        assert_eq!(db.refused_save_bytes() >= 4096, above);
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some(),
+            alarm
+        );
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_cause"),
+            alarm.then(|| serde_json::json!("charged_work"))
+        );
+    }
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(5));
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();

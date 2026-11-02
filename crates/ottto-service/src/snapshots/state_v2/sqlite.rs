@@ -314,6 +314,8 @@ pub(super) struct Sqlite {
     _owner_lock: File,
     clean: bool,
     save_failure: Option<Hold>,
+    // In-memory per connection: reopening re-arms the first over-threshold save.
+    save_over_ceiling: bool,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
@@ -522,6 +524,7 @@ impl Sqlite {
             _owner_lock: owner_lock,
             clean: false,
             save_failure: None,
+            save_over_ceiling: false,
         }
     }
     /// Journal OFF is confined to an unpublished O_EXCL .import database. A
@@ -1187,10 +1190,8 @@ impl Txn<'_> {
         }
         // Targets size the NEXT collection page; the complete dirty delta
         // commits even above the counts-only alarm threshold.
-        if self.dirty_bytes > self.store.purge_policy.save_ceiling {
+        if self.dirty_bytes >= self.store.purge_policy.save_ceiling {
             self.store.stats.refused_save_bytes = self.dirty_bytes;
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
-            telemetry::event("save_ceiling_cause", &"charged_work");
         }
         Ok(())
     }
@@ -1615,6 +1616,12 @@ impl Txn<'_> {
             self.store.stats.dirty_rows_per_save = self.dirty_rows;
             self.store.stats.encoded_bytes_per_save = self.dirty_bytes;
             if !self.store.import {
+                let over_ceiling = self.dirty_bytes >= self.store.purge_policy.save_ceiling;
+                if over_ceiling && !self.store.save_over_ceiling {
+                    telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
+                    telemetry::event("save_ceiling_cause", &"charged_work");
+                }
+                self.store.save_over_ceiling = over_ceiling;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
                 telemetry::event("save_estimated_pages", &self.estimated_pages);
             }
