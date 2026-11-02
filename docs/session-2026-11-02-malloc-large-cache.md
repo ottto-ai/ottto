@@ -18,3 +18,7 @@ text or paths. Presence confirms launch configuration, not allocator support.
 Validation: generated-plist and formula assertions updated; Rust formatting
 checked directly with rustfmt. Tests and Clippy run in CI; no local Cargo or
 service execution.
+
+Linux CI exposed an existing relay idle-clock test racing parallel ephemeral-port
+users while rebinding its retired listener (`AddrInUse`). It now runs in the
+existing serial group; its release, restart and idle-clock assertions are kept.
