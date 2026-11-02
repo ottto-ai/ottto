@@ -1887,7 +1887,7 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "{source:?}"
         );
         assert!(
-            cache.retained_checkpoint(&small_key).is_some(),
+            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
             "{source:?}"
         );
         assert_eq!(

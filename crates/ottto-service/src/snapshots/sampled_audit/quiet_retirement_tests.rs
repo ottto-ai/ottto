@@ -696,7 +696,17 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
                 .iter()
                 .filter(|row| row["stage"] == "sampled_audit_cap_delay")
                 .collect::<Vec<_>>();
-            assert_eq!(delays.len() as u64, delay);
+            assert_eq!(
+                delays.len() as u64,
+                delay,
+                "{source:?} full={full} stages={:?}",
+                rows.iter()
+                    .filter(|row| row["stage"] == "tail_db_loads"
+                        || row["stage"] == "tail_reconstruct"
+                        || row["stage"].as_str().is_some_and(|s| s.contains("growth")))
+                    .map(|row| (row["stage"].clone(), row["counts"].clone()))
+                    .collect::<Vec<_>>()
+            );
             if delay > 0 {
                 assert_eq!(delays[0]["counts"]["audit_cap_delay"], delay);
             }
@@ -1140,11 +1150,14 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         assert!(working
             .claude_account_deferred_holds
             .contains_key(&held_key));
-        assert!(cache
-            .retained_checkpoint(&held_key)
+        assert!(
+            crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+                source, &cache, &working, &held_key,
+            )
             .unwrap()
             .audit_debt()
-            .is_some());
+            .is_some()
+        );
         assert!(
             !working.files[&held_key].has_unverified_source(),
             "working retirement cannot fund a fresh held marker",

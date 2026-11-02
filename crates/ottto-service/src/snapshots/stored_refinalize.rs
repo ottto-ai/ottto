@@ -28,10 +28,17 @@ pub(super) fn reuse_label(reason: CandidateParseReason) -> Option<&'static str> 
 /// Whether this selection loads the committed Tail. A due `Audit` certifies
 /// against the committed head, as main's against its RAM copy: an unchanged
 /// file retires quietly, and only what the file proves changed reads Full.
-/// `NewFile`, the D138 held reasons and every legacy reason stay native.
+/// An `UnknownOutcome` re-read of a file with a head continues as well: main
+/// continued it from RAM. `NewFile`, the D138 held reasons and every legacy
+/// reason stay native.
 pub(super) fn reuses_stored(reason: Option<CandidateParseReason>) -> bool {
     match reason {
-        None | Some(CandidateParseReason::TranscriptChanged | CandidateParseReason::Audit) => true,
+        None
+        | Some(
+            CandidateParseReason::TranscriptChanged
+            | CandidateParseReason::Audit
+            | CandidateParseReason::UnknownOutcome,
+        ) => true,
         Some(reason) => reuse_label(reason).is_some(),
     }
 }

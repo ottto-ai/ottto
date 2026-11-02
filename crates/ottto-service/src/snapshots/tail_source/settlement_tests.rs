@@ -407,6 +407,7 @@ fn the_shipped_selections_reuse_stored_state() {
     for reason in [
         CandidateParseReason::TranscriptChanged,
         CandidateParseReason::Audit,
+        CandidateParseReason::UnknownOutcome,
         CandidateParseReason::SourceChanged,
         CandidateParseReason::Rearmed,
         CandidateParseReason::ForcedFamily,

@@ -172,15 +172,28 @@ fn assert_prefix_published(
     );
 }
 
-/// The ordinary next page: the grown file re-selects (SourceChanged), reads
-/// `Full(reason)` without a stored continuation, and matches the Full parse.
+/// The ordinary next page with no stored continuation: the growth is owed, not
+/// lost. The state database paces a growth Full (main's `growth_read_admitted`,
+/// one per `GROWTH_FULL_INTERVAL`), so the file waits with nothing unreadable,
+/// then reads `Full(reason)` and matches the Full parse.
 fn next_full(
     id: &str,
     base: &Baseline,
     index: ScanIndex,
     reason: usize,
 ) -> (ScanIndex, SourceScanResult) {
-    next_read(id, base, index, (1, 0, 0), Some(reason))
+    let at = sampled_scan::now_seconds();
+    let (index, paced, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, (0, 0, 0), "{id}: the paced page starts no read");
+    assert_eq!(seen.unreadable, 0, "{id}: causes={:?}", seen.causes);
+    assert!(
+        paced.snapshots.is_empty(),
+        "{id}: nothing new published yet"
+    );
+    sampled_scan::set_test_now(Some(at + sampled_audit::GROWTH_FULL_INTERVAL));
+    let next = next_read(id, base, index, (1, 0, 0), Some(reason));
+    sampled_scan::set_test_now(None);
+    next
 }
 
 /// The ordinary next page from a committed head: the grown file continues as
@@ -765,8 +778,10 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
         "SP-5 residual (Claude): the bytes read before the edit are published"
     );
     // FE2: even a grown Full that had no previous debt must retain a
-    // deadline. The quiet audit sees the interior rewrite and counts it.
+    // deadline. A Full audit sees the interior rewrite and counts it; only a
+    // file with no stored continuation reaches it (the SP-5 residual).
     assert!(index.files[&base.key].unverified_deadline().is_some());
+    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(&base.cache, &index);
     index
         .files
         .get_mut(&base.key)

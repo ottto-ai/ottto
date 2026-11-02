@@ -1667,7 +1667,8 @@ fn grown_virtual_audit_uses_the_scheduling_clock_before_and_at_due() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(modes, vec![DeliveryMode::Full], "due recovery reads once");
+    // The released cache keeps the committed head, so the owed growth continues.
+    assert_eq!(modes, vec![held_growth_mode()], "due recovery reads once");
     assert_eq!(result.scanned_file_count, 1);
 }
 
@@ -2556,8 +2557,10 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         );
         assert!(committed.claude_account_deferred_holds.contains_key(&key));
         assert!(!committed.files[&key].source_file_fingerprint.is_empty());
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(committed, &checkpoint);
-        *committed = ScanIndex::load(&checkpoint).unwrap();
+        *committed = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            committed,
+            &checkpoint,
+        );
     };
     let touch = || {
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -2626,6 +2629,10 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     // A restart: an empty process memo and RAM cache.
     withheld_account::support::restart(&committed.withheld_memo);
     let cache = Arc::new(sampled_scan::SharedCache::default());
+    crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
+        &cache,
+        &crate::snapshots::e2_pipeline_scan_fixture::route_of(&committed).unwrap(),
+    );
     let (parsed, result, reads) = page(committed.clone(), &cache);
     assert_eq!(reads.len(), 1, "at most one re-parse per held key");
     withhold(&mut committed, parsed, &result);

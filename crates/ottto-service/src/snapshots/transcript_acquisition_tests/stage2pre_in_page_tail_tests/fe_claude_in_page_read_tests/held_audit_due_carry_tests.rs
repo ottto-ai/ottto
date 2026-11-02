@@ -148,7 +148,15 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
         .set_modified(std::time::UNIX_EPOCH)
         .unwrap();
     now += CAP;
-    let (index, queued, fulls) = turn(index, now);
+    let ((index, queued, fulls), rows) =
+        crate::local_resource_diagnostics::capture(|| turn(index, now));
+    eprintln!(
+        "G3DIAG fe_n1 {:?}",
+        rows.iter()
+            .filter(|row| row["stage"] == "tail_db_loads" || row["stage"] == "tail_reconstruct")
+            .map(|row| row["counts"].clone())
+            .collect::<Vec<_>>()
+    );
     assert_eq!((queued, fulls), (1, 1), "retried once");
     assert_eq!(sampled_audit::held_audit_open_failed(now).0, 0);
     assert_eq!(markers(&index), CACHE_ENTRIES - 1);

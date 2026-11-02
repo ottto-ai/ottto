@@ -64,7 +64,7 @@ pub(crate) fn routed_for_test(
                 route.others.push(left);
             }
             let mut page = index.clone();
-            if page.save(mine).is_ok() {
+            if save_on_route(&mut page, mine).is_ok() {
                 return carry(ScanIndex::load(mine).unwrap());
             }
         }
@@ -116,7 +116,7 @@ pub(crate) fn head_facts_for_test(index: &ScanIndex) -> String {
 pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: &Path) {
     *cache.test_route.lock().unwrap() = Some(FixtureRoute {
         path: route.to_owned(),
-        caller_commits: true,
+        caller_commits: false,
         others: Vec::new(),
     });
 }
@@ -129,6 +129,21 @@ pub(crate) fn forget_continuations_for_test(cache: &sampled_scan::SharedCache, i
     if let Some(route) = route_of(index) {
         state_v2::retire_tail(&route, index.files.keys().cloned()).unwrap();
     }
+}
+
+/// Saves `index` on its route. A prior offered again after the route moved on
+/// (a fixture re-feeding one committed index, as a held page does) first takes
+/// the route's current baseline, as the daemon's reload would.
+fn save_on_route(index: &mut ScanIndex, route: &Path) -> Result<()> {
+    let mut first = index.clone();
+    if first.save(route).is_ok() {
+        *index = first;
+        return Ok(());
+    }
+    let current = ScanIndex::load(route)?;
+    index.retain_persistence_baseline_from(&current);
+    index.generation = current.generation;
+    index.save(route)
 }
 
 /// An in-memory prior keeps every runtime-only (`serde(skip)`) field across
@@ -317,7 +332,7 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
         index.save(path).unwrap();
         return ScanIndex::load(path).unwrap();
     };
-    index.save(&route).unwrap();
+    save_on_route(index, &route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
     carry_runtime(index, &mut loaded);
     loaded
@@ -354,7 +369,11 @@ impl E2ScanFixture {
 
     /// This owner continues from `path`'s committed heads.
     pub(crate) fn on_committed_route(&self, path: &Path) {
-        continue_route_for_test(&self.cache, path);
+        *self.cache.test_route.lock().unwrap() = Some(FixtureRoute {
+            path: path.to_owned(),
+            caller_commits: true,
+            others: Vec::new(),
+        });
     }
 
     pub(crate) fn routed(&self, index: ScanIndex, dir: &Path) -> ScanIndex {
