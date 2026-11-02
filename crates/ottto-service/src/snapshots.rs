@@ -27807,6 +27807,19 @@ impl OwnedSourceScan {
         }
         let mut claude_twin_only_family_reparses = BTreeSet::new();
         // `e2`: the page's path-twin groups, built at most once per page and
+        // These two callers prepare only Claude family members; Codex title
+        // reads remain scoped to the fallible batch above.
+        let prepare_candidate_context = |candidate: &mut CandidateFile| {
+            prepare_owned_scan_candidate(
+                SnapshotSource::ClaudeCode,
+                candidate,
+                &codex_title_metadata,
+                &claude_title_metadata,
+                claude_effort_support_dir,
+                &mut Default::default(),
+            )
+            .expect("Claude sidecar preparation is infallible");
+        };
         // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode {
@@ -33024,6 +33037,7 @@ impl OwnedSourceScan {
                     // remains "covered" for this whole generation, the state-only fallback
                     // is delayed one cycle, and a complete terminal manifest can briefly
                     // omit a thread the local state database still proves exists.
+                    let before_state_only = snapshots.len();
                     let state_only = append_codex_state_only_snapshots(
                         &mut snapshots,
                         &codex_title_metadata,
@@ -33037,6 +33051,8 @@ impl OwnedSourceScan {
                             semantic_noop_count += noops;
                         }
                         Err(_) => {
+                            scanned_session_count +=
+                                snapshots.len().saturating_sub(before_state_only);
                             state_census_complete = false;
                             sidecar_census_complete = false;
                             census.record_unreadable(UnreadableCause::Reduction, 1);
@@ -36323,6 +36339,7 @@ fn append_codex_state_only_snapshots(
         )
         .collect::<BTreeSet<_>>();
     let mut title_reads = codex_thread_rows::TitleReads::default();
+    let mut read_error = None;
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
             || unknown_protected_owner
@@ -36336,8 +36353,18 @@ fn append_codex_state_only_snapshots(
         {
             continue;
         }
-        let snapshot =
-            codex_state_only_snapshot(source_session_id, thread, collected_at, &mut title_reads)?;
+        let snapshot = match codex_state_only_snapshot(
+            source_session_id,
+            thread,
+            collected_at,
+            &mut title_reads,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                read_error.get_or_insert(error);
+                continue;
+            }
+        };
         scanned_session_count += 1;
         // The final fingerprint can still change during enrichment, privacy
         // policy application, or account-cutoff filtering. Always carry the
@@ -36350,7 +36377,7 @@ fn append_codex_state_only_snapshots(
         snapshots.len().saturating_sub(snapshots_before),
         0, // Semantic no-op suppression remains in finalize_scan_after_policy.
     );
-    Ok((scanned_session_count, 0))
+    read_error.map_or(Ok((scanned_session_count, 0)), Err)
 }
 
 fn codex_state_only_snapshot(
@@ -44252,7 +44279,7 @@ fn load_codex_sqlite_titles(
             "Codex title census",
             |row| {
                 let raw_id: String = row.get(0)?;
-                let title = row.get_ref(1)?.as_str()?;
+                let title = codex_thread_rows::text(row, 1)?.unwrap_or_default();
                 let id = record_codex_identity_key(&mut raw_ids_by_key, &mut conflicts, &raw_id);
                 if conflicts.contains(&id) || identity_conflicts.contains(&id) {
                     loaded.remove(&id);
@@ -44334,7 +44361,7 @@ fn load_codex_sqlite_state_threads(
                 title_lookup: Some(codex_thread_rows::TitleLookup {
                     database: Arc::clone(&database),
                     raw_id: raw_id.clone(),
-                    digest: codex_thread_rows::digest(row.get_ref(1)?.as_str_or_null()?),
+                    digest: codex_thread_rows::digest(codex_thread_rows::text(row, 1)?),
                 }),
                 tokens_used: non_negative_i64_to_u64(row.get::<_, i64>(2)?),
                 archived: row.get::<_, i64>(3)? != 0,

@@ -4142,12 +4142,12 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     let (on_a, on_b) = (with_conflict(a), with_conflict(b));
     let none = evidenced();
     assert_ne!(
-        sidecar_fingerprint(&on_a, &path),
-        sidecar_fingerprint(&on_b, &path)
+        sidecar_fingerprint(&on_a, &path).unwrap(),
+        sidecar_fingerprint(&on_b, &path).unwrap()
     );
     assert_ne!(
-        sidecar_fingerprint(&none, &path),
-        sidecar_fingerprint(&on_a, &path)
+        sidecar_fingerprint(&none, &path).unwrap(),
+        sidecar_fingerprint(&on_a, &path).unwrap()
     );
     let temp = Temp::new("memo-conflict-digest", b"{\"n\":1}\n");
     let file = File::open(&temp.0).unwrap();
@@ -4207,8 +4207,8 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     };
     assert_ne!(orphan_digest(&created), orphan_digest(&no_created));
     assert_ne!(
-        sidecar_fingerprint(&created, &orphan),
-        sidecar_fingerprint(&no_created, &orphan)
+        sidecar_fingerprint(&created, &orphan).unwrap(),
+        sidecar_fingerprint(&no_created, &orphan).unwrap()
     );
     assert_eq!(digest(&on_a), digest(&with_conflict(a)));
 }

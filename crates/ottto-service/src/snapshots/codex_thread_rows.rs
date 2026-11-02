@@ -14,6 +14,16 @@ impl std::fmt::Debug for TitleLookup {
     }
 }
 
+pub(super) fn text<'a>(
+    row: &'a rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<&'a str>> {
+    let value = row.get_ref(column)?;
+    value.as_str_or_null().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, value.data_type(), Box::new(error))
+    })
+}
+
 pub(super) fn digest(title: Option<&str>) -> Option<[u8; 32]> {
     title.map(|title| Sha256::digest(title.as_bytes()).into())
 }
@@ -41,17 +51,24 @@ impl TitleLookup {
         }
         let connection = reads.connection(&self.database)?;
         connection.read(|connection| {
+            use crate::codex_scan_diagnostics::LoaderStage;
             // The provider's id index is used verbatim, including UUID aliases.
-            let mut statement =
-                connection.prepare_cached("SELECT title FROM threads WHERE id = ?1")?;
-            let mut rows = statement.query([&self.raw_id])?;
-            while let Some(row) = rows.next()? {
-                let title: Option<String> = row.get(0)?;
-                if digest(title.as_deref()) == self.digest {
-                    return Ok(title);
+            let mut statement = connection
+                .prepare_cached("SELECT title FROM threads WHERE id = ?1")
+                .context(LoaderStage::Prepare)?;
+            let mut rows = statement
+                .query([&self.raw_id])
+                .context(LoaderStage::Query)?;
+            (|| -> Result<Option<String>> {
+                while let Some(row) = rows.next()? {
+                    let title: Option<String> = row.get(0)?;
+                    if digest(title.as_deref()) == self.digest {
+                        return Ok(title);
+                    }
                 }
-            }
-            anyhow::bail!("Codex title changed after census")
+                Err(anyhow::Error::new(IncompleteShape).context("Codex title changed after census"))
+            })()
+            .context(LoaderStage::Row)
         })
     }
 }
@@ -103,14 +120,6 @@ impl CodexStateThread {
             && self.same_title(other, reads)?)
     }
 }
-
-impl PartialEq for CodexStateThread {
-    fn eq(&self, other: &Self) -> bool {
-        self.same_row(other, &mut TitleReads::default())
-            .unwrap_or(false)
-    }
-}
-impl Eq for CodexStateThread {}
 
 pub(super) fn normalize_display_title_ref(value: &str, source: &str) -> Option<String> {
     let normalized = normalize_title_ref(value)?;

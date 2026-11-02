@@ -206,6 +206,62 @@ fn streamed_thread_rows_match_eager_consumers() {
         Some("Index override")
     );
 
+    let scan_page = |materialize: bool| {
+        let mut state = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &roots,
+            ScanIndex::default(),
+            COLLECTED,
+            BACKFILL_WINDOW_DAYS,
+            1,
+            false,
+            None,
+            &[],
+            false,
+        );
+        if materialize {
+            state.codex_title_metadata = eager_fields(&state.codex_title_metadata);
+        }
+        let selected = state
+            .identified_candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.path.clone(),
+                    candidate.source_file_fingerprint.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..20_000 {
+            match state.step(None) {
+                OwnedSourceScanStep::Pending(next) => state = next,
+                OwnedSourceScanStep::Complete { scan, .. } => return (selected, scan),
+            }
+        }
+        panic!("synthetic page did not finish");
+    };
+    let (selected, actual_page) = scan_page(false);
+    let (expected_selected, expected_page) = scan_page(true);
+    assert_eq!(selected, expected_selected);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        actual_page.scanned_file_count,
+        expected_page.scanned_file_count
+    );
+    assert_eq!(actual_page.census_complete, expected_page.census_complete);
+    assert_eq!(
+        actual_page.state_census_complete,
+        expected_page.state_census_complete
+    );
+    assert_eq!(
+        actual_page.sidecar_census_complete,
+        expected_page.sidecar_census_complete
+    );
+    assert_eq!(
+        serde_json::to_value(actual_page.snapshots).unwrap(),
+        serde_json::to_value(expected_page.snapshots).unwrap()
+    );
+
     let before = compact.path_sidecar_fingerprint(&path).unwrap();
     let reduction = compact.path_reduction_fingerprint(&path);
     Connection::open(roots[0].parent().unwrap().join("state_5.sqlite"))
@@ -268,9 +324,44 @@ fn thread_rows_publish_only_after_complete_reads() {
             .state_alias_keys,
         0
     );
-    let loaded = fixture.load(&[root]);
+    let loaded = fixture.load(std::slice::from_ref(&root));
     assert!(loaded.state_census_incomplete);
     assert!(loaded.sidecar_census_incomplete);
+    assert_eq!(
+        loaded.local_diagnostics.state_titles.reason,
+        codex_scan_diagnostics::LoaderReason::SqliteRowDecode
+    );
+    assert_eq!(
+        loaded.local_diagnostics.state_threads.reason,
+        codex_scan_diagnostics::LoaderReason::SqliteRowDecode
+    );
+    Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM threads WHERE id='bad'", [])
+        .unwrap();
+    let later = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    fixture.insert(&root, later, Some("Later known row"), 7);
+    let complete = fixture.load(std::slice::from_ref(&root));
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE threads SET title='Moved' WHERE id=?1", [ACTIVE])
+        .unwrap();
+    let mut output = Vec::new();
+    assert!(append_codex_state_only_snapshots(
+        &mut output,
+        &complete,
+        COLLECTED,
+        &mut ScanIndex::default(),
+        &BTreeSet::new()
+    )
+    .is_err());
+    assert_eq!(
+        output.len(),
+        1,
+        "a failed title does not delay later known money"
+    );
+    assert_eq!(output[0].source_session_id, later);
+    assert_eq!(output[0].unattributed_total_tokens, 7);
 }
 
 /// [behaviour] Raw title history is absent from retained census payloads.

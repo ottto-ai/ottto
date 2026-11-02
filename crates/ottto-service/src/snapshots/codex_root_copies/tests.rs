@@ -127,7 +127,10 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
             let row = &metadata.root_sidecars[root.parent().unwrap()].threads[id];
             let path = Path::new(row.rollout_path.as_deref().unwrap());
             let (bound, extent) = metadata.thread_extent_for_path(id, path);
-            assert_eq!(bound.unwrap(), row.as_ref());
+            assert!(bound
+                .unwrap()
+                .same_row(row, &mut Default::default())
+                .unwrap());
             assert!(extent.unwrap().next_byte_offset > 0);
             assert!(path.starts_with(root));
             if root == &fixture.roots[1] {
@@ -315,7 +318,9 @@ fn another_homes_collision_invalidates_unchanged_local_reduction_dependencies() 
     fixture.update(2, "UPDATE threads SET model='conflicting-model'");
     let after = fixture.metadata();
     assert!(after.identity_conflicts.contains(&fixture.ids[0]));
-    assert_eq!(&after.root_sidecars[root].threads[&fixture.ids[0]], local);
+    assert!(after.root_sidecars[root].threads[&fixture.ids[0]]
+        .same_row(local, &mut Default::default())
+        .unwrap());
     assert_ne!(
         after.path_reduction_fingerprint(path),
         fingerprint,
@@ -395,8 +400,8 @@ fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
     let selected = &metadata.state_threads[&fixture.ids[0]];
     let latest =
         &metadata.root_sidecars[fixture.roots[2].parent().unwrap()].threads[&fixture.ids[0]];
-    assert_eq!(
-        selected, latest,
+    assert!(
+        selected.same_row(latest, &mut Default::default()).unwrap(),
         "900 ms is later despite the first row's text sorting last"
     );
 }
