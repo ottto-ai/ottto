@@ -2960,6 +2960,68 @@ pub(in crate::snapshots) mod tests {
         index.archives.clear();
         assert_eq!(before, serde_json::to_value(index).unwrap());
     }
+    /// [money] Held replay == seeded: correction debt keeps the acquired body's
+    /// ownership and witnesses, reads no archive byte and emits no second copy,
+    /// so the seeded emission stays the money, in totals and placement.
+    #[test]
+    fn archive_held_replay_equals_seeded() {
+        use sampled_scan::transition_fixture::{money_oracle, scan_money};
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let (mut seeded, emitted, _) = run_archive(
+            &f,
+            ScanIndex::default(),
+            Arc::new(sampled_scan::SharedCache::default()),
+        );
+        let bodies: BTreeMap<_, _> = emitted
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect();
+        seeded.settle_archive_outcome(|fp| bodies.get(fp).map(String::as_str));
+        let seeded = saved(&seeded);
+        let mut replayed = saved(&seeded);
+        replayed.prepare_historical_replay("replay".into());
+        let (held, scan, logs) = run_archive(
+            &f,
+            saved(&replayed),
+            Arc::new(sampled_scan::SharedCache::default()),
+        );
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(full_decodes(&logs), 0);
+        let key = local_index_key(&f.0);
+        assert_eq!(
+            held.archives[&key].owed_cause(),
+            Some(CodexZstCause::CorrectionUnapplied)
+        );
+        assert_eq!(held.archives[&key].owner, seeded.archives[&key].owner);
+        assert!(seeded.file_snapshot_fingerprints.contains_key(&key));
+        assert_eq!(
+            held.file_snapshot_fingerprints.get(&key),
+            seeded.file_snapshot_fingerprints.get(&key)
+        );
+        assert_eq!(
+            held.files[&key].last_snapshot_fingerprint,
+            seeded.files[&key].last_snapshot_fingerprint
+        );
+        assert_eq!(
+            held.files[&key].last_upload_body_witness,
+            seeded.files[&key].last_upload_body_witness
+        );
+        money_oracle::assert_equivalent(
+            &scan_money(SnapshotSource::Codex, &seeded, &emitted),
+            &scan_money(SnapshotSource::Codex, &held, &emitted),
+        );
+    }
+
     /// [money] Correction debt alarms once per context transition, and the
     /// accepted head never grants a new archive Full on policy/replay churn.
     #[test]
