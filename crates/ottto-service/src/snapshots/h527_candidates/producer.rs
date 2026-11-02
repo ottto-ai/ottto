@@ -26,8 +26,9 @@
 //!    its own copy names, recursively) counts the request. Otherwise its source
 //!    is absent and the copy is conservative peer evidence.
 //! 4. Fix the counting allocation (B2) for the whole batch before any body or
-//!    money exists: an id seen in any peer is excluded from every target; an
-//!    id shared only by targets is kept by the first-ACKed target, else the
+//!    money exists: an id a peer's own lines count with positive usage (or an
+//!    evidenced synthetic zero on both sides) is excluded from every target;
+//!    an id shared only by targets is kept by the first-ACKed target, else the
 //!    smaller session key hash. B2 is counting only. It is not ownership.
 //! 5. Re-parse each target with the same parser, dropping only the lines of
 //!    its excluded request ids, and reconcile kept ids, per-request usage, item
@@ -386,14 +387,16 @@ fn resolve_vanished(
                     }) {
                         continue;
                     }
-                    scan.hits[index]
+                    let hit = scan.hits[index]
                         .entry(request_id.clone())
                         .or_insert_with(|| PeerHit {
                             path_sha256: witness.clone(),
                             owner_session_sha256: None,
                             line_count: 0,
                             inherited_from_absent_source: false,
+                            usage: PeerUsage::Unobserved,
                         });
+                    hit.usage = hit.usage.max(PeerUsage::Unobserved);
                 }
             }
         }
@@ -1011,6 +1014,42 @@ struct PeerHit {
     /// The only evidence is a fork-copied line whose named source session
     /// does not count the request anywhere in the census.
     inherited_from_absent_source: bool,
+    /// Strongest usage the peer's own lines show for the request.
+    usage: PeerUsage,
+}
+
+/// A peer's own usage for one request id, weakest first: the strongest
+/// observation across its lines wins. Census and fork-copy evidence carry no
+/// own usage line and keep their existing exclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PeerUsage {
+    SyntheticZero,
+    Zero,
+    Unobserved,
+    Positive,
+}
+
+impl PeerUsage {
+    fn of_line(usage: &UsageTotals, model: Option<&str>) -> Self {
+        if !usage.is_zero() {
+            Self::Positive
+        } else if synthetic_zero(usage, model) {
+            Self::SyntheticZero
+        } else {
+            Self::Zero
+        }
+    }
+
+    /// The request is already counted in the peer only when the peer's own
+    /// usage for it is positive. Zero usage places no peer row, so the target
+    /// keeps the request, except an evidenced synthetic zero on both sides.
+    fn excludes(self, target_synthetic_zero: bool) -> bool {
+        match self {
+            Self::Positive | Self::Unobserved => true,
+            Self::SyntheticZero => target_synthetic_zero,
+            Self::Zero => false,
+        }
+    }
 }
 
 /// A fork-copied line, in a peer or a target file, carrying a request some
@@ -2350,7 +2389,7 @@ fn resolve_fork_copies(
         }
         scan.inherited_absent_source_line_count += 1;
         for &target in holders.get(copy.request_id.as_str()).into_iter().flatten() {
-            scan.hits[target]
+            let hit = scan.hits[target]
                 .entry(copy.request_id.clone())
                 .or_insert_with(|| PeerHit {
                     path_sha256: copy.path_sha256.clone(),
@@ -2360,8 +2399,10 @@ fn resolve_fork_copies(
                         .map(|session| sha256_hex(session.as_bytes())),
                     line_count: 0,
                     inherited_from_absent_source: true,
-                })
-                .line_count += 1;
+                    usage: PeerUsage::Unobserved,
+                });
+            hit.line_count += 1;
+            hit.usage = hit.usage.max(PeerUsage::Unobserved);
         }
     }
 }
@@ -2514,7 +2555,8 @@ fn scan_peer_file(
             }
         }
         let provenance = claude_fork_line_provenance(&value);
-        let counted_usage = claude_code_delta_usage(&value).is_some();
+        let line_usage = claude_code_delta_usage(&value);
+        let counted_usage = line_usage.is_some();
         let Some(request_id) = line_request_id(&value) else {
             if counted_usage && provenance == ClaudeForkLineProvenance::None {
                 scan.unidentified_usage_line_count += 1;
@@ -2588,8 +2630,17 @@ fn scan_peer_file(
             }
             continue;
         }
+        let usage = line_usage.as_ref().map_or(PeerUsage::Unobserved, |usage| {
+            PeerUsage::of_line(
+                usage,
+                string_at(&value, &["message", "model"])
+                    .or_else(|| string_at(&value, &["model"]))
+                    .or_else(|| string_at(&value, &["payload", "model"]))
+                    .as_deref(),
+            )
+        });
         for &target in target_indexes {
-            scan.hits[target]
+            let hit = scan.hits[target]
                 .entry(request_id.clone())
                 .or_insert_with(|| PeerHit {
                     path_sha256: path_witness.clone(),
@@ -2598,8 +2649,10 @@ fn scan_peer_file(
                         .map(|owner| sha256_hex(owner.as_bytes())),
                     line_count: 0,
                     inherited_from_absent_source: false,
-                })
-                .line_count += 1;
+                    usage,
+                });
+            hit.line_count += 1;
+            hit.usage = hit.usage.max(usage);
         }
     }
     let after = reader
@@ -2727,10 +2780,23 @@ fn allocate(
     let mut kept_shared = vec![BTreeMap::new(); target_count];
     let mut entries = Vec::new();
     for (request_id, holding) in &holders {
-        let peer_witness = holding
-            .iter()
-            .copied()
-            .find(|target| peers.hits[*target].contains_key(*request_id));
+        // Evidenced synthetic zero in every holder: the only zero that a
+        // peer's own synthetic zero may still exclude.
+        let targets_synthetic_zero = holding.iter().all(|target| {
+            originals[*target]
+                .original
+                .as_ref()
+                .ok()
+                .and_then(|original| original.item.claude_usage_occurrences.get(*request_id))
+                .is_some_and(|occurrence| {
+                    synthetic_zero(&occurrence.usage, occurrence.model.as_deref())
+                })
+        });
+        let peer_witness = holding.iter().copied().find(|target| {
+            peers.hits[*target]
+                .get(*request_id)
+                .is_some_and(|hit| hit.usage.excludes(targets_synthetic_zero))
+        });
         if peer_witness.is_none() && holding.len() < 2 {
             continue;
         }

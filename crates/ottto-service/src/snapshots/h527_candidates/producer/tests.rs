@@ -1680,3 +1680,119 @@ fn zero_usage_without_synthetic_evidence_is_not_a_placeholder() {
         fs::remove_dir_all(fixture.root).unwrap();
     }
 }
+
+const ZERO_PEER_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000zeropeer";
+
+fn shared_peer_path(fixture: &Fixture, project: &str, session: &str) -> PathBuf {
+    fixture.input.peer_roots[0]
+        .path
+        .join(project)
+        .join(format!("{session}.jsonl"))
+}
+
+/// [regress] A peer row for the same id with plain zero usage places no row,
+/// so the request is counted nowhere else: the target keeps it and its usage
+/// stays in the kept totals. [money] A positive peer row for the same id, in
+/// any scanned peer, still excludes it.
+#[test]
+fn peer_exclusion_requires_positive_peer_usage() {
+    for (case, positive_peer) in [
+        ("plain zero peer", false),
+        ("zero and positive peers", true),
+    ] {
+        let fixture = fixture();
+        let zero_peer = |session: &str| {
+            vec![
+                assistant_line(session, 0, ("req-shared-peer", 0, 0, 0)),
+                assistant_line(session, 1, ("req-peer-own", 5, 1, 0)),
+            ]
+        };
+        if positive_peer {
+            // The fixture's positive peer stays; another peer adds a zero row.
+            write_lines(
+                &shared_peer_path(&fixture, "proj-c", ZERO_PEER_SESSION),
+                &zero_peer(ZERO_PEER_SESSION),
+            );
+        } else {
+            write_lines(
+                &shared_peer_path(&fixture, "proj-b", PEER_SESSION),
+                &zero_peer(PEER_SESSION),
+            );
+        }
+        let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+        let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+        let report = target_report(&artifact, 1);
+        assert_eq!(
+            report["candidate_status"], "computed_unqualified",
+            "{case}: {report}"
+        );
+        let kept = &report["partition"]["kept"];
+        let item = body_item(report);
+        if positive_peer {
+            let [witness] = excluded(report).as_slice() else {
+                panic!("{case}: one exclusion")
+            };
+            assert_eq!(witness["request_sha256"], sha256_hex(b"req-shared-peer"));
+            assert_eq!(witness["cause"], "peer_overlap");
+            assert_eq!(kept["request_count"], 1, "{case}");
+            assert_eq!(kept["totals"]["input_tokens"], 10, "{case}");
+            assert_eq!(item["input_tokens"], 10, "{case}");
+        } else {
+            assert!(excluded(report).is_empty(), "{case}: {report}");
+            assert_eq!(report["partition"]["excluded"]["request_count"], 0);
+            assert_eq!(kept["request_count"], 2, "{case}");
+            assert_eq!(kept["totals"]["input_tokens"], 1010, "{case}");
+            assert_eq!(kept["totals"]["cache_read_tokens"], 5100, "{case}");
+            assert_eq!(item["input_tokens"], 1010, "{case}");
+            assert_eq!(item["request_count"], 2, "{case}");
+        }
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// [money] An evidenced synthetic zero on both sides still excludes. A peer's
+/// synthetic zero against a target's positive usage does not.
+#[test]
+fn synthetic_zero_peer_excludes_only_a_synthetic_zero_target() {
+    for (case, target_synthetic) in [("both synthetic", true), ("target positive", false)] {
+        let fixture = fixture();
+        let session = &fixture.input.targets[0].source_session_id;
+        if target_synthetic {
+            let mut lines = transcript_lines(session, &[("req-t01-a", 10, 2, 100)]);
+            lines.push(zero_response(
+                session,
+                1,
+                Some("req-shared-peer"),
+                SYNTHETIC,
+            ));
+            write_lines(&fixture.input.targets[0].transcript_path, &lines);
+        }
+        write_lines(
+            &shared_peer_path(&fixture, "proj-b", PEER_SESSION),
+            &[
+                zero_response(PEER_SESSION, 0, Some("req-shared-peer"), SYNTHETIC),
+                assistant_line(PEER_SESSION, 1, ("req-peer-own", 5, 1, 0)),
+            ],
+        );
+        let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+        let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+        let report = target_report(&artifact, 1);
+        assert_eq!(
+            report["candidate_status"], "computed_unqualified",
+            "{case}: {report}"
+        );
+        let kept = &report["partition"]["kept"];
+        if target_synthetic {
+            let [witness] = excluded(report).as_slice() else {
+                panic!("{case}: one exclusion")
+            };
+            assert_eq!(witness["cause"], "peer_overlap");
+            assert_eq!(kept["request_count"], 1, "{case}");
+        } else {
+            assert!(excluded(report).is_empty(), "{case}: {report}");
+            assert_eq!(kept["request_count"], 2, "{case}");
+            assert_eq!(kept["totals"]["input_tokens"], 1010, "{case}");
+        }
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
