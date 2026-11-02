@@ -168,7 +168,8 @@ pub(crate) use claude_history_upgrade::{
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use ownership_diagnostics as ownership;
-mod admission_reoffer_window;
+#[cfg(test)]
+mod admission_reoffer_window_tests;
 mod claude_family_census_shadow;
 #[cfg(test)]
 mod claude_family_census_shadow_tests;
@@ -8860,7 +8861,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get_mut(&pending.index_key)
             .and_then(|a| a.work.as_mut())
         {
-            w.body_witness = final_upload_body_witness.clone();
+            w.record_body_witness(final_upload_body_witness.clone());
         }
         let stamped = index.stamp_effective_upload_body_witness_revision(
             &pending.index_key,
@@ -52228,7 +52229,7 @@ impl ScanIndex {
         source: SnapshotSource,
         window_days: u64,
     ) -> bool {
-        if source != SnapshotSource::ClaudeCode || !admission_reoffer_window::enabled() {
+        if source != SnapshotSource::ClaudeCode {
             return self.snapshot_admission_reoffer_pending();
         }
         let Some(now) = unix_seconds(SystemTime::now()) else {

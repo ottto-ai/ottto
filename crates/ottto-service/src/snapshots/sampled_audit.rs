@@ -3060,9 +3060,16 @@ mod growth_tests {
         );
     }
     fn identified(fixture: &Fixture, index: &ScanIndex) -> CandidateFile {
+        identified_for_source(fixture, index, SnapshotSource::ClaudeCode)
+    }
+    fn identified_for_source(
+        fixture: &Fixture,
+        index: &ScanIndex,
+        source: SnapshotSource,
+    ) -> CandidateFile {
         let mut census = ScanCensus::default();
         let candidate = candidate_from_traversal_path(
-            SnapshotSource::ClaudeCode,
+            source,
             fixture.pending(),
             &mut census,
             None,
@@ -3072,7 +3079,7 @@ mod growth_tests {
         )
         .unwrap();
         open_and_identify_scan_candidate_at(
-            SnapshotSource::ClaudeCode,
+            source,
             candidate,
             &mut census,
             crate::snapshots::CandidateWindow {
@@ -3108,6 +3115,43 @@ mod growth_tests {
                 let _lock = CheckpointLock::acquire(path).unwrap();
                 authenticate_growth_generation(&index, path).unwrap();
             }
+        }
+    }
+
+    /// [regress] daemon v2 loads authenticate plain Full reads for every active source.
+    #[test]
+    fn daemon_v2_load_authenticates_plain_full_for_active_sources() {
+        use super::super::scan_index_persistence::Source;
+        use crate::transcript_acquisition::{FullReason, ReadMode, ReadPlan, Scope};
+        use state_v2::money_test_support::ColdSession;
+
+        for source in [Source::Claude, Source::Codex] {
+            let fixture = Fixture::new();
+            let (session, _) = ColdSession::publish(source, &ScanIndex::default(), &fixture.root);
+            let mut index = ScanIndex::load_for_snapshot_source(
+                session.path(),
+                source.snapshot(),
+                &fixture.root,
+            )
+            .unwrap();
+            assert!(growth_active(&index));
+            let candidate = identified_for_source(&fixture, &index, source.snapshot());
+            let mut file = open_candidate_beneath_root(&candidate).unwrap();
+            let plan = ReadPlan::prepare(
+                &mut file,
+                None,
+                &Scope("daemon-growth-load".into()),
+                None,
+                100,
+            )
+            .unwrap();
+            assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+            assert!(growth_read_admitted_at(
+                &mut index,
+                &candidate,
+                plan.mode(),
+                100,
+            ));
         }
     }
 

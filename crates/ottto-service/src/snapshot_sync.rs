@@ -23,7 +23,7 @@ use crate::snapshot_client::{
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, ShedSnapshotIndexes, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
-    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
+    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
 #[cfg(test)]
 use crate::snapshots::apply_upload_policy;
@@ -1351,11 +1351,12 @@ fn identity_cache_wire_reserve(
     )
 }
 
-/// Answer each owed head-CAS challenge on the outgoing body of its session,
-/// at most once per quarantine retry window after a validated conflict
-/// refuses an answer. Only a body that sends the stale base under the head-CAS contract
-/// carries the answer; the body itself, its fingerprint and its witness are
-/// unchanged.
+/// Answer each owed head-CAS challenge on the outgoing body of its session.
+/// After a validated conflict refuses this exact challenge's answer, only a
+/// re-send of a held conflicted body waits, until that body's own conflict
+/// probe (within one hour); a new revision answers at once. Only a body that
+/// sends the stale base under the head-CAS contract carries the answer; the
+/// body itself, its fingerprint and its witness are unchanged.
 fn attach_head_conflict_answers(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
@@ -1375,11 +1376,11 @@ fn attach_head_conflict_answers(
         else {
             continue;
         };
-        if record.answer_attempts > 0
-            && now
-                < record
-                    .last_answer_unix
-                    .saturating_add(crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS)
+        if record.last_answer_unix != 0
+            && progress
+                .quarantined_fingerprints
+                .contains_key(&snapshot.snapshot_fingerprint)
+            && now < conflict_probe_after(&snapshot.snapshot_fingerprint, record.last_answer_unix)
         {
             continue;
         }
@@ -1510,8 +1511,9 @@ struct HeadConflictChallenge {
     /// so an unrecovered session keeps today's retryable conflict hold.
     #[serde(default)]
     answer_attempts: u32,
-    /// When the last refused answer was observed. The next answer waits one
-    /// quarantine retry window after it.
+    /// When an answer to THIS challenge and revision was last refused; 0 when
+    /// none was. A re-send of the same held body waits its conflict probe
+    /// after it; a new challenge or revision resets it.
     #[serde(default)]
     last_answer_unix: u64,
 }
@@ -2460,15 +2462,18 @@ impl SnapshotUploadProgress {
     }
 
     /// Keep the newest challenge for this session. A refused answer counts one
-    /// attempt and restarts the answer window; an unanswered conflict keeps
-    /// the existing count. Returns the attempt count for diagnostics.
+    /// attempt. The server binds a challenge to its current head and the exact
+    /// stale revision, so a changed pair is new work: it inherits no hold and
+    /// its answer is owed on the next page. Only the identical pair refusing
+    /// an answer again starts the answer hold. Returns the cumulative attempt
+    /// count for diagnostics and whether the answer is owed now.
     fn record_head_conflict_challenge(
         &mut self,
         session_id: &str,
         challenge: &str,
         rescan: &crate::snapshot_client::SnapshotConflictRescan,
         now: u64,
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         if !is_snapshot_fingerprint(challenge) || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
         {
             return None;
@@ -2483,18 +2488,19 @@ impl SnapshotUploadProgress {
             head_conflict::note("capacity_hold");
             return None;
         }
-        let (answer_attempts, last_answer_unix) = if rescan.answered {
-            (
-                previous
-                    .map_or(0, |record| record.answer_attempts)
-                    .saturating_add(1),
-                now,
-            )
-        } else {
-            previous.map_or((0, 0), |record| {
-                (record.answer_attempts, record.last_answer_unix)
-            })
+        let identical = previous.filter(|record| {
+            record.challenge == challenge
+                && record.stale_revision_v2_hash == rescan.revision_v2_hash
+        });
+        let answer_attempts = previous
+            .map_or(0, |record| record.answer_attempts)
+            .saturating_add(u32::from(rescan.answered));
+        let last_answer_unix = match identical {
+            None => 0,
+            Some(_) if rescan.answered => now,
+            Some(record) => record.last_answer_unix,
         };
+        let owed_now = identical.is_none();
         self.head_conflict_challenges.insert(
             key,
             HeadConflictChallenge {
@@ -2504,7 +2510,7 @@ impl SnapshotUploadProgress {
                 last_answer_unix,
             },
         );
-        Some(answer_attempts)
+        Some((answer_attempts, owed_now))
     }
 
     fn record_cache_state<T: Serialize>(
@@ -3282,12 +3288,29 @@ fn current_unix_seconds() -> u64 {
 }
 
 pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
-    let digest = Sha256::digest(fingerprint.as_bytes());
-    let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
-        % SNAPSHOT_QUARANTINE_RETRY_SECONDS;
-    current_unix_seconds()
-        .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS)
-        .saturating_add(jitter)
+    jittered_retry_after(
+        fingerprint,
+        current_unix_seconds(),
+        SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    )
+}
+
+/// Base of a head-CAS conflict's probe. Jitter adds less than the base, so
+/// every conflict probe and refused-answer hold ends within one hour.
+const SNAPSHOT_CONFLICT_PROBE_SECONDS: u64 = 30 * 60;
+
+/// A conflict's mandatory probe: `[30 min, 1 h)` after `from`, per body.
+/// Backend state can change without a local change, so a conflict is never
+/// left waiting for new input alone.
+fn conflict_probe_after(fingerprint: &str, from: u64) -> u64 {
+    jittered_retry_after(fingerprint, from, SNAPSHOT_CONFLICT_PROBE_SECONDS)
+}
+
+/// `[from + base, from + 2 * base)`, staggered deterministically by `key`.
+fn jittered_retry_after(key: &str, from: u64, base: u64) -> u64 {
+    let digest = Sha256::digest(key.as_bytes());
+    let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix")) % base;
+    from.saturating_add(base).saturating_add(jitter)
 }
 
 /// Last computed scan-index manifest per (upload destination, source).
@@ -3715,19 +3738,6 @@ fn with_source_cadence<T>(
         .entry(source.api_slug())
         .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
     Some(apply(cadence))
-}
-
-fn record_finished_snapshot_cadence(
-    cadence: &mut SourceCadence,
-    now: Instant,
-    accepted: u64,
-    retryable_deferral: bool,
-) {
-    if retryable_deferral {
-        cadence.record_scan_failure(now);
-    } else {
-        cadence.record_scan_success(now, accepted);
-    }
 }
 
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
@@ -8971,18 +8981,13 @@ fn finish_sync_source(
         eprintln!("local state maintenance deferred for {}", source.api_slug());
     }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
-    // quiet cycle lets it fall to idle and then cold. A conflict pass has still
-    // durably committed its accepted siblings, but remains a source failure so
-    // it returns to the retry cadence instead of advertising a clean terminal
-    // scan. The sweep marker is stamped only for fully settled scans.
+    // quiet cycle lets it fall to idle and then cold. A conflict pass durably
+    // committed its accepted siblings and each held entity waits on its own
+    // quarantine clock, so it is not a source failure; the failure ladder is
+    // for upload errors. The sweep marker is stamped only for settled scans,
+    // and the status below still reports the held entities.
     with_source_cadence(source, |cadence| {
-        let now = Instant::now();
-        record_finished_snapshot_cadence(
-            cadence,
-            now,
-            accepted,
-            deferred_entity_count.is_some() && !resolved_permanent_rejections,
-        );
+        cadence.record_scan_success(Instant::now(), accepted)
     });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -10971,6 +10976,8 @@ where
             settled_sessions.insert(key);
         }
         let now = current_unix_seconds();
+        // Conflicted bodies whose new challenge answer is owed on the next page.
+        let mut answer_owed_now = BTreeSet::new();
         for entity in &response.conflict_entities {
             let key = cache_session_key(&entity.source_session_id);
             if settled_sessions.contains(&key) {
@@ -10982,12 +10989,15 @@ where
             ) else {
                 continue;
             };
-            if let Some(attempts) = progress.record_head_conflict_challenge(
+            if let Some((attempts, owed_now)) = progress.record_head_conflict_challenge(
                 &entity.source_session_id,
                 challenge,
                 rescan,
                 now,
             ) {
+                if owed_now {
+                    answer_owed_now.insert(entity.snapshot_fingerprint.as_str());
+                }
                 head_conflicts_recorded.push((
                     SessionHash::of(&entity.source_session_id),
                     attempts,
@@ -11095,10 +11105,24 @@ where
                     );
                 }
             } else if conflicted.contains(item_fingerprint) {
+                // An owed new answer rides the next selecting page; any other
+                // conflict gets its mandatory probe within one hour.
+                // Terminal-contract re-arm: main's 6-12 h cadence, unchanged (separate timer).
+                let contract_rearm = progress
+                    .quarantined_fingerprints
+                    .get(item_fingerprint)
+                    .is_some_and(|record| record.contract_retry_claims.is_some());
+                let retry_after = if contract_rearm {
+                    quarantine_retry_after(item_fingerprint)
+                } else if answer_owed_now.contains(item_fingerprint) {
+                    now
+                } else {
+                    conflict_probe_after(item_fingerprint, now)
+                };
                 progress.quarantine_retryable_body(
                     item_fingerprint,
                     &body_witness(item),
-                    quarantine_retry_after(item_fingerprint),
+                    retry_after,
                 );
             }
         }
@@ -11844,13 +11868,11 @@ fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
     census_residue_status_admitted: bool,
-    census_status_admitted: bool,
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let disclosed_loss = status.counts.disclosed_loss();
-    let census_status_active = census_status_admitted
-        && matches!(&status.state, CollectorState::Success)
-        && !status.counts.census_complete;
+    let census_status_active =
+        matches!(&status.state, CollectorState::Success) && !status.counts.census_complete;
     let (
         enabled,
         disabled_reason,
@@ -12029,8 +12051,7 @@ fn collector_status_request(
         last_census_residue_blocked_session_count: status
             .counts
             .census_residue_blocked_session_count,
-        last_census_pending_file_count: census_status_admitted
-            .then_some(status.counts.skipped_file_count_due_to_limit),
+        last_census_pending_file_count: Some(status.counts.skipped_file_count_due_to_limit),
         last_census_block_cause: block_cause,
         consecutive_failures,
         next_retry_at,
@@ -12067,13 +12088,13 @@ fn report_status(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
-    let request = collector_status_request(destination_namespace, status, false, false)?;
+    let request = collector_status_request(destination_namespace, status, false)?;
     client.report_status(relay_token, &request)?;
     Ok(())
 }
 
-/// The terminal activity hint owns evidence width and admission of census
-/// status codes; all contracts are read from the same fresh server answer.
+/// The terminal activity hint owns evidence width and admission of the census
+/// residue code; both are read from the same fresh server answer.
 #[derive(Debug, Clone, Copy)]
 struct TerminalReceiptPolicy {
     receipt_window_days: u64,
@@ -12083,7 +12104,6 @@ struct TerminalReceiptPolicy {
     /// its entire terminal receipt rejected by a backend that predates the
     /// admission — whatever order the two are deployed in.
     census_residue_status_admitted: bool,
-    census_status_admitted: bool,
 }
 
 fn current_terminal_receipt_policy(
@@ -12095,8 +12115,6 @@ fn current_terminal_receipt_policy(
         receipt_window_days: validated_receipt_window_days(activity_hint.backfill_window_days)?,
         census_residue_status_admitted: activity_hint.census_residue_status_contract.as_deref()
             == Some(CENSUS_RESIDUE_STATUS_CONTRACT),
-        census_status_admitted: activity_hint.census_status_contract.as_deref()
-            == Some(CENSUS_STATUS_CONTRACT),
     })
 }
 
@@ -12234,12 +12252,11 @@ fn report_status_with_fresh_relay_token(
     // This is the single terminal report boundary. Every terminal outcome
     // reacquires its width here, after scanning/uploading and immediately
     // before deriving both the manifest and status scalar from that same hint
-    // — and reads census status admissions off that hint, so receipt shape
-    // and evidence width are decided by one server answer.
+    // — and reads the census residue admission off that hint, so receipt
+    // shape and evidence width are decided by one server answer.
     let TerminalReceiptPolicy {
         receipt_window_days,
         census_residue_status_admitted,
-        census_status_admitted,
     } = current_terminal_receipt_policy(client, &relay_token)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     status.counts.backfill_window_days = receipt_window_days;
@@ -12263,7 +12280,6 @@ fn report_status_with_fresh_relay_token(
         &destination_namespace,
         status,
         census_residue_status_admitted,
-        census_status_admitted,
     )?;
     let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
     // Commit the exact typed receipt before it can reach the backend. A later
@@ -20101,6 +20117,7 @@ mod tests {
         // The derived parse_error: a scan that "succeeded" while losing
         // recognized usage is a changed loss census, never a liveness beat.
         let mut counts = SyncCounts::for_policy(30);
+        counts.census_complete = true;
         counts.discovered_file_count = 1;
         counts.dropped_usage_record_count = 1_105;
         counts.recognized_usage_drop_count = 1_105;
@@ -20119,6 +20136,7 @@ mod tests {
         // healthy sibling cannot hide the dropped record.
         for healthy_sibling in [false, true] {
             let mut counts = SyncCounts::for_policy(30);
+            counts.census_complete = true;
             counts.discovered_file_count = 1;
             if healthy_sibling {
                 counts.scanned_session_count = 1;
@@ -20203,7 +20221,6 @@ mod tests {
                 },
             },
             false,
-            false,
         )
         .expect("terminal error receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -20234,132 +20251,6 @@ mod tests {
 
     /// [off=main] Absent/null/unknown admission preserves the complete legacy
     /// payload for all three sources, including failures=1 and no retry deadline.
-    #[test]
-    #[serial(source_manifests)]
-    fn census_status_without_exact_token_preserves_legacy_bytes() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let legacy = r#"{
-  "schema_version": 5,
-  "source": "codex",
-  "machine_id": "otm_test",
-  "report_kind": "scan_status",
-  "enabled": true,
-  "disabled_reason": null,
-  "last_scan_started_at": "2026-06-01T10:00:00Z",
-  "last_scan_finished_at": "2026-06-01T10:00:01Z",
-  "last_success_at": null,
-  "last_error_code": "parse_error",
-  "last_error_message": "local usage evidence produced no session snapshot",
-  "last_uploaded_count": 0,
-  "last_scanned_session_count": 0,
-  "last_scanned_file_count": 0,
-  "last_zero_snapshot_confirmed_count": 0,
-  "last_zero_snapshot_usage_evidence_count": 0,
-  "last_dropped_usage_record_count": 0,
-  "last_ownership_incomplete_file_count": 0,
-  "last_snapshot_unproven_terminal_count": 0,
-  "last_snapshot_superseded_terminal_count": 0,
-  "last_backfill_window_days": 183,
-  "last_backfill_file_limit": 10000,
-  "last_discovered_file_count": 0,
-  "last_skipped_file_count_due_to_limit": 7,
-  "last_scan_cap_hit": true,
-  "last_semantic_noop_count": 0,
-  "last_census_complete": false,
-  "last_symlink_rejected_count": 0,
-  "last_unreadable_path_count": 2,
-  "last_oversized_file_count": 0,
-  "last_disappeared_file_count": 3,
-  "last_malformed_json_line_count": 0,
-  "last_invalid_utf8_line_count": 0,
-  "last_over_line_cap_count": 0,
-  "last_recognized_usage_drop_count": 0,
-  "last_terminal_ownership_incomplete_file_count": 0,
-  "last_terminal_zero_snapshot_usage_evidence_count": 0,
-  "last_terminal_recognized_usage_drop_count": 0,
-  "last_terminal_dropped_usage_record_count": 0,
-  "last_terminal_over_line_cap_count": 0,
-  "last_census_residue_settled": false,
-  "last_census_residue_index_key_count": 0,
-  "last_census_residue_archived_rollout_count": 0,
-  "last_census_residue_blocked_session_count": 0,
-  "consecutive_failures": 1,
-  "next_retry_at": null,
-  "collector_version": "fixed",
-  "parser_version": "fixed"
-}"#;
-        for source in [
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Pi,
-        ] {
-            for hint in [
-                "",
-                r#","census_status_contract":null"#,
-                r#","census_status_contract":"census_status:v2""#,
-                RESIDUE_ADMITTING_HINT,
-            ] {
-                let mut counts = SyncCounts::for_policy(183);
-                counts.skipped_file_count_due_to_limit = 7;
-                counts.scan_cap_hit = true;
-                counts.unreadable_path_count = 2;
-                counts.disappeared_file_count = 3;
-                counts.census_status = crate::snapshots::CensusStatus {
-                    pending_work: true,
-                    retryable_problem: true,
-                    transport_reservation_refused: true,
-                    carry_admission_veto: true,
-                    state_loader_failed: true,
-                    reconciliation_incomplete: true,
-                    retry_attempt: 4,
-                    retry_not_before_unix_seconds: Some(60),
-                    admission_due_unix_seconds: Some(30),
-                };
-                let mut typed = collector_status_request(
-                    "destination",
-                    CollectorStatus {
-                        source,
-                        machine_id: "otm_test",
-                        scan_started_at: "2026-06-01T10:00:00Z",
-                        counts,
-                        state: CollectorState::Success,
-                    },
-                    false,
-                    false,
-                )
-                .unwrap();
-                typed.last_scan_finished_at = Some("2026-06-01T10:00:01Z".to_string());
-                typed.collector_version = Some("fixed".to_string());
-                typed.parser_version = Some("fixed".to_string());
-                assert_eq!(
-                    serde_json::to_vec_pretty(&typed).unwrap(),
-                    legacy
-                        .replace("\"codex\"", &format!("\"{}\"", source.api_slug()))
-                        .as_bytes()
-                );
-                let mut receipt = captured_terminal_receipt_for_source_under_hint(
-                    source,
-                    counts,
-                    CollectorState::Success,
-                    TerminalManifestSource::Withdraw,
-                    183,
-                    hint,
-                );
-                // Normalize only clocks and build identity, not census evidence.
-                receipt["last_scan_finished_at"] = serde_json::json!("2026-06-01T10:00:01Z");
-                receipt["collector_version"] = serde_json::json!("fixed");
-                receipt["parser_version"] = serde_json::json!("fixed");
-                let mut expected: serde_json::Value = serde_json::from_str(legacy).unwrap();
-                expected["source"] = serde_json::json!(source.api_slug());
-                assert_eq!(
-                    serde_json::to_vec(&receipt).unwrap(),
-                    serde_json::to_vec(&expected).unwrap(),
-                    "{source:?} {hint}"
-                );
-            }
-        }
-    }
-
     /// [behaviour] The real hint boundary and shared builder emit all seven
     /// causes plus advancing work, with fixed priority and truthful retries.
     #[test]
@@ -20439,6 +20330,7 @@ mod tests {
                     CollectorState::Success,
                     TerminalManifestSource::Withdraw,
                     183,
+                    // A retired hint token the daemon no longer reads.
                     r#","census_status_contract":"census_status:v1""#,
                 );
                 assert_eq!(
@@ -20708,7 +20600,7 @@ mod tests {
     /// pending family into a clean terminal receipt.
     #[test]
     #[serial(source_manifests)]
-    fn retry_pending_only_claude_authority_reports_parse_error() {
+    fn retry_pending_only_claude_authority_reports_census_status() {
         let _source_manifests = SourceManifestTestGuard::new();
         let retry_pending = claude_usage_authority_census_counts(
             "retry-pending-only-claude-authority-receipt",
@@ -20732,8 +20624,13 @@ mod tests {
         assert_eq!(receipt["source"], "claude_code");
         assert_eq!(receipt["last_census_complete"], false);
         assert_eq!(receipt["last_scan_cap_hit"], true);
-        assert_eq!(receipt["last_error_code"], "parse_error");
-        assert_eq!(receipt["consecutive_failures"], 1);
+        let code = receipt["last_error_code"]
+            .as_str()
+            .expect("census status code");
+        assert!(
+            matches!(code, "census_blocked" | "census_incomplete"),
+            "{code}"
+        );
         assert!(receipt["last_success_at"].is_null());
     }
 
@@ -21321,7 +21218,7 @@ mod tests {
     #[serial(source_manifests)]
     fn unsettled_residue_and_an_incomplete_census_still_report_parse_error() {
         let _source_manifests = SourceManifestTestGuard::new();
-        let unsettled: [CountsMutation; 6] = [
+        let unsettled: [CountsMutation; 5] = [
             ("ownership_incomplete unsettled", |counts| {
                 counts.terminal_ownership_incomplete_file_count = 0
             }),
@@ -21339,7 +21236,6 @@ mod tests {
             ("terminal above public", |counts| {
                 counts.terminal_ownership_incomplete_file_count = 2
             }),
-            ("census incomplete", |counts| counts.census_complete = false),
         ];
         for (case, mutate) in unsettled {
             let mut counts = m1_named_residue_counts();
@@ -21356,6 +21252,22 @@ mod tests {
             assert!(receipt["last_success_at"].is_null(), "{case}");
             assert_eq!(receipt["last_census_residue_settled"], false, "{case}");
         }
+
+        // An incomplete census reports its census status instead, still
+        // without a success clock or a settled verdict.
+        let mut incomplete = m1_named_residue_counts();
+        incomplete.census_complete = false;
+        let receipt = captured_terminal_receipt_under_hint(
+            incomplete,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["last_error_code"], "census_blocked");
+        assert_eq!(receipt["last_census_block_cause"], "other");
+        assert!(receipt["last_success_at"].is_null());
+        assert_eq!(receipt["last_census_residue_settled"], false);
 
         // And a clean census is untouched by the admission: no code, no
         // message, no settled verdict.
@@ -21833,7 +21745,6 @@ mod tests {
                     message: "local snapshot scan failed",
                 },
             },
-            false,
             false,
         )
         .expect("terminal receipt");
