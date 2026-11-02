@@ -643,9 +643,11 @@ cleared after load through the ordinary save path.
 The `local_resources` stage `file_size` reports the process high-water
 `largest_file_bytes` per source, with `file_over_1gib` on that same record.
 `first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
-and existing footprint observations through native finish. `unread_extent`
-reports `max_unread_bytes` per traversal from disk length minus the last native
-checkpoint's size (zero if none); it conservatively includes uncommitted reads.
+and existing footprint observations through native finish. Existing
+`bounded_traversal_transition` records report `max_unread_bytes` on retirement
+or in `previous` when replacing a traversal, with no per-file log emissions.
+This traversal maximum uses disk length minus the last native checkpoint's size
+(zero if none); it conservatively includes uncommitted reads.
 It resets on restart/new traversal. No persisted fields or per-file clocks are
 added; unread age and its six-hour alert are deferred because existing metadata
 does not record when an extent first became owed. Observations contain no paths

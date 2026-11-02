@@ -46453,11 +46453,6 @@ fn refresh_retained_codex_roster(
                         .map_or(0, |entry| entry.size_bytes),
                 ),
             );
-            crate::local_resource_diagnostics::traversal_point(
-                "unread_extent",
-                source.api_slug(),
-                &serde_json::json!({"max_unread_bytes": traversal.counts.max_unread_bytes}),
-            );
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
 
@@ -47114,11 +47109,6 @@ fn advance_bounded_directory_traversal_with_budget(
                         .get(&local_index_key(&path))
                         .map_or(0, |entry| entry.size_bytes),
                 ),
-            );
-            crate::local_resource_diagnostics::traversal_point(
-                "unread_extent",
-                source.api_slug(),
-                &serde_json::json!({"max_unread_bytes": traversal.counts.max_unread_bytes}),
             );
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
