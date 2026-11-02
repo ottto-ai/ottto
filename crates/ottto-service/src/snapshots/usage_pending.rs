@@ -342,17 +342,17 @@ impl ColdUsage {
             self.set_head(&root, head);
         }
         // A patched head is the row the save rewrote; one it did not write
-        // stays patched for the next save.
+        // stays patched for the next save. Every patched root has a head:
+        // `drop_head` clears both.
         for root in std::mem::take(&mut self.unproven) {
             if self.loaded.contains_key(&root) {
                 continue;
             }
             match (committed(&root), self.heads.get_mut(&root)) {
                 (Some(digest), Some(head)) => head.digest = digest,
-                (None, Some(_)) => {
+                _ => {
                     self.unproven.insert(root);
                 }
-                (_, None) => {}
             }
         }
     }

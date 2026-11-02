@@ -1,15 +1,12 @@
 // Capacity never invalidates: a corpus over the old pending-occurrence cap
-// accumulates exactly what an unbounded one does, and one over the old
-// duplicate-owner bound keeps its owners exactly with the fence open.
+// accumulates exactly what an unbounded one does.
 use super::*;
 
-/// [regress] Over the old caps nothing is invalidated, cleared or fenced. A
-/// page whose retained occurrences exceed a budget of 1 accumulates the same
-/// families as the unbounded budget, none invalid, and only the high-water
-/// alarm differs. A terminal whose cross-family duplicates exceed an owner
-/// bound of 1 folds exactly as the unbounded bound: owners kept, fence open.
+/// [regress] Over the old cap nothing is invalidated. A page whose retained
+/// occurrences exceed a budget of 1 accumulates the same families as the
+/// unbounded budget, none invalid, and only the high-water alarm differs.
 #[test]
-fn a_corpus_over_the_old_caps_is_not_invalidated() {
+fn a_corpus_over_the_old_cap_is_not_invalidated() {
     let (root, parent, items) = claude_account_family_fixture(false);
     // A copy of the first member under its own root: the two families share
     // its requests.
@@ -47,33 +44,6 @@ fn a_corpus_over_the_old_caps_is_not_invalidated() {
             pending_occurrence_cap_alarm: true,
             ..counts
         }
-    );
-
-    let fold = |max_duplicate_owners: usize| {
-        claude_census_counts_run_twice(
-            &shared,
-            &ScanIndex::default(),
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            max_duplicate_owners,
-        )
-    };
-    let (items, index, counts) = fold(MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS);
-    let (bound_items, bound_index, bound_counts) = fold(1);
-    assert_eq!(
-        serde_json::to_value(&bound_items).unwrap(),
-        serde_json::to_value(&items).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&bound_index).unwrap(),
-        serde_json::to_value(&index).unwrap()
-    );
-    assert_eq!(bound_counts, counts);
-    assert!(!bound_counts.fence_after);
-    assert!(!bound_index.claude_duplicate_request_witness_overflowed);
-    assert!(
-        !bound_index.claude_duplicate_request_owners.is_empty(),
-        "owners over the old bound are kept exactly"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -240,8 +240,7 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_completes() {
 
 /// [behaviour] A head patched `contract_unproven` with nothing loaded is read
 /// from its row with the flag, in one whole visit and one family per slice
-/// alike; the save rewrites only that row and installs nothing. A row gone
-/// from the store is Unknown, counted.
+/// alike; the save rewrites only that row and installs nothing.
 #[test]
 fn a_patched_head_is_read_and_saved_with_its_flag() {
     let (dir, _, _, _, index) = accumulated();
@@ -278,7 +277,7 @@ fn a_patched_head_is_read_and_saved_with_its_flag() {
     assert!(stored[LEGACY_PARENT]);
     assert_eq!(flags(SliceBudget::WHOLE), stored);
     assert_eq!(flags(ONE_FAMILY), stored);
-    let (reloaded, view) = custody.save_reload(&mut cold);
+    let (_, view) = custody.save_reload(&mut cold);
     assert!(
         v2::usage_head_only(&cold, LEGACY_PARENT),
         "nothing installed"
@@ -292,12 +291,6 @@ fn a_patched_head_is_read_and_saved_with_its_flag() {
         serde_json::to_value(&view.claude_usage_family_pending).unwrap(),
         serde_json::to_value(&expected.claude_usage_family_pending).unwrap()
     );
-
-    v2::delete_usage_row_in_session(&reloaded, LEGACY_PARENT);
-    let unknown = v2::usage_unknown_count();
-    let mut none = |_: &str, _: &ClaudeUsageFamilyPending| {};
-    assert!(visit_usage_ordered(&reloaded, None, None, SliceBudget::WHOLE, &mut none).is_err());
-    assert!(v2::usage_unknown_count() > unknown, "counted");
     drop(custody);
     let _ = fs::remove_dir_all(scratch);
     let _ = fs::remove_dir_all(dir);

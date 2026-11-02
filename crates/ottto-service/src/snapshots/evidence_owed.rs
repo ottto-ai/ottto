@@ -10,6 +10,7 @@
 //! - otherwise one counted `Rearmed` parse, paced per page; with the
 //!   fingerprint kept the existing RAM/durable restore may serve it (b), else
 //!   it reads Full (d).
+use super::usage_pending::UsageView;
 use super::*;
 
 /// Only the terminal-retry re-arm owes evidence instead of clearing the
@@ -154,7 +155,7 @@ fn stamp_families<T>(
             .filter(|pending| pending.census_window_end == census_window_end)
         {
             pending.identity_contract = match before {
-                _ if pending.invalid || evidence_free(pending) => None,
+                _ if pending.invalid || UsageView::Full(pending).evidence_free() => None,
                 None => current,
                 Some(stamp) if stamp.is_some() && stamp == current => current,
                 Some(_) => None,
@@ -162,14 +163,6 @@ fn stamp_families<T>(
         }
     }
     result
-}
-
-fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
-    pending.member_occurrences.is_empty()
-        && pending
-            .member_request_id_hashes
-            .values()
-            .all(BTreeSet::is_empty)
 }
 
 /// The indexed members of `root`'s family, by one ordered range over the

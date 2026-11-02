@@ -311,19 +311,9 @@ fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<Us
     let mut cold = ColdUsage::default();
     let mut count = 0_usize;
     mapper::rows(tx, "usage.pending", |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            anyhow::bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+        let Some(key_bytes) = mapper::member(&h)? else {
             return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
+        };
         count += 1;
         let family: ClaudeUsageFamilyPending = mapper::read(tx, &h, Some(&mut *seed))?;
         let digest = *seed.get(&h.key).context("state_v2_row_digest")?;

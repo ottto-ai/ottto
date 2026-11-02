@@ -19,19 +19,43 @@ pub(super) fn rows(
     kind: &str,
     mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
 ) -> Result<()> {
-    let kind = RecordKind::parse(kind)?;
-    let mut after = None;
-    loop {
-        let page = tx.scan_kind(&kind, after.as_ref(), 128)?;
-        if page.is_empty() {
-            break;
-        }
-        after = page.last().map(|h| h.key.clone());
-        for h in page {
-            f(tx, h)?;
-        }
+    let mut rows = KeyRows::new(kind, None, 128)?;
+    while let Some(h) = rows.next(tx)? {
+        f(tx, h)?;
     }
     Ok(())
+}
+/// A record row's (key, position).
+fn record(h: &Header) -> Result<(&[u8], u64)> {
+    let RowKey::Record {
+        key_bytes,
+        position,
+        ..
+    } = &h.key
+    else {
+        anyhow::bail!("state_v2_record_key")
+    };
+    Ok((key_bytes, *position))
+}
+/// `h`, the first row of its key, must be the key's only row, at position 1;
+/// `more` says whether another row shares its key.
+fn only_row(h: &Header, more: impl FnOnce() -> Result<bool>) -> Result<()> {
+    ensure!(
+        matches!(h.key, RowKey::Record { position: 1, .. }) && !more()?,
+        "state_v2_member_position"
+    );
+    Ok(())
+}
+/// A per-family kind's row: `None` for its manifest (position 0, empty key),
+/// else the family key of the family's only row.
+pub(super) fn member(h: &Header) -> Result<Option<&[u8]>> {
+    let (key_bytes, position) = record(h)?;
+    if position == 0 {
+        ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+        return Ok(None);
+    }
+    only_row(h, || Ok(false))?;
+    Ok(Some(key_bytes))
 }
 // A key has few rows of a kind, usually one.
 const KEY_PAGE: usize = 8;
@@ -79,16 +103,13 @@ pub(super) fn read_row<T: DeserializeOwned + Serialize>(
     let Some(h) = page.first() else {
         return Ok(None);
     };
-    ensure!(
-        page.len() == 1 && matches!(h.key, RowKey::Record { position: 1, .. }),
-        "state_v2_member_position"
-    );
+    only_row(h, || Ok(page.len() > 1))?;
     read_digest(tx, h).map(Some)
 }
 /// One ascending header range read over a kind, paged, resumed past every
-/// row of `after`'s key and consumed in key order. `row` returns a key's
-/// only row (position 1), as `read_row` does, passing over rows of keys it
-/// is not asked for.
+/// row of `after`'s key and consumed in key order: every row (`next`), or a
+/// key's only row (`row`), as `read_row` reads it, passing over rows of keys
+/// it is not asked for.
 pub(super) struct KeyRows {
     kind: RecordKind,
     after: Option<RowKey>,
@@ -107,9 +128,8 @@ impl KeyRows {
             limit,
         })
     }
-    /// The next row's (key, position), reading the next page once this one
-    /// is spent.
-    fn peek(&mut self, tx: &mut dyn Transaction) -> Result<Option<(&[u8], u64)>> {
+    /// The next row, reading the next page once this one is spent.
+    fn peek(&mut self, tx: &mut dyn Transaction) -> Result<Option<&Header>> {
         if self.page.is_empty() {
             self.page = tx
                 .scan_kind(&self.kind, self.after.as_ref(), self.limit)?
@@ -118,31 +138,25 @@ impl KeyRows {
                 self.after = Some(h.key.clone());
             }
         }
-        match self.page.front().map(|h| &h.key) {
-            None => Ok(None),
-            Some(RowKey::Record {
-                key_bytes,
-                position,
-                ..
-            }) => Ok(Some((key_bytes, *position))),
-            Some(_) => anyhow::bail!("state_v2_record_key"),
-        }
+        Ok(self.page.front())
+    }
+    pub(super) fn next(&mut self, tx: &mut dyn Transaction) -> Result<Option<Header>> {
+        self.peek(tx)?;
+        Ok(self.page.pop_front())
     }
     /// `name`'s only row; `None`: it has none. Names must ascend.
     pub(super) fn row(&mut self, tx: &mut dyn Transaction, name: &str) -> Result<Option<Header>> {
         use std::cmp::Ordering;
-        while let Some((key, position)) = self.peek(tx)? {
-            match key.cmp(name.as_bytes()) {
+        while let Some(h) = self.peek(tx)? {
+            match record(h)?.0.cmp(name.as_bytes()) {
                 Ordering::Less => {}
                 Ordering::Greater => break,
                 Ordering::Equal => {
-                    ensure!(position == 1, "state_v2_member_position");
                     let h = self.page.pop_front().context("state_v2_record_key")?;
-                    ensure!(
-                        self.peek(tx)?
-                            .map_or(true, |(key, _)| key != name.as_bytes()),
-                        "state_v2_member_position"
-                    );
+                    only_row(&h, || match self.peek(tx)? {
+                        Some(next) => Ok(record(next)?.0 == name.as_bytes()),
+                        None => Ok(false),
+                    })?;
                     return Ok(Some(h));
                 }
             }
@@ -537,19 +551,9 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     let expected = read::<usize>(tx, &manifest, seed.as_deref_mut())?;
     let mut result = BTreeMap::new();
     visit(tx, kind, roots, |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            anyhow::bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+        let Some(key_bytes) = member(&h)? else {
             return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
+        };
         result.insert(family(key_bytes)?, read(tx, &h, seed.as_deref_mut())?);
         Ok(())
     })?;
