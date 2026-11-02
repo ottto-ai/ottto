@@ -2550,7 +2550,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         );
         assert!(committed.claude_account_deferred_holds.contains_key(&key));
         assert!(!committed.files[&key].source_file_fingerprint.is_empty());
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut committed, &checkpoint);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(committed, &checkpoint);
         *committed = ScanIndex::load(&checkpoint).unwrap();
     };
     let touch = || {
@@ -4096,7 +4096,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     }
     let checkpoint = root.0.join("equal-held.json");
     let reload = |index: &mut ScanIndex| {
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &checkpoint);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &checkpoint);
         let mut index = ScanIndex::load(&checkpoint).unwrap();
         index.withheld_memo = memo.clone();
         activate(&mut index, revision);

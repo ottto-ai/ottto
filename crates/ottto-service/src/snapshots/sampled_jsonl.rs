@@ -44,7 +44,6 @@ crate::durable_tail_codec::durable_struct!(borrowed CachedJsonlReduction {
 pub(super) mod durable;
 #[cfg(test)]
 pub(super) mod preparation_tests {
-    use super::*;
     thread_local! {
         pub(super) static HEAP_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }

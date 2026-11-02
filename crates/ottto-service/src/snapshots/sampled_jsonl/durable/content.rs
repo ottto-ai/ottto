@@ -1,6 +1,6 @@
 //! Growth-only replay of native content projection. The caller owns the active
 //! lease, certificate, pacing and input admission; scratch never publishes money.
-use super::bounded_value::{BoundedValue, LineMeter, LINE_VALUE_CREDIT};
+use super::bounded_value::{BoundedValue, LineMeter};
 use super::*;
 use serde::de::DeserializeSeed;
 use std::os::unix::fs::FileExt;

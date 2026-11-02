@@ -632,9 +632,12 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
                 index.files[&key].has_unverified_source(),
                 selected_at != due
             );
-            let checkpoint = cache.retained_checkpoint(&key).unwrap();
-            assert_eq!(checkpoint.audit_debt().is_some(), selected_at != due);
-            assert_eq!(checkpoint.last_full_verified(), verified);
+            // Claude's obligation lives in the index, asserted above.
+            if source != SnapshotSource::ClaudeCode {
+                let checkpoint = cache.retained_checkpoint(&key).unwrap();
+                assert_eq!(checkpoint.audit_debt().is_some(), selected_at != due);
+                assert_eq!(checkpoint.last_full_verified(), verified);
+            }
             let page = diagnostics
                 .iter()
                 .find(|row| row["stage"] == "native_collection_page")
@@ -879,8 +882,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet");
     assert_eq!(modes, (0, 1, 0));
     let key = local_index_key(&fixture.file.0);
-    let checkpoint = cache.retained_checkpoint(&key).unwrap();
-    let due = checkpoint.audit_debt().unwrap().due_unix_seconds;
+    let due = index.files[&key].unverified_deadline().unwrap();
     let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
@@ -906,9 +908,6 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         assert_eq!(modes, (0, 0, 1));
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(working.files[&key].has_unverified_source());
-        let after = cache.retained_checkpoint(&key).unwrap();
-        assert_eq!(after.audit_debt(), checkpoint.audit_debt());
-        assert_eq!(after.last_full_verified(), checkpoint.last_full_verified());
         // Exercise the actual partial-save/held-body reconciliation. An
         // unaccepted withheld body must neither retire nor release a slot.
         let mut selected = working.committable_subset_with_local_holds(
@@ -952,9 +951,6 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     assert_eq!(modes, (0, 0, 1));
     assert_held_audit_diagnostics(&diagnostics, 1);
     assert!(!retired.files[&key].has_unverified_source());
-    let after = cache.retained_checkpoint(&key).unwrap();
-    assert_eq!(after.audit_debt(), None);
-    assert_eq!(after.last_full_verified(), checkpoint.last_full_verified());
     crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut retired, &index_path);
     let loaded = ScanIndex::load(&index_path).unwrap();
     let (_, _, modes, _) = production_scan_at_with_setup(

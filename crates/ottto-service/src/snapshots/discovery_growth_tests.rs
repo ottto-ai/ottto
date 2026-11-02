@@ -188,7 +188,7 @@ impl Fixture {
         let path = self.root.join("index.json");
         // Preserve the production save's updated optimistic-concurrency stamp
         // in the index passed into the next real page.
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &path);
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");

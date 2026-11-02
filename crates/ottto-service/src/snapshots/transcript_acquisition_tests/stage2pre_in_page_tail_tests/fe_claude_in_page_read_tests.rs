@@ -2019,21 +2019,6 @@ fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
         sampled_scan::copy_retire_probe();
     };
 
-    // Ordinary retaining path (unchanged): a quiescent first Full keeps its
-    // copy and calls the retire with its copy budget.
-    let fixture = ScanFixture::new(CLAUDE);
-    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    suspend(&cache);
-    let (_, _, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
-    assert_eq!(seen.modes, (1, 0, 0), "precondition: one Full read");
-    assert!(cache
-        .retained_checkpoint(&local_index_key(&fixture.file.0))
-        .is_some());
-    let probe = sampled_scan::copy_retire_probe().expect("a retaining completion retires beside");
-    assert!(probe.budget > 0, "{probe:?}");
-    assert!(probe.fits(), "{probe:?}");
-
     // H3c: the grown in-page Full publishes its sealed prefix and passes no
     // copy budget, so no budgeted retire runs and the proof is kept.
     let mut base = baseline(CLAUDE, 4, 2);

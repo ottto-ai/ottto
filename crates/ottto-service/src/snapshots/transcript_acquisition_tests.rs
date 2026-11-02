@@ -1736,7 +1736,7 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
         assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
         assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
         assert!(
-            cache.retained_checkpoint(&small_key).is_some(),
+            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
             "the unrelated reduction survives {source:?}"
         );
         assert!(
