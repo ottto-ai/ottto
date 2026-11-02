@@ -186,8 +186,8 @@ mod shared_value;
 #[cfg(test)]
 mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
-#[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_folder_login;
+#[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
 // These census helpers remain until the separate persisted-format cleanup.
@@ -4293,8 +4293,7 @@ pub struct ScanIndex {
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
     /// Per-config-folder sole-login evidence, written only under its capability.
     #[serde(default)]
-    pub(crate) claude_folder_login_ledger:
-        BTreeMap<String, claude_folder_login::FolderRecord>,
+    pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
     /// Accepted intent members still owing revision debt; rebuilt each prepare.
     #[serde(skip)]
     pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
