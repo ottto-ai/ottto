@@ -19,6 +19,9 @@ use crate::transcript_acquisition::ReadMode;
 
 const REASON: CandidateParseReason = CandidateParseReason::Rearmed;
 
+#[path = "oracle_tests.rs"]
+mod oracle_tests;
+
 fn candidate(path: &Path) -> CandidateFile {
     CandidateFile {
         physical_identity: None,
