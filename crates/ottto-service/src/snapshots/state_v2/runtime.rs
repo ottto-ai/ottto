@@ -1226,7 +1226,6 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         Err(e) => return Err(e.into()),
     }
     super::super::sync_checkpoint_parent(path)?;
-    telemetry::event("source_erasure_confirmed", &1);
     // Retain the invalidated route's custody latch: erased artifacts must not
     // let this process resume v1 or re-create v2 without an explicit new lineage.
     Ok(())
@@ -1236,7 +1235,58 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
 /// existing whole-tree removal owns legacy files and unregistered artifacts;
 /// discovering those files here would register routes for files no source reads.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
-    close_tree(support, true)
+    close_tree(support, true)?;
+    telemetry::event("source_erasure_confirmed", &1);
+    Ok(())
+}
+
+/// Unlinks one source's local copy in every namespace. `indexes` are the only
+/// routed paths; `family` (their shared file stem) also covers progress, locks,
+/// legacy and policy-scoped indexes and temps. An error leaves `complete` uncalled,
+/// so the caller's marker stays pending and the next cycle repeats this sweep.
+pub(crate) fn erase_source(
+    indexes: &[PathBuf],
+    family: &str,
+    others: &[PathBuf],
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    for path in indexes {
+        {
+            // Erasure must not depend on decoding the files it removes.
+            let _owner =
+                super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
+            crate::snapshot_sync::with_state_v2_progress_lock(path, |_| erase_locked(path, None))?;
+        }
+        // Lock files go only after their flocks are released.
+        let parent = path.parent().context("source_erasure_parent")?;
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let rest = name.to_str().and_then(|name| name.strip_prefix(family));
+            let owned = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']));
+            if owned {
+                fence::remove_artifact(&entry.path())?;
+            }
+        }
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    for path in others {
+        fence::remove_artifact(path)?;
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    // All clones are closed; a dropped latch gives reconnect a fresh lineage.
+    let mut routes = states().lock().map_err(|_| Hold::DbUnavailable)?;
+    for path in indexes {
+        routes.remove(path);
+    }
+    drop(routes);
+    complete()?;
+    telemetry::event("source_erasure_confirmed", &indexes.len());
+    Ok(())
+}
+
+pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
+    telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
 fn close_tree(support: &Path, erase: bool) -> Result<()> {

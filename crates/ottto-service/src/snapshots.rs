@@ -263,6 +263,8 @@ pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec
 pub(crate) use restart_restore::RestartRestoreForTest;
 mod sampled_audit;
 mod sampled_jsonl;
+#[cfg(test)]
+mod source_erasure_tests;
 #[cfg(all(test, unix))]
 pub(crate) use sampled_jsonl::durable::pl_text::PlText;
 /// Structural verification plus the nested source binding `decode` enforces.
