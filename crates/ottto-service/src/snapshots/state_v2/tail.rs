@@ -230,7 +230,7 @@ impl Observation {
 /// An authorised final disposition of a file's whole debt: recorded (counted),
 /// and never reported as an ACK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the G7 cutover
+#[allow(dead_code)] // first production caller is the G7 cutover
 pub(in crate::snapshots) enum Disposition {
     /// A complete census proved the file absent.
     Absence,
@@ -790,7 +790,7 @@ const REVISION: &str = "tail.revision";
 fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result<()> {
     for name in catalogue::TAIL_KINDS
         .iter()
-        .filter(|k| !matches!(**k, SET_ASIDE | FRAG) && !(keep_debt && **k == REVISION))
+        .filter(|k| !(matches!(**k, SET_ASIDE | FRAG) || keep_debt && **k == REVISION))
     {
         let kind = RecordKind::parse(name)?;
         loop {
