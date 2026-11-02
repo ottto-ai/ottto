@@ -4243,6 +4243,7 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
 }
 
 #[cfg(unix)]
+#[path = "sampled_audit/quiet_retirement_tests.rs"]
 mod audit_retirement_tests;
 /// A persisted index can legitimately have no record (capacity, deferral or GC).
 /// Enabling the durable cache must preserve main's Full-on-miss admission.
@@ -5360,3 +5361,7 @@ fn native_v3_ordinary_save_then_second_restart_tails_without_a_full() {
         assert_eq!(production_body(source, scan), production_body(source, full));
     }
 }
+
+#[cfg(unix)]
+#[path = "sampled_audit/quiet_retirement_equivalence_tests.rs"]
+mod quiet_retirement_equivalence_tests;
