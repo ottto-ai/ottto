@@ -9417,6 +9417,81 @@ fn off_publication_invalidates_outgrown_v1() {
     });
 }
 
+/// [money] the OFF clear rewrites disk only: no body, no parse drop, no re-read.
+#[test]
+fn off_retired_body_clear_keeps_retained_parses_and_reads_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("off-retired-clear");
+        let lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(&path, a1a_row("accepted", 100)).unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+        let index_path = root.join("index.json");
+        owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+        let key = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&path));
+        let mut binding = store::tests::binding("account", "old", ("accepted", None));
+        binding.key = key;
+        let mut record =
+            store::tests::pending(binding, certificate(&path, &Scope("old".into())), 1);
+        record.allowlist = store::parse_hex_digest(
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        )
+        .unwrap();
+        let dir = store::store_dir_for_index(&index_path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        fs::write(&record_path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        store::test_hooks::set_before_access(Some(Box::new(|_, phase| {
+            assert_ne!(phase, "body", "OFF never acquires a restart body");
+            Ok(())
+        })));
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut index, mut first, _) = scan(index);
+        a1a_wire(&root, &mut index, &mut first);
+        let retained = || owner.cache.retained().unwrap().keys().count();
+        let parses = retained();
+        assert!(parses > 0);
+        owner
+            .cache
+            .durable_write_after_save(lock, SnapshotSource::ClaudeCode, &index);
+        assert_eq!(
+            fs::metadata(&record_path).unwrap().len(),
+            (store::HEADER_BYTES + 32) as u64
+        );
+        assert_eq!(retained(), parses);
+        let (_, bytes) = observe_consumed(|| scan(index));
+        assert_eq!(bytes, 0);
+        assert_eq!(retained(), parses);
+        store::test_hooks::set_before_access(None);
+    });
+}
+
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
 // acknowledged successor -> second process loss, through production
 // scanner and wire calls.
