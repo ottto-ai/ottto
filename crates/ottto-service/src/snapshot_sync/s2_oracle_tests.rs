@@ -392,11 +392,12 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
         let mut held = result(&current, Mode::Restart);
         held.accepted = previous.accepted.clone();
         money_oracle::assert_held(ROOT, &previous, &held, &cold);
-        let mut prior = commit(&session, current);
-        // Evidence debt keeps the lossy file eligible on the next walk.
-        for entry in prior.files.values_mut() {
-            entry.source_file_fingerprint.clear();
-        }
+        let prior = commit(&session, current);
+        // A lossy completion sets no marker and records the grown length, so
+        // equal stamps rightly skip: the same bytes reproduce the same hold.
+        // New bytes after the lossy point re-select the file on Tail.
+        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let replay = page(&c, prior, 100, true);
         assert_eq!(
             replay.modes.0, 0,
