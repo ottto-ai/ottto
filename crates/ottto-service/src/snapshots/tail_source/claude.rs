@@ -300,6 +300,38 @@ impl TailSource for Claude {
         .find_map(|(field, set)| set.then_some(field))
     }
 
+    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
+        match collection {
+            Collection::ToolUses => acc.seen_claude_capability_tool_uses.keys().collect(),
+            Collection::ChangedFiles => acc.activity_changed_file_hashes.iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        match collection {
+            Collection::ChangedFiles => page_bytes(keys.iter(), |hash, e| {
+                hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
+            }),
+            _ => page_bytes(keys.iter(), |id, e| id.put(e)),
+        }
+    }
+
+    fn log_page_keys(
+        collection: Collection,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, ReconstructCause> {
+        let mut keys = Vec::new();
+        read_page(bytes, LOG_G, |d| {
+            keys.push(match collection {
+                Collection::ChangedFiles => String::take_h(d)?,
+                _ => String::take(d)?,
+            });
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+
     fn encode_head(
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,
@@ -340,16 +372,11 @@ impl TailSource for Claude {
                     response.put(e)
                 })
             }
-            Collection::ToolUses => {
-                let ids: Vec<_> = acc.seen_claude_capability_tool_uses.keys().collect();
-                fixed_pages(&ids, LOG_G, |id, e| id.put(e))
-            }
-            Collection::ChangedFiles => {
-                let hashes: Vec<_> = acc.activity_changed_file_hashes.iter().collect();
-                fixed_pages(&hashes, LOG_G, |hash, e| {
-                    hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
-                })
-            }
+            Collection::ToolUses | Collection::ChangedFiles => Self::log_keys(acc, collection)
+                .chunks(LOG_G as usize)
+                .enumerate()
+                .map(|(page, keys)| Ok((page as u64, Self::log_page(collection, keys)?)))
+                .collect(),
             Collection::CapabilityHours => {
                 let mut hours: BTreeMap<u64, Vec<_>> = BTreeMap::new();
                 for (key, count) in &acc.activity_capability_buckets {
@@ -501,4 +528,4 @@ fn hour_page(bucket_start: &str) -> u64 {
 
 #[cfg(test)]
 #[path = "claude_tests.rs"]
-mod tests;
+pub(super) mod tests;

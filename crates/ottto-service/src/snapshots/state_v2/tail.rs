@@ -711,6 +711,17 @@ pub(super) fn removed_files(old: &mapper::Digests) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+fn write_closure(tx: &mut dyn Transaction, closure: &[mapper::ClosureRow]) -> Result<()> {
+    for row in closure {
+        match &row.value {
+            Some(value) => {
+                mapper::put(tx, &row.key, &**value)?;
+            }
+            None => mapper::remove(tx, &row.key)?,
+        }
+    }
+    Ok(())
+}
 /// Every staged file, each alone, with its own graph rows (`Rows::take_closure`):
 /// a failure rolls back only that file and sets it aside, so siblings and shared
 /// rows commit. A systemic failure abandons the save. `true`: a file rolled back.
@@ -723,18 +734,19 @@ pub(super) fn apply(
     for (file, entry) in stage.into_iter().flat_map(|stage| &stage.files) {
         let failed = match entry {
             Entry::Failed(cause) => Some(*cause),
+            // Retirement wins: this save removes the file's progress row, so its
+            // stage is stale. Its graph rows write as an unstaged file's do, and
+            // the retirement below deletes its committed Tail rows.
+            Entry::File(_) if removed.contains(file) => {
+                let closure = rows.take_closure(file)?;
+                write_closure(rows.tx()?, &closure)?;
+                None
+            }
             Entry::File(staged) => {
                 let closure = rows.take_closure(file)?;
                 // The file's closure boundary: its graph rows, then its Tail rows.
                 let result = rows.tx()?.isolated(&mut |tx| {
-                    for row in &closure {
-                        match &row.value {
-                            Some(value) => {
-                                mapper::put(tx, &row.key, &**value)?;
-                            }
-                            None => mapper::remove(tx, &row.key)?,
-                        }
-                    }
+                    write_closure(tx, &closure)?;
                     let one = replace(tx, file, staged)?;
                     applied.files += one.files;
                     applied.head_bytes += one.head_bytes;

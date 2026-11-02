@@ -262,7 +262,10 @@ mod session_start;
 #[cfg(unix)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the Tail seam and load call these")
+    expect(
+        dead_code,
+        reason = "S2 commit 3's load calls the decode side and the base"
+    )
 )]
 mod tail_source;
 pub(crate) use session_start::OpeningFileCandidate;
@@ -30996,6 +30999,29 @@ impl OwnedSourceScan {
                             Some(&candidate.path),
                             Some(&parser.reader.reader),
                         ));
+                // This Claude completion's Tail write: encoded at PRE into a
+                // local buffer, published only on the native finish's verdict.
+                #[cfg(unix)]
+                let mut tail = completed_acquisition
+                    .as_ref()
+                    .zip(file_sampling.as_ref())
+                    .zip(sampling.as_ref())
+                    .filter(|_| {
+                        source == SnapshotSource::ClaudeCode
+                            && !comparison_target
+                            && side_origin.is_none()
+                    })
+                    .and_then(|((completed, active), context)| {
+                        tail_source::seam::PendingTail::claude(
+                            index,
+                            completed,
+                            active,
+                            &candidate,
+                            parser.reader.reader.get_ref(),
+                            &context.namespace.0,
+                            claude_request_identity_capture,
+                        )
+                    });
                 #[cfg(unix)]
                 let m3_route = sampling
                     .as_ref()
@@ -31041,6 +31067,7 @@ impl OwnedSourceScan {
                                 expected_opened_object_identity: &candidate.opened_object_identity,
                                 committed_index: index,
                             },
+                            tail.as_mut(),
                         );
                         NativePublication::carry(&mut native_publication, settled.publication);
                         completed_acquisition = settled.completed;
@@ -31051,15 +31078,29 @@ impl OwnedSourceScan {
                             settled.staged,
                         )
                     }
-                    None => (
-                        parser.finish_boxed_native(finish_request),
-                        None,
-                        false,
-                        false,
-                    ),
+                    None => {
+                        let tailed = tail.is_some();
+                        let mut encode = |live: PreFinalization<'_>| {
+                            if let Some(tail) = tail.as_mut() {
+                                tail.encode(&live);
+                            }
+                        };
+                        let pre =
+                            tailed.then_some(&mut encode as &mut dyn FnMut(PreFinalization<'_>));
+                        (
+                            parser.finish_boxed_native(finish_request, pre),
+                            None,
+                            false,
+                            false,
+                        )
+                    }
                 };
+                #[cfg(unix)]
+                if let Some(tail) = tail {
+                    tail.publish(&parsed_file);
+                }
                 #[cfg(not(unix))]
-                let parsed_file = parser.finish_boxed_native(finish_request);
+                let parsed_file = parser.finish_boxed_native(finish_request, None);
                 #[cfg(unix)]
                 if excluded_native_class && parsed_file.is_ok() {
                     if let Some(context) = sampling.as_ref() {
@@ -37230,6 +37271,7 @@ impl OwnedJsonlParser {
         mode: crate::transcript_acquisition::ReadMode,
         held: File,
         fence: NativeFence<'_>,
+        mut tail: Option<&mut tail_source::seam::PendingTail>,
     ) -> NativeSettlement {
         let chain_request = NativeChainRequest {
             source: fence.source,
@@ -37261,6 +37303,9 @@ impl OwnedJsonlParser {
         let mut preparation = None;
         let rebuilding = cache.durable_rebuild_started(fence.source, fence.key);
         let mut stage = |live: PreFinalization<'_>| {
+            if let Some(tail) = tail.as_deref_mut() {
+                tail.encode(&live);
+            }
             if rebuilding {
                 return; // The one T14 Full replaces its predecessor after index save.
             }
@@ -37282,8 +37327,12 @@ impl OwnedJsonlParser {
     // Keep the consumed parser off the caller's scan-step frame as well as
     // while it is retained in OwnedActiveFile. Unboxing belongs to this frame.
     #[inline(never)]
-    fn finish_boxed_native(self: Box<Self>, request: FinishRequest<'_>) -> Result<ParsedJsonlFile> {
-        self.finish_native(request, None)
+    fn finish_boxed_native(
+        self: Box<Self>,
+        request: FinishRequest<'_>,
+        pre: Option<&mut dyn FnMut(PreFinalization<'_>)>,
+    ) -> Result<ParsedJsonlFile> {
+        self.finish_native(request, pre)
     }
 
     /// The one native finish. `pre` runs exactly once, only on the path that
@@ -37919,6 +37968,22 @@ fn discard_staging(
     }
 }
 
+/// The native finish's own recount, after finalization: complete, no positive
+/// usage that yielded no entity, and loss-free. Only a completion that passes
+/// it may persist its PRE reduction.
+#[cfg(unix)]
+fn finish_loss_free(native: &Result<ParsedJsonlFile>) -> bool {
+    native.as_ref().is_ok_and(|parsed| {
+        parsed.complete()
+            && !parsed.zero_snapshot_usage_evidence
+            && sampled_jsonl::loss_free_source_report(
+                &parsed.report,
+                parsed.recognized_usage_drop_count,
+                parsed.dropped_usage_record_count,
+            )
+    })
+}
+
 /// Settle one prepared native finish before any of its effects: dispatch the
 /// staging through the commit fences, bind receipts or register debt, end the
 /// active lease, and park a held completion as owed. Returns the native
@@ -37946,15 +38011,7 @@ fn settle_native_attempt(
     // unresolved ownership boundary can become known only in the final result.
     // Discard the temporary without renaming or retiring the predecessor, and
     // leave disclosure to native settlement rather than manufacturing a hold.
-    let finish_loss_free = native.as_ref().is_ok_and(|parsed| {
-        parsed.complete()
-            && !parsed.zero_snapshot_usage_evidence
-            && sampled_jsonl::loss_free_source_report(
-                &parsed.report,
-                parsed.recognized_usage_drop_count,
-                parsed.dropped_usage_record_count,
-            )
-    });
+    let finish_loss_free = finish_loss_free(&native);
     let preparation = if finish_loss_free {
         preparation
     } else {

@@ -2962,7 +2962,10 @@ pub(crate) enum MarkerVerdict<'m> {
 impl OrgMarkers {
     /// Every recorded response position: each is the file's response count
     /// when its line was read.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the Tail codec calls this"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "S2 commit 3's load validates these")
+    )]
     pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries
             .iter()
@@ -2972,7 +2975,6 @@ impl OrgMarkers {
             .chain(self.context_flip_position)
     }
     /// The status-coverage key is bound at item build, never by the parser.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the Tail codec calls this"))]
     pub(crate) fn home_bound(&self) -> bool {
         self.home.is_some()
     }

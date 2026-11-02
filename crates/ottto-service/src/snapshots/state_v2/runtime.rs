@@ -984,7 +984,8 @@ fn guard_current(
     }))
 }
 
-fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
+/// The route of this graph's live session: the index path its stage is kept under.
+pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
     let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(None);
     };
@@ -1110,7 +1111,6 @@ impl BaselineRelease {
         )
     }
     /// The normal cycle exit's Tail-only commit, when anything is staged.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the acquisition cutover exits"))]
     pub(crate) fn commit_tail(&self) -> Result<()> {
         match &self.0 {
             Some((path, runtime)) => tail_route::commit_at_exit(path, runtime),
@@ -1652,7 +1652,10 @@ mod growth_tests;
 #[path = "runtime_tail.rs"]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the acquisition cutover calls these")
+    expect(
+        dead_code,
+        reason = "S2 commit 3's load, census retirement and marker retry call the rest"
+    )
 )]
 pub(super) mod tail_route;
 #[cfg(test)]

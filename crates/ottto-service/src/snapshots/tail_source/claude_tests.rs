@@ -18,7 +18,7 @@ const SKILL: &str = "ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünï
 /// A user prompt, then `responses` assistant responses a minute apart, each
 /// with a capability tool use, a compaction boundary after every fourth, and
 /// a title. The first response also invokes the `SKILL` skill.
-fn lines(responses: usize) -> Vec<String> {
+pub(in crate::snapshots) fn lines(responses: usize) -> Vec<String> {
     let at = |minute: usize| format!("2026-10-20T{:02}:{:02}:00Z", 10 + minute / 60, minute % 60);
     let mut lines = vec![json!({"type":"user","sessionId":SESSION,"uuid":"u-0",
         "parentUuid":null,"timestamp":at(0),"cwd":"/tmp/tail-claude","version":"2.1.0",

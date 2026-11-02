@@ -7611,7 +7611,7 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
-    let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
+    let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {
@@ -8968,6 +8968,12 @@ fn finish_sync_source(
         lease.note_selected_save(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
         );
+    }
+    // Tail state staged after this pass's last full save commits here, once.
+    // On error the guard's drop discards and counts it; the next read replays
+    // from the previous head. Never print private engine errors.
+    if state_v2_baseline.commit_tail().is_err() {
+        eprintln!("local tail state commit deferred for {}", source.api_slug());
     }
     // Maintenance is advisory: privacy deadlines alarm without failing an
     // otherwise committed collection cycle. Never print private engine errors.

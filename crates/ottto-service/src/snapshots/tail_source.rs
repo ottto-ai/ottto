@@ -13,6 +13,7 @@ use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod seam;
 
 /// One collection a source stores in pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +153,13 @@ pub(in crate::snapshots) trait TailSource {
         certificate: &DurableCertificate,
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse>;
+    /// A `Log` collection's elements, in its full encode's (sorted) order.
+    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String>;
+    /// One `Log` page holding `keys`, in this order.
+    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse>;
+    /// A stored `Log` page's elements, in stored order.
+    fn log_page_keys(collection: Collection, bytes: &[u8])
+        -> Result<Vec<String>, ReconstructCause>;
     /// Every page of `collection`, by position.
     fn encode_pages(
         acc: &SnapshotAccumulator,
