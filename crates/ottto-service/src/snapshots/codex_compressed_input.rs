@@ -88,6 +88,12 @@ pub(super) fn structural_read_error(error: &anyhow::Error) -> bool {
 
 pub(super) const UNKNOWN_ARCHIVE_SCOPE: &str = "archive_metadata_unknown";
 
+/// Paces only committed outcomes another read cannot change: a structural refusal
+/// with no decoded byte, a decode refused on its parent, and a complete decode
+/// whose exact ACK is unproven. Unfinished work has no clock: archives are
+/// immutable, so it retries on the next pass.
+const HELD_RETRY_SECONDS: u64 = 21600;
+
 pub(super) fn archive_alarm(count: usize) {
     if count > 0 {
         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -207,6 +213,13 @@ impl ArchiveWork {
             self.reservation = ArchiveReservation::None;
         }
     }
+    pub(super) fn record_body_witness(&mut self, witness: Option<String>) {
+        if witness.is_some() {
+            self.retry_after =
+                super::sampled_scan::now_seconds().saturating_add(HELD_RETRY_SECONDS);
+        }
+        self.body_witness = witness;
+    }
 }
 impl ArchiveEvidence {
     pub(super) fn unknown() -> Self {
@@ -241,15 +254,41 @@ impl ArchiveEvidence {
             work: Some(Box::default()),
         })
     }
+    /// A held outcome's Full clock. A reservation with no outcome carries none,
+    /// and a clock an older writer stamped on one is not read.
+    pub(super) fn body_paced(&self) -> bool {
+        self.work.as_ref().is_some_and(|w| {
+            super::sampled_scan::now_seconds() < w.retry_after
+                && match self.disposition {
+                    ArchiveDisposition::Pending => w.body_witness.is_some(),
+                    ArchiveDisposition::Held { .. } => !w.decoded,
+                    _ => false,
+                }
+        })
+    }
+    /// Whether a Full may be reserved. A decode refused on its parent also waits,
+    /// without becoming quiet; a resource refusal never does.
+    pub(super) fn full_paced(&self) -> bool {
+        self.body_paced()
+            || matches!(self.disposition, ArchiveDisposition::Held { cause, .. } if cause != CodexZstCause::AdmissionRefused)
+                && self
+                    .work
+                    .as_ref()
+                    .is_some_and(|w| super::sampled_scan::now_seconds() < w.retry_after)
+    }
+    /// A structural header refusal's clock, read on the same rule.
+    pub(super) fn header_paced(&self) -> bool {
+        matches!(self.disposition, ArchiveDisposition::Held { .. })
+            && self
+                .work
+                .as_ref()
+                .is_some_and(|w| super::sampled_scan::now_seconds() < w.header_retry_after)
+    }
     pub(super) fn transition(&mut self, change: ArchiveTransition) {
         use ArchiveTransition::*;
-        // A transient skip cannot erase paid header pacing or a named hold.
+        // A transient skip cannot erase a named hold.
         if matches!(change, Transient(_))
-            && (matches!(self.disposition, ArchiveDisposition::Held { cause, .. } if cause != CodexZstCause::AdmissionRefused)
-                || self.work.as_ref().is_some_and(|w| {
-                    w.reservation == ArchiveReservation::None
-                        && super::sampled_scan::now_seconds() < w.header_retry_after
-                }))
+            && matches!(self.disposition, ArchiveDisposition::Held { cause, .. } if cause != CodexZstCause::AdmissionRefused)
         {
             return;
         }
@@ -259,27 +298,16 @@ impl ArchiveEvidence {
             ArchiveDisposition::Acquired | ArchiveDisposition::Empty
         );
         let latched = matches!(self.disposition, ArchiveDisposition::Held { quiet: true, cause } if cause == CodexZstCause::CorrectionUnapplied || self.work.as_ref().is_some_and(|w| w.decoded));
-        let paced_structural = matches!(self.disposition, ArchiveDisposition::Held { .. })
-            && self
-                .work
-                .as_ref()
-                .is_some_and(|w| !w.decoded && super::sampled_scan::now_seconds() < w.retry_after);
+        let paced_structural =
+            matches!(self.disposition, ArchiveDisposition::Held { .. }) && self.body_paced();
         if latched || (paced_structural && !correction) || (settled && !correction) {
             return;
         }
         if matches!(self.disposition, ArchiveDisposition::Pending)
-            && self.work.as_ref().is_some_and(|w| {
-                w.body_witness.is_some()
-                    || w.reservation == ArchiveReservation::None
-                        && super::sampled_scan::now_seconds() < w.retry_after
-            })
+            && self.work.as_ref().is_some_and(|w| w.body_witness.is_some())
             && !(matches!(change, Acquired)
                 || correction
-                || matches!(change, Reserve)
-                    && self
-                        .work
-                        .as_ref()
-                        .is_some_and(|w| super::sampled_scan::now_seconds() >= w.retry_after))
+                || matches!(change, Reserve) && !self.body_paced())
         {
             return;
         }
@@ -311,7 +339,7 @@ impl ArchiveEvidence {
                 }
                 let w = self.work.as_mut().unwrap();
                 w.attempts = w.attempts.saturating_add(1);
-                w.retry_after = super::sampled_scan::now_seconds().saturating_add(21600);
+                w.retry_after = 0;
                 w.decoded = false;
                 w.body_witness = None;
                 w.reservation = ArchiveReservation::FullSave;
@@ -322,6 +350,14 @@ impl ArchiveEvidence {
             Structural(cause) => (cause, true),
         };
         let w = self.work.get_or_insert_with(Box::default);
+        if structural {
+            let held_until = super::sampled_scan::now_seconds().saturating_add(HELD_RETRY_SECONDS);
+            if w.header.is_none() {
+                w.header_retry_after = held_until;
+            } else if !w.decoded {
+                w.retry_after = held_until;
+            }
+        }
         if !w.decoded && !structural {
             if matches!(
                 w.reservation,
@@ -359,16 +395,8 @@ impl ArchiveEvidence {
     pub(super) fn quiet_disposition(&self) -> bool {
         match self.disposition {
             ArchiveDisposition::Acquired | ArchiveDisposition::Empty => true,
-            ArchiveDisposition::Pending => self
-                .work
-                .as_ref()
-                .is_some_and(|w| super::sampled_scan::now_seconds() < w.retry_after),
-            ArchiveDisposition::Held { quiet, .. } => {
-                quiet
-                    || self.work.as_ref().is_some_and(|w| {
-                        !w.decoded && super::sampled_scan::now_seconds() < w.retry_after
-                    })
-            }
+            ArchiveDisposition::Pending => self.body_paced(),
+            ArchiveDisposition::Held { quiet, .. } => quiet || self.body_paced(),
             ArchiveDisposition::HeaderValidated => false,
         }
     }
@@ -389,6 +417,10 @@ impl ArchiveEvidence {
             self.transition(ArchiveTransition::Correctness(
                 CodexZstCause::ParentLedgerUnbound,
             ));
+            if let Some(w) = self.work.as_mut() {
+                w.retry_after =
+                    super::sampled_scan::now_seconds().saturating_add(HELD_RETRY_SECONDS);
+            }
             return false;
         }
         if !parsed.complete() || parsed.zero_snapshot_usage_evidence {
@@ -848,11 +880,14 @@ impl super::ScanIndex {
         if w.reservation != ArchiveReservation::HeaderReady {
             return Ok(HeaderRead::Deferred);
         }
-        w.reservation = ArchiveReservation::None;
         self.archive_pass.started = true;
+        // An attempt is spent only once a funded reader is about to read.
         let file = match open_candidate_beneath_root(candidate) {
             Ok(file) => file,
             Err(error) => {
+                if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+                    w.cancel_unopened_header();
+                }
                 return Err(error.into());
             }
         };
@@ -861,12 +896,18 @@ impl super::ScanIndex {
             .transpose()?
             .flatten()
         else {
+            if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+                w.cancel_unopened_header();
+            }
             self.archive_transition(
                 &candidate.path,
                 ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
             );
             return Ok(HeaderRead::Deferred);
         };
+        if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+            w.reservation = ArchiveReservation::None;
+        }
         input = input.header_only();
         let _qos = crate::snapshot_sync::continuation::MacPlatformSignals::background();
         let result = (|| -> Result<ValidatedHeader> {
@@ -1107,7 +1148,8 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(a.owed_cause(), Some(CodexZstCause::AdmissionRefused));
         assert!(!index.archive_quiet(&key), "owed, never quiet-latched");
         assert_eq!(index.archive_owed_count(), 1);
-        assert_eq!(a.work.as_ref().unwrap().retry_after, retry_after, "paced");
+        assert_eq!(a.work.as_ref().unwrap().retry_after, retry_after);
+        assert!(!a.body_paced(), "a resource refusal retries next pass");
     }
 
     /// [behaviour]
@@ -1982,9 +2024,10 @@ pub(in crate::snapshots) mod tests {
         }
     }
     /// [format] Saved header and page-wide Full reservations precede body
-    /// bytes. Restart preserves owed custody; a failed save consumes no Full.
+    /// bytes. A restart keeps owed custody and retries, counted, on the next
+    /// pass with the money of a cold Full; a failed save consumes no Full.
     #[test]
-    fn archive_reservation_survives_crash_and_save_failure_reads_no_body() {
+    fn archive_reservation_retries_after_crash_and_failed_save_reads_no_body() {
         let _lock = DECODER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2029,21 +2072,38 @@ pub(in crate::snapshots) mod tests {
                     } else {
                         let mut restored = ScanIndex::load(&checkpoint.0).unwrap();
                         assert_eq!(restored.archive_owed_count(), 1);
-                        let ((_, quiet, logs), bytes) =
-                            sampled_scan::transition_fixture::observe_consumed(|| {
-                                run_archive(
-                                    &f,
-                                    restored.clone(),
-                                    Arc::new(sampled_scan::SharedCache::default()),
-                                )
-                            });
-                        assert!(quiet.archive_owed_count > 0);
-                        assert_eq!(quiet.unreadable_path_count, 0);
-                        assert_eq!(bytes, 0);
-                        assert_eq!(full_decodes(&logs), 0);
+                        let key = local_index_key(&f.0);
+                        let work = restored.archives[&key].work.as_ref().unwrap();
+                        assert_eq!((work.retry_after, work.header_retry_after), (0, 0));
+                        let (full_spent, header_spent) = (work.attempts, work.header_attempts);
+                        // A clock an older writer saved on this row is not read either.
+                        let mut older = restored.clone();
+                        let work = older.archives.get_mut(&key).unwrap().work.as_mut().unwrap();
+                        work.retry_after = sampled_scan::now_seconds() + 21600;
+                        work.header_retry_after = work.retry_after;
+                        let (retried, next_pass, logs) =
+                            run_archive(&f, older, Arc::new(sampled_scan::SharedCache::default()));
+                        assert_eq!(next_pass.snapshots.len(), 1);
+                        assert_eq!(full_decodes(&logs), 1);
+                        assert!(next_pass.archive_owed_count > 0, "owed until an exact ACK");
+                        assert_eq!(next_pass.unreadable_path_count, 0);
                         assert!(logs.iter().any(|l| l["stage"] == "codex_zst_held"));
+                        let work = retried.archives[&key].work.as_ref().unwrap();
+                        assert_eq!(work.attempts, full_spent + 1);
+                        assert_eq!(work.header_attempts, header_spent + u64::from(header));
+                        let (cold_index, cold, _) = run_archive(
+                            &f,
+                            ScanIndex::default(),
+                            Arc::new(sampled_scan::SharedCache::default()),
+                        );
+                        {
+                            use sampled_scan::transition_fixture::{money_oracle, scan_money};
+                            money_oracle::assert_equivalent(
+                                &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+                                &scan_money(SnapshotSource::Codex, &retried, &next_pass),
+                            );
+                        }
                         if header {
-                            let key = local_index_key(&f.0);
                             restored.archive_transition(
                                 &f.0,
                                 ArchiveTransition::Structural(CodexZstCause::HeaderInvalid),
@@ -2311,7 +2371,7 @@ pub(in crate::snapshots) mod tests {
                 .body_witness
                 .is_none());
             assert!(!reverted.files.contains_key(&local_index_key(&f.0)));
-            let mut committed = crate::snapshot_sync::archive_upload_checkpoint(
+            let committed = crate::snapshot_sync::archive_upload_checkpoint(
                 working, &result, &previous, outcome,
             );
             let key = local_index_key(&f.0);
@@ -2323,20 +2383,6 @@ pub(in crate::snapshots) mod tests {
                 .unwrap()
                 .body_witness
                 .is_none());
-            let (_, _, logs) = run_archive(
-                &f,
-                saved(&committed),
-                Arc::new(sampled_scan::SharedCache::default()),
-            );
-            assert_eq!(full_decodes(&logs), 0);
-            committed
-                .archives
-                .get_mut(&key)
-                .unwrap()
-                .work
-                .as_mut()
-                .unwrap()
-                .retry_after = 0;
             let (working, result, logs) = run_archive(
                 &f,
                 saved(&committed),
@@ -2498,7 +2544,6 @@ pub(in crate::snapshots) mod tests {
                 )),
                 _ => {
                     let w = a.work.as_mut().unwrap();
-                    w.body_witness = None;
                     w.decoded = false;
                     w.reservation = ArchiveReservation::None;
                 }
@@ -3344,10 +3389,14 @@ pub(in crate::snapshots) mod tests {
                     committed.archives[&key].work.as_ref().unwrap().alarmed,
                     Some(CodexZstCause::DecodeFailed)
                 );
-                let (_, _, logs) = run_archive(
+                let (held, _, logs) = run_archive(
                     &f,
                     saved(&committed),
                     Arc::new(sampled_scan::SharedCache::default()),
+                );
+                assert_eq!(
+                    held.archives[&key].owed_cause(),
+                    Some(CodexZstCause::DecodeFailed)
                 );
                 assert_eq!(full_decodes(&logs), 0);
                 assert!(!logs
@@ -3546,8 +3595,8 @@ pub(in crate::snapshots) mod tests {
         crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(accepted, result, 0);
     }
 
-    /// [format] Unopened header permission is cancelled, interrupted durable
-    /// permission stays paced, and deferred alarms survive a real reload.
+    /// [format] Unopened header permission is cancelled, an opened attempt stays
+    /// counted, and deferred alarms survive a real reload.
     #[test]
     fn archive_header_cancellation_and_deferred_alarm_survive_restart() {
         for opened in [false, true] {
@@ -3837,6 +3886,17 @@ pub(in crate::snapshots) mod tests {
                 matches!(a.disposition, ArchiveDisposition::Empty),
                 !evidence
             );
+            if evidence {
+                // A decode refused on its parent waits without becoming quiet.
+                let mut held = ArchiveEvidence::from_metadata(fs::metadata(&f.0).unwrap()).unwrap();
+                held.work.as_mut().unwrap().header = a.work.as_ref().unwrap().header.clone();
+                held.transition(ArchiveTransition::Reserve);
+                held.work.as_mut().unwrap().decoded = true;
+                parsed.codex_parent_resolution_pending = true;
+                assert!(!held.finish(Some("compressed-fixture"), &parsed));
+                assert_eq!(held.owed_cause(), Some(CodexZstCause::ParentLedgerUnbound));
+                assert!(held.full_paced() && !held.quiet_disposition());
+            }
         }
     }
 }

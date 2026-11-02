@@ -4,7 +4,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Default, Serialize)]
 struct Stats {
@@ -108,6 +108,7 @@ pub(super) enum Kind {
 pub(super) struct Stage {
     kind: Kind,
     probe: crate::local_resource_diagnostics::StateV2Probe,
+    started: Instant,
     finished: bool,
 }
 impl Stage {
@@ -124,6 +125,7 @@ impl Stage {
         Self {
             kind,
             probe: crate::local_resource_diagnostics::StateV2Probe::begin(),
+            started: Instant::now(),
             finished: false,
         }
     }
@@ -132,7 +134,7 @@ impl Stage {
             return;
         }
         self.finished = true;
-        let (_cpu, steady, peak) = self.probe.finish();
+        let (cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
             match self.kind {
                 Kind::Import => {
@@ -151,7 +153,12 @@ impl Stage {
                     } else {
                         "hydrate"
                     },
-                    MemoryWindow { current, peak },
+                    MemoryWindow {
+                        current,
+                        peak,
+                        cpu_us: cpu,
+                        wall_us: u64::try_from(self.started.elapsed().as_micros()).ok(),
+                    },
                 );
             }
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -255,6 +262,8 @@ pub(in super::super) fn phase(name: &'static str) {
             MemoryWindow {
                 current: memory,
                 peak: Default::default(),
+                cpu_us: None,
+                wall_us: None,
             },
         );
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -390,6 +399,11 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 struct MemoryWindow {
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
+    /// Save and hydrate only: process CPU and wall across the stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wall_us: Option<u64>,
 }
 /// RAII stage window; fixed label, two bounded shared samplers, no identifiers.
 pub(in super::super) struct Window {
@@ -412,9 +426,15 @@ impl Drop for Window {
     fn drop(&mut self) {
         let (current, peak) = self.probe.memory();
         if let Ok(mut stats) = stats().lock() {
-            stats
-                .stage_memory
-                .insert(self.name, MemoryWindow { current, peak });
+            stats.stage_memory.insert(
+                self.name,
+                MemoryWindow {
+                    current,
+                    peak,
+                    cpu_us: None,
+                    wall_us: None,
+                },
+            );
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
     }
@@ -516,6 +536,34 @@ mod ops_tests {
         drop(index);
         super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] Save/hydrate and summed evidence windows carry CPU and wall.
+    #[test]
+    fn stage_windows_carry_cpu_and_wall() {
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            drop(Stage::new(Kind::Save));
+            let mut window = crate::local_resource_diagnostics::StageSum::begin(
+                "claude_code",
+                "evidence_cross_root",
+            );
+            window.time(|| std::hint::black_box((0..10_000_u64).sum::<u64>()));
+        });
+        let save = records
+            .iter()
+            .rev()
+            .find(|record| record["stage"] == "claude_state_v2")
+            .map(|record| &record["counts"]["stage_memory"]["save"])
+            .unwrap();
+        let cross = records
+            .iter()
+            .find(|record| record["stage"] == "evidence_cross_root")
+            .map(|record| &record["observation"])
+            .unwrap();
+        assert!(save["wall_us"].is_u64() && cross["wall_elapsed_us"].is_u64());
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(save["cpu_us"].is_u64() && cross["shared_process_cpu_delta_us"].is_u64());
+        }
     }
 
     /// [behaviour] Claude passes with no route preserve even stale active v2 telemetry state.

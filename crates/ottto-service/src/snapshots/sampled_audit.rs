@@ -2342,6 +2342,36 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
 }
 
+/// Debt whose claim has expired. Its deferral did not re-queue it, so its
+/// queued path would wait behind the census FIFO; selection wakes it instead.
+pub(super) fn expired_growth_claims(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    now: u64,
+) -> BTreeSet<PathBuf> {
+    if !growth_active(index) {
+        return BTreeSet::new();
+    }
+    let mut oldest = 0_u64;
+    let due: BTreeSet<_> = index
+        .v2()
+        .growth_retention
+        .iter()
+        .filter_map(|(key, state)| {
+            state.predecessor_size?;
+            let claim = state.last_growth_full_unix?;
+            let expired_secs = now.checked_sub(claim.saturating_add(GROWTH_FULL_INTERVAL))?;
+            oldest = oldest.max(expired_secs);
+            Some(PathBuf::from(key))
+        })
+        .collect();
+    if !due.is_empty() {
+        let counts = serde_json::json!({"keys": due.len(), "oldest_expired_secs": oldest});
+        crate::local_resource_diagnostics::traversal_point("hold_wake", source.api_slug(), &counts);
+    }
+    due
+}
+
 /// The claim is one store transaction CAS'd on this lineage's G; no
 /// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
@@ -3060,9 +3090,16 @@ mod growth_tests {
         );
     }
     fn identified(fixture: &Fixture, index: &ScanIndex) -> CandidateFile {
+        identified_for_source(fixture, index, SnapshotSource::ClaudeCode)
+    }
+    fn identified_for_source(
+        fixture: &Fixture,
+        index: &ScanIndex,
+        source: SnapshotSource,
+    ) -> CandidateFile {
         let mut census = ScanCensus::default();
         let candidate = candidate_from_traversal_path(
-            SnapshotSource::ClaudeCode,
+            source,
             fixture.pending(),
             &mut census,
             None,
@@ -3072,7 +3109,7 @@ mod growth_tests {
         )
         .unwrap();
         open_and_identify_scan_candidate_at(
-            SnapshotSource::ClaudeCode,
+            source,
             candidate,
             &mut census,
             crate::snapshots::CandidateWindow {
@@ -3084,6 +3121,68 @@ mod growth_tests {
         )
         .unwrap()
         .0
+    }
+
+    /// [regress] the two v2 loaders bound claims differently: Codex daemon loads
+    /// had no lineage, so every Full was refused. Both loaders, every active source.
+    #[test]
+    fn every_v2_loader_binds_growth_claims_for_every_active_source() {
+        use super::super::scan_index_persistence::Source;
+        use state_v2::money_test_support::ColdSession;
+
+        for source in [Source::Claude, Source::Codex] {
+            let fixture = Fixture::new();
+            let (session, _) = ColdSession::publish(source, &ScanIndex::default(), &fixture.root);
+            let path = session.path();
+            for daemon in [false, true] {
+                let index = if daemon {
+                    ScanIndex::load_for_snapshot_source(path, source.snapshot(), &fixture.root)
+                } else {
+                    ScanIndex::load(path)
+                }
+                .unwrap();
+                assert!(growth_active(&index));
+                let _lock = CheckpointLock::acquire(path).unwrap();
+                authenticate_growth_generation(&index, path).unwrap();
+            }
+        }
+    }
+
+    /// [regress] daemon v2 loads authenticate plain Full reads for every active source.
+    #[test]
+    fn daemon_v2_load_authenticates_plain_full_for_active_sources() {
+        use super::super::scan_index_persistence::Source;
+        use crate::transcript_acquisition::{FullReason, ReadMode, ReadPlan, Scope};
+        use state_v2::money_test_support::ColdSession;
+
+        for source in [Source::Claude, Source::Codex] {
+            let fixture = Fixture::new();
+            let (session, _) = ColdSession::publish(source, &ScanIndex::default(), &fixture.root);
+            let mut index = ScanIndex::load_for_snapshot_source(
+                session.path(),
+                source.snapshot(),
+                &fixture.root,
+            )
+            .unwrap();
+            assert!(growth_active(&index));
+            let candidate = identified_for_source(&fixture, &index, source.snapshot());
+            let mut file = open_candidate_beneath_root(&candidate).unwrap();
+            let plan = ReadPlan::prepare(
+                &mut file,
+                None,
+                &Scope("daemon-growth-load".into()),
+                None,
+                100,
+            )
+            .unwrap();
+            assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+            assert!(growth_read_admitted_at(
+                &mut index,
+                &candidate,
+                plan.mode(),
+                100,
+            ));
+        }
     }
 
     /// [money] f3 growth full claim survives restart failure and subset save.

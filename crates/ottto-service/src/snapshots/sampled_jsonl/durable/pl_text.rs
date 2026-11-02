@@ -2,7 +2,7 @@
 use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, PlLiteral, Refuse, Shape};
 
 /// A byte-bounded literal. Creating one does not authorize its persistence:
-/// its field still needs an approved PL use and the current consent gate.
+/// its field still needs an approved PL use. Upload consent is applied separately.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PlText<const CAP: usize>(String);
 

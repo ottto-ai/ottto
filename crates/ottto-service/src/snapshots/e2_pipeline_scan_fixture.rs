@@ -236,6 +236,19 @@ pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str)
     }
 }
 
+/// An earlier upload delivered this origin's body. The receipt is under another
+/// context and other bytes, so it decides the copy and proves no current read:
+/// the file still owes its own upload exactly as if it had no receipt.
+pub(crate) fn origin_accepted_for_test(index: &mut ScanIndex, key: &str) {
+    index.files.get_mut(key).unwrap().upload_context_receipt =
+        Some(super::upload_context_receipt::Receipt {
+            context_fingerprint: "another-upload-context".into(),
+            replay_generation: super::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+            source_witness: "a".repeat(64),
+            body_witness: "b".repeat(64),
+        });
+}
+
 /// Each sent item's exact ACK (entity -> upload body witness), as the
 /// synthetic responders answer a fully accepted page.
 pub(crate) fn exact_acks_for_test(items: &[SnapshotItem]) -> BTreeMap<String, String> {
