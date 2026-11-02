@@ -1017,7 +1017,86 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
 
-/// [behaviour] idle maintenance emits counts once per daily reference-maintenance pass.
+/// [regress] a busy store, with no quiet cycle, still emits its daily sample;
+/// the reference check stays quiet-gated.
+#[test]
+fn store_growth_sample_runs_on_a_busy_cycle() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("busy".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.between_cycles(false).unwrap();
+    let gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    assert_eq!(gauge["partial"], false);
+    assert_eq!(gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+    assert_eq!(
+        db.read_control::<u64>("reference_check_attempt").unwrap(),
+        None
+    );
+    // Daily: the next busy cycle does not sample again.
+    db.between_cycles(false).unwrap();
+    assert!(telemetry::take_thread_event_for_test("store_growth.claude").is_none());
+}
+
+/// [regress] a reference check that exhausts its budget cannot starve the
+/// sample, and its failure names a fixed cause.
+#[test]
+fn store_growth_sample_survives_a_reference_check_over_budget() {
+    fn over_budget(
+        _: &Header,
+        _: &dyn Value,
+        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    ) -> Result<()> {
+        // Past the 2 s + 10 ms/MiB budget of this small store.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        )
+        .into())
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("slow".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.reference_extractor(over_budget);
+    db.maintenance(true).unwrap();
+    let gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    assert_eq!(gauge["partial"], false);
+    assert_eq!(gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["reference_check_failed"], 1);
+    assert_eq!(
+        stats["reference_check_failed_causes"],
+        serde_json::json!({"timeout": 1})
+    );
+}
+
+/// [regress] Claude and Codex stores keep separate latest samples.
+#[test]
+fn store_growth_samples_stay_separate_per_store() {
+    let (claude, codex) = (Scratch::new(), Scratch::new());
+    let mut claude_db = claude.live_store();
+    let mut codex_db = codex.live_store();
+    let mut identity = codex.identity();
+    identity.binding.source = super::super::scan_index_persistence::Source::Codex;
+    codex_db.control("identity", &identity).unwrap();
+    let mut tx = codex_db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("codex-only".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    claude_db.between_cycles(false).unwrap();
+    codex_db.between_cycles(false).unwrap();
+    assert!(telemetry::latest_for_test("store_growth.claude").is_some());
+    assert!(telemetry::latest_for_test("store_growth.codex").is_some());
+    let claude_gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    let codex_gauge = telemetry::take_thread_event_for_test("store_growth.codex").unwrap();
+    assert!(claude_gauge["kinds"].get("scan_state.traversal").is_none());
+    assert_eq!(codex_gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+}
+
+/// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {
     fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
@@ -1031,7 +1110,7 @@ fn store_growth_gauge_is_daily_and_counts_only() {
             crate::local_resource_diagnostics::capture(|| db.maintenance(true).unwrap());
         records
             .into_iter()
-            .filter_map(|r| r["counts"]["latest"].get("store_growth").cloned())
+            .filter_map(|r| r["counts"]["latest"].get("store_growth.claude").cloned())
             .collect()
     }
     let tmp = Scratch::new();
@@ -1081,10 +1160,9 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(gauge["chunk_bytes"], 1300);
     assert_eq!(gauge["partial"], false);
     assert!(!gauge.to_string().contains("synthetic-private"));
-    // No second sample until the next daily maintenance pass runs.
+    // No second sample until a day has passed.
     assert!(sample(&mut db).is_empty());
-    db.control("reference_check_success", &0_u64).unwrap();
-    db.control("reference_check_attempt", &0_u64).unwrap();
+    db.control("store_growth_success", &0_u64).unwrap();
     assert_eq!(sample(&mut db).len(), 1);
 }
 

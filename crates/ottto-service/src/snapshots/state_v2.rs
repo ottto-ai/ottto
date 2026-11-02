@@ -498,6 +498,7 @@ fn control_name(name: &str) -> bool {
             | "reference_check_success"
             | "reference_check_attempt"
             | "reference_drift"
+            | "store_growth_success"
             | "minimum_writer_capability"
             | "erasure_pending"
             | "erasure_since"
