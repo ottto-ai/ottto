@@ -188,14 +188,31 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
     tx.read_value(h, &mut out)?;
     Ok(out.inner)
 }
+/// Shared-evidence kinds: (kind, field holding request-set references, class).
+/// `file.census` keeps one set in its field; the others keep a map of sets.
+const SHARED: [(&str, &str, &str); 4] = [
+    ("account_window", "r", "account"),
+    ("usage.pending", "member_request_id_hashes", "requests"),
+    (
+        "proof.usage",
+        "legacy_excluded_request_id_hashes",
+        "requests",
+    ),
+    ("file.census", "b", "census"),
+];
+/// The shared field and interning class of a shared-evidence kind.
+fn shared(kind: &str) -> Option<(&'static str, &'static str)> {
+    SHARED
+        .iter()
+        .find(|(name, ..)| *name == kind)
+        .map(|&(_, field, class)| (field, class))
+}
 fn evidence_map<'a>(
     kind: &str,
     value: &'a mut Json,
 ) -> Option<&'a mut serde_json::Map<String, Json>> {
-    let field = match kind {
-        "account_window" => "r",
-        "usage.pending" => "member_request_id_hashes",
-        "proof.usage" => "legacy_excluded_request_id_hashes",
+    let field = match shared(kind) {
+        Some((field, _)) if kind != "file.census" => field,
         _ => return None,
     };
     value.get_mut(field)?.as_object_mut()
@@ -230,23 +247,9 @@ struct Projection {
     refs: Vec<RowKey>,
     created: Vec<RowKey>,
 }
-fn evidence_class(kind: &str) -> &'static str {
-    match kind {
-        "account_window" => "account",
-        "file.census" => "census",
-        _ => "requests",
-    }
-}
 fn input_cap(key: &RowKey) -> u64 {
     match key {
-        RowKey::Record { kind, .. }
-            if matches!(
-                kind.name(),
-                "account_window" | "file.census" | "usage.pending" | "proof.usage"
-            ) =>
-        {
-            VALUE_BYTES
-        }
+        RowKey::Record { kind, .. } if shared(kind.name()).is_some() => VALUE_BYTES,
         _ => value_cap(key),
     }
 }
@@ -256,25 +259,15 @@ fn shared_json(
     json: &[u8],
     acquire: bool,
 ) -> Result<Projection> {
-    if !matches!(
-        kind,
-        "account_window" | "usage.pending" | "file.census" | "proof.usage"
-    ) || json.first() != Some(&b'{')
-    {
+    let Some((field, class)) = shared(kind).filter(|_| json.first() == Some(&b'{')) else {
         return Ok(Projection {
             json: json.to_vec(),
             refs: Vec::new(),
             created: Vec::new(),
         });
-    }
+    };
     let mut root: BTreeMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_slice(json)?;
-    let field = match kind {
-        "account_window" => "r",
-        "usage.pending" => "member_request_id_hashes",
-        "proof.usage" => "legacy_excluded_request_id_hashes",
-        _ => "b",
-    };
     let mut refs = Vec::new();
     let mut created = Vec::new();
     if let Some(raw) = root.get_mut(field) {
@@ -290,18 +283,15 @@ fn shared_json(
         };
         for value in values {
             if acquire {
-                let (id, new) = interning::resolve(tx, evidence_class(kind), value)?;
+                let (id, new) = interning::resolve(tx, class, value)?;
                 refs.push(RowKey::RequestSet(id));
                 if new {
                     created.push(RowKey::RequestSet(id));
                 }
                 *value = serde_json::json!({"$request_set":id});
             } else {
-                *value = interning::read(
-                    tx,
-                    evidence_class(kind),
-                    id(value).context("state_v2_shared_reference")?,
-                )?;
+                *value =
+                    interning::read(tx, class, id(value).context("state_v2_shared_reference")?)?;
             }
         }
         *raw = serde_json::value::RawValue::from_string(serde_json::to_string(&value)?)?;
@@ -357,11 +347,7 @@ pub(super) fn put<T: Serialize + ?Sized>(
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {
-        if !matches!(
-            kind,
-            "account_window" | "usage.pending" | "file.census" | "proof.usage"
-        ) && old.digest == codec::digest(&json)
-        {
+        if shared(kind).is_none() && old.digest == codec::digest(&json) {
             return Ok(old.clone());
         }
     }
@@ -602,10 +588,7 @@ pub(super) fn references(
     let RowKey::Record { kind, .. } = &h.key else {
         return Ok(());
     };
-    if !matches!(
-        kind.name(),
-        "account_window" | "usage.pending" | "file.census" | "proof.usage"
-    ) {
+    if shared(kind.name()).is_none() {
         return Ok(());
     }
     let bytes = codec::capture(value, value_cap(&h.key))?;
