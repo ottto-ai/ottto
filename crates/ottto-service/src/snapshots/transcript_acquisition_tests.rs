@@ -2028,6 +2028,11 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         tail.file.append(&usage(source, 140, 1, "fixture-model"));
+        let tail_index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            source,
+            Some(tail_cache.as_ref()),
+            tail_index,
+        );
         let mut scan = step_until(
             cached_scan(&tail, source, tail_index, &tail_cache, |_| {}),
             |scan| scan.active_file.is_some(),

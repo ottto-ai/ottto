@@ -2077,13 +2077,6 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
     }
 }
 
-/// This item's finished fold expired a copy-prefix hold.
-pub(crate) fn copy_hold_expired(item: &SnapshotItem) -> bool {
-    item.claude_money
-        .as_deref()
-        .is_some_and(|fold| fold.prefix.hold_expired > 0)
-}
-
 /// Removal decisions of one page for the index's stored copy removals.
 #[derive(Debug, Default)]
 pub(crate) struct CopyRemovalUpdates {
@@ -2095,7 +2088,9 @@ impl CopyRemovalUpdates {
     /// The bounded replacement carries stored decisions and retry debt in the
     /// same index save. A refused decision still removes proven copies.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
+        index.copy_holds_ended.clear();
         if let Some(state) = self.state {
+            index.copy_holds_ended = index.claude_copy_removals.holds_ended_by(&state);
             index.claude_copy_removals = state;
         }
         diag("copy_removal_stored", self.added);

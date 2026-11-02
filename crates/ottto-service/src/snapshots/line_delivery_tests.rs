@@ -2499,7 +2499,12 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let today = days_from_now(0);
     let clamp_events = std::cell::Cell::new(0_u64);
     let last_page = RefCell::new(Value::Null);
-    let page = |mut index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+    let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+        let mut index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         cache.bind_withheld(&mut index);
         let recorder = Recorder::default();
         let ((index, result, _), rows) = capture(|| {

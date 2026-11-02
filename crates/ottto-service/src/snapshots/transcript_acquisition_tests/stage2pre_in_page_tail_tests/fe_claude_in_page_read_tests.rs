@@ -1153,8 +1153,10 @@ fn fe_claude_census_reread_in_window_gives_member_changed() {
     );
     let observed = record_claude_native_observations(&next, &mut index);
     assert_eq!(
-        observed.counts.page_invalidated_member_changed_count, 1,
-        "census member_changed: counted once"
+        observed.counts.page_invalidated_member_changed_count,
+        1,
+        "census member_changed: counted once; cold loaded={}",
+        crate::snapshots::state_v2::money_test_support::usage_loaded(&index, SESSION),
     );
     assert!(
         crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&index)

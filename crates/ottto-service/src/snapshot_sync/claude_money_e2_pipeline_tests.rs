@@ -3827,6 +3827,7 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
+            let g3_removals = format!("{:?}", prior.claude_copy_removals);
             let mut quiet = ready(&c, &scanner, prior, 100, sampled);
             if sampled {
                 // The expired hold's stored re-finalization differs from the
@@ -3837,7 +3838,8 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 let copy = body(&quiet, COPY).expect("the withheld body is delivered");
                 assert_eq!(
                     (copy.request_count, copy.removed_request_count),
-                    (3, Some(0))
+                    (3, Some(0)),
+                    "removals before this read: {g3_removals}"
                 );
                 let settled = settle(&c, &quiet.committed.clone(), quiet, &mut progress);
                 quiet = ready(&c, &scanner, settled, 100, sampled);

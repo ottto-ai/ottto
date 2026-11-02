@@ -3600,6 +3600,9 @@ pub struct ScanIndex {
     pub(crate) archive_pass: sampled_scan::ArchivePass,
     #[serde(skip)]
     withheld_memo: withheld_account::Memo,
+    /// Copy holds this page's decision ended, so a withheld body can owe them.
+    #[serde(skip)]
+    pub(crate) copy_holds_ended: BTreeSet<claude_money_birth_store::LocationKey>,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -4310,6 +4313,7 @@ impl Default for ScanIndex {
             archives: BTreeMap::new(),
             archive_deferred_alarm_count: 0,
             withheld_memo: Default::default(),
+            copy_holds_ended: Default::default(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
@@ -8599,11 +8603,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             final_group_fingerprint != pending.previous_snapshot_fingerprint
                 || final_upload_body_witness != pending.previous_upload_body_witness
         }) {
-            let hold_expired = result.snapshots.iter().any(|snapshot| {
-                snapshot.source_file_fingerprint.as_ref() == Some(&pending.source_file_fingerprint)
-                    && claude_request_money::e2::copy_hold_expired(snapshot)
-            });
-            stored_refinalize::withhold_for_native(index, pending, reason, hold_expired);
+            stored_refinalize::withhold_for_native(index, pending, reason);
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             continue;
         }

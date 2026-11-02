@@ -927,10 +927,25 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     let index_path = fixture.dir.join("held-index.json");
     for _ in 0..2 {
         let committed = index.clone();
+        let g3_traversal = format!(
+            "{:?}",
+            index.traversal.as_ref().map(|t| (
+                t.pending_candidates.len(),
+                t.pending_directories.len(),
+                t.listing_started_unix_seconds,
+                t.scan_roots.clone(),
+            ))
+        );
         let ((working, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet")
         });
-        assert_eq!(modes, (0, 0, 1), "{}", g3_page_facts(&diagnostics));
+        assert_eq!(
+            modes,
+            (0, 0, 1),
+            "{} traversal_before={g3_traversal} due={due} files={}",
+            g3_page_facts(&diagnostics),
+            working.files.len(),
+        );
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(working.files[&key].has_unverified_source());
         // Exercise the actual partial-save/held-body reconciliation. An

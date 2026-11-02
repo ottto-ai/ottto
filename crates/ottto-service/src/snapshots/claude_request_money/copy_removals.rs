@@ -128,6 +128,14 @@ impl CopyRemovals {
             Err(_) => {}
         }
     }
+    /// Files holding here and no longer in `next`.
+    pub(crate) fn holds_ended_by(&self, next: &Self) -> BTreeSet<LocationKey> {
+        self.files
+            .iter()
+            .filter(|(file, attempts, _)| *attempts > 0 && !next.pending(*file))
+            .map(|(file, _, _)| *file)
+            .collect()
+    }
     pub(crate) fn clear_hold(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
             if self.files[i].2.is_empty() {

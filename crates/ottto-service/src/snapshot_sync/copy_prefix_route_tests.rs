@@ -92,15 +92,19 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
             first.modes
         );
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
-        eprintln!(
-            "G3DIAG copy_prefix {} first_modes={:?} copy_owed={} copy_earned={} holder_owed={} acks={}",
-            crate::snapshots::e2_pipeline_scan_fixture::head_facts_for_test(&prior),
-            first.modes,
-            upload_context_owed_for_test(&prior, &path),
-            crate::snapshots::e2_pipeline_scan_fixture::upload_context_receipt_earned_for_test(&prior, &path),
-            upload_context_owed_for_test(&prior, &holder),
-            first.scan.snapshots.len(),
-        );
+        {
+            let mut active = prior.clone();
+            active.activate_upload_context("e2-synthetic-destination".into());
+            eprintln!(
+                "G3DIAG copy_prefix {} first_modes={:?} copy_owed={} copy_earned={} holder_owed={} acks={}",
+                crate::snapshots::e2_pipeline_scan_fixture::head_facts_for_test(&prior),
+                first.modes,
+                upload_context_owed_for_test(&active, &path),
+                crate::snapshots::e2_pipeline_scan_fixture::upload_context_receipt_earned_for_test(&active, &path),
+                upload_context_owed_for_test(&active, &holder),
+                first.scan.snapshots.len(),
+            );
+        }
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, at) in [("d", D.1), ("e", "2026-08-02T07:09:10Z")] {

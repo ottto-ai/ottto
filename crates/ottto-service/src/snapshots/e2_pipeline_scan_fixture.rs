@@ -42,8 +42,24 @@ pub(crate) fn routed_for_test(
     // A save and reload drops the runtime-only fields; the RAM-era fixture
     // passed every prior in memory, so each page keeps them.
     let runtime = runtime_only(&index);
+    let g3_prior = index.traversal.clone();
     let carry = |mut loaded: ScanIndex| {
         carry_runtime(&runtime, &mut loaded);
+        if serde_json::to_vec(&g3_prior).ok() != serde_json::to_vec(&loaded.traversal).ok() {
+            eprintln!(
+                "G3DIAG traversal differs across route reload: prior={:?} loaded={:?}",
+                g3_prior.as_ref().map(|t| (
+                    t.pending_candidates.len(),
+                    t.pending_directories.len(),
+                    t.listing_started_unix_seconds
+                )),
+                loaded.traversal.as_ref().map(|t| (
+                    t.pending_candidates.len(),
+                    t.pending_directories.len(),
+                    t.listing_started_unix_seconds
+                )),
+            );
+        }
         loaded
     };
     let mut own = cache.test_route.lock().unwrap();
@@ -179,6 +195,7 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
     into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
+    into.withheld_memo = from.withheld_memo.clone();
 }
 
 /// An empty graph holding only `index`'s runtime-only fields.
@@ -320,7 +337,7 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
     let Some(route) = route_of(index) else {
         return index.save(path).unwrap();
     };
-    index.save(&route).unwrap();
+    save_on_route(index, &route).unwrap();
     let mut copy = state_v2::money_test_support::resident(index);
     copy.v2_mut().persistence_v2 = None;
     // A fresh copy each save: its generation is the route's, not this file's.
