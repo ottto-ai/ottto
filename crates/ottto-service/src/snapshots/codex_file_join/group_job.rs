@@ -32,7 +32,7 @@ pub(in crate::snapshots) fn new_group_parser(
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
     evidence: codex_counting_version::AckEvidence,
-) -> Result<OwnedJsonlParser> {
+) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
         Some(&member.path),
         None,
@@ -49,7 +49,7 @@ pub(in crate::snapshots) fn new_group_parser(
         artifacts,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
-    Ok(parser)
+    Ok(Box::new(parser))
 }
 
 #[cfg(test)]

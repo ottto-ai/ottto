@@ -37,6 +37,7 @@ fn warm_delivered(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     warm.finish();
     deliver(&mut warm);
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+    assert!(disk.records() > 0, "the warm owner persists its records");
     (scanner, prior)
 }
 
@@ -54,6 +55,7 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// restart between pages.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
@@ -61,7 +63,7 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         let mut c = corpus("resumed_copy_prefix_dedupe");
         let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
         input_clock(&holder);
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_delivered(&c, &disk);
         let path = c.write_at(
             &file(COPY),
