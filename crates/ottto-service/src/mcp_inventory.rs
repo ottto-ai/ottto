@@ -1984,9 +1984,6 @@ fn clear_org_disabled_marker(path: &Path) {
 /// Gating is implicit and safe: harvest only runs for sources the relay device
 /// has been granted (`enabled_snapshot_sources`), and only when the device is
 /// registered at all — so telemetry-off ⇒ no device/sources ⇒ no harvest.
-pub fn spawn_mcp_inventory_sync() -> Result<()> {
-    spawn_inventory_sync(None)
-}
 pub fn spawn_mcp_inventory_sync_for_daemon(daemon: &crate::LocalDaemon) -> Result<()> {
     spawn_inventory_sync(Some(daemon.codex_versions.clone()))
 }

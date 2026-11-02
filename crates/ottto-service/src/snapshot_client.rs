@@ -1897,13 +1897,6 @@ impl SnapshotApiClient {
         self.api_base_url == expected
     }
 
-    pub fn from_env() -> Self {
-        Self::new(
-            std::env::var("OTTTO_API_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
-        )
-    }
-
     pub fn new(api_base_url: impl Into<String>) -> Self {
         // Clients are constructed per sync/upload cycle, but the underlying
         // agents (and their connection pools) are process-wide and shared with
@@ -2832,14 +2825,6 @@ impl SnapshotApiClient {
     /// Upload one bounded, content-free cloud-session batch using the same
     /// source-scoped relay principal as local snapshots. Response bodies are
     /// never retained on auth/contract failures.
-    pub fn upload_cloud_session_batch(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        self.upload_cloud_session_batch_with_timeout(
-            relay_token,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn upload_cloud_session_batch_with_timeout(
         &self,
         relay_token: &str,
@@ -2980,20 +2965,6 @@ impl SnapshotApiClient {
     }
 
     /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
-    pub fn finalize_cloud_session_scan(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        self.finalize_cloud_session_scan_with_timeout(
-            relay_token,
-            scan_id,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn finalize_cloud_session_scan_with_timeout(
         &self,
         relay_token: &str,
