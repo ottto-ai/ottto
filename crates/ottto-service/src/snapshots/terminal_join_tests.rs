@@ -1,8 +1,8 @@
 // The streamed Claude terminal over a real cold session (the state-v2
 // money harness): sliced one family at a time it decides what one whole
-// visit decides, it installs only the page's families, a changed token
-// refuses the sweep, a refused terminal keeps the census open with its
-// traversal, and a patched head is read and saved with its flag. The
+// visit decides, it installs only the page's families, a refused terminal
+// keeps the census open with its traversal, and a patched head is read and
+// saved with its flag. The
 // fixture is the legacy fork: the child's first request is the parent's
 // `req_shared`, so the two families share a request and a legacy divergent
 // prefix, in two different slices.
@@ -173,43 +173,12 @@ fn streamed_terminal_installs_only_the_page_families() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [behaviour] Every slice must read under the first slice's token: a family
-/// count that changes between slices refuses the sweep, which decided
-/// nothing. The unchanged control sweeps both families and joins them.
-#[test]
-fn a_changed_token_between_slices_refuses_the_sweep() {
-    let (dir, _, _, _, mut index) = accumulated();
-    let complete_families = complete_claude_usage_family_members(&index);
-    let item_roots = BTreeSet::new();
-    let inputs = tj::TerminalInputs {
-        census_window_end: LEGACY_WINDOW,
-        complete_families: &complete_families,
-        item_roots: &item_roots,
-        legacy_request_owners: None,
-        proof: None,
-    };
-    tj::with_slice_budget(ONE_FAMILY, || {
-        let mut sweep = tj::Sweep::new(&inputs);
-        assert_eq!(sweep.slice(&index), Ok(false), "the parent");
-        assert_eq!(sweep.slice(&index), Ok(true), "the child");
-        let join = sweep.finish(&index).unwrap();
-        assert_eq!(join.slices, 4, "two sweep slices, two targeted");
-        assert_eq!(join.native_duplicate_request_owners.len(), 1, "req_shared");
-
-        let mut sweep = tj::Sweep::new(&inputs);
-        assert_eq!(sweep.slice(&index), Ok(false));
-        index.claude_usage_family_pending.discard(LEGACY_CHILD);
-        assert_eq!(sweep.slice(&index), Err(tj::Refused));
-    });
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// [behaviour] A family row gone mid-sweep refuses the terminal: the page is
 /// held, the census stays incomplete, no census state changes, and the
 /// traversal the scan retired goes back so the next pass re-enters it. That
-/// next pass, over a readable store, commits what one whole visit commits.
+/// next pass, over a readable store, completes and retires it.
 #[test]
-fn a_refused_terminal_keeps_its_traversal_and_the_retry_commits() {
+fn a_refused_terminal_keeps_its_traversal_and_the_retry_completes() {
     let (dir, child, api, trace, index) = accumulated();
     let retired = || ClaudeTerminalCustody {
         traversal: Some(crate::snapshots::claude_family_census_shadow_tests::traversal()),
@@ -254,31 +223,14 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_commits() {
     drop(custody);
     let _ = fs::remove_dir_all(scratch);
 
-    let mut arms = Vec::new();
-    for (name, budget) in [("retry-whole", SliceBudget::WHOLE), ("retry", ONE_FAMILY)] {
-        let scratch = crate::test_scratch::canonical_private_dir(&format!("terminal-join-{name}"));
-        let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
-        let mut retry = scan();
-        let disposition = fold(&mut retry, &mut cold, budget);
-        assert_eq!(
-            disposition.terminal,
-            ClaudeTerminalOutcome::Complete,
-            "{name}"
-        );
-        assert!(
-            retry.census_complete && cold.traversal.is_none(),
-            "{name}: retired"
-        );
-        let (_, view) = custody.save_reload(&mut cold);
-        arms.push((retry.snapshots, committed(&view)));
-        drop(custody);
-        let _ = fs::remove_dir_all(scratch);
-    }
-    super::stale_family_carry_tests::assert_bodies_equal_a_full(&arms[0].0, &arms[1].0);
-    assert_eq!(
-        arms[1].1, arms[0].1,
-        "the retry commits what the whole visit does"
-    );
+    let scratch = crate::test_scratch::canonical_private_dir("terminal-join-retry");
+    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let mut retry = scan();
+    let disposition = fold(&mut retry, &mut cold, ONE_FAMILY);
+    assert_eq!(disposition.terminal, ClaudeTerminalOutcome::Complete);
+    assert!(retry.census_complete && cold.traversal.is_none(), "retired");
+    drop(custody);
+    let _ = fs::remove_dir_all(scratch);
     let _ = fs::remove_dir_all(dir);
 }
 

@@ -9671,23 +9671,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
         disposition
     } else {
-        // The whole page quarantined: a complete census is refused, as a fold
-        // refuses a page it cannot read.
-        let terminal = if scan.census_complete {
-            ClaudeTerminalOutcome::Refused
-        } else {
-            ClaudeTerminalOutcome::NotTerminal
-        };
-        scan.census_complete = false;
-        ClaudeUsageAuthorityDisposition {
-            quarantined_source_session_ids: scan
-                .snapshots
-                .iter()
-                .map(|s| s.source_session_id.clone())
-                .collect(),
-            terminal,
-            ..Default::default()
-        }
+        claude_page_refused(&scan.snapshots, scan.census_complete)
     };
     // Cursor custody: the scan retired its traversal before this fold. A
     // refused terminal (an unreadable family, or the whole page quarantined)
@@ -9748,6 +9732,27 @@ fn claude_owned_start_eligible(
         .collect::<Vec<_>>()
 }
 
+/// The whole page quarantined: a complete census is refused, as a fold
+/// refuses a page it cannot read (persistence unavailable, or a family it
+/// cannot read).
+fn claude_page_refused(
+    snapshots: &[SnapshotItem],
+    census_complete: bool,
+) -> ClaudeUsageAuthorityDisposition {
+    ClaudeUsageAuthorityDisposition {
+        quarantined_source_session_ids: snapshots
+            .iter()
+            .map(|s| s.source_session_id.clone())
+            .collect(),
+        terminal: if census_complete {
+            ClaudeTerminalOutcome::Refused
+        } else {
+            ClaudeTerminalOutcome::NotTerminal
+        },
+        ..Default::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_claude_reported_usage_with_index_limits_and_current_files(
     snapshots: &mut [SnapshotItem],
@@ -9781,20 +9786,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         .iter()
         .map(|item| claude_snapshot_family_root_ref(item).to_owned())
         .collect::<BTreeSet<_>>();
-    let refused = |snapshots: &[SnapshotItem]| ClaudeUsageAuthorityDisposition {
-        quarantined_source_session_ids: snapshots
-            .iter()
-            .map(|s| s.source_session_id.clone())
-            .collect(),
-        terminal: if census_complete {
-            ClaudeTerminalOutcome::Refused
-        } else {
-            ClaudeTerminalOutcome::NotTerminal
-        },
-        ..Default::default()
-    };
     if state_v2::load_usage(index, &page_roots).is_err() {
-        return refused(snapshots);
+        return claude_page_refused(snapshots, census_complete);
     }
     drop(page_roots);
 
@@ -9826,7 +9819,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         }) {
             Ok(counts) => counts,
             // The page's families were loaded above, so nothing accumulated.
-            Err(usage_pending::Unknown) => return refused(snapshots),
+            Err(usage_pending::Unknown) => return claude_page_refused(snapshots, census_complete),
         },
     };
     duplicate_census.census_complete = census_complete;
@@ -9966,7 +9959,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 duplicate_census.census_complete = false;
                 return ClaudeUsageAuthorityDisposition {
                     duplicate_census,
-                    ..refused(snapshots)
+                    ..claude_page_refused(snapshots, census_complete)
                 };
             }
         }

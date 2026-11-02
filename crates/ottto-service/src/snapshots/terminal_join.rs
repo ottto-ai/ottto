@@ -116,171 +116,145 @@ pub(super) struct TerminalJoin {
     pub(super) installed_families: usize,
 }
 
-/// Sweep 1 under construction; resumes from its cursor slice by slice.
-pub(super) struct Sweep<'a> {
-    inputs: &'a TerminalInputs<'a>,
-    join: TerminalJoin,
-    after: Option<String>,
-    token: Option<UsageToken>,
-    visited: usize,
-}
-
-/// Sweep every family and join them, or refuse the terminal.
+/// Sweep every family and join them, or refuse the terminal. One token
+/// covers every slice of both visits: a store changed between slices, or a
+/// sweep that missed a family, refuses.
 pub(super) fn sweep(
     index: &ScanIndex,
     inputs: &TerminalInputs<'_>,
 ) -> Result<TerminalJoin, Refused> {
-    let mut sweep = Sweep::new(inputs);
-    while !sweep.slice(index)? {}
-    sweep.finish(index)
-}
-
-impl<'a> Sweep<'a> {
-    pub(super) fn new(inputs: &'a TerminalInputs<'a>) -> Self {
-        Self {
-            inputs,
-            join: TerminalJoin::default(),
-            after: None,
-            token: None,
-            visited: 0,
-        }
-    }
-
-    /// One slice from the cursor; `true` once every family was visited.
-    pub(super) fn slice(&mut self, index: &ScanIndex) -> Result<bool, Refused> {
-        let inputs = self.inputs;
-        let join = &mut self.join;
+    let mut join = TerminalJoin::default();
+    let mut after: Option<String> = None;
+    let mut token: Option<UsageToken> = None;
+    let mut visited = 0_usize;
+    loop {
         let end: SliceEnd = state_v2::visit_usage_ordered(
             index,
             None,
-            self.after.as_deref(),
+            after.as_deref(),
             slice_budget(),
             &mut |root, family| join.add(index, inputs, root, family),
         )
         .map_err(|_| Refused)?;
-        self.join.note_slice(index, &end);
-        self.visited = self.visited.saturating_add(end.visited);
-        if *self.token.get_or_insert(end.token) != end.token {
+        join.note_slice(index, &end);
+        visited = visited.saturating_add(end.visited);
+        if *token.get_or_insert(end.token) != end.token {
             return Err(Refused);
         }
-        self.after = end.last_root;
-        Ok(self.after.is_none())
+        after = end.last_root;
+        if after.is_none() {
+            break;
+        }
     }
-
-    /// Check coverage, then resolve the cross-family joins.
-    pub(super) fn finish(mut self, index: &ScanIndex) -> Result<TerminalJoin, Refused> {
-        let token = self.token.ok_or(Refused)?;
-        if self.after.is_some() || token.families != self.visited {
-            return Err(Refused);
-        }
-        let inputs = self.inputs;
-        let join = &mut self.join;
-        join.entries.sort_unstable();
-        // Requests in two or more current-window owners' occurrences.
-        let both = OCCURRENCE | CURRENT;
-        let duplicated = join
-            .entries
-            .chunk_by(|a, b| a.0 == b.0)
-            .filter_map(|run| {
-                let owners = run
-                    .iter()
-                    .filter(|(_, _, flags)| flags & both == both)
-                    .map(|(_, owner, _)| *owner)
-                    .collect::<Vec<_>>();
-                (owners.len() > 1).then(|| (run[0].0, owners))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let duplicate_roots = duplicated
-            .values()
-            .flatten()
-            .map(|owner| join.owners[*owner as usize].0.clone())
-            .collect::<BTreeSet<_>>();
-        // A legacy fork prefix is shared only by families whose root
-        // sequences start with the same request.
-        let candidate_first_keys = join
-            .candidates
-            .iter()
-            .filter_map(|root| join.first_keys.get(root))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let group = join
-            .first_keys
-            .iter()
-            .filter(|(_, key)| candidate_first_keys.contains(*key))
-            .map(|(root, _)| root.clone())
-            .collect::<BTreeSet<_>>();
-        let targeted = group
-            .union(&duplicate_roots)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut names = BTreeMap::<RequestKey, String>::new();
-        let mut group_pending = BTreeMap::<String, ClaudeUsageFamilyPending>::new();
-        let mut after: Option<String> = None;
-        while !targeted.is_empty() {
-            let end: SliceEnd = state_v2::visit_usage_ordered(
-                index,
-                Some(&targeted),
-                after.as_deref(),
-                slice_budget(),
-                &mut |root, family| {
-                    if group.contains(root) {
-                        group_pending.insert(root.to_owned(), family.clone());
-                    }
-                    if duplicate_roots.contains(root) {
-                        for hash in family.member_occurrences.values().flat_map(BTreeMap::keys) {
-                            let key = lenient_decode::repair_key(hash);
-                            if duplicated.contains_key(&key) && !names.contains_key(&key) {
-                                names.insert(key, hash.clone());
-                            }
+    let token = token.ok_or(Refused)?;
+    if token.families != visited {
+        return Err(Refused);
+    }
+    join.entries.sort_unstable();
+    // Requests in two or more current-window owners' occurrences.
+    let both = OCCURRENCE | CURRENT;
+    let duplicated = join
+        .entries
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter_map(|run| {
+            let owners = run
+                .iter()
+                .filter(|(_, _, flags)| flags & both == both)
+                .map(|(_, owner, _)| *owner)
+                .collect::<Vec<_>>();
+            (owners.len() > 1).then(|| (run[0].0, owners))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let duplicate_roots = duplicated
+        .values()
+        .flatten()
+        .map(|owner| join.owners[*owner as usize].0.clone())
+        .collect::<BTreeSet<_>>();
+    // A legacy fork prefix is shared only by families whose root
+    // sequences start with the same request.
+    let candidate_first_keys = join
+        .candidates
+        .iter()
+        .filter_map(|root| join.first_keys.get(root))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let group = join
+        .first_keys
+        .iter()
+        .filter(|(_, key)| candidate_first_keys.contains(*key))
+        .map(|(root, _)| root.clone())
+        .collect::<BTreeSet<_>>();
+    let targeted = group
+        .union(&duplicate_roots)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeMap::<RequestKey, String>::new();
+    let mut group_pending = BTreeMap::<String, ClaudeUsageFamilyPending>::new();
+    let mut after: Option<String> = None;
+    while !targeted.is_empty() {
+        let end: SliceEnd = state_v2::visit_usage_ordered(
+            index,
+            Some(&targeted),
+            after.as_deref(),
+            slice_budget(),
+            &mut |root, family| {
+                if group.contains(root) {
+                    group_pending.insert(root.to_owned(), family.clone());
+                }
+                if duplicate_roots.contains(root) {
+                    for hash in family.member_occurrences.values().flat_map(BTreeMap::keys) {
+                        let key = lenient_decode::repair_key(hash);
+                        if duplicated.contains_key(&key) && !names.contains_key(&key) {
+                            names.insert(key, hash.clone());
                         }
                     }
-                },
-            )
-            .map_err(|_| Refused)?;
-            join.note_slice(index, &end);
-            if end.token != token {
-                return Err(Refused);
-            }
-            after = end.last_root;
-            if after.is_none() {
-                break;
-            }
+                }
+            },
+        )
+        .map_err(|_| Refused)?;
+        join.note_slice(index, &end);
+        if end.token != token {
+            return Err(Refused);
         }
-        for (key, owners) in duplicated {
-            let hash = names.remove(&key).ok_or(Refused)?;
-            let owners = owners
-                .into_iter()
-                .map(|owner| {
-                    let (root, member) = &join.owners[owner as usize];
-                    claude_duplicate_request_owner(root, member)
-                })
-                .collect();
-            join.native_duplicate_request_owners.insert(hash, owners);
+        after = end.last_root;
+        if after.is_none() {
+            break;
         }
-        // Each candidate proves with the exclusion the whole-load join gives
-        // it: another sequence sharing its prefix is in its group.
-        let exclusions = derive_claude_legacy_usage_exclusions(
-            inputs.complete_families,
-            &group_pending,
-            inputs.legacy_request_owners,
-        );
-        for root in std::mem::take(&mut join.candidates) {
-            if let (Some(members), Some(pending)) = (
-                inputs.complete_families.get(&root),
-                group_pending.get(&root),
-            ) {
-                join.prove(
-                    index,
-                    inputs,
-                    &root,
-                    members,
-                    pending,
-                    exclusions.get(&root),
-                );
-            }
-        }
-        Ok(self.join)
     }
+    for (key, owners) in duplicated {
+        let hash = names.remove(&key).ok_or(Refused)?;
+        let owners = owners
+            .into_iter()
+            .map(|owner| {
+                let (root, member) = &join.owners[owner as usize];
+                claude_duplicate_request_owner(root, member)
+            })
+            .collect();
+        join.native_duplicate_request_owners.insert(hash, owners);
+    }
+    // Each candidate proves with the exclusion the whole-load join gives
+    // it: another sequence sharing its prefix is in its group.
+    let exclusions = derive_claude_legacy_usage_exclusions(
+        inputs.complete_families,
+        &group_pending,
+        inputs.legacy_request_owners,
+    );
+    for root in std::mem::take(&mut join.candidates) {
+        if let (Some(members), Some(pending)) = (
+            inputs.complete_families.get(&root),
+            group_pending.get(&root),
+        ) {
+            join.prove(
+                index,
+                inputs,
+                &root,
+                members,
+                pending,
+                exclusions.get(&root),
+            );
+        }
+    }
+    Ok(join)
 }
 
 impl TerminalJoin {
