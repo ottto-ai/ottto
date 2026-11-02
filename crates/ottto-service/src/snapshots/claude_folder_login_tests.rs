@@ -272,7 +272,8 @@ fn parsed(birth: u64, lines: &[Value]) -> (PathBuf, Vec<SnapshotItem>) {
     let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
     std::fs::write(&path, body).unwrap();
     let items = crate::snapshots::claude_request_money::e2::with_fixture_birth(birth, || {
-        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+        // The plain parser: an ordinary-money fixture builds no fold.
+        crate::snapshots::parse_claude_code_jsonl_file(
             &path,
             "2026-08-02T07:10:00Z",
             "fingerprint".to_string(),

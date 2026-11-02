@@ -236,10 +236,14 @@ impl FolderRecord {
         if self.census_complete && self.covered_from.is_some() {
             return;
         }
+        // Request-owned hours are built after this point; the occurrences are
+        // the same requests.
         let earliest = item
-            .usage_buckets
-            .iter()
-            .filter_map(|bucket| OffsetDateTime::parse(&bucket.bucket_start, &Rfc3339).ok())
+            .claude_usage_occurrences
+            .values()
+            .filter(|occurrence| !occurrence.usage.is_zero())
+            .filter_map(|occurrence| occurrence.timestamp.as_deref())
+            .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
             .map(|at| at.unix_timestamp().div_euclid(HOUR_SECONDS) * HOUR_SECONDS)
             .min();
         self.covered_from = match (self.covered_from, earliest) {
