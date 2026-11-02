@@ -75,13 +75,15 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
 ///   charged on the acquisition's active lease inside `stream_reserve_bytes`
 ///   with the funded 64 KiB stream scratch;
-/// - A0-h custody (spent, P2 witness) and Full-pacing nodes,
+/// - A0-h custody (spent, P2 witness) and Full stamp nodes,
 ///   2*513 nodes of <=1024 bytes = 1,050,624 bytes (`RETAIL_RESERVE_BYTES`);
 /// - Per-key debt/hold and restore-pending maps, 2*257 nodes of
-///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
+///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`);
+/// - The Full budget's waiting queues, 2*256 entries of <=48 bytes = 24,576
+///   bytes (`FULL_WAIT_RESERVE_BYTES`).
 ///
 /// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
-/// Total 2,204,088 bytes; the previous canonical pin was 1,978,368 bytes.
+/// Total 2,228,664 bytes; the previous canonical pin was 2,204,088 bytes.
 /// The 526,336-byte M3 key reserve is debited from STATE_BYTES, within the
 /// existing cache budget. Native/container evidence remains required; this
 /// explicit prepayment is separate from the retained graph's heap walk.
@@ -90,26 +92,27 @@ pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
     + 2 * (store::MAX_BATCH + 1) * 4096
     + super::RETAIL_RESERVE_BYTES
     + KEY_RESERVE_BYTES
+    + FULL_WAIT_RESERVE_BYTES
     + STALE_PREDECESSOR_RESERVE_BYTES;
 
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
 /// the receipt-debt/hold map (`owed::KeyDebt`) and the restore-pending
-/// map. Neither evicts live custody; debt pressure can reclaim idle diagnostics
-/// and expired pacing. Live-capacity overflow keeps the existing safe path.
+/// map. Neither evicts live custody; debt pressure can reclaim idle
+/// reservations. Live-capacity overflow keeps the existing safe path.
 pub(crate) const KEY_RESERVE_BYTES: usize = 2 * (store::MAX_RECORDS + 1) * 1024;
 const _: () = assert!(KEY_RESERVE_BYTES == 526_336);
 
 /// Process Tail grants whose accepted end lies within the restored
 /// certificate (no old bytes owed, the write-ahead steady state). They never
 /// take the never-evicted A0-h custody node; a write or receipt at the high
-/// water frees them. Overflow refuses toward the existing paced Full.
+/// water frees them. Overflow refuses toward the existing budgeted Full.
 const RESTORE_PENDING_KEYS: usize = store::MAX_RECORDS;
 
 /// P2: restored class-X head re-reads per source and pass. The sampled-read
 /// contract pays `2 * SAMPLE_BYTES` per restore; one cache-full of restores is
 /// 2 MiB, which still admits one maximal `HEAD_BOUND` re-read every pass.
-/// Past it a restore takes the existing counted, paced resource path.
+/// Past it a restore takes the existing counted, budgeted resource path.
 const REDERIVE_PASS_BYTES: u64 =
     2 * crate::transcript_acquisition::SAMPLE_BYTES as u64 * store::MAX_RECORDS as u64;
 const _: () = assert!(REDERIVE_PASS_BYTES >= codec::HEAD_BOUND + codec::TITLE_LINE_BOUND);
@@ -122,9 +125,6 @@ thread_local! {
 pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut()>>) {
     BEFORE_CARRIER_PROBE.with(|slot| *slot.borrow_mut() = hook);
 }
-
-const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
-const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
@@ -282,16 +282,120 @@ impl RetirementEdge {
     }
 }
 
-const PACE_SECS: u64 = 6 * 3600;
-// Sleep and implausible clock changes must fail toward reading.
-const PACE_SANITY_SECS: u64 = 7 * 86_400;
-const _: () = assert!(PACE_SECS < 86_400);
+/// Restore-path Full bytes admitted per source and pass. Past it the rest
+/// waits for the next pass, oldest first, so a burst cannot storm and no file
+/// waits on a clock. A larger file is admitted alone when it reaches the front.
+const FULL_PASS_BYTES: u64 = 256 * 1024 * 1024;
+/// Passes a budget-deferred restored head waits before its counted Full path.
+const REDERIVE_DEFER_PASSES: u32 = 4;
 
-fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
-    // Backwards and implausibly large forwards jumps both EXPIRE.
-    now.duration_since(at).is_ok_and(|age| {
-        age.as_secs() <= PACE_SANITY_SECS && age < std::time::Duration::from_secs(PACE_SECS)
-    })
+#[derive(Clone, Copy)]
+struct FullWait {
+    key: store::Digest32,
+    bytes: u64,
+    seen_pass: u32,
+}
+#[cfg(test)]
+const FULL_WAIT_RESERVE_BYTES: usize =
+    crate::snapshots::durable_sources::SOURCES.len() * store::MAX_RECORDS * 48;
+const _: () = assert!(size_of::<FullWait>() <= 48);
+
+/// One source's per-pass Full budget and its bounded oldest-first queue. A
+/// file past the queue's capacity keeps retrying and enrols when space frees.
+#[derive(Default)]
+struct FullBudget {
+    spent: u64,
+    pass: u32,
+    /// The queue's front entries covered by this pass's budget.
+    reserved: usize,
+    reserved_bytes: u64,
+    waiting: std::collections::VecDeque<FullWait>,
+}
+
+impl FullBudget {
+    fn begin_pass(&mut self, limit: u64) {
+        // A front entry that did not come back during its reserved pass has
+        // left this path; it cannot hold the budget. It re-enrols if it returns.
+        let (pass, reserved) = (self.pass, self.reserved);
+        let mut position = 0;
+        self.waiting.retain(|wait| {
+            let keep = position >= reserved || wait.seen_pass == pass;
+            position += 1;
+            keep
+        });
+        self.pass = pass.wrapping_add(1);
+        self.spent = 0;
+        self.reserved = 0;
+        self.reserved_bytes = 0;
+        for wait in &self.waiting {
+            if self.reserved > 0 && self.reserved_bytes.saturating_add(wait.bytes) > limit {
+                break;
+            }
+            self.reserved += 1;
+            self.reserved_bytes = self.reserved_bytes.saturating_add(wait.bytes);
+        }
+    }
+
+    /// `bypass` reads now and is still charged. Only `start` spends budget.
+    fn admit(
+        &mut self,
+        key: store::Digest32,
+        bytes: u64,
+        bypass: bool,
+        start: bool,
+        limit: u64,
+    ) -> bool {
+        let position = self.waiting.iter().position(|wait| wait.key == key);
+        let admitted = bypass
+            || match position {
+                Some(position) => position < self.reserved,
+                None => {
+                    (self.reserved == 0 && self.spent == 0)
+                        || self
+                            .spent
+                            .saturating_add(self.reserved_bytes)
+                            .saturating_add(bytes)
+                            <= limit
+                }
+            };
+        if admitted && start {
+            self.charge(key, bytes);
+            return true;
+        }
+        match position {
+            Some(position) => {
+                let pass = self.pass;
+                let wait = &mut self.waiting[position];
+                wait.seen_pass = pass;
+                if !admitted {
+                    wait.bytes = bytes;
+                }
+            }
+            None if !admitted && self.waiting.len() < store::MAX_RECORDS => {
+                self.waiting.push_back(FullWait {
+                    key,
+                    bytes,
+                    seen_pass: self.pass,
+                });
+            }
+            None => {}
+        }
+        admitted
+    }
+
+    /// Spends `bytes` and leaves the queue.
+    fn charge(&mut self, key: store::Digest32, bytes: u64) {
+        if let Some(position) = self.waiting.iter().position(|wait| wait.key == key) {
+            if position < self.reserved {
+                self.reserved -= 1;
+                self.reserved_bytes = self
+                    .reserved_bytes
+                    .saturating_sub(self.waiting[position].bytes);
+            }
+            self.waiting.remove(position);
+        }
+        self.spent = self.spent.saturating_add(bytes);
+    }
 }
 
 /// Content-free outcome counts, by class. Field paths are static names; no
@@ -309,13 +413,16 @@ pub(crate) struct Counters {
     pub(crate) retail_full: [u64; 3],
     pub(crate) stale_full: [u64; 3],
     pub(crate) near_cap: u64,
-    pub(crate) pace_anomaly: u64,
+    /// Restore-path Full refusals by the per-pass byte budget.
+    pub(crate) full_budget_deferred: u64,
+    /// Per source: bytes of started budgeted Fulls, bytes of refused attempts.
+    pub(crate) full_budget_bytes: [[u64; 2]; 3],
     pub(crate) upgrade_missing_full: u64,
     /// Immediate emission owns these per-source eviction totals exclusively.
     pub(crate) pace_evicted: [u64; 3],
-    /// Recovery Full/paced totals per source; eviction has its separate owner.
+    /// Recovery Full/deferred totals per source; eviction has its separate owner.
     recovery_full: [[u64; 2]; 3],
-    /// [Full, paced] per Claude/Codex/Pi; process-lifetime, not store-owned.
+    /// [Full, deferred] per Claude/Codex/Pi; process-lifetime, not store-owned.
     pub(crate) active_bound: [[u64; 2]; 3],
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
@@ -392,7 +499,7 @@ impl Counters {
         let on_refused = restart_restore::on_refused_discovery_dependency();
         format!(
             "ottto-service: durable_tail source={} restart_restore={switch} restart_restore_on_refused{{reason=discovery_dependency}}={on_refused} durable_restore_after_selection_clear={} \
-             retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} \
+             retail_attempts={} retail_keys={} near_cap={} full_budget_deferred={} full_budget_bytes[admitted,deferred]={:?} upgrade_missing_full={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} \
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -411,7 +518,8 @@ impl Counters {
             self.retail_attempts,
             self.retail_keys,
             self.near_cap,
-            self.pace_anomaly,
+            self.full_budget_deferred,
+            self.full_budget_bytes,
             self.upgrade_missing_full,
             self.retail_full,
             retail_bytes(source, 0),
@@ -530,7 +638,7 @@ struct Slot {
     indexed: usize,
 }
 
-/// Fixed-size stamp in the existing paid pacing node. Remember structural
+/// Fixed-size stamp in the existing paid node. Remember structural
 /// classification after the first no-record publication changes index binding.
 #[derive(Clone, Copy)]
 struct FullPace {
@@ -538,16 +646,26 @@ struct FullPace {
     structural: bool,
     flags: u8,
     head_extent: u32,
+    /// The budget pass of this head's first deferral.
+    deferred_pass: u32,
 }
 const HEAD_USED: u8 = 1;
-const FULL_SPENT: u8 = 2;
 const DEFERRED: u8 = 4;
-const NEAR_EXTRA: u8 = 8;
-const _: () = assert!(size_of::<FullPace>() <= 24);
+const _: () = assert!(size_of::<FullPace>() <= 32);
 fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
     match durable_source(source) {
         Some(ds) => store::key_digest(ds, key),
         None => store::context_digest(source.api_slug(), Some(key)),
+    }
+}
+
+impl Stores {
+    fn full_pass_bytes(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = self.full_pass_bytes_for_test {
+            return limit;
+        }
+        FULL_PASS_BYTES
     }
 }
 
@@ -644,9 +762,12 @@ pub(crate) struct Stores {
     key_debt: BTreeMap<store::Digest32, Box<owed::KeyDebt>>,
     /// P2 restored head bytes reserved this pass, per durable source.
     rederive_spent: [u64; crate::snapshots::durable_sources::SOURCES.len()],
+    full_budget: [FullBudget; crate::snapshots::durable_sources::SOURCES.len()],
     retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
     retail_full_now: Option<std::time::SystemTime>,
+    #[cfg(test)]
+    full_pass_bytes_for_test: Option<u64>,
     /// G3: a source whose owed key could not be enrolled stays conservatively
     /// owed until reconstruction or a disabled store clears it.
     owed_overflow: [bool; crate::snapshots::durable_sources::SOURCES.len()],
@@ -700,9 +821,12 @@ impl Default for Stores {
             restore_pending: BTreeMap::new(),
             key_debt: BTreeMap::new(),
             rederive_spent: Default::default(),
+            full_budget: Default::default(),
             retail_full_at: BTreeMap::new(),
             #[cfg(test)]
             retail_full_now: None,
+            #[cfg(test)]
+            full_pass_bytes_for_test: None,
             owed_overflow: Default::default(),
             d3: Default::default(),
         }
@@ -834,7 +958,7 @@ impl Stores {
         }
         if let Some(pending) = prior.filter(|p| !zero_old || c.length < p.high) {
             if !self.fund_key(key) {
-                // Pending authority is kept; the paced Full reads instead.
+                // Pending authority is kept; the budgeted Full reads instead.
                 Counters::bump(&mut self.counters.ineligible, "retail_pending_unpromoted");
                 return Err(RetailHold::AccountingLost);
             }
@@ -1643,7 +1767,7 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::SystemTime,
     ) -> bool {
-        self.paced_full_for(
+        self.budgeted_full_for(
             SnapshotSource::ClaudeCode,
             key,
             file,
@@ -1671,10 +1795,10 @@ impl SharedCache {
             "revision_adoption_required" => 2,
             _ => return false,
         };
-        self.paced_cause_full(key, file, a.end, std::time::SystemTime::now(), Some(cause))
+        self.budgeted_cause_full(key, file, a.end, std::time::SystemTime::now(), Some(cause))
     }
 
-    fn paced_cause_full(
+    fn budgeted_cause_full(
         &self,
         key: &str,
         file: &File,
@@ -1682,7 +1806,7 @@ impl SharedCache {
         now: std::time::SystemTime,
         cause: Option<usize>,
     ) -> bool {
-        self.paced_full_for(
+        self.budgeted_full_for(
             SnapshotSource::ClaudeCode,
             key,
             file,
@@ -1692,24 +1816,24 @@ impl SharedCache {
         )
     }
 
-    /// The ONE paid map, keyed by source/file across causes. A probe may count
-    /// a delay, but only a starting acquisition enrols or spends an allowance.
-    fn paced_admission(
+    /// The ONE admission for restore-path Fulls across causes. A probe may count
+    /// a delay, but only a starting acquisition enrols a stamp or spends budget.
+    fn budgeted_admission(
         &self,
         source: SnapshotSource,
         key: &str,
+        bytes: u64,
         now: std::time::SystemTime,
-        active_bound: bool,
-        near_cap: bool,
-        start: bool,
+        flags: (bool, bool, bool),
     ) -> bool {
-        self.paced_with_cause(source, key, now, (active_bound, near_cap, start), None)
+        self.budgeted_with_cause(source, key, bytes, now, flags, None)
     }
 
-    fn paced_with_cause(
+    fn budgeted_with_cause(
         &self,
         source: SnapshotSource,
         key: &str,
+        bytes: u64,
         now: SystemTime,
         (active_bound, near_cap, start): (bool, bool, bool),
         cause: Option<usize>,
@@ -1720,37 +1844,25 @@ impl SharedCache {
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
         let key = full_pace_key(source, key);
-        // A held replay key keeps its Full spend in never-evicted custody.
-        // The pace stamp remains the overflow fallback for unfunded keys.
-        let full_at = stores
-            .key_debt
-            .get(&key)
-            .and_then(|d| d.full_spend)
-            .map(|spend| spend.at)
-            .or_else(|| {
-                stores
-                    .retail_full_at
-                    .get(&key)
-                    .filter(|stamp| stamp.flags & FULL_SPENT != 0)
-                    .map(|stamp| stamp.at)
-            });
-        // Expiry releases the pace without losing structural classification.
-        // A no-record publication may already have changed the index binding.
-        if stores.retail_full_at.get(&key).is_some_and(|stamp| {
-            now.duration_since(stamp.at)
-                .map_or(true, |age| age.as_secs() > PACE_SANITY_SECS)
-        }) {
-            stores.counters.pace_anomaly += 1;
-        }
-        let delayed = !near_cap && full_at.is_some_and(|at| full_pace_delayed(at, now));
-        if !delayed && !start {
-            return true;
-        }
         let source_slot = match source {
             SnapshotSource::ClaudeCode => 0,
             SnapshotSource::Codex => 1,
             SnapshotSource::Pi => 2,
         };
+        let limit = stores.full_pass_bytes();
+        // Rotation can remove discovery near the source cap: read now, charged.
+        let delayed = durable_source(source).is_some_and(|ds| {
+            !stores.full_budget[ds.slot()].admit(key, bytes, near_cap, start, limit)
+        });
+        if delayed {
+            stores.counters.full_budget_deferred += 1;
+            stores.counters.full_budget_bytes[source_slot][1] += bytes;
+        } else if start {
+            stores.counters.full_budget_bytes[source_slot][0] += bytes;
+        }
+        if !delayed && !start {
+            return true;
+        }
         let mut evicted = false;
         if !delayed {
             if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS
@@ -1781,16 +1893,10 @@ impl SharedCache {
                     structural,
                     flags: 0,
                     head_extent: 0,
+                    deferred_pass: 0,
                 });
                 stamp.at = now;
                 stamp.structural = structural;
-                stamp.flags = (stamp.flags | FULL_SPENT) & !NEAR_EXTRA;
-            }
-            if let Some(debt) = stores.key_debt.get_mut(&key) {
-                debt.full_spend = Some(owed::FullSpend {
-                    at: now,
-                    near_extra: false,
-                });
             }
         }
         if let Some(stamp) = stores.retail_full_at.get_mut(&key).filter(|_| active_bound) {
@@ -1844,7 +1950,7 @@ impl SharedCache {
         file: &File,
         index: &ScanIndex,
     ) -> bool {
-        grown(file, index, key) && self.active_bound_pace(source, key, file, false)
+        grown(file, index, key) && self.active_bound_budget(source, key, file, false)
     }
 
     pub(in crate::snapshots) fn start_active_bound_full(
@@ -1853,10 +1959,10 @@ impl SharedCache {
         key: &str,
         file: &File,
     ) -> bool {
-        self.active_bound_pace(source, key, file, true)
+        self.active_bound_budget(source, key, file, true)
     }
 
-    fn active_bound_pace(
+    fn active_bound_budget(
         &self,
         source: SnapshotSource,
         key: &str,
@@ -1866,19 +1972,18 @@ impl SharedCache {
         let Ok(metadata) = file.metadata() else {
             return false;
         };
-        self.paced_admission(
+        self.budgeted_admission(
             source,
             key,
+            metadata.len(),
             std::time::SystemTime::now(),
-            true,
-            near_source_cap(source, metadata.len()),
-            start,
+            (true, near_source_cap(source, metadata.len()), start),
         )
     }
 
     /// Compatibility entry for resource leaves: the single b4/A0-h map owns
     /// stamps and eviction emission for all causes; spend custody is separate.
-    fn paced_growth_full(
+    fn budgeted_growth_full(
         &self,
         source: SnapshotSource,
         key: &str,
@@ -1887,10 +1992,10 @@ impl SharedCache {
         now: SystemTime,
         _cause: &'static str,
     ) -> bool {
-        self.paced_full_for(source, key, file, accepted_end, now, None)
+        self.budgeted_full_for(source, key, file, accepted_end, now, None)
     }
 
-    fn paced_full_for(
+    fn budgeted_full_for(
         &self,
         source: SnapshotSource,
         key: &str,
@@ -1905,9 +2010,10 @@ impl SharedCache {
         if metadata.len() <= accepted_end {
             return false;
         }
-        let allowed = self.paced_with_cause(
+        let allowed = self.budgeted_with_cause(
             source,
             key,
+            metadata.len(),
             now,
             (false, near_source_cap(source, metadata.len()), true),
             cause,
@@ -1930,11 +2036,11 @@ impl SharedCache {
                 Counters::bump(
                     &mut stores.counters.ineligible,
                     if cause == 4 {
-                        "upgrade_state_missing.paced"
+                        "upgrade_state_missing.byte_budget"
                     } else if cause == 3 {
-                        "old_binding_no_match.paced"
+                        "old_binding_no_match.byte_budget"
                     } else {
-                        "stale_full.paced"
+                        "stale_full.byte_budget"
                     },
                 );
             }
@@ -2017,7 +2123,7 @@ impl SharedCache {
         Ok(true)
     }
 
-    /// Committed growth uses the ordinary per-key Full pace.
+    /// Committed growth uses the ordinary per-pass Full budget.
     pub(in crate::snapshots) fn no_match_full(
         &self,
         key: &str,
@@ -2028,7 +2134,7 @@ impl SharedCache {
         if a.revision > effective_revision(SnapshotSource::ClaudeCode) {
             return None;
         }
-        self.paced_cause_full(key, file, a.end, std::time::SystemTime::now(), Some(3))
+        self.budgeted_cause_full(key, file, a.end, std::time::SystemTime::now(), Some(3))
             .then_some(())
     }
 
@@ -2119,8 +2225,10 @@ impl SharedCache {
         };
         let dir = store::store_dir_for_index(index_path);
         if restart_restore::enabled() {
-            // P2 head budget is per pass; authorityless custody nodes are freed.
+            // P2 head and Full budgets are per pass; authorityless custody nodes are freed.
             stores.rederive_spent[source.slot()] = 0;
+            let limit = stores.full_pass_bytes();
+            stores.full_budget[source.slot()].begin_pass(limit);
             // A native error may discard staging without a publication. Its empty
             // reservation carries no authority and cannot pin next-pass capacity.
             stores.key_debt.retain(|_, debt| !debt.is_empty());
@@ -2612,7 +2720,7 @@ impl SharedCache {
     }
 
     /// A group reads as one unit. Reserve its existing history page and probe
-    /// every member's existing pace before spending any member's allowance.
+    /// every member's budget admission before charging any member.
     pub(in crate::snapshots) fn upgrade_group_full_allowed(
         &self,
         source: SnapshotSource,
@@ -2642,12 +2750,12 @@ impl SharedCache {
                 .missing_reduction_cause(source, &key)
                 .is_ok_and(|cause| cause == Some("repin"))
             {
-                retired.push(key);
+                retired.push((key, member.size_bytes));
             }
         }
         let digests: Vec<_> = retired
             .iter()
-            .map(|key| full_pace_key(source, key))
+            .map(|(key, _)| full_pace_key(source, key))
             .collect();
         if !digests.is_empty()
             && !self
@@ -2657,10 +2765,11 @@ impl SharedCache {
             return false;
         }
         // No input, file opens or other fallible admission remains between
-        // the all-member reservation and these ordinary paid-pace spends.
+        // the all-member reservation and these charges: the probes admitted
+        // the group as one read, so a member past the budget still reads.
         if !retired
             .iter()
-            .all(|key| self.start_missing_full(source, key))
+            .all(|(key, bytes)| self.start_missing_full(source, key, *bytes, true))
         {
             return false;
         }
@@ -2668,13 +2777,30 @@ impl SharedCache {
         true
     }
 
-    fn start_missing_full(&self, source: SnapshotSource, key: &str) -> bool {
-        if !self
-            .durable()
-            .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
-            || !self.paced_with_cause(
+    fn start_missing_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        bytes: u64,
+        group_admitted: bool,
+    ) -> bool {
+        let digest = full_pace_key(source, key);
+        if let Some(mut stores) = self.durable() {
+            if stores.fund_debt(digest).is_none() {
+                return false;
+            }
+            if let Some(ds) = durable_source(source).filter(|_| group_admitted) {
+                stores.full_budget[ds.slot()].charge(digest, bytes);
+                stores.counters.full_budget_bytes[diagnostic_source_slot(source)][0] += bytes;
+            }
+        } else {
+            return false;
+        }
+        if !group_admitted
+            && !self.budgeted_with_cause(
                 source,
                 key,
+                bytes,
                 SystemTime::now(),
                 (false, false, true),
                 Some(4),
@@ -2689,7 +2815,7 @@ impl SharedCache {
         true
     }
 
-    /// Missing reductions share one per-key pace. Retired-pin rebuilds also
+    /// Missing reductions share one per-pass budget. Retired-pin rebuilds also
     /// reserve the existing history page before the first native input.
     fn upgrade_full_admission(
         &self,
@@ -2737,11 +2863,12 @@ impl SharedCache {
                 return false;
             }
             return if start {
-                self.start_missing_full(source, key)
+                self.start_missing_full(source, key, metadata.len(), false)
             } else {
-                self.paced_with_cause(
+                self.budgeted_with_cause(
                     source,
                     key,
+                    metadata.len(),
                     SystemTime::now(),
                     (false, false, false),
                     Some(4),
@@ -2749,15 +2876,16 @@ impl SharedCache {
             };
         }
         if !start {
-            return self.paced_with_cause(
+            return self.budgeted_with_cause(
                 source,
                 key,
+                metadata.len(),
                 SystemTime::now(),
                 (false, near_source_cap(source, metadata.len()), false),
                 Some(4),
             );
         }
-        self.paced_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
+        self.budgeted_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
     }
 
     /// Q11 capacity/exhaustion is disclosed stale custody, never an integrity failure.
@@ -2883,7 +3011,7 @@ impl SharedCache {
             let entry = index.files.get(key);
             return RestoreOutcome::Miss(if entry.is_none() && !has_slot {
                 MissClass::NoEntry
-            } else if entry.is_some_and(|entry| entry.source_file_fingerprint.is_empty()) {
+            } else if selection_cleared(index, key) {
                 MissClass::SelectionCleared
             } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
                 MissClass::HistoryOwed
@@ -3011,12 +3139,12 @@ impl SharedCache {
             interpretation,
             &mut lease,
         ) {
-            // A re-armed entry (cleared selection) whose record cannot serve
-            // takes OFF's path for every source: OFF's immediate Full, never a
-            // pace or stale hold. The S2 floor below still holds first, and an
-            // unknown accepted floor stays closed.
+            // A re-armed entry (cleared selection) whose record's binding no
+            // longer matches takes OFF's immediate Full, unbudgeted. Claude
+            // arrives here; Codex returns the same class from its selection
+            // gate. The S2 floor below still holds first.
             Err(RestoreOutcome::Stale(reason) | RestoreOutcome::StaleUnregistered(reason, _))
-                if reason != "accepted_floor_missing" && selection_cleared(index, key) =>
+                if reason == "old_binding_no_match" && selection_cleared(index, key) =>
             {
                 Err(MissClass::StaleSelection.into())
             }
@@ -3036,10 +3164,7 @@ impl SharedCache {
                             );
                             stores.counters.durable_restore_after_selection_clear += u64::from(
                                 snapshot_source == SnapshotSource::ClaudeCode
-                                    && index
-                                        .files
-                                        .get(key)
-                                        .is_some_and(|e| e.source_file_fingerprint.is_empty()),
+                                    && selection_cleared(index, key),
                             );
                         }
                         RestoreOutcome::Restored(Box::new(taken), lease)
@@ -3168,17 +3293,16 @@ impl SharedCache {
             } else if source == SnapshotSource::Codex {
                 grown(held, index, key)
                     && held.metadata().is_ok_and(|m| {
-                        self.paced_admission(
+                        self.budgeted_admission(
                             source,
                             key,
+                            m.len(),
                             SystemTime::now(),
-                            false,
-                            near_source_cap(source, m.len()),
-                            false,
+                            (false, near_source_cap(source, m.len()), false),
                         )
                     })
             } else {
-                self.paced_growth_full(
+                self.budgeted_growth_full(
                     source,
                     key,
                     held,
@@ -3226,12 +3350,13 @@ impl SharedCache {
         let granted = if phase == "rederive_quiet" {
             // Restore itself read no input. The scanner already selected this
             // key for an ordinary reparse and checked its history-upgrade gate.
-            // Spend the existing cross-cause pace only at native Full start.
-            self.paced_admission(source, key, SystemTime::now(), false, false, true)
+            // Spend the existing cross-cause budget only at native Full start.
+            let bytes = file.metadata().map_or(0, |metadata| metadata.len());
+            self.budgeted_admission(source, key, bytes, SystemTime::now(), (false, false, true))
         } else if phase.starts_with("rederive_") || phase == "decode" {
             self.rederive_full(source, key, file, accepted_end, true)
         } else {
-            self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
+            self.budgeted_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
         };
         if !granted {
             return false;
@@ -3247,7 +3372,7 @@ impl SharedCache {
     }
 
     /// Count a re-armed entry's refused-record Full at the same input
-    /// boundary as the real Full selection counter. Never paced (OFF == ON).
+    /// boundary as the real Full selection counter. Never budgeted (OFF == ON).
     pub(in crate::snapshots) fn note_stale_selection_full(&self) {
         if let Some(mut stores) = self.durable() {
             Counters::bump(
@@ -3385,6 +3510,7 @@ impl SharedCache {
         let now = stores.retail_full_now.unwrap_or(now);
         let extent =
             u32::try_from(extent).map_err(|_| Failure::Resource("rederive_unsupported"))?;
+        let pass = stores.full_budget[ds.slot()].pass;
         let absent = !stores.retail_full_at.contains_key(&digest);
         if absent && stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
             if let Some(oldest) = stores
@@ -3406,6 +3532,7 @@ impl SharedCache {
             structural: false,
             flags: 0,
             head_extent: extent,
+            deferred_pass: pass,
         });
         if stamp.head_extent != extent {
             stamp.head_extent = extent;
@@ -3415,31 +3542,22 @@ impl SharedCache {
             return Err(Failure::Resource("rederive_paced"));
         }
         if stamp.flags & DEFERRED != 0
-            && now
-                .duration_since(stamp.at)
-                .map_or(true, |age| age.as_secs() >= PACE_SECS)
+            && pass.wrapping_sub(stamp.deferred_pass) >= REDERIVE_DEFER_PASSES
         {
             return Err(Failure::Resource("rederive_budget_aged"));
         }
         if deferred {
-            if stamp.flags & (DEFERRED | FULL_SPENT) == 0 {
-                stamp.at = now;
+            if stamp.flags & DEFERRED == 0 {
+                stamp.deferred_pass = pass;
             }
             stamp.flags |= DEFERRED;
         }
-        // Custody is funded independently of pace-node eviction. No synthetic
+        // Custody is funded independently of stamp eviction. No synthetic
         // receipt debt: this bit cannot block settlement/upload of other keys.
-        let prior_full = (stamp.flags & FULL_SPENT != 0).then_some(owed::FullSpend {
-            at: stamp.at,
-            near_extra: stamp.flags & NEAR_EXTRA != 0,
-        });
         let Some(debt) = stores.fund_debt(digest) else {
             stores.owed_overflow[ds.slot()] = true;
             return Err(Failure::Resource("rederive_custody"));
         };
-        if debt.full_spend.is_none() {
-            debt.full_spend = prior_full;
-        }
         debt.rederive_hold = Some(ds);
         if input {
             if debt.head_extent == Some(extent) {
@@ -3463,8 +3581,8 @@ impl SharedCache {
         Ok(())
     }
 
-    /// Re-derive failures share the cross-cause Full stamp, with at most one
-    /// extra near-cap read per six-hour window (rotation can remove discovery).
+    /// Re-derive failures share the cross-cause Full budget. Near the source
+    /// cap they read now, charged (rotation can remove discovery).
     fn rederive_full(
         &self,
         source: SnapshotSource,
@@ -3479,53 +3597,13 @@ impl SharedCache {
         if meta.len() <= accepted_end {
             return false;
         }
-        let now = SystemTime::now();
-        if self.paced_admission(source, key, now, false, false, start) {
-            return true;
-        }
-        if !near_source_cap(source, meta.len()) {
-            return false;
-        }
-        let Some(mut stores) = self.durable() else {
-            return false;
-        };
-        let digest = full_pace_key(source, key);
-        let spent_extra = stores
-            .key_debt
-            .get(&digest)
-            .and_then(|d| d.full_spend)
-            .map(|spend| spend.near_extra)
-            .or_else(|| {
-                stores
-                    .retail_full_at
-                    .get(&digest)
-                    .map(|stamp| stamp.flags & NEAR_EXTRA != 0)
-            });
-        // Missing spend evidence grants no additional near-cap exception.
-        if spent_extra != Some(false) {
-            return false;
-        }
-        if start {
-            if let Some(spend) = stores
-                .key_debt
-                .get_mut(&digest)
-                .and_then(|d| d.full_spend.as_mut())
-            {
-                spend.near_extra = true;
-            }
-            if let Some(stamp) = stores.retail_full_at.get_mut(&digest) {
-                stamp.flags |= NEAR_EXTRA;
-            }
-            Counters::bump(
-                &mut stores.counters.resource_full,
-                "rederive_failure_full.near_cap",
-            );
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({"rederive_failure_full":{"near_cap":1}}),
-            );
-        }
-        true
+        self.budgeted_admission(
+            source,
+            key,
+            meta.len(),
+            SystemTime::now(),
+            (false, near_source_cap(source, meta.len()), start),
+        )
     }
 
     /// P2: reserves `bytes` of this pass's restored head budget before input.
@@ -5381,7 +5459,7 @@ impl SharedCache {
 
     /// After a source's local copy is erased. With restart restore on, the next
     /// `durable_begin_pass` sees no slot and drops this source's retirements. Key
-    /// custody and pacing stay: they are source+key state, never cleared here.
+    /// custody and the Full budget stay: they are source+key state, never cleared here.
     pub(crate) fn durable_forget_source(&self, source: SnapshotSource) {
         if let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) {
             *stores.slot(source) = None;
@@ -5481,7 +5559,7 @@ impl SharedCache {
             retail_exhausted_paced: [u64; 2],
             upgrade_missing_full: [u64; 2],
             near_cap: [u64; 2],
-            pace_anomaly: [u64; 2],
+            full_budget_deferred: [u64; 2],
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
@@ -5506,8 +5584,8 @@ impl SharedCache {
             [0; 3]
         };
         let near_cap = if claude { stores.counters.near_cap } else { 0 };
-        let anomaly = if claude {
-            stores.counters.pace_anomaly
+        let budget_deferred = if claude {
+            stores.counters.full_budget_deferred
         } else {
             0
         };
@@ -5564,7 +5642,7 @@ impl SharedCache {
             stale[2],
             near_cap,
             upgrade_full,
-            anomaly,
+            budget_deferred,
             recovery[0],
             recovery[1],
         ];
@@ -5619,7 +5697,7 @@ impl SharedCache {
                     retail_exhausted_paced: pair(16),
                     near_cap: pair(12),
                     upgrade_missing_full: pair(13),
-                    pace_anomaly: pair(14),
+                    full_budget_deferred: pair(14),
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
@@ -5676,7 +5754,7 @@ impl SharedCache {
             counters.retail_full = [0; 3];
             counters.stale_full = [0; 3];
             counters.near_cap = 0;
-            counters.pace_anomaly = 0;
+            counters.full_budget_deferred = 0;
             counters.upgrade_missing_full = 0;
         }
         counters.retail_full[..2].copy_from_slice(&counters.recovery_full[source as usize]);
@@ -5834,12 +5912,12 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     Pending,
     /// Restore read zero input; an already-selected native reparse may take
-    /// its ordinary Full after history admission and the shared pace check.
+    /// its ordinary Full after history admission and the shared budget check.
     QuietPending,
     Miss(MissClass),
     /// Known correctness hold, census-neutral; never a Full fallback.
     FloorHeld,
-    /// Structural eligibility; pace is spent after page/cursor deferral.
+    /// Structural eligibility; budget is spent after page/cursor deferral.
     Degraded,
     Held(store::Refusal),
     Stale(&'static str),

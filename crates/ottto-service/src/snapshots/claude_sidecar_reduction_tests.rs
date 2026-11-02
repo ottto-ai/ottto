@@ -1184,9 +1184,7 @@ mod durable_restart {
         f.append_transcript(2);
         f.evidence(3);
         state.begin(&second);
-        // Absent-upgrade recovery paces growth. This row requires a
-        // second acquisition (ahead of the saved selection), not a paced hold.
-        crate::snapshots::sampled_scan::durable_tail::tests::expire_full_pace(&second, &key);
+        // This row requires a second acquisition, ahead of the saved selection.
         let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
         assert_ne!(
             ahead.index.files[&key].source_file_fingerprint,

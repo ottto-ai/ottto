@@ -34744,7 +34744,7 @@ impl OwnedSourceScan {
             let mut planned_mode = None;
             let mut returned_refusal = None;
             #[cfg(unix)]
-            let mut paced_full_granted = false;
+            let mut budgeted_full_granted = false;
             let mut active_bound_degraded = false;
             let mut resource_full_pending = None;
             #[cfg(unix)]
@@ -35179,7 +35179,7 @@ impl OwnedSourceScan {
                                     {
                                         // Restore grants no input. This existing explicit
                                         // selection may take its ordinary Full after the
-                                        // history gate and shared six-hour pace below.
+                                        // history gate and shared per-pass budget below.
                                         resource_full_pending = Some("rederive_quiet");
                                         (None, taken_admission, debt)
                                     }
@@ -35217,7 +35217,7 @@ impl OwnedSourceScan {
                                             context.cache.durable_stale_hold(source, index, &candidate);
                                             pending!();
                                         }
-                                        paced_full_granted = true;
+                                        budgeted_full_granted = true;
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
@@ -35229,7 +35229,7 @@ impl OwnedSourceScan {
                                                 reason,
                                             ) =>
                                     {
-                                        paced_full_granted = true;
+                                        budgeted_full_granted = true;
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason) => {
@@ -35242,7 +35242,7 @@ impl OwnedSourceScan {
                                             context.cache.durable_stale_hold(source, index, &candidate);
                                             pending!();
                                         }
-                                        paced_full_granted = true;
+                                        budgeted_full_granted = true;
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
@@ -35415,7 +35415,7 @@ impl OwnedSourceScan {
                                                 .expect("cold transfer lease")
                                                 .release();
                                             if full {
-                                                paced_full_granted = true;
+                                                budgeted_full_granted = true;
                                                 break 'cold_plan Ok(None);
                                             }
                                             context.cache.durable_retail_hold(
@@ -35939,7 +35939,7 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if !paced_full_granted
+                    if !budgeted_full_granted
                         && !active_bound_degraded
                         && !cache.upgrade_full_allowed(
                             source,
@@ -35984,14 +35984,13 @@ impl OwnedSourceScan {
                 }
             }
             // There is one shared admission for this actual Full. Earlier
-            // grants and later structural/stale-selection owners take priority.
+            // grants and the later structural owner take priority.
             #[cfg(unix)]
-            let resource_full_pending =
-                if paced_full_granted || active_bound_degraded || stale_selection_pending {
-                    None
-                } else {
-                    resource_full_pending
-                };
+            let resource_full_pending = if budgeted_full_granted || active_bound_degraded {
+                None
+            } else {
+                resource_full_pending
+            };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(

@@ -5295,6 +5295,7 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     );
     let now = std::time::Instant::now();
     cache.durable().unwrap().retail_full_now = Some(pace_time(now));
+    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
     assert!(cache.no_match_full(&key, &file, Some(floor)).is_some());
     assert!(cache.no_match_full(&key, &file, Some(floor)).is_none());
     assert!(!cache.stale_full(&key, &file, Some(floor), "context"));
@@ -5302,7 +5303,7 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     assert_eq!(cache.durable().unwrap().retail_full_at.len(), 1);
     assert_eq!(cache.durable().unwrap().counters.stale_full, [0; 3]);
     assert_eq!(
-        cache.durable().unwrap().counters.ineligible["old_binding_no_match.paced"],
+        cache.durable().unwrap().counters.ineligible["old_binding_no_match.byte_budget"],
         1
     );
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
@@ -5410,17 +5411,17 @@ fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() 
     assert!(!cache.stale_full("k", &file, None, "context"));
     let now = std::time::Instant::now();
     cache.durable().unwrap().retail_full_now = Some(pace_time(now));
+    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
     assert!(cache.stale_full("k", &file, Some(floor), "context"));
     assert!(
         !cache.stale_full("k", &file, Some(floor), "restore_semantics"),
-        "cause changes do not renew pacing"
+        "cause changes do not renew the budget"
     );
     assert!(
         !cache.retail_full("k", &file, 3, pace_time(now)),
-        "same key shares its cooldown with Q11"
+        "same key shares its budget with Q11"
     );
-    cache.durable().unwrap().retail_full_now =
-        Some(pace_time(now + std::time::Duration::from_secs(21600)));
+    next_full_budget_pass(&cache);
     assert!(cache.stale_full("k", &file, Some(floor), "revision_adoption_required"));
     let stores = cache.durable().unwrap();
     assert_eq!(stores.counters.stale_full, [1, 0, 1]);
@@ -5596,8 +5597,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             .unwrap()
             .write_all(a0h_row("growth", 200).as_bytes())
             .unwrap();
-        let now = std::time::Instant::now();
-        owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
+        owner.cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         // An undecodable body is a store-level T14 rebuild, not a stale cause:
@@ -5649,12 +5649,10 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             .unwrap()
             .write_all(a0h_row("more", 400).as_bytes())
             .unwrap();
-        // No ACK/save: unchanged committed prefix is reselected on every paced pass.
-        for seconds in [1, 21599] {
+        // No ACK/save: the spent pass refuses, and the unchanged committed
+        // prefix stays selected for the next pass.
+        for _ in 0..2 {
             owner.evict();
-            owner.begin_durable(source, &root, &index_path);
-            owner.cache.durable().unwrap().retail_full_now =
-                Some(pace_time(now + std::time::Duration::from_secs(seconds)));
             let ((held, scan, modes), io) =
                 a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
             assert_eq!(modes.0, 0);
@@ -5686,8 +5684,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             );
         }
         owner.evict();
-        owner.cache.durable().unwrap().retail_full_now =
-            Some(pace_time(now + std::time::Duration::from_secs(21600)));
+        next_full_budget_pass(&owner.cache);
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         let c = context("stale/release", modes, &scan);
@@ -5922,8 +5919,6 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        let mut wall = std::time::SystemTime::now();
-        owner.cache.durable().unwrap().retail_full_now = Some(wall);
         for (id, input, total, requests) in [("growth", 200, 300, 2), ("next-growth", 400, 700, 3)]
         {
             owner.evict();
@@ -5934,26 +5929,9 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
                 .unwrap()
                 .write_all(a0h_row(id, input).as_bytes())
                 .unwrap();
-            if id == "next-growth" {
-                let before = committed.files[&key].size_bytes;
-                let ((held, held_scan, modes), body) = observe_consumed(|| {
-                    b1g_scan(&owner, &roots, &root, &index_path, &mut committed)
-                });
-                assert_eq!(body, 0, "growth stays paced across eviction and begin_pass");
-                assert_eq!(modes.0, 0);
-                assert!(held_scan.snapshots.is_empty());
-                assert_eq!(held_scan.unreadable_path_count, 0);
-                assert_eq!(held.files[&key].size_bytes, before);
-                wall += std::time::Duration::from_secs(PACE_SECS);
-                owner.cache.durable().unwrap().retail_full_now = Some(wall);
-            }
             if matches!(arm, "cancel" | "restart") {
                 let interrupted = b1g_before_read(&owner, &roots, &root, &committed);
                 drop(interrupted); // No native read, no acceptance or observation credit.
-                                   // Admission was consumed before cancellation. The next try
-                                   // releases only after the common pace expires.
-                wall += std::time::Duration::from_secs(PACE_SECS);
-                owner.cache.durable().unwrap().retail_full_now = Some(wall);
                 if arm == "restart" {
                     committed = ScanIndex::load(&index_path).unwrap();
                 }
@@ -6884,6 +6862,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let file = File::open(&path).unwrap();
     let mut counts = crate::local_resource_diagnostics::RestoreCounts::default();
+    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
     for growth in [false, true] {
         if growth {
             std::fs::OpenOptions::new()
@@ -6926,7 +6905,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
         if growth {
             assert!(
                 cache.no_match_full(&key, &file, i.accepted).is_none(),
-                "same shared pace, no new grant"
+                "same shared budget, no new grant"
             );
         }
     }
@@ -6944,13 +6923,60 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Advance only the shared Full clock; never clear a spend or restore grant.
-pub(crate) fn expire_full_pace(cache: &SharedCache, key: &str) {
+/// Start only the Full budget's next pass; never clear a restore grant.
+fn next_full_budget_pass(cache: &SharedCache) {
     let mut stores = cache.durable().unwrap();
-    let digest = store::key_digest(DurableSource::ClaudeCode, key);
-    if let Some(at) = stores.retail_full_at.get(&digest).copied() {
-        stores.retail_full_now = Some(at.at + std::time::Duration::from_secs(PACE_SECS));
+    let limit = stores.full_pass_bytes();
+    for budget in &mut stores.full_budget {
+        budget.begin_pass(limit);
     }
+}
+
+/// [money] The Full budget defers past its bytes, drains oldest first and
+/// drops a waiter that left the path, so no file waits behind a departed one.
+#[test]
+fn full_budget_defers_drains_oldest_first_and_drops_departed_waiters() {
+    let key = |n: u8| [n; 32];
+    let mut budget = FullBudget::default();
+    budget.begin_pass(10);
+    assert!(budget.admit(key(1), 25, false, true, 10), "alone past it");
+    assert!(!budget.admit(key(2), 6, false, true, 10));
+    assert!(!budget.admit(key(3), 6, false, true, 10));
+    budget.begin_pass(10);
+    assert!(
+        !budget.admit(key(4), 5, false, true, 10),
+        "behind the oldest"
+    );
+    assert!(
+        budget.admit(key(5), 4, false, true, 10),
+        "fits what remains"
+    );
+    assert!(
+        !budget.admit(key(3), 6, false, true, 10),
+        "not yet its turn"
+    );
+    assert!(budget.admit(key(2), 6, false, true, 10));
+    budget.begin_pass(10);
+    assert!(budget.admit(key(3), 6, false, false, 10), "probe");
+    assert_eq!(budget.spent, 0, "a probe spends nothing");
+    assert!(budget.admit(key(3), 6, false, true, 10));
+    assert!(!budget.admit(key(4), 5, false, false, 10));
+    assert!(budget.admit(key(6), 100, true, true, 10), "near-cap bypass");
+    assert_eq!(budget.spent, 106, "a bypass is still charged");
+    budget.begin_pass(10);
+    assert_eq!(budget.reserved, 1);
+    budget.begin_pass(10);
+    assert!(
+        budget.waiting.is_empty(),
+        "the departed waiter holds nothing"
+    );
+    budget.charge(key(7), 1);
+    for n in 0..=store::MAX_RECORDS {
+        let mut digest = [0xff; 32];
+        digest[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        assert!(!budget.admit(digest, 11, false, true, 10));
+    }
+    assert_eq!(budget.waiting.len(), store::MAX_RECORDS, "bounded queue");
 }
 
 pub(super) fn before_warm_transfer() {
@@ -7293,6 +7319,7 @@ fn b4_structural_transition(near_cap: bool) {
     let end = std::fs::metadata(&path).unwrap().len();
     let now = std::time::SystemTime::now();
     cache.durable().unwrap().retail_full_now = Some(now);
+    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
     // Exactly enough for input + transferred graph reserve, but not typed
     // decode. This is structural even when the global FIFO is idle.
     let limit = store::RESTORE_INPUT_BYTES
@@ -7418,7 +7445,10 @@ fn b4_structural_transition(near_cap: bool) {
                 a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
             });
         assert_eq!(modes, (1, 0, high));
-        assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
+        assert_eq!(
+            reads.1, high,
+            "near cap bypass reads immediately within the spent pass"
+        );
         assert_eq!(caught.snapshots[0].input_tokens, 175);
         assert_eq!(caught_index.files[&key].size_bytes, high);
         assert_successor(&cache, high, 3);
@@ -7437,8 +7467,7 @@ fn b4_structural_transition(near_cap: bool) {
         assert_eq!(oversized.files[&key].size_bytes, high);
         return;
     }
-    cache.durable().unwrap().retail_full_now =
-        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    next_full_budget_pass(&cache);
     let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
     let final_end = std::fs::metadata(&path).unwrap().len();
     assert_eq!(modes, (1, 0, final_end));
@@ -8507,11 +8536,12 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
                     structural: false,
                     flags: 0,
                     head_extent: 0,
+                    deferred_pass: 0,
                 },
             );
         }
     }
-    assert!(cache.paced_admission(source, "eviction-trigger", now, false, false, true));
+    assert!(cache.budgeted_admission(source, "eviction-trigger", 1, now, (false, true, true)));
     let mut stores = cache.durable().unwrap();
     assert!(!stores.retail_full_at.contains_key(&digest));
     // Let the next call start another turnover; keep the failed key's debt.
@@ -8521,9 +8551,10 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
     assert!(stores.key_debt.contains_key(&digest));
 }
 
-/// [money] rederive failure full and near cap allowance survive repeated real evictions.
+/// [money] A re-derive failure Full uses the pass budget; its head-once custody
+/// survives repeated real evictions, and a deferred head ages by passes.
 #[test]
-fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions() {
+fn rederive_failure_full_uses_pass_budget_and_head_custody_survives_real_evictions() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let root = crate::test_scratch::ScratchDir::new("full-spend-custody");
@@ -8533,8 +8564,18 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
         let key = path.to_str().unwrap();
         let digest = full_pace_key(source, key);
         let cache = SharedCache::default();
-        let now = SystemTime::now();
-        cache.durable().unwrap().retail_full_now = Some(now);
+        cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+        let deferred = full_pace_key(source, "deferred-head");
+        for _ in 0..REDERIVE_DEFER_PASSES {
+            cache
+                .rederive_gate(source, deferred, 2, false, true)
+                .unwrap();
+            next_full_budget_pass(&cache);
+        }
+        assert!(matches!(
+            cache.rederive_gate(source, deferred, 2, false, true),
+            Err(Failure::Resource("rederive_budget_aged"))
+        ));
         cache.rederive_gate(source, digest, 2, true, false).unwrap();
         assert!(cache.rederive_full(source, key, &file, 2, true));
         evict_failed_replay_pace(&cache, source, key);
@@ -8550,38 +8591,14 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
             assert!(cache.owes_discovery(source, key));
         }
         // A sparse file makes the real near-cap metadata branch inexpensive.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(max_jsonl_file_bytes(source))
-            .unwrap();
+        let writable = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writable.set_len(max_jsonl_file_bytes(source)).unwrap();
         assert!(cache.rederive_full(source, key, &file, 2, false)); // probe is free
         assert!(cache.rederive_full(source, key, &file, 2, true));
-        for _ in 0..4 {
-            evict_failed_replay_pace(&cache, source, key);
-            let _ = cache.rederive_gate(source, digest, 2, true, false);
-            assert!(!cache.rederive_full(source, key, &file, 2, true));
-        }
-        let stores = cache.durable().unwrap();
-        assert_eq!(
-            stores
-                .counters
-                .resource_full
-                .get("rederive_failure_full.near_cap"),
-            Some(&1)
-        );
-        assert_eq!(stores.key_debt[&digest].full_spend.unwrap().at, now);
-        drop(stores);
-        cache.durable().unwrap().retail_full_now =
-            Some(now + std::time::Duration::from_secs(PACE_SECS));
+        writable.set_len(3).unwrap();
+        assert!(!cache.rederive_full(source, key, &file, 2, true));
+        next_full_budget_pass(&cache);
         assert!(cache.rederive_full(source, key, &file, 2, true));
-        assert!(
-            !cache.durable().unwrap().key_debt[&digest]
-                .full_spend
-                .unwrap()
-                .near_extra
-        );
         assert!(owed::key_debt_node_bytes().unwrap() <= 1024);
     }
 }
@@ -8734,30 +8751,25 @@ fn rederive_unfunded_key_custody_keeps_existing_counted_paced_full_fallback() {
     assert!(stores.owed_overflow[ds.slot()]);
 }
 
-/// [money] key debt pressure preserves live custody and only reclaims expired full spends.
+/// [money] key debt pressure preserves live custody and only reclaims idle reservations.
 #[test]
-fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spends() {
+fn key_debt_pressure_preserves_live_custody_and_only_reclaims_idle_reservations() {
     let mut stores = Stores::default();
-    let now = SystemTime::now();
-    stores.retail_full_now = Some(now);
     for n in 0..store::MAX_RECORDS {
-        let digest = full_pace_key(SnapshotSource::Codex, &format!("spent-{n}"));
-        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend {
-            at: now,
-            near_extra: true,
-        });
+        let digest = full_pace_key(SnapshotSource::Codex, &format!("held-{n}"));
+        stores.fund_debt(digest).unwrap().rederive_hold = Some(DurableSource::Codex);
     }
     let extra = full_pace_key(SnapshotSource::Codex, "extra");
-    assert!(
-        stores.fund_debt(extra).is_none(),
-        "unexpired Full allowance is custody"
-    );
-    // Even after pacing expires, an active discovery/receipt/retirement hold
-    // cannot be reclaimed. Only the remaining idle expired spend is a victim.
-    let retained = *stores.key_debt.keys().next().unwrap();
-    stores.key_debt.get_mut(&retained).unwrap().rederive_hold = Some(DurableSource::Codex);
-    stores.retail_full_now = Some(now + std::time::Duration::from_secs(PACE_SECS));
+    assert!(stores.fund_debt(extra).is_none(), "live custody is kept");
+    // An active discovery/receipt/retirement hold cannot be reclaimed. Only
+    // an idle reservation is a victim.
+    let (idle, retained) = {
+        let mut keys = stores.key_debt.keys();
+        (*keys.next().unwrap(), *keys.next().unwrap())
+    };
+    stores.key_debt.get_mut(&idle).unwrap().rederive_hold = None;
     assert!(stores.fund_debt(extra).is_some());
+    assert!(!stores.key_debt.contains_key(&idle));
     assert!(stores.key_debt.contains_key(&retained));
 }
 
@@ -8979,8 +8991,8 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
             }
             .requires(source, &path, 6));
         }
-        // A group denied on its second member must not spend the first
-        // member's pace. Its next ordinary admission can still read it.
+        // A group denied on its second member must not charge the first
+        // member. Its next ordinary admission can still read it.
         let sibling = root.join("sibling.jsonl");
         fs::write(&sibling, b"{}\n{}\n").unwrap();
         let sibling_key = local_index_key(&sibling);
@@ -9042,6 +9054,7 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
                 &mut HistoryPage::default()
             ));
         }
+        cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
         let mut page = HistoryPage::default();
         assert!(cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
         assert!(!cache.upgrade_full_allowed(
@@ -9939,7 +9952,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
                 counts.ineligible.get("selection_cleared.stale_record_full"),
                 Some(&1)
             );
-            assert_eq!(counts.ineligible.get("old_binding_no_match.paced"), None);
+            assert_eq!(
+                counts.ineligible.get("old_binding_no_match.byte_budget"),
+                None
+            );
             // Later arms need the unmatched survivor; this Full may replace it.
             std::fs::write(&disk_path, &survivor).unwrap();
             continue;
@@ -10378,6 +10394,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     owner.begin_durable(source, &root, &index_path);
     let now = std::time::Instant::now();
     owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
+    owner.cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
     let append = |id, input| {
         std::fs::OpenOptions::new()
             .append(true)
@@ -10458,15 +10475,13 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     assert!(owner.cache.retained_checkpoint(&key).is_some());
     let accepted_first = index.files[&key].size_bytes;
     append("ram-growth", 400);
-    owner.cache.durable().unwrap().retail_full_now =
-        Some(pace_time(now + std::time::Duration::from_secs(1)));
     let before = index.clone();
     let ((mut index, mut scan, modes), bytes) =
         observe_consumed(|| a1a_scan_at(&owner, &roots, &root, index, "2026-08-02T08:02:00Z"));
     assert_eq!(
         modes,
         (0, 1, 0),
-        "resident copy stays RAM-Tail-able inside cooldown"
+        "resident copy stays RAM-Tail-able inside the spent pass"
     );
     assert_eq!(
         bytes,
@@ -10520,9 +10535,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     append("cold-growth", 800);
     let length = std::fs::metadata(&path).unwrap().len();
     assert!(length > accepted);
-    for seconds in [2, 21599] {
-        owner.cache.durable().unwrap().retail_full_now =
-            Some(pace_time(now + std::time::Duration::from_secs(seconds)));
+    for attempt in [1, 2] {
         let (((held, scan, modes), io), selector) = native_restore_selection(|| {
             a0h_observe(|| {
                 a1a_scan_at(
@@ -10535,7 +10548,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
             })
         });
         let context = native_restore_context(
-            format!("a1t-shared/paced-{seconds}"),
+            format!("a1t-shared/budget-{attempt}"),
             modes,
             &scan,
             &owner.cache,
@@ -10589,11 +10602,11 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
         assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
     }
     assert_eq!(
-        owner.cache.durable_counters(source).unwrap().0.ineligible["old_binding_no_match.paced"],
+        owner.cache.durable_counters(source).unwrap().0.ineligible
+            ["old_binding_no_match.byte_budget"],
         2
     );
-    owner.cache.durable().unwrap().retail_full_now =
-        Some(pace_time(now + std::time::Duration::from_secs(PACE_SECS)));
+    next_full_budget_pass(&owner.cache);
     let ((mut index, mut scan, modes), bytes) = observe_consumed(|| {
         a1a_scan_at(
             &owner,

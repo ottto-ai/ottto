@@ -32,8 +32,6 @@ pub(super) struct KeyDebt {
     pub(super) rederive_hold: Option<DurableSource>,
     pub(super) head_extent: Option<u32>,
     pub(super) extra_head: bool,
-    /// Cross-cause Full allowance survives turnover of the paid pace map.
-    pub(super) full_spend: Option<FullSpend>,
     /// OFF diagnostic only; first failure survives retries until removal.
     pub(super) off_v1_failed_since: Option<(DurableSource, std::time::Instant)>,
     pub(super) retire_source: Option<DurableSource>,
@@ -41,24 +39,16 @@ pub(super) struct KeyDebt {
     /// D3: this Claude key's stale predecessor survived a failed write.
     hold: Option<ClaudeHold>,
 }
-#[derive(Clone, Copy)]
-pub(super) struct FullSpend {
-    pub(super) at: std::time::SystemTime,
-    pub(super) near_extra: bool,
-}
 impl KeyDebt {
-    /// Only idle reservations or expired pacing may be reclaimed. Receipt,
-    /// discovery, retirement and directory-sync custody are never victims.
-    fn reclaimable(&self, now: std::time::SystemTime) -> bool {
+    /// Only idle reservations may be reclaimed. Receipt, discovery, retirement
+    /// and directory-sync custody are never victims.
+    fn reclaimable(&self) -> bool {
         self.owed == OwedMark::None
             && self.hold.is_none()
             && self.rederive_hold.is_none()
             && self.off_v1_failed_since.is_none()
             && self.retire_source.is_none()
             && !self.retire_sync
-            && !self
-                .full_spend
-                .is_some_and(|spend| super::full_pace_delayed(spend.at, now))
     }
     pub(super) fn is_empty(&self) -> bool {
         self.owed == OwedMark::None
@@ -66,7 +56,6 @@ impl KeyDebt {
             && self.rederive_hold.is_none()
             && self.off_v1_failed_since.is_none()
             && self.retire_source.is_none()
-            && self.full_spend.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
@@ -158,7 +147,7 @@ pub(in crate::snapshots) enum OwedCompletionAdmission {
 
 impl Stores {
     /// Funds `digest`'s debt node; never evicts another key's live custody.
-    /// Idle reservations and expired pacing cannot deny capacity.
+    /// Idle reservations cannot deny capacity.
     pub(super) fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
         self.fund_debt_except(digest, &[])
     }
@@ -177,11 +166,8 @@ impl Stores {
         reserved: &[store::Digest32],
     ) -> Option<&mut KeyDebt> {
         if !self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS {
-            let now = std::time::SystemTime::now();
-            #[cfg(test)]
-            let now = self.retail_full_now.unwrap_or(now);
             if let Some(idle) = self.key_debt.iter().find_map(|(key, debt)| {
-                (debt.reclaimable(now) && !reserved.contains(key)).then_some(*key)
+                (debt.reclaimable() && !reserved.contains(key)).then_some(*key)
             }) {
                 self.key_debt.remove(&idle);
             }

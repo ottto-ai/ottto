@@ -396,10 +396,11 @@ alarm when nonzero: `old_binding_no_match` (an unprovable original binding),
 `context`, `restore_semantics` and `revision_adoption_required` (stale holds),
 `retail_exhausted` (the Tail re-read allowance is spent or its accounting was
 lost). Each is one counted Full, taken only on growth past the accepted end and
-paced to one per key per six hours through one shared RAM map;
-`retail_exhausted_paced` counts growth skipped by that pace. On map overflow the
-oldest key is evicted and the read allowed; `pace_evicted` counts it and alarms
-separately from the growth counts. `t14_rebuild_full_started` is the process
+admitted by the per-source, per-pass Full byte budget (256 MiB; a larger file is
+admitted alone at the front); the rest waits for the next pass, oldest first.
+`retail_exhausted_paced` counts growth deferred by that budget. When the RAM
+stamp map overflows, the oldest key's stamp is evicted; `pace_evicted` counts it
+and alarms separately from the growth counts. `t14_rebuild_full_started` is the process
 total of admitted rebuild Fulls. Audit deadlines remain owned by the index,
 and the v1 writer takes compatibility debt from the current committed index at
 write time, including after a restore dropped the envelope field. Unknown debt
@@ -573,12 +574,12 @@ immutable for that permission. Completed native output, exact saved selection
 and the current-target directory-sync receipt are required to count replacement.
 
 O3 adds a termination path to the existing option (i). Other migration refusals
-on real growth use the counted, shared paced `old_binding_no_match` Full, with
+on real growth use the counted, budgeted `old_binding_no_match` Full, with
 no migration/replacement authority and no A5 refund. This includes spent grants,
 a shorter current extent, obsolete certificate length, generation-ahead records,
 object changes and resource failures. Genuine idle and correctness barriers
 (future revision, owed replay, context/namespace or downgrade) stay held.
-Fallback counts and pacing are separate from A5 reads and durable replacements.
+Fallback counts and the budget are separate from A5 reads and durable replacements.
 Generic growth eligibility past the activity window remains an integration
 dependency; this migration path does not add a Claude-only discovery exception.
 Idle migration files take no body read. A changed object or mtime can require
@@ -593,10 +594,10 @@ The retired generic reread budgets and selection holds remain absent.
 
 Unregistered replay rejected by a Claude binding is still Stale policy. The
 existing restore carrier includes its typed `stale_attribution`; this is neither
-a generic Miss nor an ACK. `pace_anomaly` reports implausible wall-clock stamps
-separately from capacity `pace_evicted`; both are delta/process-total pairs.
-Clock anomalies expire the Full pace toward reading without refunding Tail
-allowance already spent.
+a generic Miss nor an ACK. `full_budget_deferred` reports Full attempts deferred
+by the per-pass byte budget separately from capacity `pace_evicted`; both are
+delta/process-total pairs. A re-armed entry whose record's binding no longer
+matches takes the unbudgeted Full, counted `selection_cleared.stale_record_full`.
 
 ## Line Delivery Counters
 
@@ -1818,7 +1819,7 @@ backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
 
-The shared six-hour Full pace also owns structural active-budget fallback.
+The shared per-pass Full byte budget also owns structural active-budget fallback.
 `degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
 `[event delta, source process total]` on the same alarm carrier. The source
 leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
@@ -1826,12 +1827,11 @@ successful restore. `pace_evicted` has one immediate alarm owner and a per-sourc
 process total; post-save alarms never emit its delta again:
 at capacity the oldest stamp is evicted, the new key is enrolled and the read
 is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
-These are RAM-only counters and stamps; restart can admit one extra growth
-Full. Structural Full publishes without a replacement retained/durable record.
-The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
-seven-day sanity maximum expires toward reading. Codex page/cursor deferral
-consumes no structural allowance; the stamp is enrolled at acquisition start.
-Growth at 90% or more of the source file cap bypasses pacing immediately, under
+These are RAM-only counters and stamps; a restart empties the waiting queue.
+Structural Full publishes without a replacement retained/durable record.
+No clock takes part in admission. Codex page/cursor deferral consumes no
+structural allowance; the stamp is enrolled at acquisition start.
+Growth at 90% or more of the source file cap bypasses the budget immediately, and is still charged, under
 the same cause with a `near_cap` annotation. Source caps predate this path:
 512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
 rejection/disclosure still applies; near-cap admission does not expand it.
@@ -1863,12 +1863,11 @@ Success receipts count successful restores separately from physical input;
 do not add the two byte counters together.
 
 A replay attempt is remembered by predecessor extent, not exact generation.
-A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours, plus at
-most one extra near the source cap, counted `rederive_failure_full.near_cap`.
-This exception avoids losing discovery when a held file grows beyond its source
-cap. Budget contention waits without a Full; after six hours its counted
-`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
+A new extent resets only the head attempt.
+Re-derive failures take a growth Full through the per-pass Full byte budget; near
+the source cap they read at once, charged, so a held file growing beyond its
+cap keeps its discovery. Head budget contention waits without a Full; after four
+passes its counted `rederive_budget_aged` fallback uses the same Full budget. The paid stamp map's
 overflow permits at most one extra head per evicted extent and alarms
 `pace_evicted`. Discovery custody survives pace eviction independently.
 
@@ -1900,8 +1899,6 @@ process total on the existing `durable_tail_alarm` carrier with `process_id`.
 It counts metadata-only restores returning Pending with zero transcript input.
 It does not decode obligations and cannot establish `pending_no_obligation`.
 Compare totals using `process_id`; they reset on restart and carry no key identity.
-Full-spend time and near-cap use for funded keys live in key custody, so evicting
-the paid pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 
@@ -1942,7 +1939,7 @@ overwrite; backend authority rules independently govern successor acceptance.
 An exact retired v1 pin is a missing reduction, never decoded as current.
 Quiet files consume zero transcript bytes. A grown file takes the existing
 missing-record Full path, counted under `resource_full.repin`, and shares the
-six-hour per-key pace. Admission uses the existing history-upgrade page:
+per-pass Full byte budget. Admission uses the existing history-upgrade page:
 2,000 files / 1 GiB total, at most 512 MiB for one file, with no first-file
 escape. Other history reservations consume the same page, not a second budget.
 No repin custody map, carry/age counters or private per-pass cap remains.
