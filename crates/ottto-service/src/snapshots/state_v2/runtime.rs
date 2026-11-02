@@ -20,7 +20,6 @@ pub(in super::super) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
-    IntegrityRetry,
     SaveCeiling,
     SaveOversize,
     SaveFull,
@@ -38,7 +37,6 @@ impl std::fmt::Display for Hold {
             Self::SaveCeiling => "state_v2_save_ceiling",
             Self::SaveOversize => "state_v2_save_oversize",
             Self::SaveFull => "state_v2_sqlite_full",
-            Self::IntegrityRetry => "state_v2_integrity_retry",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
@@ -59,6 +57,14 @@ impl Hold {
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
+        }
+        let integrity_repair = error
+            .chain()
+            .any(|cause| cause.to_string() == INTEGRITY_REPAIR);
+        if integrity_repair {
+            // Publish the refusal before any diagnostic snapshot can retain
+            // the preceding successful open's cleared hold.
+            telemetry::event("hold", &"integrity_repair");
         }
         let reason = error
             .downcast_ref::<rusqlite::Error>()
@@ -93,6 +99,9 @@ impl Hold {
         let codes = error.chain().filter_map(code).collect::<Vec<_>>();
         let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
         telemetry::event("db_unavailable_cause", &cause);
+        if integrity_repair {
+            return anyhow::anyhow!(INTEGRITY_REPAIR);
+        }
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
@@ -155,6 +164,15 @@ impl RouteState {
     fn custody_held(&self) -> bool {
         self.custody_retry_at.is_some_and(|at| Instant::now() < at)
     }
+    fn report_hold(&self) {
+        if self.custody_held() {
+            telemetry::event("hold", &Hold::AckCustody);
+        } else if let Some(hold) = self.save_hold {
+            telemetry::event("hold", &hold);
+        } else {
+            telemetry::event("hold", &"none");
+        }
+    }
     fn reduce_page(&mut self) {
         let previous = self.page_limit;
         self.page_limit = (self.page_limit / 2).max(1);
@@ -173,6 +191,7 @@ impl RouteState {
             return;
         }
         self.save_hold = None;
+        self.report_hold();
         self.last_read = None;
         self.save_retry_completed = false;
         if over_target {
@@ -351,6 +370,7 @@ fn load_with_custody(
                             }
                             session.cx = cx;
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            state.report_hold();
                             telemetry::event("route", &"v2");
                             return Ok(Some(index));
                         }
@@ -387,6 +407,7 @@ fn load_with_custody(
                 })),
             }));
             register(state, &index)?;
+            state.report_hold();
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }

@@ -47,6 +47,14 @@ resolving a string reads directly into the final owned string without loading a
 whole dictionary. Semantic caller mapping and reference-closure checks across
 owners remain prerequisites for routing this backend.
 
+On an unclean state v2 open, `PRAGMA quick_check(1)` runs to completion without
+an interrupt deadline. The former size budget (2 seconds plus 10 ms per allocated
+MiB) is a slow-alarm threshold: `quick_check_ms` records duration and
+`quick_check_slow_alarm` records whether it was exceeded. A non-ok result still
+refuses the store with `state_v2_integrity_requires_explicit_repair`.
+SQLite busy waits, maintenance-lock refusals, erasure recovery attempts, WAL-debt
+limits and VACUUM work budgets retain their existing bounds and refusal behavior.
+
 ### Deferred erasure maintenance
 
 Removing potentially private keys or values marks the first pending generation

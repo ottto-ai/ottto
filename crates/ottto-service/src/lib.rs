@@ -282,7 +282,7 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
-    scan_index_health_revisions: [[u64; 3]; 2],
+    scan_index_health_revisions: [[u64; 3]; 3],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
@@ -493,7 +493,7 @@ impl LocalDaemon {
                 sources: Vec::new(),
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
-                scan_index_health_revisions: [[0; 3]; 2],
+                scan_index_health_revisions: [[0; 3]; 3],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
                 command_ledger: Vec::new(),

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
+
 mod fence;
 mod import;
 mod runtime;
