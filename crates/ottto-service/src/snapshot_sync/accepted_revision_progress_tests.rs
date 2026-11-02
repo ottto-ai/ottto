@@ -276,10 +276,8 @@ fn erase_revision_with_entity_and_source_scope() {
             &path,
         );
         let mut retired = progress.clone();
-        let saved = ScanIndex {
-            generation: 1,
-            ..Default::default()
-        };
+        let mut saved = ScanIndex::default();
+        saved.generation = 1;
         retired.retire_acks_after_index_save(
             &saved,
             &BTreeSet::from([item.snapshot_fingerprint.clone()]),
