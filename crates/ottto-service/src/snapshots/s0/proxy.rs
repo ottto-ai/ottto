@@ -49,10 +49,10 @@ macro_rules! round_field {
  (E,$f:ident,$ty:ty,$stats:ident)=>{{ $stats.moved_fields+=1;$stats.head_moved_bytes+=layout_bytes(&$f).unwrap_or(0) as u64;$f }};
  (X,$f:ident,$ty:ty,$stats:ident)=>{round_field!(E,$f,$ty,$stats)};
  (I,$f:ident,$ty:ty,$stats:ident)=>{round_field!(E,$f,$ty,$stats)};
- // Opening state contains nested content requiring native re-derivation;
- // move it whole in this proxy rather than silently stripping those fields.
- (D,session_start,$ty:ty,$stats:ident)=>{round_field!(E,session_start,$ty,$stats)};
  ($class:ident,$f:ident,$ty:ty,$stats:ident)=>{{
+ // Retain the caller's identifier hygiene when moving opening state, whose
+ // nested content would otherwise be stripped by the existing codec.
+ if stringify!($f)=="session_start" {round_field!(E,$f,$ty,$stats)} else {
  let encoded=Enc::count_write(usize::MAX,|e|{
  let value=&$f;
  crate::durable_tail_codec::durable_field!(put $class,e,value,$ty,stringify!($f));Ok(())
@@ -68,6 +68,7 @@ macro_rules! round_field {
  Ok(crate::durable_tail_codec::durable_field!(take $class,d,$ty))
  })().map_err(|_|stringify!($f))?;
  decoder.finish().map_err(|_|stringify!($f))?;value
+ }
  }
  }
  }};

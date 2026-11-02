@@ -1,7 +1,7 @@
 //! Count-only instrumentation for the ignored copied-corpus harness.
 //! No keys, digests, field values or provider identities leave this recorder.
 use super::*;
-use crate::durable_tail_codec::{Durable, Enc, Refuse};
+use crate::durable_tail_codec::{Enc, Refuse};
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::sync::{
@@ -339,8 +339,8 @@ fn metric<T: crate::heap_layout_bound::HeapLayoutBound>(
 macro_rules! measure_fields {
     ($acc:ident; $($class:ident $field:ident: $ty:ty => $elements:expr,$nonempty:expr),* $(,)?) => {{
         let SnapshotAccumulator { $($field),* } = $acc;
-        vec![$(metric(stringify!($field),$field,$elements,stringify!($class),$nonempty,|e| {
-            crate::durable_tail_codec::durable_field!(put $class,e,$field,$ty,
+        vec![$(metric(stringify!($field),$field,$elements,stringify!($class),$nonempty,|_e| {
+            crate::durable_tail_codec::durable_field!(put $class,_e,$field,$ty,
                 concat!("SnapshotAccumulator.",stringify!($field)));
             Ok(())
         })),*]
