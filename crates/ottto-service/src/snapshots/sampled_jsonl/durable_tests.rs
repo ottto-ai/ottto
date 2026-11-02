@@ -1650,7 +1650,7 @@ fn budget_bounds_hold() {
     // A restored copy is charged to the 31 MiB state budget like any
     // retained copy; one record never exceeds one cache entry.
     assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
-    assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
+    assert_eq!(MAX_RECORDS, crate::snapshots::sampled_audit::AUDIT_SLOTS);
     // Disk admission is independent of memo precision; the old writer inventories 512 keys.
     assert_eq!(INVENTORY_BOUND, 512);
     // Per restore: one record read, two 4 KiB sample windows, a head

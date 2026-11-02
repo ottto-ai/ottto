@@ -1,10 +1,11 @@
 //! Production glue. One process-owned cache is shared by background and manual
 //! cycles; provider parsing, durable index/CAS and delivery remain native.
+use super::sampled_audit::AUDIT_SLOTS;
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{ReadMode, Scope};
-use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
+use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, ENTRY_BYTES};
 use sampled_jsonl::CachedJsonlReduction;
 
 // The existing owner enforces aggregate parked/optional-send overlap. The
@@ -137,12 +138,12 @@ struct CapStamp {
     at: SystemTime,
 }
 struct CapPace {
-    entries: [Option<CapStamp>; CACHE_ENTRIES],
+    entries: [Option<CapStamp>; AUDIT_SLOTS],
 }
 impl Default for CapPace {
     fn default() -> Self {
         Self {
-            entries: [None; CACHE_ENTRIES],
+            entries: [None; AUDIT_SLOTS],
         }
     }
 }
@@ -771,15 +772,15 @@ impl OwnedSourceScan {
                 .files
                 .values()
                 .filter(|entry| entry.has_unverified_source())
-                .take(CACHE_ENTRIES + 1)
+                .take(AUDIT_SLOTS + 1)
                 .count();
             self.sampling = Some(Context {
                 cache,
                 namespace,
                 // Legacy prefix/audit scheduling and diagnostic observations
                 // keep these values; ordinary restore never gates on them.
-                audit_metadata_supported: pending <= CACHE_ENTRIES,
-                audit_slots: CACHE_ENTRIES.saturating_sub(pending),
+                audit_metadata_supported: pending <= AUDIT_SLOTS,
+                audit_slots: AUDIT_SLOTS.saturating_sub(pending),
                 full_files: 0,
                 tail_files: 0,
                 unchanged_files: 0,

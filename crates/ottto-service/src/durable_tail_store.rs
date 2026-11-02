@@ -65,7 +65,7 @@ const MAGIC: [u8; 8] = *b"ottto-dt";
 /// (`transcript_cache::ENTRY_BYTES`): the store keeps only what RAM can.
 pub(crate) const RECORD_BYTES: usize = crate::transcript_cache::ENTRY_BYTES;
 /// Verification memo precision, independent of disk admission.
-pub(crate) const MAX_RECORDS: usize = crate::transcript_cache::CACHE_ENTRIES;
+pub(crate) const MAX_RECORDS: usize = 256;
 /// Dirty records written per index save; the rest stay dirty for the next.
 pub(crate) const MAX_BATCH: usize = 32;
 /// Encoded native/batch write allowance for one source pass.

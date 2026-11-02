@@ -2094,7 +2094,6 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 let cache = second.retained().unwrap();
                 let resident = cache.resident_bound().expect("cache admission bound");
                 assert!(resident > 0 && resident <= crate::transcript_cache::CACHE_BYTES);
-                assert!(cache.victims().len() <= crate::transcript_cache::CACHE_ENTRIES);
                 let copy = cache.peek(&key).expect("restored Tail copy was retained");
                 let budget = match copy_decisions.as_slice() {
                     [Decision::Granted {
@@ -3882,9 +3881,9 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
             Some(cache.clone()),
             "scan-pressure",
         );
-        // More cold admissions than the shared count cap. Their old source
+        // More cold admissions than the former entry-count limit. Their old source
         // timestamps must not promote them over the recent active session.
-        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+        for _ in 0..272 {
             let historical = ScanFixture::new(source);
             historical
                 .file

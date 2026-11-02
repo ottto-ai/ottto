@@ -1893,7 +1893,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     // Other pending audits leave only the slot restoration never takes.
     let mut crowded = hold.index.clone();
     // Synthetic keys outside the scan root, never walked or opened.
-    let pending = (0..crate::transcript_cache::CACHE_ENTRIES - 1)
+    let pending = (0..crate::snapshots::sampled_audit::AUDIT_SLOTS - 1)
         .map(|slot| format!("/option-b-pending/{slot}"))
         .collect::<Vec<_>>();
     for pending_key in &pending {

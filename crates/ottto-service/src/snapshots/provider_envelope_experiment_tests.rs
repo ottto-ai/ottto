@@ -3148,7 +3148,7 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
         index
             .claude_account_deferred_holds
             .insert(key.clone(), entry.source_file_fingerprint.clone());
-        for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+        for n in 0..crate::snapshots::sampled_audit::AUDIT_SLOTS {
             let audit_key = format!("/synthetic-unavailable-release/{n}.jsonl");
             let mut audit_entry = entry.clone();
             audit_entry.set_unverified_deadline(1);
@@ -3190,7 +3190,7 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
                 .values()
                 .filter(|entry| entry.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES
+            crate::snapshots::sampled_audit::AUDIT_SLOTS
         );
         let copy = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
         assert_eq!(

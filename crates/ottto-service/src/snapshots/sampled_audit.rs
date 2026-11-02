@@ -1,7 +1,7 @@
 //! Audit status lives in the existing per-file index, never in a new ledger.
 use super::*;
 use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
-use crate::transcript_cache::CACHE_ENTRIES;
+pub(super) const AUDIT_SLOTS: usize = 256;
 
 // v1 did not distinguish an ordinary Tail from a published FE prefix.
 pub(super) const UNVERIFIED_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v1";
@@ -150,9 +150,9 @@ impl ScanIndex {
                 .files
                 .values()
                 .filter(|entry| entry.has_unverified_source())
-                .take(CACHE_ENTRIES)
+                .take(AUDIT_SLOTS)
                 .count()
-                < CACHE_ENTRIES
+                < AUDIT_SLOTS
     }
 
     pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
@@ -335,9 +335,9 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
         .files
         .values()
         .filter(|entry| entry.has_unverified_source())
-        .take(CACHE_ENTRIES)
+        .take(AUDIT_SLOTS)
         .count();
-    let budget = CACHE_ENTRIES
+    let budget = AUDIT_SLOTS
         .saturating_sub(pending.saturating_add(1))
         .min(HOLD_DEADLINE_RESTORES_PER_SCAN);
     let Some(due) = now.checked_add(AUDIT_INTERVAL_SECONDS) else {
@@ -824,7 +824,7 @@ impl SourceScanResult {
                 continue;
             }
             if let Some(Some(debt)) = debt {
-                if reserved < CACHE_ENTRIES
+                if reserved < AUDIT_SLOTS
                     && index
                         .files
                         .get(key)
@@ -1014,7 +1014,7 @@ mod tests {
     #[test]
     fn marked_population_admission_and_quiet_retirement_share_the_cap() {
         let mut index = index();
-        for n in 0..CACHE_ENTRIES {
+        for n in 0..AUDIT_SLOTS {
             let key = format!("missing-{n}");
             index.files.insert(key.clone(), entry());
             assert!(index.stage_sampled_audit(
@@ -1061,7 +1061,7 @@ mod tests {
                 .values()
                 .filter(|entry| entry.has_unverified_source())
                 .count(),
-            CACHE_ENTRIES
+            AUDIT_SLOTS
         );
         assert!(index.files["missing-0"].has_unverified_source());
     }
@@ -1355,7 +1355,7 @@ mod tests {
         full.files.insert("held".into(), entry());
         full.claude_request_census_mut_for_test()
             .insert_for_test("held", held());
-        for slot in 0..CACHE_ENTRIES - 1 {
+        for slot in 0..AUDIT_SLOTS - 1 {
             let mut pending = entry();
             pending.set_unverified_deadline(1);
             full.files.insert(format!("pending-{slot}"), pending);

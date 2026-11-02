@@ -1622,7 +1622,7 @@ fn grown_virtual_audit_uses_the_scheduling_clock_before_and_at_due() {
         .insert_for_test(&key, record);
     // Reserve all but the existing last slot, as in the real erased-hold
     // regression; no restored marker can hide the virtual-slot clock seam.
-    for n in 0..crate::transcript_cache::CACHE_ENTRIES - 1 {
+    for n in 0..crate::snapshots::sampled_audit::AUDIT_SLOTS - 1 {
         let mut pending = template.clone();
         pending.set_unverified_deadline(now);
         index

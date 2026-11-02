@@ -390,17 +390,15 @@ impl CachePage {
         self.reinsert_failed = self.reinsert_failed.saturating_add(other.reinsert_failed);
     }
 }
-pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
+pub(crate) fn cache_capacity_eviction() {
     update(|counts| {
-        let cache = &mut counts.retained_cache_page_events;
-        let n = if count_pressure {
-            &mut cache.insert_count_entries_evicted
-        } else {
-            &mut cache.insert_byte_entries_evicted
-        };
+        let n = &mut counts
+            .retained_cache_page_events
+            .insert_byte_entries_evicted;
         *n = n.saturating_add(1);
     });
 }
+
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.lineage_parentless_while_incomplete

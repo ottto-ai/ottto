@@ -2,8 +2,8 @@
 //! restored marker, or failing its secure open, never moves it past D (#865).
 use super::*;
 use crate::snapshots::claude_request_census::identity_incomplete_hold_deadlines_restored_total as restored;
+use crate::snapshots::sampled_audit::AUDIT_SLOTS;
 use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
-use crate::transcript_cache::CACHE_ENTRIES;
 
 fn owe(index: &mut ScanIndex, key: &str, due: u64) {
     index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
@@ -15,7 +15,7 @@ fn owe(index: &mut ScanIndex, key: &str, due: u64) {
 
 /// Fill every sampled slot but the reserved last one with non-draining debt.
 fn saturate(index: &mut ScanIndex, key: &str, due: u64) {
-    for n in 0..CACHE_ENTRIES - 1 {
+    for n in 0..AUDIT_SLOTS - 1 {
         let mut pending = index.files[key].clone();
         pending.set_unverified_deadline(due);
         index
@@ -138,7 +138,7 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
         Some(due),
         "parked debt stays owed at D"
     );
-    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+    assert_eq!(markers(&index), AUDIT_SLOTS - 1);
 
     // The parked file appears (a stat change): one retry, which audits it.
     fs::create_dir_all(unavailable.parent().unwrap()).unwrap();
@@ -151,7 +151,7 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
     let (index, queued, fulls) = turn(index, now);
     assert_eq!((queued, fulls), (1, 1), "retried once");
     assert_eq!(sampled_audit::held_audit_open_failed(now).0, 0);
-    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+    assert_eq!(markers(&index), AUDIT_SLOTS - 1);
 }
 
 /// #870/#903 composition: rescue and failed-open backoff share the page's
@@ -207,7 +207,7 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
                     .map(|debt| debt.due_unix_seconds),
                 Some(due)
             );
-            assert_eq!(markers(&saturated), CACHE_ENTRIES - 1);
+            assert_eq!(markers(&saturated), AUDIT_SLOTS - 1);
             assert_eq!(restored(), restored_before);
             let mut early = unsaturated.clone();
             owe(&mut early, &key, due);
@@ -345,7 +345,7 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             finish_production_scan_page(scan, CLAUDE)
         };
         assert_eq!(modes, (usize::from(!denied), 0, 0));
-        assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+        assert_eq!(markers(&index), AUDIT_SLOTS - 1);
         let slot = index.held_audit_progress.as_ref().unwrap();
         assert_eq!(
             (slot.key.as_str(), slot.due, slot.attempted),
@@ -407,7 +407,7 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             let slot = index.held_audit_progress.as_ref().unwrap();
             assert_eq!((slot.due, slot.attempted), (due, true));
             assert_eq!(sampled_audit::held_audit_open_failed(due + 1), (0, 0));
-            assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+            assert_eq!(markers(&index), AUDIT_SLOTS - 1);
         } else {
             // #865 at D with capacity open: the source preparation's
             // restorer converts the owed key first and the marker carries D,

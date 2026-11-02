@@ -599,14 +599,14 @@ struct QuietRetirement {
 /// or allocated by pass registration.
 pub(super) struct StoreRoot {
     passes: [Option<OffPass>; crate::snapshots::durable_sources::SOURCES.len()],
-    retiring: [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
+    retiring: [Option<QuietRetirement>; crate::durable_tail_store::MAX_RECORDS],
     state: Option<Box<Stores>>,
 }
 impl Default for StoreRoot {
     fn default() -> Self {
         Self {
             passes: Default::default(),
-            retiring: [None; crate::transcript_cache::CACHE_ENTRIES],
+            retiring: [None; crate::durable_tail_store::MAX_RECORDS],
             state: None,
         }
     }
@@ -629,8 +629,8 @@ pub(crate) struct Stores {
     /// committed entry with this same fingerprint; local-hold settlement that
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
-    // At most CACHE_ENTRIES; the persisted marker remains owed until receipt.
-    retiring: [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
+    // At most MAX_RECORDS; the persisted marker remains owed until receipt.
+    retiring: [Option<QuietRetirement>; crate::durable_tail_store::MAX_RECORDS],
     /// Keys whose restore refused the record as `entry_changed`, until their
     /// next acquisition completes. Process-local, never persisted.
     stale_predecessor: BTreeSet<u64>,
@@ -694,7 +694,7 @@ impl Default for Stores {
             slots: Default::default(),
             touched: BTreeSet::new(),
             selected: BTreeMap::new(),
-            retiring: [None; crate::transcript_cache::CACHE_ENTRIES],
+            retiring: [None; crate::durable_tail_store::MAX_RECORDS],
             stale_predecessor: BTreeSet::new(),
             restart_full_alarmed: None,
             counters: Counters::default(),

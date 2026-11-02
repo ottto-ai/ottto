@@ -23,7 +23,7 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
     }
     let _clock = Clock::at(START);
     let source = SnapshotSource::Codex;
-    let cap = crate::transcript_cache::CACHE_ENTRIES;
+    let cap = crate::snapshots::sampled_audit::AUDIT_SLOTS;
     let mut fixture = ScanFixture::new(source);
     fs::remove_file(&fixture.file.0).unwrap();
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -394,7 +394,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
     index = next;
     let growing_key = local_index_key(&fixture.file.0);
     assert!(!index.files[&growing_key].has_unverified_source());
-    for n in 1..crate::transcript_cache::CACHE_ENTRIES {
+    for n in 1..crate::snapshots::sampled_audit::AUDIT_SLOTS {
         let key = format!("/synthetic-unavailable/{n}.jsonl");
         let mut entry = index.files[&quiet_key].clone();
         entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
@@ -515,7 +515,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
                 .values()
                 .filter(|entry| entry.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES
+            crate::snapshots::sampled_audit::AUDIT_SLOTS
         );
         let page = diagnostics
             .iter()
@@ -551,7 +551,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
             .values()
             .filter(|entry| entry.has_unverified_source())
             .count(),
-        crate::transcript_cache::CACHE_ENTRIES - 1
+        crate::snapshots::sampled_audit::AUDIT_SLOTS - 1
     );
     let (_, _, modes, _) = production_scan_at_with_setup(
         &fixture,
@@ -673,7 +673,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         fill_unavailable_audits(
             &mut index,
             &key,
-            crate::transcript_cache::CACHE_ENTRIES,
+            crate::snapshots::sampled_audit::AUDIT_SLOTS,
             START,
         );
         let markers = index
@@ -893,7 +893,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     fill_unavailable_audits(
         &mut index,
         &key,
-        crate::transcript_cache::CACHE_ENTRIES - 1,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS - 1,
         due,
     );
     sampled_scan::set_test_now(Some(due + 1));
@@ -927,7 +927,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
                 .values()
                 .filter(|e| e.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES,
+            crate::snapshots::sampled_audit::AUDIT_SLOTS,
         );
     }
     // The ordinary hold API releases the key. Quiet validation may retire it
@@ -999,7 +999,7 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     fill_unavailable_audits(
         &mut index,
         &key,
-        crate::transcript_cache::CACHE_ENTRIES,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS,
         START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
     );
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
@@ -1034,7 +1034,7 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
                 .values()
                 .filter(|e| e.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES,
+            crate::snapshots::sampled_audit::AUDIT_SLOTS,
             "central staging still refuses marker257",
         );
         index = next;
@@ -1106,7 +1106,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
     fill_unavailable_audits(
         &mut index,
         &quiet_key,
-        crate::transcript_cache::CACHE_ENTRIES - 1,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS - 1,
         due,
     );
     sampled_scan::set_test_now(Some(due + 1));
@@ -1199,7 +1199,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
                 .values()
                 .filter(|e| e.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES,
+            crate::snapshots::sampled_audit::AUDIT_SLOTS,
             "partial save cannot restore a 257th marker",
         );
     }
@@ -1213,8 +1213,8 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
     let _clock = Clock::at(START);
     let source = SnapshotSource::ClaudeCode;
     for marked in [
-        crate::transcript_cache::CACHE_ENTRIES - 1,
-        crate::transcript_cache::CACHE_ENTRIES,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS - 1,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS,
     ] {
         sampled_scan::set_test_now(Some(START));
         let fixture = ScanFixture::new(source);
@@ -1268,7 +1268,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             .is_some());
         assert_eq!(
             scanned.files[&key].has_unverified_source(),
-            marked < crate::transcript_cache::CACHE_ENTRIES
+            marked < crate::snapshots::sampled_audit::AUDIT_SLOTS
         );
         // Actual post-scan classifier removes the hold, then the production
         // completed-upload selector commits the accepted release generation.
@@ -1290,9 +1290,9 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                 .values()
                 .filter(|e| e.has_unverified_source())
                 .count(),
-            crate::transcript_cache::CACHE_ENTRIES
+            crate::snapshots::sampled_audit::AUDIT_SLOTS
         );
-        if marked == crate::transcript_cache::CACHE_ENTRIES {
+        if marked == crate::snapshots::sampled_audit::AUDIT_SLOTS {
             assert!(!accepted.files[&key].has_unverified_source());
             assert!(accepted.files[&key].source_file_fingerprint.is_empty());
             assert!(accepted
@@ -1325,7 +1325,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         let mut loaded = loaded;
         loaded.traversal = None;
         let restart = Arc::new(sampled_scan::SharedCache::default());
-        if marked < crate::transcript_cache::CACHE_ENTRIES {
+        if marked < crate::snapshots::sampled_audit::AUDIT_SLOTS {
             // A record-backed/retained quiet read can perform counted
             // retirement instead of Full; retain this positive sample control.
             let copy = cache.take(&key).unwrap();
@@ -1356,7 +1356,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             });
         assert_eq!(
             modes,
-            if marked == crate::transcript_cache::CACHE_ENTRIES {
+            if marked == crate::snapshots::sampled_audit::AUDIT_SLOTS {
                 (1, 0, 0)
             } else {
                 (0, 0, 1)
@@ -1371,18 +1371,18 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         let counts = &page["counts"]["sampled_acquisition"];
         assert_eq!(
             counts["index_state_at_page_end"]["audit_cap_full"],
-            usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
+            usize::from(marked == crate::snapshots::sampled_audit::AUDIT_SLOTS)
         );
         assert_eq!(
             counts["index_state_at_page_end"]["audit_quiet_retired"],
-            usize::from(marked < crate::transcript_cache::CACHE_ENTRIES)
+            usize::from(marked < crate::snapshots::sampled_audit::AUDIT_SLOTS)
         );
         assert_eq!(
             diagnostics
                 .iter()
                 .filter(|record| record["stage"] == "sampled_audit_cap_alarm")
                 .count(),
-            usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
+            usize::from(marked == crate::snapshots::sampled_audit::AUDIT_SLOTS)
         );
         serviced.save(&path).unwrap();
         let loaded = ScanIndex::load(&path).unwrap();
@@ -1428,7 +1428,7 @@ fn cap_pace_expires_on_six_hours_backwards_or_implausible_clock_and_evicts_oldes
     // Fresh map: enrollment order and wall time both make A the oldest.
     let cache = sampled_scan::SharedCache::default();
     assert_eq!(cache.cap_pace_for_test("oldest", at), (true, false, 1));
-    for n in 1..crate::transcript_cache::CACHE_ENTRIES {
+    for n in 1..crate::snapshots::sampled_audit::AUDIT_SLOTS {
         assert_eq!(
             cache.cap_pace_for_test(
                 &format!("pace-{n}"),
@@ -1473,10 +1473,10 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
     fill_unavailable_audits(
         &mut index,
         &key,
-        crate::transcript_cache::CACHE_ENTRIES,
+        crate::snapshots::sampled_audit::AUDIT_SLOTS,
         START,
     );
-    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+    for n in 0..crate::snapshots::sampled_audit::AUDIT_SLOTS {
         assert_eq!(
             cache.cap_pace_for_test(
                 &format!("old-{n}"),
