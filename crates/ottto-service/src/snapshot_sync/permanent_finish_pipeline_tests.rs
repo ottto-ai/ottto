@@ -300,6 +300,14 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             !matches!(outcome, FinishOutcome::Retryable),
             "{outcome:?}: {result:?}"
         );
+        // A held entity has its own quarantine clock: no finished cycle,
+        // conflicts included, enters the whole-source failure ladder.
+        let failing = source_cadences()
+            .lock()
+            .unwrap()
+            .get("claude_code")
+            .map(|cadence| cadence.state() == ottto_protocol::LocalCollectorState::Failing);
+        assert_eq!(failing, Some(false), "{outcome:?}, cycle {cycle}");
         let saved = ScanIndex::load(&index_path).unwrap();
         assert!(saved.generation > 0, "real selected save");
         let offered = server.offered.lock().unwrap();
@@ -416,12 +424,22 @@ fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
     for outcome in [
-        FinishOutcome::Retryable,
         FinishOutcome::PermanentStatusFailure,
         FinishOutcome::PermanentUncleanCensus,
     ] {
         permanent_finish_pipeline(outcome, false);
     }
+}
+
+/// [regress] A cycle whose only offered entity conflicts quarantines that
+/// entity on its own retry clock. It used to count as a source failure and
+/// climb the whole-source 1 min to 1 h ladder. The lease stays revoked.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
+    permanent_finish_pipeline(FinishOutcome::Retryable, false);
 }
 
 #[test]
