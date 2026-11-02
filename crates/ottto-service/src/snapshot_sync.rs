@@ -6815,9 +6815,12 @@ fn prepare_sync_source_inner(
     {
         upload_progress.save(&upload_progress_path)?;
     }
-    if source == SnapshotSource::ClaudeCode {
+    // One serialization feeds both input digests: the traversal contract
+    // (Claude) and the per-item proof's input record (every source).
+    let policy_bytes = serde_json::to_vec(&upload_policy).expect("upload policy is serializable");
+    if claude {
         claude_contract::prepare_context(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
         );
@@ -6829,7 +6832,7 @@ fn prepare_sync_source_inner(
     index.note_upload_context_inputs(
         source,
         crate::snapshots::UploadContextInputs::new(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
             copy_unproven_enabled,
@@ -8536,20 +8539,25 @@ fn finish_sync_source(
             clear_shed_streak(source);
             // Scope the unsettled stamp to the families of this page's
             // entities without an exact ACK of their body, and held ones.
-            let unsettled_roots = index.claude_entity_family_roots(
-                &scan_result
-                    .snapshots
-                    .iter()
-                    .filter(|item| {
-                        upload_progress
-                            .accepted_body_witnesses
-                            .get(&item.snapshot_fingerprint)
-                            != Some(&snapshot_upload_body_witness(item))
-                    })
-                    .map(|item| item.snapshot_fingerprint.clone())
-                    .chain(local_holds.held_fingerprints.iter().cloned())
-                    .collect(),
-            );
+            // Codex and Pi scopes have no reader: their stamp stays sweep-wide.
+            let unsettled_roots = if source == SnapshotSource::ClaudeCode {
+                index.claude_entity_family_roots(
+                    &scan_result
+                        .snapshots
+                        .iter()
+                        .filter(|item| {
+                            upload_progress
+                                .accepted_body_witnesses
+                                .get(&item.snapshot_fingerprint)
+                                != Some(&snapshot_upload_body_witness(item))
+                        })
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .chain(local_holds.held_fingerprints.iter().cloned())
+                        .collect(),
+                )
+            } else {
+                None
+            };
             let settlement = settle_checkpointed_upload(
                 index,
                 &committed_index,
