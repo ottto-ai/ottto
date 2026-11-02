@@ -279,6 +279,11 @@ impl Page {
             &disposition,
             &backfill,
         );
+        // The streamed terminal's local counters depend on the store's
+        // representation (resident or cold) and are logged only; the arms
+        // compare what the fold decided (its stats copy included).
+        disposition.terminal_stream = Default::default();
+        self.stats.terminal_stream = Default::default();
         self.disposition = disposition.clone();
         if let (Some(mut checks), Some((whole, whole_accepted, whole_reads))) = (checks, whole) {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;

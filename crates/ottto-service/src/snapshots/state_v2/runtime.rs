@@ -1355,18 +1355,14 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
     Ok(())
 }
 
-/// Store-only rows of one kind, read on the graph's own session in one short
-/// read transaction. `Some`: those families' rows by key (a missing row is no
-/// callback). `None`: the whole kind, complete by its manifest count. Each
-/// value comes with its row digest as stored. A graph not at the generation
-/// its save would commit over (its own, or its confirmed growth claim's),
-/// or a store changed elsewhere, holds.
-pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
+/// One short read transaction on the graph's own session, with the store
+/// stamp it read under. A graph not at the generation its save would commit
+/// over (its own, or its confirmed growth claim's), or a store changed
+/// elsewhere, holds.
+fn read_txn<R>(
     index: &ScanIndex,
-    kind: &str,
-    roots: Option<&std::collections::BTreeSet<String>>,
-    f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
-) -> Result<()> {
+    f: impl FnOnce(&mut dyn Transaction) -> Result<R>,
+) -> Result<(R, (u64, u64))> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1389,141 +1385,181 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
         Hold::DbUnavailable
     );
     let mut tx = session.db.begin(TxnMode::Read)?;
-    let expected = match roots {
-        Some(_) => None,
-        None => {
-            let h = tx
-                .get(&mapper::key(kind, "", 0)?)?
-                .context("state_v2_missing_manifest")?;
-            Some(mapper::read::<usize>(&mut tx, &h, None)?)
-        }
-    };
-    let mut count = 0_usize;
-    mapper::visit(&mut tx, kind, roots, |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-            return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
-        count += 1;
-        let mut digests = mapper::Digests::new();
-        let value = mapper::read(tx, &h, Some(&mut digests))?;
-        let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
-        f(mapper::family(key_bytes)?, value, digest)
-    })?;
-    ensure!(
-        expected.map_or(true, |expected| expected == count),
-        "state_v2_missing_member"
-    );
-    Ok(())
+    Ok((f(&mut tx)?, stamp))
 }
 
 /// Cold usage pending: load the families a page names before it
-/// accumulates (`Some`), or every family before a decision that joins them
-/// (`None`). A missing, changed or unreadable row, or a store this graph does
-/// not hold, is Unknown and the caller refuses its whole decision. Counted.
-/// Nothing installs unless every wanted row was read and matches its head.
+/// accumulates, each stored row read in one short read transaction and
+/// matching its head (a patched head's flag applied). A missing, changed or
+/// unreadable row, or a store this graph does not hold, is Unknown and the
+/// caller refuses its whole decision. Counted. Nothing installs unless every
+/// wanted row was read.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
-    roots: Option<&std::collections::BTreeSet<String>>,
+    roots: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    if roots.is_none() && index.claude_usage_family_pending.all().is_ok() {
+    let usage = &index.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        return Ok(());
+    };
+    let unread = usage.unloaded(roots.iter().map(String::as_str));
+    if unread.is_empty() {
         return Ok(());
     }
-    let mut read = Vec::new();
-    read_unloaded(index, roots, roots.is_none(), &mut |root, value, digest| {
-        read.push((root, value, digest));
-    })?;
+    let read = read_txn(index, |tx| {
+        let mut read = Vec::with_capacity(unread.len());
+        for root in unread {
+            let (value, digest) =
+                cold.head_row(&root, mapper::read_row(tx, "usage.pending", &root)?)?;
+            read.push((root, value, digest));
+        }
+        Ok(read)
+    });
+    let (read, _) = match read {
+        Ok(read) => read,
+        Err(error) => {
+            telemetry::count("usage_pending_unknown", 1);
+            return Err(error);
+        }
+    };
     let Some(cold) = index.claude_usage_family_pending.cold_mut() else {
         return Ok(());
     };
     for (root, value, digest) in read {
         cold.install(root, value, digest)?;
     }
-    if roots.is_none() {
-        cold.complete()?;
-    }
     Ok(())
 }
 
-/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
-/// time, as this graph holds it: its loaded value, else its stored row,
-/// which must still match its head. Keeps nothing and visits in no set
-/// order. Unknown, counted: a row unlike its head, a head without a row, or a
-/// store this graph does not hold.
-pub(in super::super) fn visit_usage(
+/// One slice of an ordered usage visit stops before the next family once it
+/// has visited `families`, or once the families it decoded measure `bytes`
+/// of heap. It always visits at least one family, so a family over `bytes`
+/// runs alone in its slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) struct SliceBudget {
+    pub(in super::super) families: usize,
+    pub(in super::super) bytes: usize,
+}
+impl SliceBudget {
+    /// The whole visit in one slice.
+    pub(in super::super) const WHOLE: Self = Self {
+        families: usize::MAX,
+        bytes: usize::MAX,
+    };
+}
+
+/// What every slice of one sliced visit, and its commit, must find equal:
+/// the store stamp the slice read under (`None`: a resident graph, nothing
+/// stored) and the family count. Each stored row is checked against its head
+/// as it is read, and the caller's visited total must equal `families`.
+/// Any difference refuses the whole decision; nothing is partial.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in super::super) struct UsageToken {
+    pub(in super::super) stamp: Option<(u64, u64)>,
+    pub(in super::super) families: usize,
+}
+
+/// How a slice ended. `last_root`: resume after it; `None`: no family is left.
+/// `decoded_bytes`: heap of the stored rows this slice decoded, measured on
+/// each decoded value (loaded values are not decoded and count none). A
+/// layout the bound cannot measure counts as `usize::MAX`, so its family
+/// ends the slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(in super::super) struct SliceEnd {
+    pub(in super::super) last_root: Option<String>,
+    pub(in super::super) visited: usize,
+    pub(in super::super) decoded_bytes: usize,
+    pub(in super::super) token: UsageToken,
+}
+
+/// Usage-pending families in ascending root order, from the first root after
+/// `after`, one slice under `budget`: every family (`None`) or the named ones
+/// (`Some`). Each is the graph's loaded value at its root position, else its
+/// stored row, which must match its head (a patched head's flag applied).
+/// Keeps nothing and installs nothing; one short read transaction per slice,
+/// over one ascending range of rows for a whole visit, keyed for a targeted
+/// one. Unknown, counted: a row unlike its head, a head without a row, or a store
+/// this graph does not hold.
+pub(in super::super) fn visit_usage_ordered(
     index: &ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
+    after: Option<&str>,
+    budget: SliceBudget,
     f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
-) -> Result<()> {
+) -> Result<SliceEnd> {
+    use super::super::usage_pending::{Unknown, UsageView};
     let usage = &index.claude_usage_family_pending;
-    let held = usage.resident().or(usage.cold().map(|cold| cold.loaded()));
-    for (root, family) in held.into_iter().flatten() {
-        if roots.map_or(true, |roots| roots.contains(root)) {
-            f(root.as_str(), family);
+    let families = usage.len();
+    let mut end = SliceEnd::default();
+    let mut slice = |mut tx: Option<&mut dyn Transaction>| -> Result<()> {
+        // A stored whole visit reads its rows over one ascending range per
+        // slice; a targeted one reads only its named keys.
+        let limit = budget.families.saturating_add(1).min(128);
+        let mut range = match (roots, &tx) {
+            (None, Some(_)) => Some(mapper::KeyRows::new("usage.pending", after, limit)?),
+            _ => None,
+        };
+        let views: Box<dyn Iterator<Item = (&String, UsageView<'_>)> + '_> = match roots {
+            None => usage.views_after(after),
+            Some(roots) => {
+                use std::ops::Bound;
+                let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+                Box::new(
+                    roots
+                        .range::<str, _>((from, Bound::Unbounded))
+                        .filter_map(|root| Some((root, usage.view(root)?))),
+                )
+            }
+        };
+        let mut views = views.peekable();
+        while let Some((root, view)) = views.next() {
+            match view {
+                UsageView::Full(family) => f(root, family),
+                UsageView::Head(_) => {
+                    let tx = tx.as_deref_mut().ok_or(Unknown)?;
+                    let row = match range.as_mut() {
+                        Some(range) => range
+                            .row(tx, root)?
+                            .map(|h| mapper::read_digest(tx, &h))
+                            .transpose()?,
+                        None => mapper::read_row(tx, "usage.pending", root)?,
+                    };
+                    let cold = usage.cold().ok_or(Unknown)?;
+                    let (family, _) = cold.head_row(root, row)?;
+                    let bytes = crate::heap_layout_bound::completed_bound(&family, usize::MAX)
+                        .unwrap_or(usize::MAX);
+                    f(root, &family);
+                    end.decoded_bytes = end.decoded_bytes.saturating_add(bytes);
+                }
+            }
+            end.visited += 1;
+            if views.peek().is_some()
+                && (end.visited >= budget.families || end.decoded_bytes >= budget.bytes)
+            {
+                end.last_root = Some(root.clone());
+                break;
+            }
+        }
+        Ok(())
+    };
+    let result = match usage.cold() {
+        None => slice(None).map(|()| None),
+        Some(_) => read_txn(index, |tx| slice(Some(tx))).map(|((), stamp)| Some(stamp)),
+    };
+    match result {
+        Ok(stamp) => {
+            end.token = UsageToken { stamp, families };
+            Ok(end)
+        }
+        Err(error) => {
+            telemetry::count("usage_pending_unknown", 1);
+            Err(error)
         }
     }
-    read_unloaded(index, roots, false, &mut |root, value, _| f(&root, &value))
 }
 
-/// The cold families `roots` names (`None`: every head) that this graph has
-/// not loaded, one stored row at a time, each matching its head; every one
-/// must be read. `None` reads the whole kind, complete by its manifest count,
-/// and with `whole` reads it even when nothing is unloaded. Unknown, counted:
-/// a row unlike its head, a head without a row, or a store this graph does
-/// not hold.
-fn read_unloaded(
-    index: &ScanIndex,
-    roots: Option<&std::collections::BTreeSet<String>>,
-    whole: bool,
-    f: &mut dyn FnMut(String, super::super::ClaudeUsageFamilyPending, [u8; 32]),
-) -> Result<()> {
-    let usage = &index.claude_usage_family_pending;
-    let Some(cold) = usage.cold() else {
-        return Ok(());
-    };
-    let unread = match roots {
-        Some(roots) => usage.unloaded(roots.iter().map(String::as_str)),
-        None => usage.unloaded(cold.head_roots().map(String::as_str)),
-    };
-    if unread.is_empty() && !whole {
-        return Ok(());
-    }
-    let mut seen = 0_usize;
-    let read = read_cold(
-        index,
-        "usage.pending",
-        roots.map(|_| &unread),
-        &mut |root, value: super::super::ClaudeUsageFamilyPending, digest| {
-            if !unread.contains(&root) {
-                return Ok(()); // loaded already, or removed by this graph
-            }
-            cold.admits(&root, digest)?;
-            seen += 1;
-            f(root, value, digest);
-            Ok(())
-        },
-    );
-    let result = read.and_then(|()| {
-        ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
-        Ok(())
-    });
-    if result.is_err() {
-        telemetry::count("usage_pending_unknown", 1);
-    }
-    result
-}
-
-/// End a decision that loaded every cold usage family: values unchanged
-/// since their row was read return to heads, except the `keep` families.
+/// End a decision that loaded cold usage families: values unchanged since
+/// their row was read return to heads, except the `keep` families.
 pub(in super::super) fn settle_usage(
     index: &mut ScanIndex,
     keep: &std::collections::BTreeSet<String>,

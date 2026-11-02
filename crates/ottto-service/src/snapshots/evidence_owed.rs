@@ -7,11 +7,10 @@
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
 //!   the current census window, no read; a confirmed-empty member whose
 //!   current census record holds no requests re-stamps from that record;
-//! - (c) cap-invalid family, unchanged, its occurrences still do not fit:
-//!   stays owed, no read, no credit;
 //! - otherwise one counted `Rearmed` parse, paced per page; with the
 //!   fingerprint kept the existing RAM/durable restore may serve it (b), else
 //!   it reads Full (d).
+use super::usage_pending::UsageView;
 use super::*;
 
 /// Only the terminal-retry re-arm owes evidence instead of clearing the
@@ -55,19 +54,8 @@ pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexE
         && keep_or_clear_changes(retained, !working.source_file_fingerprint.is_empty())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Arm {
-    KeptOwed,
-    Read,
-}
-
-/// Per page: one decision per family, and the pending occurrence count the
-/// cap-room rule admits against.
+/// Per page: the paced owed-read allowance.
 pub(super) struct Page {
-    pub(super) families: BTreeMap<String, Arm>,
-    pub(super) retained: Option<usize>,
-    /// The pending occurrence cap a kept family's re-read must fit.
-    pub(super) cap: usize,
     /// Owed Fulls this page already admitted, and the one
     /// per-page cap. It reuses the existing paced re-read page allowance
     /// (`BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE`); the rest wait in the
@@ -78,9 +66,6 @@ pub(super) struct Page {
 impl Default for Page {
     fn default() -> Self {
         Self {
-            families: BTreeMap::new(),
-            retained: None,
-            cap: MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             reads: 0,
             read_cap: BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE,
         }
@@ -170,7 +155,7 @@ fn stamp_families<T>(
             .filter(|pending| pending.census_window_end == census_window_end)
         {
             pending.identity_contract = match before {
-                _ if pending.invalid || evidence_free(pending) => None,
+                _ if pending.invalid || UsageView::Full(pending).evidence_free() => None,
                 None => current,
                 Some(stamp) if stamp.is_some() && stamp == current => current,
                 Some(_) => None,
@@ -178,47 +163,6 @@ fn stamp_families<T>(
         }
     }
     result
-}
-
-fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
-    pending.member_occurrences.is_empty()
-        && pending
-            .member_request_id_hashes
-            .values()
-            .all(BTreeSet::is_empty)
-}
-
-/// Kept owed with no credit, per member: cap-invalid family, no stored
-/// evidence, no authority quarantine or decode hold, no identity-contract
-/// latch and a contract not left unproven by a latch clear (that member's
-/// body is read under the current contract, paced, never kept waiting for cap
-/// room), and this exact revision is the one its census record
-/// reproduced in the family's window, with an ACKed head.
-fn kept_member(
-    index: &ScanIndex,
-    key: &str,
-    entry: &ScanIndexEntry,
-    root: &str,
-    pending: super::usage_pending::UsageView<'_>,
-) -> bool {
-    let Some(window) = rfc3339_unix_seconds(pending.window()) else {
-        return false;
-    };
-    index.persistence_available()
-        && index.claude_duplicate_request_witness_overflowed
-        && pending.invalid()
-        && pending.evidence_free()
-        && !pending.contract_unproven()
-        && !index.claude_request_identity_contract_changed
-        && !index.claude_usage_authority_quarantine.contains_key(root)
-        && !index.decode_holds_family(root)
-        && !index.claude_account_deferred_holds.contains_key(key)
-        && !index.effective_upload_body_witness_revision_requires_adoption(key)
-        && claude_stale_member_independently_accepted(index, key, entry)
-        && index
-            .claude_request_census
-            .retry_carry_record(key)
-            .is_some_and(|record| record.reproduces(&entry.source_file_fingerprint, window))
 }
 
 /// The indexed members of `root`'s family, by one ordered range over the
@@ -247,28 +191,6 @@ fn family<'a>(
     )
 }
 
-/// Cap room: the family's recorded requests fit the pending
-/// occurrence cap after what is already retained; admitted in selection order.
-fn cap_room(index: &ScanIndex, page: &mut Page, key: &str, root: &str) -> bool {
-    let retained = *page
-        .retained
-        .get_or_insert_with(|| index.claude_usage_family_pending.total_occurrences());
-    let Some(members) = family(index, key, root) else {
-        return false;
-    };
-    let requests = members
-        .filter_map(|(key, _)| index.claude_request_census.retry_carry_record(key))
-        .map(|record| record.request_hashes().len())
-        .fold(0_usize, usize::saturating_add);
-    match claude_pending_occurrence_count_after_replace(retained, 0, requests, page.cap) {
-        Some(next) => {
-            page.retained = Some(next);
-            true
-        }
-        None => false,
-    }
-}
-
 /// The traversal's selection of one candidate (`decision`, `reason` already
 /// decided by `candidate_decision_in_window`). Only an owed entry changes.
 pub(super) fn resolve(
@@ -290,7 +212,7 @@ pub(super) fn resolve(
             .is_some_and(|entry| entry.evidence_owed)
     }) {
         let roots = BTreeSet::from([root.clone()]);
-        if super::state_v2::load_usage(index, Some(&roots)).is_err() {
+        if super::state_v2::load_usage(index, &roots).is_err() {
             return;
         }
     }
@@ -367,62 +289,33 @@ pub(super) fn resolve(
             }),
         }
     }
-    let Some(entry) = index.files.get(&key) else {
+    if !index.files.contains_key(&key) {
         return;
-    };
-    let member = claude_index_path_member_ref(&candidate.path).map(|member| member.root);
-    let kept = member.is_some_and(|root| {
-        index
-            .claude_usage_family_pending
-            .view(root)
-            .is_some_and(|pending| kept_member(index, &key, entry, root, pending))
-    });
-    let arm = match member.filter(|_| kept) {
-        // Not kept: a plain read.
-        None => Arm::Read,
-        Some(root) => match page.families.get(root) {
-            Some(arm) => *arm,
-            None => {
-                let arm = if cap_room(index, page, &key, root) {
-                    Arm::Read
-                } else {
-                    Arm::KeptOwed
-                };
-                page.families.insert(root.to_owned(), arm);
-                arm
-            }
-        },
-    };
-    if arm == Arm::Read {
-        if page.reads >= page.read_cap {
-            // Paced: back into the walk's own queue as a re-read (not a
-            // census member, like a history-upgrade budget hold), still owed.
-            claude_contract::note(|c| c.evidence_owed.deferred_page_cap += 1);
-            if let Some(traversal) = index.traversal.as_mut() {
-                traversal.pending_candidates.push_back(ScanTraversalPath {
-                    scan_root: candidate.scan_root.clone(),
-                    path: candidate.path.clone(),
-                    census_member: false,
-                    watcher_hint: false,
-                });
-            }
-            return;
-        }
-        page.reads += 1;
     }
+    // Every owed member left here is read, paced per page; capacity never
+    // keeps one owed.
+    if page.reads >= page.read_cap {
+        // Paced: back into the walk's own queue as a re-read (not a
+        // census member, like a history-upgrade budget hold), still owed.
+        claude_contract::note(|c| c.evidence_owed.deferred_page_cap += 1);
+        if let Some(traversal) = index.traversal.as_mut() {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: false,
+                watcher_hint: false,
+            });
+        }
+        return;
+    }
+    page.reads += 1;
     let latched = index.claude_request_identity_contract_changed;
-    claude_contract::note(|c| match arm {
-        Arm::Read => {
-            c.evidence_owed.read += 1;
-            c.evidence_owed.identity_owed_read_under_latch += u64::from(latched);
-        }
-        // Re-examined at every visit: read once its requests fit the cap.
-        Arm::KeptOwed => c.evidence_owed.owed_waiting_cap += 1,
+    claude_contract::note(|c| {
+        c.evidence_owed.read += 1;
+        c.evidence_owed.identity_owed_read_under_latch += u64::from(latched);
     });
-    if arm == Arm::Read {
-        *decision = CandidateDecision::Parse;
-        *reason = Some(CandidateParseReason::Rearmed);
-    }
+    *decision = CandidateDecision::Parse;
+    *reason = Some(CandidateParseReason::Rearmed);
 }
 
 /// A traversal started under the recorded identity contract: its census
@@ -631,14 +524,16 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
 /// resolver reads the mark.
 pub(super) fn mark_unproven_at_latch_clear(index: &mut ScanIndex, census_window_end: &str) {
     let current = EvidenceContract::current(index);
-    for pending in index
-        .claude_usage_family_pending
-        .loaded_all_mut()
-        .values_mut()
-    {
-        if pending.census_window_end != census_window_end || pending.identity_contract != current {
-            pending.contract_unproven = true;
-        }
+    let usage = &mut index.claude_usage_family_pending;
+    let marked: Vec<String> = usage
+        .views()
+        .filter(|(_, family)| {
+            family.window() != census_window_end || family.identity_contract() != current
+        })
+        .map(|(root, _)| root.clone())
+        .collect();
+    for root in &marked {
+        usage.mark_unproven(root);
     }
 }
 

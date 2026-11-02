@@ -2146,9 +2146,9 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
     let _ = fs::remove_dir_all(dir);
 }
 
-const LEGACY_PARENT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-const LEGACY_CHILD: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
-const LEGACY_WINDOW: &str = "2026-08-02T07:10:00Z";
+pub(super) const LEGACY_PARENT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+pub(super) const LEGACY_CHILD: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+pub(super) const LEGACY_WINDOW: &str = "2026-08-02T07:10:00Z";
 
 fn legacy_line(session: &str, second: u64, request_id: &str, input: u64, output: u64) -> String {
     format!(
@@ -2162,7 +2162,7 @@ fn legacy_line(session: &str, second: u64, request_id: &str, input: u64, output:
 /// also holds `aux` telemetry-only requests: an aggregate cache-creation call
 /// and then a Haiku side call. Returns the raw parsed items, the reports, and
 /// the item index both members are tracked by.
-fn legacy_fork_fixture(
+pub(super) fn legacy_fork_fixture(
     aux: usize,
 ) -> (
     PathBuf,
