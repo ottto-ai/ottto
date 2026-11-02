@@ -1662,6 +1662,9 @@ const H_AUDIT: &[(&str, &str)] = &[
     ),
     (
         "OrgMarkers.address",
+        "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased address)",
+    ),
+    (
         "OrgMarkers.context_digest",
         "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased email)",
     ),
