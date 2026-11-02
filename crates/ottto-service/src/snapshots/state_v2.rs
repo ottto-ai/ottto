@@ -49,10 +49,6 @@ mod kinds_files;
 mod kinds_misc;
 mod mapper;
 mod sqlite;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover reads and stages")
-)]
 mod tail;
 use kinds::KindCx;
 #[allow(unused_imports)]
