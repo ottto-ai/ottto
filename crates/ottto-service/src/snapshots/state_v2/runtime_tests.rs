@@ -563,7 +563,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
 /// loads only its own families, a sibling subset saves one of them, and the
 /// working graph then loads another, changes its occurrence count, removes a
 /// third and saves itself with no Unknown refusal. Its heads are refreshed by
-/// that save; a whole-kind join and a restart see the explicit rows, and the
+/// that save; loading every family and a restart see the explicit rows, and the
 /// running total equals the sum of heads and the fold of the rows (A1).
 #[test]
 fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
@@ -608,7 +608,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         let committed = working.clone();
 
         // The page loads r1 alone; r2 stays Unknown, never absent.
-        load_usage(&mut working, Some(&roots(&["r1"]))).unwrap();
+        load_usage(&mut working, &roots(&["r1"])).unwrap();
         assert_eq!(
             working.claude_usage_family_pending.family("r2").is_err(),
             cold
@@ -627,7 +627,7 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
         // member's occurrences from it, removes r3 and saves itself: r1 is
         // rewritten as the sibling saved it and r4 is kept by its head.
         working.generation = subset.generation;
-        load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
+        load_usage(&mut working, &roots(&["r2"])).unwrap();
         let usage = &mut working.claude_usage_family_pending;
         let r2 = usage.family_mut("r2").unwrap().unwrap();
         r2.member_occurrences.pop_first().unwrap();
@@ -648,12 +648,19 @@ fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
             total(&expected)
         );
 
-        // A join loads every family and sees exactly the saved rows.
-        load_usage(&mut working, None).unwrap();
-        assert_eq!(
-            *working.claude_usage_family_pending.all().unwrap(),
-            expected
-        );
+        // Loading every family sees exactly the saved rows.
+        let every: BTreeSet<String> = working
+            .claude_usage_family_pending
+            .roots()
+            .cloned()
+            .collect();
+        load_usage(&mut working, &every).unwrap();
+        let usage = &working.claude_usage_family_pending;
+        let joined: Families = every
+            .iter()
+            .map(|root| (root.clone(), usage.family(root).unwrap().unwrap().clone()))
+            .collect();
+        assert_eq!(joined, expected);
         settle_usage(&mut working, &BTreeSet::new());
         assert_eq!(
             working.claude_usage_family_pending.family("r4").is_err(),
@@ -708,7 +715,7 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
     };
     let before = unknown();
     let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
-    assert!(load_usage(&mut working, Some(&page)).is_err());
+    assert!(load_usage(&mut working, &page).is_err());
     assert!(unknown() > before);
     let usage = &working.claude_usage_family_pending;
     assert!(usage.cold().unwrap().loaded().is_empty());

@@ -4101,8 +4101,8 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
 /// member with no pending re-stamped from its census record (a Full folds
 /// nothing for it); both arms also against a real parse and fold of the same
 /// bytes and from an identity-incomplete record of the same revision; an
-/// owed cap-invalid family gets no read and no credit
-/// unless its recorded requests fit the cap.
+/// owed invalid, evidence-free family (cap-invalid in an older store) is
+/// read, paced, with no credit.
 #[test]
 fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4210,7 +4210,8 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         assert!(index.files[&key].evidence_owed);
     }
 
-    // Cap-invalid: invalid, evidence-free pending from the record's window.
+    // Invalid, evidence-free pending from the record's window (an older
+    // store's cap invalidation).
     let (mut fixture, window) = owed_rearmed(1);
     let root = fixture.roots[0].clone();
     let pending = fixture
@@ -4222,22 +4223,15 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     pending.member_request_id_hashes.clear();
     pending.invalid = true;
     let invalid = pending.clone();
-    // Under the identity-contract latch it is read, never kept waiting.
-    for (cap, latched, parsed) in [
-        (0, false, 0),
-        (MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, false, 1),
-        (0, true, 1),
-    ] {
+    // Read, paced, never kept waiting for capacity, latched or not.
+    for latched in [false, true] {
         let mut index = fixture.index.clone();
         index.claude_request_identity_contract_changed = latched;
-        let mut page = evidence_owed::Page {
-            cap,
-            ..Default::default()
-        };
+        let mut page = evidence_owed::Page::default();
         assert_eq!(
             owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
-            parsed,
-            "cap {cap} latched {latched}"
+            1,
+            "latched {latched}"
         );
         assert_eq!(index.claude_usage_family_pending[&root], invalid);
         assert!(index.files.values().all(|entry| entry.evidence_owed));
@@ -5067,7 +5061,7 @@ fn stale_carry_shared_request_is_owned_by_the_later_carried_root() {
 
 /// [money] Under state v2, on the same failed window published cold: the
 /// streamed two-pass join carries and compacts exactly what the resident
-/// graph and a whole-kind load do, whether the pass
+/// graph and a graph with every family loaded do, whether the pass
 /// holds no family or the sharer first, and keeps no family it does not
 /// carry. A row gone from the store defers the start, counted: nothing
 /// carried, no fingerprint cleared, no family compacted.
@@ -5112,14 +5106,15 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
     );
     let expected = outcome(&resident);
     let mut whole = cold.clone();
-    state_v2::load_usage(&mut whole, None).unwrap();
-    assert_eq!(outcome(&start(whole)), expected, "whole-kind load");
+    let every: BTreeSet<String> = whole.claude_usage_family_pending.roots().cloned().collect();
+    state_v2::load_usage(&mut whole, &every).unwrap();
+    assert_eq!(outcome(&start(whole)), expected, "every family loaded");
     let streamed = start(cold.clone());
     assert_eq!(outcome(&streamed), expected, "streamed");
     assert!(v2::usage_head_only(&streamed, CARRY_SHARER));
     assert!(v2::usage_loaded(&streamed, CARRY_ROOT), "compacted");
     let mut held = cold.clone();
-    state_v2::load_usage(&mut held, Some(&BTreeSet::from([CARRY_SHARER.to_string()]))).unwrap();
+    state_v2::load_usage(&mut held, &BTreeSet::from([CARRY_SHARER.to_string()])).unwrap();
     assert_eq!(outcome(&start(held)), expected, "sharer held first");
 
     let mut gone = cold.clone();

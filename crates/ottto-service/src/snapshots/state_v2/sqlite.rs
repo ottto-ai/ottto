@@ -1816,21 +1816,12 @@ impl Sqlite {
         let mut digests = BTreeSet::new();
         let mut expected = None;
         super::mapper::rows(&mut tx, "file.progress", |tx, header| {
-            let RowKey::Record {
-                key_bytes,
-                position,
-                ..
-            } = &header.key
-            else {
-                bail!("state_v2_record_key");
-            };
-            if *position == 0 {
-                ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-                expected = Some(super::mapper::read::<usize>(tx, &header, None)?);
-            } else {
-                ensure!(*position == 1, "state_v2_member_position");
-                let path = super::mapper::family(key_bytes)?;
-                digests.insert(crate::durable_tail_store::key_digest(source, &path));
+            match super::mapper::member(&header)? {
+                None => expected = Some(super::mapper::read::<usize>(tx, &header, None)?),
+                Some(key_bytes) => {
+                    let path = super::mapper::family(key_bytes)?;
+                    digests.insert(crate::durable_tail_store::key_digest(source, &path));
+                }
             }
             Ok(())
         })?;

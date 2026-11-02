@@ -9456,6 +9456,9 @@ pub struct ClaudeLocalEvidenceStats {
     /// Fix 1's skipped full re-arms; absent from the line while empty.
     #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
     pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
+    /// The streamed terminal's slices and the fence's age; absent while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeTerminalStreamCounts::is_empty")]
+    pub terminal_stream: crate::snapshots::ClaudeTerminalStreamCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -10491,6 +10494,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .count();
     stats.duplicate_census = disposition.duplicate_census;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
+    stats.terminal_stream = disposition.terminal_stream;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
