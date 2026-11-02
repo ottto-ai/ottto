@@ -1054,6 +1054,7 @@ impl FileClaudeConfigSlotSettingsStore {
         }))
     }
 
+    #[cfg(test)]
     pub fn transition_setup_operation(
         &self,
         schema_version: u16,

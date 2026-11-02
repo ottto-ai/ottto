@@ -102,6 +102,7 @@ impl<'a> Enc<'a> {
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
+    #[cfg(test)]
     pub(crate) fn count_write(
         limit: usize,
         put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,

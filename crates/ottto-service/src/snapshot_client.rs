@@ -2948,6 +2948,7 @@ impl SnapshotApiClient {
     }
 
     /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
+    #[cfg(test)]
     pub fn upload_cloud_session_scan_chunk(
         &self,
         relay_token: &str,
