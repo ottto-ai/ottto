@@ -192,9 +192,11 @@ pub(in crate::snapshots) struct Common {
     /// The next revision id; ids are never reused, even after deletion.
     pub(in crate::snapshots) next_revision_id: u64,
 }
-/// A debt-only mutation: never touches the file's reduction, its graph rows
-/// (so no PRE or progress publishes) or its set-aside marker. Revision values
-/// are opaque to the store; their owner keeps D131 out of them.
+/// A debt-only mutation: never touches the file's graph rows (so no PRE or
+/// progress publishes) or its set-aside marker, and touches its reduction only
+/// by a representation other than Tail, which drops it. Revision values are
+/// opaque to the store; their owner keeps upload-context and policy hashes,
+/// account witnesses and replay scope out of them.
 #[derive(Default)]
 pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) representation: Representation,
@@ -230,7 +232,7 @@ impl Observation {
 /// An authorised final disposition of a file's whole debt: recorded (counted),
 /// and never reported as an ACK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // first production caller is the G7 cutover
+#[expect(dead_code, reason = "no production caller stages a disposition yet")]
 pub(in crate::snapshots) enum Disposition {
     /// A complete census proved the file absent.
     Absence,
@@ -505,12 +507,21 @@ fn delete_fragments(
 /// The common body's own version, separate from the source's (`revision`) and
 /// from the store's physical and DB generations.
 const ENVELOPE: u8 = 1;
+/// Only a Tail head holds a reduction, whichever way the head is crossing.
+fn check_shape(representation: Representation, has_reduction: bool) -> Result<()> {
+    ensure!(
+        !has_reduction || representation == Representation::Tail,
+        "state_v2_tail_value_shape"
+    );
+    Ok(())
+}
 pub(super) fn encode_head(
     revision: u32,
     table: &MembershipTable,
     common: &Common,
     reduction: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    check_shape(common.representation, reduction.is_some())?;
     let body = reduction.unwrap_or_default();
     let mut out = Vec::with_capacity(31 + table.len() * 54 + body.len());
     out.extend_from_slice(&revision.to_be_bytes());
@@ -533,7 +544,7 @@ pub(super) fn encode_head(
     out.push(debt.disposition.map_or(0, |d| d as u8));
     out.push(u8::from(reduction.is_some()));
     out.extend_from_slice(body);
-    out
+    Ok(out)
 }
 /// A committed head, decoded. `revision` below the caller's is the caller's
 /// decision; above it, `load_head` holds. Only `load_head` makes one: the private
@@ -612,7 +623,9 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
             _ => Some(NoUploadRequired::ZeroTokens),
         },
     };
-    let reduction = (code(&mut input, 1)? == 1).then(|| input.0.to_vec());
+    let has_reduction = code(&mut input, 1)? == 1;
+    check_shape(representation, has_reduction)?;
+    let reduction = has_reduction.then(|| input.0.to_vec());
     ensure!(
         reduction.is_some() || input.0.is_empty(),
         "state_v2_tail_value_shape"
@@ -1018,7 +1031,13 @@ fn write_file(
     if let Some(observation) = debt.and_then(|debt| debt.observation.as_ref()) {
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
     }
-    if staged.is_some() || disposal.is_some() {
+    // No longer a Tail file: the reduction and its pages go, the debt stays.
+    if common.representation != Representation::Tail && reduction.is_some() {
+        reduction = None;
+        table.retain(|collection, _| *collection == Collection::Revisions);
+        delete_rows(tx, file, true)?;
+    }
+    if (staged.is_some() && reduction.is_some()) || disposal.is_some() {
         tx.delete(&set_aside_key(file)?)?;
     }
     if table
@@ -1031,7 +1050,7 @@ fn write_file(
         delete_rows(tx, file, false)?;
         return Ok(applied);
     }
-    let head = encode_head(revision, &table, &common, reduction.as_deref());
+    let head = encode_head(revision, &table, &common, reduction.as_deref())?;
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     applied.head_bytes = head.len() as u64;
     Ok(applied)
@@ -1054,13 +1073,14 @@ fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, Members
     Ok((revision, table, common))
 }
 /// Retirement or progress removal without a disposition: the reduction goes;
-/// unresolved revisions stay under one metadata-only head. `true`: debt kept.
+/// unresolved revisions stay under one metadata-only head. `true`: debt kept, and
+/// the set-aside marker with it, since this is neither replacement nor disposal.
 fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
     let (revision, table, common) = committed_debt(tx, file)?;
     let keep = !table.is_empty();
     delete_rows(tx, file, keep)?;
     if keep {
-        let head = encode_head(revision, &table, &common, None);
+        let head = encode_head(revision, &table, &common, None)?;
         write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     }
     Ok(keep)
@@ -1167,8 +1187,11 @@ pub(super) fn apply(
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
     for file in removed.iter().chain(authorised) {
-        applied.kept_debt += u64::from(retire(tx, file)?);
-        tx.delete(&set_aside_key(file)?)?;
+        if retire(tx, file)? {
+            applied.kept_debt += 1;
+        } else {
+            tx.delete(&set_aside_key(file)?)?;
+        }
         applied.retired += 1;
     }
     // Scope erasure is not a reset: debt goes too, and nothing vetoes it.

@@ -4294,7 +4294,7 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
-    /// Per-folder login evidence (state layout 5); filled by ID1.
+    /// Per-folder login evidence (state layout 5); nothing fills it yet.
     #[serde(default)]
     pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
     /// Durable debt facts that outlive any one traversal (state layout 5).

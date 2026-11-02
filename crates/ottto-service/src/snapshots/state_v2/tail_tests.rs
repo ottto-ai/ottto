@@ -799,8 +799,14 @@ fn debt_survives_reset_and_retire_until_disposed() {
     assert_eq!(pages.len(), 1);
     assert_eq!(revisions(&index, FILE).len(), 2, "reset kept the debt");
 
+    set_aside_tail(&f.path, FILE, SetAsideCause::Encode).unwrap();
+    save_with(&f.path, &mut index).unwrap();
     retire_tail(&f.path, [FILE.to_owned()]).unwrap();
     save_with(&f.path, &mut index).unwrap();
+    assert!(
+        tail_set_aside(&index, FILE).unwrap().is_some(),
+        "retiring with debt neither replaces nor disposes"
+    );
     let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
     assert!(head.metadata_only && head.body.is_empty());
     assert_eq!(head.common.next_revision_id, 2);
@@ -835,13 +841,14 @@ fn debt_survives_reset_and_retire_until_disposed() {
     dispose_tail(&f.path, FILE, Disposition::Settled).unwrap();
     save_with(&f.path, &mut index).unwrap();
     assert_eq!(all_tail_rows(&index, FILE), 0, "no reduction, no debt");
+    assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "disposed");
 
     // A newer envelope, code or flag holds; never a default.
     let common = Common {
         representation: Representation::Archive,
         ..Default::default()
     };
-    let encoded = tail::encode_head(REVISION, &Default::default(), &common, None);
+    let encoded = tail::encode_head(REVISION, &Default::default(), &common, None).unwrap();
     assert!(tail::decode_head(&encoded).is_ok());
     for (at, value) in [(5, 2), (6, 4), (24, 3)] {
         let mut newer = encoded.clone();
@@ -849,6 +856,65 @@ fn debt_survives_reset_and_retire_until_disposed() {
         let error = tail::decode_head(&newer).err().unwrap();
         assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "{at}");
     }
+}
+
+/// [behaviour] Only a Tail head holds a reduction: neither side of the codec
+/// accepts another, and an observation leaving Tail drops reduction and pages.
+#[test]
+fn reduction_requires_tail_representation() {
+    let archive = Common {
+        representation: Representation::Archive,
+        ..Default::default()
+    };
+    let refused = tail::encode_head(REVISION, &Default::default(), &archive, Some(b"body"));
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "state_v2_tail_value_shape"
+    );
+    let mut bytes = tail::encode_head(
+        REVISION,
+        &Default::default(),
+        &Common::default(),
+        Some(b"body"),
+    )
+    .unwrap();
+    assert!(tail::decode_head(&bytes).is_ok());
+    bytes[6] = Representation::Archive as u8;
+    let error = tail::decode_head(&bytes).err().unwrap();
+    assert_eq!(error.to_string(), "state_v2_tail_value_shape");
+
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let page = long_value();
+    for key in [FILE, SIBLING] {
+        stage_tail(
+            &f.path,
+            key,
+            staged(b"head", &[(Collection::Requests, 0, page.as_slice())]),
+        )
+        .unwrap();
+    }
+    save_with(&f.path, &mut index).unwrap();
+
+    let leaves_tail = |added: &[&[u8]]| Observation {
+        representation: Representation::Archive,
+        ..observation(added)
+    };
+    observe_tail(&f.path, FILE, leaves_tail(&[b"r0"])).unwrap();
+    observe_tail(&f.path, SIBLING, leaves_tail(&[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only && head.body.is_empty());
+    assert_eq!(head.common.representation, Representation::Archive);
+    assert!(rows(&index, "tail.page.requests", FILE).is_empty());
+    assert_eq!(frag_rows(&index), 0);
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec())])
+    );
+    assert_eq!(all_tail_rows(&index, SIBLING), 0, "no reduction, no debt");
 }
 
 /// [behaviour] Scope erasure is not a reset: every row and the marker go, and

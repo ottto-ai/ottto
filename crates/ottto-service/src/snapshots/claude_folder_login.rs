@@ -1,5 +1,5 @@
 //! The folder login ledger's persisted shape (state layout 5). Only the stored
-//! format lives here; the code that fills and reads it ships with ID1.
+//! format lives here; the code that fills and reads it ships separately.
 
 use serde::{Deserialize, Serialize};
 
