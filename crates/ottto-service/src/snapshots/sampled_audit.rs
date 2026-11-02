@@ -2342,6 +2342,25 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
 }
 
+/// Debt whose claim has expired. Its deferral did not re-queue it, so its
+/// queued path would wait behind the census FIFO; selection wakes it instead.
+pub(super) fn expired_growth_claims(index: &ScanIndex, now: u64) -> BTreeSet<PathBuf> {
+    if !growth_active(index) {
+        return BTreeSet::new();
+    }
+    index
+        .v2()
+        .growth_retention
+        .iter()
+        .filter(|(_, state)| {
+            state.predecessor_size.is_some()
+                && state.last_growth_full_unix.is_some()
+                && !growth_claim_recent(state, now)
+        })
+        .map(|(key, _)| PathBuf::from(key))
+        .collect()
+}
+
 /// The claim is one store transaction CAS'd on this lineage's G; no
 /// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {

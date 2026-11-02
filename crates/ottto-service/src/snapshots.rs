@@ -27402,6 +27402,7 @@ impl OwnedSourceScan {
                 file_limit,
             );
         }
+        let growth_wake = sampled_audit::expired_growth_claims(index, audit_now);
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
@@ -27572,6 +27573,19 @@ impl OwnedSourceScan {
             }
         }
         let retry_service_end = pending_paths.len();
+        // A growth Full deferred by its claim left the queue; once the claim
+        // expires, its queued path rides this page instead of waiting behind
+        // the census FIFO. The claim still admits one Full per interval.
+        if !growth_wake.is_empty() {
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && growth_wake.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
                 index
