@@ -3620,7 +3620,7 @@ pub(crate) fn reconcile_request_accounts(
     items: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
 ) -> super::ClaudeUnhealthyRootNoFallbackCounts {
-    use super::claude_request_money::e2::place_request_identity;
+    use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
     let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
@@ -3912,6 +3912,7 @@ pub(crate) fn reconcile_request_accounts(
                 telemetry,
                 native.account(sequence),
                 account,
+                IdentityCaller::Request,
             );
             if backward {
                 carry.pending.push(occurrence);
@@ -3922,7 +3923,14 @@ pub(crate) fn reconcile_request_accounts(
                 .inherited
                 .saturating_add(occurrence.usage.request_count);
             occurrence.e2_inherited = Some(true);
-            place_request_identity(&mut fold, occurrence, None, None, account);
+            place_request_identity(
+                &mut fold,
+                occurrence,
+                None,
+                None,
+                account,
+                IdentityCaller::Carry,
+            );
         });
         item.claude_usage_occurrences = occurrences;
         accounts.reconciled = true;
