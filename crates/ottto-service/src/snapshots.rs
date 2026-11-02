@@ -1039,10 +1039,23 @@ const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
 /// usage accepted before the release keeps exactly the row it had.
 const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_794_182_400;
 
-fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+/// 2026-11-04T00:00:00Z, a 00:00Z expected on/after install of the release
+/// that carries the Legacy repeat gate. Legacy drops an equal-total repeat
+/// only when the repeated line itself is dated from here, so its row is a
+/// function of its file's bytes on every read route and history before this
+/// keeps exactly the rows it had. Correcting older repeats is an operator
+/// decision.
+const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+
+/// `false` for a missing or unparsable timestamp.
+fn dated_on_or_after(timestamp: Option<&str>, from_unix_seconds: u64) -> bool {
     timestamp
         .and_then(rfc3339_unix_seconds)
-        .is_some_and(|seconds| seconds >= CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
+        .is_some_and(|seconds| seconds >= from_unix_seconds)
+}
+
+fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+    dated_on_or_after(timestamp, CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
 }
 
 /// One request's bucket from its prompt size, its model and its own usage
@@ -21144,6 +21157,7 @@ impl SnapshotAccumulator {
             usage,
             last_usage,
             usage_event_identity,
+            timestamp,
             implicit_request_count,
         )?;
         self.add_usage_with_selector(
@@ -21204,6 +21218,7 @@ impl SnapshotAccumulator {
         usage: UsageTotals,
         last_usage: Option<UsageTotals>,
         usage_event_identity: Option<String>,
+        timestamp: Option<&str>,
         implicit_request_count: Option<u64>,
     ) -> Option<(String, UsageTotals)> {
         let (resolved_model, previous, reset) =
@@ -21229,7 +21244,10 @@ impl SnapshotAccumulator {
         }
         // The V2 equal-total repeat gate: a re-emitted line with the same
         // `last` and total as the previous counted one is not a new request.
-        if self.codex_legacy_ui_repeat(last_usage, usage, &delta) {
+        // Forward only: earlier lines count as they always did, and still
+        // set the tuple a later dated repeat is compared with.
+        let may_drop = dated_on_or_after(timestamp, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS);
+        if self.codex_legacy_ui_repeat(last_usage, usage, &delta, may_drop) {
             return None;
         }
         Some((resolved_model, delta))
@@ -40715,9 +40733,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             string_at(value, &["session_meta", "payload", "agent_role"])
                 .or_else(|| string_at(value, &["payload", "agent_role"]));
     }
-    let timestamp = string_at(value, &["timestamp"])
-        .or_else(|| string_at(value, &["time"]))
-        .or_else(|| string_at(value, &["created_at"]));
+    let timestamp = codex_line_timestamp(value);
     accumulator.note_time(timestamp.clone());
     codex_prompt_content(value, accumulator);
     accumulator.set_model(
@@ -41892,6 +41908,13 @@ fn codex_model_context_window(value: &Value) -> Option<u64> {
         .or_else(|| raw_value_at(value, &["info", "model_context_window"]))
         .and_then(Value::as_u64)
         .filter(|window| *window > 0)
+}
+
+/// A Codex line's own envelope time, the same on every read route.
+fn codex_line_timestamp(value: &Value) -> Option<String> {
+    string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["time"]))
+        .or_else(|| string_at(value, &["created_at"]))
 }
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {

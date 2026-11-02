@@ -994,18 +994,21 @@ impl SnapshotAccumulator {
 
     /// Legacy's use of the shared repeat gate for a line it would count.
     /// `true` drops the line. Without the slot (no counted UI line yet) there
-    /// is nothing to repeat.
+    /// is nothing to repeat. `may_drop` is false for a line dated before the
+    /// forward date: it counts and is not a counted drop, but its tuple is
+    /// still noted.
     pub(super) fn codex_legacy_ui_repeat(
         &mut self,
         last: Option<UsageTotals>,
         total: UsageTotals,
         delta: &UsageTotals,
+        may_drop: bool,
     ) -> bool {
         let Some(reducer) = self.codex_occurrence() else {
             return false;
         };
         let tuple = reducer.take_ui_tuple(last, total);
-        if reducer.equal_total_repeat(&tuple, delta) {
+        if may_drop && reducer.equal_total_repeat(&tuple, delta) {
             return true;
         }
         reducer.note_ui(tuple);
