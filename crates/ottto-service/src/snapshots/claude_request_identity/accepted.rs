@@ -307,17 +307,21 @@ const SESSION_CONTEXT_DOMAIN: &str = "claude_session_context:v1";
 pub(super) const SESSION_CONTEXT_TAG_HEX: usize = 16;
 
 // The cycle's attribution key, for a parser that sees lines without its context.
-// Fixtures start keyed, as their parsers always compared sentences.
+// Outer `None`: not bound yet this process. Fixtures start keyed, as their
+// parsers always compared sentences.
 #[cfg(not(test))]
-static SESSION_CONTEXT_KEY: std::sync::Mutex<Option<FingerprintKey>> = std::sync::Mutex::new(None);
+static SESSION_CONTEXT_KEY: std::sync::Mutex<Option<Option<FingerprintKey>>> =
+    std::sync::Mutex::new(None);
 #[cfg(test)]
 thread_local! {
-    static SESSION_CONTEXT_KEY: std::cell::RefCell<Option<FingerprintKey>> =
-        std::cell::RefCell::new(Some(fixture_key()));
+    static SESSION_CONTEXT_KEY: std::cell::RefCell<Option<Option<FingerprintKey>>> =
+        std::cell::RefCell::new(Some(Some(fixture_key())));
 }
 
 #[cfg(not(test))]
-fn with_session_context_key<R>(use_key: impl FnOnce(&mut Option<FingerprintKey>) -> R) -> R {
+fn with_session_context_key<R>(
+    use_key: impl FnOnce(&mut Option<Option<FingerprintKey>>) -> R,
+) -> R {
     use_key(
         &mut SESSION_CONTEXT_KEY
             .lock()
@@ -325,12 +329,15 @@ fn with_session_context_key<R>(use_key: impl FnOnce(&mut Option<FingerprintKey>)
     )
 }
 #[cfg(test)]
-fn with_session_context_key<R>(use_key: impl FnOnce(&mut Option<FingerprintKey>) -> R) -> R {
+fn with_session_context_key<R>(
+    use_key: impl FnOnce(&mut Option<Option<FingerprintKey>>) -> R,
+) -> R {
     SESSION_CONTEXT_KEY.with(|key| use_key(&mut key.borrow_mut()))
 }
 
 /// Binds the cycle's attribution key; true when it changed, which ends what any
-/// retained parse's digest can be compared with.
+/// retained parse's digest can be compared with. The process's first bind is no
+/// change: no Claude parse exists before it, but an earlier source's may.
 pub(crate) fn bind_session_context_key(
     context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> bool {
@@ -341,20 +348,26 @@ pub(crate) fn bind_session_context_key(
         return false;
     }
     with_session_context_key(|bound| {
-        let changed = *bound != key;
-        *bound = key;
+        let changed = bound.as_ref().is_some_and(|previous| *previous != key);
+        *bound = Some(key);
         changed
     })
 }
 #[cfg(test)]
 pub(crate) fn set_test_session_context_key(key: Option<[u8; 32]>) {
-    with_session_context_key(|bound| *bound = key.map(|key| FingerprintKey(Zeroizing::new(key))));
+    with_session_context_key(|bound| {
+        *bound = Some(key.map(|key| FingerprintKey(Zeroizing::new(key))))
+    });
+}
+#[cfg(test)]
+pub(crate) fn unbind_test_session_context_key() {
+    with_session_context_key(|bound| *bound = None);
 }
 
 /// The key's tag then the sentence's HMAC-SHA-256, each cut to fit one 32-byte
 /// class H value, so a digest names the key it was made under. `None` without a key.
 pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
-    let key = with_session_context_key(|bound| bound.clone())?;
+    let key = with_session_context_key(|bound| bound.clone().flatten())?;
     let tag = digest(&key, json!([SESSION_CONTEXT_DOMAIN]));
     let value = digest(&key, json!([SESSION_CONTEXT_DOMAIN, sentence]));
     Some(
@@ -364,6 +377,10 @@ pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     )
+}
+
+pub(super) fn session_context_key_bound() -> bool {
+    with_session_context_key(|bound| matches!(bound, Some(Some(_))))
 }
 
 /// Whether a stored digest was made under the bound key: never one under an

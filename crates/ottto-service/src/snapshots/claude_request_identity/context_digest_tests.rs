@@ -67,7 +67,8 @@ fn no_key_stores_no_field_and_fails_closed() {
     let markers = markers.unwrap();
     assert_eq!(markers.context_digest, None);
     assert_eq!(markers.context_position, None);
-    assert_eq!(markers.context_flip_position, None);
+    assert_eq!(markers.context_flip_position, Some(2));
+    assert_eq!(markers.email_home(5), None);
     assert!(markers.context_digest_is_current());
     assert!(matches!(
         markers.verdict(0, false),
@@ -166,4 +167,24 @@ fn bind_reports_only_a_key_change() {
     // Fixtures keep a key without attribution; the fail-closed test removes it.
     assert!(!bind_session_context_key(None));
     assert!(accepted::session_context_digest("x").is_some());
+}
+
+/// Codex scans before Claude's first prepare, so the first bind of a process is
+/// not a change: it must not drop the parses an earlier source just retained.
+#[test]
+fn the_first_bind_of_a_process_is_no_change() {
+    use base64::Engine as _;
+    let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::ClaudeCode,
+        std::path::Path::new("/nonexistent/context-digest"),
+        true,
+        Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1; 32])),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap();
+    unbind_test_session_context_key();
+    assert_eq!(accepted::session_context_digest("x"), None);
+    assert!(!bind_session_context_key(Some(&context)));
+    assert!(accepted::session_context_digest("x").is_some());
+    assert!(!bind_session_context_key(Some(&context)));
 }

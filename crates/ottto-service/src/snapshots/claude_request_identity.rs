@@ -42,7 +42,9 @@ pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::AcceptedBuckets;
 #[cfg(test)]
-pub(crate) use accepted::{session_context_digest, set_test_session_context_key};
+pub(crate) use accepted::{
+    session_context_digest, set_test_session_context_key, unbind_test_session_context_key,
+};
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -2867,7 +2869,9 @@ pub(crate) struct OrgMarkers {
     context_digest: Option<String>,
     context_changed: bool,
     /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one.
+    /// of the first later `session_context` naming a different one. Without a
+    /// key, the second is the first sentence after a marker: it could not be
+    /// compared, and the first stays unset so no email qualifies.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
     /// Status-coverage key of the folder holding this file, bound when the
@@ -2900,6 +2904,9 @@ pub(crate) fn note_marker_line(
             // organization change and qualifies no email.
             let Some(digest) = accepted::session_context_digest(&text) else {
                 state.context_digest = None;
+                if !state.entries.is_empty() {
+                    state.context_flip_position.get_or_insert(response_position);
+                }
                 return;
             };
             let tag = &digest[..accepted::SESSION_CONTEXT_TAG_HEX];
@@ -2996,6 +3003,19 @@ impl OrgMarkers {
         self.context_digest
             .as_deref()
             .map_or(true, accepted::session_context_digest_is_current)
+    }
+
+    /// Without a key: a sentence that could not be compared came at or before
+    /// the marker governing `sequence`, so its flip might have been explained.
+    fn flip_unexplained_for_no_key(&self, sequence: u64) -> bool {
+        !accepted::session_context_key_bound()
+            && self.context_flip_position.is_some_and(|sentence| {
+                self.entries
+                    .iter()
+                    .rev()
+                    .find(|marker| marker.position <= sequence)
+                    .is_some_and(|marker| sentence <= marker.position)
+            })
     }
 
     /// The marker governing the response with `sequence`, by line order only.
@@ -4326,6 +4346,25 @@ pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     IDENTITY_COUNTS[3].store(families, std::sync::atomic::Ordering::Relaxed);
     IDENTITY_COUNTS[4].store(files, std::sync::atomic::Ordering::Relaxed);
 }
+// Thread-local under test: another test's take must not race this count.
+#[cfg(not(test))]
+static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_no_key_flip_refusals<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        NO_KEY_FLIP_REFUSALS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&NO_KEY_FLIP_REFUSALS)
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "budget::Counts::is_empty")]
@@ -4352,6 +4391,10 @@ pub(crate) struct IdentityCounts {
     claude_carry_blocked_no_account_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_carry_skipped_incomplete_transcripts: u64,
+    /// Requests refused as an organization flip with no attribution key to
+    /// compare the sentence before it. At most what a key would have explained.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_no_key_flip_refusals: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -4374,6 +4417,9 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
         claude_carry_skipped_incomplete_transcripts: incomplete,
+        claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
     }
 }
 
@@ -5357,6 +5403,17 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
+        if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
+            && item
+                .claude_org_markers
+                .as_deref()
+                .zip(sequence)
+                .is_some_and(|(markers, at)| markers.flip_unexplained_for_no_key(at))
+        {
+            with_no_key_flip_refusals(|counter| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
