@@ -27,14 +27,6 @@ pub struct PendingSnapshotPaths {
     pub overflowed: bool,
 }
 
-fn source_index(source: SnapshotSource) -> usize {
-    match source {
-        SnapshotSource::Codex => 0,
-        SnapshotSource::ClaudeCode => 1,
-        SnapshotSource::Pi => 2,
-    }
-}
-
 fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
     static PENDING: OnceLock<Mutex<PendingSnapshotPathsState>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(PendingSnapshotPathsState::default()))
@@ -44,7 +36,7 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
     let mut state = pending_snapshot_paths()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let index = source_index(source);
+    let index = source.slot();
     for path in paths {
         if state.paths[index].contains(path) {
             continue;
@@ -83,7 +75,7 @@ pub fn take_pending_snapshot_paths(source: SnapshotSource) -> PendingSnapshotPat
     let mut state = pending_snapshot_paths()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let index = source_index(source);
+    let index = source.slot();
     PendingSnapshotPaths {
         paths: std::mem::take(&mut state.paths[index])
             .into_iter()

@@ -1,4 +1,4 @@
-//! Oversized Claude files are honest sweep-wide loss, with content-driven,
+//! Oversized files are honest sweep-wide loss. Claude has content-driven,
 //! cadence-bounded discovery retries and a six-hour recovery re-walk. This
 //! state never enters an upload body.
 use super::*;
@@ -8,6 +8,10 @@ pub(super) struct Debt {
     content_hash: String,
     /// The public loss counter counts sightings, including duplicate hints.
     observations: usize,
+    #[serde(default)]
+    size_bytes: u64,
+    #[serde(default = "sampled_scan::now_seconds")]
+    first_seen_unix_seconds: u64,
 }
 
 pub(super) fn path_hash(path: &Path) -> String {
@@ -59,6 +63,7 @@ pub(super) fn merge(target: &mut BTreeMap<String, Debt>, incoming: BTreeMap<Stri
     for (key, mut debt) in incoming {
         if let Some(old) = target.get(&key) {
             debt.observations = debt.observations.saturating_add(old.observations);
+            debt.first_seen_unix_seconds = old.first_seen_unix_seconds;
         }
         target.insert(key, debt);
     }
@@ -68,32 +73,61 @@ pub(super) fn record(
     source: SnapshotSource,
     scan_root: &Path,
     path: &Path,
+    size_bytes: u64,
     debts: &mut BTreeMap<String, Debt>,
 ) {
-    if source != SnapshotSource::ClaudeCode {
+    // Preserve Claude's sampled recovery; other sources need metadata only.
+    let (size_bytes, content_hash) = if source == SnapshotSource::ClaudeCode {
+        let Ok(witness) = content_witness(scan_root, path) else {
+            return; // Failed witnesses retain ordinary clock recovery, as before.
+        };
+        witness
+    } else {
+        (size_bytes, String::new())
+    };
+    if size_bytes <= max_jsonl_file_bytes(source) {
+        return; // It may have shrunk between discovery's stat and the sample.
+    }
+    let key = path_hash(path);
+    let observations = debts
+        .get(&key)
+        .map_or(1, |old| old.observations.saturating_add(1));
+    let first_seen_unix_seconds = debts
+        .get(&key)
+        .map_or_else(sampled_scan::now_seconds, |old| old.first_seen_unix_seconds);
+    debts.insert(
+        key,
+        Debt {
+            content_hash,
+            observations,
+            size_bytes,
+            first_seen_unix_seconds,
+        },
+    );
+}
+
+pub(super) fn alarm(source: SnapshotSource, debts: &BTreeMap<String, Debt>) {
+    if debts.is_empty() {
         return;
     }
-    // A failed witness stays untracked retryable loss; never suppress its
-    // existing clock recovery without the content evidence needed to wake it.
-    if let Ok((size, content_hash)) = content_witness(scan_root, path) {
-        // It may have shrunk between discovery's stat and this no-follow
-        // sample. Leave that sighting on ordinary recovery, so a small-file
-        // marker cannot suppress the parse that is now possible.
-        if size <= MAX_CLAUDE_JSONL_FILE_BYTES {
-            return;
-        }
-        let key = path_hash(path);
-        let observations = debts
-            .get(&key)
-            .map_or(1, |old| old.observations.saturating_add(1));
-        debts.insert(
-            key,
-            Debt {
-                content_hash,
-                observations,
-            },
-        );
-    }
+    let now = sampled_scan::now_seconds();
+    let bytes = debts
+        .values()
+        .fold(0_u64, |sum, debt| sum.saturating_add(debt.size_bytes));
+    let age = debts
+        .values()
+        .map(|debt| now.saturating_sub(debt.first_seen_unix_seconds))
+        .max()
+        .unwrap_or(0);
+    crate::local_resource_diagnostics::traversal_point(
+        "oversized_discovery_alarm",
+        source.api_slug(),
+        &serde_json::json!({
+            "outstanding_file_count": debts.len(),
+            "outstanding_bytes": bytes,
+            "first_seen_oversized_age_seconds": age,
+        }),
+    );
 }
 
 pub(super) fn clock_retry_required(
@@ -167,11 +201,9 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
         changed = true;
         if size > MAX_CLAUDE_JSONL_FILE_BYTES {
             // Retried this file's discovery cap, with the new content witness.
-            traversal
-                .oversized_discovery
-                .get_mut(&hash)
-                .unwrap()
-                .content_hash = content_hash;
+            let debt = traversal.oversized_discovery.get_mut(&hash).unwrap();
+            debt.content_hash = content_hash;
+            debt.size_bytes = size;
         } else {
             let scan_root = scan_root.clone();
             let debt = traversal.oversized_discovery.remove(&hash).unwrap();
@@ -200,4 +232,66 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
     }
 }
 
-crate::heap_layout_bound::fields!(Debt; content_hash, observations);
+crate::heap_layout_bound::fields!(Debt; content_hash, observations, size_bytes, first_seen_unix_seconds);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [regress] Size refusals emit per-source file/byte/age gauges, not sightings.
+    #[test]
+    fn oversized_alarm_counts_debts_and_omits_empty_pages() {
+        let scratch = crate::test_scratch::ScratchDir::new("oversized-alarm");
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let mut debts = BTreeMap::new();
+            let size = max_jsonl_file_bytes(source) + 1;
+            for name in ["first.jsonl", "second.jsonl"] {
+                let path = scratch.join(name);
+                if source == SnapshotSource::ClaudeCode {
+                    File::create(&path).unwrap().set_len(size).unwrap();
+                } else {
+                    // Metadata-only sources must not open the transcript.
+                    let _ = fs::remove_file(&path);
+                }
+                record(source, &scratch, &path, size, &mut debts);
+            }
+            for debt in debts.values_mut() {
+                debt.first_seen_unix_seconds = 1;
+            }
+            let mut repeated = BTreeMap::new();
+            record(
+                source,
+                &scratch,
+                &scratch.join("first.jsonl"),
+                size,
+                &mut repeated,
+            );
+            merge(&mut debts, repeated);
+            let encoded = serde_json::to_vec(&debts).unwrap();
+            let debts: BTreeMap<String, Debt> = serde_json::from_slice(&encoded).unwrap();
+            assert!(debts.values().all(|debt| debt.first_seen_unix_seconds == 1));
+            let before = sampled_scan::now_seconds();
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                alarm(source, &debts);
+                alarm(source, &debts);
+                alarm(source, &BTreeMap::new());
+            });
+            let after = sampled_scan::now_seconds();
+            assert_eq!(rows.len(), 2, "one row per nonempty page");
+            for row in rows {
+                assert_eq!(row["stage"], "oversized_discovery_alarm");
+                assert_eq!(row["source"], source.api_slug());
+                let counts = row["counts"].as_object().unwrap();
+                assert_eq!(counts.len(), 3, "aggregate counters only");
+                assert_eq!(counts["outstanding_file_count"], 2);
+                assert_eq!(counts["outstanding_bytes"], 2 * size);
+                let age = counts["first_seen_oversized_age_seconds"].as_u64().unwrap();
+                assert!((before.saturating_sub(1)..=after.saturating_sub(1)).contains(&age));
+            }
+        }
+    }
+}

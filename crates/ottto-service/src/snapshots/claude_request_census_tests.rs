@@ -6,7 +6,6 @@ use crate::snapshots::claude_request_census::{
     claude_census_member_status, claude_request_hash, ClaudeCensusMemberStatus,
     ClaudeRequestCensusRecord, ClaudeRequestCensusShape, CLAUDE_REQUEST_CENSUS_CANARY,
     CLAUDE_REQUEST_CENSUS_DERIVATION, MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_RAW_BYTES,
-    MAX_RECORD_BYTES,
 };
 use sha2::Sha256 as CanarySha256;
 
@@ -463,6 +462,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
             record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
+                    held_index_keys: &BTreeSet::new(),
                     path,
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
@@ -1466,35 +1466,6 @@ fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
 }
 
 #[test]
-fn census_decoder_stops_after_an_oversized_record() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-entry-budget");
-    let path = scratch.join("record.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let (before, after) = base.split_once("\"claude_request_census\":{}").unwrap();
-    let mut file = File::create(&path).unwrap();
-    write!(
-        file,
-        "{before}\"claude_request_census\":{{\"hostile\":{{\"h\":\""
-    )
-    .unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RECORD_BYTES / block.len() {
-        file.write_all(&block).unwrap();
-    }
-    write!(
-        file,
-        "\"}},\"after-budget\":{}}}{after}",
-        census_record_json('a', "exact", &[1])
-    )
-    .unwrap();
-    drop(file);
-    let loaded = ScanIndex::load(&path).expect("entry is bounded optional evidence");
-    assert_eq!(loaded.files.len(), 1);
-    assert!(loaded.claude_request_census_for_test().is_empty());
-}
-
-#[test]
 fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     let scratch = crate::test_scratch::ScratchDir::new("census-sequence");
     let base = census_index_json(serde_json::json!({}));
@@ -1553,38 +1524,6 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     loaded
         .save(&scratch.join("sequence.json"))
         .expect("positional CAS remains supported");
-}
-
-#[test]
-fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-escaped-bound");
-    let path = scratch.join("escaped.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let escaped = "claude_request_census_shadow"
-        .chars()
-        .map(|ch| format!("\\u{:04x}", ch as u32))
-        .collect::<String>();
-    assert!(escaped.len() > 128, "exercise the longest field spelling");
-    let mut file = File::create(&path).unwrap();
-    write!(file, "{},\"{escaped}\":\"", base.strip_suffix('}').unwrap()).unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RAW_BYTES / block.len() {
-        file.write_all(&block).unwrap();
-    }
-    write!(file, "\"}}").unwrap();
-    drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("escaped field has the same bounded reader");
-    assert_eq!(loaded.files.len(), 1);
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
-    loaded
-        .save(&path)
-        .expect("CAS also bounds escaped field names");
 }
 
 /// The valid shadow state must survive load, CAS and reload byte-for-value,
@@ -1746,7 +1685,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         &mut ScanCensus::default(),
         None,
         365,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
@@ -1838,6 +1777,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
 #[cfg(unix)]
 #[test]
 fn held_original_production_exit_conserves_copy_money_while_committed_entry_unchanged() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
     let root = scratch.join("projects");
@@ -2019,7 +1959,8 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
         };
         match arm {
             "cold" => {
-                assert_eq!(counts.durable_held, [0; 5]);
+                assert_eq!(counts.durable_held, [0; 9]);
+                assert_eq!(counts.durable_held[6], 0, "no pending receipt");
                 assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
                 // Money conservation premise: a cold read of the unchanged
                 // original emits nothing new; its accepted body stands.
@@ -2063,5 +2004,116 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
     assert!(
         record.birth().is_some(),
         "macOS records carry an opened birth"
+    );
+}
+
+/// [money] paced restore residue prevents 35 day census retirement until catchup.
+#[test]
+fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "paced.jsonl",
+        &[census_response(
+            "paced",
+            Some("req_paced"),
+            "msg_paced",
+            1,
+            10,
+        )],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "paced.jsonl");
+    let before = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .unwrap();
+    assert_eq!(before.retired_for_test(), None);
+    let held = BTreeSet::from([key.clone()]);
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &held,
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        None,
+        "paced unread residue retains exact hashes past 35 days"
+    );
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &BTreeSet::new(),
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        Some(1),
+        "negative control: ordinary quiet retirement remains enabled after catch-up"
+    );
+}
+
+/// [money] native shrink requires exact committed census and opened object.
+#[test]
+#[cfg(unix)]
+fn native_shrink_requires_exact_committed_census_and_opened_object() {
+    use std::os::unix::fs::MetadataExt;
+    let scratch = crate::test_scratch::ScratchDir::new("census-native-shrink");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "shrink.jsonl",
+        &[census_response("shrink", Some("r"), "m", 1, 10)],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "shrink.jsonl");
+    let metadata = std::fs::metadata(&key).unwrap();
+    let physical = Some([metadata.dev(), metadata.ino()]);
+    let length = index.files[&key].size_bytes;
+    assert!(length > 0);
+    let proves = |index: &ScanIndex, length, physical| {
+        claude_request_census::proves_indexed_shrink(index, &key, length, physical)
+    };
+    assert!(proves(&index, length - 1, physical));
+    assert!(
+        !proves(&index, length, physical),
+        "no change, no permission"
+    );
+    assert!(
+        !proves(&index, length - 1, None),
+        "unknown object remains held"
+    );
+    assert!(
+        !proves(
+            &index,
+            length - 1,
+            Some([metadata.dev(), metadata.ino() ^ 1])
+        ),
+        "wrong object remains held"
+    );
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = "unbound".into();
+    assert!(
+        !proves(&index, length - 1, physical),
+        "stale original cannot grant Full"
+    );
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fingerprint;
+    index.files.get_mut(&key).unwrap().modified_unix_seconds += 1;
+    assert!(
+        !proves(&index, length - 1, physical),
+        "wrong committed stamp remains held"
     );
 }

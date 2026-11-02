@@ -115,7 +115,9 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         let hash = debt["content_hash"].as_str().unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(debt.as_object().unwrap().len(), 2);
+        assert_eq!(debt.as_object().unwrap().len(), 4);
+        assert_eq!(debt["size_bytes"], OVERSIZED_BYTES);
+        assert!(debt["first_seen_unix_seconds"].as_u64().unwrap() > 0);
     }
 }
 
@@ -698,14 +700,17 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     let listed = c1a_saved(&fixture);
     assert!(listed["traversal"]["counts"]["listing_generations"].as_u64() >= Some(1));
     assert_eq!(
-        listed["traversal"]["oversized_discovery"],
-        after["traversal"]["oversized_discovery"],
+        listed["traversal"]["oversized_discovery"], after["traversal"]["oversized_discovery"],
         "a re-listing pass records no oversized debt"
     );
     assert_eq!(listed["traversal"]["counts"]["oversized_file_count"], 1);
     assert_eq!(page.scan.oversized_file_count, 1);
     assert!(!page.scan.census_complete);
-    std::fs::write(&late, rearm_transcript_line(LATE, None, "req_late_shrunk", 0)).unwrap();
+    std::fs::write(
+        &late,
+        rearm_transcript_line(LATE, None, "req_late_shrunk", 0),
+    )
+    .unwrap();
     let page = oversized_tick(
         &fixture,
         oversized_deadline(&listed).max(listed_at + interval + 60),

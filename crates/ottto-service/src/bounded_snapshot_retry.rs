@@ -464,13 +464,6 @@ pub(super) struct RetryOwner {
     slots: [Option<PreparedRetry>; 3],
     next: usize,
 }
-fn source_slot(source: SnapshotSource) -> usize {
-    match source {
-        SnapshotSource::Codex => 0,
-        SnapshotSource::ClaudeCode => 1,
-        SnapshotSource::Pi => 2,
-    }
-}
 impl RetryOwner {
     pub(super) fn allowance(&self) -> usize {
         RETAINED_BUDGET.saturating_sub(
@@ -479,7 +472,7 @@ impl RetryOwner {
         )
     }
     pub(super) fn admit(&mut self, page: PreparedRetry) -> bool {
-        let index = source_slot(page.source);
+        let index = page.source.slot();
         if self.slots[index].is_some() || page.bound > self.allowance() {
             return false;
         }
@@ -499,14 +492,9 @@ impl RetryOwner {
     }
     pub(super) fn boundary(
         &mut self,
-        busy: impl Iterator<Item = SnapshotSource>,
         now: Instant,
         mut send: impl FnMut(&mut PreparedRetry) -> Result<SnapshotPageOutcome>,
     ) {
-        let mut blocked = [false; 3];
-        for source in busy {
-            blocked[source_slot(source)] = true;
-        }
         for offset in 0..3 {
             let index = (self.next + offset) % 3;
             let Some(page) = self.slots[index].as_mut() else {
@@ -516,7 +504,7 @@ impl RetryOwner {
                 self.slots[index] = None;
                 continue;
             }
-            if blocked[index] || now < page.budget.due() {
+            if now < page.budget.due() {
                 continue;
             }
             self.next = (index + 1) % 3;

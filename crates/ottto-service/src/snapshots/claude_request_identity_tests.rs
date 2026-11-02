@@ -214,10 +214,19 @@ fn w0_r5_bounds_match_daemon_caps() {
         identity::MAX_AUTHORITY_KEYS as u64
     );
     assert_eq!(bounds["parts_per_row"], identity::MAX_PARTS_PER_ROW as u64);
-    assert_eq!(bounds["total_parts"], identity::MAX_PARTS_PER_ITEM as u64);
+    // The receiver derives its parts bound from the advertised item cap; the
+    // daemon's construction bound stays stricter (over it = counted hold).
+    assert_eq!(
+        bounds["total_parts"],
+        (identity::MAX_ADVERTISED_ITEM_BYTES / 320) as u64
+    );
+    assert!(bounds["total_parts"].as_u64().unwrap() >= identity::MAX_PARTS_PER_ITEM as u64);
     assert_eq!(bounds["bucket_rows"], identity::MAX_ROWS as u64);
     assert_eq!(bounds["top_level_rows"], identity::MAX_ROWS as u64);
-    assert_eq!(bounds["item_bytes"], identity::MAX_ITEM_BYTES as u64);
+    assert_eq!(
+        bounds["item_bytes"],
+        identity::MAX_ADVERTISED_ITEM_BYTES as u64
+    );
     assert_eq!(bounds["money_max_usd"], "1000000000");
     assert_eq!(bounds["cost_fraction_digits"], 6);
 }
@@ -2526,6 +2535,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         record_claude_request_census(
             &mut index,
             ClaudeRequestCensusParse {
+                    held_index_keys: &BTreeSet::new(),
                 path: &quiet_path,
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,

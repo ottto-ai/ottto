@@ -30,6 +30,61 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
+/// Unique acquisition metadata; the Plain native input owns it while reading.
+/// M3: the one active lease, acquired chain and receipt debt move with it.
+/// The chain lives in `owed` while debt exists, never also in `chain`.
+#[derive(Default)]
+pub(crate) struct DurableCustody {
+    state: Option<Box<DurableState>>,
+}
+#[derive(Default)]
+struct DurableState {
+    #[cfg(unix)]
+    active: Option<crate::durable_tail_store::ActiveLease>,
+    #[cfg(unix)]
+    // Keep acquisition metadata out of every parser/cache-transfer stack slot.
+    chain: Option<Box<sampled_scan::durable_tail::AcquiredChain>>,
+    #[cfg(unix)]
+    owed: Option<Box<sampled_scan::durable_tail::ReceiptOwed>>,
+    #[cfg(unix)]
+    retail: Option<sampled_scan::durable_tail::RetailAttempt>,
+}
+crate::heap_layout_bound::fields!(DurableCustody; ; optional state);
+crate::heap_layout_bound::fields!(DurableState; #[cfg(unix)] active, #[cfg(unix)] chain,
+    #[cfg(unix)] owed, #[cfg(unix)] retail);
+impl DurableCustody {
+    #[cfg(unix)]
+    fn state_mut(&mut self) -> &mut DurableState {
+        assert!(restart_restore::enabled(), "M3 custody requires ON");
+        self.state.get_or_insert_with(Default::default)
+    }
+    pub(crate) fn retained_bytes(&self, limit: usize) -> Option<usize> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        if self.is_empty() {
+            return Some(0);
+        }
+        let mut counter = Counter::new(limit);
+        counter.add(std::mem::size_of::<Self>().checked_add(std::mem::align_of::<Self>())?)?;
+        self.heap_bound(&mut counter)?;
+        Some(counter.bytes)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.state.as_ref().map_or(true, |state| {
+                state.active.is_none()
+                    && state.chain.is_none()
+                    && state.owed.is_none()
+                    && state.retail.is_none()
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
 macro_rules! discovery_retention {
@@ -143,6 +198,14 @@ mod codex_parent_side_read_tests;
 mod codex_parent_side_tests;
 #[cfg(test)]
 mod file_set_digest_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod m3_d3_tests;
+#[cfg(all(test, unix))]
+mod m3_layout_tests;
+#[cfg(all(test, unix))]
+mod m3_native_tests;
+#[cfg(all(test, unix))]
+mod native_publication_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -161,6 +224,8 @@ pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
 use disappearance_diagnostics::enabled as vanished_directory_removal;
 pub(crate) mod evidence_owed;
+mod usage_pending;
+use usage_pending::UsagePending;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
@@ -173,6 +238,8 @@ pub(crate) mod codex_version;
 pub(crate) mod discovery_growth;
 #[cfg(test)]
 mod discovery_growth_tests;
+#[cfg(unix)]
+pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
@@ -182,8 +249,19 @@ pub(crate) mod line_delivery;
 mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
+mod restart_restore;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec<SnapshotItem> {
+    m3_d3_tests::bounded_restore_tail_items(source)
+}
+
+#[cfg(test)]
+pub(crate) use restart_restore::RestartRestoreForTest;
 mod sampled_audit;
 mod sampled_jsonl;
+#[cfg(all(test, unix))]
+pub(crate) use sampled_jsonl::durable::pl_text::PlText;
 /// Structural verification plus the nested source binding `decode` enforces.
 #[cfg(unix)]
 pub(crate) fn verify_durable_body(
@@ -193,7 +271,11 @@ pub(crate) fn verify_durable_body(
     let mut d = crate::durable_tail_codec::Dec::new(body);
     let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
-        && sampled_jsonl::durable::verify(body).is_ok()
+        && (source.properties().verify)(body).is_ok()
+}
+#[cfg(all(test, unix))]
+pub(crate) fn durable_store_fixture_body_with_skill() -> Vec<u8> {
+    sampled_jsonl::durable::store_skill_fixture_body()
 }
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
@@ -201,6 +283,8 @@ pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum
 }
 
 pub(crate) mod sampled_scan;
+#[cfg(unix)]
+pub(crate) use sampled_scan::durable_tail::{AcquisitionProtocol, ImmutableCounting};
 mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
@@ -232,6 +316,8 @@ pub(crate) use pi_retry_inputs::PiRetryInputs;
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 
 #[cfg(test)]
 pub(crate) use context_curve::v1::CONTEXT_CURVE_CONTRACT_VERSION;
@@ -615,7 +701,8 @@ pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revisio
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
-pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Receiver request cap: one largest advertised item plus the batch envelope.
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
 const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
@@ -1396,6 +1483,15 @@ impl SnapshotSource {
         }
     }
 
+    /// The index of a process-local per-source array.
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            SnapshotSource::Codex => 0,
+            SnapshotSource::ClaudeCode => 1,
+            SnapshotSource::Pi => 2,
+        }
+    }
+
     pub fn parser_version(self) -> &'static str {
         match self {
             SnapshotSource::Codex => CODEX_SNAPSHOT_PARSER_VERSION,
@@ -2085,12 +2181,11 @@ pub struct SnapshotModelUsage {
     /// tagged row; omitted unless the server advertised the capability.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only, copy-prefix switch on: the row's
+    /// Wire contract 5, bucket rows only: the row's
     /// accepted proof was copy-derived and is tombstoned; a retaining receiver
     /// drops that proof for good. Like
     /// `identity_retained`, only sent when the server advertised option (ii)
-    /// and hashed in the identity leaf. Omitted when false, so switch-off
-    /// bytes are unchanged.
+    /// and hashed in the identity leaf. Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2640,6 +2735,10 @@ struct ScanTraversalCounts {
     /// its file be re-queued before six hours.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_owed_pace_evicted: u64,
+    /// Diagnostic only: paced growth reads deferred until their claim ages
+    /// out. Never an unreadable path, a retryable problem or an error.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    growth_deferred: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -3277,6 +3376,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// to an index that no longer exists. Removal needs the state-directory
 /// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Cycle-owned privacy permission travels with the existing pass inputs.
 pub(crate) fn begin_durable_pass(
     cache: &sampled_scan::SharedCache,
     support_dir: &Path,
@@ -3285,8 +3385,10 @@ pub(crate) fn begin_durable_pass(
     index_fresh: bool,
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
+    skill_labels_enabled: bool,
 ) {
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
+    cache.durable_skill_label_permission(source, skill_labels_enabled);
     if index_fresh {
         if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
             let _ = cache.durable_remove(writer, source);
@@ -3314,10 +3416,14 @@ pub(crate) fn durable_after_save(
         }
         None => cache.durable_note_unlocked(source),
     }
-    if let Some((counters, store)) = cache.durable_counters(source) {
-        eprintln!("{}", counters.summary(source, &store));
+    let _ = cache.durable_flush_pass(source);
+    if restart_restore::enabled() {
+        if let Some((counters, store)) = cache.durable_counters(source) {
+            eprintln!("{}", counters.summary(source, &store));
+        }
     }
     cache.durable_alarm(source);
+    cache.durable_rederive_proxies(source);
 }
 
 /// Audit retirement additionally commits its marker CAS only after #865's
@@ -3737,7 +3843,7 @@ pub struct ScanIndex {
     #[serde(default)]
     claude_usage_family_witnesses: SharedMap<String, ClaudeUsageFamilyWitness>,
     #[serde(default)]
-    claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
+    claude_usage_family_pending: UsagePending,
     /// Slice D1: one request-census record per Claude transcript index key,
     /// bound to the candidate fingerprint and census window of the parse that
     /// produced it. Local-only and content-free (8-byte SHA-256 prefixes of
@@ -4072,7 +4178,7 @@ pub struct ScanIndex {
     /// Appended serialized slot, so older positional indexes keep their slots.
     #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
-    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// Retired replay slot: drain old values without retaining authority.
     #[serde(rename = "reread_guard", default, skip_serializing)]
     retired_reread_guard: serde::de::IgnoredAny,
     /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
@@ -4325,7 +4431,7 @@ impl Default for ScanIndex {
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
             claude_usage_family_witnesses: SharedMap::default(),
-            claude_usage_family_pending: BTreeMap::new(),
+            claude_usage_family_pending: UsagePending::default(),
             claude_request_census: ClaudeRequestCensus::default(),
             claude_request_census_shadow: ClaudeRequestCensusShadowState::default(),
             claude_usage_authority_quarantine: BTreeMap::new(),
@@ -5812,9 +5918,8 @@ fn claude_stale_family_carry_scratch_cost(
     }
     let stale_request_hashes = stale
         .iter()
-        .filter_map(|root_session_id| index.claude_usage_family_pending.get(root_session_id))
-        .flat_map(|pending| pending.member_request_id_hashes.values())
-        .map(BTreeSet::len)
+        .filter_map(|root_session_id| index.claude_usage_family_pending.view(root_session_id))
+        .map(|pending| pending.request_hash_count())
         .fold(0_usize, usize::saturating_add);
     let families = stale.len();
     let (Some(family_paths), Some(legacy_bytes), Some(string_bytes)) = (
@@ -5914,8 +6019,8 @@ fn claude_stale_rearm_can_reopen_fence(index: &ScanIndex, stale: &BTreeSet<Strin
         && stale.iter().all(|root| {
             index
                 .claude_usage_family_pending
-                .get(root)
-                .is_some_and(|pending| !pending.invalid)
+                .view(root)
+                .is_some_and(|pending| !pending.invalid())
         })
         && index.files.iter().all(|(key, entry)| {
             let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
@@ -6024,7 +6129,7 @@ fn claude_stale_member_accepted_retry_evidence(
     index: &ScanIndex,
     key: &str,
     entry: &ScanIndexEntry,
-    pending: &ClaudeUsageFamilyPending,
+    pending: usage_pending::UsageView<'_>,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
     if !index.persistence_available() {
@@ -6032,7 +6137,7 @@ fn claude_stale_member_accepted_retry_evidence(
     }
 
     if index.claude_request_identity_contract_changed
-        && (pending.invalid
+        && (pending.invalid()
             || !debt_scope.is_some_and(|roots| {
                 claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     roots.is_empty() || !roots.contains(&claude_full_rearm_root_digest(member.root))
@@ -6042,8 +6147,9 @@ fn claude_stale_member_accepted_retry_evidence(
     {
         return false;
     }
-    let idless = pending.invalid
-        && pending.idless_revision == Some(claude_idless_revision(&entry.source_file_fingerprint));
+    let idless = pending.invalid()
+        && pending.idless_revision()
+            == Some(claude_idless_revision(&entry.source_file_fingerprint));
     claude_stale_member_independently_accepted(index, key, entry)
         && !entry.rearmed()
         && !index.claude_account_deferred_holds.contains_key(key)
@@ -6054,7 +6160,7 @@ fn claude_stale_member_accepted_retry_evidence(
                 record.current_for(&entry.source_file_fingerprint)
                     || idless && record.idless_native_for(&entry.source_file_fingerprint)
             })
-        && (!pending.invalid
+        && (!pending.invalid()
             || idless
                 && index
                     .claude_request_census
@@ -6196,17 +6302,16 @@ fn claude_stream_accepted_retry_carry_inner(
         let end = after + members[after..].partition_point(|(m, _)| m.root == root);
         let family = &members[after..end];
         after = end;
-        let Some(pending) = index.claude_usage_family_pending.get(root) else {
+        let Some(pending) = index.claude_usage_family_pending.view(root) else {
             continue;
         };
         if index.claude_usage_authority_quarantine.contains_key(root)
             || family[0].0.subagent_stem.is_some()
             || family.windows(2).any(|pair| pair[0].0 == pair[1].0)
-            || pending.invalid && (family.len() != 1 || pending.idless_revision.is_none())
+            || pending.invalid() && (family.len() != 1 || pending.idless_revision().is_none())
             || !pending
-                .member_request_id_hashes
-                .keys()
-                .chain(pending.member_occurrences.keys())
+                .hash_members()
+                .chain(pending.occurrence_members())
                 .all(|member| {
                     ClaudeIndexPathMemberRef::of_family_member(root, member).is_some_and(|member| {
                         family
@@ -6275,6 +6380,7 @@ fn claude_fence_closed_retry_carry(
         &mut Default::default(),
         claude_contract_debt_scope(index),
     )
+    .expect("usage_pending_unknown")
 }
 
 fn claude_fence_closed_retry_carry_observed(
@@ -6285,15 +6391,15 @@ fn claude_fence_closed_retry_carry_observed(
     scoped_retry_allowed: bool,
     diagnostics: &mut StaleCarryRejectionCounts,
     debt_scope: Option<&BTreeSet<String>>,
-) -> ClaudeStaleFamilyCarry {
+) -> Result<ClaudeStaleFamilyCarry, usage_pending::Unknown> {
     if !index.persistence_available() {
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
 
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
         diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
     let needs_independent_acceptance =
         prior_unsettled_upload || claude_stale_rearm_can_reopen_fence(index, stale);
@@ -6305,7 +6411,7 @@ fn claude_fence_closed_retry_carry_observed(
             StaleCarryRejectionCounts::start_gate(index, same_context_retry),
             stale.len(),
         );
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
     let legacy_witness_count = index
         .claude_usage_family_witnesses
@@ -6322,7 +6428,7 @@ fn claude_fence_closed_retry_carry_observed(
         eprintln!(
             "local snapshot census kept every stale Claude family re-arm: the carry check was not admitted under its scratch budget"
         );
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
     let mut blocked = BTreeMap::<&str, (bool, bool)>::new();
     for (index_key, entry) in &index.files {
@@ -6362,7 +6468,7 @@ fn claude_fence_closed_retry_carry_observed(
         status.1 |= refused
             || !index
                 .claude_usage_family_pending
-                .get(root_session_id)
+                .view(root_session_id)
                 .is_some_and(|pending| {
                     claude_stale_member_accepted_retry_evidence(
                         index, index_key, entry, pending, debt_scope,
@@ -6376,14 +6482,16 @@ fn claude_fence_closed_retry_carry_observed(
             .values()
             .filter(|witness| !claude_usage_family_witness_legacy_free(witness)),
     );
-    let mut carried = complete_claude_usage_family_members_where(index, |root_session_id| {
+    // The carry joins every family's requests. Two streamed passes read one
+    // family at a time from one store state: the stale families' own checks,
+    // then every family's requests against the carried owners. An
+    // unreadable or changed row carries nothing: the start defers, counted.
+    let candidates = complete_claude_usage_family_members_where(index, |root_session_id| {
         stale.contains(root_session_id)
-    })
-    .into_iter()
-    .filter(|(root_session_id, members)| {
-        let Some(pending) = index.claude_usage_family_pending.get(root_session_id) else {
-            return false;
-        };
+    });
+    let qualifies = |root_session_id: &String,
+                     members: &BTreeSet<String>,
+                     pending: &ClaudeUsageFamilyPending| {
         if index
             .claude_usage_authority_quarantine
             .contains_key(root_session_id)
@@ -6443,44 +6551,64 @@ fn claude_fence_closed_retry_carry_observed(
                         })
             })
             && claude_stale_pending_matches_witness(pending, witness, members)
+    };
+    // Pass 1: the carried roots, and the owner of each carried request.
+    let mut carried = BTreeSet::new();
+    let mut request_owners = Vec::<([u8; 32], &str)>::new();
+    let roots = candidates.keys().cloned().collect::<BTreeSet<_>>();
+    state_v2::visit_usage(index, Some(&roots), &mut |root, pending| {
+        let Some((root_session_id, members)) = candidates.get_key_value(root) else {
+            return;
+        };
+        if qualifies(root_session_id, members, pending) {
+            carried.insert(root_session_id.clone());
+            request_owners.extend(pending.member_request_id_hashes.values().flatten().map(
+                |request_hash| {
+                    (
+                        lenient_decode::repair_key(request_hash),
+                        root_session_id.as_str(),
+                    )
+                },
+            ));
+        }
     })
-    .map(|(root_session_id, _)| root_session_id)
-    .collect::<BTreeSet<_>>();
+    .map_err(|_| usage_pending::Unknown)?;
+    drop(roots);
     // Owners whose pending requests appear in another family's pending: a
     // legacy fork or takeover successor can derive its copied-prefix
     // exclusion only while the owner's root sequence is in the same window,
-    // so such an owner keeps the re-arm and is read alongside it.
-    let request_owners = carried
-        .iter()
-        .flat_map(|root_session_id| {
-            index.claude_usage_family_pending[root_session_id]
+    // so such an owner keeps the re-arm and is read alongside it. A request
+    // in two carried roots is owned by the later root in root order.
+    request_owners.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)));
+    request_owners.dedup_by_key(|(key, _)| *key);
+    // Pass 2: every family's requests against those owners.
+    let mut shared_owners = BTreeSet::new();
+    if !request_owners.is_empty() {
+        state_v2::visit_usage(index, None, &mut |root_session_id, pending| {
+            for request_hash in pending
                 .member_request_id_hashes
                 .values()
                 .flatten()
-                .map(move |request_hash| (request_hash.as_str(), root_session_id.as_str()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut shared_owners = BTreeSet::new();
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
-        for request_hash in pending
-            .member_request_id_hashes
-            .values()
-            .flatten()
-            .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
-        {
-            if let Some(owner) = request_owners.get(request_hash.as_str()) {
-                if *owner != root_session_id.as_str() {
-                    shared_owners.insert(owner.to_string());
+                .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
+            {
+                let key = lenient_decode::repair_key(request_hash);
+                if let Ok(at) = request_owners.binary_search_by(|(owned, _)| owned.cmp(&key)) {
+                    let owner = request_owners[at].1;
+                    if owner != root_session_id {
+                        shared_owners.insert(owner);
+                    }
                 }
             }
-        }
+        })
+        .map_err(|_| usage_pending::Unknown)?;
     }
+    drop(request_owners);
     carried.retain(|root_session_id| {
         (accepted_admitted
             && blocked
                 .get(root_session_id.as_str())
                 .is_some_and(|(_, refused)| !refused))
-            || !shared_owners.contains(root_session_id)
+            || !shared_owners.contains(root_session_id.as_str())
     });
     diagnostics.reject(
         if index.claude_request_identity_contract_changed {
@@ -6494,12 +6622,12 @@ fn claude_fence_closed_retry_carry_observed(
     let replay = fund_claude_family_carry_cancellations(index, &mut carried, |_, stage| {
         diagnostics.reject(stage, 1)
     });
-    ClaudeStaleFamilyCarry {
+    Ok(ClaudeStaleFamilyCarry {
         origin: None, // The traversal start binds the retained carry.
         roots: carried,
         capped_roots: BTreeSet::new(),
         replay,
-    }
+    })
 }
 
 /// Fix 2 at a traversal start: a start right after a full re-arm terminal
@@ -6937,20 +7065,16 @@ fn cancel_claude_family_carry_for_member_parse(
     let carried = index.claude_stale_family_carry.contains(root_session_id)
         && index
             .claude_usage_family_pending
-            .get(root_session_id)
+            .view(root_session_id)
             .is_some_and(|pending| {
-                pending.census_window_end != census_window_end
-                    && pending.member_occurrences.is_empty()
-                    && pending
-                        .member_request_id_hashes
-                        .values()
-                        .all(BTreeSet::is_empty)
+                pending.window() != census_window_end
+                    && pending.evidence_free()
                     && (index
                         .claude_stale_family_carry
                         .capped_roots
                         .contains(root_session_id)
-                        || !pending.invalid
-                        || pending.idless_revision.is_some())
+                        || !pending.invalid()
+                        || pending.idless_revision().is_some())
             })
         && !index
             .claude_usage_authority_quarantine
@@ -7477,7 +7601,7 @@ impl ClaudeFullRearmProgress {
     fn observe_page(
         &mut self,
         snapshots: &[SnapshotItem],
-        pending: &BTreeMap<String, ClaudeUsageFamilyPending>,
+        pending: &UsagePending,
         census_window_end: &str,
         counts: &ClaudeDuplicateCensusCounts,
         other_evidence_cause: bool,
@@ -7508,8 +7632,8 @@ impl ClaudeFullRearmProgress {
             .filter(|item| claude_member_invalidity_is_structural(item))
             .map(claude_snapshot_family_root)
             .filter(|root_session_id| {
-                pending.get(root_session_id).is_some_and(|pending| {
-                    pending.invalid && pending.census_window_end == census_window_end
+                pending.view(root_session_id).is_some_and(|pending| {
+                    pending.invalid() && pending.window() == census_window_end
                 })
             })
             .map(|root_session_id| claude_full_rearm_root_digest(&root_session_id))
@@ -7579,6 +7703,9 @@ pub struct ClaudeDuplicateCensusCounts {
     pub census_invalid: bool,
     pub invalid_current_window_family_count: usize,
     pub pending_occurrence_count: usize,
+    /// Retained occurrences reached 90% of the pending-occurrence cap.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pending_occurrence_cap_alarm: bool,
     pub page_invalidated_identity_count: usize,
     pub page_invalidated_occurrence_mismatch_count: usize,
     pub page_invalidated_cap_count: usize,
@@ -7826,6 +7953,71 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
+/// The native caller's five publishing classes and three held classes.
+/// RAM-only transport, never persisted authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePublication {
+    Receipted,
+    PublishWithoutRecord,
+    FailedPublishedWithoutRecord,
+    PublishRetainingPrior,
+    PublishStoreUntouched,
+    FailedHeld,
+    ReceiptPending,
+    Hold,
+}
+impl NativePublication {
+    /// The ONE publication policy, shared by transport and retained capture.
+    /// New outcome classes must be adjudicated here; no page-shape inference.
+    pub(crate) const fn publishes(self) -> bool {
+        match self {
+            Self::Receipted
+            | Self::PublishWithoutRecord
+            | Self::FailedPublishedWithoutRecord
+            | Self::PublishRetainingPrior
+            | Self::PublishStoreUntouched => true,
+            Self::FailedHeld | Self::ReceiptPending | Self::Hold => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn strict_rebind(source: SnapshotSource) -> Self {
+        // Only Codex permits strict rebind with degraded publication.
+        // Every non-Codex source keeps the caller's existing owed/hold conversion.
+        match source {
+            SnapshotSource::Codex => Self::FailedPublishedWithoutRecord,
+            SnapshotSource::ClaudeCode | SnapshotSource::Pi => Self::Hold,
+        }
+    }
+
+    #[cfg(unix)]
+    fn carry(page: &mut Option<Self>, completion: Option<Self>) {
+        // A bounded page can settle several files. Preserve its FIRST held
+        // completion even if a later sibling publishes; no extra key set/debt.
+        if let Some(completion) = completion {
+            if page.map_or(true, Self::publishes) {
+                *page = Some(completion);
+            }
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for NativePublication {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Receipted
+            | Self::PublishWithoutRecord
+            | Self::FailedPublishedWithoutRecord
+            | Self::PublishRetainingPrior
+            | Self::PublishStoreUntouched
+            | Self::FailedHeld
+            | Self::ReceiptPending
+            | Self::Hold => c.add(0),
+        }
+    }
+}
+
 /// RAM-only receipt inputs from existing traversal/admission state. No census
 /// decision, durable field, or scheduling change is made by this projection.
 #[derive(Debug, Clone, Copy, Default)]
@@ -7857,6 +8049,9 @@ macro_rules! scan_result {
 scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
+    /// Actual native settlement class; first held completion wins within this
+    /// page. None means no e4 decision, never a fabricated publishing class.
+    pub(crate) native_publication: Option<NativePublication>,
     pub(crate) census_status: CensusStatus,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
@@ -8184,6 +8379,7 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
+    restored_behind_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8646,6 +8842,20 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
 
+    // Count publication only after complete-body policy/finalization and
+    // semantic-noop suppression; a restored parser finish alone is no offer.
+    #[cfg(unix)]
+    for pending in &result.pending_finalization {
+        sampled_scan::durable_tail::record_restored_publication(
+            source,
+            pending.parse_complete && pending.restored_behind_accepted,
+            result.snapshots.iter().any(|snapshot| {
+                snapshot.source_file_fingerprint.as_deref()
+                    == Some(pending.source_file_fingerprint.as_str())
+            }),
+        );
+    }
+
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
     // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
@@ -9041,7 +9251,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
                     .any(|requests| requests.identity_revision.is_none())
         })
         .map(|(root, _)| root)
-        .chain(index.claude_usage_family_pending.keys())
+        .chain(index.claude_usage_family_pending.roots())
         .chain(index.claude_usage_family_witnesses.keys())
         .chain(
             index
@@ -9181,6 +9391,7 @@ pub(crate) fn record_claude_native_observations(
     }
 
     ClaudeNativeObservations {
+        // The inactive driver is v1 only: a cold graph accumulates nothing.
         counts: evidence_owed::stamped(index, &scan.snapshots, &scan.census_window_end, |index| {
             accumulate_claude_usage_family_pending_with_limit(
                 &scan.snapshots,
@@ -9188,7 +9399,8 @@ pub(crate) fn record_claude_native_observations(
                 &scan.census_window_end,
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             )
-        }),
+        })
+        .unwrap_or_default(),
         census_window_end: scan.census_window_end.clone(),
         index_generation: index.generation,
     }
@@ -9293,7 +9505,10 @@ fn claude_owned_start_eligible(
             if uncertified_roots.contains(root_session_id) {
                 return None;
             }
-            let pending = index.claude_usage_family_pending.get(root_session_id)?;
+            let pending = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(root_session_id)?;
             if pending.invalid || pending.census_window_end != census_window_end {
                 return None;
             }
@@ -9337,6 +9552,29 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ..Default::default()
         };
     }
+    // Cold usage pending: this page's own families, and every family before
+    // a terminal join. Unknown refuses the whole page, before anything is
+    // applied; its families stay discoverable for the next pass.
+    let page_roots = snapshots
+        .iter()
+        .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+        .collect::<BTreeSet<_>>();
+    let loaded_all = census_complete;
+    if state_v2::load_usage(index, Some(&page_roots))
+        .and_then(|()| match census_complete {
+            true => state_v2::load_usage(index, None),
+            false => Ok(()),
+        })
+        .is_err()
+    {
+        return ClaudeUsageAuthorityDisposition {
+            quarantined_source_session_ids: snapshots
+                .iter()
+                .map(|s| s.source_session_id.clone())
+                .collect(),
+            ..Default::default()
+        };
+    }
 
     let complete_rebuild_read =
         census_complete && take_claude_complete_rebuild_read(index, census_window_end);
@@ -9358,14 +9596,26 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             );
             observed.counts
         }
-        None => evidence_owed::stamped(index, snapshots, census_window_end, |index| {
+        None => match evidence_owed::stamped(index, snapshots, census_window_end, |index| {
             accumulate_claude_usage_family_pending_with_limit(
                 snapshots,
                 &mut index.claude_usage_family_pending,
                 census_window_end,
                 max_pending_occurrences,
             )
-        }),
+        }) {
+            Ok(counts) => counts,
+            // The page's families were loaded above, so nothing accumulated.
+            Err(usage_pending::Unknown) => {
+                return ClaudeUsageAuthorityDisposition {
+                    quarantined_source_session_ids: snapshots
+                        .iter()
+                        .map(|s| s.source_session_id.clone())
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+        },
     };
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
@@ -9492,7 +9742,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     if census_complete && reports_healthy {
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
-            &index.claude_usage_family_pending,
+            index.claude_usage_family_pending.loaded_all(),
             legacy_request_owners.as_ref(),
         );
         // Evidence owed ON: owed evidence, including a re-stamp under the
@@ -9502,7 +9752,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             if uncertified_roots.contains(root_session_id) || owed_roots.contains(root_session_id) {
                 continue;
             }
-            let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
+            let Some(base_pending) = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(root_session_id)
+            else {
                 continue;
             };
             let mut pending = base_pending.clone();
@@ -9716,10 +9970,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     let duplicate_census_invalid =
         index
             .claude_usage_family_pending
-            .iter()
+            .views()
             .any(|(root_session_id, pending)| {
-                if pending.census_window_end == census_window_end {
-                    return pending.invalid;
+                if pending.window() == census_window_end {
+                    return pending.invalid();
                 }
                 claude_stale_pending_keeps_census_invalid(
                     index,
@@ -9735,7 +9989,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // Stable native copies deliberately veto every due suppression (SOURCE).
     let native_duplicate_request_owners = if census_complete {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if pending.census_window_end != census_window_end {
                 continue;
             }
@@ -9938,10 +10192,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && (census_complete || claude_owned_start_was_census_verified(item, index))
             && !index
                 .claude_usage_family_pending
-                .get(&root_session_id)
-                .is_some_and(|pending| {
-                    pending.invalid || pending.census_window_end != census_window_end
-                })
+                .view(&root_session_id)
+                .is_some_and(|pending| pending.invalid() || pending.window() != census_window_end)
         {
             let owned = item
                 .cache_requests
@@ -10173,7 +10425,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 owners.retain(|owner| current_owner_universe.contains(owner));
             }
         }
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if pending.invalid || pending.census_window_end != census_window_end {
                 if pending.invalid && pending.census_window_end == census_window_end {
                     duplicate_census.invalid_current_window_family_count = duplicate_census
@@ -10305,7 +10557,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 latch.quarantine_exempt_families += exempt.len() as u64;
             });
             for root in &exempt {
-                if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+                if let Some(pending) = index
+                    .claude_usage_family_pending
+                    .loaded_all_mut()
+                    .get_mut(root)
+                {
                     pending.contract_unproven = true;
                 }
             }
@@ -10594,6 +10850,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             let current_member_owns_changed_request = !fence_stays_closed
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(&root_session_id)
                     .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
                     .is_some_and(|request_hashes| {
@@ -10718,6 +10975,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // with a completed family proof; every other indexed family stays owed.
         index
             .claude_usage_family_pending
+            .loaded_all_mut()
             .retain(|root_session_id, pending| {
                 (guard
                     && evidence_owed::owed_at_completion(
@@ -10817,7 +11075,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         index
             .claude_usage_authority_quarantine
             .remove(&root_session_id);
-        index.claude_usage_family_pending.remove(&root_session_id);
+        index.claude_usage_family_pending.discard(&root_session_id);
     }
     // SOURCE/COST/SI Round 12: a returning family's tombstone clears once its
     // proof settles, on the page whose members all carry the reported-usage
@@ -10849,6 +11107,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     disposition.duplicate_census = duplicate_census;
     #[cfg(test)]
     CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
+    if loaded_all {
+        state_v2::settle_usage(index, &page_roots);
+    }
     disposition
 }
 
@@ -10856,7 +11117,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
 fn claude_stale_pending_keeps_census_invalid(
     index: &ScanIndex,
     root_session_id: &str,
-    pending: &ClaudeUsageFamilyPending,
+    pending: usage_pending::UsageView<'_>,
     census_complete: bool,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
@@ -10866,9 +11127,8 @@ fn claude_stale_pending_keeps_census_invalid(
     if census_complete
         && !indexed_claude_family_ids.contains(root_session_id)
         && pending
-            .member_request_id_hashes
-            .keys()
-            .chain(pending.member_occurrences.keys())
+            .hash_members()
+            .chain(pending.occurrence_members())
             .all(|member| !indexed_claude_family_ids.contains(member))
     {
         return false;
@@ -10890,32 +11150,43 @@ fn claude_stale_pending_keeps_census_invalid(
 
 fn accumulate_claude_usage_family_pending_with_limit(
     snapshots: &[SnapshotItem],
-    pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    pending: &mut UsagePending,
     census_window_end: &str,
     max_occurrences: usize,
-) -> ClaudeDuplicateCensusCounts {
-    accumulate_claude_usage_family_pending_with_credit(
+) -> Result<ClaudeDuplicateCensusCounts, usage_pending::Unknown> {
+    let (pending_by_root, retained) = claude_page_usage_families(snapshots, pending)?;
+    Ok(accumulate_claude_usage_family_pending_with_credit(
         snapshots,
         pending_by_root,
+        retained,
         census_window_end,
         max_occurrences,
         None,
     )
-    .expect("ordinary observation accumulation has no optional credit")
+    .expect("ordinary observation accumulation has no optional credit"))
+}
+
+/// The families a page accumulates into, with the occurrences every family
+/// retains (the cap's running total). Cold: the page's families must be
+/// loaded; new ones join the loaded set.
+fn claude_page_usage_families<'a>(
+    snapshots: &[SnapshotItem],
+    pending: &'a mut UsagePending,
+) -> Result<(&'a mut BTreeMap<String, ClaudeUsageFamilyPending>, usize), usage_pending::Unknown> {
+    let retained = pending.total_occurrences();
+    let families = pending.page_mut(snapshots.iter().map(claude_snapshot_family_root_ref))?;
+    Ok((families, retained))
 }
 
 fn accumulate_claude_usage_family_pending_with_credit(
     snapshots: &[SnapshotItem],
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    mut retained_occurrence_count: usize,
     census_window_end: &str,
     max_occurrences: usize,
     mut credit: Option<&mut claude_native_comparison::NativeBodyBudget<'_>>,
 ) -> Result<ClaudeDuplicateCensusCounts, crate::source_rotation::LocalRefusal> {
     let mut counts = ClaudeDuplicateCensusCounts::default();
-    let mut retained_occurrence_count = pending_by_root
-        .values()
-        .map(ClaudeUsageFamilyPending::occurrences)
-        .fold(0_usize, usize::saturating_add);
     for item in snapshots {
         let construction = match credit.as_deref_mut() {
             Some(credit) => {
@@ -11056,6 +11327,8 @@ fn accumulate_claude_usage_family_pending_with_credit(
         }
     }
     counts.pending_occurrence_count = retained_occurrence_count;
+    counts.pending_occurrence_cap_alarm =
+        retained_occurrence_count.saturating_mul(10) >= max_occurrences.saturating_mul(9);
     Ok(counts)
 }
 
@@ -11126,13 +11399,13 @@ fn claude_family_members_unobserved_where(
 
     let covered = index
         .claude_usage_family_pending
-        .values()
-        .filter(|pending| !pending.invalid && pending.census_window_end == census_window_end)
+        .views()
+        .map(|(_, pending)| pending)
+        .filter(|pending| !pending.invalid() && pending.window() == census_window_end)
         .flat_map(|pending| {
             pending
-                .member_request_id_hashes
-                .keys()
-                .filter(move |member| pending.member_occurrences.contains_key(*member))
+                .hash_members()
+                .filter(move |member| pending.has_occurrence_member(member))
         })
         .collect::<BTreeSet<_>>();
     index
@@ -11210,12 +11483,12 @@ fn claude_full_rearm_structural_terminal(
     let observed = progress.observed_window.as_deref() == Some(census_window_end);
     let mut current = BTreeSet::new();
     let mut other = (observed && progress.other_invalidation_observed) || !owners_within_bound;
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
+    for (root_session_id, pending) in index.claude_usage_family_pending.views() {
         if other {
             break;
         }
-        if pending.census_window_end == census_window_end {
-            if pending.invalid {
+        if pending.window() == census_window_end {
+            if pending.invalid() {
                 let root_digest = claude_full_rearm_root_digest(root_session_id);
                 if observed && progress.structural_roots.contains(&root_digest) {
                     current.insert(root_digest);
@@ -12451,6 +12724,7 @@ fn claude_unchanged_proof_roots<'p>(
                     })
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(root_session_id)
                     .is_some_and(|pending| {
                         !pending.invalid
@@ -12489,6 +12763,7 @@ fn claude_unchanged_proof_roots<'p>(
             if *unchanged
                 && index
                     .claude_usage_family_pending
+                    .loaded_all()
                     .get(*root_session_id)
                     .is_some_and(|pending| {
                         pending
@@ -12508,7 +12783,7 @@ fn claude_unchanged_proof_roots<'p>(
     // a legacy fork or takeover successor can derive its copied-prefix
     // exclusion only while the owner's root sequence is in the same window.
     if let Some(request_owners) = legacy_request_owners {
-        for (root_session_id, pending) in &index.claude_usage_family_pending {
+        for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
             if proven.contains_key(root_session_id)
                 || !complete_families.contains_key(root_session_id)
                 || pending.invalid
@@ -12556,6 +12831,7 @@ fn claude_unchanged_proof_roots<'p>(
             ))
             && index
                 .claude_usage_family_pending
+                .loaded_all()
                 .get(&root_session_id)
                 .is_some_and(|pending| {
                     pending
@@ -12596,13 +12872,14 @@ fn claude_dormant_owner_successors(
             .contains_key(root_session_id)
             && !index
                 .claude_usage_family_pending
+                .loaded_all()
                 .get(root_session_id)
                 .is_some_and(|pending| pending.census_window_end == census_window_end)
     };
     let census_unix_seconds = rfc3339_unix_seconds(census_window_end);
     let mut counts = ClaudeFirstProofHoldCounts::default();
     let mut oldest_age_seconds = None::<u64>;
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
+    for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
         if proven.contains_key(root_session_id)
             || !complete_families.contains_key(root_session_id)
             || pending.invalid
@@ -12665,6 +12942,7 @@ fn claude_fence_held_only_by_witnessed_families(
     };
     index
         .claude_usage_family_pending
+        .loaded_all()
         .iter()
         .all(|(root_session_id, pending)| {
             !pending.invalid
@@ -12676,7 +12954,10 @@ fn claude_fence_held_only_by_witnessed_families(
             else {
                 return true;
             };
-            let pending = index.claude_usage_family_pending.get(&root_session_id);
+            let pending = index
+                .claude_usage_family_pending
+                .loaded_all()
+                .get(&root_session_id);
             (witnessed(&root_session_id)
                 && !pending.is_some_and(|pending| pending.census_window_end == census_window_end))
                 || index.confirmed_empty_files.contains(index_key.as_str())
@@ -16678,8 +16959,12 @@ struct ClaudeDesktopIdentityEvidence {
 }
 
 // The desktop store holds one ~80KB JSON per session; both caps are far above
-// anything observed and exist only to bound a pathological store.
+// anything observed and exist only to bound a pathological store. Tests use a
+// small page so pagination fixtures need dozens of files, not thousands.
+#[cfg(not(test))]
 const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
+#[cfg(test)]
+const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 32;
 const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
@@ -19474,8 +19759,23 @@ impl SnapshotAccumulator {
                 && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
             {
                 skills.insert(name);
+            } else if restart_restore::enabled()
+                && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
+            {
+                crate::local_resource_diagnostics::skill_label_native_dropped(
+                    self.source.api_slug(),
+                    "activity",
+                    "capacity",
+                );
             }
         });
+        if restart_restore::enabled() && !named_all {
+            crate::local_resource_diagnostics::skill_label_native_dropped(
+                self.source.api_slug(),
+                "activity",
+                "invalid_signal",
+            );
+        }
         self.skill_detector_incomplete |= !named_all;
     }
 
@@ -19664,16 +19964,7 @@ impl SnapshotAccumulator {
         );
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
-        let key = match claude_code_usage_dedup_key(value) {
-            Some(key) => key,
-            None => {
-                // Preserve the historical, conservative one-line/one-response
-                // fallback. Claude accounting proof remains absent for every
-                // snapshot until api_request logs and trace ownership are
-                // reconciled, regardless of transcript identity quality.
-                format!("u\u{1f}{}", self.claude_response_sequence)
-            }
-        };
+        let key = claude_response_key(value, self.claude_response_sequence);
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
             crate::local_resource_diagnostics::claude_record_cap_hit();
             if self.claude_responses.contains_key(&key) {
@@ -20085,6 +20376,16 @@ impl SnapshotAccumulator {
             && self.provider_skills.len() <= crate::session_attribution::MAX_SKILL_FACTS
         {
             self.provider_skills.insert(normalized);
+        } else if restart_restore::enabled() && !self.provider_skills.contains(&normalized) {
+            crate::local_resource_diagnostics::skill_label_native_dropped(
+                self.source.api_slug(),
+                "provider",
+                if normalized.is_empty() || normalized.len() > 128 {
+                    "invalid_signal"
+                } else {
+                    "capacity"
+                },
+            );
         }
     }
 
@@ -20800,6 +21101,33 @@ impl SnapshotAccumulator {
                 effort,
             );
         }
+        let (resolved_model, delta) = self.decide_codex_legacy_usage(
+            model,
+            usage,
+            last_usage,
+            usage_event_identity,
+            implicit_request_count,
+        )?;
+        self.add_usage_with_selector(
+            Some(resolved_model),
+            delta.clone(),
+            selector,
+            timestamp,
+            effort,
+        );
+        Some(delta)
+    }
+
+    /// Admission only. The native caller owns publication; bounded replay
+    /// uses the same ordered state transition without constructing money rows.
+    fn decide_codex_legacy_usage(
+        &mut self,
+        model: Option<String>,
+        usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
+        implicit_request_count: Option<u64>,
+    ) -> Option<(String, UsageTotals)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -20844,14 +21172,7 @@ impl SnapshotAccumulator {
         if delta.is_zero() {
             return None;
         }
-        self.add_usage_with_selector(
-            Some(resolved_model),
-            delta.clone(),
-            selector,
-            timestamp,
-            effort,
-        );
-        Some(delta)
+        Some((resolved_model, delta))
     }
 
     // Production finishes through `into_items_with_repository_identity`.
@@ -24823,6 +25144,10 @@ fn codex_parent_step_start(
                         &file,
                         census_unix_seconds,
                         backfill_window_days,
+                        DiscoveryRecovery {
+                            files: &index.files,
+                            cache: Some(&context.cache),
+                        },
                     ) =>
                 {
                     ParentWitness {
@@ -25008,6 +25333,7 @@ fn validate_codex_parent_ownership_ledgers(
 /// that owner go (`accept_codex_block`); any other key still blocking it, and
 /// every other owner, stay. A missing traversal skips the release: it is
 /// never read as an empty census.
+/// Owners in the traversal's residue set keep their provenance and claims.
 fn release_departed_join_owners(
     index: &mut ScanIndex,
     cache: &sampled_scan::SharedCache,
@@ -25036,9 +25362,11 @@ fn release_departed_join_owners(
     let Some(traversal) = traversal.as_ref() else {
         return;
     };
-    cache.release_join_owners(&traversal.codex_rollout_paths, keep, |owner, members| {
-        index.accept_codex_block(members, owner);
-    });
+    cache.release_join_owners(
+        &traversal.codex_rollout_paths,
+        |owner| traversal.residue.blocked_session_ids.contains(owner) || keep(owner),
+        |owner, members| index.accept_codex_block(members, owner),
+    );
 }
 
 /// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
@@ -26142,6 +26470,7 @@ fn prepare_owned_scan_candidate(
 pub(crate) mod claude_native_comparison;
 
 pub(crate) struct OwnedSourceScan {
+    native_publication: Option<NativePublication>,
     native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
@@ -26230,7 +26559,8 @@ struct OwnedActiveFile {
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
     source_file_fingerprint: String,
-    parser: OwnedJsonlParser,
+    // Preserve heap ownership when this active file is moved into native finish.
+    parser: Box<OwnedJsonlParser>,
     aliases: Vec<CandidateFile>,
     applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
     /// Present while this file is read as a paged cursor job.
@@ -26664,6 +26994,42 @@ impl OwnedSourceScan {
             watcher_overflowed,
             claude_request_identity_capture,
             recovery_priority,
+            None,
+        )
+    }
+
+    /// The daemon supplies existing per-key custody before the first bounded
+    /// directory page, so a held key cannot age out before sampling attaches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_durable_cache(
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        claude_request_identity_capture: bool,
+        recovery_priority: &[PathBuf],
+        cache: &sampled_scan::SharedCache,
+    ) -> Self {
+        Self::new_selecting(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            claude_request_identity_capture,
+            recovery_priority,
+            restart_restore::enabled().then_some(cache),
         )
     }
 
@@ -26693,6 +27059,7 @@ impl OwnedSourceScan {
         let mut codex_page = sampled_scan::codex_cursor::PageBudget::default();
         codex_page.set_continuation(ordinary_equivalent);
         Self {
+            native_publication: None,
             native_comparison: None,
             resource_probe: crate::local_resource_diagnostics::Probe::start(),
             sampling: None,
@@ -26777,6 +27144,7 @@ impl OwnedSourceScan {
         watcher_overflowed: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
+        durable_cache: Option<&sampled_scan::SharedCache>,
     ) -> Self {
         let _select_window = state_v2::state_v2_growth_retention_active(&owned_index)
             .then(|| state_v2::telemetry::Window::begin("select"))
@@ -26897,6 +27265,10 @@ impl OwnedSourceScan {
                 traversal,
                 backfill_window_days,
                 discovery_retention!(index, &resource_probe.discovery_growth),
+                DiscoveryRecovery {
+                    files: &index.files,
+                    cache: durable_cache,
+                },
             );
             start_due_listing_pass(traversal, collected_at);
             next_generation_hints =
@@ -26907,6 +27279,7 @@ impl OwnedSourceScan {
             index,
             backfill_window_days,
             Some(&resource_probe.discovery_growth),
+            durable_cache,
         );
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
@@ -26929,9 +27302,7 @@ impl OwnedSourceScan {
             claude_retry_queue_due_families(index, collected_at);
         }
         let mut scoped_prefix_paths = Vec::new();
-        if source == SnapshotSource::ClaudeCode
-            && claude_request_money::e2::resumed_prefix_enabled()
-        {
+        if source == SnapshotSource::ClaudeCode {
             claude_copy_prefix_reread::select(
                 index,
                 recovery_priority,
@@ -26957,6 +27328,25 @@ impl OwnedSourceScan {
             } else {
                 file_limit
             };
+        // A due quarantine retry of an unchanged file is neither fresh nor a
+        // census member, so no dedicated turn below selects it and it would
+        // wait for an ordinary page. It rides the next selecting page first.
+        // Order only: its flags, budgets and retry backoff are unchanged.
+        if selection_limit > 0 && !index.terminal_contract_retries.is_empty() {
+            let due_retries = index
+                .terminal_contract_retries
+                .values()
+                .map(Path::new)
+                .collect::<BTreeSet<_>>();
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && due_retries.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
@@ -27020,8 +27410,9 @@ impl OwnedSourceScan {
                 }
             }
         }
-        // Dedicated turns select only their own work: new hinted members,
-        // audits or old groups cannot consume the other turn's allowance.
+        // Dedicated turns select only their own work, plus any retry riders:
+        // new hinted members, audits or old groups cannot consume the other
+        // turn's allowance.
         let selection_limit = if freshness_page || census_page {
             pending_paths.len()
         } else {
@@ -27149,6 +27540,7 @@ impl OwnedSourceScan {
             // hint for a path this generation already processed), so each
             // page completes a first read and re-reads cannot starve one.
             // Audits keep their place; the order is otherwise unchanged.
+            // Queued retry leases ride ahead of this order.
             let (members, rereads): (Vec<_>, Vec<_>) = pending_paths
                 .split_off(audited)
                 .into_iter()
@@ -27196,7 +27588,7 @@ impl OwnedSourceScan {
                 BTreeMap::new()
             };
         let mut candidate_discovery =
-            CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
+            CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth), durable_cache);
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -27423,6 +27815,7 @@ impl OwnedSourceScan {
                     index,
                     sources: std::borrow::Cow::Borrowed(&move_sources),
                     growth: Some(&resource_probe.discovery_growth),
+                    cache: durable_cache,
                 };
                 let Some(scan_root) = scan_roots
                     .iter()
@@ -27485,6 +27878,7 @@ impl OwnedSourceScan {
             });
         resource_probe.page_events.merge(diagnostics.finish());
         Self {
+            native_publication: None,
             native_comparison: None,
             resource_probe,
             sampling: None,
@@ -27598,6 +27992,7 @@ impl OwnedSourceScan {
         result
     }
 
+    #[inline(never)]
     fn step_with_capture_credit_inner(
         mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
@@ -27692,6 +28087,7 @@ impl OwnedSourceScan {
             );
         }
         let Self {
+            mut native_publication,
             mut native_comparison,
             mut resource_probe,
             mut sampling,
@@ -27780,6 +28176,12 @@ impl OwnedSourceScan {
             codex_parent_identities.parents_applied = true;
         }
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
+        // A prior page's ownership refusal still vetoes inclusive fallback
+        // after its page-local block set has been lost to save/reload.
+        if let Some(traversal) = index.traversal.as_ref() {
+            codex_state_only_blocked_session_ids
+                .extend(traversal.residue.blocked_session_ids.iter().cloned());
+        }
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
         // callers even though the retained scanner state is unchanged.
@@ -28328,6 +28730,26 @@ impl OwnedSourceScan {
                         _ => {}
                     }
                 }
+                #[cfg(unix)]
+                if boot.awaits_read() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let allowed = cache.upgrade_group_full_allowed(
+                            source,
+                            &boot.group.members,
+                            index,
+                            &mut history_upgrade,
+                        );
+                        if !allowed {
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &boot.group.members,
+                            );
+                            index.mark_bounded_sweep_unsettled();
+                            pending!();
+                        }
+                    }
+                }
                 boot.allow_probe_bytes(
                     codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
                 );
@@ -28337,7 +28759,8 @@ impl OwnedSourceScan {
                     sampling.as_ref().map(|context| context.cache.as_ref()),
                 );
                 // Header and probe bytes are singleton-budget reads (§d.2).
-                codex_page.charge(false, boot.take_charge());
+                let boot_input = boot.take_charge();
+                codex_page.charge(false, boot_input);
                 let members = boot.group.members.len();
                 match outcome {
                     codex_file_join::Boot::Pending => {
@@ -28647,17 +29070,65 @@ impl OwnedSourceScan {
                 ) {
                     // Each member's missing-carrier deadline rides with the
                     // job across pause and defer to its own native entry.
-                    if let Some((member, reason)) = group_members.iter().find_map(|member| {
-                        let mut due = None;
-                        let key = local_index_key(&member.path);
-                        let held = cache.durable_member_hold(source, &key, index, &mut due);
-                        if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
-                            group.recovered[at] = due;
+                    // One admission BEFORE any member consumes a T14 start.
+                    // No later per-member credit failure can strand earlier grants.
+                    let checked = cache.durable_funded_member_batch(source, |cache| {
+                        let mut refused = false;
+                        for member in &group_members {
+                            let mut due = None;
+                            let key = local_index_key(&member.path);
+                            let held = cache
+                                .durable_member_hold_active(source, &key, false, index, &mut due);
+                            if let Some(at) =
+                                group.members.iter().position(|m| m.path == member.path)
+                            {
+                                group.recovered[at] = due;
+                            }
+                            if let Some(reason) = held {
+                                refused = true;
+                                cache.durable_hold_exit(source, reason, index, member, &mut census);
+                                if !restart_restore::enabled() {
+                                    break;
+                                }
+                            }
                         }
-                        held.map(|reason| (member, reason))
-                    }) {
-                        cache.durable_hold_exit(source, reason, index, member, &mut census);
-                        pending!();
+                        // OFF has no successor writer and therefore no T14
+                        // start to commit. Its one read-only pass is sufficient.
+                        if restart_restore::enabled() && !refused {
+                            for member in &group_members {
+                                let key = local_index_key(&member.path);
+                                if let Some(reason) = cache.durable_member_hold_active(
+                                    source, &key, true, index, &mut None,
+                                ) {
+                                    refused = true;
+                                    cache.durable_hold_exit(
+                                        source,
+                                        reason,
+                                        index,
+                                        member,
+                                        &mut census,
+                                    );
+                                }
+                            }
+                        }
+                        refused
+                    });
+                    match checked {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            pending!();
+                        }
+                        Err(_) => {
+                            for member in &group_members {
+                                cache.durable_custody_hold(
+                                    source,
+                                    "member_input_pending",
+                                    index,
+                                    member,
+                                );
+                            }
+                            pending!();
+                        }
                     }
                 }
                 active_file = Some(job);
@@ -28847,6 +29318,17 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     }
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        // Inventory already proved this owner has multiple
+                        // members. Refuse singleton restore before any member
+                        // probe; its old record can retire only through GC.
+                        for member in &group.members {
+                            context
+                                .cache
+                                .durable_exclude_native_class(&local_index_key(&member.path));
+                        }
+                    }
                     if group
                         .members
                         .iter()
@@ -28858,17 +29340,57 @@ impl OwnedSourceScan {
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((
-                                member,
-                                cache.durable_full_hold(
-                                    source,
-                                    &local_index_key(&member.path),
-                                    false,
-                                )?,
-                            ))
-                        }) {
-                            cache.durable_hold_exit(source, reason, index, member, &mut census);
+                        let mut refused = false;
+                        let mut retry_members = false;
+                        // C9: inspect and account for EVERY member before holding
+                        // the group; short-circuiting loses refused-member evidence.
+                        for member in &group.members {
+                            let key = local_index_key(&member.path);
+                            match cache.durable_funded_guard(source, &key, |cache| {
+                                cache.durable_full_hold_active(source, &key, false)
+                            }) {
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    refused = true;
+                                    retry_members |= !restart_restore::enabled()
+                                        || reason != crate::durable_tail_store::Refusal::Corrupt;
+                                    cache.durable_hold_exit(
+                                        source,
+                                        reason,
+                                        index,
+                                        member,
+                                        &mut census,
+                                    );
+                                    if !restart_restore::enabled() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    refused = true;
+                                    retry_members = true;
+                                    cache.durable_custody_hold(
+                                        source,
+                                        "active_input_pending",
+                                        index,
+                                        member,
+                                    );
+                                }
+                            }
+                        }
+                        if refused {
+                            if retry_members {
+                                sampled_scan::codex_cursor::requeue_members(
+                                    index,
+                                    &codex_selected_flags,
+                                    &group.members,
+                                );
+                            } else {
+                                // A spent corrupt rebuild is terminal for this
+                                // pass, just like the singleton hold exit. Keep
+                                // its accepted state while allowing the census
+                                // and unrelated groups to finish.
+                                sampled_scan::codex_cursor::dequeue_members(index, &group.members);
+                            }
                             pending!();
                         }
                     }
@@ -28896,6 +29418,49 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
+                if let Some(taken) = active
+                    .parser
+                    .pending
+                    .as_mut()
+                    .and_then(|p| p.pending_taken.take())
+                {
+                    let context = sampling.as_ref().expect("sampled custody owner");
+                    match context
+                        .cache
+                        .return_prepared_taken(local_index_key(&active.candidate.path), taken)
+                    {
+                        Ok(()) => {
+                            #[cfg(unix)]
+                            if let Some(lease) = active.parser.pending_mut().pending_funding.take()
+                            {
+                                lease.release();
+                            }
+                            identified_candidates.push_front(active.candidate);
+                        }
+                        Err(taken) => {
+                            active.parser.pending_mut().pending_returns += 1;
+                            if active.parser.pending_mut().pending_returns
+                                < RETURN_ADMISSION_ATTEMPTS
+                            {
+                                active.parser.pending_mut().pending_taken = Some(taken);
+                                active_file = Some(active);
+                            } else {
+                                drop(taken); // Optional graph goes before its funding.
+                                #[cfg(unix)]
+                                if let Some(lease) =
+                                    active.parser.pending_mut().pending_funding.take()
+                                {
+                                    lease.release();
+                                }
+                                crate::local_resource_diagnostics::durable_tail_alarm(
+                                    source.api_slug(),
+                                    &serde_json::json!({"prepared_return_dropped": 1}),
+                                );
+                            }
+                        }
+                    }
+                    pending!();
+                }
                 let before_body_read = active.parser.reader.consumed_bytes();
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active, &roots);
@@ -29073,6 +29638,16 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
+                        #[cfg(unix)]
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.durable_layout_read_settled(
+                                source,
+                                &local_index_key(&active.candidate.path),
+                                index,
+                                false,
+                            );
+                        }
+
                         // U1a-2a G14a: a side read error is its charged
                         // attempt; no census line, no dequeue.
                         if let Some(side) = active.side_origin.take() {
@@ -29210,6 +29785,21 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        if active
+                            .parser
+                            .pending
+                            .as_mut()
+                            .is_some_and(|p| std::mem::take(&mut p.owed_full_after_lossy_shrink))
+                            && matches!(
+                                plan.mode(),
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            )
+                        {
+                            let completed = &mut resource_probe
+                                .full_causes
+                                .owed_full_after_lossy_shrink_completed;
+                            *completed = completed.saturating_add(1);
+                        }
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
@@ -29342,7 +29932,7 @@ impl OwnedSourceScan {
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
                 // A Tail/Unchanged singleton, or a grown Full with an owned
-                // finish bound (`prove_release` refuses a legacy one), also decides,
+                // finish bound (a legacy one takes the plain walk), also decides,
                 // under blocking locks, whether a release of lower-ranked
                 // residents would make its copy fit; that release is deferred
                 // into its retention, after
@@ -29435,6 +30025,44 @@ impl OwnedSourceScan {
                     }
                 }
                 let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
+                // Funding admission precedes finish_job/rotation.complete.
+                // A busy probe parks the exact EOF job with its cursor lease;
+                // retry cannot be fenced out before settlement exists.
+                #[cfg(unix)]
+                let mut settlement_reprobed_due = None;
+                #[cfg(unix)]
+                if active.cursor.is_some() && active.side_origin.is_none() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let checked =
+                            (|| -> Result<(), crate::durable_tail_store::ActiveOverBudget> {
+                                if let Some(group) = active.group.as_mut() {
+                                    for (member, due) in
+                                        group.members.iter().zip(group.recovered.iter_mut())
+                                    {
+                                        let key = local_index_key(&member.path);
+                                        if due.is_none() && !index.files.contains_key(&key) {
+                                            *due = cache
+                                                .durable_carrier_reprobe(source, &key, index)?;
+                                        }
+                                    }
+                                } else {
+                                    let key = local_index_key(&active.candidate.path);
+                                    if active.recovered_audit_due.is_none()
+                                        && !index.files.contains_key(&key)
+                                    {
+                                        settlement_reprobed_due =
+                                            cache.durable_carrier_reprobe(source, &key, index)?;
+                                        active.recovered_audit_due = settlement_reprobed_due;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                        if checked.is_err() {
+                            active_file = Some(active);
+                            pending!();
+                        }
+                    }
+                }
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;
@@ -29683,8 +30311,6 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
                 });
-                #[cfg(unix)]
-                let paged = cursor_certificate.is_some();
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -29764,7 +30390,8 @@ impl OwnedSourceScan {
                 // compact records and their selector table were already charged
                 // by copy_budget_step. A refusal disables retention, preserving
                 // the ordinary native finish and its loss/output semantics.
-                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
+                let cache_compatible = !file_sampling.as_ref().is_some_and(|a| a.no_record)
+                    && sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
                 // Retain the reduction only when every applied byte is in
@@ -29806,7 +30433,16 @@ impl OwnedSourceScan {
                             .as_ref()
                             .filter(|scope| *scope == &acquisition.scope)
                             .filter(|_| {
-                                acquisition.audit_due.is_some()
+                                // H3c preserves an already-read prefix while an
+                                // audit waits. A byte-zero Full must instead
+                                // reach normal completion and discharge its
+                                // audit, even when RAM retention is unavailable.
+                                (!restart_restore::enabled()
+                                    || !matches!(
+                                        acquisition.mode,
+                                        crate::transcript_acquisition::ReadMode::Full(_)
+                                    ))
+                                    && acquisition.audit_due.is_some()
                                     && sampled_audit::progress_debt(
                                         index,
                                         &acquisition.key,
@@ -30163,21 +30799,137 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
-                let parsed_file = parser.finish_with_repository_identity(
-                    &candidate.opened_object_identity,
-                    &candidate.path,
-                    collected_at.as_str(),
-                    source_file_fingerprint.clone(),
-                    (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
-                    (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
+                let finish_request = FinishRequest {
+                    expected_opened_object_identity: &candidate.opened_object_identity,
+                    path: &candidate.path,
+                    collected_at: collected_at.as_str(),
+                    source_file_fingerprint: source_file_fingerprint.clone(),
+                    codex_title_metadata: (source == SnapshotSource::Codex)
+                        .then_some(&codex_title_metadata),
+                    claude_title_metadata: (source == SnapshotSource::ClaudeCode)
+                        .then_some(&claude_title_metadata),
                     // U1a-2a B8′: a side read takes no attribution context.
-                    attribution_context.filter(|_| side_origin.is_none()),
-                    measured_repository_identity,
-                    Some(claude_request_money::e2::ReadContext {
+                    attribution_context: attribution_context.filter(|_| side_origin.is_none()),
+                    repository_identity: measured_repository_identity,
+                    money_context: Some(claude_request_money::e2::ReadContext {
                         index,
                         path: &candidate.path,
                         twins: history_upgrade.twin_groups(),
                     }),
+                };
+                // M3 G1 and D3: ordinary plain singleton completions stage
+                // before publication for both durable sources. Codex must
+                // observe a store failure before ACK to enforce strict rebind.
+                // Group/member, proof, side and comparison keep their owners. The held descriptor is
+                // duplicated, never read, before the parser is consumed: the
+                // commit fences check it after a native Ok.
+                #[cfg(unix)]
+                let excluded_native_class = restart_restore::enabled()
+                    && source == SnapshotSource::Codex
+                    && !comparison_target
+                    && side_origin.is_none()
+                    && (!aliases.is_empty()
+                        || applied_receipts.values().any(Option::is_some)
+                        || !sampled_scan::compatible_reduction(&parser.accumulator)
+                        || codex_compressed_input::is_compressed_codex_rollout(
+                            Some(&candidate.path),
+                            Some(&parser.reader.reader),
+                        ));
+                #[cfg(unix)]
+                let m3_route = sampling
+                    .as_ref()
+                    .zip(file_sampling.as_ref())
+                    .filter(|(_, active)| {
+                        restart_restore::enabled()
+                            && matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+                            // No new acquisition is written for an ordinary
+                            // Unchanged read. Receipt-owed retries retain their
+                            // exact native owner; quiet debt changes settle only
+                            // through the post-save writer and index CAS.
+                            && (active.mode != crate::transcript_acquisition::ReadMode::Unchanged
+                                || completed_acquisition.as_ref().is_some_and(|c| c.durable.owed().is_some()))
+                            && !comparison_target
+                            && side_origin.is_none()
+                            && aliases.is_empty()
+                            && applied_receipts.values().all(Option::is_none)
+                            && (source != SnapshotSource::Codex
+                                || sampled_scan::compatible_reduction(&parser.accumulator))
+                    })
+                    .and_then(|(context, active)| {
+                        let held =
+                            native_writeahead_descriptor(&candidate.path, &parser.reader.reader)?;
+                        if !crate::heap_layout_bound::layout_supported() {
+                            context.cache.durable_note_native_layout_skipped(source);
+                            return None;
+                        }
+                        Some((context, active, held))
+                    });
+                #[cfg(unix)]
+                let (parsed_file, m3_publication, m3_strict_rebind, m3_staged) = match m3_route {
+                    Some((context, active, held)) => {
+                        let settled = parser.finish_with_repository_identity_prepared(
+                            finish_request,
+                            completed_acquisition.take(),
+                            &context.cache,
+                            active.mode,
+                            held,
+                            NativeFence {
+                                source,
+                                key: &active.key,
+                                path: &candidate.path,
+                                expected_opened_object_identity: &candidate.opened_object_identity,
+                                committed_index: index,
+                            },
+                        );
+                        NativePublication::carry(&mut native_publication, settled.publication);
+                        completed_acquisition = settled.completed;
+                        (
+                            settled.native,
+                            settled.publication,
+                            settled.strict_rebind,
+                            settled.staged,
+                        )
+                    }
+                    None => (
+                        parser.finish_boxed_native(finish_request),
+                        None,
+                        false,
+                        false,
+                    ),
+                };
+                #[cfg(not(unix))]
+                let parsed_file = parser.finish_boxed_native(finish_request);
+                #[cfg(unix)]
+                if excluded_native_class && parsed_file.is_ok() {
+                    if let Some(context) = sampling.as_ref() {
+                        context
+                            .cache
+                            .durable_exclude_native_class(&local_index_key(&candidate.path));
+                        for alias in &aliases {
+                            context
+                                .cache
+                                .durable_exclude_native_class(&local_index_key(&alias.path));
+                        }
+                    }
+                }
+                // A held completion has no effect at all: no cursor success,
+                // birth, census, entry, body or fold. The committed entry keeps
+                // its accepted body and witness; the key stays indexed and its
+                // grown length keeps it discoverable regardless of age.
+                #[cfg(unix)]
+                if m3_publication.is_some_and(|completion| !completion.publishes())
+                    && parsed_file.is_ok()
+                {
+                    if let Some((context, publication)) =
+                        sampling.as_ref().zip(cursor_publication.take())
+                    {
+                        context.cache.cursor_published(publication, false);
+                    }
+                    pending!();
+                }
+                #[cfg(test)]
+                sampled_scan::test_hooks::fire(
+                    sampled_scan::test_hooks::Point::BeforeNativeEffects,
                 );
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
@@ -30210,6 +30962,16 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(_error) => {
+                        #[cfg(unix)]
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.durable_layout_read_settled(
+                                source,
+                                &local_index_key(&candidate.path),
+                                index,
+                                false,
+                            );
+                        }
+
                         #[cfg(test)]
                         sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
@@ -30937,6 +31699,15 @@ impl OwnedSourceScan {
                             recognized_usage_drop_count,
                             dropped_usage_record_count,
                         ));
+                #[cfg(unix)]
+                if let Some(context) = sampling.as_ref() {
+                    context.cache.durable_layout_read_settled(
+                        source,
+                        &index_key,
+                        index,
+                        source_verified && parse_complete,
+                    );
+                }
                 if source == SnapshotSource::ClaudeCode {
                     index.claude_full_rearm_progress.rebuild_read_full &= parse_complete
                         && source_verified
@@ -31000,6 +31771,7 @@ impl OwnedSourceScan {
                                 index_key: &index_key,
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
+                                held_index_keys: &residue_index_keys,
                                 complete: parse_complete,
                                 lossy: dropped_usage_record_count > 0
                                     || recognized_usage_drop_count > 0
@@ -31056,35 +31828,14 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // R1: a paged job parked across a fresh index load captured
-                // no due for a file now without an entry. Re-probe the same
-                // live-context, clamped debt (read only) before recording;
-                // no restart. A re-probed singleton miss counts here.
                 #[cfg(unix)]
-                let (member_dues, recovered_audit_due, reprobed_due) = {
-                    let mut dues = (member_dues, recovered_audit_due, None);
-                    if let Some(cache) = durable_guard
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                        .filter(|_| paged && parse_complete)
-                    {
-                        let absent = |key: &str| !index.files.contains_key(key);
-                        for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
-                            let key = local_index_key(&member.path);
-                            if due.is_none() && absent(&key) {
-                                *due = cache.durable_carrier_reprobe(source, &key, index);
-                            }
-                        }
-                        if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
-                            dues.2 = cache.durable_carrier_reprobe(source, &index_key, index);
-                            dues.1 = dues.2;
-                            if dues.2.is_some() {
-                                cache.durable_note_carrier("audit_carrier");
-                            }
-                        }
+                let reprobed_due = settlement_reprobed_due.filter(|_| parse_complete);
+                #[cfg(unix)]
+                if reprobed_due.is_some() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        cache.durable_note_carrier("audit_carrier");
                     }
-                    dues
-                };
+                }
                 #[cfg(not(unix))]
                 let reprobed_due: Option<u64> = None;
                 if parse_complete && !aliases.is_empty() {
@@ -31094,6 +31845,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
+                            restored_behind_accepted: false,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -31156,6 +31908,9 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
+                    restored_behind_accepted: file_sampling
+                        .as_ref()
+                        .is_some_and(|active| active.restored_behind_accepted),
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),
@@ -31253,6 +32008,24 @@ impl OwnedSourceScan {
                     // retry instead of cloning it or guessing a nested root.
                     let quiet_scan_root =
                         quiet_audit_checked.then(|| std::mem::take(&mut recorded.scan_root));
+                    // Native completion succeeded. Invalidate an outgrown old
+                    // restart record before exposing this publication; failure
+                    // is counted and never changes OFF money/census settlement.
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        context.cache.durable_off_published(
+                            source,
+                            &index_key,
+                            recorded.size_bytes,
+                        );
+                        for alias in &aliases {
+                            context.cache.durable_off_published(
+                                source,
+                                &local_index_key(&alias.path),
+                                alias.size_bytes,
+                            );
+                        }
+                    }
                     if parse_complete && !non_progressing_residue {
                         sampled_audit::settle_growth(index, &index_key);
                     }
@@ -31403,6 +32176,13 @@ impl OwnedSourceScan {
                             }
                         }
                     }
+                    // D3 Codex: after every audit staging above (staging
+                    // matches the fingerprint), before this entry's save
+                    // settles the degraded publication.
+                    #[cfg(unix)]
+                    if m3_strict_rebind {
+                        codex_strict_rebind(index, source, &index_key);
+                    }
                     if let Some(mut completed) = completed_acquisition {
                         if let Some(context) = sampling.as_mut() {
                             let quiet_retired = quiet_audit_checked
@@ -31428,6 +32208,25 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
+                            // The M3 route already decided this completion's
+                            // record (receipt or no-record disposition): it is
+                            // no longer a Claude post-save write offer.
+                            #[cfg(unix)]
+                            let admitted = if m3_staged {
+                                context.cache.insert_settled(
+                                    key,
+                                    completed,
+                                    finalization_charge.unwrap_or(0),
+                                    m3_publication == Some(NativePublication::Receipted),
+                                )
+                            } else {
+                                context.cache.insert_admitted(
+                                    key,
+                                    completed,
+                                    finalization_charge.unwrap_or(0),
+                                )
+                            };
+                            #[cfg(not(unix))]
                             let admitted = context.cache.insert_admitted(
                                 key,
                                 completed,
@@ -31575,6 +32374,7 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
+                            native_publication,
                             cap_counts,
                             discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
@@ -31616,6 +32416,7 @@ impl OwnedSourceScan {
                         .counts
                         .unreadable_causes
                         .merge(census.unreadable_causes);
+                    traversal.counts.growth_deferred += census.growth_deferred;
                 }
                 // Per-key absence is independent of aggregate terminal authority.
                 if source == SnapshotSource::ClaudeCode {
@@ -31651,6 +32452,23 @@ impl OwnedSourceScan {
                     // Exact watcher remove/rename hints must amend the same durable
                     // observation set used by directory census reconciliation. Apply
                     // removals first so a valid observation later in this page wins.
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        for key in census
+                            .removed_index_keys
+                            .iter()
+                            .filter(|key| context.cache.owes_discovery(source, key))
+                        {
+                            context.cache.note_owed_absence_parked(source);
+                            census.observed_index_keys.insert(key.clone());
+                        }
+                        census
+                            .removed_index_keys
+                            .retain(|key| !context.cache.owes_discovery(source, key));
+                        census
+                            .claude_vanished_index_keys
+                            .retain(|key| !context.cache.owes_discovery(source, key));
+                    }
                     for index_key in census.removed_index_keys.iter() {
                         traversal.observed_index_keys.remove(index_key);
                     }
@@ -31800,10 +32618,11 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
-                    if !index
-                        .files
-                        .get(index_key)
-                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    if !index.codex_residue_holds_entry(index_key)
+                        && !index
+                            .files
+                            .get(index_key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
@@ -31929,6 +32748,7 @@ impl OwnedSourceScan {
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
+                    oversized_discovery::alarm(source, &traversal.oversized_discovery);
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -31967,6 +32787,9 @@ impl OwnedSourceScan {
                         codex_side_drop,
                         sampling.as_ref().map(|context| &*context.cache),
                         source,
+                        sampling
+                            .as_ref()
+                            .map(|context| (source, context.cache.as_ref())),
                     )
                 } else {
                     false
@@ -32396,6 +33219,7 @@ impl OwnedSourceScan {
                     ),
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     source,
+                    native_publication,
                     backfill_window_days,
                     backfill_file_limit: file_limit,
                     discovered_file_count,
@@ -32616,6 +33440,20 @@ impl OwnedSourceScan {
                     counters.tombstone_hits = counters.tombstone_hits.saturating_add(1);
                 });
             }
+            // S2: preserve accepted facts before candidate/working-entry changes.
+            #[cfg(unix)]
+            let accepted_floor = (restart_restore::enabled()
+                && source == SnapshotSource::ClaudeCode)
+                .then(|| {
+                    sampled_scan::durable_tail::AcceptedFloor::of(
+                        index,
+                        &local_index_key(&candidate.path),
+                    )
+                })
+                .flatten();
+            // This floor also covers warm and unsampled returned-original paths.
+            #[cfg(unix)]
+            let mut restore_floor = accepted_floor;
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -32653,6 +33491,15 @@ impl OwnedSourceScan {
                 census.record_unreadable(UnreadableCause::Reduction, 1);
                 pending!();
             }
+            let verification_rescue = verification_rescue
+                || sampling.as_ref().is_some_and(|context| {
+                    context.cache.missing_reduction_growth(
+                        source,
+                        &rescue_key,
+                        &index.files,
+                        candidate.size_bytes,
+                    )
+                });
             let Some((mut candidate, opened_file)) =
                 open_and_identify_scan_candidate_with_rescue_at(
                     source,
@@ -32674,6 +33521,22 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
+            // A2: a current, source-verified census independently proves that
+            // THIS committed object shrank. Read its new body even without a
+            // reusable optional record; unknown/downgrade floors remain holds.
+            #[cfg(unix)]
+            let native_edit_proven = source == SnapshotSource::ClaudeCode
+                && accepted_floor.is_some_and(|a| a.permits_real_edit())
+                && claude_request_census::proves_indexed_shrink(
+                    index,
+                    &local_index_key(&candidate.path),
+                    candidate.size_bytes,
+                    candidate.physical_identity,
+                );
+            #[cfg(unix)]
+            if native_edit_proven {
+                restore_floor = None;
+            }
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
@@ -32890,6 +33753,36 @@ impl OwnedSourceScan {
                     HistoryDecision::NotOwed => {}
                 }
             }
+            #[cfg(unix)]
+            if let Some(context) = sampling.as_ref() {
+                let key = local_index_key(&candidate.path);
+                if native_edit_proven {
+                    context.cache.durable_release_hold(source, &key);
+                }
+                match context.cache.owed_before_skip(source, &key) {
+                    sampled_scan::durable_tail::OwedQuery::None => {}
+                    sampled_scan::durable_tail::OwedQuery::Owed => {
+                        if decision == CandidateDecision::Skip {
+                            decision = CandidateDecision::Parse;
+                        }
+                    }
+                    sampled_scan::durable_tail::OwedQuery::Hold(cause) => {
+                        if source == SnapshotSource::ClaudeCode
+                            && cause == sampled_scan::durable_tail::HeldCause::StaleSurvivor
+                            && !native_edit_proven
+                            && context
+                                .cache
+                                .durable_held_paused(source, &key, &opened_file)
+                        {
+                            context.cache.retain_owed_discovery(source, &key);
+                            pending!();
+                        }
+                        if decision == CandidateDecision::Skip {
+                            decision = CandidateDecision::Parse;
+                        }
+                    }
+                }
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -33061,6 +33954,8 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            #[cfg(test)]
+            sampled_scan::test_hooks::after_selection(index, parse_reason);
             #[cfg(unix)]
             let mut recovered_audit_due = None;
             #[cfg(not(unix))]
@@ -33069,11 +33964,24 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     let key = local_index_key(&candidate.path);
-                    if let Some(reason) =
+                    match cache.durable_funded_guard(source, &key, |cache| {
                         cache.durable_hold(source, &key, index, &mut recovered_audit_due)
-                    {
-                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
-                        pending!();
+                    }) {
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                            pending!();
+                        }
+                        Err(_) => {
+                            residue_index_keys.insert(local_index_key(&candidate.path));
+                            cache.durable_custody_hold(
+                                source,
+                                "active_input_pending",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
+                        }
                     }
                 }
             }
@@ -33417,6 +34325,8 @@ impl OwnedSourceScan {
                     dev_ino: at.dev_ino,
                 });
             }
+            #[cfg(unix)]
+            let durable_accepted = accepted_floor;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -33492,6 +34402,13 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
+            let mut returned_refusal = None;
+            #[cfg(unix)]
+            let mut paced_full_granted = false;
+            let mut active_bound_degraded = false;
+            let mut resource_full_pending = None;
+            #[cfg(unix)]
+            let mut stale_selection_pending = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -33509,6 +34426,8 @@ impl OwnedSourceScan {
                     Ok(mode) => {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
+                            restored_behind_accepted: false,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -33528,7 +34447,155 @@ impl OwnedSourceScan {
                 }
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
-                let taken = context.cache.take(&key);
+                #[cfg(unix)]
+                let receipt = if matches!(
+                    context.cache.owed_before_skip(source, &key),
+                    sampled_scan::durable_tail::OwedQuery::Owed
+                ) {
+                    match context.cache.reconcile_receipt(source, &key) {
+                        sampled_scan::durable_tail::ReconcileOutcome::Receipted(receipt) => {
+                            Some(receipt)
+                        }
+                        sampled_scan::durable_tail::ReconcileOutcome::Held(cause) => {
+                            context.cache.retain_owed_discovery(source, &key);
+                            if cause == sampled_scan::durable_tail::HeldCause::ReceiptPending {
+                                pending!();
+                            }
+                            None
+                        }
+                        sampled_scan::durable_tail::ReconcileOutcome::Retained
+                        | sampled_scan::durable_tail::ReconcileOutcome::Absent => None,
+                    }
+                } else {
+                    None
+                };
+                #[cfg(unix)]
+                let (mut taken, mut preparation_lease) = match if restart_restore::enabled() {
+                    context
+                        .cache
+                        .take_prepared(source, &key)
+                        .map(|taken| taken.map(|(taken, lease)| (taken, Some(lease))))
+                } else {
+                    Ok(context
+                        .cache
+                        .take(&key)
+                        .map(|taken| (Box::new(taken), None)))
+                } {
+                    Ok(Some((taken, lease))) => (Some(taken), lease),
+                    Ok(None) => (None, None),
+                    Err(()) => {
+                        residue_index_keys.insert(key.clone());
+                        context.cache.durable_custody_hold(
+                            source,
+                            "prepared_funding_pending",
+                            index,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                };
+                #[cfg(unix)]
+                if let Some((taken, receipt)) = taken.as_mut().zip(receipt.as_ref()) {
+                    if let Some(owed) = taken.durable.take_owed() {
+                        match context.cache.discharge_owed(owed, receipt) {
+                            Ok(chain) => {
+                                let _ = taken.durable.put_chain(chain);
+                            }
+                            Err(owed) => {
+                                let _ = taken.durable.put_owed(owed);
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                let taken = context.cache.take(&key).map(Box::new);
+                #[cfg(unix)]
+                let taken = if native_edit_proven {
+                    // A real edit invalidates the old graph; no Tail spend or
+                    // guardless reuse. Drop it before releasing transfer credit.
+                    drop(taken);
+                    if let Some(lease) = preparation_lease.take() {
+                        lease.release();
+                    }
+                    None
+                } else {
+                    taken
+                };
+                // The original and its funding move together if ordinary cache
+                // admission refuses. The active frame retries before any read.
+                macro_rules! return_original {
+                    ($taken:expr, $reason:expr) => {{
+                        let reason: Option<&'static str> = $reason;
+                        let taken = $taken;
+                        if restart_restore::enabled() {
+                            let returned = if taken.durable.owed().is_some() {
+                                let live_bytes = taken.finalization_charge;
+                                match context.cache.return_owed_taken(
+                                    key.clone(),
+                                    taken,
+                                    live_bytes,
+                                ) {
+                                    sampled_scan::durable_tail::OwedAdmission::Admitted => Ok(()),
+                                    sampled_scan::durable_tail::OwedAdmission::Refused(taken) => {
+                                        Err(taken)
+                                    }
+                                }
+                            } else {
+                                context.cache.return_prepared_taken(key.clone(), taken)
+                            };
+                            match returned {
+                                Ok(()) =>
+                                {
+                                    #[cfg(unix)]
+                                    if let Some(lease) = preparation_lease.take() {
+                                        lease.release();
+                                    }
+                                }
+                                Err(taken) => {
+                                    parser.pending_mut().pending_taken = Some(taken);
+                                    parser.pending_mut().pending_returns = 1;
+                                    #[cfg(unix)]
+                                    {
+                                        parser.pending_mut().pending_funding =
+                                            preparation_lease.take();
+                                    }
+                                    active_file = Some(Box::new(OwnedActiveFile {
+                                        comparison_target,
+                                        sampling: None,
+                                        recovered_audit_due,
+                                        candidate,
+                                        decision,
+                                        parse_reason: parse_reason
+                                            .filter(|_| source == SnapshotSource::ClaudeCode),
+                                        previous_snapshot_fingerprint,
+                                        previous_upload_body_witness,
+                                        projection_adoption_required,
+                                        source_file_fingerprint,
+                                        parser,
+                                        aliases: Vec::new(),
+                                        applied_receipts: BTreeMap::new(),
+                                        cursor: None,
+                                        charged_bytes: 0,
+                                        hold_offset: None,
+                                        group: None,
+                                        side_origin,
+                                    }));
+                                    pending!();
+                                }
+                            }
+                            if let Some(reason) = reason {
+                                returned_refusal = Some(reason);
+                                retained_offset = None;
+                            } else {
+                                pending!();
+                            }
+                        } else {
+                            // Main drops optional copies rejected by eligibility;
+                            // no M3 custody return/admission or retry while OFF.
+                            drop(taken);
+                        }
+                    }};
+                }
                 // Kept beside the moved copy for R0's completion decision.
                 let taken_admission = taken.as_ref().map(|taken| {
                     (
@@ -33539,7 +34606,7 @@ impl OwnedSourceScan {
                 });
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
                     && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
-                let retained = taken.map(|taken| taken.retained);
+                let mut retained = taken;
                 let retained_present = retained.is_some();
                 let reinsertion =
                     crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
@@ -33557,7 +34624,7 @@ impl OwnedSourceScan {
                 }
                 retained_offset = retained
                     .as_ref()
-                    .map(|retained| retained.checkpoint.sealed_offset());
+                    .map(|taken| taken.retained.checkpoint.sealed_offset());
                 let owning_header_is_current = source != SnapshotSource::Codex
                     || codex_join_inventory.as_ref().is_some_and(|inventory| {
                         inventory.complete
@@ -33578,7 +34645,37 @@ impl OwnedSourceScan {
                     .admission
                     .sidecar_census_complete
                     .observe(sidecar_census_complete);
-                if owning_header_is_current && state_census_complete && sidecar_census_complete {
+                // Claude's retained reduction is captured before metadata is
+                // applied in finish. Its exact per-session dependencies still
+                // fence reuse; unrelated inventory coverage cannot force a Full
+                // on growth. Coverage/identity/publication gates below remain
+                // unchanged, and Codex still needs its closed-world sidecars.
+                // Partial Desktop coverage permits continuing a known native
+                // session, not admitting a new cold file to sampled acquisition.
+                // Without an index entry or its own held-new certificate, keep
+                // main's unsampled read and copy-refusal exemption.
+                let scoped_claude_metadata = restart_restore::enabled()
+                    && source == SnapshotSource::ClaudeCode
+                    && !sidecar_census_complete
+                    && (index.files.contains_key(&key) || e2_held_new_file);
+                if !(owning_header_is_current
+                    && state_census_complete
+                    && (sidecar_census_complete || scoped_claude_metadata))
+                {
+                    if let Some(taken) = retained.take() {
+                        if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
+                            claude_request_census::retain_held(index, &candidate);
+                        }
+                        return_original!(taken, Some("census"));
+                    }
+                }
+                if owning_header_is_current
+                    && state_census_complete
+                    && (sidecar_census_complete || scoped_claude_metadata)
+                {
+                    if scoped_claude_metadata {
+                        crate::local_resource_diagnostics::claude_reread::desktop_scoped_acquisition();
+                    }
                     let reduction_sidecar = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
@@ -33590,6 +34687,12 @@ impl OwnedSourceScan {
                         .admission
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
+                    if reduction_sidecar.is_none() && retained.is_some() {
+                        if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
+                            claude_request_census::retain_held(index, &candidate);
+                        }
+                        return_original!(retained.take().expect("present"), Some("dependency"));
+                    }
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt = sampled_audit::debt_for_key(index, &key, audit_now).or(
                             recovered_audit_due.map(|due_unix_seconds| {
@@ -33640,6 +34743,27 @@ impl OwnedSourceScan {
                             .admission
                             .audit_slot_available
                             .observe(context.audit_slots > 0);
+                        // An ineligible cold route cannot prove replacement.
+                        // Keep S2 even when sampling itself is unavailable.
+                        #[cfg(unix)]
+                        if !allow_sample
+                            && restore_floor.is_some_and(|a| {
+                                parser
+                                    .reader
+                                    .reader
+                                    .get_ref()
+                                    .metadata()
+                                    .map_or(true, |m| a.behind(m.len()))
+                            })
+                        {
+                            context.cache.durable_custody_hold(
+                                source,
+                                "accepted_body_floor",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
+                        }
                         let scope = context.file_scope(
                             source,
                             &candidate,
@@ -33649,22 +34773,29 @@ impl OwnedSourceScan {
                         );
                         // M1: on a RAM miss, a durable record may restore
                         // the copy (charged to the RAM cache, then taken as
-                        // a retained copy); any refusal leaves the read Full.
+                        // a retained copy); resource refusal keeps it Pending.
                         // #814's E2 held-new flag is RAM-only in M1: a miss
                         // carries it false, and a restore needs the
                         // committed index entry, so it never widens reuse.
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let (retained, taken_admission, debt) = match retained {
-                            None if allow_sample && !parser.reader.reader.is_compressed() => {
-                                let interpretation = sampled_scan::durable_tail::Interpretation::of(
-                                    source,
-                                    &key,
-                                    index,
-                                    claude_request_identity_capture,
-                                    &context.namespace,
-                                );
+                        let mut restored_durable = false;
+                        #[cfg(unix)]
+                        let (mut retained, taken_admission, debt) = match retained {
+                            None if allow_sample
+                                && !native_edit_proven
+                                && !parser.reader.reader.is_compressed() =>
+                            {
+                                let mut interpretation =
+                                    sampled_scan::durable_tail::Interpretation::of(
+                                        source,
+                                        &key,
+                                        index,
+                                        claude_request_identity_capture,
+                                        &context.namespace,
+                                    );
+                                interpretation.accepted = restore_floor;
                                 let restore = context.cache.durable_restore(
                                     source,
                                     &key,
@@ -33676,7 +34807,12 @@ impl OwnedSourceScan {
                                 );
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
-                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Restored(
+                                        taken,
+                                        lease,
+                                    ) => {
+                                        preparation_lease = Some(lease);
+                                        restored_durable = restart_restore::enabled();
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -33684,19 +34820,123 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
-                                        (Some(taken.retained), Some(admission), debt)
+                                        (Some(taken), Some(admission), debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
+                                        context.cache.durable_custody_hold(
+                                            source,
+                                            "accepted_body_floor",
+                                            index,
+                                            &candidate,
+                                        );
+                                        pending!();
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::QuietPending
+                                        if parse_reason.is_some_and(|reason| reason != CandidateParseReason::Audit) =>
+                                    {
+                                        // Restore grants no input. This existing explicit
+                                        // selection may take its ordinary Full after the
+                                        // history gate and shared six-hour pace below.
+                                        resource_full_pending = Some("rederive_quiet");
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Pending
+                                    | sampled_scan::durable_tail::RestoreOutcome::QuietPending => {
+                                        residue_index_keys.insert(key.clone());
+                                        context.cache.durable_custody_hold(
+                                            source,
+                                            "prepared_funding_pending",
+                                            index,
+                                            &candidate,
+                                        );
+                                        pending!();
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Degraded => {
+                                        active_bound_degraded = true;
+                                        (None, taken_admission, debt)
+                                    }
+                                    // Audit debt alone cannot skip a reusable
+                                    // record. A stale one still cannot hold a due audit.
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_)
+                                    | sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(..)
+                                        if debt.is_some_and(|owed| audit_now >= owed.due_unix_seconds) =>
+                                    {
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(reason, _) => {
+                                        let granted = source == SnapshotSource::ClaudeCode
+                                            && if reason == "old_binding_no_match" {
+                                                context.cache.no_match_full(&key, parser.reader.reader.get_ref(), durable_accepted).is_some()
+                                            } else {
+                                                context.cache.stale_full(&key, parser.reader.reader.get_ref(), durable_accepted, reason)
+                                            };
+                                        if !granted {
+                                            context.cache.durable_stale_hold(source, index, &candidate);
+                                            pending!();
+                                        }
+                                        paced_full_granted = true;
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
+                                        if source == SnapshotSource::ClaudeCode
+                                            && context.cache.stale_full(
+                                                &key,
+                                                parser.reader.reader.get_ref(),
+                                                durable_accepted,
+                                                reason,
+                                            ) =>
+                                    {
+                                        paced_full_granted = true;
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(reason) => {
+                                        let granted = source == SnapshotSource::ClaudeCode
+                                            && reason == "old_binding_no_match"
+                                            && context.cache.no_match_full(
+                                                &key, parser.reader.reader.get_ref(), durable_accepted,
+                                            ).is_some();
+                                        if !granted {
+                                            context.cache.durable_stale_hold(source, index, &candidate);
+                                            pending!();
+                                        }
+                                        paced_full_granted = true;
+                                        (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        if source == SnapshotSource::Codex {
+                                            if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
+                                                resource_full_pending = Some(phase);
+                                            }
+                                            stale_selection_pending = matches!(class,
+                                                sampled_scan::durable_tail::MissClass::StaleSelection);
+                                        }
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
-                                            sampled_scan::now_seconds(),
                                         );
                                         if rearmed.is_some() && debt.is_none() {
                                             context.audit_slots =
                                                 context.audit_slots.saturating_sub(1);
                                         }
                                         (None, taken_admission, rearmed.or(debt))
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Held(
+                                        crate::durable_tail_store::Refusal::BehindAccepted,
+                                    ) if restart_restore::enabled()
+                                        && source == SnapshotSource::ClaudeCode
+                                        && debt.is_some_and(|owed| audit_now >= owed.due_unix_seconds)
+                                        && restore_floor.is_some_and(|a| {
+                                            parser.reader.reader.get_ref().metadata()
+                                                .is_ok_and(|m| !a.behind(m.len()))
+                                        }) =>
+                                    {
+                                        // A marked lossy extent is not a verified prefix.
+                                        // Re-read the due body; S2 and the Full-start
+                                        // store guard still fence preparation/publication.
+                                        parser.pending_mut().owed_full_after_lossy_shrink = true;
+                                        resource_probe.full_causes.owed_full_after_lossy_shrink =
+                                            resource_probe.full_causes.owed_full_after_lossy_shrink.saturating_add(1);
+                                        (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
                                         context.cache.durable_hold_exit(
@@ -33726,11 +34966,11 @@ impl OwnedSourceScan {
                                 .get(&key)
                                 .is_some_and(ScanIndexEntry::has_unverified_source)
                             && !retained.as_ref().is_some_and(|old| {
-                                old.checkpoint.audit_debt().is_none()
-                                    && old.checkpoint.sealed_offset() == candidate.size_bytes
-                                    && old.checkpoint.scope() == &scope
+                                old.retained.checkpoint.audit_debt().is_none()
+                                    && old.retained.checkpoint.sealed_offset() == candidate.size_bytes
+                                    && old.retained.checkpoint.scope() == &scope
                                     && old
-                                        .checkpoint
+                                        .retained.checkpoint
                                         .stamp_matches(parser.reader.reader.get_ref())
                                         .unwrap_or(false)
                             })
@@ -33753,35 +34993,218 @@ impl OwnedSourceScan {
                                 .retained_entry_rejected_by_eligibility
                                 .saturating_add(1);
                         }
-                        let old = retained.filter(|_| allow_sample);
-                        context.admission.prepare_started =
-                            context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition(
-                            old,
-                            &scope,
-                            debt,
-                            sampled_scan::now_seconds(),
-                        ) {
-                            Ok(mode) => mode,
-                            Err(_) => {
-                                context.admission.prepare_failed =
-                                    context.admission.prepare_failed.saturating_add(1);
-                                if source == SnapshotSource::ClaudeCode {
-                                    claude_request_census::invalidate_claude_request_census(
-                                        index,
-                                        &candidate.path,
-                                    );
+                        // Both refusals, eligibility and the cap's Full, hand the
+                        // original back with its receipt debt and funding.
+                        if !allow_sample {
+                            if let Some(taken) = retained.take() {
+                                if restart_restore::enabled()
+                                    && source == SnapshotSource::ClaudeCode
+                                {
+                                    claude_request_census::retain_held(index, &candidate);
                                 }
-                                census.record_unreadable_file(
-                                    UnreadableCause::Reduction,
-                                    &candidate.path,
+                                return_original!(
+                                    taken,
+                                    Some(if cap_full { "audit_cap" } else { "eligibility" })
                                 );
-                                pending!();
+                            }
+                        }
+                        let mut old = retained;
+                        #[cfg(unix)]
+                        let restored_plan = 'cold_plan: {
+                            // Eligibility and the audit cap must settle before
+                            // spending Q11. The paid transfer still owns Taken;
+                            // attach its guard before fallible owned preparation.
+                            if restored_durable && source == SnapshotSource::ClaudeCode {
+                                let Some(taken) = old.as_mut() else {
+                                    break 'cold_plan Ok(None);
+                                };
+                                let plan = match crate::transcript_acquisition::ReadPlan::prepare(
+                                    parser.reader.reader.get_mut(),
+                                    Some(&taken.retained.checkpoint),
+                                    &scope,
+                                    debt,
+                                    sampled_scan::now_seconds(),
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(error) => {
+                                        // Preserve MAIN's prepare_io -> fresh Full
+                                        // fallback, but never return a cold graph
+                                        // without Q11 to ordinary warm reuse.
+                                        drop(old.take());
+                                        preparation_lease
+                                            .take()
+                                            .expect("cold transfer lease")
+                                            .release();
+                                        retained_offset = None;
+                                        returned_refusal = Some("prepare_io");
+                                        break 'cold_plan Err(sampled_jsonl::PrepareRejected {
+                                            error: error.into(),
+                                            taken: None,
+                                            refusal:
+                                                sampled_jsonl::PreparationRefusal::NonTransient(
+                                                    "prepare_io",
+                                                ),
+                                        });
+                                    }
+                                };
+                                if plan.mode() == crate::transcript_acquisition::ReadMode::Tail {
+                                    let accepted_end =
+                                        durable_accepted.expect("restored floor").end;
+                                    match context.cache.begin_retail(
+                                        source,
+                                        &key,
+                                        &taken.retained.checkpoint,
+                                        parser.reader.reader.get_ref(),
+                                        accepted_end,
+                                        std::time::Instant::now(),
+                                    ) {
+                                        Ok(attempt) => taken.durable.put_retail(attempt),
+                                        Err(reason) => {
+                                            let full = matches!(reason,
+                                                sampled_scan::durable_tail::RetailHold::Exhausted |
+                                                sampled_scan::durable_tail::RetailHold::AccountingLost)
+                                                && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now());
+                                            // A refused grant cannot leave a guardless
+                                            // graph in RAM. Release graph before funding.
+                                            drop(old.take());
+                                            preparation_lease
+                                                .take()
+                                                .expect("cold transfer lease")
+                                                .release();
+                                            if full {
+                                                paced_full_granted = true;
+                                                break 'cold_plan Ok(None);
+                                            }
+                                            context.cache.durable_retail_hold(
+                                                source, reason, index, &candidate,
+                                            );
+                                            pending!();
+                                        }
+                                    }
+                                }
+                                Ok(Some(plan))
+                            } else {
+                                Ok(None)
                             }
                         };
+                        #[cfg(not(unix))]
+                        let restored_plan = Ok(None);
+                        context.admission.prepare_started =
+                            context.admission.prepare_started.saturating_add(1);
+                        let mode = match restored_plan.and_then(|plan| {
+                            parser.prepare_acquisition_owned_planned(
+                                old.take(),
+                                &scope,
+                                debt,
+                                sampled_scan::now_seconds(),
+                                plan,
+                            )
+                        }) {
+                            Ok(mode) => mode,
+                            Err(rejected) => {
+                                context.admission.prepare_failed =
+                                    context.admission.prepare_failed.saturating_add(1);
+                                let refusal = match rejected.refusal {
+                                    sampled_jsonl::PreparationRefusal::Transient => None,
+                                    sampled_jsonl::PreparationRefusal::NonTransient(reason) => {
+                                        Some(reason)
+                                    }
+                                };
+                                if let Some(taken) = rejected.taken {
+                                    if restart_restore::enabled()
+                                        && source == SnapshotSource::ClaudeCode
+                                    {
+                                        claude_request_census::retain_held(index, &candidate);
+                                    }
+                                    return_original!(taken, refusal);
+                                }
+                                if restart_restore::enabled() && refusal.is_some() {
+                                    match parser.prepare_acquisition_owned(
+                                        None,
+                                        &scope,
+                                        debt,
+                                        sampled_scan::now_seconds(),
+                                    ) {
+                                        Ok(mode) => mode,
+                                        Err(_) => {
+                                            census.record_unreadable_file(
+                                                UnreadableCause::Reduction,
+                                                &candidate.path,
+                                            );
+                                            pending!();
+                                        }
+                                    }
+                                } else {
+                                    #[cfg(unix)]
+                                    if let Some(lease) = preparation_lease.take() {
+                                        lease.release();
+                                    }
+                                    if source == SnapshotSource::ClaudeCode {
+                                        claude_request_census::invalidate_claude_request_census(
+                                            index,
+                                            &candidate.path,
+                                        );
+                                    }
+                                    census.record_unreadable_file(
+                                        UnreadableCause::Reduction,
+                                        &candidate.path,
+                                    );
+                                    pending!();
+                                }
+                            }
+                        };
+                        #[cfg(unix)]
+                        if source == SnapshotSource::ClaudeCode
+                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                            && durable_accepted.is_some_and(|a| {
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map_or(true, |p| p.frozen_length() < a.end)
+                            })
+                        {
+                            context.cache.durable_hold_exit(
+                                source,
+                                crate::durable_tail_store::Refusal::BehindAccepted,
+                                index,
+                                &candidate,
+                                &mut census,
+                            );
+                            drop(parser);
+                            if let Some(lease) = preparation_lease.take() {
+                                lease.release();
+                            }
+                            pending!();
+                        }
+                        // S2 again against the actual native plan, after preparation
+                        // but before body I/O/output. Preparing may race a truncate.
+                        #[cfg(unix)]
+                        if restore_floor.is_some_and(|a| {
+                            parser
+                                .reader
+                                .acquisition
+                                .as_ref()
+                                .map_or(true, |plan| a.behind(plan.frozen_length()))
+                        }) {
+                            context.cache.durable_custody_hold(
+                                source,
+                                "accepted_body_floor",
+                                index,
+                                &candidate,
+                            );
+                            drop(parser);
+                            if let Some(lease) = preparation_lease.take() {
+                                lease.release();
+                            }
+                            pending!();
+                        }
+                        #[cfg(unix)]
+                        if let Some(lease) = preparation_lease.take() {
+                            lease.release();
+                        }
                         if !sampled_audit::growth_read_admitted(index, &candidate, mode) {
-                            sampled_audit::queue_growth_retry(index, &candidate);
-                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
                         }
                         // H1c: the plan uses absolute offsets; the reader's
@@ -33834,7 +35257,24 @@ impl OwnedSourceScan {
                         let continued = taken_admission.filter(|_| {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
+                        #[cfg(unix)]
+                        let restored_behind_accepted =
+                            sampled_scan::durable_tail::restored_tail_below_accepted(
+                                source,
+                                restored_durable,
+                                mode,
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map(|p| p.frozen_length()),
+                                index.files.get(&key).map(|e| e.size_bytes),
+                            );
+                        #[cfg(not(unix))]
+                        let restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
+                            restored_behind_accepted,
                             key,
                             scope,
                             mode,
@@ -33903,6 +35343,8 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
+                            restored_behind_accepted: false,
                             key,
                             scope,
                             mode,
@@ -33915,6 +35357,58 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            // Count MAIN's raw Full without supplying a missing cursor capability.
+            // Large Codex with unavailable inputs must keep its no-plan refusal.
+            if returned_refusal.is_some()
+                && planned_mode.is_none()
+                && (source != SnapshotSource::Codex
+                    || parser
+                        .reader
+                        .reader
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|metadata| {
+                            metadata.len()
+                                <= sampled_scan::codex_cursor::Limits::current().singleton()
+                        }))
+            {
+                let context = sampling.as_ref().expect("returned sampled original");
+                let Ok(mode) = parser.prepare_acquisition_owned(
+                    None,
+                    &context.namespace,
+                    None,
+                    sampled_scan::now_seconds(),
+                ) else {
+                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                    pending!();
+                };
+                planned_mode = Some((mode, None));
+            }
+            // S2 is a publication floor, including warm, census/dependency
+            // fallback and unsampled routes. Only the strict cold-record
+            // replacement or independently bound native shrink proof may clear it. No plan means use the
+            // actual held extent, never a fabricated zero or a skipped guard.
+            #[cfg(unix)]
+            if restore_floor.is_some_and(|a| {
+                parser.reader.acquisition.as_ref().map_or_else(
+                    || {
+                        parser
+                            .reader
+                            .reader
+                            .get_ref()
+                            .metadata()
+                            .map_or(true, |m| a.behind(m.len()))
+                    },
+                    |plan| a.behind(plan.frozen_length()),
+                )
+            }) {
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    cache.durable_custody_hold(source, "accepted_body_floor", index, &candidate);
+                } else {
+                    claude_request_census::retain_held(index, &candidate);
+                }
+                pending!();
+            }
             if source == SnapshotSource::ClaudeCode
                 && file_sampling.is_none()
                 && !sampled_audit::growth_read_admitted(
@@ -33925,8 +35419,7 @@ impl OwnedSourceScan {
                     ),
                 )
             {
-                sampled_audit::queue_growth_retry(index, &candidate);
-                census.record_unreadable(UnreadableCause::Reduction, 1);
+                sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
@@ -34104,26 +35597,136 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_full_hold(
+                    if !paced_full_granted
+                        && !active_bound_degraded
+                        && !cache.upgrade_full_allowed(
+                            source,
+                            &local_index_key(&active.candidate.path),
+                            active.parser.reader.reader.get_ref(),
+                            index,
+                            &mut history_upgrade,
+                        )
+                    {
+                        cache.durable_stale_hold(source, index, &active.candidate);
+                        pending!();
+                    }
+                    match cache.durable_full_hold(
                         source,
                         &local_index_key(&active.candidate.path),
                         true,
                     ) {
-                        cache.durable_hold_exit(
-                            source,
-                            reason,
-                            index,
-                            &active.candidate,
-                            &mut census,
-                        );
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            cache.durable_hold_exit(
+                                source,
+                                reason,
+                                index,
+                                &active.candidate,
+                                &mut census,
+                            );
+                            pending!();
+                        }
+                        Err(_) => {
+                            cache.durable_custody_hold(
+                                source,
+                                "full_input_pending",
+                                index,
+                                &active.candidate,
+                            );
+                            // No body or Full-start count yet. Re-offer the
+                            // candidate; accepted state and spend stay intact.
+                            identified_candidates.push_front(active.candidate);
+                            pending!();
+                        }
+                    }
+                }
+            }
+            // There is one shared admission for this actual Full. Earlier
+            // grants and later structural/stale-selection owners take priority.
+            #[cfg(unix)]
+            let resource_full_pending =
+                if paced_full_granted || active_bound_degraded || stale_selection_pending {
+                    None
+                } else {
+                    resource_full_pending
+                };
+            if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
+                let key = local_index_key(&active.candidate.path);
+                if !context.cache.start_resource_full(
+                    source,
+                    &key,
+                    active.parser.reader.reader.get_ref(),
+                    index.files.get(&key).map_or(0, |entry| entry.size_bytes),
+                    phase,
+                ) {
+                    residue_index_keys.insert(key);
+                    drop(codex_cursor_lease.take());
+                    pending!();
+                }
+            }
+            if active_bound_degraded {
+                if let Some(context) = sampling.as_ref() {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_active_bound_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        // A concurrent same-key start can win after the probe.
+                        // Return any pre-input cursor slot before retrying.
+                        drop(codex_cursor_lease.take());
                         pending!();
                     }
                 }
             }
-            if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
-                context.record_mode(mode, audit_due);
-                resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
-                resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
+            #[cfg(unix)]
+            if native_edit_proven {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    source.api_slug(),
+                    &serde_json::json!({"full_reads": {"real_edit": {"shrunk": 1}}}),
+                );
+            }
+            if let Some(context) = sampling.as_mut() {
+                #[cfg(unix)]
+                if stale_selection_pending
+                    && planned_mode.map_or(true, |(mode, _)| {
+                        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    })
+                {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_stale_selection_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        drop(codex_cursor_lease.take());
+                        pending!();
+                    }
+                }
+                if let Some((mode, audit_due)) = planned_mode {
+                    context.record_mode(mode, audit_due);
+                    resource_probe
+                        .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
+                    resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
+                    if active_bound_degraded {
+                        crate::local_resource_diagnostics::durable_tail_alarm(
+                            source.api_slug(),
+                            &serde_json::json!({"full_reads": {"degraded_no_record": {"active_bound": 1}}}),
+                        );
+                    }
+                }
+                if planned_mode.is_some_and(|(mode, _)| {
+                    matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                }) {
+                    if let Some(reason) = returned_refusal {
+                        crate::local_resource_diagnostics::durable_tail_alarm(
+                            source.api_slug(),
+                            &serde_json::json!({"returned_original_full": {(reason): 1}}),
+                        );
+                    }
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -34135,6 +35738,7 @@ impl OwnedSourceScan {
             delivery.left_active();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
+            native_publication,
             native_comparison,
             resource_probe,
             sampling,
@@ -34985,6 +36589,21 @@ type ParserReader = BoundedJsonlReader<OpenedInput>;
 /// The parser's one per-line sink, as `with_line_sink` lends it.
 type LineSink<'a> = &'a mut dyn FnMut(&Value);
 
+// Includes the first failed return: at most two retries may park the owner.
+const RETURN_ADMISSION_ATTEMPTS: u8 = 3;
+
+#[derive(Default)]
+struct ParserPending {
+    owed_full_after_lossy_shrink: bool,
+    pending_taken: Option<Box<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>>,
+    pending_returns: u8,
+    // Drop the original graph before releasing its funding.
+    #[cfg(unix)]
+    pending_funding: Option<crate::durable_tail_store::ActiveLease>,
+}
+crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
+    pending_taken, pending_returns, #[cfg(unix)] pending_funding);
+
 struct OwnedJsonlParser {
     #[cfg(test)]
     source_read_probe: Option<PathBuf>,
@@ -34997,8 +36616,19 @@ struct OwnedJsonlParser {
     positive_usage_evidence: bool,
     /// P1 ledger birth from the same open-time read as `claude_file_birth`.
     claude_opened_birth: Option<claude_request_census::ClaudeRequestBirth>,
+    // Last: parser-owned graphs are gone before the return funding releases.
+    pending: Option<Box<ParserPending>>,
 }
 impl OwnedJsonlParser {
+    fn pending_mut(&mut self) -> &mut ParserPending {
+        assert!(restart_restore::enabled(), "M3 parser state requires ON");
+        self.pending.get_or_insert_with(Default::default)
+    }
+    fn return_pending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.pending_taken.is_some())
+    }
     #[allow(clippy::too_many_arguments)]
     fn new(
         file: File,
@@ -35070,6 +36700,7 @@ impl OwnedJsonlParser {
         }
 
         Ok(Self {
+            pending: None,
             #[cfg(test)]
             source_read_probe: Some(path.to_owned()),
             reader: BoundedJsonlReader::new(
@@ -35090,6 +36721,7 @@ impl OwnedJsonlParser {
         self.step_delivering(None)
     }
     fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
+        anyhow::ensure!(!self.return_pending(), "acquisition return pending");
         #[cfg(test)]
         transcript_io_allowed()?;
         #[cfg(test)]
@@ -35106,8 +36738,24 @@ impl OwnedJsonlParser {
         observe: impl FnMut(&Value),
         on_line: Option<line_delivery::LineTap<'_>>,
     ) -> Result<bool> {
-        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line))?;
-        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+        anyhow::ensure!(!self.return_pending(), "acquisition return pending");
+        #[cfg(unix)]
+        let observation = restart_restore::enabled().then(|| {
+            (
+                self.reader.consumed_bytes(),
+                self.reader.acquisition.as_ref().map(|plan| plan.mode()),
+            )
+        });
+        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line));
+        #[cfg(unix)]
+        if let Some((before, Some(mode))) = observation {
+            sampled_scan::durable_tail::record_native_phase_input(
+                self.source,
+                mode,
+                self.reader.consumed_bytes().saturating_sub(before),
+            );
+        }
+        Ok(matches!(step?, JsonlReaderStep::Complete(_)))
     }
 
     /// Apply one record another parser's reader produced (a group's legacy
@@ -35277,6 +36925,113 @@ impl OwnedJsonlParser {
         repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) -> Result<ParsedJsonlFile> {
+        self.finish_native(
+            FinishRequest {
+                expected_opened_object_identity,
+                path,
+                collected_at,
+                source_file_fingerprint,
+                codex_title_metadata,
+                claude_title_metadata,
+                attribution_context,
+                repository_identity,
+                money_context,
+            },
+            None,
+        )
+    }
+
+    /// M3 G1: the same native finish, staging a durable record at the checked
+    /// PRE-finalization seam: after the held FD revalidated the opened object,
+    /// before any finalization write. A retained copy is staged from its own
+    /// reduction, otherwise from the live parser state; both use the one body
+    /// engine behind `prepare`. Bind, finish and settle in this separate frame
+    /// so their large acquisition temporaries never occupy the scan-step frame.
+    /// Native failure still explicitly discards staging and preserves its debt.
+    #[cfg(unix)]
+    #[inline(never)]
+    fn finish_with_repository_identity_prepared(
+        mut self: Box<Self>,
+        request: FinishRequest<'_>,
+        mut completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+        cache: &sampled_scan::SharedCache,
+        mode: crate::transcript_acquisition::ReadMode,
+        held: File,
+        fence: NativeFence<'_>,
+    ) -> NativeSettlement {
+        let chain_request = NativeChainRequest {
+            source: fence.source,
+            key: fence.key,
+            opened_object_identity: fence.expected_opened_object_identity,
+            mode,
+            held: &held,
+            index: fence.committed_index,
+            counting: sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
+                &self.accumulator,
+            )
+            .ok(),
+        };
+        if let Some(completed) = completed.as_mut() {
+            bind_native_chain(cache, completed, &chain_request);
+        }
+        use sampled_scan::durable_tail::{FinishAcquisition, NativeFinishAttempt};
+        let mut acquisition = match completed {
+            Some(completed) => FinishAcquisition::Certified(completed),
+            // The read's own custody (lease, chain, debt) moves with it.
+            None => FinishAcquisition::Uncertified(self.completed_durable()),
+        };
+        let mut prepare = Some(
+            |lease: &mut crate::durable_tail_store::ActiveLease,
+             view: sampled_scan::durable_tail::LiveFinishView<'_>| {
+                cache.prepare_live(lease, view)
+            },
+        );
+        let mut preparation = None;
+        let rebuilding = cache.durable_rebuild_started(fence.source, fence.key);
+        let mut stage = |live: PreFinalization<'_>| {
+            if rebuilding {
+                return; // The one T14 Full replaces its predecessor after index save.
+            }
+            if let Some(prepare) = prepare.take() {
+                preparation = stage_preparation(&mut acquisition, live, prepare);
+            }
+        };
+        let native = self.finish_native(request, Some(&mut stage));
+        let attempt = NativeFinishAttempt {
+            native,
+            acquisition,
+            preparation,
+        };
+        #[cfg(test)]
+        sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeNativeSettle);
+        settle_native_attempt(cache, attempt, held, fence)
+    }
+
+    // Keep the consumed parser off the caller's scan-step frame as well as
+    // while it is retained in OwnedActiveFile. Unboxing belongs to this frame.
+    #[inline(never)]
+    fn finish_boxed_native(self: Box<Self>, request: FinishRequest<'_>) -> Result<ParsedJsonlFile> {
+        self.finish_native(request, None)
+    }
+
+    /// The one native finish. `pre` runs exactly once, only on the path that
+    /// reached the PRE-finalization seam; every earlier error returns first.
+    fn finish_native(
+        self,
+        request: FinishRequest<'_>,
+        pre: Option<&mut dyn FnMut(PreFinalization<'_>)>,
+    ) -> Result<ParsedJsonlFile> {
+        let FinishRequest {
+            expected_opened_object_identity,
+            path,
+            collected_at,
+            source_file_fingerprint,
+            codex_title_metadata,
+            claude_title_metadata,
+            attribution_context,
+            repository_identity,
+            money_context,
+        } = request;
         anyhow::ensure!(
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
@@ -35303,6 +37058,9 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
+        // The retained reduction's own count (`retain_reduction` copies it
+        // before the line-cap adjustment below); a live body must equal it.
+        let reduction_drop_count = recognized_usage_drop_count;
         // Present for a cursor job or Claude in-page read whose prefix
         // certificate passed (S12/FE1)
         // or whose lossy job holds ruling 2's same-object identity proof.
@@ -35335,6 +37093,24 @@ impl OwnedJsonlParser {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
+        }
+        // M3 G1 PRE-finalization seam. The live scan-shared inputs are
+        // detached exactly as a retained copy excludes them, then restored
+        // before any finalization reads them; no early exit lies between.
+        if let Some(pre) = pre {
+            let traces = accumulator.codex_turn_traces.take();
+            let parents = accumulator.codex_parent_ownership_ledgers.take();
+            pre(PreFinalization::new(
+                &accumulator,
+                &report,
+                (
+                    reduction_drop_count,
+                    positive_recognized_usage_count,
+                    positive_usage_evidence,
+                ),
+            ));
+            accumulator.codex_turn_traces = traces;
+            accumulator.codex_parent_ownership_ledgers = parents;
         }
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
@@ -35560,6 +37336,669 @@ impl OwnedJsonlParser {
             codex_parent_proof_refusal,
         })
     }
+}
+
+/// Native finish inputs, shared by the legacy and the M3 prepared wrapper.
+struct FinishRequest<'a> {
+    expected_opened_object_identity: &'a str,
+    path: &'a Path,
+    collected_at: &'a str,
+    source_file_fingerprint: String,
+    codex_title_metadata: Option<&'a CodexTitleMetadata>,
+    claude_title_metadata: Option<&'a ClaudeTitleMetadata>,
+    attribution_context: Option<&'a crate::session_attribution::SessionAttributionContext>,
+    repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+    money_context: Option<claude_request_money::e2::ReadContext<'a>>,
+}
+
+/// The live parser state at the PRE-finalization seam, scan-shared inputs
+/// detached; the same fields a retained reduction copies.
+struct PreFinalization<'a> {
+    accumulator: &'a SnapshotAccumulator,
+    report: &'a JsonlReadReport,
+    recognized_usage_drop_count: usize,
+    positive_recognized_usage_count: usize,
+    positive_usage_evidence: bool,
+}
+
+impl<'a> PreFinalization<'a> {
+    fn new(
+        accumulator: &'a SnapshotAccumulator,
+        report: &'a JsonlReadReport,
+        scalars: (usize, usize, bool),
+    ) -> Self {
+        Self {
+            accumulator,
+            report,
+            recognized_usage_drop_count: scalars.0,
+            positive_recognized_usage_count: scalars.1,
+            positive_usage_evidence: scalars.2,
+        }
+    }
+}
+
+/// Stage one durable record from the acquisition's own chain and lease.
+/// `None`: no acquired chain, so this completion is not on the M3 route and
+/// keeps the legacy behavior. The retained reduction, when present, is the
+/// view; otherwise the live state is, through the same body engine.
+#[cfg(unix)]
+fn stage_preparation<F>(
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    live: PreFinalization<'_>,
+    prepare: F,
+) -> Option<sampled_scan::durable_tail::PrepareOutcome>
+where
+    F: for<'v> FnOnce(
+        &mut crate::durable_tail_store::ActiveLease,
+        sampled_scan::durable_tail::LiveFinishView<'v>,
+    ) -> sampled_scan::durable_tail::PrepareOutcome,
+{
+    use sampled_scan::durable_tail::{
+        FinishAcquisition, LiveFinishView, NotPersisted, PrepareOutcome,
+    };
+    let (custody, certified) = match acquisition {
+        FinishAcquisition::Certified(completed) => (
+            &mut completed.durable,
+            Some((
+                &completed.checkpoint,
+                completed.reduction.as_ref(),
+                completed.unsealed,
+            )),
+        ),
+        FinishAcquisition::Uncertified(custody) => (custody, None),
+    };
+    let DurableState {
+        active,
+        chain,
+        owed,
+        ..
+    } = custody.state.as_deref_mut()?;
+    // While debt exists the chain lives only in it.
+    let chain = chain
+        .as_deref()
+        .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
+    if !sampled_jsonl::loss_free_source_report(
+        live.report,
+        live.recognized_usage_drop_count,
+        live.accumulator.dropped_usage_record_count,
+    ) {
+        // A certificate cannot authorize a lossy source. Preserve its
+        // predecessor and let native settlement disclose the loss. Loss
+        // discovered after this seam is checked again before commit.
+        return None;
+    }
+    let Some((checkpoint, reduction, unsealed)) = certified else {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::Certificate));
+    };
+    if unsealed {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::Unsealed));
+    }
+    let Some(lease) = active.as_mut() else {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::ActiveBound));
+    };
+    let live = reduction.map_or(live, |reduction| {
+        let (accumulator, report, scalars) = reduction.finish_view();
+        PreFinalization::new(accumulator, report, scalars)
+    });
+    Some(
+        match LiveFinishView::new(live, checkpoint, chain, jsonl_line_cap() as u64) {
+            Ok(view) => prepare(lease, view),
+            Err(refusal) => PrepareOutcome::NotPersisted(refusal),
+        },
+    )
+}
+
+/// The custody's acquired chain; while debt exists it lives only in the debt.
+#[cfg(unix)]
+fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail::AcquiredChain> {
+    custody
+        .chain()
+        .or_else(|| custody.owed().map(|owed| owed.chain()))
+}
+
+/// Descriptor acquisition for the already admitted M3 finish route. Use the
+/// existing input-kind predicate before chain/lease/debt acquisition: archive
+/// checkpoints belong to the ordinary archive owner, never physical prefixes.
+/// This does not change the single transcript-path admission boundary.
+#[cfg(unix)]
+fn native_writeahead_descriptor(path: &Path, input: &OpenedInput) -> Option<File> {
+    if codex_compressed_input::is_compressed_codex_rollout(Some(path), Some(input)) {
+        return None;
+    }
+    input.get_ref().try_clone().ok()
+}
+
+/// The facts the commit fences check against, all frozen before mutation.
+#[cfg(unix)]
+struct NativeFence<'a> {
+    source: SnapshotSource,
+    key: &'a str,
+    path: &'a Path,
+    expected_opened_object_identity: &'a str,
+    committed_index: &'a ScanIndex,
+}
+
+/// What only the native caller proves for an M3 chain: the read's actual
+/// mode and cause, its held descriptor, the opened object O and the
+/// committed index the binding is computed from. Never a newer accepted body.
+#[cfg(unix)]
+struct NativeChainRequest<'a> {
+    source: SnapshotSource,
+    key: &'a str,
+    opened_object_identity: &'a str,
+    mode: crate::transcript_acquisition::ReadMode,
+    counting: Option<sampled_scan::durable_tail::ImmutableCounting>,
+    held: &'a File,
+    index: &'a ScanIndex,
+}
+
+/// Bind this completion to its one acquisition chain before the native
+/// finish: a genuine content change first releases any D3 hold on the key;
+/// a carried (retained, restored or owed) chain moves with r_a, protocol and
+/// eligibility inherited; otherwise a fresh Legacy chain is captured from the
+/// actual mode, held O and committed index. Write-ahead eligibility is only a
+/// native byte-zero origin: a never-indexed first read or a real edit. Any
+/// refusal leaves no usable chain, so nothing is staged and the completion
+/// keeps its existing route; a held key still holds (`settle_native_attempt`).
+#[cfg(unix)]
+fn bind_native_chain(
+    cache: &sampled_scan::SharedCache,
+    completed: &mut sampled_jsonl::CompletedNativeAcquisition,
+    request: &NativeChainRequest<'_>,
+) {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    let Some(counting) = request.counting.as_ref() else {
+        return;
+    };
+    let real_edit = matches!(
+        request.mode,
+        ReadMode::Full(
+            FullReason::Replaced
+                | FullReason::Shrunk
+                | FullReason::SameSizeEdit
+                | FullReason::HeadChanged
+                | FullReason::BoundaryChanged
+        )
+    );
+    if real_edit {
+        cache.durable_release_hold(request.source, request.key);
+    }
+    let custody = &mut completed.durable;
+    if real_edit {
+        custody.take_owed();
+        custody.take_chain();
+    }
+    if let Some(mut owed) = custody.state.as_mut().and_then(|state| state.owed.take()) {
+        if custody.ensure_active(cache, request.source, 0).is_ok() {
+            let _ = cache.advance_owed(
+                &mut owed,
+                &completed.checkpoint,
+                custody.active_mut().expect("lease"),
+            );
+            let _ = cache.durable_rebind_chain(
+                custody.active_mut().expect("lease"),
+                owed.chain_mut(),
+                request.opened_object_identity,
+                request.held,
+                &completed.checkpoint,
+                request.index,
+                counting,
+            );
+        }
+        custody.state_mut().owed = Some(owed);
+        return;
+    }
+    if !custody.has_active() {
+        match cache.acquire_active(request.source, 0) {
+            crate::durable_tail_store::LeaseWait::Granted(lease) => {
+                let _ = custody.attach_active(lease);
+            }
+            crate::durable_tail_store::LeaseWait::Busy
+            | crate::durable_tail_store::LeaseWait::OverBudget => return,
+        }
+    }
+    let state = custody.state_mut();
+    if let Some(chain) = state.chain.as_mut() {
+        if cache
+            .durable_rebind_chain(
+                state.active.as_mut().expect("ensured active lease"),
+                chain,
+                request.opened_object_identity,
+                request.held,
+                &completed.checkpoint,
+                request.index,
+                counting,
+            )
+            .is_err()
+        {
+            // Never restamp a carried chain into a new binding.
+            state.chain = None;
+        }
+        return;
+    }
+    let first_read = matches!(request.mode, ReadMode::Full(_));
+    let Some(lease) = state.active.as_mut() else {
+        return;
+    };
+    if let Ok(chain) = cache.durable_capture_chain(
+        lease,
+        request.source,
+        request.key,
+        request.opened_object_identity,
+        request.held,
+        &completed.checkpoint,
+        request.index,
+        first_read || real_edit,
+        counting,
+    ) {
+        state.chain = Some(Box::new(chain));
+    }
+}
+
+/// One settled native completion.
+#[cfg(unix)]
+struct NativeSettlement {
+    native: Result<ParsedJsonlFile>,
+    /// The certified completion the caller may still admit.
+    completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+    /// Existing PRE-index action only; this never decides publication.
+    strict_rebind: bool,
+    /// Classified once while consuming the real e4 result, including early holds.
+    publication: Option<NativePublication>,
+    /// The M3 route decided this completion's record; no post-save offer.
+    staged: bool,
+}
+
+/// Explicit cleanup of a staging the native finish cannot use.
+#[cfg(unix)]
+fn discard_staging(
+    cache: &sampled_scan::SharedCache,
+    staged: sampled_scan::durable_tail::PrepareOutcome,
+) {
+    use sampled_scan::durable_tail::PrepareOutcome;
+    match staged {
+        PrepareOutcome::Prepared(prepared) => cache.discard_prepared(prepared),
+        PrepareOutcome::StoreFailed(failure) => cache.discard_failed_preparation(failure),
+        PrepareOutcome::NotPersisted(_) | PrepareOutcome::Degraded(_) => {}
+    }
+}
+
+/// Settle one prepared native finish before any of its effects: dispatch the
+/// staging through the commit fences, bind receipts or register debt, end the
+/// active lease, and park a held completion as owed. Returns the native
+/// result, the certified completion the caller may still admit, and how the
+/// caller proceeds. A native error publishes nothing and keeps its debt.
+#[cfg(unix)]
+#[inline(never)]
+fn settle_native_attempt(
+    cache: &sampled_scan::SharedCache,
+    attempt: sampled_scan::durable_tail::NativeFinishAttempt,
+    mut held: File,
+    fence: NativeFence<'_>,
+) -> NativeSettlement {
+    use sampled_scan::durable_tail::{
+        CommitFences, FinishAcquisition, NativeFinishAttempt, OwedCompletionAdmission,
+        PrepareOutcome, Unprepared,
+    };
+    let NativeFinishAttempt {
+        native,
+        mut acquisition,
+        preparation,
+    } = attempt;
+    let staged = preparation.is_some();
+    // Certification precedes finalization: conflicts, dropped usage, or an
+    // unresolved ownership boundary can become known only in the final result.
+    // Discard the temporary without renaming or retiring the predecessor, and
+    // leave disclosure to native settlement rather than manufacturing a hold.
+    let finish_loss_free = native.as_ref().is_ok_and(|parsed| {
+        parsed.complete()
+            && !parsed.zero_snapshot_usage_evidence
+            && sampled_jsonl::loss_free_source_report(
+                &parsed.report,
+                parsed.recognized_usage_drop_count,
+                parsed.dropped_usage_record_count,
+            )
+    });
+    let preparation = if finish_loss_free {
+        preparation
+    } else {
+        if let Some(staged) = preparation {
+            discard_staging(cache, staged);
+        }
+        if acquisition.custody().owed().is_some() {
+            cache.retain_owed_discovery(fence.source, fence.key);
+        }
+        None
+    };
+    let (publication, strict_rebind) = match preparation {
+        // Not staged (no chain or no lease). A Claude key held by D3 still
+        // never publishes over its surviving A; the query counts its growth
+        // and releases it if the held object itself changed.
+        None if finish_loss_free
+            && fence.source == SnapshotSource::ClaudeCode
+            && cache.durable_claude_hold(fence.source, fence.key, &held) =>
+        {
+            (Some(NativePublication::Hold), false)
+        }
+        None => (None, false),
+        Some(staged) => {
+            // Bound before the staging is consumed: a pending or held write
+            // owes exactly this candidate, never a later one.
+            let candidate = match &staged {
+                PrepareOutcome::Prepared(prepared) => Some(prepared.identity().clone()),
+                PrepareOutcome::StoreFailed(failure) => failure.identity().cloned(),
+                PrepareOutcome::NotPersisted(_) | PrepareOutcome::Degraded(_) => None,
+            };
+            if let PrepareOutcome::Prepared(prepared) = &staged {
+                if acquisition.custody().owed().is_some()
+                    && cache
+                        .bind_owed_prepared(&mut acquisition, prepared)
+                        .is_err()
+                {
+                    discard_staging(cache, staged);
+                    cache.retain_owed_discovery(fence.source, fence.key);
+                    return NativeSettlement {
+                        native,
+                        completed: None,
+                        strict_rebind: false,
+                        publication: Some(NativePublication::Hold),
+                        staged: true,
+                    };
+                }
+            }
+            let fences = match custody_chain(acquisition.custody()) {
+                Some(chain) => CommitFences::new(
+                    &mut held,
+                    fence.path,
+                    fence.expected_opened_object_identity,
+                    acquisition.checkpoint(),
+                    chain,
+                    fence.committed_index,
+                ),
+                None => Err(sampled_scan::durable_tail::HeldCause::Fence),
+            };
+            let (publication, strict_rebind) = match fences {
+                Err(_cause) => {
+                    #[cfg(test)]
+                    eprintln!("M3 native commit fence refused: {_cause:?}");
+                    // The fences, not the staging, refused: discard the stage
+                    // and hold the custody for an exact retry.
+                    discard_staging(cache, staged);
+                    owe_receipt(cache, &mut acquisition, None);
+                    (NativePublication::Hold, false)
+                }
+                // Each outcome is computed (fences consumed) before the
+                // acquisition is borrowed again to bind or owe it.
+                Ok(fences) => match staged {
+                    PrepareOutcome::Prepared(prepared) => {
+                        let outcome = cache.commit_prepared(prepared, fences);
+                        write_disposition(
+                            cache,
+                            &mut acquisition,
+                            fence.source,
+                            outcome,
+                            candidate.as_ref(),
+                        )
+                    }
+                    PrepareOutcome::StoreFailed(failure) => {
+                        let outcome = cache.resolve_failed_preparation(failure, fences);
+                        write_disposition(
+                            cache,
+                            &mut acquisition,
+                            fence.source,
+                            outcome,
+                            candidate.as_ref(),
+                        )
+                    }
+                    PrepareOutcome::NotPersisted(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                    }
+                    PrepareOutcome::Degraded(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                    }
+                },
+            };
+            (Some(publication), strict_rebind)
+        }
+    };
+    // Only Codex rebinds strictly. Any other source never publishes over a
+    // surviving A: its key holds (Claude's original-v1 adapter would bind A).
+    if strict_rebind && fence.source != SnapshotSource::Codex {
+        owe_receipt(cache, &mut acquisition, None);
+    }
+    // The process-wide lease ends before any cache admission or effect.
+    acquisition.custody_mut().release_active();
+    let completed = match acquisition {
+        FinishAcquisition::Certified(_) if !finish_loss_free => None,
+        FinishAcquisition::Certified(completed)
+            if publication.is_some_and(|completion| !completion.publishes()) =>
+        {
+            // Funded owed retention, or the debt survives through the
+            // index-held discovery obligation without the graph.
+            if let OwedCompletionAdmission::Refused(completed) =
+                cache.retain_owed_completion(fence.key.to_owned(), completed, 0)
+            {
+                drop(completed);
+                cache.retain_owed_discovery(fence.source, fence.key);
+            }
+            None
+        }
+        FinishAcquisition::Certified(completed) => Some(completed),
+        FinishAcquisition::Uncertified(custody) => {
+            if publication.is_some_and(|completion| !completion.publishes())
+                && custody.owed().is_some()
+            {
+                cache.retain_owed_discovery(fence.source, fence.key);
+            }
+            drop(custody);
+            None
+        }
+    };
+    NativeSettlement {
+        native,
+        completed,
+        strict_rebind,
+        publication,
+        staged,
+    }
+}
+
+/// Register receipt debt for a completion that cannot publish. A refused
+/// registration still holds: the facade then keeps the conservative
+/// source-class obligation and never reports the key as free of debt.
+#[cfg(unix)]
+fn owe_receipt(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
+) {
+    let _held = cache.mark_receipt_owed(acquisition, candidate);
+}
+
+#[cfg(unix)]
+fn write_disposition(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    source: SnapshotSource,
+    outcome: sampled_scan::durable_tail::WriteOutcome,
+    candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
+) -> (NativePublication, bool) {
+    use sampled_scan::durable_tail::{DegradedCause, WriteOutcome};
+    match outcome {
+        // Only the exact receipt for this acquisition's candidate publishes.
+        WriteOutcome::Receipted {
+            generation,
+            receipt,
+        } => {
+            debug_assert_eq!(generation, receipt.generation());
+            match cache.receipt_acquisition(acquisition, &receipt) {
+                Ok(()) => (NativePublication::Receipted, false),
+                Err(_) => {
+                    owe_receipt(cache, acquisition, candidate);
+                    (NativePublication::Hold, false)
+                }
+            }
+        }
+        WriteOutcome::ReceiptPending => {
+            owe_receipt(cache, acquisition, candidate);
+            (NativePublication::ReceiptPending, false)
+        }
+        WriteOutcome::FailedHeld(cause) => {
+            #[cfg(test)]
+            eprintln!("M3 native write held: {cause:?}");
+            if cause == sampled_scan::durable_tail::HeldCause::StaleSurvivor {
+                if let Some(chain) = custody_chain(acquisition.custody()) {
+                    cache.retain_owed_discovery(chain.source(), chain.key());
+                }
+            }
+            owe_receipt(cache, acquisition, candidate);
+            (NativePublication::FailedHeld, false)
+        }
+        WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind) => {
+            acquisition.custody_mut().take_owed();
+            (NativePublication::strict_rebind(source), true)
+        }
+        WriteOutcome::FailedPublishedWithoutRecord(
+            DegradedCause::WriteFailedRetired
+            | DegradedCause::StoreUntouched
+            | DegradedCause::PriorUnbindable,
+        ) => {
+            acquisition.custody_mut().take_owed();
+            (NativePublication::FailedPublishedWithoutRecord, false)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unprepared_disposition(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    source: SnapshotSource,
+    disposition: sampled_scan::durable_tail::UnpreparedDisposition,
+) -> (NativePublication, bool) {
+    use sampled_scan::durable_tail::UnpreparedDisposition;
+    if !matches!(disposition, UnpreparedDisposition::Hold(_)) {
+        acquisition.custody_mut().take_owed();
+    }
+    match disposition {
+        UnpreparedDisposition::PublishStrictRebind => {
+            (NativePublication::strict_rebind(source), true)
+        }
+        UnpreparedDisposition::PublishRetainingPrior { format, cause } => {
+            debug_assert!(matches!(format, 1 | 3));
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Unprepared::NotPersisted(_)
+                    | sampled_scan::durable_tail::Unprepared::Degraded(_)
+            ));
+            (NativePublication::PublishRetainingPrior, false)
+        }
+        UnpreparedDisposition::PublishWithoutRecord { cause } => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Unprepared::NotPersisted(_)
+                    | sampled_scan::durable_tail::Unprepared::Degraded(_)
+            ));
+            (NativePublication::PublishWithoutRecord, false)
+        }
+        UnpreparedDisposition::PublishStoreUntouched { cause } => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Degraded::Disabled
+                    | sampled_scan::durable_tail::Degraded::NoLock
+                    | sampled_scan::durable_tail::Degraded::Paused
+                    | sampled_scan::durable_tail::Degraded::Refused
+            ));
+            (NativePublication::PublishStoreUntouched, false)
+        }
+        UnpreparedDisposition::Hold(cause) => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::HeldCause::Fence
+                    | sampled_scan::durable_tail::HeldCause::Protected(_)
+                    | sampled_scan::durable_tail::HeldCause::ReceiptPending
+                    | sampled_scan::durable_tail::HeldCause::CustodyBound
+                    | sampled_scan::durable_tail::HeldCause::Incompatible
+                    | sampled_scan::durable_tail::HeldCause::StaleSurvivor
+            ));
+            owe_receipt(cache, acquisition, None);
+            (NativePublication::Hold, false)
+        }
+    }
+}
+
+/// For Codex, make a surviving record A
+/// unbindable in the same working index whose save settles the degraded
+/// publication, without deleting anything. The entry, its audit marker and
+/// deadline (`scan_identity_version`), key, membership and accepted body
+/// facts stay; only the selection witness is cleared, the existing reparse
+/// debt that settlement preserves. Both readers refuse A afterward: this
+/// build's Codex selection gate and v1 strict entry check
+/// (`durable_tail_store.rs` `DurableRecord::eligible`), and 0.1.201
+/// (`f174d111f`): selection gate `durable_tail.rs:409-417`, generation/entry
+/// check `durable_tail_store.rs:334-337` over `entry_digest` (`:227-233`).
+/// Claude never takes this path: its original-v1 adapter and account
+/// identity inputs stay unchanged (Claude holds the key instead).
+#[cfg(unix)]
+fn codex_strict_rebind(index: &mut ScanIndex, source: SnapshotSource, key: &str) -> bool {
+    if source != SnapshotSource::Codex {
+        return false;
+    }
+    match index.files.get_mut(key) {
+        Some(entry) => {
+            entry.source_file_fingerprint.clear();
+            true
+        }
+        None => false,
+    }
+}
+
+/// D3's crash boundary is before the upload request can be acknowledged.
+/// Persist the binding change on the previously committed PRE entry, never on
+/// a newly parsed body/revision/extent. Retain or increase existing audit debt.
+#[cfg(unix)]
+pub(crate) fn commit_store_fault_barrier(
+    cache: &sampled_scan::SharedCache,
+    source: SnapshotSource,
+    working: &mut ScanIndex,
+    committed: &mut ScanIndex,
+    index_path: &Path,
+) -> Result<bool> {
+    if !restart_restore::enabled()
+        || source != SnapshotSource::Codex
+        || !cache.durable_store_faulted(source)
+    {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for (key, entry) in committed.files.slots_mut() {
+        if working
+            .files
+            .get(key)
+            .is_some_and(|current| current.source_file_fingerprint.is_empty())
+            && !entry.source_file_fingerprint.is_empty()
+        {
+            let entry = entry.make_mut();
+            entry.carry_sampled_audit(&working.files[key]);
+            entry.source_file_fingerprint.clear();
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeFaultBarrier);
+    committed.save(index_path)?;
+    // Subsequent selected saves CAS against this actual durable publication.
+    working.adopt_committed_save(committed);
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterFaultBarrier);
+    Ok(true)
 }
 
 /// `created()` of an opened file with its device and inode, or None when the
@@ -36182,6 +38621,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(&available[..offset + 1], true)?;
                     }
                     reader.consume(offset + 1);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed((offset + 1) as u64);
                     #[cfg(test)]
                     sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
                         if let Some(ranges) = v.borrow_mut().as_mut() {
@@ -36208,6 +38649,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(available, false)?;
                     }
                     reader.consume(len);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed(len as u64);
                     #[cfg(test)]
                     sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
                         if let Some(ranges) = v.borrow_mut().as_mut() {
@@ -36351,14 +38794,9 @@ fn apply_physical_line(
         buf.shrink_to(max_line_bytes);
         return;
     }
-    // Trim a trailing CR so a CRLF transcript parses identically to LF.
-    let mut bytes = buf.as_slice();
-    if bytes.last() == Some(&b'\r') {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    let value = match std::str::from_utf8(bytes) {
-        Ok(line) if line.trim().is_empty() => None,
-        Ok(line) => match serde_json::from_str::<Value>(line) {
+    let value = match jsonl_line_text(buf) {
+        JsonlLineText::Blank => None,
+        JsonlLineText::Text(line) => match serde_json::from_str::<Value>(line) {
             Ok(value) => {
                 report.parsed_json_line_count += 1;
                 Some(value)
@@ -36368,7 +38806,7 @@ fn apply_physical_line(
                 None
             }
         },
-        Err(_) => {
+        JsonlLineText::InvalidUtf8 => {
             report.invalid_utf8_line_count += 1;
             None
         }
@@ -37493,6 +39931,101 @@ fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionA
     })
 }
 
+// Content projection shared with growth-only durable replay. Keep native N/U
+// processing at its existing call sites; these helpers never publish usage.
+enum JsonlLineText<'a> {
+    Blank,
+    InvalidUtf8,
+    Text(&'a str),
+}
+fn jsonl_line_text(mut bytes: &[u8]) -> JsonlLineText<'_> {
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => JsonlLineText::Blank,
+        Ok(line) => JsonlLineText::Text(line),
+        Err(_) => JsonlLineText::InvalidUtf8,
+    }
+}
+fn claude_response_key(value: &Value, sequence: u64) -> String {
+    match claude_code_usage_dedup_key(value) {
+        Some(key) => key,
+        None => {
+            // Preserve the historical, conservative one-line/one-response
+            // fallback. Claude accounting proof remains absent for every
+            // snapshot until api_request logs and trace ownership are
+            // reconciled, regardless of transcript identity quality.
+            format!("u\u{1f}{}", sequence)
+        }
+    }
+}
+fn claude_title_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
+    accumulator.set_title(
+        string_at(value, &["customTitle"]).and_then(claude_custom_title_display_title),
+        "transcript_title",
+    );
+    accumulator.set_title_if_absent(
+        string_at(value, &["summary"])
+            .or_else(|| string_at(value, &["title"]))
+            .or_else(|| string_at(value, &["metadata", "title"])),
+        "summary",
+    );
+}
+fn claude_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    claude_title_content(value, accumulator);
+    let real_prompt = claude_first_user_prompt(value);
+    if real_prompt.is_some() {
+        accumulator.session_start.note_user_turn();
+    }
+    accumulator.set_first_prompt_title(real_prompt);
+}
+fn claude_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(
+        string_at(value, &["cwd"])
+            .or_else(|| string_at(value, &["projectPath"]))
+            .or_else(|| string_at(value, &["workspace"])),
+    );
+}
+fn codex_opening_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator
+        .session_start
+        .observe_codex_line(value, accumulator.workspace_path.as_deref());
+}
+fn codex_user_turn_content(_: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.session_start.note_user_turn();
+}
+fn codex_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_title(codex_transcript_title(value), "transcript_title");
+    accumulator.set_first_prompt_title(codex_first_user_prompt(value));
+}
+fn codex_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(
+        string_at(value, &["turn_context", "payload", "cwd"])
+            .or_else(|| string_at(value, &["payload", "cwd"]))
+            .or_else(|| string_at(value, &["cwd"])),
+    );
+}
+fn codex_header_workspace_content(meta: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
+}
+fn codex_agent_content(src: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.codex_agent_label = string_at(src, &["subagent", "thread_spawn", "agent_path"])
+        .and_then(safe_codex_agent_display_label);
+    accumulator
+        .durable_marks
+        .note_end(|marks| &mut marks.agent_label);
+}
+fn pi_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(string_at(value, &["cwd"]));
+}
+fn pi_prompt_content(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
+    if role == Some("user") {
+        accumulator.set_first_prompt_title(pi_message_text(value));
+    }
+}
+
 /// First physical header remains the identity/graph owner. Later copied headers
 /// cannot replace it, and contradictory creator evidence permanently clears
 /// only the optional creator witness for this scan.
@@ -37548,18 +40081,13 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
                 codex_identity_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
                     .or_else(|| codex_identity_at(meta, &["parent_thread_id"])),
             );
-            accumulator.codex_agent_label =
-                string_at(src, &["subagent", "thread_spawn", "agent_path"])
-                    .and_then(safe_codex_agent_display_label);
-            accumulator
-                .durable_marks
-                .note_end(|marks| &mut marks.agent_label);
+            codex_agent_content(src, accumulator);
         }
     }
     accumulator.origin.originator = string_at(meta, &["originator"]);
     accumulator.origin.agent_role =
         string_at(meta, &["agent_role"]).or_else(|| string_at(meta, &["agent_type"]));
-    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
+    codex_header_workspace_content(meta, accumulator);
     accumulator
         .note_time(string_at(value, &["timestamp"]).or_else(|| string_at(meta, &["timestamp"])));
     accumulator.codex_session_meta_seen = true;
@@ -37980,9 +40508,7 @@ fn apply_codex_ledger_line(value: &Value, accumulator: &mut SnapshotAccumulator)
 }
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator
-        .session_start
-        .observe_codex_line(value, accumulator.workspace_path.as_deref());
+    codex_opening_content(value, accumulator);
     if string_eq_at(value, &["type"], "turn_context") {
         if let Some(payload) = value.get("payload").and_then(Value::as_object) {
             let metadata = payload
@@ -38011,7 +40537,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
     }
     if string_eq_at(value, &["payload", "type"], "task_started") {
-        accumulator.session_start.note_user_turn();
+        codex_user_turn_content(value, accumulator);
         if let Some(turn) = string_at(value, &["payload", "turn_id"]) {
             accumulator.cache_active_turns.insert(turn);
         }
@@ -38081,18 +40607,13 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         .or_else(|| string_at(value, &["time"]))
         .or_else(|| string_at(value, &["created_at"]));
     accumulator.note_time(timestamp.clone());
-    accumulator.set_title(codex_transcript_title(value), "transcript_title");
-    accumulator.set_first_prompt_title(codex_first_user_prompt(value));
+    codex_prompt_content(value, accumulator);
     accumulator.set_model(
         string_at(value, &["turn_context", "payload", "model"])
             .or_else(|| string_at(value, &["payload", "model"]))
             .or_else(|| string_at(value, &["model"])),
     );
-    accumulator.set_workspace_hash(
-        string_at(value, &["turn_context", "payload", "cwd"])
-            .or_else(|| string_at(value, &["payload", "cwd"]))
-            .or_else(|| string_at(value, &["cwd"])),
-    );
+    codex_workspace_content(value, accumulator);
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
     accumulator.note_codex_thread_settings(value, timestamp.as_deref());
@@ -38862,32 +41383,13 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.claude_last_user_ts = Some(user_ts);
         }
     }
-    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
-    accumulator.set_title(
-        string_at(value, &["customTitle"]).and_then(claude_custom_title_display_title),
-        "transcript_title",
-    );
-    accumulator.set_title_if_absent(
-        string_at(value, &["summary"])
-            .or_else(|| string_at(value, &["title"]))
-            .or_else(|| string_at(value, &["metadata", "title"])),
-        "summary",
-    );
-    let real_prompt = claude_first_user_prompt(value);
-    if real_prompt.is_some() {
-        accumulator.session_start.note_user_turn();
-    }
-    accumulator.set_first_prompt_title(real_prompt);
+    claude_prompt_content(value, accumulator);
     accumulator.set_model(
         string_at(value, &["message", "model"])
             .or_else(|| string_at(value, &["model"]))
             .or_else(|| string_at(value, &["payload", "model"])),
     );
-    accumulator.set_workspace_hash(
-        string_at(value, &["cwd"])
-            .or_else(|| string_at(value, &["projectPath"]))
-            .or_else(|| string_at(value, &["workspace"])),
-    );
+    claude_workspace_content(value, accumulator);
     // Defer the whole response. Sidechain content-block rows progressively
     // increase cumulative output and may add selectors late; neither the first
     // nor an arbitrary line is an authoritative complete response.
@@ -39569,7 +42071,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            accumulator.set_workspace_hash(string_at(value, &["cwd"]));
+            pi_workspace_content(value, accumulator);
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -39577,9 +42079,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            if role.as_deref() == Some("user") {
-                accumulator.set_first_prompt_title(pi_message_text(value));
-            }
+            pi_prompt_content(value, role.as_deref(), accumulator);
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
                 && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
@@ -40442,6 +42942,8 @@ struct ScanCensus {
     /// Count-only: parsed Claude compaction summaries on this page whose
     /// `parentUuid` chain never reached a boundary. Logged, never a decision.
     claude_compaction_unlinked_parent_count: usize,
+    /// Count-only: this page's paced growth reads (see `ScanTraversalCounts`).
+    growth_deferred: u64,
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
@@ -42812,6 +45314,23 @@ enum TraversalProgress {
     Resumed,
 }
 
+/// A traversal start whose stored usage pending could not be read whole
+/// defers its stale retry, as when it could not fund the carry: the start's
+/// markers return and no fingerprint is cleared. Counted by the read.
+fn claude_stale_retry_usage_unknown(
+    index: &mut ScanIndex,
+    prior_unsettled_upload: bool,
+    prior_unsettled_causes: u16,
+    prior_held_family_roots: Option<BTreeSet<String>>,
+) -> TraversalProgress {
+    index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
+    index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
+    index.claude_full_rearm_progress.held_family_roots = prior_held_family_roots;
+    eprintln!("local snapshot census deferred a stale Claude retry: stored usage pending is unknown; no fingerprints cleared");
+    state_v2::settle_usage(index, &BTreeSet::new());
+    TraversalProgress::Resumed
+}
+
 fn ensure_bounded_traversal(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -43085,10 +45604,12 @@ fn ensure_bounded_traversal(
         // witnessed, accepted families and compacts their pending to member
         // keys: it credits no evidence, keeps that census invalid so the fence
         // stays closed, and the next complete census retires it.
+        // Cold usage pending: the carry streams the families it joins.
+        // Unknown defers this retry, counted.
         let stale_pending_roots = index
             .claude_usage_family_pending
-            .iter()
-            .filter(|(_, pending)| pending.census_window_end != collected_at)
+            .views()
+            .filter(|(_, pending)| pending.window() != collected_at)
             .filter(|(root, _)| {
                 !index
                     .claude_usage_authority_quarantine
@@ -43124,10 +45645,8 @@ fn ensure_bounded_traversal(
                         .filter(|root| {
                             index
                                 .claude_usage_family_pending
-                                .get(*root)
-                                .is_some_and(|pending| {
-                                    window_ends.contains(&pending.census_window_end)
-                                })
+                                .view(root)
+                                .is_some_and(|pending| window_ends.contains(pending.window()))
                         })
                         .cloned()
                         .collect::<BTreeSet<_>>()
@@ -43184,7 +45703,7 @@ fn ensure_bounded_traversal(
                     debt_scope,
                 )
             };
-            match whole {
+            Ok(match whole {
                 Ok(carry) => carry,
                 Err(refusal) if owed_route => {
                     // No new batch admission: every stale root returns to the
@@ -43229,16 +45748,17 @@ fn ensure_bounded_traversal(
                         index.claude_full_rearm_progress.held_family_roots =
                             prior_held_family_roots;
                         eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
+                        state_v2::settle_usage(index, &BTreeSet::new());
                         return TraversalProgress::Resumed;
                     }
                 }
-            }
+            })
         } else if !window_scratch_admitted {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::WindowScratch,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else if scoped_retry_allowed || full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry_observed(
                 index,
@@ -43254,7 +45774,7 @@ fn ensure_bounded_traversal(
                 StaleCarryRejection::ProvenanceOrContext,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::ProvenanceOrContext,
@@ -43271,6 +45791,14 @@ fn ensure_bounded_traversal(
                 &mut stale_carry_rejection_counts,
                 debt_scope,
             )
+        };
+        let Ok(carry) = carry else {
+            return claude_stale_retry_usage_unknown(
+                index,
+                prior_unsettled_upload,
+                prior_unsettled_causes,
+                prior_held_family_roots,
+            );
         };
         let ClaudeStaleFamilyCarry {
             roots: mut carried_roots,
@@ -43309,8 +45837,22 @@ fn ensure_bounded_traversal(
             capped_roots.retain(|root| retained_roots.contains(root));
             replay
         };
-        for root_session_id in carried_roots.iter().chain(&capped_roots) {
-            if let Some(pending) = index.claude_usage_family_pending.get_mut(root_session_id) {
+        // Cold: the carried and capped families load before they compact.
+        let compacted = carried_roots.union(&capped_roots).cloned().collect();
+        if state_v2::load_usage(index, Some(&compacted)).is_err() {
+            return claude_stale_retry_usage_unknown(
+                index,
+                prior_unsettled_upload,
+                prior_unsettled_causes,
+                prior_held_family_roots,
+            );
+        }
+        for root_session_id in &compacted {
+            if let Some(pending) = index
+                .claude_usage_family_pending
+                .family_mut(root_session_id)
+                .expect("usage_pending_loaded_before_join")
+            {
                 pending.member_occurrences.clear();
                 pending
                     .member_request_id_hashes
@@ -43318,6 +45860,7 @@ fn ensure_bounded_traversal(
                     .for_each(BTreeSet::clear);
             }
         }
+        drop(compacted);
         let window_root_digests = full_rearm_window_roots
             .iter()
             .map(|root| claude_full_rearm_root_digest(root))
@@ -43444,6 +45987,7 @@ fn ensure_bounded_traversal(
             capped_roots,
             replay,
         };
+        state_v2::settle_usage(index, &BTreeSet::new());
     }
     if source == SnapshotSource::ClaudeCode {
         index.claude_full_rearm_progress.complete_rebuild_read = None;
@@ -43869,6 +46413,7 @@ fn refresh_retained_codex_roster(
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
     retention: DiscoveryRetention<'_>,
+    recovery: DiscoveryRecovery<'_>,
 ) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
@@ -43967,14 +46512,18 @@ fn refresh_retained_codex_roster(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if census_unix_seconds.is_some_and(|now| {
+            let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-            }) && !retention.owes_stamped(
-                source,
-                &path,
-                metadata.len(),
-                codex_fragment::Stamp::metadata(&metadata),
-            ) {
+            });
+            let owes_stamped = aged
+                && retention.owes_stamped(
+                    source,
+                    &path,
+                    metadata.len(),
+                    codex_fragment::Stamp::metadata(&metadata),
+                );
+            let requires_recovery = recovery.requires(source, &path, metadata.len());
+            if !requires_recovery && aged && !owes_stamped {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
@@ -43986,6 +46535,7 @@ fn refresh_retained_codex_roster(
                     source,
                     &scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -44225,11 +46775,55 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
     }
 }
 
+fn owed_discovery(
+    _cache: Option<&sampled_scan::SharedCache>,
+    _source: SnapshotSource,
+    _key: &str,
+) -> bool {
+    #[cfg(unix)]
+    {
+        _cache.is_some_and(|cache| cache.owes_discovery(_source, _key))
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DiscoveryRecovery<'a> {
+    files: &'a SharedMap<String, ScanIndexEntry>,
+    cache: Option<&'a sampled_scan::SharedCache>,
+}
+impl<'a> From<&'a SharedMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
+    fn from(files: &'a SharedMap<String, ScanIndexEntry>) -> Self {
+        Self { files, cache: None }
+    }
+}
+impl DiscoveryRecovery<'_> {
+    fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
+        #[cfg(unix)]
+        if self.cache.is_some_and(|cache| {
+            cache.owes_discovery(source, &local_index_key(path))
+                || cache.missing_reduction_growth(
+                    source,
+                    &local_index_key(path),
+                    self.files,
+                    length,
+                )
+        }) {
+            return true;
+        }
+        sampled_audit::path_requires_recovery(source, self.files, path, length)
+    }
+}
+
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     growth: Option<&discovery_growth::Page>,
+    cache: Option<&sampled_scan::SharedCache>,
 ) {
     advance_bounded_directory_traversal_with_budget(
         source,
@@ -44237,6 +46831,7 @@ fn advance_bounded_directory_traversal(
         backfill_window_days,
         directory_entries_per_tick(),
         growth,
+        cache,
     );
 }
 
@@ -44274,6 +46869,7 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
+    cache: Option<&sampled_scan::SharedCache>,
 ) {
     let mut traversal = index
         .traversal
@@ -44475,6 +47071,10 @@ fn advance_bounded_directory_traversal_with_budget(
                     &metadata,
                 );
             }
+            let recovery = DiscoveryRecovery {
+                files: &index.files,
+                cache,
+            };
             let retention = DiscoveryRetention {
                 growth,
                 ..discovery_retention!(index)
@@ -44490,18 +47090,26 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if census_unix_seconds.is_some_and(|now| {
+            let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-            }) && !retention.owes_stamped(
-                source,
-                &path,
-                metadata.len(),
-                codex_fragment::Stamp::metadata(&metadata),
-            ) && !sampled_audit::growth_selectable(
-                source,
-                &path,
-                growth_retention.then(|| &index.v2().growth_retention),
-            ) {
+            });
+            let owes_stamped = aged
+                && retention.owes_stamped(
+                    source,
+                    &path,
+                    metadata.len(),
+                    codex_fragment::Stamp::metadata(&metadata),
+                );
+            let requires_recovery = recovery.requires(source, &path, metadata.len());
+            if !requires_recovery
+                && aged
+                && !owes_stamped
+                && !sampled_audit::growth_selectable(
+                    source,
+                    &path,
+                    growth_retention.then(|| &index.v2().growth_retention),
+                )
+            {
                 if !relisting {
                     line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 }
@@ -44559,6 +47167,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     source,
                     &directory.scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -44657,14 +47266,20 @@ struct CandidateDiscovery<'a> {
     index: &'a mut ScanIndex,
     sources: std::borrow::Cow<'a, BTreeMap<String, Option<String>>>,
     growth: Option<&'a discovery_growth::Page>,
+    cache: Option<&'a sampled_scan::SharedCache>,
 }
 impl<'a> CandidateDiscovery<'a> {
-    fn new(index: &'a mut ScanIndex, growth: Option<&'a discovery_growth::Page>) -> Self {
+    fn new(
+        index: &'a mut ScanIndex,
+        growth: Option<&'a discovery_growth::Page>,
+        cache: Option<&'a sampled_scan::SharedCache>,
+    ) -> Self {
         let sources = index.held_move_sources();
         Self {
             index,
             sources: std::borrow::Cow::Owned(sources),
             growth,
+            cache,
         }
     }
 }
@@ -44763,6 +47378,10 @@ fn candidate_from_traversal_path_at(
             discovery.index.traversal = Some(walk);
         }
     }
+    let recovery = DiscoveryRecovery {
+        files: &discovery.index.files,
+        cache: discovery.cache,
+    };
     let retention = DiscoveryRetention {
         growth: discovery.growth,
         ..discovery_retention!(discovery.index)
@@ -44787,6 +47406,7 @@ fn candidate_from_traversal_path_at(
                 source,
                 &pending.scan_root,
                 &pending.path,
+                metadata.len(),
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &pending.path);
@@ -44798,14 +47418,19 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if census_unix_seconds
-        .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days))
-        && !retention.owes_stamped(
+    let aged = census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days));
+    let owes_stamped = aged
+        && retention.owes_stamped(
             source,
             &pending.path,
             metadata.len(),
             codex_fragment::Stamp::metadata(&metadata),
-        )
+        );
+    let requires_recovery = recovery.requires(source, &pending.path, metadata.len());
+    if !requires_recovery
+        && aged
+        && !owes_stamped
         && !sampled_audit::growth_selectable(
             source,
             &pending.path,
@@ -44850,11 +47475,13 @@ fn candidate_from_traversal_path_at(
     })
 }
 
+#[inline(never)]
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
     cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
+    durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
     reconcile_missing_index_entries_with_side(
         index,
@@ -44862,12 +47489,20 @@ fn reconcile_missing_index_entries_bounded(
         codex_side_drop,
         cache,
         source,
+        durable,
     )
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, None, SnapshotSource::ClaudeCode)
+    reconcile_missing_index_entries_with_side(
+        index,
+        limit,
+        None,
+        None,
+        SnapshotSource::ClaudeCode,
+        None,
+    )
 }
 
 fn reconcile_missing_index_entries_with_side(
@@ -44876,6 +47511,7 @@ fn reconcile_missing_index_entries_with_side(
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
     cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
+    durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
@@ -44989,6 +47625,8 @@ fn reconcile_missing_index_entries_with_side(
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
         if !observed
+            && !durable.is_some_and(|(source, cache)| owed_discovery(Some(cache), source, key))
+            && !index.codex_residue_holds_entry(key)
             && !index.decode_holds_file(key)
             && !index
                 .files
@@ -45123,7 +47761,13 @@ fn collect_recent_jsonl_files(
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
             census.oversized_file_count += 1;
-            oversized_discovery::record(source, scan_root, &path, &mut census.oversized_discovery);
+            oversized_discovery::record(
+                source,
+                scan_root,
+                &path,
+                metadata.len(),
+                &mut census.oversized_discovery,
+            );
             continue;
         }
         selection.insert(CandidateFile {
@@ -45304,6 +47948,7 @@ fn codex_parent_outside_window(
     file: &File,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
+    recovery: DiscoveryRecovery<'_>,
 ) -> bool {
     let metadata = file.metadata().ok();
     let modified = metadata
@@ -45317,20 +47962,38 @@ fn codex_parent_outside_window(
         modified,
         metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
     );
-    census_unix_seconds.is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
-        && !retention.owes_stamped(
+    let aged = census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days));
+    let owes_stamped = aged
+        && retention.owes_stamped(
             SnapshotSource::Codex,
             path,
             metadata.as_ref().map_or(0, |m| m.len()),
             metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
-        )
+        );
+    let requires_recovery = recovery.requires(
+        SnapshotSource::Codex,
+        path,
+        metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
+    );
+    !requires_recovery && aged && !owes_stamped
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Scale the existing SIZE boundary in synthetic transition fixtures only.
+    static TEST_JSONL_FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = TEST_JSONL_FILE_CAP.get() {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,
@@ -45546,6 +48209,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                 source,
                 &candidate.scan_root,
                 &candidate.path,
+                candidate.size_bytes,
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &candidate.path);
@@ -45562,18 +48226,34 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         candidate.modified_unix_seconds,
         codex_fragment::Stamp::candidate(&candidate),
     );
-    if !verification_rescue
-        && !opened_candidate_is_within_frozen_window(
-            &candidate,
-            census_unix_seconds,
-            backfill_window_days,
-        )
-        && !retention.owes_stamped(
+    let aged = !opened_candidate_is_within_frozen_window(
+        &candidate,
+        census_unix_seconds,
+        backfill_window_days,
+    );
+    // Count aged retention before cache rescue, keeping the caller's rescue boundary.
+    let owes_stamped = !verification_rescue
+        && aged
+        && retention.owes_stamped(
             source,
             &candidate.path,
             candidate.size_bytes,
             codex_fragment::Stamp::candidate(&candidate),
-        )
+        );
+    #[cfg(unix)]
+    let verification_rescue = verification_rescue
+        || cache
+            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(&candidate.path)));
+    let recovery = DiscoveryRecovery {
+        files: retention.files,
+        cache,
+    };
+    let requires_recovery =
+        !verification_rescue && recovery.requires(source, &candidate.path, candidate.size_bytes);
+    if !verification_rescue
+        && !requires_recovery
+        && aged
+        && !owes_stamped
         && !sampled_audit::growth_selectable(source, &candidate.path, growth)
     {
         // The path can be atomically replaced after directory/candidate stat
@@ -45741,6 +48421,8 @@ fn read_opened_content_samples(file: &mut File, len: u64) -> std::io::Result<Ope
     let mut head = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
     let first_len = file.read(&mut head)?;
     head.truncate(first_len);
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterIdentityHead);
     let tail = if len > FILE_CONTENT_SAMPLE_BYTES as u64 {
         file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
         let mut tail = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
@@ -46691,6 +49373,12 @@ impl ScanIndex {
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
         self.active_upload_context_fingerprint = Some(fingerprint);
+    }
+
+    /// Preserve the census's existing context adoption when only retryable
+    /// upload refusals remain; this grants no new context or acknowledgement.
+    pub(crate) fn preserve_scanned_upload_context_from(&mut self, scanned: &Self) {
+        self.upload_context_fingerprint = scanned.upload_context_fingerprint.clone();
     }
 
     /// Select before taking the committed baseline and scanning. Nonzero
@@ -47983,16 +50671,6 @@ impl ScanIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn claude_retry_admission_for_test(&self) -> Option<(Option<&str>, bool)> {
-        self.claude_stale_family_carry
-            .origin
-            .as_ref()?
-            .admission
-            .as_ref()
-            .map(|state| (state.after_root.as_deref(), state.complete))
-    }
-
-    #[cfg(test)]
     pub(crate) fn initialize_current_claude_contract_for_test(&mut self) {
         assert!(self.files.is_empty() && self.traversal.is_none());
         assert!(self.claude_request_identity_contract.is_none());
@@ -48009,18 +50687,6 @@ impl ScanIndex {
             self.claude_request_identity_contract.as_deref(),
             self.claude_request_identity_contract_changed,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn claude_duplicate_fence_closed_for_test(&self) -> bool {
-        self.claude_duplicate_request_witness_overflowed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scan_traversal_exhausted_for_test(&self) -> bool {
-        self.traversal.as_ref().is_some_and(|traversal| {
-            traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
-        })
     }
 
     #[cfg(test)]
@@ -48657,7 +51323,7 @@ impl ScanIndex {
                     refused += 1;
                     return true;
                 }
-                family_pending.remove(root_session_id);
+                family_pending.discard(root_session_id);
                 retired += 1;
                 false
             });
@@ -48755,7 +51421,7 @@ impl ScanIndex {
                 if absent
                     && tombstone_retired_claude_family(tombstones, root_session_id, retired_at)
                 {
-                    family_pending.remove(root_session_id);
+                    family_pending.discard(root_session_id);
                     retired += 1;
                     return false;
                 }
@@ -49753,7 +52419,8 @@ impl ScanIndex {
             ));
         }
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
-        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir, _lock.custody)?;
+        let (v2_index, try_import) =
+            state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
         if let Some(mut index) = v2_index {
             let file = File::open(path)?;
             let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
@@ -49764,7 +52431,6 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded(opened)));
         }
-        let v1_gauge = state_v2::telemetry::Stage::v1(path, sample_v1);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -49823,10 +52489,7 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
-                if let Some(gauge) = v1_gauge {
-                    gauge.finish();
-                }
-                if sample_v1 {
+                if try_import {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
                 Ok((index, LoadOrigin::Loaded(opened)))
@@ -50107,6 +52770,8 @@ impl ScanIndex {
         }
         self.save_internal(path, read_limit, false, Some(owner))
     }
+    /// Test-only since growth claims commit their rows directly.
+    #[cfg(test)]
     fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
         self.save_internal(path, None, true, None)
     }
@@ -51143,140 +53808,12 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        let empty_advances = self.claude_empty_map_advances(previous);
-        let held_keys = self.locally_held_keys(held);
-        let placeholders =
-            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
-        let mut result = self.clone();
-        result
-            .claude_money_birth_store
-            .preserve_missing_from(&previous.claude_money_birth_store);
-        self.note_claude_history_not_accepted(previous, &held_keys);
-        for key in &held_keys {
-            let reparse = self
-                .files
-                .get(key)
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
-                || self
-                    .file_snapshot_fingerprints
-                    .get(key)
-                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
-                    && !self.claude_account_deferred_holds.contains_key(key);
-            match previous.files.get(key) {
-                Some(committed) => {
-                    let mut committed = committed.clone();
-                    // Account retry preserves its sampled audit obligation;
-                    // authority/family-only holds keep their existing restore
-                    // semantics (E1 #870 owns that separate composition).
-                    if let Some(working) = self.files.get(key).filter(|_| {
-                        self.claude_account_deferred_holds.contains_key(key)
-                            || self
-                                .file_snapshot_fingerprints
-                                .get(key)
-                                .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
-                    }) {
-                        committed.carry_sampled_audit(working);
-                    }
-                    if reparse {
-                        committed.source_file_fingerprint.clear();
-                    } else if let Some(working) = self.files.get(key) {
-                        evidence_owed::carry_debt(&mut committed, working);
-                    }
-                    result.files.insert(key.clone(), committed);
-                }
-                None if placeholders.contains(key) => {
-                    if let Some(entry) = result.files.get_mut(key) {
-                        entry.last_snapshot_fingerprint = None;
-                        entry.last_upload_body_witness = None;
-                    }
-                    result.re_owe_effective_upload_body_witness_revision(key, 0);
-                }
-                None => {
-                    result.files.remove(key);
-                }
-            }
-            if let Some(carried) = previous.accepted_rebuild_incidence.get(key) {
-                result
-                    .accepted_rebuild_incidence
-                    .insert(key.clone(), carried.clone());
-                result.preserve_carried_ack_clock(previous);
-            }
-            match previous.file_snapshot_fingerprints.get(key) {
-                Some(fingerprints) => {
-                    result
-                        .file_snapshot_fingerprints
-                        .insert(key.clone(), fingerprints.clone());
-                }
-                None => {
-                    result.file_snapshot_fingerprints.remove(key);
-                }
-            }
-            if previous.confirmed_empty_files.contains(key) {
-                result.confirmed_empty_files.insert(key.clone());
-            } else {
-                result.confirmed_empty_files.remove(key);
-            }
-            result.revert_codex_blocked_attribution(previous, key);
-            match previous.terminal_jsonl_dispositions.get(key) {
-                Some(disposition) => {
-                    result
-                        .terminal_jsonl_dispositions
-                        .insert(key.clone(), disposition.clone());
-                }
-                None => {
-                    result.terminal_jsonl_dispositions.remove(key);
-                }
-            }
-            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
-                match previous.claude_owned_start_census.get(&member) {
-                    Some(witness) => {
-                        result
-                            .claude_owned_start_census
-                            .insert(member, witness.clone());
-                    }
-                    None => {
-                        result.claude_owned_start_census.remove(&member);
-                    }
-                }
-            }
-        }
-        let mut restored = BTreeSet::new();
-        for key in &held_keys {
-            match result.file_snapshot_fingerprints.get(key) {
-                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
-                None => restored.extend(
-                    result
-                        .files
-                        .get(key)
-                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
-                ),
-            }
-        }
-        for fingerprint in &restored {
-            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
-                result
-                    .snapshot_activity_at
-                    .insert_if_absent(fingerprint.clone(), || activity_at.clone());
-            }
-            if previous
-                .accepted_snapshot_fingerprints
-                .contains(fingerprint)
-            {
-                result
-                    .accepted_snapshot_fingerprints
-                    .insert(fingerprint.clone());
-            }
-        }
-        result.restore_claude_empty_map_advances(empty_advances);
-        let current = result.current_snapshot_fingerprints();
-        result
-            .snapshot_activity_at
-            .retain(|fingerprint, _| current.contains(fingerprint));
-        result
+        self.clone()
+            .into_locally_held_keys_reverted(previous, held, reparse_held)
     }
 
     /// The caller already owns the scanned graph. Restore only held keys in
-    /// that allocation; the unchanged borrowed implementation remains a test-only oracle.
+    /// that allocation.
     pub(crate) fn into_locally_held_keys_reverted(
         mut self,
         previous: &ScanIndex,
@@ -51454,6 +53991,7 @@ impl ScanIndex {
         self.committable_subset_with_local_holds(previous, accepted, quarantined, &BTreeSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn committable_subset_with_local_holds(
         &self,
         previous: &ScanIndex,
@@ -51461,21 +53999,23 @@ impl ScanIndex {
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        self.committable_subset_with_refusals(previous, accepted, quarantined, locally_held, None)
+        self.committable_subset_for_upload(previous, accepted, quarantined, locally_held, false)
     }
 
-    /// With `isolated_refusals`, the upload sent every batch and refused only
-    /// those items: every other entity not locally held settled exactly as
-    /// on a clean page, including unchanged ones this pass did not resend.
-    /// Refused and held entities keep their committed revision and stay owed.
-    /// Without it, only this pass's ACKs and quarantines settle.
-    pub(crate) fn committable_subset_with_refusals(
+    /// What a save after an upload may commit. Exact ACKs and quarantines
+    /// settle; locally held and decode-held entities never do and keep their
+    /// committed revision. With `every_batch_sent` (Completed, Deferred and
+    /// Rejected: refusals already have quarantine custody) every other entity
+    /// settles exactly as on a clean page, including unchanged ones this pass
+    /// did not resend. Without it (a shed, interrupted or failed upload) only
+    /// this pass's ACKs and quarantines settle.
+    pub(crate) fn committable_subset_for_upload(
         &self,
         previous: &ScanIndex,
         accepted: &BTreeSet<String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
         locally_held: &BTreeSet<String>,
-        isolated_refusals: Option<&BTreeSet<String>>,
+        every_batch_sent: bool,
     ) -> ScanIndex {
         if !self.persistence_available() || !previous.persistence_available() {
             let mut held = self.clone();
@@ -51483,14 +54023,22 @@ impl ScanIndex {
             return held;
         }
 
+        let accepted = accepted
+            .iter()
+            .filter(|fingerprint| !locally_held.contains(*fingerprint))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let quarantined = quarantined
+            .iter()
+            .filter(|(fingerprint, _)| !locally_held.contains(*fingerprint))
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
                 && (accepted.contains(fingerprint)
                     || quarantined.contains_key(fingerprint)
-                    || isolated_refusals.is_some_and(|refused| {
-                        !refused.contains(fingerprint) && !locally_held.contains(fingerprint)
-                    }))
+                    || (every_batch_sent && !locally_held.contains(fingerprint)))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.decode_holds_file(key) {
@@ -51914,21 +54462,28 @@ impl ScanIndex {
             }
         }
         for (key, working) in &self.files {
+            // `get_mut` deep-copies an entry still shared with `self` or
+            // `previous`, so take it only for an entry a carry changes.
+            if !result.files.get(key).is_some_and(|retained| {
+                evidence_owed::carry_debt_changes(retained, working)
+                    || retained.carry_sampled_audit_changes(working)
+            }) {
+                continue;
+            }
+            let Some(retained) = result.files.get_mut(key) else {
+                continue;
+            };
             // A cleared source witness is outstanding reparse work, not a new
             // accepted body. Reverting an unsettled entry must keep that debt;
             // otherwise a partial save can undo a census/fence correction.
             if working.rearmed() {
-                if let Some(retained) = result.files.get_mut(key) {
-                    evidence_owed::carry_debt(retained, working);
-                }
+                evidence_owed::carry_debt(retained, working);
             }
-            if let Some(retained) = result.files.get_mut(key) {
-                retained.carry_sampled_audit(working);
-            }
+            retained.carry_sampled_audit(working);
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
-        result.reconcile_codex_recovery_settlement(previous, accepted);
+        result.reconcile_codex_recovery_settlement(previous, &accepted);
         result
     }
 
@@ -52170,6 +54725,18 @@ impl ScanIndex {
                 cache.and_then(|cache| cache.resident_usage(source, key)),
             );
         }
+    }
+
+    /// Ownership uncertainty survives absence until the traversal resolves it.
+    /// Filename candidates veto retirement only; they grant no ownership.
+    fn codex_residue_holds_entry(&self, key: &str) -> bool {
+        let Some(traversal) = self.traversal.as_ref() else {
+            return false;
+        };
+        let owners = &traversal.residue.blocked_session_ids;
+        codex_session_id_candidates_from_path(Path::new(key))
+            .iter()
+            .any(|owner| owners.contains(owner))
     }
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
@@ -52604,10 +55171,9 @@ impl ScanIndex {
         // re-parse, usually the binding read, instead of a Full every pass.
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if claude_request_money::e2::resumed_prefix_enabled()
-            && self
-                .claude_copy_removals
-                .pending(claude_money_birth_store::location_key(&key))
+        if self
+            .claude_copy_removals
+            .pending(claude_money_birth_store::location_key(&key))
         {
             return (
                 CandidateDecision::Parse,
@@ -53022,10 +55588,8 @@ impl ScanIndex {
         );
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
-                if claude_request_money::e2::resumed_prefix_enabled() {
-                    self.claude_copy_removals
-                        .clear_hold(claude_money_birth_store::location_key(&key));
-                }
+                self.claude_copy_removals
+                    .clear_hold(claude_money_birth_store::location_key(&key));
                 self.note_empty_file_upload_context(&key);
                 self.confirmed_empty_files.insert(key);
             }
@@ -54406,8 +56970,6 @@ mod tests {
 
     #[test]
     fn e2_deferred_retry_root_keeps_service_debt_and_committed_fingerprints() {
-        let _resumed_prefix =
-            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
         {
             let root = "11111111-1111-4111-8111-111111111111";
             let project = PathBuf::from("/synthetic/projects/p");
@@ -55837,141 +58399,6 @@ mod tests {
         ));
     }
 
-    fn legacy_shaped_index(mut index: ScanIndex) -> ScanIndex {
-        let mut value = serde_json::to_value(&index).expect("serialize current index");
-        let object = value.as_object_mut().expect("scan index object");
-        object.remove("accepted_snapshot_fingerprints");
-        object.remove("accepted_snapshot_fingerprint_ledger_version");
-        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
-        assert!(index.accepted_snapshot_fingerprints.is_empty());
-        assert!(index.legacy_settlement_ledger_needs_migration());
-        index
-    }
-
-    /// The 0.1.122 ledger records no witness of which migration path wrote it,
-    /// so a machine that sealed its revisions without proof and one that swept
-    /// them are indistinguishable on disk. Every ledger left at the unproven
-    /// version is therefore re-opened exactly once and re-proved.
-    #[test]
-    fn ledger_migrated_without_settlement_proof_reopens_once_then_stays_terminal() {
-        let root = temp_dir("scan-index-unproven-ledger-reopen");
-        let path = root.join("codex-scan-index-v3.json");
-        let sealed = "a".repeat(64);
-        let stranded = "b".repeat(64);
-        let mut index = ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([sealed.clone(), stranded.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([sealed.clone(), stranded.clone()])
-                .into(),
-            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-            ..ScanIndex::default()
-        };
-        index
-            .save(&path)
-            .expect("persist the unproven 0.1.122 ledger");
-
-        let mut reopened = ScanIndex::load(&path).expect("the unproven ledger shape still loads");
-        assert!(
-            reopened.legacy_settlement_ledger_needs_migration(),
-            "an unproven ledger is not treated as migrated"
-        );
-        let (armed, changed) =
-            reopened.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([sealed.clone(), stranded.clone()]),
-            "the whole unproven accepted set is re-offered, not trusted"
-        );
-        assert!(reopened.accepted_snapshot_fingerprints.is_empty());
-
-        // The re-open is idempotent: a second cycle resumes the sweep from the
-        // persisted cursor instead of discarding what the server has since
-        // acknowledged.
-        reopened.save(&path).expect("persist the re-opened ledger");
-        let mut resumed = ScanIndex::load(&path).expect("reload the re-opened ledger");
-        let (again, _) =
-            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(
-            again.is_empty(),
-            "both revisions are already armed, so no page is re-armed"
-        );
-        assert_eq!(
-            resumed.legacy_settlement_reconciliation_pending_fingerprints(),
-            BTreeSet::from([sealed.clone(), stranded.clone()])
-        );
-
-        // The server settles both, which is the only evidence that closes the
-        // migration.
-        resumed.retain_quarantined_fingerprints(&BTreeMap::new());
-        resumed.record_accepted_snapshot_fingerprints(&BTreeSet::from([sealed, stranded]));
-        resumed.finish_legacy_settlement_reconciliation();
-        assert!(!resumed.legacy_settlement_ledger_needs_migration());
-        assert!(resumed
-            .legacy_settlement_reconcile_after_fingerprint
-            .is_none());
-        let (terminal, changed) =
-            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(terminal.is_empty());
-        assert!(!changed, "a settled ledger never re-opens again");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_0_1_121_unfinished_strand_rearms_in_persisted_bounded_pages() {
-        let root = temp_dir("scan-index-rearm-stranded-revision");
-        let path = root.join("codex-scan-index-v3.json");
-        let accepted = "a".repeat(64);
-        let stranded = "b".repeat(64);
-        let mut index = legacy_shaped_index(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), stranded.clone()]),
-            )]),
-            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
-            ..ScanIndex::default()
-        });
-
-        let (first_page, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
-        assert!(changed);
-        assert_eq!(first_page, BTreeSet::from([accepted.clone()]));
-        assert!(
-            index.traversal.is_none(),
-            "the empty traversal is restarted"
-        );
-        let first = index
-            .quarantined_snapshot_fingerprints
-            .get(&accepted)
-            .expect("the first bounded identity is armed");
-        assert_eq!(
-            first.witness.contract,
-            SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION
-        );
-        assert_eq!(first.retry_after_unix_seconds, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint,
-            Some(accepted.clone())
-        );
-        index.save(&path).expect("persist repaired retry state");
-
-        let mut restarted = ScanIndex::load(&path).expect("reload repaired index");
-        let (second_page, changed) =
-            restarted.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
-        assert!(changed);
-        assert_eq!(second_page, BTreeSet::from([stranded.clone()]));
-        assert!(restarted
-            .quarantined_snapshot_fingerprints
-            .contains_key(&stranded));
-        assert_eq!(
-            restarted.legacy_settlement_reconciliation_pending_fingerprints(),
-            BTreeSet::from([accepted, stranded])
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn snapshot_admission_boundaries_match_backend_640_kib() {
         assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
@@ -56414,7 +58841,7 @@ mod tests {
             &mut census,
             census_at,
             BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
         )
         .expect("recent path is discovered");
 
@@ -57045,94 +59472,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scan_index_reparses_once_to_establish_semantic_activity_witness() {
-        let root = temp_dir("scan-index-migration");
-        let path = root.join("rollout-019e253c-6666-7000-9000-ffffffffffff.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-ffffffffffff\"}}\n",
-                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let metadata = fs::metadata(&path).expect("metadata");
-        let modified_unix_seconds = metadata
-            .modified()
-            .ok()
-            .and_then(unix_seconds)
-            .expect("mtime seconds");
-        let legacy_metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&root));
-        let legacy_source_file_fingerprint = source_file_fingerprint_with_context(
-            &path,
-            metadata.len(),
-            modified_unix_seconds,
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            &legacy_metadata.legacy_sidecar_fingerprint,
-        );
-        let mut index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&path),
-                ScanIndexEntry {
-                    codex_fragment: None,
-                    size_bytes: metadata.len(),
-                    modified_unix_seconds,
-                    modified_unix_nanos: None,
-                    source_file_fingerprint: legacy_source_file_fingerprint,
-                    last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
-                    scan_identity_version: None,
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
-                    evidence_owed: false,
-                },
-            )]),
-            ..ScanIndex::default()
-        };
-
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan");
-        assert_eq!(scan.scanned_file_count, 1);
-        assert_eq!(scan.snapshots.len(), 1);
-        let migrated = index.files.get(&local_index_key(&path)).expect("entry");
-        assert_eq!(
-            migrated.scan_identity_version.as_deref(),
-            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-        );
-        assert_ne!(
-            migrated.last_snapshot_fingerprint.as_deref(),
-            Some("legacy-snapshot-fingerprint")
-        );
-        assert!(migrated.modified_unix_nanos.is_some());
-        assert!(index
-            .file_snapshot_fingerprints
-            .get(&local_index_key(&path))
-            .expect("exact entity set")
-            .iter()
-            .all(|fingerprint| index.snapshot_activity_at.contains_key(fingerprint)));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn parsed_semantic_noop_is_not_returned_for_upload() {
         let root = temp_dir("semantic-noop");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
@@ -57260,6 +59599,7 @@ mod tests {
             &mut index,
             BACKFILL_WINDOW_DAYS,
             3,
+            None,
             None,
         );
         let traversal = index.traversal.as_mut().expect("traversal");
@@ -58277,48 +60617,6 @@ mod tests {
         "019fb22b-0000-7000-8000-000000000013",
     ];
 
-    /// One cycle of the source loop in the order `sync_source_snapshots`
-    /// evaluates it: the historical-backfill gate is read from durable
-    /// backfill state before the scan, the legacy settlement sweep is armed
-    /// only while no replay is pending, the scan runs, a complete census marks
-    /// the backfill done for this destination, and the sweep is finished after
-    /// settlement. The server leg is deliberately absent - nothing is ACKed -
-    /// so an armed page stays armed and the accepted set never grows here.
-    fn gated_codex_cycle(
-        index: &mut ScanIndex,
-        roots: &[PathBuf],
-        backfill: &mut crate::backfill::BackfillState,
-        destination: &str,
-        collected_at: &str,
-    ) -> (SourceScanResult, Option<BTreeSet<String>>) {
-        let backfill_pending =
-            crate::backfill::pending_backfill_sources_for_destination(backfill, destination)
-                .contains(&SnapshotSource::Codex);
-        let armed =
-            (!backfill_pending && index.legacy_settlement_ledger_needs_migration()).then(|| {
-                index
-                    .prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50)
-                    .0
-            });
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            roots,
-            index,
-            collected_at,
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan the residue fixture");
-        if backfill_pending && scan.census_complete {
-            crate::backfill::mark_backfill_complete_for_destination(
-                backfill,
-                SnapshotSource::Codex,
-                destination,
-            );
-        }
-        index.finish_legacy_settlement_reconciliation();
-        (scan, armed)
-    }
-
     fn cycle_clock(cycle: u64) -> String {
         format!("2026-09-03T00:{:02}:00Z", 5 * cycle)
     }
@@ -58402,248 +60700,6 @@ mod tests {
         let clean = ScanTraversalCounts::default();
         assert!(!clean.has_errors());
         assert!(clean.settled_residue().is_none());
-    }
-
-    /// The shape found on an upgraded machine: a ledger sealed at the unproven
-    /// version with every current revision recorded as accepted and no cursor,
-    /// behind a Codex census that a single unresolvable archived rollout keeps
-    /// incomplete with nothing pending. The census must complete with the
-    /// residue named, the destination backfill must clear on that census, and
-    /// the next cycle must re-open the ledger exactly once.
-    #[test]
-    fn unproven_ledger_behind_non_progressing_codex_residue_completes_and_reopens_once() {
-        let fixture = CodexResidueFixture::create("codex-residue-unproven-ledger");
-        fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
-        let residue_path =
-            fixture.write_rollout(&fixture.archived, RESIDUE_SESSION, "2026-07-30T11-35-45");
-        for (position, session_id) in HEALTHY_SESSIONS.iter().take(2).enumerate() {
-            fixture.insert_thread(session_id, 40, "user");
-            fixture.write_rollout(
-                &fixture.sessions,
-                session_id,
-                &format!("2026-08-2{position}T09-00-00"),
-            );
-        }
-        let roots = fixture.roots();
-        let destination = "destination-namespace-under-test";
-        let mut index = ScanIndex::default();
-        let mut backfill = crate::backfill::BackfillState::default();
-
-        // Cycle 0 establishes the checkpointed history. Then model the
-        // upgrade: the previous daemon sealed every current revision into a
-        // v1 ledger, and this destination's backfill is pending again.
-        let (seed, _) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(0),
-        );
-        assert_eq!(seed.snapshots.len(), 2, "{seed:#?}");
-        assert_eq!(seed.ownership_incomplete_file_count, 1);
-        assert_eq!(seed.zero_snapshot_usage_evidence_count, 1);
-        assert_eq!(seed.dropped_usage_record_count, 1);
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(RESIDUE_SESSION));
-        let current = index.current_snapshot_fingerprints();
-        assert_eq!(current.len(), 2);
-        index.accepted_snapshot_fingerprints = current.clone().into();
-        index.accepted_snapshot_fingerprint_ledger_version =
-            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION;
-        index.legacy_settlement_reconcile_after_fingerprint = None;
-        let mut backfill = crate::backfill::BackfillState::default();
-        assert!(
-            crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
-                .contains(&SnapshotSource::Codex)
-        );
-
-        // Cycle 1: the gate is still closed when it is read, but the census
-        // completes with the residue named, which clears the backfill.
-        let (first, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(1),
-        );
-        assert!(
-            armed.is_none(),
-            "the gate was closed when this cycle read it"
-        );
-        assert!(first.census_complete, "{first:#?}");
-        assert!(!first.scan_cap_hit);
-        assert_eq!(first.ownership_incomplete_file_count, 1);
-        assert_eq!(first.dropped_usage_record_count, 1);
-        assert!(
-            index.traversal.is_none(),
-            "a complete census drops the traversal"
-        );
-        let witness = index
-            .scan_residue_witness
-            .clone()
-            .expect("a census that completed with residue records it");
-        assert_eq!(witness.ownership_incomplete_file_count, 1);
-        assert_eq!(witness.zero_snapshot_usage_evidence_count, 1);
-        assert_eq!(witness.dropped_usage_record_count, 1);
-        assert_eq!(
-            witness.index_keys,
-            BTreeSet::from([local_index_key(&residue_path)])
-        );
-        assert_eq!(witness.archived_residue_file_count(), 1);
-        assert_eq!(
-            witness.codex_state_only_blocked_session_ids,
-            BTreeSet::from([RESIDUE_SESSION.to_string()])
-        );
-        assert!(
-            !crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
-                .contains(&SnapshotSource::Codex),
-            "a complete census marks the destination backfill done"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-            "the ledger is untouched until the gate opens"
-        );
-
-        // Cycle 2: the gate is open and the unproven ledger re-opens.
-        let (second, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(2),
-        );
-        assert!(second.census_complete);
-        assert_eq!(
-            armed.as_ref(),
-            Some(&current),
-            "every previously sealed revision is re-offered"
-        );
-        assert!(index.accepted_snapshot_fingerprints.is_empty());
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
-            current.iter().next_back()
-        );
-        let persisted = serde_json::to_value(&index).expect("serialize index");
-        assert!(
-            persisted
-                .get("accepted_snapshot_fingerprint_ledger_version")
-                .is_none(),
-            "the re-opened ledger drops its version key"
-        );
-        assert!(persisted
-            .get("legacy_settlement_reconcile_after_fingerprint")
-            .is_some());
-
-        // Cycle 3: nothing is re-opened again; the armed page waits for the
-        // server, which this model never provides.
-        let (third, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(3),
-        );
-        assert!(third.census_complete);
-        assert_eq!(armed, Some(BTreeSet::new()));
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(index.quarantined_snapshot_fingerprints.len(), 2);
-        assert_eq!(
-            index.legacy_settlement_reconciliation_pending_fingerprints(),
-            current
-        );
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(RESIDUE_SESSION));
-        let _ = fs::remove_dir_all(fixture.home);
-    }
-
-    /// The other shape: a pre-ledger index mid-sweep with a persisted cursor,
-    /// frozen behind the same residue. Once the census completes the sweep
-    /// arms its next page; nothing is re-opened and the re-earned acceptances
-    /// are kept.
-    #[test]
-    fn pre_ledger_sweep_behind_non_progressing_codex_residue_resumes() {
-        let fixture = CodexResidueFixture::create("codex-residue-pre-ledger-sweep");
-        fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
-        fixture.write_rollout(
-            &fixture.sessions,
-            ACTIVE_RESIDUE_SESSION,
-            "2026-07-30T11-35-45",
-        );
-        for (position, session_id) in HEALTHY_SESSIONS.iter().enumerate() {
-            fixture.insert_thread(session_id, 40, "user");
-            fixture.write_rollout(
-                &fixture.sessions,
-                session_id,
-                &format!("2026-08-2{position}T09-00-00"),
-            );
-        }
-        let roots = fixture.roots();
-        let destination = "destination-namespace-under-test";
-        let mut index = ScanIndex::default();
-        let mut backfill = crate::backfill::BackfillState::default();
-        let (seed, _) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(0),
-        );
-        assert_eq!(seed.snapshots.len(), 3, "{seed:#?}");
-        let current = index
-            .current_snapshot_fingerprints()
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(current.len(), 3);
-        let settled = current.iter().take(2).cloned().collect::<BTreeSet<_>>();
-        index.accepted_snapshot_fingerprints = settled.clone().into();
-        index.accepted_snapshot_fingerprint_ledger_version = 0;
-        index.legacy_settlement_reconcile_after_fingerprint = Some(current[1].clone());
-        let mut backfill = crate::backfill::BackfillState::default();
-
-        let (first, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(1),
-        );
-        assert!(armed.is_none());
-        assert!(first.census_complete, "{first:#?}");
-        assert_eq!(first.ownership_incomplete_file_count, 1);
-        let witness = index.scan_residue_witness.clone().expect("residue witness");
-        assert_eq!(witness.archived_residue_file_count(), 0);
-        assert_eq!(
-            witness.codex_state_only_blocked_session_ids,
-            BTreeSet::from([ACTIVE_RESIDUE_SESSION.to_string()])
-        );
-
-        let (second, armed) = gated_codex_cycle(
-            &mut index,
-            &roots,
-            &mut backfill,
-            destination,
-            &cycle_clock(2),
-        );
-        assert!(second.census_complete);
-        assert_eq!(
-            armed,
-            Some(BTreeSet::from([current[2].clone()])),
-            "the sweep resumes from its cursor with the one unsettled revision"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprints, settled,
-            "a pre-ledger sweep keeps what the server already acknowledged"
-        );
-        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
-        assert_eq!(
-            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
-            Some(&current[2])
-        );
-        let _ = fs::remove_dir_all(fixture.home);
     }
 
     /// Residue is settled only once discovery has finished: a page that still
@@ -59267,197 +61323,6 @@ mod tests {
         .expect("restored root converges through a fresh complete census");
         assert!(restored.census_complete);
         assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[test]
-    fn old_index_without_root_witness_infers_missing_previously_observed_root() {
-        let parent = temp_dir("old-index-missing-root");
-        let root = parent.join("sessions");
-        let index_path = parent.join("scan-index.json");
-        let prior_path = root.join("session.jsonl");
-        let mut old_index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        old_index
-            .save(&index_path)
-            .expect("write pre-witness index");
-        let serialized: Value =
-            serde_json::from_slice(&fs::read(&index_path).expect("read pre-witness index"))
-                .expect("parse pre-witness index");
-        assert!(serialized.get("known_configured_scan_roots").is_none());
-        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness index");
-
-        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
-        let (scan, disappearance_events) = disappearance_diagnostics::observe(|| {
-            scan_source_roots(
-                SnapshotSource::Pi,
-                std::slice::from_ref(&root),
-                &mut upgraded,
-                "2026-07-31T00:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-            )
-            .expect("upgrade inference remains source-local")
-        });
-        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
-        assert_eq!(
-            serde_json::to_vec(&upgraded.files).unwrap(),
-            authoritative_files,
-            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
-        );
-
-        assert!(!scan.census_complete);
-        assert_eq!(scan.disappeared_file_count, 1);
-        assert!(upgraded.files.contains_key(&local_index_key(&prior_path)));
-        assert!(upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&root)));
-        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_vanished_symlink_witness_does_not_promote_optional_roots() {
-        use std::os::unix::fs::symlink;
-
-        let parent = temp_dir("legacy-vanished-symlink-root");
-        let target = parent.join("relocated-sessions");
-        let configured_link = parent.join("configured-sessions");
-        let optional_root = parent.join("optional-sessions");
-        fs::create_dir_all(&target).expect("create prior canonical target");
-        let prior_path = fs::canonicalize(&target)
-            .expect("canonicalize prior target")
-            .join("session.jsonl");
-        fs::remove_dir_all(&target).expect("remove prior canonical target");
-        let index_path = parent.join("scan-index.json");
-        let mut old_index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        let roots = vec![optional_root.clone(), configured_link.clone()];
-        old_index.traversal = Some(terminal_unhealthy_traversal(
-            scan_traversal_context_fingerprint(
-                SnapshotSource::Pi,
-                &roots,
-                &old_index,
-                BACKFILL_WINDOW_DAYS,
-            ),
-        ));
-        old_index
-            .save(&index_path)
-            .expect("write pre-witness symlink index");
-        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness symlink index");
-
-        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
-        let (missing, disappearance_events) = disappearance_diagnostics::observe(|| {
-            scan_source_roots(
-                SnapshotSource::Pi,
-                &roots,
-                &mut upgraded,
-                "2026-07-31T00:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-            )
-            .expect("unresolved legacy symlink remains source-local")
-        });
-        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
-        assert_eq!(
-            serde_json::to_vec(&upgraded.files).unwrap(),
-            authoritative_files,
-            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
-        );
-
-        assert!(!missing.census_complete);
-        assert_eq!(missing.disappeared_file_count, 1);
-        assert_eq!(
-            upgraded.legacy_unresolved_root_file_witnesses,
-            BTreeSet::from([local_index_key(&prior_path)])
-        );
-        assert!(!upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&optional_root)));
-
-        fs::create_dir_all(&target).expect("restore canonical target");
-        symlink(&target, &configured_link).expect("restore configured symlink");
-        let restored = scan_source_roots(
-            SnapshotSource::Pi,
-            &roots,
-            &mut upgraded,
-            "2026-07-31T00:10:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("restored symlink covers its durable legacy witness");
-
-        assert_eq!(
-            restored.disappeared_file_count,
-            0,
-            "legacy_witnesses={} optional_known={} link_known={}",
-            upgraded.legacy_unresolved_root_file_witnesses.len(),
-            upgraded
-                .known_configured_scan_roots
-                .contains(&local_index_key(&optional_root)),
-            upgraded
-                .known_configured_scan_roots
-                .contains(&local_index_key(&configured_link)),
-        );
-        assert!(restored.census_complete, "restored scan: {restored:#?}");
-        assert!(upgraded.files.is_empty());
-        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
-        assert!(upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&configured_link)));
-        assert!(!upgraded
-            .known_configured_scan_roots
-            .contains(&local_index_key(&optional_root)));
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[test]
-    fn legacy_root_context_change_does_not_claim_unrelated_optional_root() {
-        let parent = temp_dir("legacy-root-context-change");
-        let old_root = parent.join("old-sessions");
-        let new_optional_root = parent.join("new-optional-sessions");
-        let prior_path = old_root.join("session.jsonl");
-        let mut index = ScanIndex {
-            files: SharedMap::from([(
-                local_index_key(&prior_path),
-                manifest_index_entry(Some("prior-entity")),
-            )]),
-            ..ScanIndex::default()
-        };
-        let old_roots = vec![old_root];
-        index.traversal = Some(terminal_unhealthy_traversal(
-            scan_traversal_context_fingerprint(
-                SnapshotSource::Pi,
-                &old_roots,
-                &index,
-                BACKFILL_WINDOW_DAYS,
-            ),
-        ));
-
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&new_optional_root),
-            &mut index,
-            "2026-07-31T00:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("changed root context starts a fresh authoritative scope");
-
-        assert!(scan.census_complete);
-        assert_eq!(scan.disappeared_file_count, 0);
-        assert!(index.files.is_empty());
-        assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
-        assert!(!index
-            .known_configured_scan_roots
-            .contains(&local_index_key(&new_optional_root)));
         let _ = fs::remove_dir_all(parent);
     }
 
@@ -79420,100 +81285,6 @@ mod tests {
         index
     }
 
-    /// L-SB upgrade (C-1, SB-T4): an index from before attribution moves its
-    /// whole blocked set to `legacy` once; attribution never releases a
-    /// legacy id, and only an acceptance, a holder-less join release or a
-    /// fresh index does.
-    #[test]
-    fn l_sb_upgrade_moves_the_blocked_set_to_legacy_once_and_attribution_never_releases_it() {
-        let mut index = ScanIndex::default();
-        index
-            .codex_state_only_blocked_session_ids
-            .extend(sb_ids(&["old-x", "old-y", "old-z"]));
-        index.migrate_codex_blocked_attribution();
-        assert!(index.codex_state_only_blocked_attributed);
-        assert_eq!(
-            index.codex_state_only_blocked_legacy,
-            sb_ids(&["old-x", "old-y", "old-z"])
-        );
-        // Idempotent: a later page start adds nothing.
-        sb_disclose(&mut index, "k1", &["new"]);
-        index.migrate_codex_blocked_attribution();
-        assert!(!index.codex_state_only_blocked_legacy.contains("new"));
-        // A key that blocked a legacy id re-parses, shrinks, is deleted (no
-        // retirement): the legacy id stays blocked.
-        sb_disclose(&mut index, "k1", &["old-x"]);
-        sb_disclose(&mut index, "k1", &[]);
-        assert!(sb_blocked(&index, "old-x") && !sb_blocked(&index, "new"));
-        // Released only by an acceptance or a holder-less join release.
-        index.accept_codex_block(["k9".to_owned()], "old-y");
-        assert!(!sb_blocked(&index, "old-y"));
-        index.codex_state_only_blocked_unattributed.remove("old-z");
-        index.codex_state_only_blocked_legacy.remove("old-z");
-        index.release_codex_block("old-z");
-        assert!(!sb_blocked(&index, "old-z"));
-        assert!(sb_blocked(&index, "old-x"));
-        assert_attribution_blocked(&index);
-    }
-
-    /// C-1 downgrade and re-upgrade: the four fields are additive and
-    /// skipped when empty, so an old binary loads the index, drops them on
-    /// its next save and keeps the blocked set. Re-upgrading moves the whole
-    /// set to `legacy` again (one jump), and nothing is released.
-    #[test]
-    fn l_sb_downgrade_and_reupgrade_preserve_every_block() {
-        let fresh = serde_json::to_value(ScanIndex::default()).unwrap();
-        for field in [
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
-        ] {
-            assert!(fresh.get(field).is_none(), "{field} serialized when empty");
-        }
-        let mut index = ScanIndex::default();
-        index
-            .codex_state_only_blocked_session_ids
-            .insert("legacy-id".to_owned());
-        index.migrate_codex_blocked_attribution();
-        sb_disclose(&mut index, "held-key", &["held-id", "shared-id"]);
-        sb_disclose(&mut index, "other-key", &["shared-id"]);
-        index
-            .codex_state_only_blocked_session_ids
-            .insert("queued-owner".to_owned());
-        index
-            .codex_state_only_blocked_unattributed
-            .insert("queued-owner".to_owned());
-        let blocked = index.codex_state_only_blocked_session_ids.clone();
-        // Round trip through this binary keeps everything.
-        let saved = serde_json::to_value(&index).unwrap();
-        let reloaded: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
-        assert_eq!(
-            reloaded.codex_state_only_blocked_by_file,
-            index.codex_state_only_blocked_by_file
-        );
-        assert!(reloaded.codex_state_only_blocked_attributed);
-        // The old binary: unknown fields are ignored and gone on its save.
-        let mut old = saved;
-        for field in [
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
-        ] {
-            assert!(old.as_object_mut().unwrap().remove(field).is_some());
-        }
-        let mut reupgraded: ScanIndex = serde_json::from_value(old).unwrap();
-        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
-        assert!(!reupgraded.codex_state_only_blocked_attributed);
-        reupgraded.migrate_codex_blocked_attribution();
-        assert_eq!(reupgraded.codex_state_only_blocked_legacy, blocked);
-        // Nothing is released by attribution after the jump.
-        sb_disclose(&mut reupgraded, "held-key", &[]);
-        sb_disclose(&mut reupgraded, "other-key", &[]);
-        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
-    }
-
     /// SB-T5b (zero-usage cure), both legs, each with a variant where another
     /// stored key still names the id. (a) A held fork with ambiguous
     /// candidates {X, Y} re-parses complete resolved to X: Y is released and
@@ -82006,7 +83777,7 @@ mod tests {
         for index in 0..40 {
             let mut item = batch.snapshots[0].clone();
             item.source_session_id = format!("large-session-{index}");
-            item.session_display_name = Some("y".repeat(110 * 1024));
+            item.session_display_name = Some("y".repeat(300 * 1024));
             item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
             items.push(item);
         }
@@ -82587,23 +84358,23 @@ mod tests {
     fn refused_item_keeps_only_its_own_file_owed() {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let no_holds = BTreeSet::new();
-        let ack_only = scanned.committable_subset_with_refusals(
+        let ack_only = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
             &no_holds,
-            None,
+            false,
         );
         assert!(ack_only.files["reread.jsonl"]
             .source_file_fingerprint
             .is_empty());
 
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &no_holds,
-            Some(&refused),
+            &refused,
+            true,
         );
         assert_eq!(
             scoped.files["reread.jsonl"].source_file_fingerprint,
@@ -82625,12 +84396,12 @@ mod tests {
         let (committed, scanned, accepted, refused) = refused_item_page();
         let mut clean = scanned.clone();
         clean.record_accepted_snapshot_fingerprints(&accepted);
-        let scoped = scanned.committable_subset_with_refusals(
+        let scoped = scanned.committable_subset_for_upload(
             &committed,
             &accepted,
             &BTreeMap::new(),
-            &BTreeSet::new(),
-            Some(&refused),
+            &refused,
+            true,
         );
         let entry = |index: &ScanIndex, key: &str| {
             (
@@ -82708,6 +84479,101 @@ mod tests {
             ordinary.files[&key].source_file_fingerprint,
             previous.files[&key].source_file_fingerprint
         );
+    }
+
+    /// A held-page subset copies no file entry that no carry changes: safe
+    /// and restored entries keep the source's shared handle.
+    #[test]
+    fn held_page_subset_shares_every_entry_no_carry_changes() {
+        let mut previous = ScanIndex::default();
+        for n in 0..3 {
+            let key = format!("/opaque/{n}.jsonl");
+            let entity = format!("entity-{n}");
+            previous
+                .files
+                .insert(key.clone(), manifest_index_entry(Some(entity.as_str())));
+            previous
+                .file_snapshot_fingerprints
+                .insert(key, BTreeSet::from([entity]));
+        }
+        let mut scanned = previous.clone();
+        let held = scanned.files.get_mut("/opaque/0.jsonl").unwrap();
+        held.last_snapshot_fingerprint = Some("held-entity".into());
+        held.size_bytes = 42;
+        scanned.file_snapshot_fingerprints.insert(
+            "/opaque/0.jsonl".into(),
+            BTreeSet::from(["held-entity".to_string()]),
+        );
+
+        let subset = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::from(["entity-1".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held-entity".to_string()]),
+        );
+        assert_eq!(subset.files.len(), 3);
+        for (key, entry) in subset.files.iter_shared() {
+            assert!(
+                Shared::ptr_eq(entry, previous.files.get_shared(key).unwrap()),
+                "{key} was copied"
+            );
+        }
+    }
+
+    /// The subset still applies both carries where they change an entry,
+    /// with today's values, and copies no entry its carry leaves equal.
+    #[test]
+    fn held_page_subset_applies_debt_and_audit_carries() {
+        let _on = evidence_owed::EvidenceOwedForTest::on();
+        let mut previous = ScanIndex::default();
+        let mut add = |key: &str, version: String| {
+            let mut entry = manifest_index_entry(Some(format!("{key}-entity").as_str()));
+            entry.scan_identity_version = Some(version);
+            previous.files.insert(key.into(), entry);
+        };
+        add("owed", "semantic_sync:v1".into());
+        add("v1", "semantic_sync:v2+sampled_unverified:v1:500".into());
+        add("v2-earlier", sampled_audit::marker(300));
+        add("v2-same", sampled_audit::marker(200));
+        let mut scanned = previous.clone();
+        let owed = scanned.files.get_mut("owed").unwrap();
+        owed.evidence_owed = true;
+        owed.last_snapshot_fingerprint = Some("held-owed".into());
+        let earlier = scanned.files.get_mut("v2-earlier").unwrap();
+        earlier.scan_identity_version = Some(sampled_audit::marker(200));
+        earlier.last_snapshot_fingerprint = Some("held-v2".into());
+
+        let subset = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held-owed".to_string(), "held-v2".to_string()]),
+        );
+        let owed = &subset.files["owed"];
+        assert!(owed.evidence_owed);
+        assert_eq!(owed.source_file_fingerprint, "source");
+        assert_eq!(
+            owed.last_snapshot_fingerprint.as_deref(),
+            Some("owed-entity")
+        );
+        assert_eq!(
+            subset.files["v1"].scan_identity_version.as_deref(),
+            Some("semantic_sync:v2+sampled_unverified:v2:500:p")
+        );
+        assert_eq!(
+            subset.files["v2-earlier"].scan_identity_version.as_deref(),
+            Some("semantic_sync:v2+sampled_unverified:v2:200:c")
+        );
+        assert_eq!(
+            subset.files["v2-earlier"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("v2-earlier-entity")
+        );
+        assert!(Shared::ptr_eq(
+            subset.files.get_shared("v2-same").unwrap(),
+            previous.files.get_shared("v2-same").unwrap()
+        ));
     }
 
     /// R11/R12: an exact refusal re-offer lease re-reads an unchanged,
@@ -83319,223 +85185,6 @@ mod tests {
         assert!(envelope.get("forced_full_rescan").is_none());
     }
 
-    /// The exact on-disk shape of an index written before the accepted-ledger
-    /// version field existed: the accepted set is present, because
-    /// `record_accepted_snapshot_fingerprints` recorded real entity ACKs, and
-    /// the version field is absent, so serde defaults it to the pre-ledger
-    /// value. Building it through serde rather than by assigning `0` is what
-    /// makes it the shape a real upgrade deserializes.
-    fn pre_ledger_index_with_accepted(mut index: ScanIndex) -> ScanIndex {
-        let mut value = serde_json::to_value(&index).expect("serialize current index");
-        let object = value.as_object_mut().expect("scan index object");
-        object.remove("accepted_snapshot_fingerprint_ledger_version");
-        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION
-        );
-        assert!(!index.accepted_snapshot_fingerprints.is_empty());
-        assert!(index.legacy_settlement_ledger_needs_migration());
-        index
-    }
-
-    /// A pre-ledger accepted set holds real entity ACKs, but the revisions the
-    /// silent retry-loss dropped are gone from the index entirely, so
-    /// `current - accepted` is already empty and the seal branch is reachable
-    /// on the first cycle. Sealing there retires the migration without ever
-    /// arming a page, and arming is the forced re-parse of the owning files
-    /// that recovers those revisions.
-    ///
-    /// This is the exact pre-fix state: version field absent on disk, accepted
-    /// covering every current revision, no sweep cursor, empty pending set.
-    #[test]
-    fn pre_ledger_accepted_set_is_not_sealed_by_finish_without_the_bounded_sweep() {
-        let accepted = "a".repeat(64);
-        let sibling = "b".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), sibling.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted, sibling]).into(),
-            ..ScanIndex::default()
-        });
-        assert!(
-            index
-                .legacy_settlement_reconcile_after_fingerprint
-                .is_none(),
-            "the shape under test has never armed a page"
-        );
-        assert!(
-            index
-                .legacy_settlement_reconciliation_pending_fingerprints()
-                .is_empty(),
-            "the seal branch is reachable only because nothing is pending"
-        );
-
-        index.finish_legacy_settlement_reconciliation();
-
-        assert_eq!(
-            index.accepted_snapshot_fingerprint_ledger_version,
-            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
-            "an empty pending set over a never-swept pre-ledger accepted set is not settlement \
-             evidence and may not close the migration"
-        );
-        assert!(index.legacy_settlement_ledger_needs_migration());
-    }
-
-    /// The same guard has to hold at the earlier site.
-    /// `prepare_legacy_settlement_reconciliation` runs at the top of every
-    /// ordinary cycle and `finish_legacy_settlement_reconciliation` only at its
-    /// end, so a guard that lives only in `finish_*` delays the unproven seal
-    /// by one cycle instead of preventing it. On the same never-armed
-    /// pre-ledger shape the sweep re-opens the ledger and arms every current
-    /// revision rather than sealing it.
-    #[test]
-    fn pre_ledger_accepted_set_is_reopened_by_prepare_instead_of_sealed() {
-        let accepted = "a".repeat(64);
-        let sibling = "b".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), sibling.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone(), sibling.clone()])
-                .into(),
-            ..ScanIndex::default()
-        });
-        assert!(
-            index
-                .legacy_settlement_reconciliation_pending_fingerprints()
-                .is_empty(),
-            "the seal branch is reachable only because nothing is pending"
-        );
-
-        let (armed, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([accepted.clone(), sibling.clone()]),
-            "the never-swept pre-ledger set is re-offered, not sealed"
-        );
-        assert!(
-            index.accepted_snapshot_fingerprints.is_empty(),
-            "the re-open clears the set so the sweep has something to arm"
-        );
-        assert!(
-            index.legacy_settlement_ledger_needs_migration(),
-            "the ledger stays open until the server settles every revision"
-        );
-        for fingerprint in [&accepted, &sibling] {
-            let record = index
-                .quarantined_snapshot_fingerprints
-                .get(fingerprint)
-                .expect("every current revision is re-armed for the bounded sweep");
-            assert_eq!(
-                record.disposition,
-                SnapshotQuarantineDisposition::RetryPending
-            );
-            assert_eq!(record.retry_after_unix_seconds, 0);
-        }
-        assert!(
-            index.bounded_sweep_had_unsettled_upload,
-            "arming is what forces the re-parse that recovers a dropped revision"
-        );
-        assert_eq!(
-            index.bounded_sweep_unsettled_cause_names(),
-            ["legacy_reconcile"]
-        );
-    }
-
-    /// The re-open is bounded, not a wedge: refusing the unproven seal starts
-    /// the ordinary sweep, and the sweep closes the migration once the server
-    /// has settled every page.
-    #[test]
-    fn reopened_pre_ledger_sweep_terminates_and_seals_after_the_server_settles() {
-        let fingerprints = (0..120)
-            .map(|value| format!("{value:064x}"))
-            .collect::<BTreeSet<_>>();
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "bounded-sweep-session-set.jsonl".to_string(),
-                fingerprints.clone(),
-            )]),
-            accepted_snapshot_fingerprints: fingerprints.clone().into(),
-            ..ScanIndex::default()
-        });
-        assert!(index
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty());
-
-        let mut pages = Vec::new();
-        while index.legacy_settlement_ledger_needs_migration() {
-            let (armed, _) =
-                index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-            if armed.is_empty() {
-                break;
-            }
-            assert!(armed.len() <= 50, "a cycle never arms more than one page");
-            pages.push(armed.len());
-            // The server settles the armed page.
-            index.retain_quarantined_fingerprints(&BTreeMap::new());
-            index.record_accepted_snapshot_fingerprints(&armed);
-            index.finish_legacy_settlement_reconciliation();
-        }
-
-        assert_eq!(pages, vec![50, 50, 20]);
-        assert!(
-            !index.legacy_settlement_ledger_needs_migration(),
-            "the guard refuses one unproven seal; it does not hold the ledger open forever"
-        );
-        assert_eq!(index.accepted_snapshot_fingerprints, fingerprints);
-        let (terminal, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(terminal.is_empty());
-        assert!(!changed, "a settled ledger never re-opens again");
-    }
-
-    /// The sweep cursor is what scopes the pre-ledger leg to never-armed
-    /// ledgers. A ledger already being swept has re-earned acceptances through
-    /// the server, and a second re-open would discard them and restart the
-    /// pass, so the guard must not fire once the cursor is set.
-    #[test]
-    fn pre_ledger_ledger_already_being_swept_is_not_reopened_again() {
-        let proved = "a".repeat(64);
-        let first_pending = "b".repeat(64);
-        let second_pending = "c".repeat(64);
-        let mut index = pre_ledger_index_with_accepted(ScanIndex {
-            file_snapshot_fingerprints: SharedMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([
-                    proved.clone(),
-                    first_pending.clone(),
-                    second_pending.clone(),
-                ]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([proved.clone()]).into(),
-            legacy_settlement_reconcile_after_fingerprint: Some(proved.clone()),
-            ..ScanIndex::default()
-        });
-        assert!(!index.legacy_settlement_ledger_is_unproven());
-
-        let (armed, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-
-        assert!(changed);
-        assert_eq!(
-            armed,
-            BTreeSet::from([first_pending, second_pending]),
-            "the sweep resumes over the remaining revisions"
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprints,
-            BTreeSet::from([proved]),
-            "an acceptance the sweep already proved is never discarded"
-        );
-    }
-
     fn traversal_reset_scope_checkpoint(
         pending_directories: VecDeque<ScanTraversalPath>,
         counts: ScanTraversalCounts,
@@ -84130,10 +85779,10 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; optional native_publication; shared codex_versions);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision; inline restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
@@ -84149,11 +85798,11 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U model_provider: Option<String>,
     U subscription_product: Option<String>,
 });
-crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, context_inputs);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
@@ -84252,7 +85901,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N title_source: Option<String>,
     X first_prompt_title: Option<String>,
     X first_prompt_material: Option<String>,
-    E provider_skills: BTreeSet<String>,
+    PL provider_skills: BTreeSet<String>,
     N started_at: Option<String>,
     N ended_at: Option<String>,
     N last_activity_at: Option<String>,
@@ -84339,7 +85988,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     L activity_mcp_call_ids: BTreeMap<String, bool>,
     U activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     L seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
-    E activity_skills: BTreeSet<String>,
+    PL activity_skills: BTreeSet<String>,
     N skill_detector_incomplete: bool,
     H activity_changed_file_hashes: BTreeSet<String>,
     N activity_patch_operations: u64,
@@ -84471,6 +86120,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             retain_room,
         } = self;
         c.add(reader.capacity())?;
+        reader.custody_heap_bound(c)?;
         buf.heap_bound(c)?;
         report.heap_bound(c)?;
         max_line_bytes.heap_bound(c)?;
@@ -84678,7 +86328,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
         )
         .is_none());
         assert_eq!(
@@ -84702,7 +86352,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
@@ -84745,7 +86395,7 @@ mod census_unreadable_tests {
             "2026-10-12T00:00:00Z",
             30,
         );
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None, None);
         assert_eq!(
             projection(&index.traversal.as_ref().unwrap().counts)["counts"],
             json!([0, 1, 0, 0, 0, 0, 0, 0])
@@ -84756,7 +86406,7 @@ mod census_unreadable_tests {
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
-crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, pending_occurrence_cap_alarm, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
@@ -84790,6 +86440,13 @@ crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_token
 crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
 
 impl ScanIndex {
+    /// A save on the committed copy moved the CAS baseline: this working
+    /// copy's next save compares against that publication, never its own load.
+    pub(crate) fn adopt_committed_save(&mut self, committed: &Self) {
+        self.generation = committed.generation;
+        self.retain_persistence_baseline_from(committed);
+    }
+
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
         if let Some(state) = &committed.v2 {
             let own = self.v2_mut();
@@ -84814,6 +86471,24 @@ impl ScanIndex {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    sampled_jsonl::durable::test_replay_privacy_artifacts(root)
+}
+
+// Static receipts from the qualified 64-bit production layout. These keep
+// the listed OFF parser-box allocation delta honest; no runtime test executes.
+#[cfg(all(unix, target_pointer_width = "64", not(test)))]
+const _: () = {
+    assert!(size_of::<OwnedJsonlParser>() == 5312);
+    assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
+    // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
+    // to M3's 856-byte active frame; parser/custody boxing is unchanged.
+    assert!(size_of::<OwnedActiveFile>() == 880);
+    assert!(
+        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
+    );
+};
 /// Explicit privacy erasure hooks. Source-disable and Repair must not call this.
 pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
     state_v2::erase_tree(support)
@@ -85044,8 +86719,11 @@ mod state_v2_maintenance_lock_tests {
 pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::{
+    cold_usage_families as state_v2_cold_usage_families,
     has_cold_archive as state_v2_has_cold_archive,
-    roll_account_families as state_v2_roll_account_families, ColdStore as StateV2ColdStore,
+    roll_account_families as state_v2_roll_account_families,
+    usage_head_only as state_v2_usage_head_only, ColdSession as StateV2ColdSession,
+    ColdStore as StateV2ColdStore,
 };
 
 #[cfg(test)]

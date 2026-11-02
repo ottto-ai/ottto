@@ -307,7 +307,7 @@ pub(super) struct Sqlite {
     last_collection_check: Option<(SystemTime, Instant)>,
     recovery_attempts_left: u8,
     paths: PathExtractor,
-    references: Option<ReferenceExtractor>,
+    references: ReferenceExtractor,
     // Keep DB identity separate from ownership: Darwin flock conflicts with
     // SQLite's fcntl locks on the same inode. Both fds outlive the connection.
     owner: File,
@@ -336,6 +336,7 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
+                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -541,8 +542,8 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
@@ -636,18 +637,6 @@ impl Sqlite {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("state_v2_connection_unavailable"))
     }
-    /// Immutable identity probe must precede a read-write open, WAL recovery,
-    /// settings changes, and SHM creation. The expected identity comes from the
-    /// independently read fence, never from the candidate database.
-    #[cfg(test)]
-    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
-        Self::open_with_policy(
-            path,
-            identity,
-            Duration::from_secs(86400),
-            Duration::from_secs(2),
-        )
-    }
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
         private_file(path)?;
         let probe = Connection::open_with_flags(
@@ -666,16 +655,10 @@ impl Sqlite {
         ensure!(actual == *identity, "state_v2_foreign_binding");
         Ok(())
     }
-    pub(super) fn open_with_policy(
-        path: &Path,
-        identity: &super::Identity,
-        deadline: Duration,
-        work: Duration,
-    ) -> Result<Self> {
-        ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
-            "state_v2_purge_policy"
-        );
+    /// Immutable identity probe must precede a read-write open, WAL recovery,
+    /// settings changes, and SHM creation. The expected identity comes from the
+    /// independently read fence, never from the candidate database.
+    pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -740,14 +723,13 @@ impl Sqlite {
             last_purge_attempt: None,
             last_collection_check: None,
             recovery_attempts_left: 0,
-            paths: missing_path_extractor,
-            references: None,
+            paths: kinds::private_paths,
+            references: kinds::references,
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
             save_failure: None,
         };
-        store.set_purge_policy(deadline, work)?;
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
@@ -851,9 +833,8 @@ impl Sqlite {
     }
 }
 
-impl Store for Sqlite {
-    type Txn<'a> = Txn<'a>;
-    fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
+impl Sqlite {
+    pub(super) fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
             telemetry::row_cap_reset();
             self.save_failure = None;
@@ -861,6 +842,7 @@ impl Store for Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
+            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -884,7 +866,7 @@ impl Store for Sqlite {
             dirty_rows: 0,
         })
     }
-    fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
+    pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         if mode == CheckpointMode::Purge && self.vacuum().is_err() {
             self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
@@ -1016,14 +998,7 @@ fn scan_record_range(
         values.push(SqlValue::Integer(i64::try_from(*position)?));
         filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
     }
-    values.push(SqlValue::Integer(limit as i64));
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
-        projection(Table::Records),
-        values.len()
-    ))?;
-    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    record_headers(conn, &filter, values, "key_bytes,position", limit)
 }
 fn scan_record_key(
     conn: &Connection,
@@ -1042,15 +1017,25 @@ fn scan_record_key(
         values.push(SqlValue::Integer(i64::try_from(position)?));
         filter.push_str(" AND position>?3");
     }
+    record_headers(conn, &filter, values, "position", limit)
+}
+fn record_headers(
+    conn: &Connection,
+    filter: &str,
+    mut values: Vec<SqlValue>,
+    order: &str,
+    limit: usize,
+) -> Result<Vec<Header>> {
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM records WHERE {filter} ORDER BY position LIMIT ?{}",
+        "SELECT {} FROM records WHERE {filter} ORDER BY {order} LIMIT ?{}",
         projection(Table::Records),
         values.len()
     ))?;
     let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
     ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
     if let RowKey::Meta(name) = &h.key {
@@ -1122,18 +1107,11 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
 /// The semantic encoder owns path classification, including paths inside raw
 /// holds and packed maps AND the primary key. Only actual PL strings are
 /// emitted, through a bounded sink before allocation. No table field knowledge
-/// belongs here. Missing extractors refuse mutations, never infer privacy.
+/// belongs here. The default extractors use the semantic encoder.
 pub(super) type PathExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
 pub(super) type ReferenceExtractor =
     fn(&Header, &dyn Value, &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()>;
-fn missing_path_extractor(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    bail!("state_v2_private_path_extractor_required")
-}
 struct StoredValue<'a> {
     conn: &'a Connection,
     header: &'a Header,
@@ -1144,11 +1122,13 @@ impl Value for StoredValue<'_> {
     }
 }
 impl Sqlite {
+    #[cfg(test)]
     pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
         self.paths = paths;
     }
+    #[cfg(test)]
     pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
-        self.references = Some(refs);
+        self.references = refs;
     }
 }
 impl Sqlite {
@@ -1178,6 +1158,10 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
+    /// Charged bytes of the last refused save, for its ceiling alarm.
+    pub(super) fn refused_save_bytes(&self) -> u64 {
+        self.stats.refused_save_bytes
+    }
     fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
@@ -1185,13 +1169,6 @@ impl Sqlite {
         if disk_full(error) {
             self.save_failure = Some(Hold::SaveFull);
             telemetry::event("sqlite_full", &1);
-        } else if error.chain().any(|e| {
-            matches!(
-                e.to_string().as_str(),
-                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
-            )
-        }) {
-            self.save_failure = Some(Hold::SaveCeiling);
         }
     }
 }
@@ -1207,6 +1184,7 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
@@ -1223,7 +1201,6 @@ impl Txn<'_> {
         // exceed them. Only the hard charged-work ceiling refuses publication.
         if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
             anyhow::bail!(Hold::SaveCeiling);
         }
         Ok(())
@@ -1270,31 +1247,49 @@ impl Txn<'_> {
             self.shared_erasure = true;
             return Ok(());
         }
-        if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
+        // Once erasure is required, a remembered set cannot change the outcome.
+        if self.shared_erasure || !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
-        let mut bytes = self.path_bytes;
-        bytes = bytes
-            .checked_add(owner_key_bytes(&old.key)?.len() * 2 + 512)
-            .context("state_v2_path_diff_admission")?;
+        let budget = self.store.purge_policy.path_diff_budget;
+        let mut bytes = self
+            .path_bytes
+            .saturating_add(owner_key_bytes(&old.key)?.len().saturating_mul(2))
+            .saturating_add(512);
+        let mut over = bytes > budget;
         let mut paths = BTreeSet::new();
-        (self.store.paths)(
-            old,
-            &StoredValue {
-                conn: self.store.conn()?,
-                header: old,
-            },
-            &mut |path| {
-                if !paths.contains(path) {
-                    bytes = bytes
-                        .checked_add(path.len() + 64)
-                        .context("state_v2_path_diff_admission")?;
-                    ensure!(bytes <= 32 * 1024 * 1024, "state_v2_path_diff_admission");
-                    paths.insert(path.to_owned());
-                }
-                Ok(())
-            },
-        )?;
+        if !over {
+            (self.store.paths)(
+                old,
+                &StoredValue {
+                    conn: self.store.conn()?,
+                    header: old,
+                },
+                &mut |path| {
+                    if !over && !paths.contains(path) {
+                        bytes = bytes.saturating_add(path.len()).saturating_add(64);
+                        over = bytes > budget;
+                        if !over {
+                            paths.insert(path.to_owned());
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if over {
+            // The diff budget bounds memory, never the save. Stop buffering and
+            // require erasure as a detected removal would: over-erasing is safe.
+            let rows = self.original_paths.len().saturating_add(1);
+            self.shared_erasure = true;
+            self.original_paths = BTreeMap::new();
+            self.path_bytes = 0;
+            telemetry::event(
+                "path_diff_conservative",
+                &serde_json::json!({ "bytes": bytes, "rows": rows }),
+            );
+            return Ok(());
+        }
         // Remember empty sets too, so repeated changes extract at most once.
         self.path_bytes = bytes;
         self.original_paths.insert(old.key.clone(), paths);
@@ -1663,6 +1658,7 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
+            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;

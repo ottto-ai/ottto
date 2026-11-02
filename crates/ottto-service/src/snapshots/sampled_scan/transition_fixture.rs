@@ -33,6 +33,21 @@ pub(crate) struct V1Golden<'a> {
     pub(crate) metadata: Value,
 }
 
+impl V1Golden<'_> {
+    /// Relocate only the envelope key for a scratch-path rebuild fixture.
+    /// The body, old pin, generation, certificate and interpretation stay archived;
+    /// this is NOT evidence of a portable old-writer restore binding.
+    pub(crate) fn relocated_record(&self, key: [u8; 32]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut bytes = self.record.to_vec();
+        bytes[43..75].copy_from_slice(&key);
+        let end = bytes.len() - 32;
+        let checksum = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+        bytes
+    }
+}
+
 #[derive(Clone, Copy)]
 struct V1Files<'a> {
     case_id: &'static str,
@@ -219,10 +234,9 @@ pub(crate) fn seed_old_writer(
     cache: &super::SharedCache,
     source: SnapshotSource,
     key: &str,
-    index: &super::super::ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
+    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, pin)
 }
 
 /// The production body allowlist, without exposing the private codec module.
@@ -296,6 +310,14 @@ impl CrashPoint {
         Self::SaveGc,
         Self::RestartOne,
         Self::RestartTwo,
+    ];
+    /// The executable native-M3 SIGKILL rows (m3_d3_tests::OrderPoint).
+    /// FileSynced is N/A: plain-flush engine: no fsync boundary.
+    /// The old-writer/M1 ALL matrix above keeps its historical row.
+    pub(crate) const NATIVE_M3: [Self; 3] = [
+        Self::Prepared,
+        Self::BeforeRename,
+        Self::BeforeNativeEffects,
     ];
     /// Additional physical store edges wired on this fixture branch. The
     /// retirement edges refer to classified remove_keys, never temp cleanup.
@@ -493,6 +515,21 @@ impl RouteResult {
             modes: (0, 0, 0),
             restored: 0,
         }
+    }
+}
+
+/// Test adapter observes the real native boundary without exposing the
+/// acquisition module or constructing a synthetic publication receipt.
+pub(crate) struct NativeEffectsObserver;
+impl NativeEffectsObserver {
+    pub(crate) fn new(callback: impl FnMut() + 'static) -> Self {
+        super::test_hooks::set(super::test_hooks::Point::BeforeNativeEffects, callback);
+        Self
+    }
+}
+impl Drop for NativeEffectsObserver {
+    fn drop(&mut self) {
+        super::test_hooks::clear();
     }
 }
 
@@ -1158,22 +1195,26 @@ pub(crate) mod money_oracle {
             result
         }
 
+        /// [format] quiet default accepts zero anchor reads.
         #[test]
         fn quiet_default_accepts_zero_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(0));
         }
 
+        /// [format] quiet default rejects anchor reads.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_default_rejects_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(ANCHOR_WINDOW));
         }
 
+        /// [format] quiet anchor window accepts exact count.
         #[test]
         fn quiet_anchor_window_accepts_exact_count() {
             assert_quiet_restart_with_anchor_window(&quiet_result(ANCHOR_WINDOW), ANCHOR_WINDOW);
         }
 
+        /// [format] quiet anchor window rejects short count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_short_count() {
@@ -1183,6 +1224,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [format] quiet anchor window rejects excess count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_excess_count() {
@@ -1192,6 +1234,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [format] quiet anchor window rejects body bytes.
         #[test]
         fn quiet_anchor_window_rejects_body_bytes() {
             let baseline = quiet_result(ANCHOR_WINDOW);
@@ -1218,6 +1261,7 @@ pub(crate) mod money_oracle {
             }
         }
 
+        /// [format] quiet anchor window rejects other reads.
         #[test]
         #[should_panic(expected = "other I/O unmeasured/nonzero")]
         fn quiet_anchor_window_rejects_other_reads() {
@@ -1226,6 +1270,7 @@ pub(crate) mod money_oracle {
             assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
         }
 
+        /// [format] quiet anchor window rejects unmeasured anchors.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_unmeasured_anchors() {
@@ -1340,6 +1385,7 @@ pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
     StoreFailure { previous, hits }
 }
 
+/// [format] scan clock restores after nested scope and unwind.
 #[test]
 fn scan_clock_restores_after_nested_scope_and_unwind() {
     with_scan_clock(100, || {
@@ -1351,6 +1397,7 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
     });
 }
 
+/// [format] transition failure restores outer hook after unwind.
 #[test]
 fn transition_failure_restores_outer_hook_after_unwind() {
     use crate::durable_tail_store::test_hooks;
@@ -1380,6 +1427,7 @@ fn transition_failure_restores_outer_hook_after_unwind() {
 
 /// Protect the existing matrix while publishing new names for owners. This
 /// checks vocabulary only; it is not evidence that live call sites execute.
+/// [format] crash extension names are disjoint from the m1 matrix.
 #[test]
 fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     let mut names = BTreeSet::new();
@@ -1392,4 +1440,324 @@ fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     }
     assert_eq!(names.len(), 32);
     assert!(names.contains("BeforeCodexPublication"));
+}
+
+/// [format] native m3 plain flush matrix has no file fsync boundary.
+#[test]
+fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
+    assert!(CrashPoint::ALL.contains(&CrashPoint::FileSynced));
+    assert!(
+        !CrashPoint::NATIVE_M3.contains(&CrashPoint::FileSynced),
+        "plain-flush engine: no fsync boundary"
+    );
+    // Qualify the real native engine, not a synthetic crash edge. Any new
+    // file fsync on this path requires revisiting the design and its matrix.
+    let native = include_str!("../../durable_tail_store/stream.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    for forbidden in [".sync_all(", ".sync_data(", "libc::fsync(", ".sync()"] {
+        assert!(
+            !native.contains(forbidden),
+            "native-M3 added file fsync: {forbidden}"
+        );
+    }
+    let store = include_str!("../../durable_tail_store.rs");
+    let temp_commit = store
+        .split("fn commit(&mut self, path: &Path, prior: Option<Stamp>)")
+        .nth(1)
+        .unwrap()
+        .split("fn discard(")
+        .next()
+        .unwrap();
+    assert!(
+        !temp_commit.contains(".sync"),
+        "native temp commit added fsync"
+    );
+}
+
+/// Native cold-store setup shared by transition tests. Scans stop before
+/// policy finalization, ACK and save; each driver chooses its settlement.
+pub(crate) mod native_cold {
+    #[cfg(target_os = "macos")]
+    use super::super::durable_tail;
+    use super::super::SharedCache;
+    use crate::durable_tail_store::{self as store, DurableSource};
+    use crate::locked_state_dir::test_locks;
+    use crate::snapshots::*;
+    use crate::transcript_acquisition::Scope;
+    #[cfg(target_os = "macos")]
+    use std::sync::Arc;
+
+    pub(crate) struct NativeColdStore {
+        pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
+        #[cfg(target_os = "macos")]
+        pub(crate) source: SnapshotSource,
+        pub(crate) root: PathBuf,
+        pub(crate) sessions: PathBuf,
+        #[cfg(target_os = "macos")]
+        pub(crate) index_path: PathBuf,
+        pub(crate) namespace: Scope,
+        #[cfg(target_os = "macos")]
+        pub(crate) cache: Arc<SharedCache>,
+        #[cfg(target_os = "macos")]
+        pub(crate) index: ScanIndex,
+        scratch: Option<crate::test_scratch::ScratchDir>,
+    }
+    impl NativeColdStore {
+        pub(crate) fn with_scope(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
+            let scratch = crate::test_scratch::ScratchDir::new(tag);
+            let mut fixture = Self::open_with_scope(source, scratch.to_path_buf(), namespace);
+            fixture.scratch = Some(scratch);
+            fixture
+        }
+        pub(crate) fn open_with_scope(
+            source: SnapshotSource,
+            root: PathBuf,
+            namespace: Scope,
+        ) -> Self {
+            #[cfg(not(target_os = "macos"))]
+            let _ = source;
+            let sessions = root.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let writer = test_locks::hold(&root);
+            #[cfg(target_os = "macos")]
+            let index_path = root.join("index.json");
+            #[cfg(target_os = "macos")]
+            let index = if index_path.exists() {
+                ScanIndex::load(&index_path).unwrap()
+            } else {
+                ScanIndex::default()
+            };
+            Self {
+                writer,
+                #[cfg(target_os = "macos")]
+                source,
+                root,
+                sessions,
+                #[cfg(target_os = "macos")]
+                index_path,
+                namespace,
+                #[cfg(target_os = "macos")]
+                cache: Arc::new(SharedCache::default()),
+                #[cfg(target_os = "macos")]
+                index,
+                scratch: None,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn restart(&mut self) {
+            self.cache = Arc::new(SharedCache::default());
+            self.index = ScanIndex::load(&self.index_path).unwrap();
+        }
+        pub(crate) fn path(&self, session: &str) -> PathBuf {
+            self.sessions.join(format!("{session}.jsonl"))
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn key(&self, session: &str) -> String {
+            local_index_key(&self.path(session))
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn digest(&self, session: &str) -> store::Digest32 {
+            store::key_digest(
+                durable_tail::durable_source(self.source).unwrap(),
+                &self.key(session),
+            )
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn store_dir(&self) -> PathBuf {
+            store::store_dir_for_index(&self.index_path)
+        }
+    }
+
+    pub(crate) fn jsonl(lines: impl IntoIterator<Item = serde_json::Value>) -> String {
+        lines
+            .into_iter()
+            .map(|line| line.to_string() + "\n")
+            .collect()
+    }
+    pub(crate) fn save(index_path: &Path, index: &mut ScanIndex) {
+        index.save(index_path).unwrap();
+    }
+
+    pub(crate) fn cache(
+        source: SnapshotSource,
+        index: &Path,
+        namespace: &Scope,
+        capture: bool,
+    ) -> SharedCache {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, index, namespace, capture);
+        cache
+    }
+    pub(crate) fn store(index: &Path, source: DurableSource) -> store::DurableTailStore {
+        store::DurableTailStore::new(store::store_dir_for_index(index), source)
+    }
+    pub(crate) fn acquisition(source: SnapshotSource) -> Option<store::AcquisitionFields> {
+        Some(store::AcquisitionFields {
+            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(source),
+            protocol: AcquisitionProtocol::Legacy,
+        })
+    }
+    pub(crate) fn pending(
+        source: SnapshotSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        body: Vec<u8>,
+    ) -> store::PendingRecord {
+        store::PendingRecord {
+            acquisition: acquisition(source),
+            binding,
+            certificate,
+            body,
+            allowlist: super::allowlist_digest(source),
+        }
+    }
+
+    /// Advance production scanning only. The pre-step counters match native
+    /// drivers; source-specific finish/save/ACK remains with each caller.
+    pub(crate) fn scan(
+        mut owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize), u64) {
+        for _ in 0..steps {
+            let (modes, bytes) = owned.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
+                (
+                    (s.full_files, s.tail_files, s.unchanged_files),
+                    s.native_bytes,
+                )
+            });
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return (index, scan, modes, bytes)
+                }
+            }
+        }
+        panic!("native fixture scan did not complete");
+    }
+
+    pub(crate) fn scan_modes(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let (index, scan, modes, _) = scan(owned, steps);
+        (index, scan, modes)
+    }
+    pub(crate) fn scan_reads(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, u64)) {
+        let (index, scan, modes, bytes) = scan(owned, steps);
+        (index, scan, (modes.0, modes.1, bytes))
+    }
+    /// Seal the exact complete bytes through production ReadPlan, retaining
+    /// the caller's open file and resulting position for later growth reads.
+    pub(crate) fn checkpoint(
+        file: &mut std::fs::File,
+        scope: &Scope,
+        now: u64,
+    ) -> crate::transcript_acquisition::Checkpoint {
+        use std::io::Read;
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(file, None, scope, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        plan.commit_after_native_completion(file, scope, now)
+            .unwrap()
+    }
+
+    pub(crate) fn record_path(dir: &Path, key: &store::Digest32) -> PathBuf {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("{hex}.rec"))
+    }
+
+    pub(crate) fn native_header(
+        source: DurableSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        revision: u64,
+        generation: u64,
+        body_len: usize,
+    ) -> store::PreparedHeader {
+        store::PreparedHeader {
+            binding,
+            certificate,
+            format: store::FORMAT_V3,
+            allowlist: source.properties().allowlist(),
+            acquisition: store::AcquisitionFields {
+                acquired_revision: revision,
+                protocol: AcquisitionProtocol::WriteAhead,
+            },
+            generation,
+            body_len,
+        }
+    }
+
+    pub(in crate::snapshots) fn parser(
+        source: SnapshotSource,
+        path: &Path,
+        file: std::fs::File,
+        apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
+    ) -> OwnedJsonlParser {
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
+    }
+    pub(in crate::snapshots) fn finish_record(
+        parser: &mut OwnedJsonlParser,
+        scope: &Scope,
+        now: u64,
+    ) -> (
+        crate::snapshots::sampled_jsonl::CachedJsonlReduction,
+        crate::transcript_acquisition::Checkpoint,
+    ) {
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
+            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
+                completed.checkpoint
+            }
+            _ => panic!("a clean native fixture is certified"),
+        };
+        (reduction, checkpoint)
+    }
+
+    /// Reset existing counterfactual-route records without manufacturing a
+    /// receipt or changing their per-route save/ACK order.
+    pub(crate) fn restore_records(
+        index: &Path,
+        records: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let dir = store::store_dir_for_index(index);
+        for (path, bytes) in records {
+            let target = dir.join(path.file_name().unwrap());
+            if fs::read(&target).unwrap() != *bytes {
+                fs::write(target, bytes).unwrap();
+            }
+        }
+    }
+
+    /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
+    pub(crate) fn commit(
+        disk: &mut store::DurableTailStore,
+        writer: &dyn store::SingleWriter,
+        header: store::PreparedHeader,
+        body: &[u8],
+    ) -> store::ReceiptProof {
+        let prepared = disk
+            .prepare_stream(writer, header)
+            .unwrap()
+            .write(|out| {
+                out.write_all(body)
+                    .map_err(|_| crate::durable_tail_codec::Refuse::WriteFailed)?;
+                Ok(body.len())
+            })
+            .unwrap();
+        let committed = disk
+            .commit_stream(writer, prepared)
+            .unwrap()
+            .commit()
+            .unwrap();
+        disk.finish_stream(committed).unwrap()
+    }
 }
