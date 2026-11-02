@@ -9,8 +9,8 @@
 //! content (`X`) is re-derived from the file and hash-checked, including each
 //! opening call's file paths by call id. Skill labels are stored as they are.
 use super::{
-    encode, fixed_pages, page_bytes, read_page, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, ReconstructCause, TailSource,
+    capability_hour_entry, capability_hour_pages, encode, fixed_pages, page_bytes, read_page,
+    slot_start, CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
@@ -62,18 +62,6 @@ crate::durable_tail_codec::durable_struct!(SessionArtifact {
     U value: String,
 });
 
-macro_rules! head_fields {
-    ($($c:ident $f:ident : $ty:ty),* $(,)?) => {
-        fn put_fields(acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
-            let SnapshotAccumulator { $($f),* } = acc;
-            $(durable_field!(put $c, e, $f, $ty, concat!("SnapshotAccumulator.", stringify!($f)));)*
-            Ok(())
-        }
-        fn take_fields(d: &mut Dec<'_>) -> Result<SnapshotAccumulator, Corrupt> {
-            Ok(SnapshotAccumulator { $($f: durable_field!(take $c, d, $ty)),* })
-        }
-    };
-}
 // Every accumulator field, by its Tail home. Stored fields keep their record
 // class, except that skill labels are plain data and the fork parent and
 // artifacts are stored. `I` marks a field kept elsewhere: pages (responses,
@@ -231,6 +219,7 @@ head_fields! {
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
     D durable_marks: crate::durable_tail_codec::DurableMarks,
+    I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
 }
 
 /// The Claude Code source: a marker type, never a value.
@@ -377,25 +366,7 @@ impl TailSource for Claude {
                 .enumerate()
                 .map(|(page, keys)| Ok((page as u64, Self::log_page(collection, keys)?)))
                 .collect(),
-            Collection::CapabilityHours => {
-                let mut hours: BTreeMap<u64, Vec<_>> = BTreeMap::new();
-                for (key, count) in &acc.activity_capability_buckets {
-                    hours
-                        .entry(hour_page(&key.0))
-                        .or_default()
-                        .push((key, count));
-                }
-                hours
-                    .into_iter()
-                    .map(|(hour, entries)| {
-                        let bytes = page_bytes(entries.iter(), |(key, count), e| {
-                            key.put(e)?;
-                            count.put(e)
-                        })?;
-                        Ok((hour, bytes))
-                    })
-                    .collect()
-            }
+            Collection::CapabilityHours => capability_hour_pages(acc),
             Collection::Compactions => fixed_pages(
                 &acc.claude_compaction_observations,
                 COMPACTIONS_G,
@@ -465,19 +436,9 @@ impl TailSource for Claude {
                     Err(ReconstructCause::Corrupt)
                 }
             }),
-            Collection::CapabilityHours => read_page(bytes, 0, |d| {
-                let key = <(String, String, String)>::take(d)?;
-                let count = u64::take(d)?;
-                if hour_page(&key.0) != page
-                    || into
-                        .activity_capability_buckets
-                        .insert(key, count)
-                        .is_some()
-                {
-                    return Err(ReconstructCause::Corrupt);
-                }
-                Ok(())
-            }),
+            Collection::CapabilityHours => {
+                read_page(bytes, 0, |d| capability_hour_entry(d, page, into))
+            }
             Collection::Compactions => {
                 let observations = &mut into.claude_compaction_observations;
                 slot_start(page, COMPACTIONS_G, observations.len())?;
@@ -516,14 +477,6 @@ impl TailSource for Claude {
             Err(ReconstructCause::Corrupt)
         }
     }
-}
-
-/// An hourly bucket's page: its hour since the epoch. A start that does not
-/// parse (the parser never writes one) shares the last page.
-fn hour_page(bucket_start: &str) -> u64 {
-    OffsetDateTime::parse(bucket_start, &Rfc3339).map_or(u64::MAX, |start| {
-        start.unix_timestamp().div_euclid(3600) as u64
-    })
 }
 
 #[cfg(test)]

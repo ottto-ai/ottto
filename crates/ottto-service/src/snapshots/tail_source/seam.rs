@@ -255,13 +255,28 @@ impl TailBase {
                 Some((_, log)) => log_pages::<S>(acc, spec, log)?,
                 None => S::encode_pages(acc, spec.collection)?,
             };
+            let mut current = BTreeSet::new();
             for (page, bytes) in pages {
+                current.insert(page);
                 if self.committed((spec.collection, page)) != Some(&page_digest(&bytes)) {
                     staged.pages.insert((spec.collection, page), bytes);
                 }
             }
+            // A `Log` restates only its tail. Any other collection restates
+            // every page, so one it no longer encodes has shrunk away: Codex's
+            // signature list clears at its cap.
+            if log.is_none() {
+                staged
+                    .obsolete
+                    .extend(self.pages.iter().filter_map(|((collection, page), _)| {
+                        (*collection == spec.collection && !current.contains(page))
+                            .then_some((*collection, *page))
+                    }));
+            }
         }
-        let changed = !staged.pages.is_empty() || page_digest(&staged.head) != self.head;
+        let changed = !staged.pages.is_empty()
+            || !staged.obsolete.is_empty()
+            || page_digest(&staged.head) != self.head;
         if self.migrate && !changed {
             super::counters::bump("tail_head_migrated", S::SOURCE.api_slug());
         }

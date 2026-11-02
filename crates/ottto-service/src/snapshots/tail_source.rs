@@ -12,7 +12,23 @@ use super::*;
 use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
+// Every accumulator field, by its source's Tail home: the walk is exhaustive,
+// so a new field is a compile error in each codec until it is placed.
+macro_rules! head_fields {
+    ($($c:ident $f:ident : $ty:ty),* $(,)?) => {
+        fn put_fields(acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
+            let SnapshotAccumulator { $($f),* } = acc;
+            $(durable_field!(put $c, e, $f, $ty, concat!("SnapshotAccumulator.", stringify!($f)));)*
+            Ok(())
+        }
+        fn take_fields(d: &mut Dec<'_>) -> Result<SnapshotAccumulator, Corrupt> {
+            Ok(SnapshotAccumulator { $($f: durable_field!(take $c, d, $ty)),* })
+        }
+    };
+}
+
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod floor;
 pub(in crate::snapshots) mod load;
@@ -315,6 +331,54 @@ fn read_page(
         take(&mut d)?;
     }
     Ok(d.finish()?)
+}
+
+/// An hourly bucket's page: its hour since the epoch. A start that does not
+/// parse (the parser never writes one) shares the last page.
+fn hour_page(bucket_start: &str) -> u64 {
+    OffsetDateTime::parse(bucket_start, &Rfc3339).map_or(u64::MAX, |start| {
+        start.unix_timestamp().div_euclid(3600) as u64
+    })
+}
+
+/// The hourly capability buckets, one page per hour.
+fn capability_hour_pages(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+    let mut hours: BTreeMap<u64, Vec<_>> = BTreeMap::new();
+    for (key, count) in &acc.activity_capability_buckets {
+        hours
+            .entry(hour_page(&key.0))
+            .or_default()
+            .push((key, count));
+    }
+    hours
+        .into_iter()
+        .map(|(hour, entries)| {
+            let bytes = page_bytes(entries.iter(), |(key, count), e| {
+                key.put(e)?;
+                count.put(e)
+            })?;
+            Ok((hour, bytes))
+        })
+        .collect()
+}
+
+/// One capability bucket from hour page `page`: another hour or a repeat is corrupt.
+fn capability_hour_entry(
+    d: &mut Dec<'_>,
+    page: u64,
+    into: &mut SnapshotAccumulator,
+) -> Result<(), ReconstructCause> {
+    let key = <(String, String, String)>::take(d)?;
+    let count = u64::take(d)?;
+    if hour_page(&key.0) != page
+        || into
+            .activity_capability_buckets
+            .insert(key, count)
+            .is_some()
+    {
+        return Err(ReconstructCause::Corrupt);
+    }
+    Ok(())
 }
 
 /// A `Slot` page must start where the previous pages ended.

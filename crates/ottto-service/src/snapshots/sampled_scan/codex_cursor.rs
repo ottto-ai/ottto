@@ -511,6 +511,13 @@ pub(in crate::snapshots) struct OpenStamp {
     changed: (i64, i64),
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
+crate::durable_tail_codec::durable_struct!(OpenStamp {
+    N dev: u64,
+    N ino: u64,
+    N extent: u64,
+    N modified: (i64, i64),
+    N changed: (i64, i64),
+});
 
 /// The cursor/acquisition content key, without metadata-only ctime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
