@@ -1079,10 +1079,14 @@ fn store_growth_sample_survives_a_reference_check_over_budget() {
 fn store_growth_samples_stay_separate_per_store() {
     let (claude, codex) = (Scratch::new(), Scratch::new());
     let mut claude_db = claude.live_store();
-    let mut codex_db = codex.live_store();
     let mut identity = codex.identity();
     identity.binding.source = super::super::scan_index_persistence::Source::Codex;
-    codex_db.control("identity", &identity).unwrap();
+    let mut import = sqlite::Sqlite::create_import(&codex.path()).unwrap();
+    import.control("identity", &identity).unwrap();
+    import.control("generation", &0_u64).unwrap();
+    import.finish_import().unwrap();
+    let mut codex_db = sqlite::Sqlite::open(&codex.path(), &identity).unwrap();
+    codex_db.path_extractor(test_paths);
     let mut tx = codex_db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &traversal("codex-only".into()), b"evidence");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
