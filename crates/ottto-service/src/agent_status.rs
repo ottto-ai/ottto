@@ -436,7 +436,6 @@ pub(crate) struct CodexHomeBinding {
 /// `Debug` nor `Serialize`: the access token must stay in memory and never
 /// become diagnostic or persistence material.
 struct ResolvedClaudeSlot {
-    descriptor: ClaudeConfigSlotDescriptorV1,
     account: AgentAccountStatus,
     account_identifier_hash: String,
     organization_identifier_hash: String,
@@ -3227,28 +3226,8 @@ fn collect_codex_status_for_home(
     snapshot.account = Some(AgentAccountStatus {
         login_state: AgentLoginState::Unknown,
         provider: Some("openai".to_string()),
-        auth_method: None,
-        email: None,
-        account_id: None,
-        organization_id: None,
-        organization_label: None,
-        plan_type: None,
-        subscription_product: None,
-        billing_channel: None,
-        subscription_period_start: None,
-        subscription_period_end: None,
-        subscription_period_last_checked_at: None,
-        account_identifier_hash: None,
-        organization_identifier_hash: None,
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
-        billing_identity_evidence: None,
-        claude_quota_access_state: None,
-        claude_anchor_durability: None,
-        claude_anchor_health: None,
-        billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Unknown,
+        ..unsupported_account("openai")
     });
 
     let login = run_codex_home_command(
@@ -4919,165 +4898,49 @@ fn collect_claude_status_snapshots(
             None => {}
         }
         let previous = previous_states.slots.get(&descriptor.slot_id);
-        // Another account signed in to this slot: no upkeep, CLI, usage call,
-        // candidate or refresh for it until the approved account is back.
-        let expected_binding =
-            match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
-                Ok(expected) => expected,
-                Err(status) => {
-                    claude_oauth_end_slot_run(&descriptor.slot_id);
-                    note_claude_status_coverage(
-                        &descriptor,
-                        &captured_at,
-                        CoverageObservation::Unavailable,
-                    );
-                    slot_states.insert(descriptor.slot_id, status);
-                    continue;
-                }
-            };
-        #[cfg(test)]
-        claude_slot_after_pre_gate_hook();
-        // One live local read per slot per pass (identity, stored credential,
-        // identity), shared by the upkeep decision and the resolution below.
-        // Never a `claude` spawn.
-        let network_enabled = !claude_oauth_usage_network_disabled();
-        let local = network_enabled
-            .then(|| read_registered_claude_slot_locally(&descriptor))
-            .flatten();
-        let live = local
-            .as_ref()
-            .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
-        // "Keep my Claude accounts signed in": start (or follow) the one
-        // background refresh for this login when it is due.
-        let refresh = registered_slot_refresh(&descriptor, &live, upkeep_consent, network_enabled);
-        let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
+        let step = collect_registered_claude_slot_step(
             &descriptor,
-            upkeep_consent,
-            network_enabled,
-            &live,
-            refresh,
-        );
-        if !upkeep.proceed_with_collection {
-            claude_oauth_end_slot_run(&descriptor.slot_id);
-            note_claude_status_coverage(
-                &descriptor,
-                &captured_at,
-                CoverageObservation::Unavailable,
-            );
-            let result_observed_at = upkeep.result_observed_at.clone();
-            let paused = upkeep.paused_awaiting_claude_refresh;
-            let mut status = if paused {
-                paused_claude_refresh_status(&descriptor.slot_id, &captured_at, upkeep.status)
-            } else {
-                blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status)
-            };
-            if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
-                retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
-            } else {
-                clear_claude_slot_binding(&mut status);
-            }
-            append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
-            if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue && !paused {
-                blocked_worker_receipt_descriptors
-                    .insert(descriptor.slot_id.clone(), descriptor.clone());
-            }
-            slot_states.insert(descriptor.slot_id, status);
-            continue;
-        }
-        let resolved = match local {
-            Some(local) => resolve_registered_claude_slot_from_local(descriptor.clone(), local),
-            None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
-        };
-        let mut resolved = match resolved {
-            Ok(resolved) => resolved,
-            Err(failure) => {
-                claude_oauth_end_slot_run(&descriptor.slot_id);
-                note_claude_status_coverage(
-                    &descriptor,
-                    &captured_at,
-                    match failure {
-                        ClaudeSlotProbeFailure::SignedOutByCli
-                        | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
-                        _ => CoverageObservation::Unavailable,
-                    },
-                );
-                let status = registered_claude_failure_status(
-                    &descriptor,
-                    failure,
-                    &captured_at,
-                    upkeep.status,
-                );
-                slot_states.insert(descriptor.slot_id, status);
-                continue;
-            }
-        };
-        let slot_id = resolved.descriptor.slot_id.clone();
-        if let Err(status) = claude_slot_post_resolution_gate(
-            &descriptor,
-            expected_binding,
-            &resolved,
             previous,
+            upkeep_consent,
             &captured_at,
-        ) {
-            claude_oauth_end_slot_run(&slot_id);
-            note_claude_status_coverage(
-                &descriptor,
-                &captured_at,
-                CoverageObservation::Unavailable,
-            );
-            slot_states.insert(slot_id, status);
-            continue;
-        }
-        let account_hash = resolved.account_identifier_hash.clone();
-        let organization_hash = resolved.organization_identifier_hash.clone();
-        note_claude_status_coverage(
-            &descriptor,
-            &captured_at,
-            CoverageObservation::Qualified {
-                login: &account_hash,
-                org: &organization_hash,
-            },
+            &expires_at,
+            |observation| note_claude_status_coverage(&descriptor, &captured_at, observation),
         );
-        let access_token = resolved.credential.access_token.take();
-        let credential_available = access_token.is_some();
-        let outcome = collect_claude_oauth_usage_with_credential(
-            &account_hash,
-            &organization_hash,
-            access_token,
-            resolved.credential.access_expires_at.clone(),
-            &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.clone()),
-        );
-        match custom_claude_snapshot_from_usage(
-            resolved,
-            outcome,
-            credential_available,
-            captured_at.clone(),
-            expires_at.clone(),
-        ) {
-            Ok((snapshot, mut state)) => {
-                apply_claude_upkeep_observation(&mut state, upkeep.status);
-                let mut snapshot = snapshot;
-                apply_claude_quota_access_state(&mut snapshot, &state);
-                if claude_slot_status_carries_meters(&state) {
+        match step {
+            ClaudeSlotCollectionStep::PreGateRefused(status)
+            | ClaudeSlotCollectionStep::Stopped(status)
+            | ClaudeSlotCollectionStep::UsageFailed(status) => {
+                slot_states.insert(descriptor.slot_id, status);
+            }
+            ClaudeSlotCollectionStep::UpkeepBlocked { status, paused } => {
+                if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue && !paused {
+                    blocked_worker_receipt_descriptors
+                        .insert(descriptor.slot_id.clone(), descriptor.clone());
+                }
+                slot_states.insert(descriptor.slot_id, status);
+            }
+            ClaudeSlotCollectionStep::Collected {
+                mut snapshot,
+                status,
+                account_identifier_hash,
+                organization_identifier_hash,
+            } => {
+                apply_claude_quota_access_state(&mut snapshot, &status);
+                if claude_slot_status_carries_meters(&status) {
                     let quality = claude_snapshot_candidate_rank(&snapshot)
                         .expect("validated custom meter snapshot is rankable");
                     candidates.push(ClaudeSnapshotCandidate {
-                        slot_id: slot_id.clone(),
+                        slot_id: descriptor.slot_id.clone(),
                         slot_class: ClaudeSnapshotSlotClass::Registered,
                         binding: ClaudeStrongBinding {
-                            account_identifier_hash: account_hash,
-                            organization_identifier_hash: organization_hash,
+                            account_identifier_hash,
+                            organization_identifier_hash,
                         },
                         quality,
                         snapshot,
                     });
                 }
-                slot_states.insert(slot_id, state);
-            }
-            Err(mut state) => {
-                retain_exact_claude_slot_binding(&mut state, &account_hash, &organization_hash);
-                apply_claude_upkeep_observation(&mut state, upkeep.status);
-                slot_states.insert(slot_id, state);
+                slot_states.insert(descriptor.slot_id, status);
             }
         }
     }
@@ -6066,6 +5929,164 @@ fn ordered_claude_slot_descriptors(
     descriptors
 }
 
+/// Where one registered slot's collection stopped. The bulk pass and the
+/// single-slot refresh share the pipeline and differ only in what they do with
+/// the result (coverage and candidates there, one persisted state here).
+#[allow(clippy::large_enum_variant)] // Moved once to the caller; never stored.
+enum ClaudeSlotCollectionStep {
+    /// The pre-collection gate refused: no upkeep, read, usage call or refresh.
+    PreGateRefused(ClaudeConfigSlotCollectionStatusV1),
+    /// Upkeep held collection back, either blocked or paused on a Claude refresh.
+    UpkeepBlocked {
+        status: ClaudeConfigSlotCollectionStatusV1,
+        paused: bool,
+    },
+    /// Resolution failed, or the post-resolution gate refused the login.
+    Stopped(ClaudeConfigSlotCollectionStatusV1),
+    /// The usage call ran and produced no snapshot.
+    UsageFailed(ClaudeConfigSlotCollectionStatusV1),
+    Collected {
+        snapshot: AgentStatusSnapshot,
+        status: ClaudeConfigSlotCollectionStatusV1,
+        account_identifier_hash: String,
+        organization_identifier_hash: String,
+    },
+}
+
+/// Gate, read, upkeep, resolve, gate again and call usage for one registered
+/// slot. A slot that stops before the usage call has its passive sign-in run
+/// ended here, and `note_coverage` hears each result at the point it is known.
+fn collect_registered_claude_slot_step(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    upkeep_consent: bool,
+    captured_at: &str,
+    expires_at: &str,
+    note_coverage: impl Fn(CoverageObservation<'_>),
+) -> ClaudeSlotCollectionStep {
+    let slot_id = descriptor.slot_id.as_str();
+    // Another account signed in to this slot: no upkeep, CLI, usage call,
+    // candidate or refresh for it until the approved account is back.
+    let expected_binding = match claude_slot_pre_collection_gate(descriptor, previous, captured_at)
+    {
+        Ok(expected) => expected,
+        Err(status) => {
+            claude_oauth_end_slot_run(slot_id);
+            note_coverage(CoverageObservation::Unavailable);
+            return ClaudeSlotCollectionStep::PreGateRefused(status);
+        }
+    };
+    #[cfg(test)]
+    claude_slot_after_pre_gate_hook();
+    // One live local read per slot per pass (identity, stored credential,
+    // identity), shared by the upkeep decision and the resolution below.
+    // Never a `claude` spawn.
+    let network_enabled = !claude_oauth_usage_network_disabled();
+    let local = network_enabled
+        .then(|| read_registered_claude_slot_locally(descriptor))
+        .flatten();
+    let live = local
+        .as_ref()
+        .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
+    // "Keep my Claude accounts signed in": start (or follow) the one
+    // background refresh for this login when it is due.
+    let refresh = registered_slot_refresh(descriptor, &live, upkeep_consent, network_enabled);
+    let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
+        descriptor,
+        upkeep_consent,
+        network_enabled,
+        &live,
+        refresh,
+    );
+    if !upkeep.proceed_with_collection {
+        claude_oauth_end_slot_run(slot_id);
+        note_coverage(CoverageObservation::Unavailable);
+        let result_observed_at = upkeep.result_observed_at.clone();
+        let paused = upkeep.paused_awaiting_claude_refresh;
+        let mut status = if paused {
+            paused_claude_refresh_status(slot_id, captured_at, upkeep.status)
+        } else {
+            blocked_claude_upkeep_status(slot_id, captured_at, upkeep.status)
+        };
+        if let Some(slot) = claude_config_slot_for_descriptor(descriptor) {
+            retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
+        } else {
+            clear_claude_slot_binding(&mut status);
+        }
+        append_claude_upkeep_result_receipt(&mut status, descriptor, result_observed_at);
+        return ClaudeSlotCollectionStep::UpkeepBlocked { status, paused };
+    }
+    let resolved = match local {
+        Some(local) => resolve_registered_claude_slot_from_local(local),
+        None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
+    };
+    let mut resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            claude_oauth_end_slot_run(slot_id);
+            note_coverage(match failure {
+                ClaudeSlotProbeFailure::SignedOutByCli
+                | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
+                _ => CoverageObservation::Unavailable,
+            });
+            return ClaudeSlotCollectionStep::Stopped(registered_claude_failure_status(
+                descriptor,
+                failure,
+                captured_at,
+                upkeep.status,
+            ));
+        }
+    };
+    if let Err(status) = claude_slot_post_resolution_gate(
+        descriptor,
+        expected_binding,
+        &resolved,
+        previous,
+        captured_at,
+    ) {
+        claude_oauth_end_slot_run(slot_id);
+        note_coverage(CoverageObservation::Unavailable);
+        return ClaudeSlotCollectionStep::Stopped(status);
+    }
+    let account_hash = resolved.account_identifier_hash.clone();
+    let organization_hash = resolved.organization_identifier_hash.clone();
+    note_coverage(CoverageObservation::Qualified {
+        login: &account_hash,
+        org: &organization_hash,
+    });
+    let access_token = resolved.credential.access_token.take();
+    let credential_available = access_token.is_some();
+    let outcome = collect_claude_oauth_usage_with_credential(
+        &account_hash,
+        &organization_hash,
+        access_token,
+        resolved.credential.access_expires_at.clone(),
+        &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
+    );
+    match custom_claude_snapshot_from_usage(
+        resolved,
+        outcome,
+        credential_available,
+        captured_at.to_string(),
+        expires_at.to_string(),
+    ) {
+        Ok((snapshot, mut status)) => {
+            apply_claude_upkeep_observation(&mut status, upkeep.status);
+            ClaudeSlotCollectionStep::Collected {
+                snapshot,
+                status,
+                account_identifier_hash: account_hash,
+                organization_identifier_hash: organization_hash,
+            }
+        }
+        Err(mut status) => {
+            retain_exact_claude_slot_binding(&mut status, &account_hash, &organization_hash);
+            apply_claude_upkeep_observation(&mut status, upkeep.status);
+            ClaudeSlotCollectionStep::UsageFailed(status)
+        }
+    }
+}
+
 /// Refresh exactly one registered custom slot for the connection workflow.
 /// This intentionally does not collect the default slot, statusLine, or any
 /// sibling custom slot and never uploads a backend snapshot.
@@ -6108,107 +6129,34 @@ pub(crate) fn collect_registered_claude_slot_status(
     }
     let previous_states = read_persisted_claude_slot_collection_state();
     let previous = previous_states.slots.get(slot_id);
-    let expected_binding =
-        match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
-            Ok(expected) => expected,
-            Err(mut status) => {
-                claude_oauth_end_slot_run(slot_id);
-                apply_claude_slot_approval_notice(
-                    &mut status,
-                    claude_slot_approvals().get(slot_id),
-                );
-                let _ = persist_one_claude_slot_collection_state(slot_id, &status);
-                return status;
-            }
-        };
-    #[cfg(test)]
-    claude_slot_after_pre_gate_hook();
-    let network_enabled = !claude_oauth_usage_network_disabled();
-    let local = network_enabled
-        .then(|| read_registered_claude_slot_locally(&descriptor))
-        .flatten();
-    let live = local
-        .as_ref()
-        .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
-    let refresh = registered_slot_refresh(&descriptor, &live, upkeep_consent, network_enabled);
-    let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
+    // This path keeps no status coverage: only the bulk pass feeds it.
+    let step = collect_registered_claude_slot_step(
         &descriptor,
-        upkeep_consent,
-        network_enabled,
-        &live,
-        refresh,
-    );
-    if !upkeep.proceed_with_collection {
-        claude_oauth_end_slot_run(slot_id);
-        let result_observed_at = upkeep.result_observed_at.clone();
-        let mut status = if upkeep.paused_awaiting_claude_refresh {
-            paused_claude_refresh_status(slot_id, &captured_at, upkeep.status)
-        } else {
-            blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status)
-        };
-        if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
-            retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
-        } else {
-            clear_claude_slot_binding(&mut status);
-        }
-        append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
-        let _ = persist_one_claude_slot_collection_state(slot_id, &status);
-        return status;
-    }
-    let resolved = match local {
-        Some(local) => resolve_registered_claude_slot_from_local(descriptor.clone(), local),
-        None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
-    };
-    let mut resolved = match resolved {
-        Ok(resolved) => resolved,
-        Err(failure) => {
-            claude_oauth_end_slot_run(slot_id);
-            let status =
-                registered_claude_failure_status(&descriptor, failure, &captured_at, upkeep.status);
-            let _ = persist_one_claude_slot_collection_state(slot_id, &status);
-            return status;
-        }
-    };
-    if let Err(status) = claude_slot_post_resolution_gate(
-        &descriptor,
-        expected_binding,
-        &resolved,
         previous,
+        upkeep_consent,
         &captured_at,
-    ) {
-        claude_oauth_end_slot_run(slot_id);
-        let _ = persist_one_claude_slot_collection_state(slot_id, &status);
-        return status;
-    }
-    let account_hash = resolved.account_identifier_hash.clone();
-    let organization_hash = resolved.organization_identifier_hash.clone();
-    let access_token = resolved.credential.access_token.take();
-    let credential_available = access_token.is_some();
-    let outcome = collect_claude_oauth_usage_with_credential(
-        &account_hash,
-        &organization_hash,
-        access_token,
-        resolved.credential.access_expires_at.clone(),
-        &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
+        &expires_at,
+        |_| {},
     );
-    let mut status = match custom_claude_snapshot_from_usage(
-        resolved,
-        outcome,
-        credential_available,
-        captured_at,
-        expires_at,
-    ) {
-        Ok((_, status)) => status,
-        Err(mut status) => {
-            retain_exact_claude_slot_binding(&mut status, &account_hash, &organization_hash);
+    match step {
+        ClaudeSlotCollectionStep::PreGateRefused(mut status) => {
+            apply_claude_slot_approval_notice(&mut status, claude_slot_approvals().get(slot_id));
+            let _ = persist_one_claude_slot_collection_state(slot_id, &status);
             status
         }
-    };
-    apply_claude_upkeep_observation(&mut status, upkeep.status);
-    inherit_claude_slot_account_profile(&mut status, previous);
-    apply_claude_slot_approval_notice(&mut status, claude_slot_approvals().get(slot_id));
-    let _ = persist_one_claude_slot_collection_state(slot_id, &status);
-    status
+        ClaudeSlotCollectionStep::UpkeepBlocked { status, .. }
+        | ClaudeSlotCollectionStep::Stopped(status) => {
+            let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+            status
+        }
+        ClaudeSlotCollectionStep::UsageFailed(mut status)
+        | ClaudeSlotCollectionStep::Collected { mut status, .. } => {
+            inherit_claude_slot_account_profile(&mut status, previous);
+            apply_claude_slot_approval_notice(&mut status, claude_slot_approvals().get(slot_id));
+            let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+            status
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6715,7 +6663,7 @@ fn resolve_registered_claude_slot(
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     let local = read_registered_claude_slot_locally(&descriptor)
         .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
-    resolve_registered_claude_slot_from_local(descriptor, local)
+    resolve_registered_claude_slot_from_local(local)
 }
 
 /// Resolve a registered slot from local metadata alone. `claude auth status`
@@ -6724,7 +6672,6 @@ fn resolve_registered_claude_slot(
 /// same fields are read here directly, so no Claude command runs and nothing
 /// can refresh (or sign out) the login.
 fn resolve_registered_claude_slot_from_local(
-    descriptor: ClaudeConfigSlotDescriptorV1,
     local: ClaudeSlotLocalRead,
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     match local.state {
@@ -6762,7 +6709,6 @@ fn resolve_registered_claude_slot_from_local(
         &account.credential_fingerprint_hash,
     );
     Ok(ResolvedClaudeSlot {
-        descriptor,
         account,
         account_identifier_hash,
         organization_identifier_hash,
@@ -8087,27 +8033,16 @@ fn degraded_claude_slot_snapshot(
         },
         provider: Some("anthropic".to_string()),
         auth_method: Some("oauth".to_string()),
-        email: None,
-        account_id: None,
-        organization_id: None,
-        organization_label: None,
-        plan_type: None,
-        subscription_product: None,
         billing_channel: Some("subscription".to_string()),
-        subscription_period_start: None,
-        subscription_period_end: None,
-        subscription_period_last_checked_at: None,
         account_identifier_hash: Some(account_hash),
         organization_identifier_hash: Some(organization_hash),
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
         billing_identity_evidence: Some("provider_account_id".to_string()),
         claude_quota_access_state: Some(access_state),
         claude_anchor_durability: Some(durability),
         claude_anchor_health: anchor_health,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
+        ..unsupported_account("anthropic")
     });
     if let Some(profile) = exact_claude_slot_account_profile(status) {
         let account = snapshot.account.as_mut().expect("degraded account exists");
@@ -15152,29 +15087,10 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
     snapshot.account = Some(AgentAccountStatus {
         login_state: AgentLoginState::Unknown,
         provider: None,
-        auth_method: None,
         email: read_pi_safe_auth_metadata()
             .and_then(|metadata| first_json_string(&metadata, &["email"])),
-        account_id: None,
-        organization_id: None,
-        organization_label: None,
-        plan_type: None,
-        subscription_product: None,
-        billing_channel: None,
-        subscription_period_start: None,
-        subscription_period_end: None,
-        subscription_period_last_checked_at: None,
-        account_identifier_hash: None,
-        organization_identifier_hash: None,
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
-        billing_identity_evidence: None,
-        claude_quota_access_state: None,
-        claude_anchor_durability: None,
-        claude_anchor_health: None,
-        billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Low,
+        ..unsupported_account("")
     });
     let settings = read_pi_agent_settings();
     let auth = read_pi_agent_auth();
@@ -15538,28 +15454,8 @@ fn not_installed_snapshot(
     snapshot.account = Some(AgentAccountStatus {
         login_state: AgentLoginState::Unsupported,
         provider: None,
-        auth_method: None,
-        email: None,
-        account_id: None,
-        organization_id: None,
-        organization_label: None,
-        plan_type: None,
-        subscription_product: None,
-        billing_channel: None,
-        subscription_period_start: None,
-        subscription_period_end: None,
-        subscription_period_last_checked_at: None,
-        account_identifier_hash: None,
-        organization_identifier_hash: None,
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
-        billing_identity_evidence: None,
-        claude_quota_access_state: None,
-        claude_anchor_durability: None,
-        claude_anchor_health: None,
-        billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::High,
+        ..unsupported_account("")
     });
     snapshot.diagnostics.push(AgentStatusDiagnostic::source(
         "agent_cli_not_found",
@@ -15580,27 +15476,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
             login_state: AgentLoginState::SignedOut,
             provider: Some("openai".to_string()),
             auth_method: Some("oauth".to_string()),
-            email: None,
-            account_id: None,
-            organization_id: None,
-            organization_label: None,
-            plan_type: None,
-            subscription_product: None,
-            billing_channel: None,
-            subscription_period_start: None,
-            subscription_period_end: None,
-            subscription_period_last_checked_at: None,
-            account_identifier_hash: None,
-            organization_identifier_hash: None,
-            superseded_account_identifier_hash: None,
-            superseded_organization_identifier_hash: None,
-            credential_fingerprint_hash: None,
-            billing_identity_evidence: None,
-            claude_quota_access_state: None,
-            claude_anchor_durability: None,
-            claude_anchor_health: None,
-            billing_identity_confidence: AgentStatusConfidence::Unknown,
             confidence: AgentStatusConfidence::Medium,
+            ..unsupported_account("openai")
         });
     }
     let email = extract_email(text);
@@ -15617,26 +15494,11 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
         provider: Some("openai".to_string()),
         auth_method: Some("oauth".to_string()),
         email,
-        account_id: None,
-        organization_id: None,
-        organization_label: None,
         plan_type: plan_type.clone(),
         subscription_product: plan_type.map(|plan| format!("chatgpt_{plan}")),
         billing_channel: Some("subscription".to_string()),
-        subscription_period_start: None,
-        subscription_period_end: None,
-        subscription_period_last_checked_at: None,
-        account_identifier_hash: None,
-        organization_identifier_hash: None,
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
-        billing_identity_evidence: None,
-        claude_quota_access_state: None,
-        claude_anchor_durability: None,
-        claude_anchor_health: None,
-        billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Medium,
+        ..unsupported_account("openai")
     })
 }
 
@@ -15747,24 +15609,15 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         email,
         account_id,
         organization_id: workspace_id,
-        organization_label: None,
         plan_type: plan_type.clone(),
         subscription_product: plan_type.map(chatgpt_subscription_product),
         billing_channel: Some("subscription".to_string()),
         subscription_period_start,
         subscription_period_end,
         subscription_period_last_checked_at,
-        account_identifier_hash: None,
-        organization_identifier_hash: None,
-        superseded_account_identifier_hash: None,
-        superseded_organization_identifier_hash: None,
-        credential_fingerprint_hash: None,
-        billing_identity_evidence: None,
-        claude_quota_access_state: None,
-        claude_anchor_durability: None,
-        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Low,
         confidence: AgentStatusConfidence::Low,
+        ..unsupported_account("openai")
     })
 }
 
@@ -33000,8 +32853,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         }
 
         let resolved = || ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 plan_type: Some("team".to_string()),
@@ -33133,8 +32984,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ]
         });
         let resolved = || ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 plan_type: Some("max".to_string()),
@@ -33305,8 +33154,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     #[test]
     fn unavailable_claude_read_keeps_verified_slot_labels_without_quota() {
         let resolved = ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 email: Some("test@example.invalid".to_string()),
