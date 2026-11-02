@@ -307,6 +307,12 @@ crate::durable_tail_codec::durable_struct!(CodexCompactionSizes {
     N pending_after: bool,
 });
 
+#[cfg(test)]
+impl CodexCompactionSizes {
+    pub(in crate::snapshots) fn s0_lengths(&self) -> Vec<u64> {
+        super::s0::estimate_elements(self.entries.iter())
+    }
+}
 impl CodexCompactionSizes {
     /// Keep the first marker at each timestamp. Once a timestamp falls below
     /// the newest-64 cutoff it can never return: that cutoff only increases.

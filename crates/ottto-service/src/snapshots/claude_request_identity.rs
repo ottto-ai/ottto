@@ -2871,6 +2871,12 @@ pub(crate) struct OrgMarkers {
     /// item is built and only for a file with a recorded email.
     home: Option<crate::claude_status_coverage::HomeKey>,
 }
+#[cfg(test)]
+impl OrgMarkers {
+    pub(in crate::snapshots) fn s0_counts(&self) -> (u64, bool) {
+        (self.entries.len() as u64, self.home.is_some())
+    }
+}
 
 /// Field check on an already-decoded, owned (non-inherited) Claude line.
 pub(crate) fn note_marker_line(

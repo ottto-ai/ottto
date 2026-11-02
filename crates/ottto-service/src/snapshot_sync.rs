@@ -8491,6 +8491,20 @@ fn finish_sync_source(
                 .map(String::as_str)
         });
     }
+    #[cfg(test)]
+    crate::snapshots::s0::upload_exit(match &upload_result {
+        Ok(ResumableUploadResult::Completed) => "completed",
+        Ok(ResumableUploadResult::Deferred { .. }) => "deferred",
+        Ok(ResumableUploadResult::Rejected { .. }) => "rejected",
+        Ok(ResumableUploadResult::Shed { .. }) => "shed",
+        Ok(ResumableUploadResult::Disabled(_)) => "disabled",
+        Err(error)
+            if snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState) =>
+        {
+            "local_state_error"
+        }
+        Err(_) => "upload_error",
+    });
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);

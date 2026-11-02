@@ -126,6 +126,7 @@ impl Lane {
         let scope = crate::transcript_acquisition::Scope("on-proof".into());
         let capture = crate::snapshots::claude_request_identity::captures(source);
         let cache = self.owner.cache.clone();
+        let jobs_lost_before = crate::snapshots::s0::cursor_snapshot(&cache);
         crate::snapshots::s0::bind_cache(&cache);
         let policy = SnapshotUploadPolicy::default();
         crate::snapshots::s0::event(
@@ -302,6 +303,18 @@ impl Lane {
         let emitted = wire_items.len();
         drop(wire_items);
         self.index = self.disk.commit(&cache, source, &mut index);
+        crate::snapshots::s0::saved();
+        crate::snapshots::s0::cursor_loss(
+            crate::snapshots::s0::cursor_snapshot(&cache).saturating_sub(jobs_lost_before),
+        );
+        crate::snapshots::s0::upload_exit(if upload_failed {
+            "upload_error"
+        } else if rejected > 0 {
+            "preflight_rejected"
+        } else {
+            "completed"
+        });
+        crate::snapshots::s0::end_pass();
         drop(index);
         crate::snapshots::s0::audits(&self.index);
         if source == SnapshotSource::Codex {
@@ -832,11 +845,20 @@ fn run(arm: &str, dir: &Path) {
     );
     if arm == "cold" {
         oracle(dir, &lanes);
+        report(
+            arm,
+            json!({"phase":"s0_proxy","measurements":crate::snapshots::s0::proxy_measurements(dir)}),
+        );
     } else {
         // A restart: a new owner with an empty cache over the same committed
         // checkpoint and store, which keep their production path and binding.
         let restart = |lanes: &mut [Lane]| {
             for lane in lanes {
+                report(
+                    arm,
+                    json!({"phase":"restart_cursor_state","source":lane.source.api_slug(),
+                    "counts":crate::snapshots::s0::cursor_restart(&lane.owner.cache)}),
+                );
                 lane.owner = E2ScanFixture::default();
             }
         };

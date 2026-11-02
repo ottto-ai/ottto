@@ -29579,6 +29579,8 @@ impl OwnedSourceScan {
                 }
                 index.archive_pass.started |= active.parser.reader.reader.is_compressed();
                 let mut group_end = None;
+                #[cfg(test)]
+                s0::reading(&local_index_key(&active.candidate.path));
                 let stepped = if active.group.is_some() {
                     // A group job: one record of the current member, or one
                     // member transition (P2).

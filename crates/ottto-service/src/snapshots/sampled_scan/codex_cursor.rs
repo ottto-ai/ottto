@@ -4658,6 +4658,25 @@ impl SharedCache {
     }
 
     #[cfg(test)]
+    pub(in crate::snapshots) fn s0_cursor_state(&self) -> [u64; 4] {
+        self.with_cursor(|cursor| {
+            let (paused, bootstrap) = match &cursor.slot {
+                Slot::Paused(job) => (
+                    1,
+                    job.parser.accumulator.codex_legacy_bootstrap_buffer.len() as u64,
+                ),
+                _ => (0, 0),
+            };
+            [
+                cursor.counters.jobs_lost,
+                paused,
+                u64::from(!matches!(cursor.proof, ProofHolder::None)),
+                bootstrap,
+            ]
+        })
+        .unwrap_or_default()
+    }
+    #[cfg(test)]
     pub(in crate::snapshots) fn counters_for_test(&self) -> Counters {
         self.with_cursor(|cursor| cursor.counters)
             .unwrap_or_default()

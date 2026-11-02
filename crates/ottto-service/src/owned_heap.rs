@@ -88,6 +88,18 @@ impl<T: HeapLayoutBound> HeapLayoutBound for OwnedVec<T> {
         self.elements.is_some()
     }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        #[cfg(test)]
+        if crate::snapshots::s0::measuring_heap() {
+            c.add(
+                self.values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<T>())?,
+            )?;
+            for value in &self.values {
+                value.heap_bound(c)?;
+            }
+            return Some(());
+        }
         c.add(
             self.values
                 .capacity()
@@ -175,6 +187,10 @@ impl<K: HeapLayoutBound, V: HeapLayoutBound> HeapLayoutBound for OwnedMap<K, V> 
         self.elements.is_some()
     }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        #[cfg(test)]
+        if crate::snapshots::s0::measuring_heap() {
+            return self.values.heap_bound(c);
+        }
         heap_layout_bound::tree_nodes::<K, V>(self.values.len(), c)?;
         c.add(self.elements?)
     }

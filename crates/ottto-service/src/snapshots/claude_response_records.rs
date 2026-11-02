@@ -43,6 +43,32 @@ pub(super) struct ClaudeResponseBook {
 }
 
 impl ClaudeResponseBook {
+    #[cfg(test)]
+    pub(super) fn s0_geometry(&self) -> super::s0::BookGeometry {
+        use crate::durable_tail_codec::Durable;
+        let mut lengths = super::s0::estimate_elements(self.responses.iter());
+        for (key, slot) in self.index.iter() {
+            let mut e = crate::durable_tail_codec::Enc::count(usize::MAX);
+            if key.put(&mut e).is_ok() {
+                if let Some(n) = lengths.get_mut(*slot as usize) {
+                    *n += e.counted() as u64;
+                }
+            }
+        }
+        let mut head = crate::durable_tail_codec::Enc::count(usize::MAX);
+        let head_bytes = self
+            .selectors
+            .put(&mut head)
+            .ok()
+            .map_or(0, |_| head.counted() as u64);
+        super::s0::BookGeometry {
+            head_bytes,
+            elements: lengths.len(),
+            pages: super::s0::CANDIDATE_G
+                .map(|g| lengths.chunks(g).map(|v| v.iter().sum()).collect()),
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.responses.is_empty()
     }
@@ -73,6 +99,7 @@ impl ClaudeResponseBook {
                 .ok()
                 .map(|_| e.counted() as u64);
             super::s0::touch(
+                slot as usize,
                 self.responses.len().saturating_sub(slot as usize + 1),
                 encoded,
             );

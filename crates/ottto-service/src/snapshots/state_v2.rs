@@ -549,3 +549,8 @@ pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 pub(super) fn growth_claim_refused(reason: &'static str) {
     telemetry::event("growth_claim_refused", &reason);
 }
+
+#[cfg(test)]
+pub(crate) fn s0_header_scan(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    sqlite::s0_header_scan(path)
+}

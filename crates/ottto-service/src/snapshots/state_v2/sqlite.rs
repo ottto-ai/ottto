@@ -1813,3 +1813,43 @@ impl Sqlite {
         })
     }
 }
+
+/// Count-only inventory timing on an immutable copied main DB. Never opens
+/// a runtime path and never writes a database, WAL, or checkpoint.
+#[cfg(test)]
+pub(in crate::snapshots) fn s0_header_scan(path: &Path) -> Result<serde_json::Value> {
+    let uri = sqlite_uri(path, "immutable=1")?;
+    let conn = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let now = Instant::now();
+    conn.execute_batch("BEGIN")?;
+    let mut after = None;
+    let mut count = 0u64;
+    let mut pages = 0u64;
+    let mut value_bytes = 0u64;
+    loop {
+        let page = scan(
+            &conn,
+            RowPrefix {
+                table: Table::Records,
+            },
+            after.as_ref(),
+            PAGE_HEADERS,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        count += page.len() as u64;
+        pages += 1;
+        value_bytes += page.iter().map(|h| h.len).sum::<u64>();
+        after = page.last().map(|h| h.key.clone());
+    }
+    conn.execute_batch("ROLLBACK")?;
+    Ok(
+        serde_json::json!({"rows":count,"pages":pages,"logical_value_bytes":value_bytes,
+        "header_scan_us":now.elapsed().as_micros(),"header_scan_ms":now.elapsed().as_secs_f64()*1000.,
+        "main_file_bytes":std::fs::metadata(path)?.len(),"immutable":true,"wal_included":false,"tail_load_tx_ms":null}),
+    )
+}

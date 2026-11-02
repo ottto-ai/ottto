@@ -596,6 +596,20 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N content_end: Option<u64>,
 });
 
+#[cfg(test)]
+impl SessionStartState {
+    pub(in crate::snapshots) fn s0_counts(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            (
+                "OpeningCall.files",
+                self.calls.values().map(|v| v.files.len() as u64).sum(),
+            ),
+            ("session_start.calls", self.calls.len() as u64),
+            ("session_start.claude_blobs", self.claude_blobs.len() as u64),
+            ("session_start.files", self.files.len() as u64),
+        ]
+    }
+}
 impl SessionStartState {
     pub(super) fn client_version(&self) -> Option<&str> {
         self.client_version.as_deref()
