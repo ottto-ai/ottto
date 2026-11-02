@@ -179,14 +179,14 @@ pub(super) trait CursorContinuation {
 /// A platform answer. Anything but `Allowed` falls back to the ordinary
 /// cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlatformState {
+pub(crate) enum PlatformState {
     Allowed,
     Refused,
     Unknown,
 }
 
 /// Mandatory platform gates for a continuation page (hunk F).
-pub(super) trait PlatformGates {
+pub(crate) trait PlatformGates {
     /// On mains power with Low Power Mode off.
     fn power(&mut self) -> PlatformState;
     /// Lower this thread to background QoS for the page. `Allowed` means it
@@ -196,7 +196,7 @@ pub(super) trait PlatformGates {
 }
 
 #[derive(Default)]
-pub(super) struct MacPlatformSignals {
+pub(crate) struct MacPlatformSignals {
     saved: Option<(u32, i32)>,
     #[cfg(test)]
     setter: Option<fn(u32, i32) -> bool>,
@@ -242,7 +242,7 @@ impl MacPlatformSignals {
             PlatformState::Unknown
         }
     }
-    fn background() -> Option<Self> {
+    pub(crate) fn background() -> Option<Self> {
         let mut signals = Self::default();
         (signals.enter_background_qos() == PlatformState::Allowed).then_some(signals)
     }

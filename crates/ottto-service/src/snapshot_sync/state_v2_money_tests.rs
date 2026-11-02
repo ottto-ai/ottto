@@ -683,6 +683,7 @@ fn cold_row(name: &str) {
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
         let (custody, v2) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
             &v1,
             &c.base.canonicalize().unwrap().join("cold-session"),
         );

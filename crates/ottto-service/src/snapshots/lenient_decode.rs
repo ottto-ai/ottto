@@ -327,11 +327,12 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
-        field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
+        field!(archives, BTreeMap::is_empty);
+        field!(archive_deferred_alarm_count, is_zero_u64);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
@@ -450,7 +451,7 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
-    "upload_context_fingerprint",
+    "upload_context_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "files",
     "session_account_bindings",
     "terminal_jsonl_dispositions",
@@ -537,6 +538,8 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
     "upload_context_proof",
+    "archives",
+    "archive_deferred_alarm_count",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -615,6 +618,9 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
+    // Exact-ACK stamps of the carried acknowledgements (P2). Damage only
+    // means owed, as on a load.
+    "upload_context_proof",
 ];
 #[derive(Default)]
 struct Counts {
@@ -1870,7 +1876,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
-        self.records_checked(field, span, debt, |_| false)
+        self.records_checked(field, span, debt, |_| false, None)
     }
     fn records_checked<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -1878,9 +1884,16 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
         repaired: impl Fn(&T) -> bool,
+        unknown: Option<fn() -> T>,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
+            if let Some(unknown) = unknown {
+                return Ok(BTreeMap::from([(
+                    codex_compressed_input::UNKNOWN_ARCHIVE_SCOPE.to_owned(),
+                    unknown(),
+                )]));
+            }
             if debt {
                 return Err(Error::Refused("unkeyed negative collection"));
             }
@@ -1904,6 +1917,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             } else {
                 self.typed(value)
             };
+            let decoded = decoded.or_else(|error| unknown.map(|f| f()).ok_or(error));
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
@@ -1982,6 +1996,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             span,
             true,
             |record: &SnapshotQuarantineRecord| !snapshot_quarantine_deadline_is_bounded(record),
+            None,
         )?;
         self.repair_held(
             "quarantined_snapshot_fingerprints",
@@ -2139,11 +2154,26 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_ack_retirement_handoff =
                                 self.history_scalar(value, None)?
                         }
-                        "upload_context_fingerprint" => {
-                            index.upload_context_fingerprint = self.typed(value)?
-                        }
+                        "upload_context_fingerprint" => {} // TOMBSTONE: decode-and-drop.
                         "files" => {
                             index.files = self.records::<Shared<_>>("files", value, true)?.into()
+                        }
+                        "archive_deferred_alarm_count" => {
+                            index.archive_deferred_alarm_count =
+                                self.diagnostic_timestamp(value)?.unwrap_or(0)
+                        }
+                        "archives" => {
+                            index.archives = self
+                                .records_checked(
+                                    "archives",
+                                    value,
+                                    false,
+                                    |_| false,
+                                    Some(codex_compressed_input::ArchiveEvidence::unknown),
+                                )?
+                                .into_iter()
+                                .map(|(key, a)| (key, a.checked()))
+                                .collect()
                         }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?

@@ -180,7 +180,31 @@ impl PipelineFixture {
     ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
-        index.activate_upload_context(cycle.upload_context.to_string());
+        // Production order (`finish_sync_source`): the upload ledger loads
+        // under the context's quarantine witness, and one activation binds
+        // the context to the index and the ledger before the scan. Contexts
+        // are fingerprint-shaped on the wire and in the durable ledger.
+        let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
+        let progress_path = self.base.join("upload-progress.json");
+        let mut progress = if self.durable_progress {
+            SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 99),
+                crate::snapshots::snapshot_quarantine_witness_for_context(
+                    SnapshotSource::ClaudeCode,
+                    &upload_context,
+                ),
+            )
+            .expect("load durable synthetic upload progress")
+        } else {
+            test_upload_progress()
+        };
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            upload_context,
+            &mut index,
+            &mut progress,
+        );
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
@@ -237,17 +261,6 @@ impl PipelineFixture {
             &mut scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
-        let progress_path = self.base.join("upload-progress.json");
-        let mut progress = if self.durable_progress {
-            SnapshotUploadProgress::load(
-                &progress_path,
-                &format!("{:064x}", 99),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .expect("load durable synthetic upload progress")
-        } else {
-            test_upload_progress()
-        };
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
@@ -408,15 +421,20 @@ impl PipelineFixture {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
             PipelineUpload::ServerDeferred => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
             }
             PipelineUpload::ServerRejected => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true, None)
             }
             PipelineUpload::EntityAckRejected { .. } => match &result {
-                ResumableUploadResult::Rejected { .. } => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
-                }
+                ResumableUploadResult::Rejected { .. } => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    true,
+                    None,
+                ),
                 ResumableUploadResult::Completed => {
                     settle_completed_upload(index, &committed_index, &progress, &holds)
                 }
@@ -432,6 +450,19 @@ impl PipelineFixture {
         }
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        // The service finish: each exact ACK of this page's sent bodies earns
+        // its file receipt under the active context. Refused or unsent bodies
+        // are not accepted, so their files stay owed.
+        let acks: BTreeMap<String, String> =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
+                .into_iter()
+                .filter(|(entity, _)| progress.accepted_fingerprints.contains(entity))
+                .collect();
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &acks,
+        );
         let fully_settled = settle_upload_corrections_after_selection(
             &mut index,
             &scan,

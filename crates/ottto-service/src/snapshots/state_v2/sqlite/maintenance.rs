@@ -209,6 +209,13 @@ impl MaintenanceStats {
     }
 }
 
+unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
+    // Installed only by limited and removed before its stack deadline drops.
+    // No panic crosses the C boundary.
+    let deadline = unsafe { &*(raw.cast::<Instant>()) };
+    (Instant::now() >= *deadline) as std::ffi::c_int
+}
+
 /// Interrupt work at VM progress points. Busy waits have their separate 100 ms
 /// bound. This is a finite work budget, not a hard wall-clock latency promise.
 fn limited<T>(conn: &Connection, work: Duration, f: impl FnOnce() -> Result<T>) -> Result<T> {

@@ -216,6 +216,7 @@ impl<'a> UsageView<'a> {
                 .fold(0, usize::saturating_add),
         }
     }
+    #[cfg(test)]
     pub(super) fn occurrences(self) -> usize {
         match self {
             Self::Full(f) => f.occurrences(),

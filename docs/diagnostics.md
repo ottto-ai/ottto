@@ -79,6 +79,8 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
+| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure or live ACK-custody hold remains visible after hydration. This is current posture, not an occurrence counter. |
+| `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without an interrupt deadline; a slow scan never holds collection. |
 | `db_unavailable_cause` | Latest v2 storage-hold cause: `at` = outermost static `state_v2_*` code, `cause` = innermost static code, `io_<ErrorKind>` or `sqlite_<extended code>`. Never messages, paths, keys or values. |
 | `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
 | `ack_receipt_inventory` | Companion count/bytes/bounded inventory during maintenance; does not certify a recovery set or authorize GC. |
@@ -128,6 +130,14 @@ maintenance work. A pending age is null when no obligation exists or its clock
 is unavailable; `erasure_overdue` distinguishes conservative clock handling.
 Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
 by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+
+Source health uses `index_retrying` and "local index busy, retrying" for typed
+reload, migration, save-pressure and ACK-custody holds. These do not increment
+repair-required counters or recommend repair. Unsupported formats require an
+update. `DbUnavailable` retains `index_shard_unavailable` repair advice for every
+cause; explicit integrity repair, lost fences, foreign bindings and reference
+drift also retain repair advice. A successful compatible load clears retrying;
+a different current refusal replaces the old reason.
 
 There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
 
@@ -1666,6 +1676,14 @@ rereads count again. Shape probes do not count. These are observations rather
 than retention failures.
 
 
+## Codex non-default thread tier
+
+`codex_non_default_thread_tier` in `process_retained_cache_lifecycle_totals`
+counts each `thread_settings_applied` line whose `service_tier` is `fast`,
+`priority` or `flex`, whether or not its date makes it count for pricing; rereads
+count again. It is a cumulative saturating process total with no labelled log
+line and no path or session id, and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
@@ -1871,41 +1889,19 @@ Conflicting retained predecessors also require their existing writer/receipt
 settlement before another witness can be installed. A failed stat/read is never
 proven absence; unlink's pending directory sync stays in key custody.
 
-`retire_exact_held_first_attempt{source}` is a **process proxy**, emitted with
-`process_id` on the same per-source pass carrier. It counts keys whose first
-retirement attempt in this process lacked authority; a first success followed
-by a later hold does not count. It resets on restart and stores no restart
-streak. Alarm on the server/log side when this proxy is non-zero across more
-than three consecutive starts. It cannot identify a repeated key. If a first
-observation cannot be funded or is reclaimed, the process latches
-`retire_exact_first_attempt_tracking_closed` and stops enrolling first attempts;
-the cumulative total is then a lower bound and a returning key cannot count
-twice. These observations use the existing bounded key custody and do not
-change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
 Codex and Pi report `restored_behind_accepted.published` only when a complete
 restored Tail body below the frozen accepted extent reaches publication.
 
-`rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
-**proxies**, emitted once per source pass as cumulative process totals on the
-existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
-whose first eligible non-quiet (b) restore attempt in this process failed, including
-a fence drop; later failures of the same key do not increment it, and a first
-success followed by failure does not count. Its diagnostic marker shares the
-bounded key custody. Under capacity pressure, idle diagnostic observations and
-expired pacing can be reclaimed; live receipt, discovery and retirement custody
-remain protected. If any first-result marker is forgotten or cannot be funded,
-`rederive_first_attempt_tracking_closed` latches true and no more first results
-are enrolled for this process. The first-failure total is then a lower bound;
-returning keys cannot be counted twice, and diagnostics cannot pin write capacity. The quiet proxy
-counts metadata-only restores returning Pending with zero transcript input.
+`restore_pending_quiet{source}` is emitted once per source pass as a cumulative
+process total on the existing `durable_tail_alarm` carrier with `process_id`.
+It counts metadata-only restores returning Pending with zero transcript input.
 It does not decode obligations and cannot establish `pending_no_obligation`.
-Neither proxy measures a per-key restart streak. Compare process totals using
-`process_id`; they reset on restart and carry no key identity. Full-spend time
-and near-cap use for funded keys also live in key custody, so evicting the paid
-pace node cannot renew either allowance.
+Compare totals using `process_id`; they reset on restart and carry no key identity.
+Full-spend time and near-cap use for funded keys live in key custody, so evicting
+the paid pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 
@@ -2149,6 +2145,28 @@ Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
 and kept today's untagged/refused rule). `accepted_share_changed` also counts
 proved rows sent with different proof.
 
+### Freshness alarm (all sources)
+
+Each source emits one `local_resources` `freshness_alarm` point when a root walk
+ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
+`now - live mtime` over indexed files whose live listing stamp differs from the
+stored settled stamp, and `changed_files` and `over_6h_files` count them.
+Members of an `UnprovenTerminal` Claude usage-authority family are reported
+apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
+hold keeps the pre-growth stamp and no read reaches the growth, so they are real
+unuploaded data, never counted as accepted or $0. A failed pass may never reach
+the walk, so with `basis: "last_ack"` `age_s` is the time since the source's
+newest accepted upload receipt, the file counts are 0, and no receipt in the
+bounded ring gives `age_s: null`. `alarm` is true when `age_s` is null or above
+21,600 seconds, or when `authority_terminal_files` is above 0 at any age, which
+lasts until those files settle. Both inputs are durable and nothing new is
+stored, so the first complete walk after a restart reports the true age; only the
+in-progress fold is process-local, so a restart mid-walk under-reports for one
+walk and a retried page can count a file twice. A file appended to continuously
+reads as fresh until it pauses. Files refused by snapshot quarantine settle
+without acceptance and stay with the terminal counters. The row carries counts
+only, and the `money_freshness_disabled` marker does not affect it.
+
 ### Money freshness (Claude queue and replay)
 
 The default-ON Claude shadow and freshness gauges share one
@@ -2163,11 +2181,10 @@ All ages are process-local LOWER BOUNDS, never inputs to decisions.
 A regular file `money_freshness_disabled` in the normal support directory turns
 BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
 them ON. Policy is read once per process; restart after adding/removing the
-marker. OFF skips Touched allocation, equality attestation, page observation and
-metadata observation before any tracker mutex, clone or candidate decision. It
-emits neither shadow nor freshness data. The ordinary scan and skipped-file audit
-count continue unchanged. Fixtures use thread-local guards and never consult the
-host marker.
+marker. OFF skips Touched allocation, equality attestation and page observation
+before any tracker mutex, clone or candidate decision. It emits neither shadow
+nor freshness gauge data. The ordinary scan and skipped-file audit count continue
+unchanged. Fixtures use thread-local guards and never consult the host marker.
 
 `discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
 `discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
@@ -2178,35 +2195,9 @@ retained stamps. `skipped_untracked_entries` and
 16,384-stamp bound; they are occurrences, not invented distinct-file counts.
 Directories not yet enumerated and files outside the skipped view are uncovered.
 
-`changed_since_scan_files` and `unchanged_since_scan_files` compare metadata
-already observed on the opened candidate with indexed size and second/nanosecond
-mtime. No transcript read or extra candidate stat is added. Missing or stale
-samples and files without an indexed scan count as
-`changed_since_scan_unknown_files`; `changed_since_scan_complete_count` is null
-when coverage is incomplete. The first page may have only unknown coverage.
-These counters are folded into the existing FirstPending traversal and bounded
-stamp work, with no third queue pass or second map.
-
-`changed_over_6h_alarm` is true after observed changed positives on consecutive
-passes span **more than 21,600 seconds**; the same row includes unread count and
-age. There is no second alarm emission. Zero/unknown-only observations, scope
-reset, restart or clock rollback break the episode. Inter-pass continuity is a
-sampled condition, not proof of continuous filesystem state.
-
-The restart proxy is DERIVED server/log-side from this same emission:
-`tracker_initialized && changed_since_scan_files > 0`, correlated with its
-`process_id` and source. `tracker_initialized` is claimed by an independent
-process-wide atomic at completed emission, so it is true AT MOST ONCE per process.
-Tracker resets, index reloads, scope/path changes and kill-switch toggles never
-re-arm it. No per-scope ledger, restart_* payload field or persisted evidence is
-needed. This counts starts with an observed positive condition; it does not prove
-a prior episode. A positive condition cleared before the first completed pass,
-or hidden by unknown initial metadata, is not counted. A disabled process emits
-nothing and does not claim a first observation.
-
-Memory remains bounded by the existing 16,384 stamps (48 bytes each, +512 KiB
-versus the original shadow), accounted by runtime_heap_bytes and its retained
-bound. Classification is transient in the existing bounded heap/vector; there
-is no separate gauge dedup allocation or scope ledger. Enlarged stamp transients
-are conservatively bounded by an additional 4 MiB. No child-finalize eligibility
-measurement, dormant family-consumer API or money/read/census decision is added.
+Memory remains bounded by the existing 16,384 stamps (16 bytes each), accounted
+by runtime_heap_bytes and its retained bound. Classification is transient in the
+existing bounded heap/vector; there is no separate gauge dedup allocation or
+scope ledger. Enlarged stamp transients are conservatively bounded by an
+additional 4 MiB. No child-finalize eligibility measurement, dormant
+family-consumer API or money/read/census decision is added.
