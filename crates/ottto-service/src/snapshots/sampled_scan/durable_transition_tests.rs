@@ -1130,6 +1130,241 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
     });
 }
 
+/// [money] The requested tier from thread settings, from real old state: both
+/// counting versions start from pinned-writer records of a pre-epoch prefix
+/// that holds a Fast snapshot and no reducer key. Post-epoch growth then emits
+/// what a cold Full emits on RAM and restart, in totals and placement, first
+/// with no new snapshot, where the pre-epoch evidence stamps nothing on any
+/// route, then through an explicit tier, a clearing snapshot and another
+/// explicit tier. Controls: swapped accounts and a changed tier fail the
+/// comparator.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M1 requires qualified native heap layout"
+)]
+fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
+    if !supported("shared_codex_thread_tier") {
+        return;
+    }
+    const SECOND: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let source = SnapshotSource::Codex;
+    let settings = |at: &str, tier: Option<&str>| {
+        let mut settings = json!({"model": "gpt-5.2"});
+        if let Some(tier) = tier {
+            settings["service_tier"] = json!(tier);
+        }
+        json!({"type":"event_msg","timestamp":at,"payload":{
+            "type":"thread_settings_applied","thread_settings":settings}})
+        .to_string()
+            + "\n"
+    };
+    let tiers = |scan: &SourceScanResult| {
+        let mut tiers = BTreeMap::<Option<String>, u64>::new();
+        let root = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        for row in &root.model_usage {
+            *tiers
+                .entry(row.selector_context.get("service_tier").cloned())
+                .or_default() += row.input_tokens;
+        }
+        tiers
+    };
+    for legacy in [false, true] {
+        let c = corpus(if legacy {
+            "transition-codex-tier-legacy"
+        } else {
+            "transition-codex-tier-v2"
+        });
+        let disk = Disk::new(&c);
+        // The session id in the file name is what lets each header's creator
+        // pair reach the row as account evidence.
+        let files = [ROOT, SECOND].map(|session| {
+            let name = format!("rollout-2026-10-27T07-00-00-{session}.jsonl");
+            (c.root.join(name), session)
+        });
+        let grow = |text: &str| {
+            for (path, session) in &files {
+                append(path, &text.replace(ROOT, session));
+                input_clock(path);
+            }
+        };
+        for (path, session) in &files {
+            let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"id":session,"timestamp":"2026-10-27T07:00:00Z",
+                "creator_user_id":format!("synthetic-user-{session}"),
+                "creator_account_id":format!("synthetic-workspace-{session}")}})
+            .to_string()
+                + "\n";
+            std::fs::write(path, header).unwrap();
+        }
+        grow(&(settings("2026-10-27T07:00:00Z", Some("priority")) + &codex_rows("turn-a", 10)));
+        let scanner = disk.owner(source);
+        // The record binds the cutover active at its commit.
+        let (mut live, mut prior) = {
+            let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+            let (mut live, scan, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (2, 0, 0));
+            live.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            let prior = disk.commit(&scanner.cache, source, &mut live);
+            (live, prior)
+        };
+        let _cutover = crate::snapshots::TestCutover::set(0);
+        if legacy {
+            // A real prior Legacy ACK keeps this file Legacy under the cutover.
+            grow(&codex_rows("turn-b", 20));
+            let (upgraded, scan, modes) = other_page(&c, &scanner, source, prior);
+            assert_eq!(modes, (2, 0, 0));
+            assert!(!scan.snapshots.is_empty());
+            live = upgraded;
+            prior = disk.commit(&scanner.cache, source, &mut live);
+        }
+        for (path, _) in &files {
+            let old = fixture::seed_old_writer(
+                &scanner.cache,
+                source,
+                &fixture::local_key(path),
+                &live,
+                WRITERS[0],
+            );
+            let key = b"codex_thread_tier";
+            assert!(!old.windows(key.len()).any(|bytes| bytes == key));
+        }
+        let mut flex = 0;
+        for (step, tier) in [None, Some(Some("flex")), Some(None), Some(Some("priority"))]
+            .into_iter()
+            .enumerate()
+        {
+            let at = "2026-11-09T07:00:00Z";
+            let snapshot = tier.map_or(String::new(), |tier| settings(at, tier));
+            let rows = codex_rows(&format!("tier-{step}"), 30 + step as u64)
+                .replace("2026-10-27", "2026-11-09");
+            grow(&(snapshot + &rows));
+            let (cold_index, cold_scan, cold_modes) =
+                other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+            assert_eq!(cold_modes, (2, 0, 0));
+            let owner = disk.owner(source);
+            let (restart_index, restart_scan, restart_modes) =
+                other_page(&c, &owner, source, prior.clone());
+            assert_eq!(restart_modes, (0, 2, 0));
+            assert_eq!(durable_restores(&owner.cache, source).1, 2);
+            disk.begin(&scanner, source);
+            let (mut ram_index, ram_scan, ram_modes) =
+                other_page(&c, &scanner, source, prior.clone());
+            assert_eq!(ram_modes, (0, 2, 0));
+            let route = |mode, index: &ScanIndex, scan: &SourceScanResult| {
+                let mut route = RouteResult::emitted(
+                    mode,
+                    source,
+                    vec![other_wire(source, scan)],
+                    &scan.snapshots,
+                );
+                route.codex_evidence = fixture::codex_evidence(index, scan);
+                route
+            };
+            let cold = route(Mode::ColdFull, &cold_index, &cold_scan);
+            let restart = route(Mode::Restart, &restart_index, &restart_scan);
+            money_oracle::assert_equivalent(&cold, &restart);
+            money_oracle::assert_equivalent(&cold, &route(Mode::Ram, &ram_index, &ram_scan));
+            let restored = tiers(&restart_scan);
+            let tiers = tiers(&cold_scan);
+            assert_eq!(restored, tiers, "restored and cold Full tiers");
+            let flex_now = tiers.get(&Some("flex".to_string())).copied().unwrap_or(0);
+            match step {
+                0 => {
+                    assert_eq!(tiers.len(), 1);
+                    assert!(
+                        tiers.contains_key(&None::<String>),
+                        "pre-epoch evidence stamps no post-epoch usage"
+                    );
+                }
+                1 => {
+                    assert_eq!(tiers.len(), 2);
+                    assert!(flex_now > 0);
+                    flex = flex_now;
+                }
+                2 => {
+                    assert_eq!(tiers.len(), 2);
+                    assert_eq!(flex_now, flex, "a clearing snapshot leaks no earlier tier");
+                }
+                _ => {
+                    assert_eq!(tiers.len(), 3);
+                    assert!(tiers.contains_key(&Some("priority".to_string())));
+                    let evidence =
+                        |session: &str| cold.snapshots[session]["session_account_evidence"].clone();
+                    let (a, b) = (evidence(ROOT), evidence(SECOND));
+                    assert!(a.is_object() && b.is_object(), "placement evidence");
+                    assert_ne!(a, b, "two accounts");
+                    let mut wrong = restart.clone();
+                    wrong.snapshots.get_mut(ROOT).unwrap()["session_account_evidence"] = b;
+                    wrong.snapshots.get_mut(SECOND).unwrap()["session_account_evidence"] = a;
+                    assert!(std::panic::catch_unwind(|| {
+                        money_oracle::assert_placement_equivalent(&cold, &wrong)
+                    })
+                    .is_err());
+                    let mut wrong = restart.clone();
+                    for row in wrong.snapshots.get_mut(ROOT).unwrap()["model_usage"]
+                        .as_array_mut()
+                        .unwrap()
+                    {
+                        if row["selector_context"].get("service_tier").is_some() {
+                            row["selector_context"]["service_tier"] = json!("standard");
+                        }
+                    }
+                    assert!(std::panic::catch_unwind(|| {
+                        money_oracle::assert_equivalent(&cold, &wrong)
+                    })
+                    .is_err());
+                }
+            }
+            ram_index.record_accepted_snapshot_fingerprints(
+                &ram_scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            prior = disk.commit(&scanner.cache, source, &mut ram_index);
+        }
+        // Nothing changed: a restarted process starts a first walk, which opens
+        // each file once for its identity samples and parses no byte of it.
+        let opens = crate::snapshots::all_transcript_opens_for_test();
+        let owner = disk.owner(source);
+        let ((_, quiet_scan, modes), consumed) =
+            fixture::observe_consumed(|| other_page(&c, &owner, source, prior.clone()));
+        assert!(quiet_scan.snapshots.is_empty());
+        let identity_opens = crate::snapshots::all_transcript_opens_for_test() - opens;
+        assert_eq!(identity_opens, files.len());
+        const IDENTITY_SAMPLE_BYTES: u64 = 4096;
+        let anchor_window = files
+            .iter()
+            .map(|(path, _)| match std::fs::metadata(path).unwrap().len() {
+                len if len > IDENTITY_SAMPLE_BYTES => 2 * IDENTITY_SAMPLE_BYTES,
+                len => len,
+            })
+            .sum::<u64>();
+        let mut quiet = RouteResult::emitted(Mode::Restart, source, Vec::new(), &[]);
+        quiet.modes = modes;
+        quiet.io = IoBytes {
+            consumed,
+            cheap_checks: Some(0),
+            anchor_reads: Some(anchor_window),
+            other_reads: Some(0),
+            ..Default::default()
+        };
+        money_oracle::assert_quiet_restart_with_anchor_window(&quiet, anchor_window);
+    }
+}
+
 /// First consumer: 24b observes the restored native state at the real EOF seam.
 /// Main still has the approved card-F content re-derivation: record it separately
 /// and leave the strict zero-old-byte target visibly unexecuted below.

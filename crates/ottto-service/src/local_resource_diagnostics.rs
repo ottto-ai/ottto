@@ -253,6 +253,12 @@ pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
     cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
 }
 
+/// Counts per observed `priority` or `flex` thread-settings snapshot, dated or
+/// not; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn codex_non_default_thread_tier() {
+    cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -2788,8 +2794,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi observation fields add 97 bytes at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2304);
+        // The two Pi fields add 97 bytes at u64::MAX, the Codex tier field 53.
+        assert!(serde_json::to_string(record).unwrap().len() < 2357);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

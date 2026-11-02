@@ -804,6 +804,7 @@ impl SnapshotAccumulator {
                 self.latest_turn_id.as_deref(),
             )
         });
+        self.stamp_codex_thread_tier(&mut usage_selector, timestamp);
         // Match the UI price stamp after tier replay, on this row only. Codex
         // input already includes cached input; price the original request's
         // prompt, even when coverage admits only part of its usage.
