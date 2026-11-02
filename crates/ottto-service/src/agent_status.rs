@@ -1,4 +1,3 @@
-use crate::claude_status_coverage::Observation as CoverageObservation;
 use crate::locked_state_dir::open_private_lock_file;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
@@ -4096,10 +4095,7 @@ fn resolve_claude_default_home_owner(
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
     // The same gates as a background usage read, "Background limit refresh"
     // included, and never for a lapsed token: no call means unproven.
-    let may_call = !refresh_pending
-        && !claude_oauth_usage_network_disabled()
-        && !claude_pass_saved_only()
-        && !claude_background_read_withheld();
+    let may_call = !refresh_pending && claude_owner_call_allowed();
     let owner = stable
         .credential
         .access_token
@@ -4873,8 +4869,6 @@ fn collect_claude_status_snapshots(
     custom_descriptors.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
     let (custom_descriptors, overflow_descriptors) =
         bounded_claude_custom_descriptors(custom_descriptors);
-    let coverage_dirs = crate::claude_status_coverage::enabled()
-        .then(|| claude_status_coverage_dirs(&custom_descriptors, &overflow_descriptors));
     for descriptor in overflow_descriptors {
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
@@ -4885,7 +4879,6 @@ fn collect_claude_status_snapshots(
                 crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
-                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 continue;
             }
             Some(
@@ -4893,7 +4886,6 @@ fn collect_claude_status_snapshots(
                 | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
-                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
                 continue;
             }
@@ -4906,7 +4898,6 @@ fn collect_claude_status_snapshots(
             upkeep_consent,
             &captured_at,
             &expires_at,
-            |observation| note_claude_status_coverage(&descriptor, &captured_at, observation),
         );
         match step {
             ClaudeSlotCollectionStep::PreGateRefused(status)
@@ -4945,12 +4936,6 @@ fn collect_claude_status_snapshots(
                 slot_states.insert(descriptor.slot_id, status);
             }
         }
-    }
-    if let Some(dirs) = &coverage_dirs {
-        crate::claude_status_coverage::retain_registered(
-            dirs.iter().map(String::as_str),
-            &home_dir().join(".claude"),
-        );
     }
     let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {
@@ -5824,20 +5809,6 @@ fn coherent_claude_provider_observed_at(snapshot: &AgentStatusSnapshot) -> Strin
         .to_string()
 }
 
-/// Every registered custom folder for the status-coverage feed. Slots past
-/// collection capacity are still registered: their transcripts must never
-/// read as never-registered.
-fn claude_status_coverage_dirs(
-    collected: &[ClaudeConfigSlotDescriptorV1],
-    overflow: &[ClaudeConfigSlotDescriptorV1],
-) -> Vec<String> {
-    collected
-        .iter()
-        .chain(overflow)
-        .filter_map(|descriptor| descriptor.config_dir.clone())
-        .collect()
-}
-
 fn bounded_claude_custom_descriptors(
     mut descriptors: Vec<ClaudeConfigSlotDescriptorV1>,
 ) -> (
@@ -5957,14 +5928,13 @@ enum ClaudeSlotCollectionStep {
 
 /// Gate, read, upkeep, resolve, gate again and call usage for one registered
 /// slot. A slot that stops before the usage call has its passive sign-in run
-/// ended here, and `note_coverage` hears each result at the point it is known.
+/// ended here.
 fn collect_registered_claude_slot_step(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
     upkeep_consent: bool,
     captured_at: &str,
     expires_at: &str,
-    note_coverage: impl Fn(CoverageObservation<'_>),
 ) -> ClaudeSlotCollectionStep {
     let slot_id = descriptor.slot_id.as_str();
     // Another account signed in to this slot: no upkeep, CLI, usage call,
@@ -5974,7 +5944,6 @@ fn collect_registered_claude_slot_step(
         Ok(expected) => expected,
         Err(status) => {
             claude_oauth_end_slot_run(slot_id);
-            note_coverage(CoverageObservation::Unavailable);
             // Another account here is exactly what the folder ledger records.
             note_refused_claude_slot(descriptor);
             return ClaudeSlotCollectionStep::PreGateRefused(status);
@@ -6011,7 +5980,6 @@ fn collect_registered_claude_slot_step(
     );
     if !upkeep.proceed_with_collection {
         claude_oauth_end_slot_run(slot_id);
-        note_coverage(CoverageObservation::Unavailable);
         let result_observed_at = upkeep.result_observed_at.clone();
         let paused = upkeep.paused_awaiting_claude_refresh;
         let mut status = if paused {
@@ -6035,11 +6003,6 @@ fn collect_registered_claude_slot_step(
         Ok(resolved) => resolved,
         Err(failure) => {
             claude_oauth_end_slot_run(slot_id);
-            note_coverage(match failure {
-                ClaudeSlotProbeFailure::SignedOutByCli
-                | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
-                _ => CoverageObservation::Unavailable,
-            });
             return ClaudeSlotCollectionStep::Stopped(registered_claude_failure_status(
                 descriptor,
                 failure,
@@ -6056,15 +6019,10 @@ fn collect_registered_claude_slot_step(
         captured_at,
     ) {
         claude_oauth_end_slot_run(slot_id);
-        note_coverage(CoverageObservation::Unavailable);
         return ClaudeSlotCollectionStep::Stopped(status);
     }
     let account_hash = resolved.account_identifier_hash.clone();
     let organization_hash = resolved.organization_identifier_hash.clone();
-    note_coverage(CoverageObservation::Qualified {
-        login: &account_hash,
-        org: &organization_hash,
-    });
     let access_token = resolved.credential.access_token.take();
     let credential_available = access_token.is_some();
     let outcome = collect_claude_oauth_usage_with_credential(
@@ -6140,14 +6098,12 @@ pub(crate) fn collect_registered_claude_slot_status(
     }
     let previous_states = read_persisted_claude_slot_collection_state();
     let previous = previous_states.slots.get(slot_id);
-    // This path keeps no status coverage: only the bulk pass feeds it.
     let step = collect_registered_claude_slot_step(
         &descriptor,
         previous,
         upkeep_consent,
         &captured_at,
         &expires_at,
-        |_| {},
     );
     match step {
         ClaudeSlotCollectionStep::PreGateRefused(mut status) => {
@@ -6661,6 +6617,14 @@ fn registered_slot_refresh(
     }
 }
 
+/// The background gates every owner-profile call shares ("Background limit
+/// refresh" included).
+fn claude_owner_call_allowed() -> bool {
+    !claude_oauth_usage_network_disabled()
+        && !claude_pass_saved_only()
+        && !claude_background_read_withheld()
+}
+
 /// Reports one folder's login to the recorded-login ledger, in memory. Reads no
 /// extra file. At most one profile call per token on the default folder, only
 /// while the capability is on and the folder can still qualify, never a login
@@ -6670,6 +6634,7 @@ fn note_claude_folder_owner(
     local: &ClaudeSlotLocalRead,
     registered: Option<&ClaudeSlotAccountBinding>,
 ) {
+    use crate::claude_status_coverage as coverage;
     use crate::snapshots::claude_folder_login as folder;
     let config_dir = slot
         .config_dir()
@@ -6694,7 +6659,7 @@ fn note_claude_folder_owner(
                 binding.account_identifier_hash.clone(),
                 binding.organization_identifier_hash.clone(),
             );
-            folder::OwnerReport {
+            coverage::OwnerReport {
                 slot: true,
                 other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
                 pair: cached.is_some().then_some(pair),
@@ -6707,12 +6672,10 @@ fn note_claude_folder_owner(
                 ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
                 _ => None,
             };
-            let may_call = folder::proof_wanted(&home)
+            let may_call = coverage::proof_wanted(&home)
                 && matches!(local.state, ClaudeLocalLoginState::AccessValid)
-                && !claude_oauth_usage_network_disabled()
-                && !claude_pass_saved_only()
-                && !claude_background_read_withheld();
-            folder::OwnerReport {
+                && claude_owner_call_allowed();
+            coverage::OwnerReport {
                 slot: false,
                 pair: cached,
                 proven: token
@@ -6723,12 +6686,13 @@ fn note_claude_folder_owner(
             }
         }
     };
-    folder::observe_owner(home, report);
+    coverage::observe(home, report);
 }
 
 /// A refused slot: only another strong account in it reaches the ledger. An
 /// unreadable login or approval proves nothing.
 fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
+    use crate::claude_status_coverage as coverage;
     use crate::snapshots::claude_folder_login as folder;
     if !claude_slot_login_unapproved(descriptor) || claude_slot_local_login(descriptor).is_none() {
         return;
@@ -6736,12 +6700,12 @@ fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
     if let Some(config_dir) = claude_config_slot_for_descriptor(descriptor)
         .and_then(|slot| slot.config_dir().map(PathBuf::from))
     {
-        folder::observe_owner(
+        coverage::observe(
             folder::folder_key(&config_dir),
-            folder::OwnerReport {
+            coverage::OwnerReport {
                 slot: true,
                 other_account: true,
-                ..folder::OwnerReport::default()
+                ..coverage::OwnerReport::default()
             },
         );
     }
@@ -14114,24 +14078,6 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
-/// Status-coverage feed: this slot's already-qualified hashes, or
-/// that the pass has none. Returns nothing, so the feed cannot change status.
-fn note_claude_status_coverage(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-    captured_at: &str,
-    observation: CoverageObservation<'_>,
-) {
-    if crate::claude_status_coverage::enabled() {
-        crate::claude_status_coverage::observe(
-            &descriptor.slot_id,
-            descriptor.config_dir.as_deref(),
-            &home_dir().join(".claude"),
-            captured_at,
-            observation,
-        );
-    }
-}
-
 /// Multi-account collection never assigns full meters through organization or
 /// email fallback. Both provider UUIDs must be present and independently
 /// hashed before a window or credit can leave the machine.
@@ -19542,8 +19488,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 mod tests {
     use super::*;
 
-    mod status_coverage_feed;
-
     /// The account resolution `collect_claude_status` performs, for tests that
     /// exercise the OAuth path directly.
     fn claude_oauth_account_identifier_hash() -> String {
@@ -21650,40 +21594,6 @@ mod tests {
             .slots
             .contains_key(&slot.slot_id));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn status_coverage_registers_slots_past_collection_capacity() {
-        use crate::claude_status_coverage::{self as coverage, Registration};
-        let default_dir = Path::new("/tmp/claude-default/.claude");
-        let registration = |dirs: &[String], dir: &str| {
-            coverage::clear_global_for_test();
-            coverage::retain_registered(dirs.iter().map(String::as_str), default_dir);
-            coverage::snapshot()
-                .expect("feed available")
-                .registration(&coverage::home_key(Path::new(dir)), u64::MAX)
-        };
-        for count in [9, 12] {
-            let (collected, overflow) =
-                bounded_claude_custom_descriptors((0..count).map(test_slot_descriptor).collect());
-            let dirs = claude_status_coverage_dirs(&collected, &overflow);
-            assert_eq!(dirs.len(), count, "overflow folders are fed too");
-            for index in 0..count {
-                // Past the ledger cap a folder may be forgotten, never proven absent.
-                assert_ne!(
-                    registration(&dirs, &format!("/tmp/claude-slot-{index}")),
-                    Registration::NeverRegistered
-                );
-            }
-            let unregistered = registration(&dirs, "/tmp/claude-slot-unregistered");
-            if count <= coverage::MAX_SLOTS {
-                assert_eq!(unregistered, Registration::NeverRegistered, "control");
-            } else {
-                assert_eq!(unregistered, Registration::Unknown);
-            }
-        }
-        coverage::clear_global_for_test();
     }
 
     /// Synthetic Claude and Codex agent-status snapshots exactly as the

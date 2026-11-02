@@ -435,9 +435,6 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         .iter()
         .filter(|(version, _)| *version > stored)
         .fold(0, |mask, (_, marks)| mask | marks);
-    let to = index
-        .active_effective_upload_body_witness_revision
-        .saturating_sub(1);
     let mut live = Vec::new();
     let mut owed = Vec::new();
     for key in index.files.keys() {
@@ -450,13 +447,21 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         }
         live.push(location);
     }
-    for key in owed {
-        index.re_owe_effective_upload_body_witness_revision(&key, to);
-    }
+    re_owe_files(index, owed);
     live.sort_unstable();
     let store = &mut index.claude_money_birth_store;
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
+}
+
+/// Owes these files one more read. The history gate paces them.
+pub(crate) fn re_owe_files(index: &mut ScanIndex, keys: Vec<String>) {
+    let to = index
+        .active_effective_upload_body_witness_revision
+        .saturating_sub(1);
+    for key in keys {
+        index.re_owe_effective_upload_body_witness_revision(&key, to);
+    }
 }
 
 /// Fixed count-only causes of the existing certificate veto.
@@ -913,7 +918,7 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
-    /// What this read saw for the folder ledger, set after the native finish.
+    /// Which file this fold read, for the folder ledger; set as it becomes an item.
     pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
 money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);

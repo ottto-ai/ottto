@@ -5,44 +5,43 @@
 //! the proven owner of a folder that has only ever held one login, or the
 //! account a registered slot is bound to. Everything else stays untagged.
 //!
-//! The email stays in memory: only the comparison result is persisted, as a
-//! file location in `FolderRecord::matched`, so a file resumed from its tail keeps
-//! its result without the sentence. The whole path stays off until the server
-//! advertises `SOLE_LOGIN_WITNESS_CONTRACT`.
+//! The evidence is the Claude applier's own accumulators (`OrgMarkers`, the fork
+//! flags). Only the comparison result is persisted, as a file location in
+//! `FolderRecord::matched`. The whole path stays off until the server advertises
+//! `SOLE_LOGIN_WITNESS_CONTRACT`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::Digest;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::claude_history_upgrade::{
+    HISTORY_UPGRADE_BYTES_PER_PAGE, HISTORY_UPGRADE_FILES_PER_PAGE,
+};
 use super::claude_money_birth_store::location_key;
 use super::claude_request_identity::{
-    complete_org, marker_email_digest, marker_org_hash, valid_login, AcceptedBuckets,
+    complete_org, marker_email_digest, valid_login, AcceptedBuckets, RecordedLogin,
 };
 use super::{local_index_key, ScanIndex, SnapshotItem, SoleLoginWitness};
 use crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 use crate::claude_status_coverage as coverage;
+pub(crate) use crate::claude_status_coverage::OwnerReport;
 
 /// Exact activity-hint capability; anything else leaves the path off.
 pub(crate) const SOLE_LOGIN_WITNESS_CONTRACT: &str = "session_request_sole_login_witness:v1";
-/// Default folder plus every registered and every previously registered slot.
-/// A folder past this bound is never recorded, so it never qualifies.
-pub(crate) const MAX_FOLDERS: usize = 1 + 2 * ottto_core::MAX_CLAUDE_ACCOUNT_SLOTS;
-/// A folder holding more own files than this stops recording them: the rest
-/// stay owed. 160 KiB per folder at most.
-const MAX_MATCHED_FILES: usize = 20_000;
-/// One folder's re-offer, whole. A bigger folder stays owed.
-const MAX_REOFFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-/// One re-offer step; the history gate then paces it page by page. Stepping is
-/// what lets a sticky verdict stop the rest of a folder's read.
-const REOFFER_STEP_FILES: usize = 2_000;
 const HOUR_SECONDS: i64 = 3_600;
 const MAX_HASH_TEXT: usize = 128;
+/// The sync cadence the history gate pages at, for the time estimate.
+const MINUTES_PER_PAGE: u64 = 5;
+/// A re-offer that moved no file for this long warns, and keeps going.
+const STALL_SECONDS: i64 = 6 * HOUR_SECONDS;
+/// Marks a ledger that decoded as damaged: it may have held a sticky verdict, so
+/// every folder first seen after it starts sticky.
+const DAMAGED_LEDGER: &str = "damaged";
 
 /// No re-offer started.
 const REOFFER_IDLE: u8 = 0;
@@ -52,7 +51,6 @@ const REOFFER_CENSUS: u8 = 1;
 /// Re-reading this folder's own matched files, so their bodies carry the tag.
 const REOFFER_TAG: u8 = 2;
 const REOFFER_DONE: u8 = 3;
-const REOFFER_TOO_BIG: u8 = 4;
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -63,103 +61,30 @@ pub(crate) fn folder_key(config_dir: &Path) -> String {
     hex(&coverage::home_key(config_dir))
 }
 
-/// The one address a recorded `userEmail` sentence names, lowercased. The
-/// wording belongs to another program: anything but exactly one well-formed
-/// address is no answer.
-fn recorded_address(text: &str) -> Option<String> {
-    let mut words = text.split_whitespace().filter(|word| word.contains('@'));
-    let word = words.next()?;
-    if words.next().is_some() {
-        return None;
-    }
-    let address = word.trim_matches(|c: char| ".,;:!?()<>[]\"'`".contains(c));
-    let (local, domain) = address.split_once('@')?;
-    let well_formed = !local.is_empty()
-        && domain.contains('.')
-        && !domain.contains('@')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.');
-    well_formed.then(|| address.to_ascii_lowercase())
-}
-
-/// The in-memory form of an address: both sides of the comparison use it.
+/// The in-memory form of the login's email: what `OrgMarkers` keeps of an address.
 pub(crate) fn address_digest(address: &str) -> String {
     marker_email_digest(&address.trim().to_ascii_lowercase())
 }
 
-/// What one transcript read saw. Never serialized, never logged.
-#[derive(Clone, Default, PartialEq, Eq)]
+/// Which file a fold read and whether it is its session's own, set when the
+/// finished fold becomes an item. Never serialized, never logged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FolderTrace {
-    org: Option<String>,
-    other_org: bool,
-    bad_org: bool,
-    email: Option<String>,
-    other_email: bool,
-    /// A sentence without exactly one address: untagged, no verdict on the folder.
-    unreadable_email: bool,
     forked: bool,
-    /// The read started at the first byte, so it saw any fork reference.
-    whole: bool,
     home: Option<String>,
     location: Option<u64>,
     /// Set for this page only, on a matched own file of a qualified folder.
     qualified: Option<Box<QualifiedFolder>>,
 }
-crate::heap_layout_bound::fields!(FolderTrace; org, other_org, bad_org, email, other_email, unreadable_email, forked, whole, home, location, qualified);
-
-impl std::fmt::Debug for FolderTrace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FolderTrace").finish_non_exhaustive()
-    }
-}
-
-/// Whether this line can change a trace, checked before any allocation.
-pub(crate) fn line_matters(value: &Value, inherited: bool) -> bool {
-    inherited
-        || match value.get("type").and_then(Value::as_str) {
-            Some("fork-context-ref") => true,
-            Some("attachment") => matches!(
-                value.pointer("/attachment/type").and_then(Value::as_str),
-                Some("credential_org" | "session_context")
-            ),
-            _ => false,
-        }
-}
+crate::heap_layout_bound::fields!(FolderTrace; forked, home, location, qualified);
 
 impl FolderTrace {
-    /// Called above the inherited-line return: a copied marker is still a trace.
-    pub(crate) fn note_line(&mut self, value: &Value, inherited: bool) {
-        let kind = value.get("type").and_then(Value::as_str);
-        self.forked |= inherited || kind == Some("fork-context-ref");
-        let Some(attachment) = value
-            .get("attachment")
-            .filter(|_| kind == Some("attachment"))
-        else {
-            return;
-        };
-        match attachment.get("type").and_then(Value::as_str) {
-            Some("credential_org") => match marker_org_hash(attachment) {
-                None => self.bad_org = true,
-                Some(org) => note_value(&mut self.org, &mut self.other_org, org),
-            },
-            Some("session_context") => {
-                let text = attachment
-                    .pointer("/context/userEmail")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    return;
-                }
-                match recorded_address(text) {
-                    Some(address) => note_value(
-                        &mut self.email,
-                        &mut self.other_email,
-                        address_digest(&address),
-                    ),
-                    None => self.unreadable_email = true,
-                }
-            }
-            _ => {}
+    pub(crate) fn of_file(path: &Path, forked: bool) -> Self {
+        Self {
+            forked,
+            home: coverage::transcript_home_key(path).map(|home| hex(&home)),
+            location: Some(file_location(&local_index_key(path))),
+            qualified: None,
         }
     }
 
@@ -167,17 +92,9 @@ impl FolderTrace {
         self.qualified.as_deref()
     }
 
-    /// What `attach_trace` adds to a finished fold: the box and three hashes.
+    /// What `of_file` adds to a finished fold: the box and one hash.
     pub(crate) fn finish_heap_bound() -> usize {
-        std::mem::size_of::<Self>() + std::mem::align_of::<Self>() + 3 * MAX_HASH_TEXT
-    }
-}
-
-fn note_value(first: &mut Option<String>, other: &mut bool, value: String) {
-    match first {
-        None => *first = Some(value),
-        Some(known) if *known == value => {}
-        Some(_) => *other = true,
+        std::mem::size_of::<Self>() + std::mem::align_of::<Self>() + MAX_HASH_TEXT
     }
 }
 
@@ -187,25 +104,6 @@ fn file_location(index_key: &str) -> u64 {
     u64::from_be_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
-}
-
-/// Hands the read's trace to the finished Claude items. `whole`: the read began
-/// at the file's first byte.
-pub(crate) fn attach_trace(
-    items: &mut [SnapshotItem],
-    path: &Path,
-    trace: Option<Box<FolderTrace>>,
-    whole: bool,
-) {
-    let mut trace = trace.unwrap_or_default();
-    trace.home = coverage::transcript_home_key(path).map(|home| hex(&home));
-    trace.location = Some(file_location(&local_index_key(path)));
-    trace.whole = whole;
-    for item in items {
-        if let Some(fold) = item.claude_money.as_deref_mut() {
-            fold.folder_trace = Some(trace.clone());
-        }
-    }
 }
 
 /// One folder's durable evidence: hashes, flags and file digests, no email.
@@ -228,20 +126,16 @@ pub(crate) struct FolderRecord {
     /// Sorted. Own files whose own marker matched `login` and `org`.
     matched: Vec<u64>,
     reoffer: u8,
-    reoffer_cursor: Option<String>,
-    /// Contradictions after names were possible. Earlier names stay inferred.
-    late_contradictions: u64,
+    /// Files the running re-offer still owes, and when that last changed.
+    reoffer_remaining: u64,
+    reoffer_moved_at: i64,
 }
-crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_cursor, late_contradictions);
+crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_remaining, reoffer_moved_at);
 
 impl FolderRecord {
     fn set_mixed(&mut self) {
-        if !self.mixed && (self.census_complete || self.fresh) {
-            self.late_contradictions = self.late_contradictions.saturating_add(1);
-        }
         self.mixed = true;
         self.matched = Vec::new();
-        self.reoffer_cursor = None;
     }
 
     fn note_pair(&mut self, login: Option<&str>, org: Option<&str>) {
@@ -277,9 +171,7 @@ impl FolderRecord {
 
     fn set_matched(&mut self, location: u64, matched: bool) {
         match (self.matched.binary_search(&location), matched) {
-            (Err(at), true) if self.matched.len() < MAX_MATCHED_FILES => {
-                self.matched.insert(at, location);
-            }
+            (Err(at), true) => self.matched.insert(at, location),
             (Ok(at), false) => {
                 self.matched.remove(at);
             }
@@ -308,21 +200,6 @@ impl FolderRecord {
             (known, at) => known.or(at),
         };
     }
-}
-
-/// What this process's status pass last established for one folder. In memory.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct OwnerReport {
-    pub(crate) slot: bool,
-    /// The strong pair: a slot's registered account, or what the default
-    /// folder's `.claude.json` names.
-    pub(crate) pair: Option<(String, String)>,
-    /// The pair a completed proof named for the default folder's current token.
-    pub(crate) proven: Option<(String, String)>,
-    /// `address_digest` of the login's own email.
-    pub(crate) email: Option<String>,
-    /// A registered slot now holds another account.
-    pub(crate) other_account: bool,
 }
 
 /// A folder's verdict, handed to the classifier through its own files.
@@ -363,53 +240,6 @@ pub(crate) fn qualify<'r>(
         })
 }
 
-#[derive(Default)]
-struct Feed {
-    enabled: bool,
-    /// Sticky folders: no profile call is worth making.
-    stopped: BTreeSet<String>,
-    reports: BTreeMap<String, OwnerReport>,
-}
-
-#[cfg(not(test))]
-static FEED: std::sync::Mutex<Option<Feed>> = std::sync::Mutex::new(None);
-
-#[cfg(not(test))]
-fn with_feed<R>(use_feed: impl FnOnce(&mut Feed) -> R) -> R {
-    use_feed(
-        FEED.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(Feed::default),
-    )
-}
-
-#[cfg(test)]
-thread_local! {
-    static FEED: std::cell::RefCell<Feed> = std::cell::RefCell::new(Feed::default());
-}
-
-#[cfg(test)]
-fn with_feed<R>(use_feed: impl FnOnce(&mut Feed) -> R) -> R {
-    FEED.with(|feed| use_feed(&mut feed.borrow_mut()))
-}
-
-/// Status pass: whether a profile call could still help this folder.
-pub(crate) fn proof_wanted(home: &str) -> bool {
-    with_feed(|feed| feed.enabled && !feed.stopped.contains(home))
-}
-
-/// Status pass: the folder's latest report. A slot's other account stays
-/// reported until a sync pass absorbs it into the sticky ledger.
-pub(crate) fn observe_owner(home: String, mut report: OwnerReport) {
-    with_feed(|feed| {
-        report.other_account |= feed
-            .reports
-            .get(&home)
-            .is_some_and(|known| known.other_account);
-        feed.reports.insert(home, report);
-    });
-}
-
 /// Sync pass, before this page's evidence: records each folder the first time
 /// it is seen. Off, it writes nothing.
 pub(crate) fn begin_page(
@@ -418,18 +248,19 @@ pub(crate) fn begin_page(
     roots: &[PathBuf],
     enabled: bool,
 ) {
-    with_feed(|feed| feed.enabled = enabled);
     if !enabled {
+        coverage::set_wanted(false, BTreeSet::new());
         return;
     }
+    let damaged = index
+        .claude_folder_login_ledger
+        .contains_key(DAMAGED_LEDGER);
     for root in roots {
         let Some(config) = root.parent() else {
             continue;
         };
         let key = folder_key(config);
-        if index.claude_folder_login_ledger.contains_key(&key)
-            || index.claude_folder_login_ledger.len() >= MAX_FOLDERS
-        {
+        if index.claude_folder_login_ledger.contains_key(&key) {
             continue;
         }
         // The committed index predates this page's reads.
@@ -443,6 +274,7 @@ pub(crate) fn begin_page(
             key,
             FolderRecord {
                 fresh,
+                mixed: damaged,
                 ..FolderRecord::default()
             },
         );
@@ -453,21 +285,29 @@ pub(crate) fn begin_page(
         .filter(|(_, record)| record.mixed)
         .map(|(home, _)| home.clone())
         .collect();
-    with_feed(|feed| feed.stopped = stopped);
+    coverage::set_wanted(true, stopped);
 }
 
-/// Whether this read's own lines record exactly the folder's known login.
-fn read_matches(trace: &FolderTrace, report: &OwnerReport) -> bool {
+/// What a ledger that failed to decode becomes: sticky, never empty.
+pub(crate) fn damaged_ledger() -> BTreeMap<String, FolderRecord> {
+    BTreeMap::from([(
+        DAMAGED_LEDGER.to_owned(),
+        FolderRecord {
+            mixed: true,
+            ..FolderRecord::default()
+        },
+    )])
+}
+
+/// Whether this file's own lines record exactly the folder's known login.
+fn read_matches(seen: &RecordedLogin<'_>, report: &OwnerReport) -> bool {
     let Some((_, org)) = report.pair.as_ref() else {
         return false;
     };
-    !trace.other_email
-        && !trace.other_org
-        && !trace.bad_org
-        && !trace.unreadable_email
-        && trace.email.is_some()
-        && trace.email == report.email
-        && trace.org.as_ref() == Some(org)
+    !seen.contradicted
+        && seen.email.is_some()
+        && seen.email == report.email.as_deref()
+        && seen.org == Some(org.as_str())
 }
 
 /// One read's evidence on its folder. Sticky on any mismatch; a read of a folder
@@ -475,28 +315,32 @@ fn read_matches(trace: &FolderTrace, report: &OwnerReport) -> bool {
 fn note_read(
     record: &mut FolderRecord,
     item: &SnapshotItem,
-    trace: &FolderTrace,
+    location: Option<u64>,
     report: Option<&OwnerReport>,
     own: bool,
 ) {
-    let names_someone = trace.email.is_some() || trace.org.is_some();
-    if trace.bad_org || trace.other_org || trace.other_email {
+    let seen = item
+        .claude_org_markers
+        .as_deref()
+        .map(|markers| markers.recorded_login())
+        .unwrap_or_default();
+    if seen.contradicted {
         record.set_mixed();
     }
     let Some(report) = report.filter(|report| report.pair.is_some() && report.email.is_some())
     else {
-        if names_someone && !record.census_complete {
+        if (seen.email.is_some() || seen.org.is_some()) && !record.census_complete {
             record.fresh = false;
         }
         return;
     };
-    let org_differs = trace.org.is_some()
-        && trace.org.as_deref() != report.pair.as_ref().map(|(_, org)| org.as_str());
-    let email_differs = trace.email.is_some() && trace.email != report.email;
+    let org_differs =
+        seen.org.is_some() && seen.org != report.pair.as_ref().map(|(_, org)| org.as_str());
+    let email_differs = seen.email.is_some() && seen.email != report.email.as_deref();
     if org_differs || email_differs {
         record.set_mixed();
     }
-    let matches = read_matches(trace, report);
+    let matches = read_matches(&seen, report);
     // An upgraded slot has no history of its own, so every session must carry
     // the matching login. A subagent file stands on its own record.
     let root_file = super::claude_snapshot_family_root_ref(item) == item.source_session_id;
@@ -507,14 +351,8 @@ fn note_read(
         return;
     }
     record.note_requests(item);
-    let Some(location) = trace.location else {
-        return;
-    };
-    if !own {
-        record.set_matched(location, false);
-    } else if trace.whole {
-        // A tail read carries the earlier result: it never saw the file's start.
-        record.set_matched(location, matches);
+    if let Some(location) = location {
+        record.set_matched(location, own && matches);
     }
 }
 
@@ -526,8 +364,13 @@ pub(crate) fn note_page(
     api: &ClaudeLocalOtelLoadReport,
     census_clean: bool,
 ) {
-    let reports = with_feed(|feed| feed.reports.clone());
+    let reports = coverage::snapshot();
     let mut ledger = std::mem::take(&mut index.claude_folder_login_ledger);
+    let mixed_before = ledger
+        .iter()
+        .filter(|(_, record)| record.mixed)
+        .map(|(home, _)| home.clone())
+        .collect::<BTreeSet<_>>();
     for (home, record) in &mut ledger {
         if let Some(report) = reports.get(home) {
             record.absorb_owner(report);
@@ -546,7 +389,7 @@ pub(crate) fn note_page(
         };
         let own = own_session(item, index, api);
         let report = trace.home.as_deref().and_then(|home| reports.get(home));
-        note_read(record, item, trace, report, own);
+        note_read(record, item, trace.location, report, own);
         let root = super::claude_snapshot_family_root_ref(item);
         for row in api.evidence.get(root).into_iter().flatten() {
             if let Some(login) = valid_login(row, root) {
@@ -554,23 +397,90 @@ pub(crate) fn note_page(
             }
         }
     }
-    for record in ledger.values_mut().filter(|_| census_clean) {
-        record.census_complete |= record.fresh;
+    for (home, record) in &mut ledger {
+        record.census_complete |= census_clean && record.fresh;
+        if record.mixed && !mixed_before.contains(home) {
+            eprintln!(
+                "ottto-service: claude folder login contradicted folder={} names_were_possible={}",
+                short_key(home),
+                record.census_complete || record.fresh,
+            );
+        }
     }
     index.claude_folder_login_ledger = ledger;
 }
 
-/// Sync pass, before the walk, in the same save as the ledger: moves each
-/// folder's single re-offer one step. History already uploaded untagged reaches
-/// the tag only through one more read of the file. Each file goes through the
-/// history gate like any owed file, once. Files of a sticky folder are never
-/// offered, so a mixed folder stops at its first step that sees the mismatch.
-pub(crate) fn step_reoffers(index: &mut ScanIndex, enabled: bool) {
+fn short_key(home: &str) -> &str {
+    home.get(..8).unwrap_or(home)
+}
+
+/// One folder's files the running phase covers, in counts.
+#[derive(Default)]
+struct ReofferTally {
+    files: u64,
+    bytes: u64,
+    owed_files: u64,
+    owed_bytes: u64,
+}
+
+/// A counts-only line when the re-offer moved, or a warning when it has not for
+/// `STALL_SECONDS`. It only ever reports: the history gate keeps pacing.
+fn reoffer_line(
+    home: &str,
+    record: &mut FolderRecord,
+    tally: &ReofferTally,
+    now: i64,
+) -> Option<String> {
+    let folder = short_key(home);
+    let phase = if record.reoffer == REOFFER_TAG {
+        "tag"
+    } else {
+        "census"
+    };
+    if record.reoffer_moved_at == 0 || record.reoffer_remaining != tally.owed_files {
+        record.reoffer_remaining = tally.owed_files;
+        record.reoffer_moved_at = now;
+        let pages = tally
+            .owed_bytes
+            .div_ceil(HISTORY_UPGRADE_BYTES_PER_PAGE)
+            .max(
+                tally
+                    .owed_files
+                    .div_ceil(HISTORY_UPGRADE_FILES_PER_PAGE as u64),
+            );
+        return Some(format!(
+            "ottto-service: claude folder re-offer folder={folder} phase={phase} files_read={} bytes_read={} files_remaining={} bytes_remaining={} eta_minutes={}",
+            tally.files - tally.owed_files,
+            tally.bytes - tally.owed_bytes,
+            tally.owed_files,
+            tally.owed_bytes,
+            pages * MINUTES_PER_PAGE,
+        ));
+    }
+    if now.saturating_sub(record.reoffer_moved_at) < STALL_SECONDS {
+        return None;
+    }
+    record.reoffer_moved_at = now;
+    Some(format!(
+        "ottto-service: warning: claude folder re-offer has not moved folder={folder} phase={phase} files_remaining={} bytes_remaining={} hours={}",
+        tally.owed_files,
+        tally.owed_bytes,
+        STALL_SECONDS / HOUR_SECONDS,
+    ))
+}
+
+/// Sync pass, before the walk, in the same save as the ledger. History already
+/// uploaded untagged reaches the tag only through one more read, so each phase
+/// owes its files once through the money rules' re-owe and the history gate then
+/// paces them like any owed file. A folder turning sticky mid-phase freezes that
+/// phase; the files already owed are still read once.
+pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
     if !enabled {
         return;
     }
-    let reports = with_feed(|feed| feed.reports.clone());
-    let mut due = BTreeSet::new();
+    let reports = coverage::snapshot();
+    let mut starting = BTreeSet::new();
+    let mut running = BTreeMap::<String, ReofferTally>::new();
     for (home, record) in &mut index.claude_folder_login_ledger {
         if record.mixed {
             continue;
@@ -584,81 +494,61 @@ pub(crate) fn step_reoffers(index: &mut ScanIndex, enabled: bool) {
             } else if report.is_some_and(|report| qualify(record, report).is_some()) {
                 record.reoffer = REOFFER_TAG;
             }
+            if matches!(record.reoffer, REOFFER_CENSUS | REOFFER_TAG) {
+                starting.insert(home.clone());
+            }
         }
         if matches!(record.reoffer, REOFFER_CENSUS | REOFFER_TAG) {
-            due.insert(home.clone());
+            running.insert(home.clone(), ReofferTally::default());
         }
     }
-    if due.is_empty() {
+    if running.is_empty() {
         return;
     }
-    let mut files = BTreeMap::<&str, Vec<(&str, u64, bool)>>::new();
+    let mut owe = Vec::new();
     for (key, entry) in &index.files {
         let Some(home) = coverage::transcript_home_key(Path::new(key)).map(|home| hex(&home))
         else {
             continue;
         };
-        let Some(home) = due.get(&home) else {
+        let (Some(tally), Some(record)) = (
+            running.get_mut(&home),
+            index.claude_folder_login_ledger.get(&home),
+        ) else {
             continue;
         };
-        let owed = index.effective_upload_body_witness_revision_requires_adoption(key);
-        files
-            .entry(home.as_str())
-            .or_default()
-            .push((key.as_str(), entry.size_bytes, owed));
-    }
-    let mut owe = Vec::new();
-    let mut steps = Vec::new();
-    for home in &due {
-        let Some(record) = index.claude_folder_login_ledger.get(home) else {
-            continue;
-        };
-        let held = files.get(home.as_str()).map_or(&[][..], Vec::as_slice);
-        // Earlier steps settle first: a verdict they reach can stop this one.
-        if held.iter().any(|(.., owed)| *owed) {
+        if record.reoffer == REOFFER_TAG && !record.matches_file(file_location(key)) {
             continue;
         }
-        let tag = record.reoffer == REOFFER_TAG;
-        let offered = held
-            .iter()
-            .filter(|(key, ..)| !tag || record.matches_file(file_location(key)))
-            .collect::<Vec<_>>();
-        if record.reoffer_cursor.is_none()
-            && offered.iter().map(|(_, bytes, _)| *bytes).sum::<u64>() > MAX_REOFFER_BYTES
+        tally.files += 1;
+        tally.bytes += entry.size_bytes;
+        if starting.contains(&home) {
+            owe.push(key.clone());
+        }
+        if starting.contains(&home)
+            || index.effective_upload_body_witness_revision_requires_adoption(key)
         {
-            steps.push((home.clone(), REOFFER_TOO_BIG, None));
-            continue;
+            tally.owed_files += 1;
+            tally.owed_bytes += entry.size_bytes;
         }
-        let cursor = record.reoffer_cursor.as_deref();
-        let step = offered
-            .iter()
-            .filter(|(key, ..)| cursor < Some(*key))
-            .take(REOFFER_STEP_FILES)
-            .map(|(key, ..)| (*key).to_owned())
-            .collect::<Vec<_>>();
-        let last = step.last().cloned();
-        // A census whose every read has settled is complete: a file that never
-        // settles stays owed above, and so does the folder.
-        let next = match (last.is_some(), tag) {
-            (true, _) => record.reoffer,
-            (false, true) => REOFFER_DONE,
-            (false, false) => REOFFER_IDLE,
+    }
+    super::claude_request_money::e2::re_owe_files(index, owe);
+    for (home, tally) in &running {
+        let Some(record) = index.claude_folder_login_ledger.get_mut(home) else {
+            continue;
         };
-        owe.extend(step);
-        steps.push((home.clone(), next, last));
-    }
-    drop(files);
-    let to = index
-        .active_effective_upload_body_witness_revision
-        .saturating_sub(1);
-    for key in owe {
-        index.re_owe_effective_upload_body_witness_revision(&key, to);
-    }
-    for (home, reoffer, cursor) in steps {
-        if let Some(record) = index.claude_folder_login_ledger.get_mut(&home) {
-            record.census_complete |= reoffer == REOFFER_IDLE;
-            record.reoffer = reoffer;
-            record.reoffer_cursor = cursor;
+        if let Some(line) = reoffer_line(home, record, tally, now) {
+            eprintln!("{line}");
+        }
+        // Every read of the phase settled. A file that never settles stays owed,
+        // and so does its folder.
+        if tally.owed_files == 0 && !starting.contains(home) {
+            record.census_complete |= record.reoffer == REOFFER_CENSUS;
+            record.reoffer = match record.reoffer {
+                REOFFER_CENSUS => REOFFER_IDLE,
+                _ => REOFFER_DONE,
+            };
+            record.reoffer_moved_at = 0;
         }
     }
 }
@@ -711,7 +601,7 @@ pub(crate) fn stamp_page(
     api: &ClaudeLocalOtelLoadReport,
     accepted: &AcceptedBuckets,
 ) {
-    let reports = with_feed(|feed| feed.reports.clone());
+    let reports = coverage::snapshot();
     let mut verdicts = BTreeMap::<String, Option<QualifiedFolder>>::new();
     for item in items {
         let Some((home, location)) = item

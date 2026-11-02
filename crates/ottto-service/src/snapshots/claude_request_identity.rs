@@ -143,15 +143,6 @@ impl Drop for PreCutoverEvidenceForTest {
     }
 }
 
-/// `transcript_email` (and its status-coverage feed) needs its own review and
-/// receiver acceptance on top of contract-5 emission. Flipping this is a
-/// separate, parent-owned change.
-pub(crate) const TRANSCRIPT_EMAIL_ENABLED: bool = false;
-
-pub(crate) const fn transcript_email_enabled() -> bool {
-    TRANSCRIPT_EMAIL_ENABLED || cfg!(test)
-}
-
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
@@ -260,12 +251,6 @@ pub(crate) enum Refusal {
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
-    /// A recorded email in a registered folder with no usable status history
-    /// for its window (feed failed, never observed, gap, restart, eviction).
-    CoverageUnavailable,
-    /// Status samples span the window but cannot prove continuity, and the
-    /// email is never joined to a login: nothing qualifies `transcript_email`.
-    CoverageUnqualified,
 }
 
 /// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
@@ -2893,9 +2878,11 @@ pub(crate) struct OrgMarkers {
     /// of the first later `session_context` naming a different one.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
-    /// Status-coverage key of the folder holding this file, bound when the
-    /// item is built and only for a file with a recorded email.
-    home: Option<crate::claude_status_coverage::HomeKey>,
+    /// `marker_email_digest` of the one address the sentences name, and whether
+    /// a later one named another. A sentence without exactly one well-formed
+    /// address answers nothing.
+    address: Option<String>,
+    other_address: bool,
 }
 
 /// Domain-separated SHA-256 of a trimmed, lowercased `session_context` email
@@ -2908,6 +2895,34 @@ pub(crate) fn marker_email_digest(text: &str) -> String {
             .chain_update(text.as_bytes())
             .finalize()
     )
+}
+
+/// The one address a lowercased `userEmail` sentence names. The wording belongs
+/// to another program: anything but exactly one well-formed address is no answer.
+fn recorded_address(text: &str) -> Option<&str> {
+    let mut words = text.split_whitespace().filter(|word| word.contains('@'));
+    let word = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    let address = word.trim_matches(|c: char| ".,;:!?()<>[]\"'`".contains(c));
+    let (local, domain) = address.split_once('@')?;
+    let well_formed = !local.is_empty()
+        && domain.contains('.')
+        && !domain.contains('@')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.');
+    well_formed.then_some(address)
+}
+
+/// What one file's own lines record about its login, for the folder ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecordedLogin<'m> {
+    pub(crate) email: Option<&'m str>,
+    /// `None` past the marker cap too: that file matches nothing.
+    pub(crate) org: Option<&'m str>,
+    /// Another address or organization, or a malformed organization.
+    pub(crate) contradicted: bool,
 }
 
 /// The hashed organization of a `credential_org` attachment; `None` when blank
@@ -2952,6 +2967,13 @@ pub(crate) fn note_marker_line(
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
             }
+            if let Some(address) = recorded_address(&text).map(marker_email_digest) {
+                state.other_address |= state
+                    .address
+                    .as_ref()
+                    .is_some_and(|known| *known != address);
+                state.address.get_or_insert(address);
+            }
         }
         Some("credential_org") => {
             let org = marker_org_hash(attachment);
@@ -2995,24 +3017,27 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
-    /// Binds the registered-folder key once the item's path is known.
-    pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
-        if self.context_position.is_some() {
-            self.home = crate::claude_status_coverage::transcript_home_key(transcript);
+    pub(crate) fn recorded_login(&self) -> RecordedLogin<'_> {
+        let first = self.starting_marker.as_ref();
+        let contradicted = self.other_address
+            || first.is_some_and(|first| {
+                first.org.is_none() || self.entries.iter().any(|marker| marker.org != first.org)
+            });
+        RecordedLogin {
+            email: self.address.as_deref(),
+            org: first
+                .filter(|_| !self.overflowed)
+                .and_then(|first| first.org.as_deref()),
+            contradicted,
         }
     }
 
-    /// The folder key when one unchanged email precedes the response with
-    /// `sequence` (line order; an email switch at or before it disqualifies).
-    pub(crate) fn email_home(
-        &self,
-        sequence: u64,
-    ) -> Option<&crate::claude_status_coverage::HomeKey> {
-        let precedes = self.context_position.is_some_and(|at| at <= sequence)
-            && self.context_flip_position.map_or(true, |at| at > sequence);
-        (precedes && !self.overflowed)
-            .then_some(self.home.as_ref())
-            .flatten()
+    /// One unchanged email precedes the response with `sequence` (line order;
+    /// an email switch at or before it disqualifies).
+    pub(crate) fn email_precedes(&self, sequence: u64) -> bool {
+        self.context_position.is_some_and(|at| at <= sequence)
+            && self.context_flip_position.map_or(true, |at| at > sequence)
+            && !self.overflowed
     }
 
     /// The marker governing the response with `sequence`, by line order only.
@@ -4527,10 +4552,6 @@ pub(crate) struct ScanEvidence<'a> {
     invalid_logins: BTreeSet<(&'a str, &'a str)>,
     /// Orgs per login, proven by complete telemetry request identity.
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
-    /// This scan's copy of the local status-coverage history.
-    status_coverage: Option<crate::claude_status_coverage::Ledger>,
-    /// Key of the shared default folder, where the email basis never applies.
-    default_home: Option<crate::claude_status_coverage::HomeKey>,
     /// Pre-enrichment native evidence already saved by this scan. Request
     /// telemetry may veto its original org for billing without changing the
     /// unambiguous native account used by local Desktop activity.
@@ -4715,34 +4736,6 @@ impl<'a> ScanEvidence<'a> {
         roots.get(request_id)
     }
 
-    /// Adds this scan's status-coverage copy: the `transcript_email` window
-    /// check, and each qualified status-pass (login, org) pairing as org
-    /// membership. `None` (feed off or failed) adds nothing.
-    pub(crate) fn with_status_coverage(
-        mut self,
-        coverage: Option<crate::claude_status_coverage::Ledger>,
-    ) -> Self {
-        if let Some(coverage) = &coverage {
-            for (login, org) in coverage.pairings() {
-                if !self
-                    .memberships
-                    .get(login)
-                    .is_some_and(|orgs| orgs.contains(org))
-                {
-                    self.memberships
-                        .entry(login.to_string())
-                        .or_default()
-                        .insert(org.to_string());
-                }
-            }
-        }
-        self.status_coverage = coverage;
-        self.default_home = Some(crate::claude_status_coverage::home_key(
-            &crate::agent_status::home_dir().join(".claude"),
-        ));
-        self
-    }
-
     /// Test-only stand-in for the unruled current-writer witness.
     #[cfg(test)]
     pub(crate) fn with_pending_writer_witnesses(mut self, roots: BTreeSet<String>) -> Self {
@@ -4849,9 +4842,8 @@ pub(crate) struct RequestFacts<'a> {
     pub(crate) marker: MarkerVerdict<'a>,
     pub(crate) desktop: bool,
     pub(crate) scan_unix_seconds: Option<u64>,
-    /// Registered-folder key when an unchanged email precedes this request.
-    pub(crate) email_home: Option<&'a crate::claude_status_coverage::HomeKey>,
-    pub(crate) session_start_unix_seconds: Option<u64>,
+    /// An unchanged email precedes this request.
+    pub(crate) email_precedes: bool,
     /// Another transcript also carries this request (the pass's duplicate
     /// witness): it is not this transcript's alone.
     pub(crate) duplicated_elsewhere: bool,
@@ -5081,7 +5073,7 @@ fn transcript_identity<'k>(
     // pair-only.
     if let Some(folder) = facts
         .recorded_login
-        .filter(|folder| folder.org == org && facts.email_home.is_some() && !facts.desktop)
+        .filter(|folder| folder.org == org && facts.email_precedes && !facts.desktop)
     {
         return Some(IdentityRef::Tagged(KeyRef {
             login: Some(&folder.login),
@@ -5090,61 +5082,12 @@ fn transcript_identity<'k>(
             account_source: None,
         }));
     }
-    if let Some(refusal) = email_refusal(evidence, facts, org) {
-        return Some(IdentityRef::Refused(refusal));
-    }
     Some(IdentityRef::Tagged(KeyRef {
         login: None,
         org: Some(org),
         basis: TRANSCRIPT_ORG,
         account_source: None,
     }))
-}
-
-/// `transcript_email` never binds a login. No qualified join from a recorded
-/// email to a login exists, and sampled status coverage cannot prove that the
-/// slot's login ran continuously over [session start − 300 s, request]. So the
-/// basis only decides whether the request keeps its earlier meaning:
-/// - not applicable (`None`, the org-only path stands): the basis compiled
-///   out, Desktop, no unchanged email before the request, the shared default
-///   folder, or a folder proven never registered over the window;
-/// - otherwise refused, never weakened to org-only: the feed unavailable or
-///   not yet run since restart, a removed slot or forgotten registration, an
-///   unknown session start, a conflicting sample, no history spanning the
-///   window, or samples that span it but prove nothing.
-fn email_refusal(
-    evidence: &ScanEvidence<'_>,
-    facts: &RequestFacts<'_>,
-    org: &str,
-) -> Option<Refusal> {
-    use crate::claude_status_coverage::{Registration, Verdict};
-    if facts.desktop || !transcript_email_enabled() {
-        return None;
-    }
-    let home = facts.email_home?;
-    if evidence.default_home.as_ref() == Some(home) {
-        return None;
-    }
-    let Some(coverage) = evidence.status_coverage.as_ref() else {
-        return Some(Refusal::CoverageUnavailable);
-    };
-    let window = facts
-        .session_start_unix_seconds
-        .and_then(|start| start.checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS))
-        .zip(facts.terminal_unix_seconds);
-    let Some((from, to)) = window else {
-        return Some(Refusal::CoverageUnavailable);
-    };
-    match coverage.registration(home, from) {
-        Registration::Registered => {}
-        Registration::NeverRegistered => return None,
-        Registration::Unknown => return Some(Refusal::CoverageUnavailable),
-    }
-    Some(match coverage.verdict(home, from, to, org) {
-        Verdict::Unavailable => Refusal::CoverageUnavailable,
-        Verdict::Conflicting => Refusal::ContradictoryOrg,
-        Verdict::Unqualified => Refusal::CoverageUnqualified,
-    })
 }
 
 // --- Desktop store inventory digest -----------------------------------------
@@ -5191,7 +5134,6 @@ pub(crate) struct RequestSink<'s, 'a> {
     root: String,
     desktop: bool,
     scan_unix_seconds: Option<u64>,
-    session_start_unix_seconds: Option<u64>,
     grouping: Grouping,
 }
 
@@ -5213,10 +5155,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 .and_then(|origin| origin.entrypoint.as_deref())
                 == Some("claude-desktop"),
             scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
-            session_start_unix_seconds: item
-                .source_started_at
-                .as_deref()
-                .and_then(rfc3339_unix_seconds),
             grouping: Grouping::new(max_groups),
         })
     }
@@ -5298,11 +5236,10 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             },
             desktop: self.desktop,
             scan_unix_seconds: self.scan_unix_seconds,
-            email_home: match (item.claude_org_markers.as_deref(), sequence) {
-                (Some(markers), Some(sequence)) => markers.email_home(sequence),
-                _ => None,
+            email_precedes: match (item.claude_org_markers.as_deref(), sequence) {
+                (Some(markers), Some(sequence)) => markers.email_precedes(sequence),
+                _ => false,
             },
-            session_start_unix_seconds: self.session_start_unix_seconds,
             duplicated_elsewhere,
             recorded_login: item
                 .claude_money
@@ -5756,14 +5693,10 @@ fn request_occurrence_facts<'a>(
             }),
         desktop,
         scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
-        email_home: item
+        email_precedes: item
             .claude_org_markers
             .as_deref()
-            .and_then(|markers| markers.email_home(occurrence.sequence)),
-        session_start_unix_seconds: item
-            .source_started_at
-            .as_deref()
-            .and_then(rfc3339_unix_seconds),
+            .is_some_and(|markers| markers.email_precedes(occurrence.sequence)),
         duplicated_elsewhere,
         recorded_login,
     })
@@ -5998,7 +5931,7 @@ fn tag_item(
     Some(tagged)
 }
 
-crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
+crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, address, other_address);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
     D entries: Vec<OrgMarker>,
     D starting_marker: Option<OrgMarker>,
@@ -6007,7 +5940,8 @@ crate::durable_tail_codec::durable_struct!(OrgMarkers {
     N context_changed: bool,
     N context_position: Option<u64>,
     N context_flip_position: Option<u64>,
-    E home: Option<crate::claude_status_coverage::HomeKey>,
+    H address: Option<String>,
+    N other_address: bool,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::durable_tail_codec::durable_struct!(OrgMarker {

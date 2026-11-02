@@ -1580,7 +1580,7 @@ fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotIt
         let org = ottto_core::billing_identity_hash("anthropic", "organization", RECORDED_ORG_UUID)
             .unwrap();
         let pair = (e2_account(), org);
-        folder::observe_owner(
+        crate::claude_status_coverage::observe(
             folder::folder_key(projects.parent().unwrap()),
             folder::OwnerReport {
                 slot: false,

@@ -4279,11 +4279,10 @@ fn folder_login_ledger_old_state_loads_empty_and_damage_never_refuses() {
     assert!(read(br#"{"files":{}}"#)
         .claude_folder_login_ledger
         .is_empty());
-    assert!(
-        read(br#"{"files":{},"claude_folder_login_ledger":17}"#)
-            .claude_folder_login_ledger
-            .is_empty(),
-        "damage only loses the ledger, so the folder stays owed"
+    assert_eq!(
+        read(br#"{"files":{},"claude_folder_login_ledger":17}"#).claude_folder_login_ledger,
+        crate::snapshots::claude_folder_login::damaged_ledger(),
+        "damage can never un-stick a mixed folder"
     );
     let kept = read(
         br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":true}}}"#,

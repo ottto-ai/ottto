@@ -2435,10 +2435,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.copy_prefix_last_accepted_nonce = self.typed(value)?
                         }
                         "claude_folder_login_ledger" => {
-                            // Damage only means owed: a re-created record has
-                            // no census, so it never qualifies.
-                            index.claude_folder_login_ledger =
-                                self.history_scalar(value, BTreeMap::new())?
+                            // Damage may have lost a sticky verdict: fail closed.
+                            index.claude_folder_login_ledger = self.history_scalar(
+                                value,
+                                crate::snapshots::claude_folder_login::damaged_ledger(),
+                            )?
                         }
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never

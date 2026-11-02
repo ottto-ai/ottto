@@ -1,12 +1,12 @@
 // Recorded-login naming per folder. Synthetic hashes and addresses only; the
 // sentence and the line keys follow the real transcript shape.
 use super::*;
+use crate::claude_status_coverage::{observe, proof_wanted};
+use crate::snapshots::claude_request_identity::marker_org_hash;
 use crate::snapshots::claude_request_money::e2::with_fixture_birth;
-use crate::snapshots::{
-    apply_claude_code_line, opened_object_identity, parse_claude_code_jsonl_file, sampled_scan,
-    ClaudeTitleMetadata, CodexTitleMetadata, OwnedJsonlParser, ScanIndexEntry, SnapshotSource,
-};
-use serde_json::json;
+use crate::snapshots::claude_response_compaction_tests::acquire_items;
+use crate::snapshots::{parse_claude_code_jsonl_file, ScanIndexEntry};
+use serde_json::{json, Value};
 
 const ORG_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const OTHER_ORG_UUID: &str = "22222222-2222-4222-8222-222222222222";
@@ -16,6 +16,7 @@ const ADDRESS: &str = "one.login+tag@Example.test";
 const OTHER_ADDRESS: &str = "second@example.test";
 const EARLY_BIRTH: u64 = 1_785_542_400_000_000_000;
 const LATE_BIRTH: u64 = 1_785_801_600_000_000_000;
+const NOW: i64 = 1_785_801_600;
 
 fn login() -> String {
     "a".repeat(64)
@@ -34,14 +35,10 @@ fn sentence(address: &str) -> String {
     )
 }
 
-fn context_text(text: &str, session: &str) -> Value {
+fn context(address: &str, session: &str) -> Value {
     json!({"type": "attachment", "sessionId": session, "timestamp": "2026-08-02T06:59:58Z",
         "isSidechain": false, "entrypoint": "cli", "attachment": {"type": "session_context",
-            "context": {"userEmail": text, "gitStatus": ""}}})
-}
-
-fn context(address: &str, session: &str) -> Value {
-    context_text(&sentence(address), session)
+            "context": {"userEmail": sentence(address), "gitStatus": ""}}})
 }
 
 fn marker(uuid: &str, session: &str) -> Value {
@@ -124,7 +121,7 @@ impl Folder {
             std::slice::from_ref(&self.root),
             true,
         );
-        observe_owner(self.key.clone(), report);
+        observe(self.key.clone(), report);
     }
 
     /// A folder whose first read predates the record.
@@ -135,7 +132,7 @@ impl Folder {
             ScanIndexEntry::default(),
         );
         begin_page(index, &committed, std::slice::from_ref(&self.root), true);
-        observe_owner(self.key.clone(), report);
+        observe(self.key.clone(), report);
     }
 
     fn record<'i>(&self, index: &'i ScanIndex) -> &'i FolderRecord {
@@ -188,59 +185,8 @@ fn settle(index: &mut ScanIndex) {
     }
 }
 
-#[test]
-fn only_one_well_formed_address_in_the_sentence_is_an_answer() {
-    assert_eq!(
-        recorded_address(&sentence(ADDRESS)).as_deref(),
-        Some("one.login+tag@example.test")
-    );
-    assert_eq!(
-        recorded_address(&format!("Mail <{ADDRESS}>, please")).as_deref(),
-        Some("one.login+tag@example.test")
-    );
-    for text in [
-        "no address at all",
-        "two a@example.test and b@example.test here",
-        "@example.test",
-        "a@b",
-        "a@@example.test",
-        "a@.test",
-    ] {
-        assert_eq!(recorded_address(text), None, "{text}");
-    }
-}
-
-#[test]
-fn the_real_sentence_matches_the_login_email_and_nothing_is_sticky() {
-    let mut trace = FolderTrace::default();
-    trace.note_line(&context(ADDRESS, SESSION_A), false);
-    trace.note_line(&marker(ORG_UUID, SESSION_A), false);
-    assert!(read_matches(&trace, &folder_report()));
-    let mut record = FolderRecord::default();
-    record.absorb_owner(&folder_report());
-    assert!(!record.mixed);
-}
-
-#[test]
-fn an_unreadable_sentence_is_untagged_without_a_verdict() {
-    let f = folder("recorded-unreadable");
-    let mut index = ScanIndex::default();
-    f.begin(&mut index, folder_report());
-    let mut items = f.read(
-        SESSION_A,
-        &[
-            context_text("two a@example.test b@example.test", SESSION_A),
-            marker(ORG_UUID, SESSION_A),
-            assistant(SESSION_A, "req_1", "2026-08-02T07:00:00Z"),
-        ],
-    );
-    page(&mut index, &mut items, true);
-    assert_eq!(witness(&items), None);
-    assert!(!f.record(&index).mixed);
-}
-
-/// A real multi-page first walk: only the last page can be tagged at upload,
-/// and the single re-offer brings the earlier page to 100%.
+/// [money] A real multi-page first walk: only the last page can be tagged at
+/// upload, and the single re-offer brings the earlier page to 100%.
 #[test]
 fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
     let f = folder("recorded-multi-page");
@@ -259,9 +205,9 @@ fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
     seed(&mut index, &f.path(SESSION_A), 100);
     seed(&mut index, &f.path(SESSION_B), 100);
     seed(&mut index, &f.path("no-own-marker"), 100);
-    step_reoffers(&mut index, false);
+    apply_reoffers(&mut index, false, NOW);
     assert!(owed(&index).is_empty(), "off offers nothing");
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(
         owed(&index),
         BTreeSet::from([
@@ -270,12 +216,12 @@ fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
         ]),
         "only matched own files are offered"
     );
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     settle(&mut index);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(f.record(&index).reoffer, REOFFER_DONE);
     assert!(owed(&index).is_empty());
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert!(owed(&index).is_empty(), "never repeats");
 
     let mut again = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
@@ -283,6 +229,7 @@ fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
     assert!(witness(&again).is_some(), "the re-offered read is named");
 }
 
+/// [regress]
 #[test]
 fn a_late_proof_starts_the_re_offer_and_a_failed_one_is_only_not_yet() {
     let f = folder("recorded-late-proof");
@@ -299,15 +246,16 @@ fn a_late_proof_starts_the_re_offer_and_a_failed_one_is_only_not_yet() {
     assert_eq!(witness(&items), None);
     assert!(!f.record(&index).mixed);
     seed(&mut index, &f.path(SESSION_A), 100);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert!(owed(&index).is_empty());
 
-    observe_owner(f.key.clone(), folder_report());
+    observe(f.key.clone(), folder_report());
     page(&mut index, &mut [], true);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(owed(&index).len(), 1);
 }
 
+/// [regress]
 #[test]
 fn two_folders_are_judged_alone_and_the_mixed_one_stays_owed() {
     let one = folder("recorded-one-login");
@@ -319,8 +267,8 @@ fn two_folders_are_judged_alone_and_the_mixed_one_stays_owed() {
         &[one.root.clone(), two.root.clone()],
         true,
     );
-    observe_owner(one.key.clone(), folder_report());
-    observe_owner(two.key.clone(), folder_report());
+    observe(one.key.clone(), folder_report());
+    observe(two.key.clone(), folder_report());
     let mut clean = one.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
     let mut foreign = two.read(
         SESSION_A,
@@ -353,6 +301,7 @@ fn proof_wanted_after_page(index: &mut ScanIndex, f: &Folder) -> bool {
     proof_wanted(&f.key)
 }
 
+/// [money]
 #[test]
 fn a_mid_session_swap_is_never_tagged_and_org_must_match_too() {
     let f = folder("recorded-swap");
@@ -388,8 +337,9 @@ fn a_mid_session_swap_is_never_tagged_and_org_must_match_too() {
     assert!(g.record(&index).mixed);
 }
 
+/// [regress]
 #[test]
-fn a_login_change_stops_later_names_and_is_counted() {
+fn a_login_change_stops_later_names() {
     let f = folder("recorded-login-change");
     let mut index = ScanIndex::default();
     f.begin(&mut index, folder_report());
@@ -398,7 +348,7 @@ fn a_login_change_stops_later_names_and_is_counted() {
     assert!(witness(&items).is_some());
 
     let other = ("b".repeat(64), org_of(ORG_UUID));
-    observe_owner(
+    observe(
         f.key.clone(),
         OwnerReport {
             pair: Some(other.clone()),
@@ -410,9 +360,8 @@ fn a_login_change_stops_later_names_and_is_counted() {
     page(&mut index, &mut later, true);
     assert_eq!(witness(&later), None);
     assert!(f.record(&index).mixed);
-    assert_eq!(f.record(&index).late_contradictions, 1);
 
-    observe_owner(f.key.clone(), folder_report());
+    observe(f.key.clone(), folder_report());
     let mut back = f.read(SESSION_B, &own_lines(SESSION_B, "req_b"));
     page(&mut index, &mut back, true);
     assert_eq!(
@@ -420,7 +369,6 @@ fn a_login_change_stops_later_names_and_is_counted() {
         None,
         "the first login returning lifts nothing"
     );
-    assert_eq!(f.record(&index).late_contradictions, 1);
 
     // A proof naming another owner than `.claude.json` is a split login.
     let g = folder("recorded-split");
@@ -436,6 +384,7 @@ fn a_login_change_stops_later_names_and_is_counted() {
     assert!(g.record(&index).mixed);
 }
 
+/// [money]
 #[test]
 fn a_new_slot_names_from_its_first_read_and_never_needs_a_re_offer() {
     let f = folder("recorded-new-slot");
@@ -445,11 +394,11 @@ fn a_new_slot_names_from_its_first_read_and_never_needs_a_re_offer() {
     page(&mut index, &mut items, false);
     assert_eq!(witness(&items).expect("named").kind, "slot");
     seed(&mut index, &f.path(SESSION_A), 100);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(f.record(&index).reoffer, REOFFER_DONE);
     assert!(owed(&index).is_empty());
 
-    observe_owner(
+    observe(
         f.key.clone(),
         OwnerReport {
             slot: true,
@@ -467,6 +416,7 @@ fn a_new_slot_names_from_its_first_read_and_never_needs_a_re_offer() {
     assert!(f.record(&index).mixed);
 }
 
+/// [money]
 #[test]
 fn an_upgraded_slot_needs_every_session_to_match() {
     let f = folder("recorded-upgraded-slot");
@@ -485,8 +435,8 @@ fn an_upgraded_slot_needs_every_session_to_match() {
     assert!(f.record(&index).mixed, "a session with no recorded login");
 }
 
-/// Upgraded history: one wire-silent census read, then one tag read of the
-/// matched files only, each stepped and capped.
+/// [money] Upgraded history: one wire-silent census read, then one tag read of
+/// the matched files only.
 #[test]
 fn an_upgraded_folder_reads_its_census_first_then_re_offers_its_own_files() {
     let f = folder("recorded-upgraded");
@@ -494,15 +444,15 @@ fn an_upgraded_folder_reads_its_census_first_then_re_offers_its_own_files() {
     f.begin_upgraded(&mut index, folder_report());
     seed(&mut index, &f.path(SESSION_A), 100);
     seed(&mut index, &f.path("no-own-marker"), 100);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(owed(&index).len(), 2, "the census reads every file");
     let mut read = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
     page(&mut index, &mut read, false);
     assert_eq!(witness(&read), None);
     settle(&mut index);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert!(f.record(&index).census_complete);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
     assert_eq!(
         owed(&index),
         BTreeSet::from([local_index_key(&f.path(SESSION_A))])
@@ -513,43 +463,7 @@ fn an_upgraded_folder_reads_its_census_first_then_re_offers_its_own_files() {
     assert!(witness(&named).is_some());
 }
 
-#[test]
-fn a_re_offer_is_capped_stepped_and_stops_at_a_sticky_verdict() {
-    let f = folder("recorded-caps");
-    let mut index = ScanIndex::default();
-    f.begin_upgraded(&mut index, folder_report());
-    seed(&mut index, &f.path("huge"), MAX_REOFFER_BYTES + 1);
-    step_reoffers(&mut index, true);
-    assert_eq!(f.record(&index).reoffer, REOFFER_TOO_BIG);
-    assert!(owed(&index).is_empty(), "a too-big folder stays owed");
-
-    let g = folder("recorded-steps");
-    let mut index = ScanIndex::default();
-    g.begin_upgraded(&mut index, folder_report());
-    for file in 0..REOFFER_STEP_FILES + 1 {
-        seed(&mut index, &g.path(&format!("{file:05}")), 1);
-    }
-    step_reoffers(&mut index, true);
-    assert_eq!(owed(&index).len(), REOFFER_STEP_FILES);
-    step_reoffers(&mut index, true);
-    assert_eq!(
-        owed(&index).len(),
-        REOFFER_STEP_FILES,
-        "earlier steps first"
-    );
-    settle(&mut index);
-    index
-        .claude_folder_login_ledger
-        .get_mut(&g.key)
-        .unwrap()
-        .set_mixed();
-    step_reoffers(&mut index, true);
-    assert!(
-        owed(&index).is_empty(),
-        "a sticky folder is offered no more"
-    );
-}
-
+/// [regress]
 #[test]
 fn off_writes_nothing_and_asks_nothing() {
     let f = folder("recorded-off");
@@ -572,6 +486,7 @@ fn off_writes_nothing_and_asks_nothing() {
     assert!(!proof_wanted(&f.key));
 }
 
+/// [money]
 #[test]
 fn a_session_copied_in_never_passes_the_own_session_gate() {
     let f = folder("recorded-copied");
@@ -592,67 +507,6 @@ fn a_session_copied_in_never_passes_the_own_session_gate() {
     // Source deleted: the file's birth is later than its responses.
     let copied = f.read_born(LATE_BIRTH, SESSION_A, &lines);
     assert!(copied.iter().all(|item| !own_session(item, &index, &api)));
-}
-
-type Reduction =
-    crate::transcript_cache::Retained<crate::snapshots::sampled_jsonl::CachedJsonlReduction>;
-
-/// One real read of the file through the resumable parser: whole with no
-/// checkpoint, from the tail with one.
-fn resumable_read(
-    path: &Path,
-    old: Option<Reduction>,
-    now: u64,
-) -> (
-    Option<Reduction>,
-    crate::transcript_acquisition::ReadMode,
-    Vec<SnapshotItem>,
-) {
-    with_fixture_birth(EARLY_BIRTH, || {
-        let scope = crate::transcript_acquisition::Scope("recorded-login-tail".into());
-        let mut file = std::fs::File::open(path).unwrap();
-        let expected = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).unwrap();
-        let mut parser = OwnedJsonlParser::new(
-            file,
-            path,
-            SnapshotSource::ClaudeCode,
-            apply_claude_code_line,
-            Some(&CodexTitleMetadata::default()),
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
-        let mode = parser.prepare_acquisition(old, &scope, debt, now).unwrap();
-        while !parser.step().unwrap() {}
-        let acquisition = parser
-            .retain_reduction(
-                &scope,
-                now,
-                sampled_scan::RetainBudget::granted_unclassified(
-                    crate::transcript_cache::ENTRY_BYTES,
-                ),
-            )
-            .unwrap()
-            .unwrap();
-        let retained = acquisition.reduction.map(|state| Reduction {
-            checkpoint: acquisition.checkpoint,
-            state,
-        });
-        let parsed = parser
-            .finish(
-                &expected,
-                path,
-                "2026-08-02T07:10:00Z",
-                "fingerprint".into(),
-                Some(&CodexTitleMetadata::default()),
-                Some(&ClaudeTitleMetadata::default()),
-                None,
-            )
-            .unwrap();
-        (retained, mode, parsed.snapshots)
-    })
 }
 
 fn append(path: &Path, lines: &[Value]) {
@@ -676,6 +530,21 @@ fn restored(index: &ScanIndex, f: &Folder) -> ScanIndex {
     restored
 }
 
+type Reduction =
+    crate::transcript_cache::Retained<crate::snapshots::sampled_jsonl::CachedJsonlReduction>;
+
+fn resumable_read(
+    path: &Path,
+    old: Option<Reduction>,
+    now: u64,
+) -> (
+    Option<Reduction>,
+    crate::transcript_acquisition::ReadMode,
+    Vec<SnapshotItem>,
+) {
+    with_fixture_birth(EARLY_BIRTH, || acquire_items(path, old, now))
+}
+
 /// First a whole read names the session; returns its checkpoint.
 fn named_session(f: &Folder, index: &mut ScanIndex) -> Option<Reduction> {
     f.begin(index, folder_report());
@@ -692,8 +561,9 @@ fn named_session(f: &Folder, index: &mut ScanIndex) -> Option<Reduction> {
     retained
 }
 
+/// [regress]
 #[test]
-fn a_tail_read_after_restore_keeps_the_result_without_the_sentence() {
+fn a_tail_read_after_a_restart_stays_named() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -707,26 +577,19 @@ fn a_tail_read_after_restore_keeps_the_result_without_the_sentence() {
     );
     let (_, mode, mut tailed) = resumable_read(&path, retained, 101);
     assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
-    let trace = tailed[0]
-        .claude_money
-        .as_deref()
-        .and_then(|fold| fold.folder_trace.as_deref())
-        .unwrap();
-    assert!(!trace.whole);
-    assert_eq!(trace.email, None, "the sentence is not in this read");
-
     let mut index = restored(&index, &f);
-    observe_owner(f.key.clone(), folder_report());
+    observe(f.key.clone(), folder_report());
     page(&mut index, &mut tailed, false);
     assert!(
         witness(&tailed).is_some(),
-        "the persisted result carries it"
+        "the retained markers carry the sentence"
     );
     assert!(!serde_json::to_string(&index.claude_folder_login_ledger)
         .unwrap()
         .contains(&address_digest(ADDRESS)));
 }
 
+/// [regress]
 #[test]
 fn a_fork_reference_growing_by_tail_ends_the_name_and_never_returns() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -750,10 +613,10 @@ fn a_fork_reference_growing_by_tail_ends_the_name_and_never_returns() {
     assert_eq!(witness(&tailed), None);
     assert!(f.record(&index).matched.is_empty());
 
-    // Restored, and growing with its own marker lines again: a tail read never
-    // saw the start of the file, so it cannot earn the result back.
+    // Restored, and growing with its own marker lines again: the retained fork
+    // reference keeps it out for good.
     let mut index = restored(&index, &f);
-    observe_owner(f.key.clone(), folder_report());
+    observe(f.key.clone(), folder_report());
     append(
         &path,
         &[
@@ -768,6 +631,7 @@ fn a_fork_reference_growing_by_tail_ends_the_name_and_never_returns() {
     assert_eq!(witness(&again), None);
 }
 
+/// [money]
 #[test]
 fn later_real_telemetry_replaces_the_name_for_good() {
     let f = folder("recorded-correction");
@@ -793,6 +657,56 @@ fn later_real_telemetry_replaces_the_name_for_good() {
 
     // A re-offered later read sees no file left to offer.
     seed(&mut index, &f.path(SESSION_A), 100);
-    step_reoffers(&mut index, true);
+    apply_reoffers(&mut index, true, NOW);
+    assert!(owed(&index).is_empty());
+}
+
+/// [regress] Counts only, with the 8-hex key; a stalled re-offer warns, never stops.
+#[test]
+fn a_re_offer_reports_counts_and_warns_only_when_it_stalls() {
+    let home = "ab".repeat(32);
+    let mut record = FolderRecord {
+        reoffer: REOFFER_CENSUS,
+        ..FolderRecord::default()
+    };
+    let tally = ReofferTally {
+        files: 2_001,
+        bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
+        owed_files: 2_001,
+        owed_bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
+    };
+    assert_eq!(
+        reoffer_line(&home, &mut record, &tally, NOW).unwrap(),
+        format!(
+            "ottto-service: claude folder re-offer folder=abababab phase=census files_read=0 \
+             bytes_read=0 files_remaining=2001 bytes_remaining={} eta_minutes=15",
+            3 * HISTORY_UPGRADE_BYTES_PER_PAGE
+        )
+    );
+    assert_eq!(reoffer_line(&home, &mut record, &tally, NOW + 300), None);
+    let warning = reoffer_line(&home, &mut record, &tally, NOW + STALL_SECONDS).unwrap();
+    assert!(warning.contains("warning") && warning.contains("folder=abababab"));
+    assert_eq!(
+        reoffer_line(&home, &mut record, &tally, NOW + STALL_SECONDS + 300),
+        None,
+        "bounded"
+    );
+}
+
+/// [regress] A damaged ledger keeps every folder first seen after it sticky.
+#[test]
+fn a_damaged_ledger_fails_closed() {
+    let f = folder("recorded-damaged");
+    let mut index = ScanIndex {
+        claude_folder_login_ledger: damaged_ledger(),
+        ..ScanIndex::default()
+    };
+    f.begin(&mut index, folder_report());
+    assert!(f.record(&index).mixed);
+    let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
+    page(&mut index, &mut items, true);
+    assert_eq!(witness(&items), None);
+    seed(&mut index, &f.path(SESSION_A), 100);
+    apply_reoffers(&mut index, true, NOW);
     assert!(owed(&index).is_empty());
 }
