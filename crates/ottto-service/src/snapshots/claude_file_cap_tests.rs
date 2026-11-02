@@ -110,7 +110,7 @@ fn claude_file_past_the_old_record_limits_keeps_all_usage() {
         write_row(&mut writer, &usage(n));
     }
     // One response's progressive blocks: only its last output count is money.
-    let blocks = CLAUDE_RECORDS_PER_RESPONSE_ALARM as u64 + 1;
+    let blocks = 4_097_u64;
     let mut block = usage(singles);
     for output_tokens in 1..=blocks {
         block["message"]["usage"]["output_tokens"] = json!(output_tokens);

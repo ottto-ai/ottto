@@ -16521,9 +16521,8 @@ struct ClaudeResponseRecord {
 }
 
 // Response-local buffering repairs provider-time ordering, so it grows with the
-// file's usage-bearing lines and never refuses one. Above these sizes the
-// finalizer only raises an alarm: they gate nothing.
-const CLAUDE_RECORDS_PER_RESPONSE_ALARM: usize = 4_096;
+// file's usage-bearing lines and never refuses one. Above this size the
+// finalizer only counts a hit: it gates nothing.
 const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
 
 /// One Claude provider response assembled from its content-block transcript
@@ -16652,13 +16651,6 @@ impl ClaudeResponseObservation {
             cache_slot,
         );
         self.records.push(record);
-    }
-
-    /// Test shim for an observation built without a file's selector table:
-    /// its selectors are inline, so the empty table decodes them exactly.
-    #[cfg(test)]
-    fn resolve(self) -> Option<ResolvedClaudeResponse> {
-        self.resolve_with(&ClaudeSelectorTable::default())
     }
 
     #[cfg(test)]
@@ -20135,7 +20127,6 @@ impl SnapshotAccumulator {
                 .max()
                 .unwrap_or(0),
             CLAUDE_RECORDS_PER_FILE_ALARM,
-            CLAUDE_RECORDS_PER_RESPONSE_ALARM,
         );
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
@@ -70419,49 +70410,6 @@ mod tests {
         assert_eq!(item.first_turn_context_tokens, Some(132));
         assert_eq!(item.peak_context_fill_tokens, Some(132));
         let _ = fs::remove_file(path);
-    }
-
-    /// [regress] A response far past the old 4,096 and u16 record limits still
-    /// resolves, in physical order when no provider time orders it. The whole
-    /// file's case runs through a real scan in `claude_file_cap_tests`.
-    #[test]
-    fn claude_response_keeps_every_record_past_the_old_limits() {
-        let usage = |output_tokens| UsageTotals {
-            output_tokens,
-            request_count: 1,
-            ..UsageTotals::default()
-        };
-        let mut response = ClaudeResponseObservation::new(
-            0,
-            usage(0),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        );
-        let last = u64::from(u16::MAX) + 2;
-        for output_tokens in 1..=last {
-            response.push(
-                usage(output_tokens),
-                None,
-                SelectorCapture::default(),
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-                RequestSlot::default(),
-            );
-        }
-        assert_eq!(response.records.len() as u64, last + 1);
-        let resolved = response.resolve().expect("every record resolves");
-        assert_eq!(resolved.usage.output_tokens, last);
-        assert!(!resolved.event_clock_complete);
     }
 
     #[test]

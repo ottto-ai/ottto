@@ -453,26 +453,19 @@ fn with_claude_record_counters<T>(f: impl FnOnce(&ClaudeRecordCounters) -> T) ->
         f(&CLAUDE_RECORD_COUNTERS)
     }
 }
-/// Local alarm: a finalized Claude file holds more records than the sizes this
-/// parser once refused. Nothing is dropped; the counts show how memory grows.
-#[derive(Serialize)]
-struct ClaudeRecordAlarm {
-    file_records: usize,
-    largest_response_records: usize,
-}
+/// `file_alarm` is the size this parser once refused past: nothing is dropped
+/// above it, the counters only show how memory grows.
 pub(crate) fn claude_record_counts(
     file_records: usize,
     largest_response_records: usize,
     file_alarm: usize,
-    response_alarm: usize,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let hit = file_records > file_alarm || largest_response_records > response_alarm;
     with_claude_record_counters(|counters| {
         if file_records >= file_alarm / 2 {
             counters.half.fetch_add(1, Relaxed);
         }
-        if hit {
+        if file_records > file_alarm {
             counters.hits.fetch_add(1, Relaxed);
         }
         counters.max_file.fetch_max(file_records as u64, Relaxed);
@@ -480,16 +473,6 @@ pub(crate) fn claude_record_counts(
             .max_response
             .fetch_max(largest_response_records as u64, Relaxed);
     });
-    if hit {
-        traversal_point(
-            "claude_record_cap_hit",
-            "claude_code",
-            &ClaudeRecordAlarm {
-                file_records,
-                largest_response_records,
-            },
-        );
-    }
 }
 fn take_claude_record_caps() -> ClaudeRecordCaps {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2815,7 +2798,7 @@ mod tests {
     fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_record_counts(2, 1, 4, 4);
+            claude_record_counts(2, 1, 4);
             claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
             claude_reread::terminal_rearm(
                 claude_reread::IgnoredVeto::WithheldAccount.bit(),
