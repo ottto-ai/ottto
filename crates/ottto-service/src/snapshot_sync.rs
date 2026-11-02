@@ -7857,6 +7857,31 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
+    // The Companion uses machine-local labels before upload policy clears them.
+    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
+        scan_agent_status,
+        &current_codex_bindings,
+        cached_codex_login_changed,
+    );
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
+    if crate::active_sessions::reconcile_active_sessions(
+        support_dir,
+        source,
+        &scan_result.snapshots,
+        Some(&reconciliation_status),
+        upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
+        &current_rfc3339(),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "local active-session cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
@@ -7992,29 +8017,6 @@ fn finish_sync_source(
         scan_result.local_codex_diagnostics.as_mut(),
     ) {
         upload_progress.save(&upload_progress_path)?;
-    }
-    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
-        scan_agent_status,
-        &current_codex_bindings,
-        cached_codex_login_changed,
-    );
-    // Claude activity remains recent relative to the scan's observation
-    // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
-        support_dir,
-        source,
-        &scan_result.snapshots,
-        Some(&reconciliation_status),
-        upload_policy,
-        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
-    )
-    .is_err()
-    {
-        eprintln!(
-            "local active-session cache update skipped for {}",
-            source.api_slug()
-        );
     }
     if !scan_result.census_complete {
         // A stale prior manifest must not survive a lossy census. The healthy

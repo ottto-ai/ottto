@@ -3405,7 +3405,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// to an index that no longer exists. Removal needs the state-directory
 /// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)] // Cycle-owned privacy permission travels with the existing pass inputs.
+#[allow(clippy::too_many_arguments)] // Keep the cycle policy input at the local/upload boundary.
 pub(crate) fn begin_durable_pass(
     cache: &sampled_scan::SharedCache,
     support_dir: &Path,
@@ -3414,10 +3414,12 @@ pub(crate) fn begin_durable_pass(
     index_fresh: bool,
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
-    skill_labels_enabled: bool,
+    _skill_labels_enabled: bool,
 ) {
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
-    cache.durable_skill_label_permission(source, skill_labels_enabled);
+    // Privacy settings govern uploads. Local custody always retains the native
+    // labels, including restore and post-save erasure decisions.
+    cache.durable_skill_label_permission(source, true);
     if index_fresh {
         if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
             let _ = cache.durable_remove(writer, source);
@@ -18385,8 +18387,8 @@ struct SnapshotAccumulator {
     // schedule, and explicit slash-skill facts. The source text is never copied
     // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
     first_prompt_material: Option<String>,
-    // In-memory only: provider-native skill names. HMACed before facts are
-    // produced; an allowlisted short name may also become a private display
+    // Private local state: provider-native skill names. HMACed before facts
+    // are produced; an allowlisted short name may also become a private display
     // label, which upload policy strips unless title consent is active.
     provider_skills: BTreeSet<String>,
     started_at: Option<String>,
