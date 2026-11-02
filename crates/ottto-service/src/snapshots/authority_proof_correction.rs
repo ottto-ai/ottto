@@ -995,7 +995,7 @@ impl ScanIndex {
             // (counted); nothing of it is applied.
             let roots = BTreeSet::from([candidate.root.clone()]);
             if !drains.families.contains_key(&candidate.root)
-                && state_v2::load_usage(self, Some(&roots)).is_err()
+                && state_v2::load_usage(self, &roots).is_err()
             {
                 continue;
             }

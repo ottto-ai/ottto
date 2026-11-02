@@ -87,8 +87,8 @@ pub(super) struct Starting {
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) contract_unproven_families: usize,
     /// Evidence owed ON: request occurrences of pending kept from earlier
-    /// windows at this start. They use the shared pending occurrence cap a new
-    /// window's families and owed cap-room reads also need. Omitted while zero.
+    /// windows at this start. They count toward the pending-occurrence
+    /// high-water alarm. Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) stale_pending_occurrences: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,

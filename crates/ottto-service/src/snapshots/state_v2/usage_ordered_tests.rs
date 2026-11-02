@@ -142,7 +142,7 @@ fn sliced_usage_visit_equals_one_whole_visit() {
     }
     let dir = crate::test_scratch::canonical_private_dir("usage-ordered-parity");
     let (custody, mut cold) = v2::ColdSession::publish(&fixture(), &dir);
-    load_usage(&mut cold, Some(&BTreeSet::from(["root-e".to_owned()]))).unwrap();
+    load_usage(&mut cold, &BTreeSet::from(["root-e".to_owned()])).unwrap();
     let usage = &mut cold.claude_usage_family_pending;
     usage
         .page_mut(["root-e"])
@@ -205,8 +205,7 @@ fn sliced_usage_visit_equals_one_whole_visit() {
 }
 
 /// [regress] The ordered visit holds at most one decoded family and installs
-/// none, where `load_usage(None)` installs every family: under a one-byte
-/// budget each slice decodes exactly one stored row. A patched head is
+/// none: under a one-byte budget each slice decodes exactly one stored row. A patched head is
 /// rewritten alone at save with nothing loaded, and the stored row carries
 /// the flag. A row gone mid-sweep refuses the next slice, counted.
 #[test]
@@ -243,9 +242,6 @@ fn ordered_usage_visit_decodes_one_family_and_installs_none() {
         }
     }
     assert_eq!(slices, 6);
-    let mut whole = cold.clone();
-    load_usage(&mut whole, None).unwrap();
-    assert_eq!(loaded(&whole), 6, "the whole-kind load this replaces");
 
     // Patch at save: two heads flip, no family loads, only their rows change.
     let mut expected = v2::resident(&cold);

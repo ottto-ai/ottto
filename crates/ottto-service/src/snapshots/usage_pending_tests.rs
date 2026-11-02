@@ -90,24 +90,24 @@ fn cold_heads_equal_the_fold_of_their_rows_in_any_order() {
     assert_eq!(usage.len(), 4);
     assert_eq!(usage.family("a"), Err(Unknown));
     assert_eq!(usage.family("z"), Ok(None));
-    assert!(usage.all().is_err());
     assert!(usage.page_mut(["a"]).is_err());
 
-    // Load every family: the join sees exactly the resident families.
+    // Load every family: each family reads exactly its resident value.
     let cold_usage = usage.cold_mut().unwrap();
     for (root, family) in resident.resident().unwrap() {
         cold_usage
             .install(root.clone(), family.clone(), digest(family))
             .unwrap();
     }
-    cold_usage.complete().unwrap();
-    assert_eq!(usage.all().unwrap(), resident.resident().unwrap());
+    for (root, family) in resident.resident().unwrap() {
+        assert_eq!(usage.family(root), Ok(Some(family)));
+    }
     assert_eq!(usage.total_occurrences(), resident.total_occurrences());
 
     // The join removes one family and changes another; settling returns the
     // unchanged ones to heads and keeps the changed one loaded.
     usage.discard("c");
-    usage.all_mut().unwrap().get_mut("a").unwrap().invalid = true;
+    usage.family_mut("a").unwrap().unwrap().invalid = true;
     usage
         .cold_mut()
         .unwrap()

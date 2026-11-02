@@ -50,7 +50,6 @@ counters!(EvidenceOwed {
     read,
     selected_by_other_reason,
     deferred_page_cap,
-    owed_waiting_cap,
     changed,
     refused_contract_latch,
     refused_contract_unproven,

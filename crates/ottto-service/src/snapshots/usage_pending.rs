@@ -2,9 +2,9 @@
 //! them `Resident`. A complete v2 hydrate keeps them `Cold`: each family's
 //! row stays in the store and RAM keeps its head (window, flags, member names
 //! with counts, row digest). A page loads its own families before it
-//! accumulates; a terminal decision that joins every family loads them all
-//! first, and the traversal-start carry streams them one at a time. A
-//! family with a head and no loaded value is Unknown, never absent.
+//! accumulates; the terminal join and the traversal-start carry stream them
+//! one at a time. A family with a head and no loaded value is Unknown, never
+//! absent.
 use super::evidence_owed::EvidenceContract;
 use super::ClaudeUsageFamilyPending;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
@@ -240,27 +240,23 @@ impl<'a> UsageView<'a> {
 }
 
 /// Heads of every stored family plus the families loaded this pass. A loaded
-/// value overrides its head and is always rewritten at save. `complete`: a
-/// decision loaded every family, so `loaded` alone is the family set until
-/// `settle` returns to heads.
+/// value overrides its head and is always rewritten at save.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct ColdUsage {
     heads: BTreeMap<String, UsageHead>,
     loaded: Families,
-    complete: bool,
     /// Occurrences summed over every head.
     head_occurrences: usize,
     /// Heads marked `contract_unproven` but not loaded: the save rewrites
     /// only these rows with the flag set, and a read applies it.
     unproven: std::collections::BTreeSet<String>,
 }
-crate::heap_layout_bound::fields!(ColdUsage; heads, loaded, complete, head_occurrences, unproven);
+crate::heap_layout_bound::fields!(ColdUsage; heads, loaded, head_occurrences, unproven);
 impl std::fmt::Debug for ColdUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColdUsage")
             .field("heads", &self.heads.len())
             .field("loaded", &self.loaded.len())
-            .field("complete", &self.complete)
             .field("unproven", &self.unproven.len())
             .finish_non_exhaustive()
     }
@@ -275,9 +271,6 @@ impl ColdUsage {
     }
     pub(super) fn loaded(&self) -> &Families {
         &self.loaded
-    }
-    pub(super) fn head_roots(&self) -> impl Iterator<Item = &String> + '_ {
-        self.heads.keys()
     }
     /// Whether `root`'s stored row is patched `contract_unproven` at save.
     pub(super) fn patched(&self, root: &str) -> bool {
@@ -318,42 +311,18 @@ impl ColdUsage {
         match self.heads.get(root) {
             Some(head) if head.digest == digest => Ok(()),
             // A row this graph removed stays removed.
-            None if !self.complete => Ok(()),
-            _ => Err(Unknown),
+            None => Ok(()),
+            Some(_) => Err(Unknown),
         }
     }
-    /// After a whole-kind load: every head must be loaded.
-    pub(super) fn complete(&mut self) -> Result<(), Unknown> {
-        if self
-            .heads
-            .keys()
-            .any(|root| !self.loaded.contains_key(root))
-        {
-            return Err(Unknown);
-        }
-        self.complete = true;
-        Ok(())
-    }
-    /// End a decision that loaded every family: heads of removed families go,
-    /// and loaded values still equal to their row return to heads, except
-    /// the `keep` families the caller's page still reads.
+    /// End a decision that loaded families: loaded values still equal to
+    /// their row return to heads, except the `keep` families the caller's
+    /// page still reads.
     pub(super) fn settle(
         &mut self,
         keep: &std::collections::BTreeSet<String>,
         digest: impl Fn(&ClaudeUsageFamilyPending) -> Option<[u8; 32]>,
     ) {
-        if self.complete {
-            let removed: Vec<String> = self
-                .heads
-                .keys()
-                .filter(|root| !self.loaded.contains_key(*root))
-                .cloned()
-                .collect();
-            for root in removed {
-                self.drop_head(&root);
-            }
-            self.complete = false;
-        }
         let heads = &self.heads;
         self.loaded.retain(|root, family| {
             keep.contains(root)
@@ -365,17 +334,6 @@ impl ColdUsage {
     /// After this graph's committed save: each loaded family's head is the
     /// row the save left, so it matches the committed baseline again.
     pub(super) fn saved(&mut self, committed: impl Fn(&str) -> Option<[u8; 32]>) {
-        if self.complete {
-            let removed: Vec<String> = self
-                .heads
-                .keys()
-                .filter(|root| !self.loaded.contains_key(*root))
-                .cloned()
-                .collect();
-            for root in removed {
-                self.drop_head(&root);
-            }
-        }
         let heads: Vec<(String, UsageHead)> = self
             .loaded
             .iter()
@@ -414,7 +372,6 @@ fn merged<'a>(
     let mut heads = cold
         .heads
         .range::<str, _>((lower, Bound::Unbounded))
-        .filter(|_| !cold.complete)
         .peekable();
     let mut loaded = cold
         .loaded
@@ -463,7 +420,6 @@ impl UsagePending {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Resident(families) => families.len(),
-            Self::Cold(cold) if cold.complete => cold.loaded.len(),
             Self::Cold(cold) => {
                 cold.heads.len()
                     + cold
@@ -488,7 +444,6 @@ impl UsagePending {
             Self::Resident(families) => families.get(root).map(UsageView::Full),
             Self::Cold(cold) => match cold.loaded.get(root) {
                 Some(family) => Some(UsageView::Full(family)),
-                None if cold.complete => None,
                 None => cold.heads.get(root).map(UsageView::Head),
             },
         }
@@ -531,48 +486,12 @@ impl UsagePending {
         match self {
             Self::Resident(families) => Ok(families.get_mut(root)),
             Self::Cold(cold) => {
-                if !cold.loaded.contains_key(root)
-                    && !cold.complete
-                    && cold.heads.contains_key(root)
-                {
+                if !cold.loaded.contains_key(root) && cold.heads.contains_key(root) {
                     return Err(Unknown);
                 }
                 Ok(cold.loaded.get_mut(root))
             }
         }
-    }
-    /// Every family's evidence, for decisions that join across families.
-    /// Cold: only after a whole-kind load in this decision.
-    pub(super) fn all(&self) -> Result<&Families, Unknown> {
-        match self {
-            Self::Resident(families) => Ok(families),
-            Self::Cold(cold) if cold.complete => Ok(&cold.loaded),
-            Self::Cold(_) => Err(Unknown),
-        }
-    }
-    pub(super) fn all_mut(&mut self) -> Result<&mut Families, Unknown> {
-        match self {
-            Self::Resident(families) => Ok(families),
-            Self::Cold(cold) if cold.complete => Ok(&mut cold.loaded),
-            Self::Cold(_) => Err(Unknown),
-        }
-    }
-    /// `all` inside a decision that loaded every family before it began (a
-    /// terminal page): a cold graph refused that page when the load failed,
-    /// so this cannot see Unknown.
-    #[expect(
-        dead_code,
-        reason = "the terminal streams usage now; removed with the whole-kind load"
-    )]
-    pub(super) fn loaded_all(&self) -> &Families {
-        self.all().expect("usage_pending_loaded_before_join")
-    }
-    #[expect(
-        dead_code,
-        reason = "the terminal streams usage now; removed with the whole-kind load"
-    )]
-    pub(super) fn loaded_all_mut(&mut self) -> &mut Families {
-        self.all_mut().expect("usage_pending_loaded_before_join")
     }
     /// The families a page accumulates into: every root it names that has a
     /// head must be loaded. New families are added to the loaded set.
@@ -583,10 +502,9 @@ impl UsagePending {
         match self {
             Self::Resident(families) => Ok(families),
             Self::Cold(cold) => {
-                if !cold.complete
-                    && roots.into_iter().any(|root| {
-                        cold.heads.contains_key(root) && !cold.loaded.contains_key(root)
-                    })
+                if roots
+                    .into_iter()
+                    .any(|root| cold.heads.contains_key(root) && !cold.loaded.contains_key(root))
                 {
                     return Err(Unknown);
                 }
@@ -601,7 +519,6 @@ impl UsagePending {
     ) -> std::collections::BTreeSet<String> {
         match self {
             Self::Resident(_) => Default::default(),
-            Self::Cold(cold) if cold.complete => Default::default(),
             Self::Cold(cold) => roots
                 .into_iter()
                 .filter(|root| cold.heads.contains_key(*root) && !cold.loaded.contains_key(*root))
@@ -639,7 +556,7 @@ impl UsagePending {
             Self::Cold(cold) => {
                 if let Some(family) = cold.loaded.get_mut(root) {
                     family.contract_unproven = true;
-                } else if !cold.complete {
+                } else {
                     let ColdUsage {
                         heads, unproven, ..
                     } = &mut **cold;
@@ -663,16 +580,11 @@ impl UsagePending {
             }
         }
     }
-    /// Retained occurrences over every family: the pending-occurrence cap's
+    /// Retained occurrences over every family: the high-water alarm's
     /// running total.
     pub(super) fn total_occurrences(&self) -> usize {
         match self {
             Self::Resident(families) => families
-                .values()
-                .map(ClaudeUsageFamilyPending::occurrences)
-                .fold(0_usize, usize::saturating_add),
-            Self::Cold(cold) if cold.complete => cold
-                .loaded
                 .values()
                 .map(ClaudeUsageFamilyPending::occurrences)
                 .fold(0_usize, usize::saturating_add),
