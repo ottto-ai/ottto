@@ -1478,6 +1478,11 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// returned unreachable with `deferred = true`, and the cycle keeps the last
 /// good inventory (see `harvest_source`).
 fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput, bool) {
+    // The agent never loads a disabled server, so it is reported without
+    // launching it.
+    if server.disabled {
+        return (unreachable_server(server), false);
+    }
     let tools = match &server.transport {
         Transport::Stdio {
             command,

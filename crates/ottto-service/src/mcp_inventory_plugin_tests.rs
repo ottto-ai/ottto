@@ -103,3 +103,28 @@ enabled = true
     assert_eq!(servers["tools"].config_dir.as_deref(), Some(root.as_path()));
     let _ = fs::remove_dir_all(&home);
 }
+
+#[cfg(unix)]
+#[test]
+fn disabled_servers_are_not_launched() {
+    let home = test_home("disabled-not-launched");
+    let marker = home.join("launched");
+    let server = ConfiguredServer {
+        name: "off".to_string(),
+        transport: Transport::Stdio {
+            command: "/usr/bin/touch".to_string(),
+            args: vec![marker.to_string_lossy().into_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        disabled: true,
+        always_load: false,
+        config_dir: None,
+    };
+
+    let (input, deferred) = harvest_server(&server, &test_spawn_env());
+
+    assert!(input.disabled && !input.reachable && !deferred);
+    assert!(!marker.exists(), "a disabled server is never spawned");
+    let _ = fs::remove_dir_all(&home);
+}
