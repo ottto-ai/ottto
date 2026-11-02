@@ -72,7 +72,7 @@ fn actual_batches(
 ) -> (Vec<Vec<usize>>, u64) {
     let mut batches = Vec::new();
     let mut accepted = 0;
-    let result = upload_resumable_batches_with_body_witness_partitioned(
+    let result = upload_resumable_batches_with_literal_families(
         items,
         &unique_poison_scope(),
         &mut progress,
@@ -81,6 +81,7 @@ fn actual_batches(
         |item| item.fingerprint.clone(),
         |_| None,
         |item| item.class,
+        |_| None,
         &mut InplaceRetryBudget::default(),
         |batch| {
             batches.push(batch.iter().map(|item| item.ordinal).collect());
@@ -242,7 +243,7 @@ fn snapshot_packing_count_serialization_failure_keeps_local_error_and_no_upload(
     let mut accepted = 0;
     let mut uploads = 0;
     let mut saves = 0;
-    let error = upload_resumable_batches_with_body_witness_partitioned(
+    let error = upload_resumable_batches_with_literal_families(
         &[item],
         &unique_poison_scope(),
         &mut progress,
@@ -251,6 +252,7 @@ fn snapshot_packing_count_serialization_failure_keeps_local_error_and_no_upload(
         |item| item.fingerprint.clone(),
         |_| None,
         |_| false,
+        |_| None,
         &mut InplaceRetryBudget::default(),
         |_| {
             uploads += 1;

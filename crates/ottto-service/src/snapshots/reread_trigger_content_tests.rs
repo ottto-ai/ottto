@@ -727,7 +727,6 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         let mut bound = candidate.clone();
         assert!(
             adopt_stored_changed_time(
-                source,
                 &mut bound,
                 &fixture.index.files,
                 Some(live),
@@ -744,7 +743,6 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         };
         assert_eq!(
             adopt_stored_changed_time(
-                source,
                 &mut candidate,
                 &fixture.index.files,
                 Some(unbound),

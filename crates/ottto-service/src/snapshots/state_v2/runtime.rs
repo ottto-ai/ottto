@@ -159,6 +159,8 @@ struct RouteState {
     pass_written_start: Option<u64>,
     // Live ACK custody exceeded the companion bound: no collection before this.
     custody_retry_at: Option<Instant>,
+    // This pass's unsaved Tail state, published by the next full save or at exit.
+    tail: tail::TailStage,
 }
 impl RouteState {
     fn custody_held(&self) -> bool {
@@ -228,6 +230,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_retry_completed: false,
                     pass_written_start: None,
                     custody_retry_at: None,
+                    tail: Default::default(),
                 }))
             })
             .clone()
@@ -633,14 +636,21 @@ pub(in super::super) fn save_locked(
             index.generation = previous.generation;
         }
         recovered_write(path, progress_owner, &id, session, |session| {
-            let digests = import::save(
+            session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
+            let saved = import::save(
                 &mut session.db,
                 &id,
                 previous,
                 index,
                 &mut session.cx,
                 claim_only,
-            )?;
+            );
+            // A commit published the stage; otherwise it waits for the next
+            // save or the exit commit.
+            if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
+                state.tail = stage;
+            }
+            let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
             if !claim_only && !session.reload {
@@ -1084,17 +1094,34 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
 }
 
 /// idle releases the page baseline when a cycle completes; an error exit skips
-/// idle, so dropping this at the cycle's end releases it as well.
-pub(in super::super) struct BaselineRelease(Option<PathBuf>);
+/// idle, so dropping this at the cycle's end releases it as well. It also owns
+/// the end of the pass for staged Tail state no later save carried: `commit_tail`
+/// is the normal exit's one write, and dropping only discards and counts.
+pub(crate) struct BaselineRelease(Option<(PathBuf, std::sync::Weak<Runtime>)>);
 impl BaselineRelease {
     pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
         // A v1 graph has no runtime: hold nothing, so drop is a no-op.
-        Self(index.v2().persistence_v2.as_ref().map(|_| path.to_owned()))
+        Self(
+            index
+                .v2()
+                .persistence_v2
+                .as_ref()
+                .map(|runtime| (path.to_owned(), Arc::downgrade(runtime))),
+        )
+    }
+    /// The normal cycle exit's Tail-only commit, when anything is staged.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the acquisition cutover exits"))]
+    pub(crate) fn commit_tail(&self) -> Result<()> {
+        match &self.0 {
+            Some((path, runtime)) => tail_route::commit_at_exit(path, runtime),
+            None => Ok(()),
+        }
     }
 }
 impl Drop for BaselineRelease {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
+        if let Some((path, _)) = &self.0 {
+            tail_route::discard_at_exit(path);
             let _ = with_state(path, |state| {
                 state.save_digests = None;
                 Ok(())
@@ -1199,6 +1226,7 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         state.latched = true;
         state.inventory_ready = false;
         state.save_digests = None;
+        state.tail = Default::default();
         state.current = None;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
             runtime
@@ -1355,6 +1383,13 @@ fn read_txn<R>(
     index: &ScanIndex,
     f: impl FnOnce(&mut dyn Transaction) -> Result<R>,
 ) -> Result<(R, (u64, u64))> {
+    read_txn_at(index, |tx, stamp| Ok((f(tx)?, stamp)))
+}
+/// `read_txn`, handing `f` the authenticated stamp before it reads.
+fn read_txn_at<R>(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut dyn Transaction, (u64, u64)) -> Result<R>,
+) -> Result<R> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1377,7 +1412,7 @@ fn read_txn<R>(
         Hold::DbUnavailable
     );
     let mut tx = session.db.begin(TxnMode::Read)?;
-    Ok((f(&mut tx)?, stamp))
+    f(&mut tx, stamp)
 }
 
 /// Cold usage pending: load the families a page names before it
@@ -1613,6 +1648,20 @@ pub(in super::super) fn confirmed_growth_stamp(
 #[cfg(test)]
 #[path = "runtime_growth_tests.rs"]
 mod growth_tests;
+
+#[path = "runtime_tail.rs"]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the acquisition cutover calls these")
+)]
+pub(super) mod tail_route;
+#[cfg(test)]
+#[path = "tail_tests.rs"]
+mod tail_tests;
+#[cfg(test)]
+pub(crate) use tail_tests::{
+    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+};
 
 #[path = "runtime_live_keys.rs"]
 mod live_keys;

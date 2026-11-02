@@ -29,7 +29,9 @@ impl Fixture {
             SnapshotSource::ClaudeCode => {
                 json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}})
             }
-            _ => unreachable!(),
+            SnapshotSource::Pi => json!({"type":"session", "version":3,
+                "id":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z",
+                "cwd":"/synthetic/pi"}),
         };
         let fixture = Self(path);
         fixture.append(&value);
@@ -62,7 +64,10 @@ pub(super) fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> V
             "requestId":format!("req-{id}"), "message":{"id":format!("response-{id}"), "model":model,
             "usage":{"input_tokens":n,"cache_read_input_tokens":n/2,"output_tokens":n/10}}})
         }
-        _ => unreachable!(),
+        SnapshotSource::Pi => json!({"type":"message", "timestamp":timestamp,
+            "message":{"role":"assistant", "responseId":format!("response-{id}"),
+            "model":model, "timestamp":timestamp,
+            "usage":{"input":n,"output":n/10,"cacheRead":n/2}}}),
     }
 }
 
@@ -84,7 +89,7 @@ fn native_parser_with(
         match source {
             SnapshotSource::Codex => apply_codex_line,
             SnapshotSource::ClaudeCode => apply_claude_code_line,
-            _ => unreachable!(),
+            SnapshotSource::Pi => apply_pi_line,
         },
         Some(metadata),
         None,
@@ -216,7 +221,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        _ => unreachable!(),
+        SnapshotSource::Pi => {
+            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
@@ -504,12 +511,17 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
     }
 }
 
+/// [behaviour] A hidden same-width edit can leave a sampled Tail prefix stale.
 #[test]
 fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
         let fixture = Fixture::new(source);
         fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
         let model = if source == SnapshotSource::Codex {
@@ -521,19 +533,27 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
         let (old, _, _, _) = acquire(&fixture, source, None, 100);
         assert!(old.is_some());
+        fixture.append(&usage(source, 140, 1, model));
+        let unedited = oracle(&fixture, source);
         let original = fs::read_to_string(&fixture.0).unwrap();
-        let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
+        let field = if source == SnapshotSource::Pi {
+            "input"
+        } else {
+            "input_tokens"
+        };
+        let edited = original.replace(&format!("\"{field}\":100"), &format!("\"{field}\":900"));
         assert_ne!(original, edited);
         assert_eq!(original.len(), edited.len());
         fs::write(&fixture.0, edited).unwrap();
-        fixture.append(&usage(source, 140, 1, model));
         let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
         assert_eq!(mode, ReadMode::Tail);
-        assert_ne!(
-            interim,
-            oracle(&fixture, source),
-            "accepted sampled limitation must be visible"
-        );
+        assert_eq!(interim, unedited, "Tail retains the pre-edit prefix");
+        let full = oracle(&fixture, source);
+        if source == SnapshotSource::Pi {
+            assert_eq!(interim[0]["input_tokens"], 240);
+            assert_eq!(full[0]["input_tokens"], 1040);
+        }
+        assert_ne!(interim, full, "accepted sampled limitation must be visible");
         let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
         assert_eq!(mode, ReadMode::Unchanged);
         assert_eq!(guards, 0);
@@ -1069,7 +1089,7 @@ impl ScanFixture {
         let root = match source {
             SnapshotSource::Codex => dir.join("home/.codex/sessions"),
             SnapshotSource::ClaudeCode => dir.join("home/.claude/projects"),
-            _ => unreachable!(),
+            SnapshotSource::Pi => dir.join("home/.pi/agent/sessions"),
         };
         fs::create_dir_all(&root).unwrap();
         let path = root.join(if source == SnapshotSource::Codex {
@@ -5096,6 +5116,37 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             }
         }
     }
+}
+
+/// [regress] A new file was incorrectly counted as a recordless content change.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_new_file_reads_once_without_transitional_full_count() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let source = SnapshotSource::Pi;
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let index = ScanIndex::default();
+    let key = local_index_key(&fixture.file.0);
+    assert!(!index.files.contains_key(&key));
+    let (((index, scan, modes), _counts), reads) =
+        terminal_contract_retry::source_acquisitions(|| {
+            observe(|| production_scan(&fixture, source, index, Some(cache.clone()), "pi-new-file"))
+        });
+    assert_eq!(modes, (1, 0, 0));
+    assert!(!scan.snapshots.is_empty());
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads.get(&fixture.file.0), Some(&1));
+    assert!(index.files.contains_key(&key));
+    let (((_, _, modes), _counts), reads) = terminal_contract_retry::source_acquisitions(|| {
+        observe(|| production_scan(&fixture, source, index, Some(cache), "pi-new-file"))
+    });
+    assert_eq!(modes, (0, 0, 0));
+    assert!(
+        reads.is_empty(),
+        "the new Pi file is settled after one read"
+    );
 }
 
 mod codex_mcp_version_tests;

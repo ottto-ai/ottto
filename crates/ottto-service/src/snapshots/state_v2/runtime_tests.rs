@@ -12,13 +12,13 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     states().lock().unwrap().remove(path);
 }
 
-fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
     Ok(load_locked(path, importable, published(path)?)?.0)
 }
-fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
+pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
 }
-fn save_with_mode(
+pub(super) fn save_with_mode(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
@@ -28,7 +28,7 @@ fn save_with_mode(
 }
 
 /// Generation of a freshly imported native fixture store.
-const G: u64 = 1;
+pub(super) const G: u64 = 1;
 
 /// (generation, data version) before and after a raced delete.
 type RacedStamps = Option<((u64, u64), (u64, u64))>;
@@ -90,12 +90,12 @@ fn fill_session(index: &mut ScanIndex) {
     }
 }
 
-struct Fixture {
-    support: PathBuf,
-    path: PathBuf,
+pub(super) struct Fixture {
+    pub(super) support: PathBuf,
+    pub(super) path: PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let support = crate::test_scratch::canonical_private_dir("ottto-v2-route");
         let parent = support.join("snapshots/destinations").join("b".repeat(64));
         fs::create_dir_all(&parent).unwrap();
@@ -104,7 +104,7 @@ impl Fixture {
             support,
         }
     }
-    fn identity(&self) -> Identity {
+    pub(super) fn identity(&self) -> Identity {
         Identity {
             format: FORMAT,
             db_id: "fixture-db".into(),
@@ -145,7 +145,7 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn published(&self) {
+    pub(super) fn published(&self) {
         self.imported();
         fence::publish(&self.path, &self.identity(), &mut false).unwrap();
     }
@@ -732,8 +732,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     for (source, keys) in [
         (Source::Claude, Some(DurableSource::ClaudeCode)),
         (Source::Codex, Some(DurableSource::Codex)),
-        // Pi has no key mapping: never an empty complete set that a sweep could erase by.
-        (Source::Pi, None),
+        (Source::Pi, Some(DurableSource::Pi)),
     ] {
         f6_forget(source, keys);
     }
@@ -967,19 +966,17 @@ fn generation_and_capability_are_checked_before_external_effects() {
 fn another_graph_save_cannot_advance_a_stale_external_guard() {
     let f = Fixture::new();
     f.published();
-    let (mut first, load_events) =
-        crate::local_resource_diagnostics::capture(|| load_with(&f.path, false).unwrap().unwrap());
-    let load = &load_events.last().unwrap()["counts"]["latest"]["load_span"];
+    let mut first = load_with(&f.path, false).unwrap().unwrap();
+    let load = telemetry::take_thread_event_for_test("load_span").unwrap();
     assert!(load["duration_ms"].is_u64());
     assert_eq!(load["generation"], G);
     assert_eq!(load.as_object().unwrap().len(), 2);
     let second = load_with(&f.path, false).unwrap().unwrap();
     let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
     stale().unwrap();
-    let (saved, save_events) =
-        crate::local_resource_diagnostics::capture(|| save_with(&f.path, &mut first).unwrap());
+    let saved = save_with(&f.path, &mut first).unwrap();
     assert!(saved);
-    let save = &save_events.last().unwrap()["counts"]["latest"]["save_span"];
+    let save = telemetry::take_thread_event_for_test("save_span").unwrap();
     assert!(save["duration_ms"].is_u64());
     assert_eq!(save["outcome"], "committed");
     assert_eq!(save["generation"], G + 1);
@@ -2100,6 +2097,116 @@ fn paced_growth_read_defers_at_both_admission_sites() {
             "sampled={sampled}: the aged-out Full was admitted"
         );
     }
+}
+
+/// [regress] A deferred growth Full left the queue, and after its claim
+/// expired its queued path waited behind the census FIFO. It now rides the
+/// next selecting page and its one admitted Full settles the debt.
+#[test]
+fn expired_growth_claim_rides_the_next_selecting_page() {
+    use crate::snapshots::sampled_audit::GROWTH_FULL_INTERVAL;
+    use crate::snapshots::{
+        local_index_key, sampled_scan, scan_source_roots_with_test_limit, SnapshotSource,
+    };
+    let at = |seconds: u64| {
+        ::time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&::time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let f = Fixture::new();
+    let roots = f.support.join("transcripts");
+    fs::create_dir(&roots).unwrap();
+    let write = |digit: char| {
+        let session = format!(
+            "{0}{0}{0}{0}{0}{0}{0}{0}-{0}{0}{0}{0}-4{0}{0}{0}-8{0}{0}{0}-{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}",
+            digit
+        );
+        let line = serde_json::json!({"type": "assistant", "sessionId": session,
+            "uuid": format!("u{digit}"), "cwd": "/synthetic",
+            "timestamp": "2026-10-06T10:00:00.000Z", "requestId": format!("req_{digit}"),
+            "message": {"id": format!("msg_{digit}"), "model": "claude-opus-4-8",
+                "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+        let path = roots.join(format!("{session}.jsonl"));
+        fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    };
+    // Name order queues the ordinary members ahead of the debt file.
+    let ahead = ['1', '2', '3'].map(&write);
+    let transcript = write('f');
+    let key = local_index_key(&transcript);
+    let claimed = sampled_scan::now_seconds();
+    let mut seed = ScanIndex::default();
+    seed.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 4, "modified_unix_seconds": 1,
+            "source_file_fingerprint": "a".repeat(64),
+            "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+        }))
+        .unwrap(),
+    );
+    seed.v2_mut().growth_retention.insert(
+        key.clone(),
+        serde_json::from_value(
+            serde_json::json!({"predecessor_size": 4, "last_growth_full_unix": claimed}),
+        )
+        .unwrap(),
+    );
+    let mut index =
+        super::super::money_test_support::publish(&seed, &f.path, br#"{"generation":0}"#);
+    let page = |index: &mut ScanIndex, now: u64| {
+        scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&roots),
+            index,
+            &at(now),
+            30,
+            1,
+            false,
+        )
+        .unwrap()
+    };
+    let queued = |index: &ScanIndex, path: &std::path::Path| {
+        index.traversal.as_ref().is_some_and(|walk| {
+            walk.pending_candidates
+                .iter()
+                .any(|c| c.path.as_path() == path)
+        })
+    };
+    let claim = |index: &ScanIndex| {
+        serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()["last_growth_full_unix"]
+            .clone()
+    };
+    page(&mut index, claimed);
+    assert!(
+        queued(&index, transcript.as_path()),
+        "the debt file waits in the queue"
+    );
+    assert!(
+        queued(&index, ahead[2].as_path()),
+        "an ordinary member is queued ahead"
+    );
+    assert_eq!(claim(&index), claimed);
+
+    let later = claimed + GROWTH_FULL_INTERVAL;
+    sampled_scan::set_test_now(Some(later));
+    page(&mut index, later);
+    sampled_scan::set_test_now(None);
+    assert_eq!(claim(&index), later, "the expired claim was taken once");
+    let debt = serde_json::to_value(&index.v2().growth_retention[&key]).unwrap();
+    assert!(
+        debt["predecessor_size"].is_null(),
+        "its Full settled the debt"
+    );
+    assert_eq!(
+        index.files[&key].size_bytes,
+        fs::metadata(&transcript).unwrap().len()
+    );
+    assert!(
+        queued(&index, ahead[2].as_path()),
+        "it rode the page ahead of the census FIFO"
+    );
 }
 
 /// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.

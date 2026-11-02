@@ -832,6 +832,15 @@ impl Transaction for ReadBack<'_> {
     fn delete(&mut self, _: &RowKey) -> Result<bool> {
         bail!(Pause::Mismatch)
     }
+    fn isolated(
+        &mut self,
+        _: &mut dyn FnMut(&mut dyn Transaction) -> Result<()>,
+    ) -> Result<Result<()>> {
+        bail!(Pause::Mismatch)
+    }
+    fn mark_erasure(&mut self) -> Result<()> {
+        bail!(Pause::Mismatch)
+    }
     fn request_set_candidates(
         &mut self,
         digest: &[u8; 32],

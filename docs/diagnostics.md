@@ -66,7 +66,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 
 | Field | Measurement |
 | --- | --- |
-| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
@@ -338,6 +338,13 @@ windows.
 Claude Code's local-evidence stage adds three such footprint records (empty
 counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
+Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
+read) and `evidence_cross_root` (each root's cross-root summary add plus the
+final sort) are summed over roots into one record each per pass, with
+`wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
+step) and no footprint fields.
+A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
+around folding stored usage families into heads.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
@@ -1728,6 +1735,58 @@ Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
+Pi fork files exclude copied usage entries whose envelope timestamp is strictly
+before their session header time. If the envelope time is absent, the provider
+time can establish the cutoff. Entries at or after the header time retain normal
+identity and deduplication. Missing or invalid cutoff evidence never proves a
+copy; ordinary timestamp validation still applies. A fork's durable Pi section
+stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
+ledger. The L cutoff never enters logs, diagnostics or uploads.
+The `parentSession` value is checked at the header and never retained in the
+ledger or included in records, logs, diagnostics or uploads.
+
+The fixed cache lifecycle counters `pi_fork_copies_skipped_entries` and
+`pi_fork_copies_skipped_tokens` count physical usage-bearing entries excluded
+and their tokens. A copied message/message_end pair contributes two skipped
+entries, even though normal pairing would count one request. Counts accumulate
+per process and in the existing per-page observer; repeated Full reads count
+again.
+
+Historical parent spend is excluded even if its file was never uploaded. Copies
+from a machine whose clock ran ahead can have timestamps at or after the fork
+header and still count; detecting them needs parent history, which this reader
+does not acquire. There is no clock-skew counter. Correcting an earlier inflated
+Pi session produces a normal lower-usage revision, without a Claude usage-decrease
+marker or an additional history read. A complete fork containing only copied
+usage publishes a zero-usage revision; copied usage does not make that read
+incomplete. Malformed owned evidence retains normal loss handling.
+
+Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
+counts report Full, Tail and Unchanged decisions with the actual planner reasons.
+Pi inherits the accepted sampled residual: an interior same-length rewrite plus
+growth can Tail a stale prefix until the next Full. Pi's writer is append-only,
+and its header rewrite reads Full. The shared
+`sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
+pins it for Claude Code, Codex and Pi.
+Age and clock changes do not invalidate checkpoints. Admission of a new sampled
+obligation follows the shared audit cap: with no slot left, an unmarked change
+reads a counted cap Full (or waits); already-marked files keep Tailing.
+Pi uses the shared durable restore path. An indexed file that changes without
+an available RAM or durable reduction reads Full under the shared `state_missing`
+planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
+fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
+A Pi usage ledger above 65,536 keys refuses persistence through the shared
+`not_persisted{wa.entry_cap}` class; the ledger is never truncated.
+
+`restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
+counts a durable-restored Tail read ending strictly below the frozen indexed
+accepted extent when it offers a complete body after policy and semantic no-op
+suppression. Pi has no accepted-body floor. Full, Unchanged and RAM-retained
+reads do not count. Upload retries count again. The same signal uses source
+`codex` for surviving restored Tail offers and source `claude_code` with outcome
+`held` for accepted-floor holds. It contains only counts, source and outcome,
+with no file names, response ids or content.
+
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
 main's narrower current-representation binding formula. Grouped Codex members
@@ -1892,8 +1951,8 @@ proven absence; unlink's pending directory sync stays in key custody.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
-Codex and Pi report `restored_behind_accepted.published` only when a complete
-restored Tail body below the frozen accepted extent reaches publication.
+Codex and Pi report `restored_behind_accepted.published` when a complete restored
+Tail body below the frozen accepted extent reaches publication.
 
 `restore_pending_quiet{source}` is emitted once per source pass as a cumulative
 process total on the existing `durable_tail_alarm` carrier with `process_id`.
@@ -2070,17 +2129,20 @@ erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
-`store_growth` samples the SQLite store once per idle daily reference-maintenance
-pass, after reference verification (an hourly retry of a failed pass samples again).
-It reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
+`store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
+SQLite store once a day, on any between-cycles window, before reference verification.
+Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
 (`rows`), `key_bytes` and `value_bytes` for each present catalogue kind, plus
 `shared_value_bytes` and `chunk_bytes`. Value bytes use the store's logical
 length metadata; chunk bytes sum stored chunk lengths and overlap the logical
 record/shared values, so do not add them together. These are payload lengths,
-not per-table allocated space. Sampling uses what remains of the existing
-reference-check VM budget. `partial: true` means
+not per-table allocated space. Sampling has its own VM budget, the same size as
+the reference check's. `partial: true` means
 sampling was interrupted, failed or ran out of budget; completed counts remain,
 unavailable scalar counts are null and missing kinds are unknown, not zero.
+`reference_check_failed_causes` counts each failed reference check by a fixed cause:
+timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
+counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`
