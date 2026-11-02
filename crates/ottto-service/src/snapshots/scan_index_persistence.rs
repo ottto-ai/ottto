@@ -2071,7 +2071,7 @@ impl LockedStore {
             return Ok(());
         }
         visit_storage_directory(&self.parent, |name| {
-            if name.to_str().is_ok_and(own_temp) {
+            if name.to_str().is_ok_and(|name| names.own_temp(name)) {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 unlink_at(&self.parent, name)?;
             }
