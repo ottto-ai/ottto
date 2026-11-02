@@ -13,6 +13,7 @@ use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
 
 /// One collection a source stores in pages.
@@ -42,6 +43,20 @@ pub(in crate::snapshots) enum ReconstructCause {
     Revision,
     /// The head was written for another route, scan root or path.
     Identity,
+    /// A re-derived content field no longer matches its stored digest.
+    NotRederivable,
+}
+impl ReconstructCause {
+    pub(in crate::snapshots) fn label(self) -> &'static str {
+        match self {
+            Self::Corrupt => "corrupt",
+            Self::Incompatible => "incompatible",
+            Self::Incomplete => "incomplete",
+            Self::Revision => "revision",
+            Self::Identity => "identity",
+            Self::NotRederivable => "not_rederivable",
+        }
+    }
 }
 impl From<Corrupt> for ReconstructCause {
     fn from(_: Corrupt) -> Self {
@@ -50,9 +65,11 @@ impl From<Corrupt> for ReconstructCause {
 }
 
 /// What a head binds: the route and file it was reduced for, and the
-/// parse-time capture mode. The reduction revision is the head's stored
-/// revision. Upload context, replay generation, the artifacts flag, the
-/// sidecar digest, the account witness and version strings are not inputs.
+/// parse-time capture mode. The route is the destination-scoped index path,
+/// so it names the upload destination namespace. The reduction revision is
+/// the head's stored revision. Upload context, replay generation, the
+/// artifacts flag, the sidecar digest, the account witness and version
+/// strings are not inputs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::snapshots) struct HeadIdentity {
     binding: [u8; 32],
@@ -60,7 +77,6 @@ pub(in crate::snapshots) struct HeadIdentity {
 }
 impl HeadIdentity {
     pub(in crate::snapshots) fn new(
-        namespace: &str,
         index_path: &Path,
         source: SnapshotSource,
         scan_root: &Path,
@@ -75,7 +91,6 @@ impl HeadIdentity {
         let mut hash = Sha256::new();
         for part in [
             "ottto-tail-head-identity:v1",
-            namespace,
             &index_path,
             source.api_slug(),
             &scan_root,

@@ -367,6 +367,18 @@ pub(crate) struct Decoded {
     reduction: CachedJsonlReduction,
     rederive: Rederive,
 }
+impl Decoded {
+    /// Stored Tail state before re-derivation.
+    pub(in crate::snapshots) fn stored(
+        reduction: CachedJsonlReduction,
+        rederive: Rederive,
+    ) -> Self {
+        Self {
+            reduction,
+            rederive,
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
@@ -509,36 +521,36 @@ impl Decoded {
     }
 
     /// How far the head re-parse must read: the latest mark of a field to
-    /// re-derive. 0 when nothing needs the head.
-    pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
+    /// re-derive, each within `bound`. 0 when nothing needs the head.
+    pub(crate) fn head_end(&self, bound: u64) -> Result<u64, Refuse> {
         let acc = &self.reduction.accumulator;
         let marks = acc.durable_marks;
         let mut end = 0;
         if self.rederive.first_prompt.is_some() {
             end = end.max(head_mark(
                 marks.first_prompt,
-                HEAD_BOUND,
+                bound,
                 "SnapshotAccumulator.first_prompt_material",
             )?);
         }
         if self.rederive.workspace.is_some() {
             end = end.max(head_mark(
                 marks.workspace,
-                HEAD_BOUND,
+                bound,
                 "SnapshotAccumulator.workspace_path",
             )?);
         }
         if self.rederive.agent_label.is_some() {
             end = end.max(head_mark(
                 marks.agent_label,
-                HEAD_BOUND,
+                bound,
                 "SnapshotAccumulator.codex_agent_label",
             )?);
         }
         if self.rederive.session_start.is_some() {
             end = end.max(head_mark(
                 acc.session_start.durable_content_end(),
-                HEAD_BOUND,
+                bound,
                 "SessionStartState.content_end",
             )?);
         }

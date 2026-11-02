@@ -2962,10 +2962,6 @@ pub(crate) enum MarkerVerdict<'m> {
 impl OrgMarkers {
     /// Every recorded response position: each is the file's response count
     /// when its line was read.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "S2 commit 3's load validates these")
-    )]
     pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries
             .iter()

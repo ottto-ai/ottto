@@ -6,12 +6,14 @@
 //! discloses the loss. Upload never waits on any of this.
 //!
 //! Changed pages are relative to the committed head the read continued (its
-//! `TailBase`): a page whose encoding equals the committed page's is not
-//! restated. A `Log` collection never reorders committed pages: elements new
-//! since the base follow them, sorted among themselves (the accumulator's
-//! sets keep no arrival order), filling the last committed page while it has
-//! room. A full encode writes each `Log` sorted. Without a base every page is
-//! restated; a Full read replaces every stored row.
+//! `TailBase`, built by the load): a page whose encoding equals the committed
+//! page's is not restated, and a read that changes no page and no head byte
+//! writes nothing. A `Log` collection never reorders committed pages:
+//! elements new since the base follow them, sorted among themselves (the
+//! accumulator's sets keep no arrival order), filling the last committed page
+//! while it has room. A full encode writes each `Log` sorted. Without a base
+//! (a Full read, or a retry of a set-aside file) the stage is a `Reset` that
+//! replaces every stored row.
 use super::{stage_full, CollectionSpec, HeadIdentity, ReconstructCause, TailSource};
 use crate::durable_tail_codec::Refuse;
 use crate::snapshots::sampled_jsonl::CompletedNativeAcquisition;
@@ -38,7 +40,8 @@ pub(in crate::snapshots) struct PendingTail {
 
 /// What PRE encoded, held until the verdict. A refusal is held too.
 pub(in crate::snapshots) struct Encoded {
-    staged: Result<StagedFile, Refuse>,
+    /// `None`: nothing differs from the committed head.
+    staged: Result<Option<StagedFile>, Refuse>,
     /// A finish-only or live field already set at PRE.
     finish_field: Option<&'static str>,
 }
@@ -46,20 +49,27 @@ pub(in crate::snapshots) struct Encoded {
 impl PendingTail {
     /// A certified Claude completion on a state database route. `None`: no
     /// route or no valid certificate, so nothing is written for this read.
+    /// `base` is the committed head the load continued; `quiet` a quiet audit
+    /// this completion retires, so the head no longer carries its debt.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::snapshots) fn claude(
         index: &ScanIndex,
         completed: &CompletedNativeAcquisition,
         active: &sampled_scan::Active,
         candidate: &CandidateFile,
         held: &File,
-        namespace: &str,
         capture: bool,
+        base: Option<TailBase>,
+        quiet: bool,
     ) -> Option<Self> {
         let route = state_v2::runtime_path(index).ok()??;
         let birth = crate::transcript_acquisition::birth_unix_nanos(&held.metadata().ok()?);
+        let mut certificate = completed.checkpoint.durable_certificate(birth)?;
+        if quiet {
+            certificate.audit_debt_unix_seconds = None;
+        }
         Some(Self {
             id: HeadIdentity::new(
-                namespace,
                 &route,
                 SnapshotSource::ClaudeCode,
                 &candidate.scan_root,
@@ -68,11 +78,10 @@ impl PendingTail {
             ),
             route,
             key: active.key.clone(),
-            certificate: completed.checkpoint.durable_certificate(birth)?,
+            certificate,
             unsealed: completed.unsealed,
             full: matches!(active.mode, ReadMode::Full(_)),
-            // The committed base comes with the Tail load.
-            base: None,
+            base,
             encode: tail_encode::<super::claude::Claude>,
             encoded: None,
         })
@@ -85,35 +94,41 @@ impl PendingTail {
     }
 
     /// The native verdict, then this completion's one call into the store.
-    pub(in crate::snapshots) fn publish(self, native: &Result<ParsedJsonlFile>) {
+    /// True when the committed head stays valid for this completion: staged,
+    /// or nothing to restate.
+    pub(in crate::snapshots) fn publish(self, native: &Result<ParsedJsonlFile>) -> bool {
         let Some(encoded) = self.encoded else {
-            return; // PRE never ran: the read failed before it.
+            return false; // PRE never ran: the read failed before it.
         };
         if self.unsealed || !finish_loss_free(native) {
-            return;
+            return false;
         }
         // Staging only fails on a poisoned route lock; the predecessor stays.
-        let _ = match (encoded.staged, encoded.finish_field) {
-            (Err(_), _) => state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode),
-            (Ok(_), Some(_)) => state_v2::set_aside_tail(
-                &self.route,
-                &self.key,
-                SetAsideCause::UnexpectedFinishField,
-            ),
-            (Ok(staged), None) => state_v2::stage_tail(&self.route, &self.key, staged),
-        };
+        match (encoded.staged, encoded.finish_field) {
+            (Err(_), _) => {
+                let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
+                false
+            }
+            (Ok(_), Some(_)) => {
+                let _ = state_v2::set_aside_tail(
+                    &self.route,
+                    &self.key,
+                    SetAsideCause::UnexpectedFinishField,
+                );
+                false
+            }
+            (Ok(Some(staged)), None) => {
+                state_v2::stage_tail(&self.route, &self.key, staged).is_ok()
+            }
+            (Ok(None), None) => true,
+        }
     }
 }
 
 fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) -> Encoded {
     let staged = match tail.base.as_ref().filter(|_| !tail.full) {
         Some(base) => base.stage::<S>(view, &tail.certificate, &tail.id),
-        None => stage_full::<S>(view, &tail.certificate, &tail.id).map(|mut staged| {
-            if !tail.full {
-                staged.change = Change::Ordinary;
-            }
-            staged
-        }),
+        None => stage_full::<S>(view, &tail.certificate, &tail.id).map(Some),
     };
     Encoded {
         staged,
@@ -121,16 +136,18 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
     }
 }
 
-/// The committed head's pages a read continued: each page's digest, and each
-/// `Log`'s committed elements and last page.
-#[derive(Default)]
+/// The committed head a read continued: its digest, each page's digest, and
+/// each `Log`'s committed elements and last page. Flat sorted vectors, so its
+/// heap is one bounded charge.
 pub(in crate::snapshots) struct TailBase {
-    pages: BTreeMap<(Collection, u64), [u8; 32]>,
-    logs: BTreeMap<Collection, LogBase>,
+    head: [u8; 32],
+    /// In load order: by collection, then page.
+    pages: Vec<((Collection, u64), [u8; 32])>,
+    logs: Vec<(Collection, LogBase)>,
 }
-#[derive(Default)]
 struct LogBase {
-    keys: BTreeSet<u64>,
+    /// Sorted element digests.
+    keys: Vec<u64>,
     last: (u64, Vec<String>),
 }
 
@@ -147,6 +164,15 @@ fn page_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 impl TailBase {
+    /// The base of a committed head whose source body is `head`.
+    pub(in crate::snapshots) fn new(head: &[u8]) -> Self {
+        Self {
+            head: page_digest(head),
+            pages: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
+
     /// One committed page, in the load's order: by collection, then page.
     pub(in crate::snapshots) fn observe<S: TailSource>(
         &mut self,
@@ -154,27 +180,45 @@ impl TailBase {
         page: u64,
         bytes: &[u8],
     ) -> Result<(), ReconstructCause> {
-        self.pages.insert((collection, page), page_digest(bytes));
+        self.pages.push(((collection, page), page_digest(bytes)));
         if S::collections()
             .iter()
             .any(|spec| spec.collection == collection && spec.shape == PageShape::Log)
         {
             let keys = S::log_page_keys(collection, bytes)?;
-            let log = self.logs.entry(collection).or_default();
+            if self.logs.last().map(|(last, _)| *last) != Some(collection) {
+                self.logs.push((
+                    collection,
+                    LogBase {
+                        keys: Vec::new(),
+                        last: (page, Vec::new()),
+                    },
+                ));
+            }
+            let (_, log) = self.logs.last_mut().expect("pushed above");
             log.keys.extend(keys.iter().map(|key| key_digest(key)));
+            log.keys.sort_unstable();
             log.last = (page, keys);
         }
         Ok(())
     }
 
+    fn committed(&self, page: (Collection, u64)) -> Option<&[u8; 32]> {
+        self.pages
+            .binary_search_by(|(at, _)| at.cmp(&page))
+            .ok()
+            .map(|at| &self.pages[at].1)
+    }
+
     /// The new head, every collection's metadata, and only the pages whose
-    /// bytes differ from the committed ones.
+    /// bytes differ from the committed ones; `None` when neither the head
+    /// nor any page differs.
     fn stage<S: TailSource>(
         &self,
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,
         id: &HeadIdentity,
-    ) -> Result<StagedFile, Refuse> {
+    ) -> Result<Option<StagedFile>, Refuse> {
         let acc = view.accumulator;
         let mut staged = StagedFile {
             revision: S::REDUCTION_REVISION,
@@ -195,17 +239,48 @@ impl TailBase {
                     elements,
                 },
             );
-            let pages = match self.logs.get(&spec.collection) {
-                Some(log) => log_pages::<S>(acc, spec, log)?,
+            let log = self
+                .logs
+                .iter()
+                .find(|(collection, _)| *collection == spec.collection);
+            let pages = match log {
+                Some((_, log)) => log_pages::<S>(acc, spec, log)?,
                 None => S::encode_pages(acc, spec.collection)?,
             };
             for (page, bytes) in pages {
-                if self.pages.get(&(spec.collection, page)) != Some(&page_digest(&bytes)) {
+                if self.committed((spec.collection, page)) != Some(&page_digest(&bytes)) {
                     staged.pages.insert((spec.collection, page), bytes);
                 }
             }
         }
-        Ok(staged)
+        Ok((!staged.pages.is_empty() || page_digest(&staged.head) != self.head).then_some(staged))
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for TailBase {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let logs = self.logs.iter().try_fold(0usize, |sum, (_, log)| {
+            let names = log
+                .last
+                .1
+                .iter()
+                .try_fold(0usize, |sum, key| sum.checked_add(key.capacity()))?;
+            sum.checked_add(log.keys.capacity().checked_mul(size_of::<u64>())?)?
+                .checked_add(log.last.1.capacity().checked_mul(size_of::<String>())?)?
+                .checked_add(names)
+        })?;
+        c.add(
+            self.pages
+                .capacity()
+                .checked_mul(size_of::<((Collection, u64), [u8; 32])>())?
+                .checked_add(
+                    self.logs
+                        .capacity()
+                        .checked_mul(size_of::<(Collection, LogBase)>())?,
+                )?
+                .checked_add(logs)?,
+        )
     }
 }
 
@@ -218,7 +293,7 @@ fn log_pages<S: TailSource>(
 ) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
     let mut fresh: Vec<&String> = S::log_keys(acc, spec.collection)
         .into_iter()
-        .filter(|key| !log.keys.contains(&key_digest(key)))
+        .filter(|key| log.keys.binary_search(&key_digest(key)).is_err())
         .collect();
     if fresh.is_empty() {
         return Ok(Vec::new());
@@ -240,4 +315,4 @@ fn log_pages<S: TailSource>(
 
 #[cfg(test)]
 #[path = "seam_tests.rs"]
-mod tests;
+pub(in crate::snapshots::tail_source) mod tests;

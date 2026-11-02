@@ -13,16 +13,21 @@ use crate::snapshots::state_v2::{SetAside, TailHead};
 use crate::transcript_acquisition::Scope;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const NOW: u64 = 1_790_000_000;
+pub(in crate::snapshots::tail_source) const NOW: u64 = 1_790_000_000;
 
-struct Route {
-    _session: ColdSession,
-    dir: PathBuf,
-    path: PathBuf,
-    index: ScanIndex,
+pub(in crate::snapshots::tail_source) fn scope() -> Scope {
+    Scope("tail-seam".into())
 }
 
-fn route() -> Route {
+/// A state database route in a fresh directory.
+pub(in crate::snapshots::tail_source) struct Route {
+    _session: ColdSession,
+    pub(in crate::snapshots::tail_source) dir: PathBuf,
+    pub(in crate::snapshots::tail_source) path: PathBuf,
+    pub(in crate::snapshots::tail_source) index: ScanIndex,
+}
+
+pub(in crate::snapshots::tail_source) fn route() -> Route {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ottto-tail-seam-{}-{}",
@@ -41,19 +46,28 @@ fn route() -> Route {
 }
 
 impl Route {
-    fn save(&mut self, claim_only: bool) {
+    pub(in crate::snapshots::tail_source) fn save(&mut self, claim_only: bool) {
         let custody = state_v2::published(&self.path).unwrap();
         state_v2::save_locked(&self.path, &mut self.index, claim_only, None, custody).unwrap();
     }
-    fn head(&self, key: &str) -> Option<TailHead> {
+    pub(in crate::snapshots::tail_source) fn head(&self, key: &str) -> Option<TailHead> {
         state_v2::load_head(&self.index, key, Claude::REDUCTION_REVISION).unwrap()
     }
-    fn marker(&self, key: &str) -> Option<SetAside> {
+    pub(in crate::snapshots::tail_source) fn marker(&self, key: &str) -> Option<SetAside> {
         state_v2::tail_set_aside(&self.index, key).unwrap()
+    }
+    /// A fresh Claude parser on `path`, not yet prepared.
+    pub(in crate::snapshots::tail_source) fn open(&self, path: &Path) -> OwnedJsonlParser {
+        fixture::parser(
+            SnapshotSource::ClaudeCode,
+            path,
+            File::open(path).unwrap(),
+            apply_claude_code_line,
+        )
     }
     /// One certified native completion of `lines` as `name`, encoded at the
     /// real PRE seam. Without a `base` it is a Full read.
-    fn complete(
+    pub(in crate::snapshots::tail_source) fn complete(
         &self,
         name: &str,
         lines: &[String],
@@ -62,30 +76,37 @@ impl Route {
     ) -> (PendingTail, Result<ParsedJsonlFile>) {
         let path = self.dir.join(name);
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-        let scope = Scope("tail-seam".into());
-        let mut parser = fixture::parser(
-            SnapshotSource::ClaudeCode,
-            &path,
-            File::open(&path).unwrap(),
-            apply_claude_code_line,
-        );
-        parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
+        let mut parser = self.open(&path);
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
         while !parser.step().unwrap() {}
+        self.finish(&path, parser, base, at_pre)
+    }
+    /// A read of `path` stepped to its end, to its certified completion and
+    /// native finish, encoded at the real PRE seam over `base` (none: every
+    /// row).
+    pub(in crate::snapshots::tail_source) fn finish(
+        &self,
+        path: &Path,
+        mut parser: OwnedJsonlParser,
+        base: Option<TailBase>,
+        at_pre: impl FnOnce(&mut SnapshotAccumulator),
+    ) -> (PendingTail, Result<ParsedJsonlFile>) {
         let SideCertificate::Certified { completed, .. } =
-            parser.certify_without_retention(&scope, NOW).unwrap()
+            parser.certify_without_retention(&scope(), NOW).unwrap()
         else {
             panic!("a clean fixture is certified");
         };
         at_pre(&mut parser.accumulator);
         let mut tail = PendingTail {
             route: self.path.clone(),
-            key: local_index_key(&path),
+            key: local_index_key(path),
             id: HeadIdentity::new(
-                "tail-seam",
                 &self.path,
                 SnapshotSource::ClaudeCode,
                 &self.dir,
-                &path,
+                path,
                 false,
             ),
             certificate: completed.checkpoint.durable_certificate(0).unwrap(),
@@ -96,11 +117,11 @@ impl Route {
             encoded: None,
         };
         let identity =
-            opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(&path).unwrap())
+            opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(path).unwrap())
                 .unwrap();
         let request = FinishRequest {
             expected_opened_object_identity: &identity,
-            path: &path,
+            path,
             collected_at: "2026-10-20T16:00:00Z",
             source_file_fingerprint: "a".repeat(64),
             codex_title_metadata: None,
@@ -115,6 +136,20 @@ impl Route {
         );
         assert!(tail.encoded.is_some(), "PRE encoded");
         (tail, native)
+    }
+}
+
+impl PendingTail {
+    pub(in crate::snapshots::tail_source) fn key_for_test(&self) -> &str {
+        &self.key
+    }
+    /// The encoded stage, for a test that commits a damaged copy.
+    pub(in crate::snapshots::tail_source) fn take_staged_for_test(&mut self) -> StagedFile {
+        let encoded = self.encoded.take().expect("PRE encoded");
+        let Ok(Some(staged)) = encoded.staged else {
+            panic!("a full encode stages every row");
+        };
+        staged
     }
 }
 
@@ -228,18 +263,19 @@ fn an_append_restates_only_the_open_pages() {
     tail.publish(&native);
     route.save(false);
     let head = route.head(&key).unwrap();
-    let mut base = TailBase::default();
+    let mut base = TailBase::new(&head.body);
     state_v2::load_tail(&route.index, &key, &head, |collection, page, bytes| {
         base.observe::<Claude>(collection, page, &bytes).unwrap();
         Ok(())
     })
     .unwrap();
-    let committed: BTreeSet<_> = base.pages.keys().copied().collect();
+    let committed: BTreeSet<_> = base.pages.iter().map(|(page, _)| *page).collect();
     assert!(committed.contains(&(Collection::Responses, 1)));
     assert!(committed.contains(&(Collection::ToolUses, 1)));
 
     let (tail, native) = route.complete("a.jsonl", &lines(301), Some(base), |_| {});
     let staged = tail.encoded.as_ref().unwrap().staged.as_ref().unwrap();
+    let staged = staged.as_ref().expect("an append restates its open pages");
     assert_eq!(staged.change, Change::Ordinary);
     let restated: Vec<_> = staged.pages.keys().copied().collect();
     let [(Collection::Responses, 1), (Collection::ToolUses, 1), (Collection::CapabilityHours, hour)] =

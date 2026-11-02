@@ -38,6 +38,16 @@ impl Decoded {
     }
 
     pub(crate) fn rederive_plan(&self) -> Result<RederivePlan, &'static str> {
+        self.rederive_plan_within(HEAD_BOUND, TITLE_LINE_BOUND)
+    }
+
+    /// The plan with marks within `head_bound` and a title line of at most
+    /// `line_bound` bytes. Tail state passes no bound.
+    pub(crate) fn rederive_plan_within(
+        &self,
+        head_bound: u64,
+        line_bound: u64,
+    ) -> Result<RederivePlan, &'static str> {
         if !self.has_content() {
             return Ok(RederivePlan {
                 end: 0,
@@ -70,12 +80,12 @@ impl Decoded {
                 return Err("parent");
             }
         }
-        let end = self.head_end().map_err(|_| "mark")?;
+        let end = self.head_end(head_bound).map_err(|_| "mark")?;
         let title = self.title_line(end).map_err(|_| "title")?;
         let t = title.map_or(0, |(_, n)| n);
-        if title.is_some_and(|(offset, n)| {
-            n == 0 || n > TITLE_LINE_BOUND || offset.checked_add(n).is_none()
-        }) {
+        if title
+            .is_some_and(|(offset, n)| n == 0 || n > line_bound || offset.checked_add(n).is_none())
+        {
             return Err("title");
         }
         let input = end.checked_add(t).ok_or("charge")?;

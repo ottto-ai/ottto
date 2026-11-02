@@ -85,7 +85,6 @@ fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
 fn identity(file: &str, capture: bool) -> HeadIdentity {
     let root = Path::new("/home/projects");
     HeadIdentity::new(
-        "namespace-a",
         Path::new("/state/scan-index.json"),
         SnapshotSource::ClaudeCode,
         root,

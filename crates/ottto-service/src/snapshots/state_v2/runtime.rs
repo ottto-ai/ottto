@@ -1650,13 +1650,6 @@ pub(in super::super) fn confirmed_growth_stamp(
 mod growth_tests;
 
 #[path = "runtime_tail.rs"]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "S2 commit 3's load, census retirement and marker retry call the rest"
-    )
-)]
 pub(super) mod tail_route;
 #[cfg(test)]
 #[path = "tail_tests.rs"]

@@ -72,6 +72,25 @@ pub(super) mod preparation_tests {
 }
 
 impl CachedJsonlReduction {
+    /// A reduction rebuilt from stored Tail state.
+    #[cfg(unix)]
+    pub(in crate::snapshots) fn stored(
+        accumulator: SnapshotAccumulator,
+        report: JsonlReadReport,
+        (recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence): (
+            usize,
+            usize,
+            bool,
+        ),
+    ) -> Self {
+        Self {
+            accumulator,
+            report,
+            recognized_usage_drop_count,
+            positive_recognized_usage_count,
+            positive_usage_evidence,
+        }
+    }
     #[cfg(test)]
     pub(in crate::snapshots) fn accumulator_for_test(&mut self) -> &mut SnapshotAccumulator {
         &mut self.accumulator

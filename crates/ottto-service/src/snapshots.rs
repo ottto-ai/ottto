@@ -260,13 +260,6 @@ mod context_curve;
 mod session_start;
 /// Tail state codecs: each source's head and pages in the state database.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "S2 commit 3's load calls the decode side and the base"
-    )
-)]
 mod tail_source;
 pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
@@ -30781,6 +30774,11 @@ impl OwnedSourceScan {
                         sampled_scan::test_hooks::fire(
                             sampled_scan::test_hooks::Point::BeforeRetain,
                         );
+                        // A Claude reduction on a state database route is
+                        // never retained in RAM: its Tail is its continuation.
+                        #[cfg(unix)]
+                        let cache_compatible =
+                            cache_compatible && tail_source::load::route(source, index).is_none();
                         match parser.retain_reduction(
                             &acquisition.scope,
                             sampled_scan::now_seconds(),
@@ -31002,24 +31000,27 @@ impl OwnedSourceScan {
                 // This Claude completion's Tail write: encoded at PRE into a
                 // local buffer, published only on the native finish's verdict.
                 #[cfg(unix)]
+                let tail_base = parser.take_tail_base();
+                #[cfg(unix)]
                 let mut tail = completed_acquisition
                     .as_ref()
                     .zip(file_sampling.as_ref())
-                    .zip(sampling.as_ref())
                     .filter(|_| {
                         source == SnapshotSource::ClaudeCode
+                            && sampling.is_some()
                             && !comparison_target
                             && side_origin.is_none()
                     })
-                    .and_then(|((completed, active), context)| {
+                    .and_then(|(completed, active)| {
                         tail_source::seam::PendingTail::claude(
                             index,
                             completed,
                             active,
                             &candidate,
                             parser.reader.reader.get_ref(),
-                            &context.namespace.0,
                             claude_request_identity_capture,
+                            tail_base,
+                            quiet_audit_checked,
                         )
                     });
                 #[cfg(unix)]
@@ -31095,10 +31096,12 @@ impl OwnedSourceScan {
                         )
                     }
                 };
+                // On a Claude database route: whether this file's committed
+                // head stays its continuation (staged, or nothing to restate).
                 #[cfg(unix)]
-                if let Some(tail) = tail {
-                    tail.publish(&parsed_file);
-                }
+                let tail_reused = tail
+                    .map(|tail| tail.publish(&parsed_file))
+                    .filter(|_| tail_source::load::route(source, index).is_some());
                 #[cfg(not(unix))]
                 let parsed_file = parser.finish_boxed_native(finish_request, None);
                 #[cfg(unix)]
@@ -32416,9 +32419,14 @@ impl OwnedSourceScan {
                     }
                     if let Some(mut completed) = completed_acquisition {
                         if let Some(context) = sampling.as_mut() {
+                            #[cfg(unix)]
+                            let retained =
+                                completed.reduction.is_some() || tail_reused == Some(true);
+                            #[cfg(not(unix))]
+                            let retained = completed.reduction.is_some();
                             let quiet_retired = quiet_audit_checked
                                 && !completed.unsealed
-                                && completed.reduction.is_some()
+                                && retained
                                 && cursor_fragment.is_none()
                                 && state_census_complete
                                 && sidecar_census_complete
@@ -32443,7 +32451,11 @@ impl OwnedSourceScan {
                             // record (receipt or no-record disposition): it is
                             // no longer a Claude post-save write offer.
                             #[cfg(unix)]
-                            let admitted = if m3_staged {
+                            let admitted = if let Some(reused) = tail_reused {
+                                // No Claude reduction in RAM on a database route.
+                                drop(completed);
+                                reused
+                            } else if m3_staged {
                                 context.cache.insert_settled(
                                     key,
                                     completed,
@@ -33363,6 +33375,14 @@ impl OwnedSourceScan {
                     });
                     index.accepted_incidence_pending_census =
                         !index.accepted_rebuild_incidence.is_empty();
+                    // A4d: the same proof retires a Tail whose file is gone.
+                    #[cfg(unix)]
+                    tail_source::load::retire_absent(
+                        source,
+                        index,
+                        &traversal_snapshot.observed_index_keys,
+                        &traversal_snapshot.residue.index_keys,
+                    );
                 }
                 if !index.decode_holds.is_empty() {
                     index.mark_bounded_sweep_unsettled();
@@ -34070,6 +34090,16 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            // A file whose Tail failed alone is selected by its set-aside
+            // marker before an ordinary Skip, even with equal stamps, and
+            // re-reads from its committed head.
+            #[cfg(unix)]
+            if decision == CandidateDecision::Skip
+                && tail_source::load::route(source, index).is_some()
+                && tail_source::load::set_aside(index, &local_index_key(&candidate.path))
+            {
+                decision = CandidateDecision::Parse;
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -34766,12 +34796,20 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                // Claude's continuation on a state database route is its
+                // committed Tail, never a RAM copy.
+                #[cfg(unix)]
+                let tail_route = tail_source::load::route(source, index);
+                #[cfg(not(unix))]
+                let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
                 let (mut taken, mut preparation_lease) = match if restart_restore::enabled() {
                     context
                         .cache
                         .take_prepared(source, &key)
                         .map(|taken| taken.map(|(taken, lease)| (taken, Some(lease))))
+                } else if tail_route.is_some() {
+                    Ok(None)
                 } else {
                     Ok(context
                         .cache
@@ -34951,7 +34989,7 @@ impl OwnedSourceScan {
                 // session, not admitting a new cold file to sampled acquisition.
                 // Without an index entry or its own held-new certificate, keep
                 // main's unsampled read and copy-refusal exemption.
-                let scoped_claude_metadata = restart_restore::enabled()
+                let scoped_claude_metadata = (restart_restore::enabled() || tail_route.is_some())
                     && source == SnapshotSource::ClaudeCode
                     && !sidecar_census_complete
                     && (index.files.contains_key(&key) || e2_held_new_file);
@@ -35078,11 +35116,52 @@ impl OwnedSourceScan {
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
                         let mut restored_durable = false;
+                        // On Claude's database route a RAM miss loads the
+                        // committed Tail (D142: transcript changes only).
                         #[cfg(unix)]
-                        let (mut retained, taken_admission, debt) = match retained {
-                            None if allow_sample
+                        let tail_load = tail_route.as_deref().filter(|_| {
+                            retained.is_none()
+                                && allow_sample
                                 && !native_edit_proven
-                                && !parser.reader.reader.is_compressed() =>
+                                && tail_source::load::reuses_stored(parse_reason)
+                                && !parser.reader.reader.is_compressed()
+                        });
+                        #[cfg(unix)]
+                        let (mut retained, taken_admission, debt) = match (retained, tail_load) {
+                            (None, Some(route)) => {
+                                match tail_source::load::claude(
+                                    index,
+                                    route,
+                                    &candidate,
+                                    claude_request_identity_capture,
+                                    parser.reader.reader.get_mut(),
+                                    &scope,
+                                ) {
+                                    tail_source::load::Load::Reused(taken, base) => {
+                                        if let Some(base) = base {
+                                            parser.set_tail_base(base);
+                                        }
+                                        retained_offset =
+                                            Some(taken.retained.checkpoint.sealed_offset());
+                                        let admission = (
+                                            taken.modified_hint,
+                                            taken.finalization_charge,
+                                            taken.retained.state.usage_witness(),
+                                        );
+                                        (Some(taken), Some(admission), debt)
+                                    }
+                                    // A newer build's head: untouched, held as residue.
+                                    tail_source::load::Load::Held => {
+                                        residue_index_keys.insert(key.clone());
+                                        pending!();
+                                    }
+                                    tail_source::load::Load::Cold => (None, taken_admission, debt),
+                                }
+                            }
+                            (None, None)
+                                if allow_sample
+                                    && !native_edit_proven
+                                    && !parser.reader.reader.is_compressed() =>
                             {
                                 let mut interpretation =
                                     sampled_scan::durable_tail::Interpretation::of(
@@ -35247,7 +35326,7 @@ impl OwnedSourceScan {
                                     }
                                 }
                             }
-                            retained => (retained, taken_admission, debt),
+                            (retained, _) => (retained, taken_admission, debt),
                         };
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
@@ -36901,9 +36980,13 @@ struct ParserPending {
     // Drop the original graph before releasing its funding.
     #[cfg(unix)]
     pending_funding: Option<crate::durable_tail_store::ActiveLease>,
+    /// The committed Tail head this read continues, from its load to the
+    /// PRE seam's encode.
+    #[cfg(unix)]
+    tail_base: Option<tail_source::seam::TailBase>,
 }
 crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
-    pending_taken, pending_returns, #[cfg(unix)] pending_funding);
+    pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(unix)] tail_base);
 
 struct OwnedJsonlParser {
     #[cfg(test)]
@@ -36929,6 +37012,14 @@ impl OwnedJsonlParser {
         self.pending
             .as_ref()
             .is_some_and(|p| p.pending_taken.is_some())
+    }
+    #[cfg(unix)]
+    fn set_tail_base(&mut self, base: tail_source::seam::TailBase) {
+        self.pending.get_or_insert_with(Default::default).tail_base = Some(base);
+    }
+    #[cfg(unix)]
+    fn take_tail_base(&mut self) -> Option<tail_source::seam::TailBase> {
+        self.pending.as_mut()?.tail_base.take()
     }
     #[allow(clippy::too_many_arguments)]
     fn new(
