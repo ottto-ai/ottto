@@ -1,8 +1,7 @@
 //! Freshness diagnostics; none grants a read, alters a hold or adds a read.
 //! `freshness_alarm` is each source's age of the oldest change not yet settled,
 //! derived from stored stamps and live mtimes, so it survives restarts. `Counts`
-//! are count-only Claude gauges over the bounded FirstPending stamps. Startup
-//! policy probes only its support-directory sentinel once.
+//! are count-only Claude gauges over the bounded FirstPending stamps.
 use super::SnapshotSource;
 use serde::Serialize;
 
@@ -119,22 +118,3 @@ pub(super) struct Counts {
 #[cfg(test)]
 #[path = "money_freshness_tests.rs"]
 mod tests;
-
-// Default ON, sampled once per process through the shared local switch.
-super::local_switch::local_switch!(
-    "money_freshness_disabled",
-    marker_enables = false,
-    test_default = true
-);
-#[cfg(test)]
-pub(super) struct DisabledForTest {
-    _switch: super::local_switch::ThreadSwitchForTest,
-}
-#[cfg(test)]
-impl DisabledForTest {
-    pub(super) fn new() -> Self {
-        Self {
-            _switch: super::local_switch::ThreadSwitchForTest::set(&ENABLED, false),
-        }
-    }
-}

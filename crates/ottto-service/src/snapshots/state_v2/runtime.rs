@@ -472,13 +472,8 @@ fn normalize_hydrated(
     index: &mut ScanIndex,
     source: super::super::scan_index_persistence::Source,
 ) -> Result<()> {
-    use super::super::{lenient_decode, scan_index_persistence::Source, SnapshotSource};
-    let slug = match source {
-        Source::Claude => SnapshotSource::ClaudeCode,
-        Source::Codex => SnapshotSource::Codex,
-        Source::Pi => SnapshotSource::Pi,
-    }
-    .api_slug();
+    use super::super::lenient_decode;
+    let slug = source.snapshot().api_slug();
     lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
         lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
             Hold::Future.into()

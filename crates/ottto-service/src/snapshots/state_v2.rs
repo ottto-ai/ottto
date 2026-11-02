@@ -117,13 +117,10 @@ struct Identity {
     fence_generation: u64,
 }
 
-/// Sources whose index routes through this store. The set only grows: a
-/// published route's custody wins, and dropping its source here would let v1
-/// load the frozen JSON. Removing a source needs an explicit export back to
-/// v1, never an edit to this set.
+/// Sources whose index routes through this store: their durable_sources row.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    use super::scan_index_persistence::Source;
-    matches!(source, Source::Claude | Source::Codex)
+    crate::durable_tail_store::DurableSource::from_snapshot(source.snapshot())
+        .is_some_and(|source| source.properties().state_v2)
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;

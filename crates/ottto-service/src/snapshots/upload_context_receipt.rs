@@ -15,7 +15,7 @@ pub(crate) struct Receipt {
 /// context-curve replay that once advanced it is retired (an index that never
 /// negotiated curve upload held 0). A historical replay clears receipts
 /// instead of advancing it.
-pub(crate) const RECEIPT_REPLAY_EPOCH: u64 = crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH;
+pub(crate) const RECEIPT_REPLAY_EPOCH: u64 = 0;
 
 /// One entity's exact stored-body ACK, copied from the upload ledger so it
 /// outlives ACK retirement. It proves only that body under that context, in
@@ -315,68 +315,46 @@ impl ScanIndex {
     /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries
     /// THIS file's receipt to the new revision instead of re-sending the same
     /// accepted bodies. The caller found a complete parse of the new revision
-    /// with the identical entity and body sets, and excludes quarantined, held
-    /// and correction-owed files. The old receipt must prove those bodies
-    /// under the file's context and replay epoch, and every entity must still
-    /// have its durable exact-ACK stamp of that body under that context.
+    /// with the identical entity and body sets, every entity stamp-proven, and
+    /// excludes quarantined, held and correction-owed files. The old receipt
+    /// must prove that body under the file's context and replay epoch.
     /// Anything else is sent; the read itself always happens.
-    pub(super) fn carry_upload_context_receipt(
-        &mut self,
-        key: &str,
-        source_witness: &str,
-        entity_bodies: &BTreeMap<String, String>,
-    ) -> bool {
-        let carried = !entity_bodies.is_empty()
-            && self.files.get(key).is_some_and(|entry| {
-                entry.source_file_fingerprint == source_witness
-                    && entry
-                        .upload_context_receipt
-                        .as_ref()
-                        .is_some_and(|receipt| {
-                            receipt.source_witness != source_witness
-                                && self.file_expected_context(key)
-                                    == Some(&receipt.context_fingerprint)
-                                && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
-                                && entry.last_upload_body_witness.as_ref()
-                                    == Some(&receipt.body_witness)
-                        })
+    pub(super) fn carry_upload_context_receipt(&mut self, key: &str, source_witness: &str) -> bool {
+        let body = self
+            .files
+            .get(key)
+            .and_then(|entry| entry.upload_context_receipt.as_ref())
+            .filter(|receipt| {
+                receipt.source_witness != source_witness
+                    && self.file_expected_context(key) == Some(&receipt.context_fingerprint)
+                    && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
             })
-            && entity_bodies
-                .iter()
-                .all(|(entity, body)| self.file_entity_stamp_proves(key, entity, body));
-        if carried {
-            if let Some(receipt) = self
-                .files
-                .get_mut(key)
-                .and_then(|entry| entry.upload_context_receipt.as_mut())
-            {
-                receipt.source_witness = source_witness.to_string();
-            }
-        }
-        carried
+            .map(|receipt| receipt.body_witness.clone());
+        body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
     }
 
     /// An entity's durable stamp proves this body under THIS file's context in
-    /// the stamp set's replay generation. The context carries the destination
-    /// namespace, so a destination change is a context change.
+    /// the stamp set's destination and replay generation. The context carries
+    /// the destination namespace, so a destination change is a context change.
     pub(super) fn file_entity_stamp_proves(&self, key: &str, entity: &str, body: &str) -> bool {
-        let proof = &self.upload_context_proof;
         self.file_upload_context_enabled()
-            && proof.destination_namespace_hash.is_some()
-            && proof.replay_generation == self.historical_replay_generation
-            && self.file_expected_context(key).is_some_and(|context| {
-                proof.entity_stamps.get(entity).is_some_and(|stamp| {
-                    stamp.context_fingerprint == *context && stamp.body_witness == body
+            && self
+                .upload_context_proof
+                .destination_namespace_hash
+                .as_deref()
+                .zip(self.file_expected_context(key))
+                .is_some_and(|(destination, context)| {
+                    self.entity_upload_context_proven(destination, entity, body, context)
                 })
-            })
     }
 
-    /// P1/P2 after a manual-override rebuild, which keeps stamps but no file
-    /// receipts: this page's complete parse of the current revision found
-    /// exactly the carried accepted set, every entity stamp-proven with this
-    /// body (the caller checks that and the A1-A3 exclusions). Never from
-    /// stamps alone.
-    pub(super) fn receipt_from_rebuilt_stamps(
+    /// P1/P2: THIS file's receipt from durable entity stamps, never from
+    /// stamps alone. The caller found a complete parse of the current
+    /// revision whose every entity is stamp-proven with this body, under the
+    /// A1-A3 exclusions: a carried revision-only move, or the exact carried
+    /// accepted set after a manual-override rebuild (which keeps stamps but
+    /// no file receipts).
+    pub(super) fn receipt_from_stamps(
         &mut self,
         key: &str,
         source_witness: &str,

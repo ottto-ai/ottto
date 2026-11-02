@@ -6490,8 +6490,7 @@ fn load_source_checkpoints(
     crate::snapshots::ScanIndexLoadOrigin,
     SnapshotUploadProgress,
 )> {
-    let custody = source == SnapshotSource::ClaudeCode
-        && crate::snapshots::state_v2_custody_published(index_path)?;
+    let custody = crate::snapshots::state_v2_custody_published(index_path)?;
     if custody {
         // Begin once at preparation admission. Claim-only nested loads must
         // preserve the pass's measurements rather than start another pass.
@@ -6815,9 +6814,12 @@ fn prepare_sync_source_inner(
     {
         upload_progress.save(&upload_progress_path)?;
     }
-    if source == SnapshotSource::ClaudeCode {
+    // One serialization feeds both input digests: the traversal contract
+    // (Claude) and the per-item proof's input record (every source).
+    let policy_bytes = serde_json::to_vec(&upload_policy).expect("upload policy is serializable");
+    if claude {
         claude_contract::prepare_context(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
         );
@@ -6829,7 +6831,7 @@ fn prepare_sync_source_inner(
     index.note_upload_context_inputs(
         source,
         crate::snapshots::UploadContextInputs::new(
-            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            &policy_bytes,
             checkpoint_namespace.as_deref(),
             cache_observations_enabled,
             copy_unproven_enabled,
@@ -8536,20 +8538,25 @@ fn finish_sync_source(
             clear_shed_streak(source);
             // Scope the unsettled stamp to the families of this page's
             // entities without an exact ACK of their body, and held ones.
-            let unsettled_roots = index.claude_entity_family_roots(
-                &scan_result
-                    .snapshots
-                    .iter()
-                    .filter(|item| {
-                        upload_progress
-                            .accepted_body_witnesses
-                            .get(&item.snapshot_fingerprint)
-                            != Some(&snapshot_upload_body_witness(item))
-                    })
-                    .map(|item| item.snapshot_fingerprint.clone())
-                    .chain(local_holds.held_fingerprints.iter().cloned())
-                    .collect(),
-            );
+            // Codex and Pi scopes have no reader: their stamp stays sweep-wide.
+            let unsettled_roots = if source == SnapshotSource::ClaudeCode {
+                index.claude_entity_family_roots(
+                    &scan_result
+                        .snapshots
+                        .iter()
+                        .filter(|item| {
+                            upload_progress
+                                .accepted_body_witnesses
+                                .get(&item.snapshot_fingerprint)
+                                != Some(&snapshot_upload_body_witness(item))
+                        })
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .chain(local_holds.held_fingerprints.iter().cloned())
+                        .collect(),
+                )
+            } else {
+                None
+            };
             let settlement = settle_checkpointed_upload(
                 index,
                 &committed_index,
@@ -16418,14 +16425,18 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [format] damaged custody or a stat error holds before progress containment or transcript reads.
+    /// [regress] for every state v2 source, damaged custody or a stat error holds before progress
+    /// containment or transcript reads.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
-        for stat_error in [false, true] {
+        for (source, stat_error) in [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+            .into_iter()
+            .flat_map(|source| [(source, false), (source, true)])
+        {
             let root = crate::test_scratch::private_dir("v2-route-before-progress");
             let namespace = root.join("snapshots/destinations").join("b".repeat(64));
             std::fs::create_dir_all(&namespace).unwrap();
-            let index_path = namespace.join("claude_code-scan-index-v3.json");
+            let index_path = namespace.join(format!("{}-scan-index-v3.json", source.api_slug()));
             let progress_path = snapshot_upload_progress_path(&index_path);
             std::fs::write(&index_path, b"{broken-fence").unwrap();
             std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
@@ -16449,10 +16460,10 @@ mod tests {
                 load_source_checkpoints(
                     &index_path,
                     &progress_path,
-                    SnapshotSource::ClaudeCode,
+                    source,
                     &root,
                     &"b".repeat(64),
-                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                    snapshot_quarantine_witness(source),
                 )
             });
             let counts = scope.finish();

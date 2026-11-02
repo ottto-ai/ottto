@@ -2217,11 +2217,11 @@ in-progress fold is process-local, so a restart mid-walk under-reports for one
 walk and a retried page can count a file twice. A file appended to continuously
 reads as fresh until it pauses. Files refused by snapshot quarantine settle
 without acceptance and stay with the terminal counters. The row carries counts
-only, and the `money_freshness_disabled` marker does not affect it.
+only.
 
 ### Money freshness (Claude queue and replay)
 
-The default-ON Claude shadow and freshness gauges share one
+The Claude shadow and freshness gauges are always on and share one
 `claude_family_census_shadow` emission. Gauges are flattened into
 `counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
 and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
@@ -2229,14 +2229,6 @@ oldest-skipped or skipped-tracked fields or second queue traversal is added.
 `count` includes queue/replay occurrences, while age thresholds count retained
 unique queued files. `tracked` also includes unresolved files no longer queued.
 All ages are process-local LOWER BOUNDS, never inputs to decisions.
-
-A regular file `money_freshness_disabled` in the normal support directory turns
-BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
-them ON. Policy is read once per process; restart after adding/removing the
-marker. OFF skips Touched allocation, equality attestation and page observation
-before any tracker mutex, clone or candidate decision. It emits neither shadow
-nor freshness gauge data. The ordinary scan and skipped-file audit count continue
-unchanged. Fixtures use thread-local guards and never consult the host marker.
 
 `discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
 `discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.

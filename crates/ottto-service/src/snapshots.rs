@@ -1069,9 +1069,6 @@ pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
-/// The retired context-curve replay epoch. An index that never negotiated
-/// curve upload held 0, so digests and receipts keep that value.
-pub(crate) const RETIRED_CONTEXT_CURVE_REPLAY_EPOCH: u64 = 0;
 
 pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
     timestamps.sort();
@@ -8805,7 +8802,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             && !pending.codex_pending_recovery
             && !quarantine_retry_required;
         let correction_named = source == SnapshotSource::ClaudeCode
-            && index.claude_authority_correction_owed(&pending.index_key);
+            && index.claude_authority_correction_owed(Path::new(&pending.index_key));
         let correction_owed = semantic_noop && correction_named;
         // The A1-A3 exclusions shared by the carry and a rebuilt receipt.
         let receipt_eligible = !correction_named
@@ -8835,13 +8832,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
         } else {
             BTreeMap::new()
         };
-        if semantic_noop && receipt_eligible {
-            index.carry_upload_context_receipt(
-                &pending.index_key,
-                &pending.source_file_fingerprint,
-                &entity_bodies,
-            );
-        }
         // P1: a carried accepted entity whose durable stamp proves this body
         // under the file's context is not re-sent, even while its file owes
         // a receipt (a manual-override rebuild keeps stamps, not receipts).
@@ -8850,6 +8840,14 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .filter(|(fp, body)| index.file_entity_stamp_proves(&pending.index_key, fp, body))
             .map(|(fp, _)| fp.clone())
             .collect::<BTreeSet<_>>();
+        if semantic_noop
+            && receipt_eligible
+            && !entity_bodies.is_empty()
+            && stamp_proven.len() == entity_bodies.len()
+        {
+            index
+                .carry_upload_context_receipt(&pending.index_key, &pending.source_file_fingerprint);
+        }
         // P2: the file receipt only from this complete parse of the current
         // revision that found exactly the carried accepted set, every entity
         // stamp-proven with its body, under the A1-A3 exclusions.
@@ -8860,7 +8858,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             && index.file_upload_context_requires_adoption(&pending.index_key)
         {
             if let Some(body) = final_upload_body_witness.as_deref() {
-                index.receipt_from_rebuilt_stamps(
+                index.receipt_from_stamps(
                     &pending.index_key,
                     &pending.source_file_fingerprint,
                     body,
@@ -27682,12 +27680,11 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow =
-            (source == SnapshotSource::ClaudeCode && money_freshness::enabled()).then(|| {
-                Box::new(claude_family_census_shadow::Touched::from_paths(
-                    pending_paths.iter().map(|pending| pending.path.as_path()),
-                ))
-            });
+        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
+            Box::new(claude_family_census_shadow::Touched::from_paths(
+                pending_paths.iter().map(|pending| pending.path.as_path()),
+            ))
+        });
         let codex_selected_flags =
             if source == SnapshotSource::Codex || index.file_upload_context_enabled() {
                 pending_paths
@@ -33047,7 +33044,7 @@ impl OwnedSourceScan {
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
-                if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
+                if source == SnapshotSource::ClaudeCode {
                     claude_family_census_shadow::observe_page(
                         index,
                         &claude_family_shadow,
@@ -34286,10 +34283,7 @@ impl OwnedSourceScan {
                     }
                     // E7-8a: the ordinary equality Skip attests this revision
                     // for the shadow family census. Counts only.
-                    if source == SnapshotSource::ClaudeCode
-                        && parse_reason.is_none()
-                        && money_freshness::enabled()
-                    {
+                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
                         claude_family_census_shadow::attest_equality_skip(
                             index, &candidate, &sampling, audit_now,
                         );
@@ -49372,8 +49366,8 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
-        // Custody is the single authority for Claude v2 maintenance priority.
-        // Legacy Claude, Codex and Pi retain main's nonblocking flock behavior,
+        // Custody is the single authority for v2 maintenance priority. Routes
+        // the store does not serve keep main's nonblocking flock behavior,
         // including when the v2 checkpoint-owner registry is poisoned.
         // Maintenance already owns a reservation even if its runtime was
         // invalidated while it waited for the previous checkpoint owner.
@@ -54097,9 +54091,10 @@ impl ScanIndex {
         }
     }
 
-    /// Keys whose scanned entity set or head names a held revision.
     /// Claude family roots of the files holding these entities. `None` when
-    /// one cannot be placed, or for another source: the stamp stays sweep-wide.
+    /// one cannot be placed: the stamp stays sweep-wide. Any `.jsonl` index
+    /// key maps to a root, and every reader of the scope is Claude-only, so a
+    /// Codex or Pi scope is inert; a caller that knows the source skips them.
     pub(crate) fn claude_entity_family_roots(
         &self,
         entities: &BTreeSet<String>,
@@ -54121,6 +54116,7 @@ impl ScanIndex {
         (placed.len() == entities.len()).then_some(roots)
     }
 
+    /// Keys whose scanned entity set or head names a held revision.
     fn locally_held_keys(&self, held: &BTreeSet<String>) -> BTreeSet<String> {
         self.files
             .iter()
@@ -55851,11 +55847,9 @@ impl ScanIndex {
         }
     }
 
-    /// StateMissing M2: this member is selected only because its family owes
-    /// a proof correction (no witness change and no due retry).
-    /// This indexed file is a family member an owed proof correction names.
-    fn claude_authority_correction_owed(&self, key: &str) -> bool {
-        claude_index_path_family_member(Path::new(key)).is_some_and(|(root, member)| {
+    /// This file is a family member an owed proof correction names.
+    fn claude_authority_correction_owed(&self, path: &Path) -> bool {
+        claude_index_path_family_member(path).is_some_and(|(root, member)| {
             self.claude_usage_authority_quarantine
                 .get(&root)
                 .and_then(|record| record.proof_correction.as_ref())
@@ -55863,16 +55857,13 @@ impl ScanIndex {
         })
     }
 
+    /// StateMissing M2: this member is selected only because its family owes
+    /// a proof correction (no witness change and no due retry).
     fn claude_authority_correction_only(&self, candidate: &CandidateFile) -> bool {
-        claude_index_path_family_member(&candidate.path).is_some_and(|(root, member)| {
-            self.claude_usage_authority_quarantine
-                .get(&root)
-                .and_then(|record| record.proof_correction.as_ref())
-                .is_some_and(|correction| correction.owed_member_ids.contains(&member))
-                && self
-                    .claude_usage_authority_candidate_requires_family_reparse(candidate)
-                    .is_none()
-        })
+        self.claude_authority_correction_owed(&candidate.path)
+            && self
+                .claude_usage_authority_candidate_requires_family_reparse(candidate)
+                .is_none()
     }
 
     /// StateMissing M2: whether an owed proof correction still blocks a fully
