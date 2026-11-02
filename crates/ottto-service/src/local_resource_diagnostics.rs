@@ -955,11 +955,7 @@ impl Probe {
         observation
     }
     fn observation(&self) -> Observation {
-        Observation::between(
-            self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            self.process,
-            process_sample(),
-        )
+        Observation::between(wall_us(self.started), self.process, process_sample())
     }
     #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
@@ -1290,6 +1286,22 @@ impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     }
 }
 
+fn wall_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn emit_stage(stage: &'static str, source: Source, observation: impl FnOnce() -> Observation) {
+    if std::thread::panicking() {
+        return;
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source,
+        observation: observation(),
+        counts: EmptyCounts {},
+    });
+}
 /// Named window summed over repeated steps inside a source stage: one record
 /// with summed wall time and process CPU, and no footprint fields. Empty
 /// counts; unwinding emits nothing, like `StageWindow`.
@@ -1313,11 +1325,7 @@ impl StageSum {
         let started = Instant::now();
         let before = process_sample();
         let result = step();
-        let delta = Observation::between(
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            before,
-            process_sample(),
-        );
+        let delta = Observation::between(wall_us(started), before, process_sample());
         self.wall_us = self.wall_us.saturating_add(delta.wall_elapsed_us);
         self.cpu_us = self
             .cpu_us
@@ -1328,19 +1336,11 @@ impl StageSum {
 }
 impl Drop for StageSum {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-        let mut observation = Observation::point();
-        observation.wall_elapsed_us = self.wall_us;
-        observation.shared_process_cpu_delta_us = self.cpu_us;
-        emit(&Record {
-            schema_version: SCHEMA_VERSION,
-            process_id: std::process::id(),
-            stage: self.stage,
-            source: self.source,
-            observation,
-            counts: EmptyCounts {},
+        emit_stage(self.stage, self.source, || {
+            let mut observation = Observation::point();
+            observation.wall_elapsed_us = self.wall_us;
+            observation.shared_process_cpu_delta_us = self.cpu_us;
+            observation
         });
     }
 }
@@ -3467,15 +3467,20 @@ pub(crate) fn scan_index_repair_required(
 /// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
 /// can contribute. Peaks are 50-ms observations, not hard memory bounds.
 pub(crate) struct StateV2Probe {
+    started: Instant,
     footprint: Option<footprint::Stage>,
     cpu: Option<ProcessSample>,
 }
 impl StateV2Probe {
     pub(crate) fn begin() -> Self {
         Self {
+            started: Instant::now(),
             footprint: footprint::Stage::begin(),
             cpu: process_sample(),
         }
+    }
+    pub(crate) fn wall_us(&self) -> u64 {
+        wall_us(self.started)
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         self.footprint

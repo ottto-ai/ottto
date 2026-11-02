@@ -2295,9 +2295,9 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     assert_eq!(calls, 0);
 }
 
-/// [format] skill label bounds and consent preserve the whole native state.
+/// [regress] upload consent never gates native local labels; grammar stays strict.
 #[test]
-fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
+fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() {
     let scratch = Scratch::new("label-bounds");
     let path = scratch.write("t.jsonl", &claude_lines(1, 1));
     let (base, _) = full_read(&path, SnapshotSource::ClaudeCode);
@@ -2338,23 +2338,112 @@ fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
     let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
     assert!(body_has_skill_labels(SnapshotSource::ClaudeCode, &body).unwrap());
     let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
-    assert!(
-        !decoded.permits_skill_labels(false),
-        "consent off never resurrects old labels"
-    );
-    assert!(decoded.permits_skill_labels(true));
+    let _on = RestartRestoreForTest::enabled();
+    let cache = sampled_scan::SharedCache::default();
+    for consent in [false, true] {
+        begin_durable_pass(
+            &cache,
+            &scratch.0,
+            SnapshotSource::ClaudeCode,
+            &scratch.0.join("index.json"),
+            false,
+            &scope(),
+            false,
+            consent,
+        );
+        let local_labels = cache.skill_labels_enabled(SnapshotSource::ClaudeCode);
+        assert!(local_labels, "local custody ignores upload consent");
+        assert!(decoded.permits_skill_labels(local_labels));
+        assert_eq!(
+            encode_permitted(&record, usize::MAX, line_cap(), local_labels).unwrap(),
+            body
+        );
+    }
     assert_eq!(
-        encode_permitted(&record, usize::MAX, line_cap(), false).err(),
-        Some(Refuse::NonEmpty("skill_label_consent_off"))
+        decoded.reduction.accumulator.provider_skills,
+        record.accumulator.provider_skills
     );
-    assert!(
-        encode_permitted(&base, usize::MAX, line_cap(), false).is_ok(),
-        "empty sets need no label permission"
+    assert_eq!(
+        decoded.reduction.accumulator.activity_skills,
+        record.accumulator.activity_skills
     );
-    assert!(
-        encode_permitted(&record, usize::MAX, line_cap(), true).is_ok(),
-        "turn-on permits the next native save without a forced read"
+    let (restored, _) = restore(&path, &body, SnapshotSource::ClaudeCode).unwrap();
+    let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::ClaudeCode,
+        &scratch.0,
+        true,
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap();
+    // Native finalization resolves the Claude response book and money fold;
+    // the PRE accumulator alone is deliberately not an emitted snapshot.
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        local_index_key(&path),
+        serde_json::from_value(json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
     );
+    let twins = Default::default();
+    let project = |accumulator: SnapshotAccumulator| {
+        let mut native = parser(&path, SnapshotSource::ClaudeCode);
+        native
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !native.step().unwrap() {}
+        native.accumulator = accumulator;
+        let workers = launch_workers_for_parsed(
+            SnapshotSource::ClaudeCode,
+            native.accumulator.source_session_id.as_deref(),
+            &path,
+        );
+        while !context.prepare_launch_step(&workers).unwrap() {}
+        let identity =
+            opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(&path).unwrap())
+                .unwrap();
+        native
+            .finish_with_repository_identity(
+                &identity,
+                &path,
+                COLLECTED,
+                "fp".into(),
+                None,
+                None,
+                Some(&context),
+                None,
+                Some(claude_request_money::e2::ReadContext {
+                    index: &index,
+                    path: &path,
+                    twins: &twins,
+                }),
+            )
+            .unwrap()
+            .snapshots
+    };
+    let cold = project(record.accumulator.clone());
+    let local = project(restored.accumulator);
+    assert!(!cold.is_empty());
+    assert!(!cold[0].attribution_facts.is_empty());
+    for flags in 0..32 {
+        let policy = SnapshotUploadPolicy {
+            session_titles_enabled: flags & 1 != 0,
+            workspace_labels_enabled: flags & 2 != 0,
+            session_artifacts_enabled: flags & 4 != 0,
+            session_attribution_enabled: flags & 8 != 0,
+            session_attribution_labels_enabled: flags & 16 != 0,
+        };
+        let mut expected = cold.clone();
+        let mut actual = local.clone();
+        apply_upload_policy(SnapshotSource::ClaudeCode, &mut expected, policy);
+        apply_upload_policy(SnapshotSource::ClaudeCode, &mut actual, policy);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap(),
+            "policy {flags}"
+        );
+    }
     record.accumulator.activity_skills.insert("bad/path".into());
     assert_eq!(
         encode_permitted(&record, usize::MAX, line_cap(), true).err(),
