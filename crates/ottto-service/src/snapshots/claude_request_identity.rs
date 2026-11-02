@@ -11,7 +11,7 @@
 //! reproduces every row exactly; otherwise the item keeps today's path. It adds
 //! no transcript read or parse. Legacy transcript markers never authorize
 //! emitted tags; login-only telemetry keeps its login without a marker org.
-//! E2 partitions counted requests using bounded native marker runs before
+//! `e2` partitions counted requests using bounded native marker runs before
 //! aggregation, then feeds those exact final shares to this same tag installer.
 
 use super::claude_request_accounts::{local_subscription, normalize_activity};
@@ -113,7 +113,7 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
 
 /// Every Claude sync cycle builds contract-5 evidence. A test may model a
 /// pre-cutover daemon's unpermitted page, or pin the legacy account path
-/// (D1 qualification, mixed bodies, owner holds) that production now
+/// (own-request account qualification, mixed bodies, owner holds) that production now
 /// reaches only for bodies contract 5 leaves untagged.
 pub(crate) fn builds_evidence() -> bool {
     #[cfg(test)]
@@ -161,7 +161,7 @@ pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, P1 `MAX_IDENTITY_PARTS_PER_ITEM`).
+/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`).
 /// The byte cap is the real limit; this stops construction early.
 pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
@@ -3001,7 +3001,7 @@ impl OrgMarkers {
     }
 }
 
-// E2 consumes this compact, native-sequence-ordered placement before any
+// `e2` consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 /// A counted request's grain slot (live key, origin), the account a copied
@@ -3021,7 +3021,7 @@ struct AccountRun {
     position: u64,
     account: AccountPartition,
     /// First nonzero usage following this marker: its response position and
-    /// E2 copy status. Zero-usage responses may separate it from the marker.
+    /// `e2` copy status. Zero-usage responses may separate it from the marker.
     copied: Option<(u64, bool)>,
 }
 crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
@@ -3262,7 +3262,7 @@ impl Carry<'_> {
     }
 }
 
-/// One account policy for E2. Never use a later marker for an earlier request.
+/// One account policy for `e2`. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
 /// Subagents are assigned their root's starting account at page finalization.
 pub(crate) fn request_accounts(
@@ -3297,7 +3297,7 @@ pub(crate) fn request_accounts(
     let Some(first) = first_sequence else {
         return accounts;
     };
-    // Only E2 can exclude a request. Marker timestamps never decide identity.
+    // Only `e2` can exclude a request. Marker timestamps never decide identity.
     let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
     if markers.overflowed {
         if let Some(marker) = markers
@@ -3475,7 +3475,7 @@ impl RequestAccounts {
             *into = into.saturating_add(1);
         }
     }
-    /// The governing native marker run; E2 uses its own skipped ranges to
+    /// The governing native marker run; `e2` uses its own skipped ranges to
     /// stage inherited usage until its copy decision is final.
     pub(crate) fn copied_marker_position(&self, sequence: u64) -> Option<u64> {
         let end = self.runs.partition_point(|run| run.position <= sequence);
@@ -4359,8 +4359,8 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
     }
 }
 
-/// Exact final E2 rows, including copied exclusions and telemetry side calls.
-/// E2 owns placement; this owner supplies contract-5 keys and evidence only.
+/// Exact final `e2` rows, including copied exclusions and telemetry side calls.
+/// `e2` owns placement; this owner supplies contract-5 keys and evidence only.
 fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
     let mut grouping = Grouping::new(bucket_row_count(item));
     super::claude_request_money::e2::visit_identity_rows(
@@ -4453,7 +4453,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// load proves only what was already written, not a live writer, and no
     /// existing qualified current-writer witness exists; production therefore
     /// supplies none (pending is unproven; young missing requests stay missing)
-    /// until SESSION rules on one. Only tests can populate this.
+    /// until one exists. Only tests can populate this.
     pending_writer_witnesses: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the
@@ -4743,7 +4743,7 @@ pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> Ac
     }))
 }
 
-/// The row's login when the row itself is intact: D1's capture, count,
+/// The row's login when the row itself is intact: the legacy account path's capture, count,
 /// fingerprint and account-origin checks. Ownership is checked separately.
 fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a str> {
     let login = row
@@ -4763,7 +4763,7 @@ fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a s
     .then_some(login)
 }
 
-/// D1's account check: each recorded origin must carry exactly this login.
+/// The legacy account path's check: each recorded origin must carry exactly this login.
 fn account_origin_matches(account: &ClaudeIdentityAttributeEvidence, login: &str) -> bool {
     let log = account.log_record_hash.as_deref();
     let resource = account.resource_hash.as_deref();
@@ -4898,7 +4898,7 @@ impl From<IdentityRef<'_>> for RequestIdentity {
     }
 }
 
-/// Owned classification, for the ruling tests.
+/// Owned classification, for the ownership tests.
 #[cfg(test)]
 pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) -> RequestIdentity {
     classify_ref(evidence, facts).into()
@@ -5318,7 +5318,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             request_id: request.request_id,
             // Auxiliary (telemetry-only) rows carry `observed_at`, which v2
             // OTLP capture may have taken from the observer clock and does not
-            // record which; as in D1 they cannot qualify. The trace span start
+            // record which; as in the legacy account path they cannot qualify. The trace span start
             // is event-origin but no existing rule qualifies it, and transcript
             // clocks are not theirs to borrow.
             terminal_unix_seconds: request
@@ -5552,7 +5552,7 @@ pub(super) fn full_rearm_requests_refused(
 /// request id) adds no row, token or money and is never placed, so its id
 /// neither counts nor refuses the item; it makes no claim. Any usage counted
 /// without an owned occurrence, or an occurrence the count skipped, still
-/// refuses. The census and D1 keep the plain request-id count guard.
+/// refuses. The census and the legacy account path keep the plain request-id count guard.
 fn transcript_requests_counted(item: &SnapshotItem) -> bool {
     let counted = item
         .claude_usage_occurrences
@@ -5564,7 +5564,7 @@ fn transcript_requests_counted(item: &SnapshotItem) -> bool {
         && u64::try_from(counted) == Ok(item.request_count)
 }
 
-/// The request-owner root for an item, as D1 derives it.
+/// The request-owner root for an item, as the legacy account path derives it.
 pub(crate) fn owner_root(item: &SnapshotItem) -> Option<&str> {
     match item.source_session_id.split_once("_agent-") {
         Some((root, agent)) => (!root.is_empty() && !agent.is_empty()).then_some(root),
@@ -5611,7 +5611,7 @@ pub(crate) fn apply_scan(
     outcome
 }
 
-/// Tag every eligible Claude item of this pass. Runs before D1, which leaves
+/// Tag every eligible Claude item of this pass. Runs before the legacy account path, which leaves
 /// new-collector items alone; ineligible items stay on today's path untouched.
 /// `reported` holds the groupings the reported rebuild produced this pass.
 pub(crate) fn apply_scan_with_ownership(
@@ -5889,7 +5889,7 @@ fn tag_item(
         {
             return None;
         }
-        // Single-account markerless bodies keep their established D1 wire
+        // Single-account markerless bodies keep their established account-path wire
         // shape. The account owner already tagged their final usage uniformly.
         if keeps_markerless_account(item) {
             return None;
@@ -5982,9 +5982,9 @@ fn tag_item(
     // census nor an open fence makes those markers request-owned evidence.
     // Both grouping sources withdraw them before any identity is installed.
     grouping.withdraw_transcript_tags();
-    // D1 leaves new-collector items alone, so the backend UTC lifecycle
+    // The legacy account path leaves new-collector items alone, so the backend UTC lifecycle
     // spelling it applies to every item it qualifies happens here, inside the
-    // byte cap; an ineligible item returns to D1 exactly as it arrived.
+    // byte cap; an ineligible item returns to the legacy account path exactly as it arrived.
     let lifecycle = (
         item.source_started_at.clone(),
         item.source_ended_at.clone(),

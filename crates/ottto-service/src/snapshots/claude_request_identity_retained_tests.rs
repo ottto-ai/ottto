@@ -9,7 +9,7 @@ fn retained_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
     (item, proof)
 }
 // Option (ii): `identity_retained` markers over the witnessed proved-row
-// ledger (SOURCE rule (ii) Addendum 1, Lead B Addendum 1). Synthetic proof only.
+// ledger. Synthetic proof only.
 fn retained_state() -> identity::AcceptedBuckets {
     let mut state = identity::AcceptedBuckets::for_test();
     state.set_retained_enabled(true);
@@ -267,7 +267,7 @@ fn retained_proof_missing_leaves_the_set_and_the_next_revision_re_tags_when_it_f
     sticky_apply(&mut fourth, &proof, &state).unwrap();
     assert_eq!(retained_marked(&fourth), vec![true, false]);
 
-    // Unfit (Lead B Addendum 1): newer fresh proof fills the unchanged
+    // Unfit: newer fresh proof fills the unchanged
     // 16-key cap first. Counted; the bucket keeps today's untagged/refused
     // rule. No hold, no cap increase, no marker without server proof.
     let (mut wide, wide_proof) = retained_wide_open_hour(&original, &proof, 16);
@@ -584,7 +584,7 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
     );
 }
 
-/// [format] X-B1 wire contract (Lead B 2026-10-31; COST PR-B #14454): the
+/// [format] X-B1 wire contract (#14454): the
 /// shared golden bucket row with `copy_invalidated=true`, as the canonical
 /// body serializes it, and the same row unflagged. False is omitted, so a
 /// row without the flag keeps today's bytes and an old receiver, which
@@ -780,7 +780,7 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
     sticky_assert_reconciled(&missing);
 }
 
-/// Lead B F1: a copy-prefix row marked `copy_unproven` and its unmarked own
+/// A copy-prefix row marked `copy_unproven` and its unmarked own
 /// twin share a bucket and every other key field. #909 freezes, and #944
 /// proves, each under the daemon's partitioned RowKey: no false refusal, no
 /// silent re-tag, and the unmarked row keeps its key when no marked row is

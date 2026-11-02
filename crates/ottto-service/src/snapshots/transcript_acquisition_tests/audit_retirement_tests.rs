@@ -92,7 +92,7 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
             } else {
                 fs::remove_file(&fixture.file.0).unwrap();
                 fs::remove_dir(&unavailable_parent).unwrap();
-                // ENOTDIR is uncertain under E3's hardened proof; a truly
+                // ENOTDIR is uncertain under the hardened proof; a truly
                 // missing intermediate beneath a readable root would retire.
                 fs::write(&unavailable_parent, b"unavailable mount placeholder").unwrap();
             }
@@ -1847,7 +1847,7 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
             let key = local_index_key(&fixture.file.0);
             assert_eq!(modes, (0, 1, 0));
             assert!(index.files[&key].has_unverified_source());
-            // Compose E3's account-release carve-out on the Claude path.
+            // Compose the account-release carve-out on the Claude path.
             if source == SnapshotSource::ClaudeCode {
                 index.claude_account_deferred_holds.insert(
                     key.clone(),

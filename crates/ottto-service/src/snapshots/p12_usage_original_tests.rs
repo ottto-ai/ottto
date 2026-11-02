@@ -506,7 +506,7 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
 
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();

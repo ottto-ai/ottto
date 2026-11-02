@@ -231,7 +231,7 @@ fn c1a_close_and_reprove(fixture: &RearmFixture, arm: &str) -> (C1aWindow, C1aWi
     (closing, reproved)
 }
 
-/// T1, closed fence: once an unchanged proof was re-proved from members read
+/// Closed fence: once an unchanged proof was re-proved from members read
 /// in its own window and their bodies were accepted, the terminal re-arms
 /// nothing and the next window reads nothing. The BASE arm re-arms all three
 /// members at every terminal and re-reads them as semantic no-ops.
@@ -413,8 +413,8 @@ fn c1a_changed_witness_rearms_like_base() {
             "a changed witness re-arms every member"
         );
     }
-    // The next window re-selects the changed members (M1 and the source
-    // change) in both arms and settles them identically.
+    // The next window re-selects the changed members in both arms and
+    // settles them identically.
     assert_eq!(after.family_reads, base_after.family_reads);
     assert_eq!(after.retry_pending, base_after.retry_pending);
     assert_eq!(after.proven, base_after.proven);
@@ -738,7 +738,7 @@ fn c1a_assert_family_emitted_and_tagged(
 #[serial(source_manifests)]
 fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     // Contract-5 tagging oracle on ordinary money: a markerless single-account
-    // request-owned (E2) body need not carry the cycle collector. The family
+    // request-owned (`e2`) body need not carry the cycle collector. The family
     // is listed after an unlisted baseline, as a protected family is in
     // production; listed bodies take the cycle contract and its row tags.
     use crate::snapshots::claude_request_identity::with_cycle_contract_for_test;
@@ -971,7 +971,7 @@ fn c1a_successor_generation(
     window
 }
 
-/// SOURCE F1 receipt, real pipeline: the skip leaves owner family O unread,
+/// Real pipeline: the skip leaves owner family O unread,
 /// and a new copied-prefix successor of O appears. The successor can derive
 /// its legacy exclusion only in a window that also reads O, so while O stays
 /// skipped it stays unproven, and the first-proof hold counter names it with
@@ -1057,12 +1057,12 @@ fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
     assert_eq!(proof.hold.oldest_dormant_owner_successor_age, None);
 }
 
-// SOURCE 2026-10-27, option A: a `Completed` page that holds an entity locally
+// A `Completed` page that holds an entity locally
 // scopes the sweep's unsettled marker to the held entity's own families for
 // the terminal unchanged-proof skip. These arms run with native comparison on,
 // as in production: the hold withholds the scan census, but the native census
 // still completes, so the terminal fold runs its proof re-arm. Every held arm
-// is compared with the same steps and no hold. Holds use the production E2
+// is compared with the same steps and no hold. Holds use the production `e2`
 // hold (`hold_request_owned`), which no authority record binds.
 
 /// Two unrelated single-session transcripts in their own directory. The
@@ -1141,7 +1141,7 @@ fn c1a_assert_scoped_hold(pages: &[RearmPage], arm: &str) {
     );
 }
 
-/// SOURCE option A, test (a): a held family still re-arms its own members,
+/// A held family still re-arms its own members,
 /// even when its held member's committed revision passes every per-member
 /// settlement check. After the skip is active, the root transcript gains a
 /// user turn (a changed body, no new request) and both subagents are re-armed,

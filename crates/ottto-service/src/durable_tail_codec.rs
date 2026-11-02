@@ -1,5 +1,4 @@
-//! Field codec for durable warm-cache reuse (M1; SOURCE field ruling with
-//! Amendment 1).
+//! Field codec for durable warm-cache reuse.
 //!
 //! Every persisted type names each of its fields once, next to its definition,
 //! with an admission class:

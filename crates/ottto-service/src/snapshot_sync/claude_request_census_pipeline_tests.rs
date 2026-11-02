@@ -1,4 +1,4 @@
-// Slice D1 through the executed page pipeline of `finish_sync_source` (the
+// The request census through the executed page pipeline of `finish_sync_source` (the
 // `PipelineFixture` stages): request-census records survive held reverts and
 // partial commits as the working index's, and records change no decision.
 // Fixtures are synthetic.
@@ -281,7 +281,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
         crate::snapshots::claude_request_census::disable_records_under_for_test(&fixture.root);
     }
     fixture.baseline();
-    // The parity is pre-E2 (E2 reads census records as copy-holder evidence),
+    // The parity is pre-`e2` (`e2` reads census records as copy-holder evidence),
     // so every family whose body is compared reads ordinary money: list them
     // after the unlisted baseline. Each page loads the real list.
     let listed = [
@@ -384,7 +384,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[test]
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
-    // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
+    // Pre-`e2` invariant: `e2` reads census records as copy-holder evidence.
 
     let (records, records_held, records_reset_owed) =
         census_pre_hold_parity_arm("census-all-bodies-records", true);

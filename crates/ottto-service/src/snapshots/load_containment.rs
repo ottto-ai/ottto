@@ -251,7 +251,7 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         .is_some_and(|stamp| now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS))
 }
 
-// User Repair override (#718 follow-up, SOURCE ruling): one explicit,
+// User Repair override (#718 follow-up): one explicit,
 // interactive Repair of a paused source passes the seven-day guard once. The
 // override rebuild is the ordinary gated rebuild (quarantined origin, so the
 // #712 history gate, protected list and latches apply) and its witness
@@ -265,13 +265,13 @@ const SCAN_INDEX_OVERRIDE_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 /// Repair refusal reason: an override already ran or is armed within 24 h.
 pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE: &str =
     "scan_index_rebuild_override_cooldown";
-/// SI-718-O1 refusal: the damaged index's session-identity state could not be
+/// Refusal: the damaged index's session-identity state could not be
 /// strictly recovered, so the armed override did not rebuild; the source
 /// stays paused and the index stays in place.
 pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE: &str =
     "scan_index_rebuild_override_identity_unrecoverable";
 
-/// SI-718-O2: the newest override of this source under ANY destination. It
+/// The newest override of this source under ANY destination. It
 /// lives in `<support>/snapshots/`, outside every
 /// `destinations/<namespace>/` checkpoint directory (which the temp sweep
 /// alone visits), so restart plus re-pair keeps the 24-hour cooldown. Fixed
@@ -418,7 +418,7 @@ fn unix_seconds_at(now: SystemTime) -> u64 {
 
 /// A refusal records what the guard read: when it lifts by itself and the
 /// newest durable override, this checkpoint's witness or the source-wide
-/// stamp (SI-718-O2), so the cooldown survives a restart and a re-pair.
+/// stamp, so the cooldown survives a restart and a re-pair.
 fn note_scan_index_rebuild_refusal(
     source: SnapshotSource,
     stamps: ScanIndexRebuildWitnessStamps,
@@ -666,7 +666,7 @@ fn note_scan_index_quarantine_rebuild(
     ));
 }
 
-/// One armed user Repair passing the seven-day guard (SI-718-O1). The guard
+/// One armed user Repair passing the seven-day guard. The guard
 /// was keeping the damaged index because it holds session-identity state;
 /// the override keeps that state too. It decodes
 /// `lenient_decode::IDENTITY_CARRY_FIELDS` by each field's policy, refusing
@@ -814,7 +814,7 @@ fn override_scan_index_rebuild_loop(
 }
 
 impl ScanIndex {
-    /// SI-718-O1: what an override rebuild keeps from the damaged index
+    /// What an override rebuild keeps from the damaged index
     /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, each field's decoder). Bindings
     /// stay authoritative, so conflicting creator evidence defers; held and
     /// deferred families stay held; duplicate ownership and owned-start /

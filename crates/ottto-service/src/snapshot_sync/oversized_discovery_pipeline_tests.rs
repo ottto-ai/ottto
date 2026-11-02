@@ -435,7 +435,7 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
-    // Legacy demotion hold; E2 literals bypass it, so only the listed held
+    // Legacy demotion hold; `e2` literals bypass it, so only the listed held
     // family reaches it (real list, loaded by every page after an unlisted
     // baseline). Gate-on local holds and the same six-hour floor:
     // oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
@@ -728,7 +728,7 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     assert!(!page.scan.census_complete);
 }
 
-/// E2 holds stay progress-blocking beside an oversized file and are offered
+/// `e2` holds stay progress-blocking beside an oversized file and are offered
 /// again at the same recovery floor, never cancelled or uploaded while held.
 #[test]
 #[serial(source_manifests)]

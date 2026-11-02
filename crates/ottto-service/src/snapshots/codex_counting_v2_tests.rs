@@ -1,4 +1,4 @@
-//! Codex usage counting V2: the eight COST regressions, the counting-version
+//! Codex usage counting V2: the eight counting regressions, the counting-version
 //! decision and its acknowledgement-evidence transitions. Token numbers mirror
 //! the saved minimal sequences S1-S3; every fixture is synthetic.
 use super::codex_counting_version::{self, AckEvidence, CountingVersion};
@@ -1189,7 +1189,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
         AckEvidence::of_view([&unacknowledged_twin]),
         AckEvidence::None
     );
-    // COST rule 2: any Legacy ACK dominates any V2 mark, in either order.
+    // Any Legacy ACK dominates any V2 mark, in either order.
     for view in [[&marked, &legacy_acked], [&legacy_acked, &marked]] {
         assert_eq!(AckEvidence::of_view(view), AckEvidence::LegacyAcked);
     }
@@ -1240,7 +1240,7 @@ fn codex_counting_destination_loss_rederives_only_from_its_own_index() {
     );
     assert_eq!(decide(&marked), CountingVersion::V2);
     assert_eq!(decide(&old_binary), CountingVersion::Legacy);
-    // Disclosed residual R1: a lost or rotated destination index has no ACK
+    // Disclosed residual: a lost or rotated destination index has no ACK
     // evidence, so an old-binary-acknowledged post-cutover session re-derives V2.
     assert_eq!(decide(&ScanIndex::default()), CountingVersion::V2);
 }

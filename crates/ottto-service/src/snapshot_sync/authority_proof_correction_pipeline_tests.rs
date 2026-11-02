@@ -10,7 +10,7 @@
 // member transcripts together with paired local OTEL API and trace rows. The
 // NATURAL tests edit no clock, quarantine, witness or index state by hand.
 // Tests named `controlled_*` say so: one seeds the owed set through the
-// persisted index after a natural grant, and the A2 and checkpoint-cost tests
+// persisted index after a natural grant, and the selection and checkpoint-cost tests
 // drive the real locked partial checkpoint on a synthetic persisted index.
 // Fixtures are synthetic.
 //
@@ -199,16 +199,15 @@ struct ApcGrant {
     held: BTreeSet<String>,
 }
 
-/// How one page changed the correction, checked against SOURCE T1-T5, R1-R6,
-/// M1-M2 and A1-A3.
+/// How one page changed the correction.
 #[derive(Debug, Default)]
 struct ApcTransition {
     granted: Option<String>,
     acked: BTreeSet<String>,
     noop: BTreeSet<String>,
-    /// M2/A3: confirmed-empty members completed with no body.
+    /// Confirmed-empty members completed with no body.
     empty: BTreeSet<String>,
-    /// M1: members a complete census proved absent.
+    /// Members a complete census proved absent.
     retired: BTreeSet<String>,
     failed: bool,
     cleared: bool,
@@ -489,7 +488,7 @@ impl ApcFixture {
 
     /// One page through the production stage order of `finish_sync_source`.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
-        // Ordinary transcripts: each file exists before its records (E2).
+        // Ordinary transcripts: each file exists before its records (`e2`).
         crate::snapshots::claude_request_money::e2::with_fixture_birth(
             1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
             || self.page_born(collected_at, upload),
@@ -1237,7 +1236,7 @@ impl ApcFixture {
         panic!("a complete census follows the terminal authority hold");
     }
 
-    /// The premise of the R2 and F1 regressions at the production E2 gate
+    /// The premise of two regressions at the production `e2` gate
     /// (ON). A request-owned body never demotes, so no terminal hold grants a
     /// correction at that gate: in production an owed correction is one an
     /// older build persisted before the flip. Two accepting generations prove
@@ -1296,7 +1295,7 @@ impl ApcFixture {
         }
     }
 
-    /// Classify one page's correction change and check it against SOURCE:
+    /// Classify one page's correction change and check it:
     /// drains only on an exact ACK or a proven no-op of a current body, never
     /// a fresh grant without a genuinely new complete proof, the record clears
     /// only with its last owed member, and a failure replaces the record as a
@@ -1379,7 +1378,7 @@ impl ApcFixture {
         }
         for member in drained {
             let Some(key) = keys.get(&member) else {
-                // M1: only a complete census proves a member absent.
+                // Only a complete census proves a member absent.
                 assert!(
                     page.scan.census_complete,
                     "{label}: {member} is retired only by a complete census"
@@ -1397,7 +1396,7 @@ impl ApcFixture {
                 .cloned()
                 .unwrap_or_default();
             if entities.is_empty() && page.index.confirmed_empty_files.contains(key) {
-                // M2/A3: no body, at its recorded revision, only at a complete
+                // No body, at its recorded revision, only at a complete
                 // census, and never one this page offered.
                 assert!(
                     page.scan.census_complete,
@@ -1547,7 +1546,7 @@ impl Drop for ApcFixture {
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-shed", false);
@@ -1672,7 +1671,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn superseded_revision_ack_never_drains_the_current_revision() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
@@ -1772,7 +1771,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[test]
 #[serial(source_manifests)]
 fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-unhealthy", false);
@@ -1828,7 +1827,7 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 #[test]
 #[serial(source_manifests)]
 fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-churn", false);
@@ -1915,12 +1914,12 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-three-owed", true);
     let (_, natural) = fixture.reach_grant();
-    // A02 transfer (E2-003): the natural grant already owes more than one
+    // The natural grant already owes more than one
     // member before the controlled seeding widens it to the whole family.
     assert!(
         natural.owed.len() >= 2,
@@ -2137,7 +2136,7 @@ fn apc_m2_scan(census_complete: bool) -> crate::snapshots::SourceScanResult {
     scan
 }
 
-/// Everything the A2 selection may never lose or invent, apart from the
+/// Everything the selection may never lose or invent, apart from the
 /// authority record itself.
 fn apc_m2_debts(index: &ScanIndex) -> serde_json::Value {
     let value = serde_json::to_value(index).expect("encode index");
@@ -2151,7 +2150,7 @@ fn apc_m2_debts(index: &ScanIndex) -> serde_json::Value {
     })
 }
 
-/// A2/A1/A3 through the real locked partial checkpoint (progress lock, durable
+/// The selection rules through the real locked partial checkpoint (progress lock, durable
 /// progress check, committable selection, no-body settlement, locked save) and
 /// a restart, CONTROLLED. The agent is the LAST owed member and was just parsed
 /// empty with its paired map advance; no body was accepted.
@@ -2342,7 +2341,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
 // A rejected entity records Poisoned in the shared client_report counters.
 #[serial(client_report)]
 fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-permanent-drain", true);
@@ -2397,7 +2396,7 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
 #[test]
 #[serial(source_manifests)]
 fn retryable_refusal_keeps_its_member_owed_across_restart() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-retryable-owed", true);
@@ -2418,7 +2417,7 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
 #[test]
 #[serial(source_manifests)]
 fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-cutoff-drain", true);
@@ -2437,7 +2436,7 @@ fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
         .all(|page| page.parsed.is_disjoint(&apc_family_sessions())));
 }
 
-/// R8/A2: requested bytes of the actual locked partial checkpoint on the small
+/// Requested bytes of the actual locked partial checkpoint on the small
 /// synthetic family shape (32 and 64 roots), for old-contract records, granted
 /// records owing every member, and granted records whose every agent carries
 /// an A1 advance that the selection rolls back (prior entities) or carries
@@ -2535,7 +2534,7 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
     ignore = "needs macOS heap layout"
 )]
 fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     assert!(
         crate::heap_layout_bound::layout_supported(),
@@ -2615,7 +2614,7 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
 #[test]
 #[serial(source_manifests)]
 fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("authority-unbound-rearm", false);
@@ -2715,7 +2714,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     panic!("the re-armed family is re-read within two bounded generations");
 }
 
-/// E2 flip (T8 round 2): a correction owed before the flip settles on its
+/// `e2` flip: a correction owed before the flip settles on its
 /// owed members' first request-owned bodies, through the same exact-ACK
 /// settlement, with one read each; once clear nothing is re-offered.
 #[test]
@@ -2724,13 +2723,13 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
     let grant = { fixture.reach_grant().1 };
-    // A01 transfer (E2-002): the grant's record covers every owed member.
+    // The grant's record covers every owed member.
     assert!(
         grant.record.member_source_file_fingerprints.len() >= grant.owed.len(),
         "{:?}",
         grant.record
     );
-    // A01 transfer (E2-008): more than one owed member, so the drain can
+    // More than one owed member, so the drain can
     // span separate bounded pages.
     assert!(
         grant.owed.len() >= 2,
@@ -2739,14 +2738,14 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     );
 
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
-    // A01 transfer (E2-008): one parsed file per page puts the owed members
+    // One parsed file per page puts the owed members
     // on separate real bounded pages; the sibling keeps working beside them.
     fixture.page_files.set(1);
     ApcFixture::append(&fixture.sibling_path(), &apc_note_line(APC_SIBLING, 2));
     let mut reads = BTreeMap::<String, usize>::new();
     let mut acked = BTreeSet::new();
     let mut cleared_hour = None;
-    // A01 transfer (E2-002, E2-008): every page is checked against SOURCE;
+    // Every page is checked;
     // each owed member drains once, on its exact ACK or proven no-op; the
     // record keeps exactly the undrained members and clears exactly once,
     // with the last drain.
@@ -2819,7 +2818,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
         }
         let last = pages.last().unwrap();
         if last.record().is_none() {
-            // A01 transfer (E2-002): the settled family keeps the granted
+            // The settled family keeps the granted
             // proof and every member's current head is accepted.
             assert_eq!(
                 last.index
@@ -2854,7 +2853,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
         reads.values().all(|reads| *reads == 1),
         "one read per owed member, no extra: {reads:?}"
     );
-    // A01 transfer (E2-002, E2-008): every owed member drained exactly, on
+    // Every owed member drained exactly, on
     // separate bounded pages, and the record cleared with the last one.
     assert_eq!(
         drained_on.keys().cloned().collect::<BTreeSet<_>>(),
@@ -2884,7 +2883,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
                 .all(|session| !grant.owed.contains(session)),
             "nothing is re-offered once settled"
         );
-        // A01 transfer (E2-002): the same proof grants nothing again and no
+        // The same proof grants nothing again and no
         // correction candidate is captured on a quiet generation.
         let transition = ApcFixture::check(page, &format!("quiet page {number}"));
         assert!(
@@ -2895,7 +2894,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     }
 }
 
-/// E2 flip (T8 round 2), returning tombstoned family (the tombstone formed
+/// `e2` flip, returning tombstoned family (the tombstone formed
 /// before the flip). Gate on, each returning member's request-owned body
 /// replaces its session: offered and ACKed exactly once (no double count),
 /// the tombstone clears with that publication and no authority record is
@@ -2954,7 +2953,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let retired = pages_until("the absent family retires", &|page| {
         page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
     });
-    // A11 transfer (E2-015): the tombstone keeps the proven witness and no
+    // The tombstone keeps the proven witness and no
     // member key is left.
     let retired = retired.last().expect("retiring page");
     assert_eq!(
@@ -2967,7 +2966,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     );
     assert!(ApcFixture::family_keys(&retired.index).is_empty());
 
-    // A11 transfer (E2-015), before the list removal: the members return
+    // Before the list removal, the members return
     // under unhealthy evidence. They are read through the authority path,
     // never skipped, held with nothing offered, and a bounded RetryPending
     // record re-forms against the same witness; the tombstone stays.
@@ -3228,7 +3227,7 @@ fn apc_r2_redrain(
     }
 }
 
-/// [regress] R2 on main, shed seam, at the production E2 gate (ON) on an owed
+/// [regress] R2 on main, shed seam, at the production `e2` gate (ON) on an owed
 /// pre-flip correction (`ApcFixture::pre_flip_grant`). A write to the root's
 /// API sidecar that adds no evidence moves every member's revision with no
 /// body or proof change. On the next shed page the owed members with
@@ -3288,7 +3287,7 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }
 
-/// [regress] R2 on main, held seam, at the production E2 gate (ON) on an owed
+/// [regress] R2 on main, held seam, at the production `e2` gate (ON) on an owed
 /// pre-flip correction (`ApcFixture::pre_flip_grant`): the same sidecar-only
 /// revision move, then a Deferred page that holds an account-deferred owed
 /// member (agent b). Only the held key keeps its committed entry. The root,
@@ -3525,7 +3524,7 @@ fn apc_f1_redrain(
     }
 }
 
-/// [regress] F1 (review-942), last owed member, exact ACK. The owed
+/// [regress] F1, last owed member, exact ACK. The owed
 /// member's committed account hold is released on a settled page and its corrected body is
 /// ACKed, which drains the last owed member. The production account-audit
 /// release then finds no retained custody: it clears the member's saved
@@ -3533,7 +3532,7 @@ fn apc_f1_redrain(
 /// owed under the same proof and its pre-drain pair, never a cleared record
 /// beside an unselected drained revision. The retry drains it again at the
 /// revision its saved entry has, offering at most the same exact body.
-/// At the production E2 gate (ON), on an owed pre-flip correction
+/// At the production `e2` gate (ON), on an owed pre-flip correction
 /// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
 /// before the release, carries the drain and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
@@ -3582,12 +3581,12 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     );
 }
 
-/// [regress] F1 (review-942), proven no-op, with another member still
+/// [regress] F1, proven no-op, with another member still
 /// owed. Agent b's corrected body is its accepted body, so its release page no-op-drains it
 /// without an upload, and the account-audit release then clears its saved
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
-/// At the production E2 gate (ON), on an owed pre-flip correction
+/// At the production `e2` gate (ON), on an owed pre-flip correction
 /// (`ApcFixture::pre_flip_grant`). Not a discriminator of 2015e841f on its
 /// own: if selection kept agent b's committed re-arm marker, either order
 /// re-owes it, and the page exposes no pre-release entry to tell. The last
@@ -3655,14 +3654,14 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
     assert_eq!(owed, BTreeSet::from([still_held]));
 }
 
-/// [regress] F1 (review-942), D1: the released member's body is
-/// permanently refused on a fully settled page, so the post-selection settlement (D1) drains the
+/// [regress] F1: the released member's body is
+/// permanently refused on a fully settled page, so the post-selection settlement drains the
 /// last owed member. The account-audit release then clears its saved
-/// revision. D1's drain joins the finish restore: the member stays owed with
+/// revision. That drain joins the finish restore: the member stays owed with
 /// its pre-drain pair, and drains again at the revision its saved entry has
 /// once the retry re-reads it.
-/// At the production E2 gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: D1's drain never
+/// At the production `e2` gate (ON), on an owed pre-flip correction
+/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the drain never
 /// reaches the restore and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]

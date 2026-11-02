@@ -1,10 +1,10 @@
-//! Slice D1: one durable request-census record per Claude transcript (index
+//! One durable request-census record per Claude transcript (index
 //! key), bound to the exact revision and census window that produced it, plus
 //! a shadow of the convergence predicate those records would allow.
 //!
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
-//! upload input. D1 only produces, persists, prunes and measures records; no
+//! upload input. This module only produces, persists, prunes and measures records; no
 //! fence, coverage, posture or upload decision reads them. The narrowed
 //! unhealthy-retry carry conservatively refuses its per-family exception
 //! on saved negative evidence for loss or incomplete identity, and uses a
@@ -98,7 +98,7 @@ pub(super) fn identity_incomplete_hold_deadlines_restored_total() -> u64 {
 /// Bumped only when request-id or occurrence extraction, or the shape rule,
 /// changes. A bump makes every stored record inert until its file is parsed
 /// again. `CLAUDE_REQUEST_CENSUS_CANARY` pins what the fixed fixture corpus
-/// yields under it; SOURCE reviews any change to that literal without a bump.
+/// yields under it; a change to that literal without a bump needs review.
 pub(crate) const CLAUDE_REQUEST_CENSUS_DERIVATION: u16 = 1;
 /// `(derivation, sha256 of the canary corpus table)`. The derivation canary
 /// test fails until both move together.
@@ -108,7 +108,7 @@ pub(crate) const CLAUDE_REQUEST_CENSUS_CANARY: (u16, &str) = (
     "e8e0dbc0cce7d3afefdb65752cda8f8236c6f5704a00aa1080e46620473e0ff5",
 );
 /// 16 MiB of hashes per census. The scan index's census (transcript records)
-/// and the P1 ledger's own census (telemetry, message-only, family and sweep
+/// and the money ledger's own census (telemetry, message-only, family and sweep
 /// records) each have this bound and the serialized one below: two separate
 /// budgets, not one shared. A record that would push the total past it is
 /// kept as an `OverBudget` tombstone without hashes, which never counts as
@@ -117,7 +117,7 @@ pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_HASHES: usize = 2_097_152;
 /// Serialized budget of the whole census field (keys, fixed fields and base64
 /// hashes), charged exactly at insert. The hash bound alone serializes to
 /// about 22.4 MB; the rest is keys and fixed fields with headroom for long
-/// paths. Measured at M4 size: about 9.5 MB for the index's transcript
+/// paths. Measured on a live index: about 9.5 MB for the index's transcript
 /// records and about 23 MB for the ledger.
 pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES: usize = 48 * 1024 * 1024;
 /// Part of the serialized budget only tombstones may use, so a record that
@@ -206,8 +206,8 @@ pub(crate) struct ClaudeRequestCensusRecord {
     shape: ClaudeRequestCensusShape,
     /// The parsed content (root, member) differs from the path-derived pair.
     twin: bool,
-    /// Pending ruling S2: not source-verified (a tail parse that still owes
-    /// its sampled audit, or a read that cannot certify its source). D1
+    /// Not source-verified (a tail parse that still owes
+    /// its sampled audit, or a read that cannot certify its source). The census
     /// produces it as for a verified parse and only notes it here.
     unverified: bool,
     /// Sorted, strictly ascending `claude_request_hash` of every request id
@@ -225,12 +225,12 @@ pub(crate) struct ClaudeRequestCensusRecord {
     /// Transcript records: the file's modification time (unix seconds) at the
     /// parse that wrote the record. Retirement reads it, never the index.
     modified: Option<u64>,
-    /// P1 money ledger records only (they live in the ledger's own store,
+    /// Money ledger records only (they live in the ledger's own store,
     /// never in the scan index): boxed so transcript records stay small.
     ledger: Option<Box<ClaudeLedgerFields>>,
 }
 
-/// The fields only P1 ledger records carry.
+/// The fields only money ledger records carry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeLedgerFields {
     /// Telemetry records (`otel:` keys): the sidecar tail position.
@@ -477,7 +477,7 @@ impl ClaudeRequestCensusRecord {
         self.unverified || self.twin
     }
 
-    /// A current native body can supersede an unverified D1 record only if
+    /// A current native body can supersede an unverified census record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
     /// Identity-incomplete records wait for a Full audit: saved-witness
@@ -492,8 +492,8 @@ impl ClaudeRequestCensusRecord {
             )
     }
 
-    /// N1: an unverified identity-incomplete record holds its root until a
-    /// Full audit verifies its source (SOURCE rule 3: delay, never cancel).
+    /// An unverified identity-incomplete record holds its root until a
+    /// Full audit verifies its source (delay, never cancel).
     pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
@@ -502,7 +502,7 @@ impl ClaudeRequestCensusRecord {
             && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
     }
 
-    /// E2 copy proof: this record is the census of the entry's CURRENT
+    /// `e2` copy proof: this record is the census of the entry's CURRENT
     /// revision (same fingerprint, current derivation, its own content) and
     /// still lists every request id it read. Retired and over-budget records
     /// dropped their hashes, so they prove nothing.
@@ -510,7 +510,7 @@ impl ClaudeRequestCensusRecord {
         self.proves_scan() && fingerprint_matches(self, entry_fingerprint)
     }
 
-    /// E2 copy proof from a scan whose upload is withheld (its index entry
+    /// `e2` copy proof from a scan whose upload is withheld (its index entry
     /// not advanced): the record of that scan still lists every request id
     /// it read (current derivation, its own content, not retired or over
     /// budget). The caller binds it to the file.
@@ -737,7 +737,7 @@ impl ClaudeRequestCensusRecord {
     }
 }
 
-/// Census keys of the P1 money ledger. They live in the ledger's own store
+/// Census keys of the money ledger. They live in the ledger's own store
 /// (`claude_request_money::store`), never in the scan index; ordinary keys
 /// are absolute file paths (`local_index_key`), so they always start with
 /// `/` and ledger keys never do. An index that still holds one (a pre-release
@@ -824,7 +824,7 @@ pub(crate) struct ClaudeRequestCensus {
 }
 crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, release_memo);
 
-/// E7 #920: an admission derive scan (`release_aged`) at `cutoff` released
+/// Stopgap (#920): an admission derive scan (`release_aged`) at `cutoff` released
 /// nothing: no record was releasable, or releasing every one (`freeable`
 /// hashes and serialized bytes) would still not have admitted the record.
 /// Every other record that may age at that cutoff (`may_age`) is in
@@ -1068,7 +1068,7 @@ impl ClaudeRequestCensus {
             .filter(|(_, record)| !record.is_birth_stub())
     }
 
-    /// E2 side calls: which of each wanted family's sorted unique candidate
+    /// `e2` side calls: which of each wanted family's sorted unique candidate
     /// hashes a transcript record of THAT family holds, and which members
     /// have a record. One walk of the keys (a borrowed path parse, no hash
     /// read outside a wanted family); only the wanted families' records are
@@ -1103,7 +1103,7 @@ impl ClaudeRequestCensus {
         Some(found)
     }
 
-    /// E2 copy decisions, once per page: every MAIN transcript record (never
+    /// `e2` copy decisions, once per page: every MAIN transcript record (never
     /// a subagent) holding some of the sorted unique `wanted` hashes, with
     /// its key, session and the hashes it holds. The caller decides whether
     /// the record proves anything (current revision, other session, earlier
@@ -1303,7 +1303,7 @@ impl ClaudeRequestCensus {
         outcome
     }
 
-    /// E7 stopgap (#920 round 3): retire, oldest first (by mtime, then key),
+    /// Stopgap (#920): retire, oldest first (by mtime, then key),
     /// the records the transcript retirement rule would retire at `cutoff`
     /// but that still hold their hashes (kept by overlap, or aged since the
     /// last terminal), until `fits` admits the totals or none is left. Each
@@ -1564,7 +1564,7 @@ impl ClaudeRequestCensusShadowState {
 /// the decoder still reads the older `h` (16 hex per hash). Optional fields,
 /// each omitted when absent: `bi`/`bd`/`bn` (birth unix seconds, device,
 /// inode), `r` (retired hash count), `ur`/`ut` (old-path requests, tokens),
-/// the record's file mtime `m`. P1 ledger records (in the ledger's own store
+/// the record's file mtime `m`. Money ledger records (in the ledger's own store
 /// only) add the telemetry tail `to`, `td`, `tn`, `ta`, `tc`, `tl`, `tv`,
 /// `tw2`, `tm`, `te`, `tk` with its resumable audit `xa`/`xs`/`xp`/`xq`/`xk`
 /// and its facts `f` (base64), a sweep `sk`/`sd` and a family memo
@@ -2110,7 +2110,7 @@ impl<'de> Deserialize<'de> for ClaudeRequestCensus {
     }
 }
 
-/// Decode one shard file of the P1 ledger's own store
+/// Decode one shard file of the money ledger's own store
 /// (`claude_request_money::store`) with the same record codec, keeping only
 /// ledger keys, each record bounded by the whole census budget rather than
 /// one file's hashes. None unless it is one JSON map whose every entry was
@@ -2302,7 +2302,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
         let mut unverified = false;
         let mut request_hashes = Vec::new();
         let mut facts = None;
-        // Every other P1 field is an unsigned scalar.
+        // Every other ledger field is an unsigned scalar.
         let mut scalars = BTreeMap::<&'static str, u64>::new();
         while let Some(field) = map.next_key::<String>()? {
             let Some(position) = FIELDS.iter().position(|known| *known == field) else {
@@ -3044,7 +3044,7 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
-/// A2 metadata proof for the currently opened object, independent of optional
+/// Metadata proof for the currently opened object, independent of optional
 /// RAM/disk restore. A verified census must bind the exact committed fingerprint,
 /// mtime and physical object. Missing/stale/unknown evidence grants nothing.
 pub(super) fn proves_indexed_shrink(
@@ -3069,7 +3069,7 @@ pub(super) fn proves_indexed_shrink(
             .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
 }
 
-/// Stores a transcript parse's record. E7 stopgap (#920 round 3): a record
+/// Stores a transcript parse's record. Stopgap (#920): a record
 /// that does not fit whole first releases what the retirement rule would
 /// retire at this window (`release_aged`), counted as admission overflow.
 ///
@@ -3254,8 +3254,8 @@ pub(crate) fn settle_claude_request_census_terminal(
 /// A transcript is retired 35 days after its last modification.
 pub(crate) const CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS: u64 = 35 * 24 * 60 * 60;
 
-/// Process counters of transcript retirements (aged, vanished) for the P1
-/// shadow line; D1's counts are unchanged.
+/// Process counters of transcript retirements (aged, vanished) for the ledger
+/// shadow line; the census counts are unchanged.
 static TRANSCRIPT_RETIRED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -3318,7 +3318,7 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 }
 
 /// Occupancy up to which a terminal keeps aged records that share a request
-/// id (E7 stopgap): 90% of the census hash budget and of its serialized
+/// id (the stopgap): 90% of the census hash budget and of its serialized
 /// budget, after the other aged records retire.
 const CLAUDE_RETIRE_KEEP_OCCUPANCY_HASHES: usize = MAX_CLAUDE_REQUEST_CENSUS_HASHES * 9 / 10;
 const CLAUDE_RETIRE_KEEP_OCCUPANCY_BYTES: usize =
@@ -3393,14 +3393,14 @@ fn revalidate_retirement_growth(index: &mut ScanIndex, census: &ClaudeRequestCen
     }
 }
 
-/// P1 ledger transcript retirement, by the record's own mtime (never the
+/// Money ledger transcript retirement, by the record's own mtime (never the
 /// index entry's): a record whose file was last modified more than 35 days
 /// before this window keeps its hash count and drops its hashes. A later
 /// request in another file that reuses one of those ids then counts as
 /// `owned_after_retirement` (an overcount risk the ledger discloses: the
 /// copy is counted although the original already was).
 ///
-/// E7 stopgap: an aged record that shares a request id with another
+/// Stopgap: an aged record that shares a request id with another
 /// unretired record is kept, so a resumed copy keeps its cross-session proof
 /// while both files are indexed. They stay while the census, after the
 /// other aged records retire, is at most 90% full (hashes and serialized
@@ -3409,7 +3409,7 @@ fn revalidate_retirement_growth(index: &mut ScanIndex, census: &ClaudeRequestCen
 /// partner was pruned or retired retires then. A record that does not fit
 /// whole at insert first retires them, oldest first (`release_aged`).
 ///
-/// A vanished file (StateMissing's red producer removes its index entry at
+/// A vanished file (its index entry is removed at
 /// page end) is not retired here: the terminal prune drops its record and
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
@@ -3624,7 +3624,7 @@ fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
     serde_json::to_writer(&mut count, census).map_or(0, |()| count.0)
 }
 
-/// Per-key answer for Context 2c and D2's posture seam. D1 computes it only in
+/// Per-key answer for a posture seam. It is computed only in
 /// tests; nothing in production reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4275,7 +4275,7 @@ impl ScanIndex {
     /// paths persist, with paths made relative to `base` and source
     /// fingerprints reduced to present/cleared, so two fixtures at different
     /// temporary paths compare. The record map and shadow state are excluded:
-    /// they are the only state D1 adds.
+    /// they are the only state the census adds.
     pub(crate) fn claude_census_decision_view_for_test(&self, base: &Path) -> serde_json::Value {
         let canonical_base = std::fs::canonicalize(base).unwrap_or_default();
         let relative = |key: &str| {

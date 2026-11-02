@@ -17,10 +17,10 @@ sparse_lifetime_counters! {
     insert_poisoned_lock: InsertPoisonedLock,
     insert_entries_evicted: InsertEntriesEvicted,
     cursor_reservation_entries_evicted: CursorReservationEntriesEvicted,
-    // M1 copy refusals. `entries_evicted` and `admission_evicted` count
+    // Copy refusals. `entries_evicted` and `admission_evicted` count
     // entries; `bytes_released` their stored charge, for both causes.
     // `admission_evicted` also counts a shape-F completion's exact
-    // lower-ranked release (P1-RETAIN R0, `Release::CopyAdmission`). The
+    // lower-ranked release (`Release::CopyAdmission`). The
     // others count zero-budget step starts, not files or refusals: a long
     // tail beside a full cache counts once per line it reads.
     copy_refusal_entries_evicted: CopyRefusalEntriesEvicted,
@@ -43,7 +43,7 @@ sparse_lifetime_counters! {
     retention_clone_bound_refused: RetentionCloneBoundRefused,
     retention_finalization_bound_refused: RetentionFinalizationBoundRefused,
     retention_produced: RetentionProduced,
-    // SOURCE (B): fixed content-free totals, never per-file history.
+    // Fixed content-free totals, never per-file history.
     prefix_excluded_bodies: PrefixExcludedBody,
     prefix_tag_clears: PrefixTagCleared,
     // Pi source-field parsing observations, independent of retention decisions.

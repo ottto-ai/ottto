@@ -5127,7 +5127,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Live M4, 2026-10-02: "Add Claude account" for an account whose only
+    /// Observed live, 2026-10-02: "Add Claude account" for an account whose only
     /// saved connection was signed out ended "already connected", quarantined
     /// the fresh login and left the account on the dead connection. A slot
     /// that cannot serve the pair must not swallow the login; a healthy one

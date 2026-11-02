@@ -4,7 +4,7 @@
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
 //!
-//! Restart records are R1's; joined by key digest, never referenced here.
+//! Restart records live elsewhere; joined by key digest, never referenced here.
 use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -328,7 +328,7 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
-        // Measured on a copy of real M4 state (245,006 values): only these two
+        // Measured on a copy of a real state store (245,006 values): only these two
         // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
         // Bound logical JSON on both admission and decompression, before chunks.
         RowKey::Record { kind, .. }

@@ -1,4 +1,4 @@
-//! P1-RETAIN R0: a sampled Tail/Unchanged singleton's completion-time release
+//! A sampled Tail/Unchanged singleton's completion-time release
 //! of residents ranked below its copy's re-admission rank (shape F), and the
 //! diagnostic packet's
 //! refusal buckets. Its own block, apart from the shared appends above.
@@ -525,7 +525,7 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
     }
 }
 
-/// T-D2: the retained lock is never relocked on one thread; a debug build
+/// The retained lock is never relocked on one thread; a debug build
 /// panics before it would deadlock.
 #[test]
 #[cfg(debug_assertions)]
@@ -536,7 +536,7 @@ fn r0_retained_relock_panics_in_debug_builds() {
     let _ = cache.retained();
 }
 
-/// T-D1: R0's completion measure waits for a held retained lock; every other
+/// The completion measure waits for a held retained lock; every other
 /// walk reads contention as unbounded.
 #[test]
 fn r0_blocking_measure_waits_for_the_retained_lock() {
@@ -576,7 +576,7 @@ fn r0_blocking_measure_waits_for_the_retained_lock() {
     );
 }
 
-/// T-D3 (β): an insert keeps its own finalization charge on the entry, apart
+/// An insert keeps its own finalization charge on the entry, apart
 /// from the cursor reservation, and the next take carries it.
 #[test]
 fn r0_insert_carries_its_finalization_charge_to_the_next_take() {

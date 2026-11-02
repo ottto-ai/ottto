@@ -2167,7 +2167,7 @@ mod tests {
         // format. This test asserts refusal, not persistent completeness.
     }
 
-    /// [regress] ID1: capture and the shared streaming readers retain every
+    /// [regress] Capture and the shared streaming readers retain every
     /// request after a sidecar crosses its warning threshold, including retries.
     #[test]
     fn api_and_trace_past_warning_threshold_keep_every_request() {

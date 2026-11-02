@@ -585,7 +585,7 @@ fn sticky_missing_state_uses_current_proof_and_counts_unknown() {
 
     // [money] No stored-body proof plus eight ID-less synthetic zero rows
     // cannot erase positive usage or change the current request identities.
-    // Use the always-on ordinary E2 finalizer before identity tagging, as the
+    // Use the always-on ordinary `e2` finalizer before identity tagging, as the
     // neighboring zero-usage fixtures do; raw parse has no read context.
     let dir = temp_dir("identity-window-idless-zero");
     let (api, trace) = owned_session_reports();
@@ -2613,7 +2613,7 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             .unwrap_err()
             .contains("wire body"));
     }
-    // Lead B's increased-cap last resort: preserve tags and money, and use
+    // The increased-cap last resort: preserve tags and money, and use
     // the existing upload hold instead of sending a smaller stripped revision.
     let mut held = item.clone();
     let before = sticky_money(&held);

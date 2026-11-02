@@ -412,7 +412,7 @@ pub(crate) fn retained_refusal_settles_for_test(
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in; 3 (E2)
+// Code 2 re-reads its history once so the newer context numbers fill in; 3 (`e2`)
 // re-reads it once more for request-owned money, paced. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
@@ -422,7 +422,7 @@ pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSourc
     }
 }
 
-// SOURCE F2: a Claude revision the history gate is not complete for does not
+// A Claude revision the history gate is not complete for does not
 // build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
 const _: () = assert!(
     effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
@@ -434,9 +434,8 @@ fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
     effective_upload_body_witness_revision(source)
 }
 
-/// Where this destination's Claude prior history comes from (SOURCE
-/// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
-/// support state.
+/// Where this destination's Claude prior history comes from. A fresh install
+/// is only a positively empty support state.
 /// - `Unverified`: the backfill state is unreadable.
 /// - `Here`: this destination's completed bootstrap; a server-attested record
 ///   in its upload ledger (an accepted, quarantined or refused body or
@@ -444,14 +443,14 @@ fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
 ///   sibling of this index; or the re-emission seen-marker. Also, when the
 ///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
-///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   beside `destinations/`: it names no destination, so it
 ///   is not a move, but this Mac did index history, so a cutoff keeps that
 ///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
 ///   copy another destination's directory holds (an interrupted bootstrap
 ///   before a re-pair). A leftover is another destination only when it sits
-///   under a different namespace (I-r3-1); unless a claim
+///   under a different namespace; unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -476,7 +475,7 @@ fn claude_prior_history(
         == Some(destination_namespace);
     // A quarantined copy of this index, of a legacy index or of this
     // destination's ledger. An unreadable directory fails closed; a missing
-    // one is empty (SOURCE h695 N2).
+    // one is empty.
     let quarantined_sibling = || {
         let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
         let claude_prefix = format!("{slug}-scan-index");
@@ -524,7 +523,7 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
-    // Fails closed: only a positively missing marker is absent (h695 N2).
+    // Fails closed: only a positively missing marker is absent.
     let seen_marker = || match std::fs::symlink_metadata(
         crate::snapshots::claude_reemission_seen_marker_path(support_dir),
     ) {
@@ -541,7 +540,7 @@ fn claude_prior_history(
     // A claim that recorded a different-user cutoff keeps the other
     // destinations' history excluded by that cutoff, not by the gate, but
     // only on that claim's own destination: a later same-user re-claim keeps
-    // the cutoff on a new destination (SOURCE h695 N1).
+    // the cutoff on a new destination.
     let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
         && backfill_state
             .backfill_cutoff_destination_namespace
@@ -554,7 +553,7 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
-    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
+    // A pre-scoping daemon's unscoped index. An unreadable
     // directory fails closed; a missing one is empty.
     let unscoped_legacy_index = || {
         let prefix = format!("{slug}-scan-index");
@@ -1117,7 +1116,7 @@ fn settle_index_after_upload(
 }
 
 /// Correction completion depends on the final selected file/empty facts. In
-/// particular, the last M2 no-body drain must precede the completion decision.
+/// particular, the last no-body drain must precede the completion decision.
 #[expect(
     clippy::too_many_arguments,
     reason = "the selected index, page facts, correction candidates and drain ledger"
@@ -1132,7 +1131,7 @@ fn settle_upload_corrections_after_selection(
     transport_fully_settled: bool,
     body_drains: &mut crate::snapshots::ClaudeProofBodyDrains,
 ) -> bool {
-    // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
+    // This drain is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
     // It settles against the selected entries, but a later account-audit
     // release can still clear one; its drains join the finish restore.
@@ -1161,7 +1160,7 @@ fn settle_upload_corrections_after_selection(
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
     // Correction members the history gate holds wait for it; they are counted,
-    // not blocking (StateMissing M2).
+    // not blocking.
     let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
     if deferred > 0 {
         eprintln!(
@@ -1230,7 +1229,7 @@ fn finish_selected_settlement(
         );
     }
     // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // can clear a drained entry's revision: a drain (pre-selection or settlement)
     // whose entry this save does not keep stays owed.
     if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
@@ -1625,9 +1624,9 @@ struct SnapshotUploadProgress {
 impl SnapshotUploadProgress {
     /// A server-attested record of an earlier upload to this destination: an
     /// accepted, quarantined or refused body, or accepted cache evidence
-    /// (SOURCE F1a prior history). A saved generation, a replay claim or a
+    /// (prior history). A saved generation, a replay claim or a
     /// pending cache head is this daemon's own claim, saved before any upload,
-    /// so it is not evidence (StateMissing N1).
+    /// so it is not evidence.
     fn records_server_attested_upload(&self) -> bool {
         !self.accepted_fingerprints.is_empty()
             || !self.accepted_body_witnesses.is_empty()
@@ -3658,7 +3657,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         committable.keep_unacknowledged_codex_files_owed(index, locally_held);
     }
     if let Some(scan) = correction_scan {
-        // A2: settle no-body grants only against the file/empty/map facts
+        // Settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
     }
@@ -6807,7 +6806,7 @@ fn prepare_sync_source_inner(
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
     // Absent, quarantined or undecodable: every file would come back new. The
-    // load origin decides it (StateMissing M3); an empty saved index counts too.
+    // load origin decides it; an empty saved index counts too.
     let claude_index_loaded_fresh = load_origin.is_fresh(&index);
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
@@ -7539,7 +7538,7 @@ fn capture_codex_recovery_evidence(
     scan_result.finish_codex_capture_boundary(index);
 }
 
-/// U1a-2a D5′ (C15), Codex only: read immediately before the call that
+/// Codex only: read immediately before the call that
 /// assembles and writes the selected save; no side writer runs in between.
 fn codex_side_save_mark(
     daemon: &LocalDaemon,
@@ -7620,7 +7619,7 @@ fn finish_sync_source(
     } = preparation;
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
-    // D3: a source-fault fallback may not reach any POST until the retained
+    // A source-fault fallback may not reach any POST until the retained
     // Codex entry no longer binds stale A on disk. Save only committed PRE
     // facts; a failed barrier returns before upload/ACK/settlement.
     #[cfg(unix)]
@@ -9442,7 +9441,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
-    /// E2 requests left Unknown because their family's strict read failed;
+    /// `e2` requests left Unknown because their family's strict read failed;
     /// absent from the line while empty.
     #[serde(
         skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
@@ -9970,7 +9969,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
-    // E2: every held copy skip is decided (or the session held) before
+    // `e2`: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
@@ -10132,7 +10131,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-    // E2: roots whose strict API and trace reads were both healthy. A healthy
+    // `e2`: roots whose strict API and trace reads were both healthy. A healthy
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
@@ -10248,7 +10247,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
         );
     }
-    // E2 side calls need the trace-named owner, so they follow the trace read.
+    // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
         &api_report,
@@ -10264,7 +10263,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
         // A discarded strict trace read defers the family's bodies through the
-        // E2 withhold: the accepted revision stays, delayed one pass, never
+        // `e2` withhold: the accepted revision stays, delayed one pass, never
         // replaced by an untagged one. Listed families included.
         let (deferred, unfolded) = crate::snapshots::claude_request_money::e2::hold_trace_discarded(
             &mut scan_result.snapshots,
@@ -10348,7 +10347,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &request_owned_originals,
         )
     });
-    // E2 bodies are final before any identity owner runs: contract 5, D1 and
+    // `e2` bodies are final before any identity owner runs: contract 5, transcript ownership and
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
@@ -10400,7 +10399,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         index.hold_claude_history_for_unread_telemetry();
     }
     if let Some(evidence) = &identity_evidence {
-        // Contract 5 first: D1 below leaves new-collector items untouched. The
+        // Contract 5 first: the ownership step below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
@@ -10514,7 +10513,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // All local consumers (comparison/fallback, finalizer, identity, account
     // qualification and the optional shadow) have finished. Release native
-    // inputs only for emitted E2 bodies before upload clones/checkpoints.
+    // inputs only for emitted `e2` bodies before upload clones/checkpoints.
     // Held and legacy bodies retain their inputs for their existing owners.
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
@@ -15070,7 +15069,7 @@ mod tests {
         }
     }
 
-    /// COST condition: a held body (an `unchanged` ACK with a basis) never
+    /// A held body (an `unchanged` ACK with a basis) never
     /// blocks a later, different body of the same session. Unchanged ACK,
     /// then local growth, then the grown body is offered and accepted, in the
     /// same cycle and in the next one (hold carried through the index).
@@ -18102,7 +18101,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// [regress] M4 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
+    /// [regress] Version 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
     #[test]
     fn version_only_quarantine_witness_change_keeps_retry_after() {
         let root = test_dir("snapshot-upload-progress-quarantine-upgrade");
@@ -18196,7 +18195,7 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
-    /// [regress] M4 q8: four due quarantines had already left census pending.
+    /// [regress] Observed live: four due quarantines had already left census pending.
     /// Also retains the live 0.1.121 strand: the quarantine deadline became
     /// due after a settled sibling had already advanced the shared backend
     /// head, but an independently backed-off terminal-unhealthy traversal
@@ -18317,7 +18316,7 @@ mod tests {
             "the current-schema manifest revision stays armed rather than becoming unproven"
         );
         // Resume the retained traversal with this file already observed and
-        // absent from its candidate queue, just like the four M4 quarantines.
+        // absent from its candidate queue, just like the four quarantines observed live.
         let mut state = serde_json::to_value(&index).unwrap();
         state["traversal"]["scan_roots"] = serde_json::json!([root]);
         state["traversal"]["observed_index_keys"] =
@@ -18420,7 +18419,7 @@ mod tests {
             progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
             0
         );
-        // Round 4 P2a (theoretical): a count-only HTTP reply remains a real
+        // Theoretical: a count-only HTTP reply remains a real
         // send even though it cannot settle legacy reconciliation.
         let replied = upload_resumable_batches(
             &retry.snapshots,
@@ -20592,7 +20591,7 @@ mod tests {
         }
     }
 
-    /// The M1 codex witness once its residue settles (ottto#399): a COMPLETED
+    /// The codex witness once its residue settles (ottto#399): a COMPLETED
     /// census whose every nonzero loss class equals its terminal counterpart,
     /// with the witness reported as counts only.
     fn m1_named_residue_counts() -> SyncCounts {
@@ -24699,7 +24698,7 @@ mod tests {
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
@@ -24863,7 +24862,7 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);

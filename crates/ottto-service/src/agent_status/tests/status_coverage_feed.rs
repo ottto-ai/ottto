@@ -1,6 +1,6 @@
-//! The status-coverage feed (plan §2a.9) only listens: with it working, with
+//! The status-coverage feed only listens: with it working, with
 //! its lock poisoned, and with a conflicting prior history, the same status
-//! pass produces byte-identical SOURCE account/plan observations, quota
+//! pass produces byte-identical account/plan observations, quota
 //! output, source health and persisted slot state.
 use super::*;
 use crate::claude_status_coverage::{self as coverage, Observation};
@@ -226,7 +226,7 @@ fn status_coverage_feed_never_changes_source_or_quota_status_output() {
             Some(false)
         );
     });
-    // SOURCE outputs are really in the fixture.
+    // The account and plan outputs are really in the fixture.
     assert!(working.0.contains(&hash_a) && working.0.contains(&hash_b));
     assert!(working.2.iter().any(|(_, plans)| plans != "[]"));
 

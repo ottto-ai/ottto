@@ -164,7 +164,7 @@ struct RearmFixture {
     native_file_limit: usize,
     owned_base_preparation: bool,
     /// Sessions every page holds locally after the fold, through the
-    /// production E2 hold (`hold_request_owned`): unbound, so
+    /// production `e2` hold (`hold_request_owned`): unbound, so
     /// progress-blocking. Empty unless a test sets it.
     local_holds: BTreeSet<String>,
     body_trace: std::cell::RefCell<RearmBodyTrace>,
@@ -437,7 +437,7 @@ impl RearmFixture {
         target: Option<&str>,
         input: Option<ScanIndex>,
     ) -> RearmPage {
-        // Ordinary transcripts: each file exists before its records (E2).
+        // Ordinary transcripts: each file exists before its records.
         crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
             self.page_with_input_index_born(collected_at, upload, target, input)
         })
@@ -1297,7 +1297,7 @@ fn native_comparison_assert_ack_conservation(fixture: &RearmFixture, selected: &
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
@@ -1524,7 +1524,7 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
@@ -1541,14 +1541,14 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     // The deferred-only contract applies to families that fit a native page.
     // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
     fixture.native_file_limit = 4;
-    // Transferred from E2-052: trace every finalized and ACKed body so the
+    // Trace every finalized and ACKed body so the
     // own-ACK conservation check below runs on this copy-hit history.
     fixture.owned_base_preparation = true;
     fixture.establish();
     assert_eq!(rearm_reads(&fixture.generation(10)), 0);
     const COPY: &str = "e5555555-5555-4555-8555-555555555555";
     let path = native_comparison_add_import(&fixture, COPY, "req_root_1");
-    // The copy keeps the pre-E2 ordinary body this oracle compares: list its
+    // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
     // own root beside the family, before its first read.
     fixture.list_held(&[REARM_ROOT, COPY]);
     let family = rearm_family_sessions();
@@ -1675,7 +1675,7 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
         RearmFixture::family_rearm_debt(&followup.last().unwrap().index),
         0
     );
-    // Transferred from E2-052: the followup settles, and every member's
+    // The followup settles, and every member's
     // latest effective body has its own strict ACK.
     assert!(followup.last().unwrap().fully_settled);
     native_comparison_assert_ack_conservation(
@@ -1725,7 +1725,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
     let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
     const COPY: &str = "f6666666-6666-4666-8666-666666666666";
     let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
-    // The copy keeps the pre-E2 ordinary body this oracle compares: list its
+    // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
     // own root beside the family, before its first read (BASE shares it).
     fixture.list_held(&[REARM_ROOT, COPY]);
     drop(native);
@@ -1783,7 +1783,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
             }
             assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
             // Transferred from the retired corrective-parse interruption
-            // variants (E2-043/044): an offered, unACKed page never mints.
+            // variants: an offered, unACKed page never mints.
             assert_eq!(
                 page.native_receipts, 0,
                 "offered/shed/pending ACK never mint"
@@ -1891,7 +1891,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
 }
@@ -1900,7 +1900,7 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
@@ -1932,7 +1932,7 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
     }
     const OWN: &str = "d7777777-7777-4777-8777-777777777777";
     native_comparison_add_import(&base, OWN, "req_own_C5");
-    // The own-identity body is the pre-E2 ordinary body under test: list its
+    // The own-identity body is the pre-`e2` ordinary body under test: list its
     // own root beside the family, before its first read.
     base.list_held(&[REARM_ROOT, OWN]);
     // Own request-scoped OTEL identity, never an A marker or possible owner.

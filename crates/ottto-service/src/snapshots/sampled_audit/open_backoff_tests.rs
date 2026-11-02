@@ -1,4 +1,4 @@
-//! GUARDRAILS rule 5: a held-audit progress open that keeps failing backs
+//! A held-audit progress open that keeps failing backs
 //! off and parks, its debt still owed, and never blocks a healthy held key.
 //! These drive the page scheduler directly, so they also run off macOS.
 use super::*;
@@ -261,7 +261,7 @@ fn held_open_backoff_due_carries_into_rotation_and_restoration() {
     assert_eq!(restored.files[&failing].unverified_deadline(), Some(D));
 }
 
-/// Rule 7 overflow: with 256 failing keys tracked, a 257th failure evicts
+/// Overflow: with 256 failing keys tracked, a 257th failure evicts
 /// the longest-quiet entry (counted). That key may retry: it takes the next
 /// turn with its owed due, never later, across a save/reload.
 #[test]

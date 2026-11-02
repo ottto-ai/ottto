@@ -1,4 +1,4 @@
-//! E7-8a: per-family Claude census completion, in shadow.
+//! Per-family Claude census completion, in shadow.
 //!
 //! Each Claude page evaluates, for the families its selection touched, the
 //! families a parse attested on the previous page, and a rotating cursor of at
@@ -7,7 +7,7 @@
 //! (source `census_complete`, manifest, wire, account window), calls a fold,
 //! retires, loads evidence, schedules or reads. It feeds no decisions.
 //!
-//! Coverage is attestation, not presence (E1 Q-E1-3). A member counts as
+//! Coverage is attestation, not presence. A member counts as
 //! covered only when this generation recorded a real attestation of its
 //! current revision: a completed parse, or the ordinary equality Skip after
 //! every selection gate passed on the opened identity. Discovery-only
@@ -81,7 +81,7 @@ pub(super) enum Incomplete {
     /// `MAX_FAMILY_KEYS`.
     MembershipUnknown,
     /// A member is queued (census member, re-read hint or carry replay).
-    /// Claude growth hints stay current-generation members (Q-E1-4).
+    /// Claude growth hints stay current-generation members.
     Queued,
     /// A member's read was refused by the size cap (`oversized_discovery`).
     RefusedRead,
@@ -1143,7 +1143,7 @@ pub(super) struct PendingCensusMembers {
     pub(super) freshness: super::money_freshness::Counts,
 }
 
-/// E1's rotation diagnostic: an order-free digest of the skipped entries and
+/// The rotation diagnostic: an order-free digest of the skipped entries and
 /// how many the previous page already skipped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(super) struct SkippedSet {

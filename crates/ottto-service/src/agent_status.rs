@@ -11303,7 +11303,7 @@ fn collect_claude_oauth_usage_unstamped(
         .is_some_and(|breaker| breaker.rate_limit_failures > 0);
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
-    // Read cadence (design R7): one read per binding per slot. The
+    // Read cadence: one read per binding per slot. The
     // slot follows the account's recent activity; due slots alternate the
     // plain and saved-reset reads.
     let account_state_dir =
@@ -11482,7 +11482,7 @@ fn collect_claude_oauth_usage_unstamped(
         );
     }
 
-    // Passive input (design R7: active-account freshness): Claude Code's own
+    // Passive input (active-account freshness): Claude Code's own
     // plain reading for exactly this binding, newer than ours and inside the
     // slot, stands in for a plain slot's call. Parsed by the same plain-body
     // parser; no provider request.
@@ -14090,7 +14090,7 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
-/// Status-coverage feed (plan §2a.9): this slot's already-qualified hashes, or
+/// Status-coverage feed: this slot's already-qualified hashes, or
 /// that the pass has none. Returns nothing, so the feed cannot change status.
 fn note_claude_status_coverage(
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -16093,7 +16093,7 @@ fn collect_codex_app_server_usage_for_home(
                     )
                 );
                 // No reading at all: the detail back-off still applies to the
-                // account last validated at this home (design R7).
+                // account last validated at this home.
                 codex_credit_grants::record_session_failure(codex_home, now);
                 return Err(message);
             }
@@ -16548,7 +16548,7 @@ fn run_codex_app_server_rate_limits_for_home(
         "params": {"refreshToken": false}
     });
     // Every poll reads usage and the count first; the reset-credit list
-    // follows in this session only when the cadence asks for it (design R7).
+    // follows in this session only when the cadence asks for it.
     let read = codex_credit_grants::CodexRateLimitsRead::Routine.request("ottto_rate_limits");
     let detail_read = codex_credit_grants::CodexRateLimitsRead::Detailed
         .request(codex_credit_grants::DETAIL_READ_ID);
@@ -19739,7 +19739,7 @@ mod tests {
         }
     }
 
-    /// The exact M4 slot set behind the 0.1.132 report, as data: one fresh
+    /// The exact slot set behind the 0.1.132 report, as data: one fresh
     /// canonical anchor serving live meters, one duplicate anchor, one
     /// canonical anchor whose provider read failed, and a default slot that
     /// holds full-meter evidence and also failed its provider read.
@@ -21524,7 +21524,7 @@ mod tests {
         assert_eq!(unanchored.winning_by_binding[&binding], 0);
     }
 
-    /// Live M4 Gmail anchor, 2026-10-02: the worker read a signed-out
+    /// Live Gmail anchor, 2026-10-02: the worker read a signed-out
     /// credential (expiry epoch) and published `needs_login`, but the saved
     /// slot stayed `refresh_due`, so the companion never offered "Sign in
     /// again". Exercise the real worker publication and the real blocked
