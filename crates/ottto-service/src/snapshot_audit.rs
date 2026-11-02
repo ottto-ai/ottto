@@ -11,9 +11,8 @@ use crate::snapshots::{
     apply_upload_policy, collector_version, finalize_scan_after_policy,
     scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
-    snapshot_semantic_envelope, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    snapshot_semantic_envelope, ScanIndex, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
+    BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -344,17 +343,15 @@ pub fn run_snapshot_audit<W: Write>(
         // audit report covers the full local scan; its optional private payload
         // reproduces the narrower production upload exactly.
         claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: options.source.api_slug().to_string(),
-            machine_id: options.machine_id.clone(),
-            collector_version: Some(collector_version()),
-            snapshots: uploadable_snapshots,
+        let request = crate::snapshot_sync::snapshot_batch_request(
+            options.source,
+            &options.machine_id,
+            uploadable_snapshots,
             upload_policy,
             // The audit is an offline reproduction of one upload, so it reports
             // no losses of its own; the live counters belong to the sync loop.
-            client_report: crate::client_report::ClientReport::empty(),
-        };
+            crate::client_report::ClientReport::empty(),
+        );
         write_private_json(path, &request)?;
     }
 

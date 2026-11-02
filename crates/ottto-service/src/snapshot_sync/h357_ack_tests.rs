@@ -348,7 +348,6 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             state: deferred_entity_state(false),
         },
         false,
-        false,
     )
     .unwrap();
     assert_eq!(partial.last_uploaded_count, 43);
@@ -367,7 +366,6 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
             },
             state: CollectorState::Success,
         },
-        false,
         false,
     )
     .unwrap();
@@ -513,18 +511,15 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (ledger, outcome, accepted) = h359_all_rejected("invalid");
+    let (ledger, _, accepted) = h359_all_rejected("invalid");
     let now = Instant::now();
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
     for _ in 0..8 {
         cadence.record_scan_failure(now);
     }
-    record_finished_snapshot_cadence(
-        &mut cadence,
-        now,
-        accepted,
-        matches!(outcome, ResumableUploadResult::Deferred { .. }),
-    );
+    // Finish records every finished cycle this way (pinned end to end by the
+    // real-finish entity-conflict test).
+    cadence.record_scan_success(now, accepted);
     assert_eq!(cadence.state(), ottto_protocol::LocalCollectorState::Idle);
     let status = collector_status_request(
         "h359-synthetic",
@@ -536,7 +531,6 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
-        false,
     )
     .unwrap();
     assert_eq!(status.last_uploaded_count, 0);

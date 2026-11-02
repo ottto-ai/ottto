@@ -5584,6 +5584,31 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             assert_eq!(mio, (0, 0));
             assert_eq!(mi.files[&key].size_bytes, accepted);
             assert_eq!(mi.files[&key].last_upload_body_witness, witness);
+            // Re-armed, this reason keeps its route: only a no-match takes the
+            // immediate Full, so an unchanged file reads nothing here.
+            let mut cleared = prior.clone();
+            cleared
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+            let cleared_owner = E2ScanFixture::default();
+            cleared_owner.begin_durable(source, &root, &index_path);
+            let ((_, _, cleared_modes), cleared_io) =
+                a0h_observe(|| a0h_scan(&cleared_owner, &roots, &root, cleared.clone()));
+            assert_eq!(cleared_modes.0, 0, "{reason}: re-armed keeps its route");
+            assert_eq!(cleared_io, (0, 0));
+            assert_eq!(
+                cleared_owner
+                    .cache
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .ineligible
+                    .get("selection_cleared.stale_record_full"),
+                None
+            );
         }
         File::options()
             .write(true)
@@ -9958,10 +9983,31 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             })
         });
         let (index, scan, modes) = page;
-        assert_eq!(
-            modes.0, 0,
-            "{arm}: no Full even on selection clear or mtime-only change"
-        );
+        if arm == "cleared" {
+            // A re-armed entry whose record cannot match takes OFF's path:
+            // OFF's immediate Full of the whole file, never a pace or hold.
+            assert_eq!(modes.0, 1, "cleared: OFF's immediate Full");
+            assert_eq!(body, prior.files[&key].size_bytes, "cleared");
+            assert!(samples.is_empty(), "cleared: no certificate/body sample");
+            assert_eq!(scan.unreadable_path_count, 0, "cleared");
+            assert!(
+                scan.snapshots
+                    .iter()
+                    .all(|s| s.input_tokens == 100 && s.request_count == 1),
+                "cleared: the re-read neither shrinks nor synthesizes $0"
+            );
+            let counts = owner.cache.durable_counters(source).unwrap().0;
+            assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
+            assert_eq!(
+                counts.ineligible.get("selection_cleared.stale_record_full"),
+                Some(&1)
+            );
+            assert_eq!(counts.ineligible.get("old_binding_no_match.paced"), None);
+            // Later arms need the unmatched survivor; this Full may replace it.
+            std::fs::write(&disk_path, &survivor).unwrap();
+            continue;
+        }
+        assert_eq!(modes.0, 0, "{arm}: no Full on an idle or mtime-only change");
         assert_eq!(body, 0, "{arm}");
         if arm == "mtime" {
             assert_eq!(
