@@ -813,7 +813,8 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
                 "sidecars" => f.write_rows(true, &f.trace[..2]),
                 "context" => {
                     scan.index.active_upload_context_fingerprint =
-                        Some("changed-after-start".into())
+                        Some("changed-after-start".into());
+                    scan.index.active_acquisition_context = Some("changed-after-start".into());
                 }
                 "object" => {
                     let replacement = f.path.with_extension("replacement");

@@ -364,7 +364,7 @@ fn partial_upload_under_flip_rolls_back_and_still_selects() {
     f.flip(all(false));
     let walked = f.flip_walk(all(false), None);
     assert_eq!(walked.scan.scanned_file_count, 1);
-    assert!(walked.bytes > 0);
+    assert!(!walked.scan.snapshots.is_empty(), "the grown body is offered");
 }
 
 /// [behaviour] T4: this file's entity was sent since under another context, by a
@@ -605,5 +605,5 @@ fn over_limit_link_is_dropped_only_at_upload() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].session_artifacts.len(), 1);
     assert!(items[0].session_artifacts[0].value.len() <= 512);
-    assert_ne!(items[0].snapshot_fingerprint, before);
+    assert_eq!(items[0].snapshot_fingerprint, before, "names the sent body");
 }
