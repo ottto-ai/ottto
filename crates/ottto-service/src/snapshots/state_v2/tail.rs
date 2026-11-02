@@ -31,6 +31,8 @@ pub(super) fn owned(key: &RowKey) -> bool {
 /// Paged collections, in `catalogue::TAIL_KINDS` order. `Revisions` is the
 /// file's debt (`tail.revision`, layout 5, position = revision id): it shares
 /// membership, checksums and fragments, but no reduction stage may name it.
+/// `SessionFacts` (layout 5) is an ordinary reduction page of opaque per-session
+/// facts: only `load_pages` reads it, never a head read, retire or marker check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::snapshots) enum Collection {
     Responses,
@@ -47,9 +49,10 @@ pub(in crate::snapshots) enum Collection {
     CodexOpenCalls,
     CodexNameCounts,
     Revisions,
+    SessionFacts,
 }
 impl Collection {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Responses,
         Self::ToolUses,
         Self::ChangedFiles,
@@ -64,6 +67,7 @@ impl Collection {
         Self::CodexOpenCalls,
         Self::CodexNameCounts,
         Self::Revisions,
+        Self::SessionFacts,
     ];
     fn kind(self) -> &'static str {
         catalogue::TAIL_KINDS[self as usize]
@@ -797,20 +801,29 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result
     }
     let kind = RecordKind::parse(FRAG)?;
     let digest = frag_file(file);
-    // The bare digest sorts before every fragment key that starts with it, and
-    // the revisions' owner id sorts after every other owner's.
-    let mut stop = digest.to_vec();
-    stop.extend_from_slice(&Collection::Revisions.owner().to_be_bytes());
-    let before = row(FRAG, &digest, 0)?;
+    let mut debt = digest.to_vec();
+    debt.extend_from_slice(&Collection::Revisions.owner().to_be_bytes());
+    let has = |header: &Header, prefix: &[u8]| match &header.key {
+        RowKey::Record { key_bytes, .. } => key_bytes.starts_with(prefix),
+        _ => false,
+    };
+    // The bare digest sorts before every fragment key that starts with it. Owners
+    // sort on both sides of the kept revisions, so the walk passes over them.
+    let mut after = row(FRAG, &digest, 0)?;
     loop {
-        let rows = tx.scan_kind(&kind, Some(&before), HEADER_PAGE)?;
-        let own = rows.into_iter().take_while(|header| {
-            matches!(&header.key, RowKey::Record { key_bytes, .. }
-                if key_bytes.starts_with(&digest) && !(keep_debt && key_bytes.starts_with(&stop)))
-        });
-        if !purge(tx, own.collect())? {
+        let rows = tx.scan_kind(&kind, Some(&after), HEADER_PAGE)?;
+        let own: Vec<Header> = rows
+            .into_iter()
+            .take_while(|header| has(header, &digest))
+            .collect();
+        let Some(last) = own.last() else {
             return Ok(());
-        }
+        };
+        after = last.key.clone();
+        let gone = own
+            .into_iter()
+            .filter(|header| !(keep_debt && has(header, &debt)));
+        purge(tx, gone.collect())?;
     }
 }
 /// The file's committed revision rows, from headers alone.

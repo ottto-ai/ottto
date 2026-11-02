@@ -624,6 +624,7 @@ fn split_reads_head_keys_late_kinds_and_bootstrap_reset() {
         Collection::CodexActiveTurns,
         Collection::CodexOpenCalls,
         Collection::CodexNameCounts,
+        Collection::SessionFacts,
     ];
     let pages = kinds.map(|collection| (collection, 0, b"page".as_slice()));
     let reset = StagedFile {
@@ -683,6 +684,25 @@ fn split_reads_head_keys_late_kinds_and_bootstrap_reset() {
     .unwrap_err();
     assert_eq!(stale.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
     assert_eq!(visits, 0);
+
+    // A long fact fragments, and its owner sorts after the revisions': a retire
+    // that keeps the debt still takes the fact's fragments and only those.
+    let long = long_value();
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"head", &[(Collection::SessionFacts, 0, &long)])
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    observe_tail(&f.path, FILE, observation(&[long.as_slice()])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(frag_rows(&index), 4);
+    let (_, pages) = read(&index, FILE).unwrap();
+    assert_eq!(pages[&(Collection::SessionFacts, 0)], long);
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(rows(&index, "tail.page.session_facts", FILE).is_empty());
+    assert_eq!(frag_rows(&index), 2, "only the kept revision's fragments");
+    assert_eq!(revisions(&index, FILE)[&0], long);
 }
 
 fn revisions(index: &ScanIndex, key: &str) -> BTreeMap<u64, Vec<u8>> {

@@ -204,6 +204,7 @@ pub(super) const TAIL_KINDS: &[&str] = &[
     "tail.page.codex_open_calls",
     "tail.page.codex_name_counts",
     "tail.revision",
+    "tail.page.session_facts",
     "tail.head",
     "tail.frag",
     "tail.set_aside",
@@ -212,7 +213,7 @@ pub(super) const TAIL_KINDS: &[&str] = &[
 /// layout at most, never to a later one whose graph roots it does not write.
 pub(super) const TAIL_LAYOUT: u32 = 4;
 /// Tail kinds added after the Tail store, each at its own layout.
-const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5)];
+const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
         .iter()
@@ -287,6 +288,7 @@ mod tests {
         assert_eq!(TAIL_LAYOUT, 4);
         assert_eq!(introduced("tail.head").unwrap(), TAIL_LAYOUT);
         assert_eq!(introduced("tail.revision").unwrap(), 5);
+        assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
         assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
         // An unversioned store's inventory never names a layout-5 field, so its
         // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).
