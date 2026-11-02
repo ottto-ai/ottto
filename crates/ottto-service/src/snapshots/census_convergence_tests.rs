@@ -333,7 +333,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
             ..Default::default()
         }
     );
-    assert!(after.files[unobserved].source_file_fingerprint.is_empty());
+    assert!(after.files[unobserved].rearmed());
 
     // Inside the backoff the same closed census does not replay again.
     let mut deferred = after.clone();

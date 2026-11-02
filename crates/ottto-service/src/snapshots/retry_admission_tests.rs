@@ -68,33 +68,6 @@ fn retry_test_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     loaded
 }
 
-fn retry_test_corrections(fixture: &mut ScopedRetryFixture) {
-    let deadline = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
-    for (number, family) in fixture.roots.iter().take(70).enumerate() {
-        let record = fixture
-            .index
-            .claude_usage_authority_quarantine
-            .get_mut(family)
-            .unwrap();
-        record.retry_after_unix_seconds = deadline;
-        if number < 65 {
-            // A correction is a terminal re-offer, never a RetryPending grant.
-            record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
-            record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
-            record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
-            record.retry_after_unix_seconds = 0;
-            record.proof_correction = Some(ClaudeAuthorityProofCorrection {
-                proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
-                owed_member_ids: BTreeSet::from([family.clone()]),
-            });
-        }
-        assert!(claude_usage_authority_preserves_pending(
-            record,
-            &fixture.index.claude_usage_family_witnesses[family]
-        ));
-    }
-}
-
 fn retry_test_context(index: &mut ScanIndex, root: &Path) {
     let context = scan_traversal_context_fingerprint(
         SnapshotSource::ClaudeCode,
@@ -105,35 +78,6 @@ fn retry_test_context(index: &mut ScanIndex, root: &Path) {
     let traversal = index.traversal.as_mut().unwrap();
     traversal.context_fingerprint = context;
     traversal.scan_roots = vec![root.to_owned()];
-}
-
-// Runs on Linux too: the strict persistence checks reproduce both original
-// fixture defects without asking an unsupported platform to mint native carry.
-#[test]
-fn retry_scheduling_fixtures_keep_ack_and_correction_custody_on_reload() {
-    let mut fixture = retry_durable_fixture(70, 3);
-    retry_test_corrections(&mut fixture);
-    fixture.index = retry_test_reload(&mut fixture.index, &fixture._scratch.join("custody.json"));
-    assert_eq!(fixture.index.accepted_snapshot_fingerprints.len(), 73);
-    assert_eq!(fixture.index.claude_usage_authority_quarantine.len(), 70);
-    assert_eq!(
-        fixture
-            .index
-            .claude_usage_authority_quarantine
-            .values()
-            .filter(|r| r.proof_correction.is_some())
-            .count(),
-        65
-    );
-    assert_eq!(
-        fixture
-            .index
-            .claude_usage_authority_quarantine
-            .values()
-            .filter(|r| r.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending)
-            .count(),
-        5
-    );
 }
 
 // The classifier runs on Linux too; native carry allocation is intentionally

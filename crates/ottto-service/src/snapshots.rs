@@ -4742,12 +4742,12 @@ pub struct ScanIndexEntry {
     /// Evidence owed: a census re-arm kept `source_file_fingerprint` and
     /// owes this file's request evidence to the current census window. Only
     /// census-window debt is kept this way; a read the file really needs
-    /// clears the fingerprint as main does.
-    /// An older v1 binary drops the bit and treats such entries as observed;
-    /// debt that keeps main's clear stays visible to it as an empty
-    /// fingerprint, owed debt (the identity-contract re-arm included) does
-    /// not. After a downgrade from ON, start a fresh walk. A state-v2 store
-    /// refuses the bit instead (see `identity_contract`).
+    /// clears the fingerprint.
+    /// An older v1 binary drops the bit and keeps the fingerprint; a cleared
+    /// entry stays visible to it as an empty fingerprint, owed debt (the
+    /// identity-contract re-arm included) does not. A re-stamp moves only a
+    /// fully observed family, so that older reader holds what a Full holds.
+    /// A state-v2 store refuses the bit instead (see `identity_contract`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
 }
@@ -4757,14 +4757,14 @@ pub struct ScanIndexEntry {
 const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 560);
 
 impl ScanIndexEntry {
-    /// Re-armed: the fingerprint was cleared (main) or kept with its evidence
-    /// owed (`evidence_owed` ON). Every "cleared = owes a census observation"
-    /// reader asks this, never `source_file_fingerprint.is_empty()` alone.
+    /// Re-armed: the fingerprint was cleared or kept with its evidence owed.
+    /// Every "cleared = owes a census observation" reader asks this, never
+    /// `source_file_fingerprint.is_empty()` alone.
     pub(crate) fn rearmed(&self) -> bool {
         self.source_file_fingerprint.is_empty() || self.evidence_owed
     }
-    /// The fingerprint as main's re-arm leaves it: empty while evidence is
-    /// owed. Readers where equality means "observed" or feeds a proof or
+    /// The fingerprint as a clearing re-arm leaves it: empty while evidence
+    /// is owed. Readers where equality means "observed" or feeds a proof or
     /// credit ask this, so an owed revision proves nothing until resolved.
     pub(crate) fn observed_fingerprint(&self) -> &str {
         if self.evidence_owed {
@@ -9709,9 +9709,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             index.claude_usage_family_pending.loaded_all(),
             legacy_request_owners.as_ref(),
         );
-        // Owed evidence, including a re-stamp under the
-        // identity-contract latch, proves nothing until it resolves.
-        let owed_roots = evidence_owed::owed_roots(index);
+        // Owed evidence this window did not observe proves nothing until it
+        // resolves.
+        let owed_roots = evidence_owed::owed_roots(index, census_window_end);
         for (root_session_id, members) in &complete_families {
             if uncertified_roots.contains(root_session_id) || owed_roots.contains(root_session_id) {
                 continue;
@@ -10878,8 +10878,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
                 // A census-only re-arm owes instead of clearing and is
                 // resolved by a bound re-stamp. A changed witness or duplicate
-                // owner must be read: main's clear, so an older reader still
-                // sees the debt. The identity-contract
+                // owner must be read: the fingerprint clears, so an older
+                // reader still sees the debt. The identity-contract
                 // re-arm is owed and paced too: older-contract pending is
                 // marked `contract_unproven` at the latch clear (or stays
                 // under the latch), so it never re-stamps and is read.
@@ -11376,8 +11376,10 @@ fn claude_family_members_unobserved_where(
                 return false;
             };
             // A re-stamped family's still-owed member is verified at its own
-            // selection; until then it is unobserved (`evidence_owed`).
-            entry.evidence_owed
+            // selection; until then it is unobserved (`evidence_owed`),
+            // unless this window read it (`observed_in_window`).
+            (entry.evidence_owed
+                && !evidence_owed::observed_in_window(index, index_key, census_window_end))
                 || !(covered.contains(&member)
                     || index.confirmed_empty_files.contains(*index_key)
                     || excused_root(&root_session_id)
@@ -45585,24 +45587,26 @@ fn ensure_bounded_traversal(
         let carry = if streaming_carry {
             // No batch admission: an unfinished admission keeps only its due
             // cursor (below), and the owed resolver pages the stale set.
-            Ok(match claude_stream_accepted_retry_carry_observed(
-                index,
-                &stale_pending_roots,
-                &mut stale_carry_rejection_counts,
-                debt_scope,
-            ) {
-                Ok(carry) => carry,
-                Err(refusal) => {
-                    // Every stale root returns to the re-arm below and the
-                    // resolver; carry credits nothing.
-                    let accounted = stale_carry_rejection_counts.rejected() as usize;
-                    stale_carry_rejection_counts.reject(
-                        refusal.into(),
-                        stale_pending_roots.len().saturating_sub(accounted),
-                    );
-                    ClaudeStaleFamilyCarry::default()
-                }
-            })
+            Ok(
+                match claude_stream_accepted_retry_carry_observed(
+                    index,
+                    &stale_pending_roots,
+                    &mut stale_carry_rejection_counts,
+                    debt_scope,
+                ) {
+                    Ok(carry) => carry,
+                    Err(refusal) => {
+                        // Every stale root returns to the re-arm below and the
+                        // resolver; carry credits nothing.
+                        let accounted = stale_carry_rejection_counts.rejected() as usize;
+                        stale_carry_rejection_counts.reject(
+                            refusal.into(),
+                            stale_pending_roots.len().saturating_sub(accounted),
+                        );
+                        ClaudeStaleFamilyCarry::default()
+                    }
+                },
+            )
         } else if !window_scratch_admitted {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::WindowScratch,
@@ -54959,8 +54963,10 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        let withheld_unchanged =
-            !entry.rearmed() && self.withheld_account_unchanged(&key, candidate);
+        // An owed (kept) revision keeps its validated CONTENT memo Skip; a
+        // cleared entry still reads.
+        let withheld_unchanged = !entry.source_file_fingerprint.is_empty()
+            && self.withheld_account_unchanged(&key, candidate);
         // A withheld key's audit debt (carried onto its reverted entry) cannot
         // settle while held; an unchanged one defers it to its next counted
         // re-parse, usually the binding read, instead of a Full every pass.
@@ -56886,8 +56892,8 @@ mod tests {
                 Some(member_key.as_str())
             );
             assert!(state.progressed);
-            assert!(index.files[&root_key].source_file_fingerprint.is_empty());
-            assert!(index.files[&member_key].source_file_fingerprint.is_empty());
+            assert!(index.files[&root_key].rearmed());
+            assert!(index.files[&member_key].rearmed());
             assert_eq!(
                 index.files[&healthy_key].source_file_fingerprint,
                 fingerprints[&healthy_key]
@@ -66822,9 +66828,12 @@ mod tests {
             (None, None, None, None)
         );
         assert!(index.claude_duplicate_request_witness_overflowed);
-        assert!(!index
+        // The re-armed copier owes instead of dropping its pending; any it
+        // keeps stays invalid, so it credits no coverage or proof.
+        assert!(index
             .claude_usage_family_pending
-            .contains_key(hidden_copy_id));
+            .view(hidden_copy_id)
+            .map_or(true, |pending| pending.invalid()));
         assert!(index.claude_duplicate_request_owners.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -71971,10 +71980,7 @@ mod tests {
         assert!(cap_index.claude_duplicate_request_witness_overflowed);
         assert!(cap_index.claude_duplicate_request_owners.is_empty());
         assert_eq!(cap_sibling_page[0].peak_context_fill_tokens, None);
-        assert!(cap_index
-            .files
-            .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert!(cap_index.files.values().all(|entry| entry.rearmed()));
 
         cap_index.files.remove(&local_index_key(&sibling_path));
         let mut cap_recovery = vec![corrective_page[0].clone()];
@@ -71994,11 +72000,13 @@ mod tests {
         );
         assert!(!cap_index.claude_duplicate_request_witness_overflowed);
         assert_eq!(cap_recovery[0].peak_context_fill_tokens, None);
-        cap_index
+        // The child is read again: an observed revision.
+        let recovered = cap_index
             .files
             .get_mut(&local_index_key(&child_path))
-            .expect("cap child index entry")
-            .source_file_fingerprint = "cap-recovered".to_string();
+            .expect("cap child index entry");
+        recovered.source_file_fingerprint = "cap-recovered".to_string();
+        recovered.evidence_owed = false;
         let mut cap_restored = vec![corrective_page[0].clone()];
         apply_claude_reported_usage_with_index_and_limits(
             &mut cap_restored,

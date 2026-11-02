@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(rows[0]["counts"]["prior_unsettled_upload"], true);
         assert_eq!(rows[0]["counts"]["stale_pending_families"], 1);
         assert_eq!(rows[0]["counts"]["rearmed_index_files"], 1);
-        assert!(index.files[key].source_file_fingerprint.is_empty());
+        assert!(index.files[key].rearmed());
         assert!(!index.bounded_sweep_had_unsettled_upload);
         assert!(rows[0]["counts"]["previous"].is_null());
         assert_eq!(rows[0]["stage"], "bounded_traversal_transition");

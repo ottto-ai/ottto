@@ -566,7 +566,7 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     // unstamped one is read.
     spent.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
     rearm.fold(&mut spent, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
-    assert!(!spent.claude_request_identity_contract_changed, "main's clear");
+    assert!(!spent.claude_request_identity_contract_changed, "the latch clears");
     let pending = &spent.claude_usage_family_pending[OTHER_ROOT];
     assert!(pending.contract_unproven && pending.identity_contract.is_none());
     evidence_owed::clear(spent.files.get_mut(&other_key).unwrap());
@@ -633,7 +633,7 @@ fn record_read(index: &mut ScanIndex, key: &str, source: &str) {
 }
 
 /// [behaviour] The identity-contract re-arm owes and paces:
-/// every family file keeps its revision, owed and counted, instead of main's
+/// every family file keeps its revision, owed and counted, instead of a
 /// clear, and older-contract pending never re-stamps. Here one owed read
 /// fits a page, so the family files drain one per page, each read once,
 /// with the latch cleared at that completion and with it held (an
@@ -755,7 +755,7 @@ fn hex_sources(rearm: &mut Rearm, index: &mut ScanIndex) {
 }
 
 /// [regress] While the identity-contract latch holds (an unsettled sweep),
-/// main clears and re-reads every family file at each complete census.
+/// a clearing re-arm re-reads every family file at each complete census.
 /// Owed instead, a member read under the recorded contract is not owed again
 /// at any later completion: one read clears that debt, also for a
 /// cap-invalid family. Three completions in three windows: the member read
@@ -2588,10 +2588,7 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         );
         assert!(first.duplicate_census.full_rearm);
-        assert!(index
-            .files
-            .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert!(index.files.values().all(|entry| entry.rearmed()));
 
         // Consume the first paid re-arm's real scanner window, then verify
         // that the unchanged, withheld family no longer requests a re-arm.

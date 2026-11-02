@@ -46,7 +46,7 @@ counters!(ContextChange {
 counters!(EvidenceOwed {
     restamped,
     restamped_from_record,
-    restamped_under_latch,
+    restamped_current_contract,
     read,
     selected_by_other_reason,
     deferred_page_cap,
