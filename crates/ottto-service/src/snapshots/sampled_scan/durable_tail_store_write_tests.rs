@@ -540,7 +540,8 @@ fn post_save_write_takes_an_evidence_clear_and_refuses_real_changes() {
         let key = local_index_key(&path);
         let scope = Scope("evidence-clear-file".into());
         let index_path = root.join("index.json");
-        let cache = fixture::cache(source, &index_path, &Scope("evidence-clear".into()), false);
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &Scope("evidence-clear".into()), false);
         let (reduction, checkpoint) = native_record(&path, &scope);
         let completed = native_v3_completion(&cache, &path, source, reduction, checkpoint);
         assert!(cache.insert_admitted(key.clone(), completed, 0));
