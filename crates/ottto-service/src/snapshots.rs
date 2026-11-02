@@ -50450,12 +50450,27 @@ impl ScanIndex {
     /// any activation, below the highest revision with a policy row), so the
     /// file is owed again and goes back through the history gate. Counts
     /// `history_reowed`. Returns false and writes nothing otherwise. MONEY's
-    /// census 3 -> 2 path calls it.
+    /// census 3 -> 2 path calls it. What it owes is never handed back by a
+    /// folder's re-offer.
     pub(crate) fn re_owe_effective_upload_body_witness_revision(
         &mut self,
         index_key: &str,
         to: u64,
     ) -> bool {
+        claude_folder_login::keep_owed(&mut self.claude_folder_login_ledger, index_key);
+        self.lower_effective_upload_body_witness_revision(index_key, to)
+    }
+
+    /// A folder re-offer's one more read of a settled file. It may hand the file
+    /// back through the stamp below while no other owner has re-owed it.
+    pub(in crate::snapshots) fn re_owe_for_folder_reoffer(&mut self, index_key: &str) -> bool {
+        let to = self
+            .active_effective_upload_body_witness_revision
+            .saturating_sub(1);
+        self.lower_effective_upload_body_witness_revision(index_key, to)
+    }
+
+    fn lower_effective_upload_body_witness_revision(&mut self, index_key: &str, to: u64) -> bool {
         let active = self.active_effective_upload_body_witness_revision;
         self.files.get_mut(index_key).is_some_and(|entry| {
             claude_history_upgrade::re_owe(

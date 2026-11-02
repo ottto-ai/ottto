@@ -674,12 +674,14 @@ fn a_re_offer_reports_counts_and_warns_only_when_it_stalls() {
         bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
         owed_files: 2_001,
         owed_bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
+        ..ReofferTally::default()
     };
     assert_eq!(
         reoffer_line(&home, &mut record, &tally, NOW).unwrap(),
         format!(
             "ottto-service: claude folder re-offer folder=abababab phase=census files_read=0 \
-             bytes_read=0 files_remaining=2001 bytes_remaining={} eta_minutes=15",
+             bytes_read=0 files_released=0 bytes_released=0 files_remaining=2001 \
+             bytes_remaining={} eta_minutes=15",
             3 * HISTORY_UPGRADE_BYTES_PER_PAGE
         )
     );
@@ -709,4 +711,72 @@ fn a_damaged_ledger_fails_closed() {
     seed(&mut index, &f.path(SESSION_A), 100);
     apply_reoffers(&mut index, true, NOW);
     assert!(owed(&index).is_empty());
+}
+
+/// [money] A folder turning sticky hands back only what its own census lowered;
+/// a file owed for any other reason keeps its read, and a qualifying folder's
+/// census goes on.
+#[test]
+fn a_sticky_folder_releases_only_its_own_census_files() {
+    let f = folder("recorded-release");
+    let g = folder("recorded-release-other");
+    let mut index = ScanIndex::default();
+    f.begin_upgraded(&mut index, folder_report());
+    g.begin_upgraded(&mut index, folder_report());
+    let key = |name: &str| local_index_key(&f.path(name));
+    for name in [SESSION_A, "unread", "re-owed", "owed-before"] {
+        seed(&mut index, &f.path(name), 100);
+    }
+    seed(&mut index, &g.path(SESSION_B), 100);
+    index
+        .files
+        .get_mut(&key("owed-before"))
+        .unwrap()
+        .effective_upload_body_witness_revision = 2;
+    apply_reoffers(&mut index, true, NOW);
+    assert_eq!(owed(&index).len(), 5);
+    index.re_owe_effective_upload_body_witness_revision(&key("re-owed"), 2);
+
+    let mut first = f.read(
+        SESSION_A,
+        &[
+            context(OTHER_ADDRESS, SESSION_A),
+            marker(ORG_UUID, SESSION_A),
+            assistant(SESSION_A, "req_a", "2026-08-02T07:00:00Z"),
+        ],
+    );
+    page(&mut index, &mut first, false);
+    assert!(f.record(&index).mixed);
+    apply_reoffers(&mut index, true, NOW + 300);
+    assert_eq!(
+        owed(&index),
+        BTreeSet::from([
+            key("re-owed"),
+            key("owed-before"),
+            local_index_key(&g.path(SESSION_B)),
+        ]),
+    );
+    assert!(f.record(&index).reoffer_owed.is_empty());
+    assert_eq!(g.record(&index).reoffer, REOFFER_CENSUS);
+    apply_reoffers(&mut index, true, NOW + 600);
+    assert_eq!(owed(&index).len(), 3, "released once, never owed again");
+}
+
+/// [money] A newer revision since the census began owes the file for real.
+#[test]
+fn a_revision_change_keeps_a_sticky_folders_files_owed() {
+    let f = folder("recorded-release-revision");
+    let mut index = ScanIndex::default();
+    f.begin_upgraded(&mut index, folder_report());
+    seed(&mut index, &f.path(SESSION_A), 100);
+    apply_reoffers(&mut index, true, NOW);
+    index
+        .claude_folder_login_ledger
+        .get_mut(&f.key)
+        .unwrap()
+        .set_mixed();
+    index.active_effective_upload_body_witness_revision = 4;
+    apply_reoffers(&mut index, true, NOW + 300);
+    assert_eq!(owed(&index).len(), 1);
+    assert!(f.record(&index).reoffer_owed.is_empty());
 }

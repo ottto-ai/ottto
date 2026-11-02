@@ -435,6 +435,9 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         .iter()
         .filter(|(version, _)| *version > stored)
         .fold(0, |mask, (_, marks)| mask | marks);
+    let to = index
+        .active_effective_upload_body_witness_revision
+        .saturating_sub(1);
     let mut live = Vec::new();
     let mut owed = Vec::new();
     for key in index.files.keys() {
@@ -447,21 +450,13 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         }
         live.push(location);
     }
-    re_owe_files(index, owed);
+    for key in owed {
+        index.re_owe_effective_upload_body_witness_revision(&key, to);
+    }
     live.sort_unstable();
     let store = &mut index.claude_money_birth_store;
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
-}
-
-/// Owes these files one more read. The history gate paces them.
-pub(crate) fn re_owe_files(index: &mut ScanIndex, keys: Vec<String>) {
-    let to = index
-        .active_effective_upload_body_witness_revision
-        .saturating_sub(1);
-    for key in keys {
-        index.re_owe_effective_upload_body_witness_revision(&key, to);
-    }
 }
 
 /// Fixed count-only causes of the existing certificate veto.

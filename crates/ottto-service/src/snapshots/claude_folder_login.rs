@@ -129,8 +129,12 @@ pub(crate) struct FolderRecord {
     /// Files the running re-offer still owes, and when that last changed.
     reoffer_remaining: u64,
     reoffer_moved_at: i64,
+    /// Sorted. Settled files this phase itself lowered, at `reoffer_revision`:
+    /// the only ones a folder turning sticky hands back.
+    reoffer_owed: Vec<u64>,
+    reoffer_revision: u64,
 }
-crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_remaining, reoffer_moved_at);
+crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_remaining, reoffer_moved_at, reoffer_owed, reoffer_revision);
 
 impl FolderRecord {
     fn set_mixed(&mut self) {
@@ -421,6 +425,8 @@ struct ReofferTally {
     bytes: u64,
     owed_files: u64,
     owed_bytes: u64,
+    released_files: u64,
+    released_bytes: u64,
 }
 
 /// A counts-only line when the re-offer moved, or a warning when it has not for
@@ -432,10 +438,10 @@ fn reoffer_line(
     now: i64,
 ) -> Option<String> {
     let folder = short_key(home);
-    let phase = if record.reoffer == REOFFER_TAG {
-        "tag"
-    } else {
-        "census"
+    let phase = match (record.mixed, record.reoffer) {
+        (true, _) => "released",
+        (false, REOFFER_TAG) => "tag",
+        (false, _) => "census",
     };
     if record.reoffer_moved_at == 0 || record.reoffer_remaining != tally.owed_files {
         record.reoffer_remaining = tally.owed_files;
@@ -449,9 +455,11 @@ fn reoffer_line(
                     .div_ceil(HISTORY_UPGRADE_FILES_PER_PAGE as u64),
             );
         return Some(format!(
-            "ottto-service: claude folder re-offer folder={folder} phase={phase} files_read={} bytes_read={} files_remaining={} bytes_remaining={} eta_minutes={}",
-            tally.files - tally.owed_files,
-            tally.bytes - tally.owed_bytes,
+            "ottto-service: claude folder re-offer folder={folder} phase={phase} files_read={} bytes_read={} files_released={} bytes_released={} files_remaining={} bytes_remaining={} eta_minutes={}",
+            tally.files - tally.owed_files - tally.released_files,
+            tally.bytes - tally.owed_bytes - tally.released_bytes,
+            tally.released_files,
+            tally.released_bytes,
             tally.owed_files,
             tally.owed_bytes,
             pages * MINUTES_PER_PAGE,
@@ -472,17 +480,25 @@ fn reoffer_line(
 /// Sync pass, before the walk, in the same save as the ledger. History already
 /// uploaded untagged reaches the tag only through one more read, so each phase
 /// owes its files once through the money rules' re-owe and the history gate then
-/// paces them like any owed file. A folder turning sticky mid-phase freezes that
-/// phase; the files already owed are still read once.
+/// paces them like any owed file. A sticky folder can no longer qualify, so it
+/// hands back what its phase lowered and not yet read: those files had nothing
+/// else owed, and the ordinary walk still reads any change.
 pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
     if !enabled {
         return;
     }
     let reports = coverage::snapshot();
+    let active = index.active_effective_upload_body_witness_revision;
     let mut starting = BTreeSet::new();
     let mut running = BTreeMap::<String, ReofferTally>::new();
     for (home, record) in &mut index.claude_folder_login_ledger {
         if record.mixed {
+            if record.reoffer_revision != active {
+                record.reoffer_owed = Vec::new();
+            }
+            if !record.reoffer_owed.is_empty() {
+                running.insert(home.clone(), ReofferTally::default());
+            }
             continue;
         }
         if record.reoffer == REOFFER_IDLE {
@@ -506,6 +522,7 @@ pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
         return;
     }
     let mut owe = Vec::new();
+    let mut release = Vec::new();
     for (key, entry) in &index.files {
         let Some(home) = coverage::transcript_home_key(Path::new(key)).map(|home| hex(&home))
         else {
@@ -517,32 +534,69 @@ pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
         ) else {
             continue;
         };
-        if record.reoffer == REOFFER_TAG && !record.matches_file(file_location(key)) {
+        let location = file_location(key);
+        let owed = index.effective_upload_body_witness_revision_requires_adoption(key);
+        if record.mixed {
+            if owed && record.reoffer_owed.binary_search(&location).is_ok() {
+                release.push((key.clone(), home, entry.size_bytes));
+            }
+            continue;
+        }
+        if record.reoffer == REOFFER_TAG && !record.matches_file(location) {
             continue;
         }
         tally.files += 1;
         tally.bytes += entry.size_bytes;
-        if starting.contains(&home) {
-            owe.push(key.clone());
+        if starting.contains(&home) && !owed {
+            owe.push((key.clone(), home.clone()));
         }
-        if starting.contains(&home)
-            || index.effective_upload_body_witness_revision_requires_adoption(key)
-        {
+        if starting.contains(&home) || owed {
             tally.owed_files += 1;
             tally.owed_bytes += entry.size_bytes;
         }
     }
-    super::claude_request_money::e2::re_owe_files(index, owe);
+    for (key, home) in owe {
+        if index.re_owe_for_folder_reoffer(&key) {
+            if let Some(record) = index.claude_folder_login_ledger.get_mut(&home) {
+                record.reoffer_owed.push(file_location(&key));
+                record.reoffer_revision = active;
+            }
+        }
+    }
+    for (key, home, bytes) in release {
+        // The stamp's own holds still apply: a refused file simply stays owed.
+        let released = index.stamp_effective_upload_body_witness_revision(&key, "", active);
+        if let Some(tally) = running.get_mut(&home) {
+            tally.files += 1;
+            tally.bytes += bytes;
+            if released {
+                tally.released_files += 1;
+                tally.released_bytes += bytes;
+            } else {
+                tally.owed_files += 1;
+                tally.owed_bytes += bytes;
+            }
+        }
+    }
     for (home, tally) in &running {
         let Some(record) = index.claude_folder_login_ledger.get_mut(home) else {
             continue;
         };
+        record.reoffer_owed.sort_unstable();
+        if record.mixed {
+            record.reoffer_owed = Vec::new();
+            record.reoffer_moved_at = 0;
+        }
         if let Some(line) = reoffer_line(home, record, tally, now) {
             eprintln!("{line}");
+        }
+        if record.mixed {
+            continue;
         }
         // Every read of the phase settled. A file that never settles stays owed,
         // and so does its folder.
         if tally.owed_files == 0 && !starting.contains(home) {
+            record.reoffer_owed = Vec::new();
             record.census_complete |= record.reoffer == REOFFER_CENSUS;
             record.reoffer = match record.reoffer {
                 REOFFER_CENSUS => REOFFER_IDLE,
@@ -550,6 +604,21 @@ pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
             };
             record.reoffer_moved_at = 0;
         }
+    }
+}
+
+/// Another owner re-owed this file: its folder's re-offer never hands it back.
+pub(crate) fn keep_owed(ledger: &mut BTreeMap<String, FolderRecord>, index_key: &str) {
+    if ledger.is_empty() {
+        return;
+    }
+    let Some(record) = coverage::transcript_home_key(Path::new(index_key))
+        .and_then(|home| ledger.get_mut(&hex(&home)))
+    else {
+        return;
+    };
+    if let Ok(at) = record.reoffer_owed.binary_search(&file_location(index_key)) {
+        record.reoffer_owed.remove(at);
     }
 }
 
