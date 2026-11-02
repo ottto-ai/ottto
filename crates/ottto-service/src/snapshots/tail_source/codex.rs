@@ -824,3 +824,7 @@ impl TailSource for Codex {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+pub(in crate::snapshots) mod tests;

@@ -1,0 +1,746 @@
+//! The Codex Tail codec on real parses of synthetic rollouts: every field home
+//! round-trips across page boundaries, dictionary slots keep their place through
+//! removal and reinsertion, damaged state is a classified reconstruction, the
+//! finish-field list is Codex's own, and live installation waits or rebuilds as
+//! its evidence says.
+use super::super::counters::{self, ReplayCharge};
+use super::super::stage_full;
+use super::*;
+use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
+use crate::snapshots::state_v2::StagedFile;
+use crate::transcript_acquisition::{ReadMode, Scope};
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const NOW: u64 = 1_790_000_000;
+pub(in crate::snapshots) const SESSION: &str = "019a0c2a-8e11-7222-8333-944445555777";
+
+fn at(minute: usize) -> String {
+    format!("2026-10-18T{:02}:{:02}:00Z", 10 + minute / 60, minute % 60)
+}
+
+fn header() -> String {
+    json!({"timestamp":at(0),"type":"session_meta","payload":{"id":SESSION,
+        "timestamp":at(0),"source":"cli","cwd":"/tmp/tail-codex"}})
+    .to_string()
+}
+
+fn event(minute: usize, payload: serde_json::Value) -> String {
+    json!({"timestamp":at(minute),"type":"event_msg","payload":payload}).to_string()
+}
+
+fn tokens(scale: usize) -> serde_json::Value {
+    json!({"input_tokens":100 * scale,"cached_input_tokens":0,"cache_write_input_tokens":0,
+        "output_tokens":10 * scale,"reasoning_output_tokens":0,"total_tokens":110 * scale})
+}
+
+/// One turn: start, context, a tool call (every fifth stays open), a usage
+/// record, its completion, and every fourth turn a compaction and a patch.
+fn turn(i: usize) -> Vec<String> {
+    let id = format!("turn-{i:04}");
+    let mut lines = vec![
+        event(i, json!({"type":"task_started","turn_id":id})),
+        json!({"timestamp":at(i),"type":"turn_context","payload":{"turn_id":id,"model":"gpt-5"}})
+            .to_string(),
+        json!({"timestamp":at(i),"type":"response_item","payload":{"type":"function_call",
+            "name":format!("tool_{}", i % 3),"call_id":format!("call-{i:04}"),"arguments":"{}"}})
+        .to_string(),
+    ];
+    if i % 5 != 4 {
+        lines.push(
+            json!({"timestamp":at(i),"type":"response_item","payload":{
+                "type":"function_call_output","call_id":format!("call-{i:04}")}})
+            .to_string(),
+        );
+    }
+    lines.push(event(
+        i,
+        json!({"type":"token_count","info":{"last_token_usage":tokens(1),
+            "total_token_usage":tokens(i + 1),"model":"gpt-5"}}),
+    ));
+    if i % 4 == 3 {
+        lines.push(event(
+            i,
+            json!({"type":"patch_apply_end","changes":{format!("src/{i}.rs"):{"unified_diff":"+a"}}}),
+        ));
+        lines.push(json!({"type":"compacted","timestamp":at(i)}).to_string());
+    }
+    lines.push(event(i, json!({"type":"task_complete","turn_id":id})));
+    lines
+}
+
+/// A rollout of `turns` closed turns. Each count's lines are a prefix of the next.
+pub(in crate::snapshots) fn lines(turns: usize) -> Vec<String> {
+    std::iter::once(header())
+        .chain((0..turns).flat_map(turn))
+        .collect()
+}
+
+/// A cold positioned Full read: the PRE-finalization reduction and the
+/// checkpoint's certificate.
+fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ottto-tail-codex-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-10-18T10-00-00-{SESSION}.jsonl"));
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let scope = Scope("tail-codex-codec".into());
+    let mut parser = fixture::parser(
+        SnapshotSource::Codex,
+        &path,
+        File::open(&path).unwrap(),
+        apply_codex_line,
+    );
+    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
+    assert!(matches!(mode, ReadMode::Full(_)));
+    let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
+    std::fs::remove_dir_all(&dir).unwrap();
+    (reduction, checkpoint.durable_certificate(0).unwrap())
+}
+
+fn identity() -> HeadIdentity {
+    let root = Path::new("/home/sessions");
+    HeadIdentity::new(
+        Path::new("/state/scan-index.json"),
+        SnapshotSource::Codex,
+        root,
+        &root.join("rollout.jsonl"),
+        false,
+    )
+}
+
+fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
+    let (acc, report, scalars) = reduction.finish_view();
+    let view = PreFinalization::new(acc, report, scalars);
+    stage_full::<Codex>(&view, certificate, &identity()).unwrap()
+}
+
+/// Head first, then every page in key order, then the codec contract.
+fn load(
+    staged: &StagedFile,
+    into: &mut SnapshotAccumulator,
+) -> Result<DecodedHead, ReconstructCause> {
+    let head = Codex::decode_head(staged.revision, &staged.head, into)?;
+    for (&(collection, page), bytes) in &staged.pages {
+        Codex::decode_page(collection, page, bytes, into)?;
+    }
+    Codex::validate_loaded(into, &staged.collections)?;
+    Ok(head)
+}
+
+fn loaded(staged: &StagedFile) -> SnapshotAccumulator {
+    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert_eq!(load(staged, &mut into).err(), None);
+    into
+}
+
+fn cause(staged: &StagedFile) -> Option<ReconstructCause> {
+    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+    load(staged, &mut into).err()
+}
+
+fn copy(staged: &StagedFile) -> StagedFile {
+    StagedFile {
+        revision: staged.revision,
+        head: staged.head.clone(),
+        collections: staged.collections.clone(),
+        pages: staged.pages.clone(),
+        obsolete: staged.obsolete.clone(),
+        change: staged.change,
+    }
+}
+
+/// The re-derived content comes back from the cold reduction, as the file would
+/// restore it; the loaded state then encodes to exactly the stored rows.
+fn assert_reencodes(
+    reduction: &CachedJsonlReduction,
+    certificate: &DurableCertificate,
+    staged: &StagedFile,
+) {
+    let (acc, _, _) = reduction.finish_view();
+    let mut restored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    let head = load(staged, &mut restored).expect("the rows load");
+    assert_eq!(head.certificate, *certificate);
+    restored.title = acc.title.clone();
+    restored.first_prompt_title = acc.first_prompt_title.clone();
+    restored.first_prompt_material = acc.first_prompt_material.clone();
+    restored.workspace_path = acc.workspace_path.clone();
+    restored.codex_agent_label = acc.codex_agent_label.clone();
+    restored
+        .session_start
+        .adopt_durable_content(&mut acc.session_start.clone());
+    let view = PreFinalization::new(&restored, &head.report, head.scalars);
+    let again = stage_full::<Codex>(&view, &head.certificate, &identity()).unwrap();
+    assert!(again.head == staged.head, "the head re-encodes exactly");
+    assert!(again.pages == staged.pages, "the pages re-encode exactly");
+    assert!(again.collections == staged.collections);
+}
+
+/// [format] Every Codex field home round-trips, including every slot collection
+/// across a page boundary and parse-time totals, with no finish field at the seam.
+#[test]
+fn every_codex_field_home_round_trips_through_head_and_pages() {
+    let (mut reduction, certificate) = parse(&lines(300));
+    let acc = reduction.accumulator_for_test();
+    acc.codex_observed_priority_turns = Some(
+        (0..300)
+            .map(|n| (format!("turn-{n:04}"), n % 7 == 0))
+            .collect(),
+    );
+    acc.codex_physical_signatures.clear();
+    for n in 0..300 {
+        // Multiplicity and order are data: every tenth repeats its predecessor.
+        let n = n - usize::from(n % 10 == 9);
+        acc.codex_physical_signatures
+            .push(sha256_hex(&["tail-codex-signature", &n.to_string()]));
+    }
+    let staged = stage(&reduction, &certificate);
+    let (acc, _, _) = reduction.finish_view();
+    assert_eq!(Codex::finish_field_nonempty(acc), None);
+    assert_eq!(Codex::elements(acc, Collection::CodexActiveTurns), 300);
+    assert!(acc.cache_active_turns.is_empty());
+    for spec in Codex::collections().iter().filter(|spec| spec.g > 0) {
+        let pages = staged
+            .pages
+            .keys()
+            .filter(|(collection, _)| *collection == spec.collection)
+            .count() as u64;
+        assert_eq!(
+            pages,
+            Codex::elements(acc, spec.collection).div_ceil(u64::from(spec.g)),
+            "{:?}",
+            spec.collection
+        );
+    }
+    for collection in [
+        Collection::CodexActiveTurns,
+        Collection::CodexOpenCalls,
+        Collection::PriorityTurns,
+        Collection::Signatures,
+    ] {
+        assert!(
+            staged.pages.contains_key(&(collection, 1)),
+            "{collection:?}"
+        );
+    }
+
+    let back = loaded(&staged);
+    assert_eq!(back.accepted_usage_totals, acc.accepted_usage_totals);
+    assert_eq!(back.session_cumulative_usage, acc.session_cumulative_usage);
+    assert_eq!(
+        back.usage_buckets.keys().collect::<Vec<_>>(),
+        acc.usage_buckets.keys().collect::<Vec<_>>()
+    );
+    assert!(back.session_cumulative_usage.is_some());
+    assert_eq!(back.activity_tool_counts, acc.activity_tool_counts);
+    assert_eq!(back.activity_mcp_call_ids, acc.activity_mcp_call_ids);
+    assert_eq!(
+        back.activity_call_tools
+            .keys()
+            .map(|call| &call.id)
+            .collect::<Vec<_>>(),
+        acc.activity_call_tools
+            .keys()
+            .map(|call| &call.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        back.codex_observed_priority_turns,
+        acc.codex_observed_priority_turns
+    );
+    assert_eq!(
+        *back.codex_physical_signatures,
+        *acc.codex_physical_signatures
+    );
+    assert_eq!(*back.compaction_timestamps, *acc.compaction_timestamps);
+    assert_eq!(
+        back.activity_changed_file_hashes,
+        acc.activity_changed_file_hashes
+    );
+    assert_eq!(
+        back.activity_capability_buckets,
+        acc.activity_capability_buckets
+    );
+    assert_eq!(
+        back.codex_dictionary_slots.open_calls.ordered(),
+        acc.codex_dictionary_slots.open_calls.ordered()
+    );
+    // Live inputs never come back from storage.
+    assert!(back.codex_turn_traces.is_none() && back.codex_tier_replay.is_none());
+    assert!(back.codex_parent_signatures.is_none());
+    assert!(back.codex_parent_prefix_proof.is_none());
+    assert_reencodes(&reduction, &certificate, &staged);
+}
+
+/// [format] A turn removed and started again keeps its first slot, whatever its
+/// sort position; an earlier page does not move when a later slot tombstones.
+#[test]
+fn a_reinserted_turn_keeps_its_slot_and_earlier_pages_stay() {
+    let mut rollout = vec![header()];
+    for (minute, kind, turn) in [
+        (1, "task_started", "z-first"),
+        (2, "task_started", "a-second"),
+        (3, "task_complete", "z-first"),
+        (4, "task_started", "m-third"),
+        (5, "task_started", "z-first"),
+    ] {
+        rollout.push(event(minute, json!({"type":kind,"turn_id":turn})));
+    }
+    let (reduction, certificate) = parse(&rollout);
+    let (acc, _, _) = reduction.finish_view();
+    let slots = &acc.codex_dictionary_slots.active_turns;
+    assert_eq!(slots.ordered(), ["z-first", "a-second", "m-third"]);
+    let staged = stage(&reduction, &certificate);
+    let back = loaded(&staged);
+    assert_eq!(
+        back.codex_dictionary_slots.active_turns.ordered(),
+        ["z-first", "a-second", "m-third"]
+    );
+    assert_eq!(back.cache_active_turns, acc.cache_active_turns);
+
+    let (mut reduction, _) = parse(&lines(70));
+    let acc = reduction.accumulator_for_test();
+    let before = Codex::encode_pages(acc, Collection::CodexActiveTurns).unwrap();
+    let last = "turn-0069".to_owned();
+    acc.cache_active_turns.insert(last.clone());
+    let during = Codex::encode_pages(acc, Collection::CodexActiveTurns).unwrap();
+    assert_eq!(before[0], during[0], "an earlier page keeps its bytes");
+    assert_ne!(before[1], during[1]);
+    acc.cache_active_turns.remove(&last);
+    assert_eq!(
+        before,
+        Codex::encode_pages(acc, Collection::CodexActiveTurns).unwrap(),
+        "the tombstone restores the same bytes"
+    );
+}
+
+/// [format] A pending MCP call is not a deletion, completion is its own value,
+/// and a removed call is a counted tombstone that takes its slot back.
+#[test]
+fn mcp_call_states_survive_and_a_gone_call_is_a_tombstone() {
+    let (mut reduction, certificate) = parse(&lines(1));
+    let acc = reduction.accumulator_for_test();
+    let slots_before = acc.codex_dictionary_slots.open_calls.len();
+    for (call, completed) in [("mcp-pending", false), ("mcp-done", true)] {
+        acc.codex_dictionary_slots.open_calls.note(&call.to_owned());
+        acc.activity_mcp_call_ids.insert(call.to_owned(), completed);
+    }
+    acc.codex_dictionary_slots
+        .open_calls
+        .note(&"mcp-gone".to_owned());
+    let staged = stage(&reduction, &certificate);
+    let back = loaded(&staged);
+    assert_eq!(back.activity_mcp_call_ids.get("mcp-pending"), Some(&false));
+    assert_eq!(back.activity_mcp_call_ids.get("mcp-done"), Some(&true));
+    assert_eq!(back.activity_mcp_call_ids.get("mcp-gone"), None);
+    let open_calls = &back.codex_dictionary_slots.open_calls;
+    assert_eq!(open_calls.len(), slots_before + 3);
+    assert!(open_calls.contains(&"mcp-gone".to_owned()));
+    assert_reencodes(&reduction, &certificate, &staged);
+}
+
+/// [format] A zero count is a value and a removed name a tombstone, per map: one
+/// name in two maps has two slots.
+#[test]
+fn name_counts_keep_zero_apart_from_gone_per_map() {
+    let (mut reduction, certificate) = parse(&lines(1));
+    let acc = reduction.accumulator_for_test();
+    acc.note_codex_name_slot(CodexCountMap::McpActivity, "shared");
+    acc.activity_mcp_tool_counts.insert("shared".into(), 0);
+    acc.note_codex_name_slot(CodexCountMap::McpUsage, "shared");
+    acc.note_codex_name_slot(CodexCountMap::Tool, "gone");
+    let staged = stage(&reduction, &certificate);
+    let back = loaded(&staged);
+    assert_eq!(back.activity_mcp_tool_counts.get("shared"), Some(&0));
+    assert_eq!(back.activity_mcp_tool_usage_counts.get("shared"), None);
+    assert_eq!(back.activity_tool_counts.get("gone"), None);
+    let names = &back.codex_dictionary_slots.name_counts;
+    assert!(names.contains(&(CodexCountMap::McpUsage, "shared".to_owned())));
+    assert!(names.contains(&(CodexCountMap::Tool, "gone".to_owned())));
+    assert_reencodes(&reduction, &certificate, &staged);
+}
+
+/// [money] A native insert that missed its slot would vanish at load: it refuses
+/// this file's stage instead of storing a short dictionary.
+#[test]
+fn a_live_key_without_a_slot_refuses_the_stage() {
+    let (mut reduction, certificate) = parse(&lines(1));
+    reduction
+        .accumulator_for_test()
+        .cache_active_turns
+        .insert("no-slot".into());
+    let (acc, report, scalars) = reduction.finish_view();
+    let view = PreFinalization::new(acc, report, scalars);
+    assert!(matches!(
+        stage_full::<Codex>(&view, &certificate, &identity()),
+        Err(Refuse::NonEmpty(_))
+    ));
+}
+
+/// [format] No decisions and an empty decision map stay apart.
+#[test]
+fn priority_none_and_empty_stay_apart() {
+    let (mut reduction, certificate) = parse(&lines(1));
+    reduction
+        .accumulator_for_test()
+        .codex_observed_priority_turns = None;
+    let none = stage(&reduction, &certificate);
+    assert!(loaded(&none).codex_observed_priority_turns.is_none());
+    reduction
+        .accumulator_for_test()
+        .codex_observed_priority_turns = Some(BTreeMap::new());
+    let empty = stage(&reduction, &certificate);
+    assert_eq!(
+        loaded(&empty).codex_observed_priority_turns,
+        Some(BTreeMap::new())
+    );
+    assert_ne!(none.head, empty.head);
+}
+
+/// [format] Repeated compaction timestamps each keep a slot; sizes sort and
+/// deduplicate on their own in the head and are never zipped to them.
+#[test]
+fn duplicate_compaction_timestamps_stay_apart_from_sizes() {
+    let (mut reduction, certificate) = parse(&lines(8));
+    let acc = reduction.accumulator_for_test();
+    let repeated = acc.compaction_timestamps[0].clone();
+    acc.compaction_timestamps.push(repeated.clone());
+    acc.compaction_timestamps.push(repeated);
+    let staged = stage(&reduction, &certificate);
+    let (acc, _, _) = reduction.finish_view();
+    assert_eq!(acc.compaction_timestamps.len(), 4);
+    assert_eq!(
+        *loaded(&staged).compaction_timestamps,
+        *acc.compaction_timestamps
+    );
+    assert_reencodes(&reduction, &certificate, &staged);
+}
+
+/// [format] Damaged stored state is a classified reconstruction, never a
+/// default-empty success.
+#[test]
+fn damaged_state_is_classified() {
+    let (reduction, certificate) = parse(&lines(70));
+    let staged = stage(&reduction, &certificate);
+    assert_eq!(cause(&staged), None);
+
+    let mut other = copy(&staged);
+    other.revision = Codex::REDUCTION_REVISION + 1;
+    assert_eq!(cause(&other), Some(ReconstructCause::Revision));
+
+    let mut short = copy(&staged);
+    short.head.pop();
+    assert_eq!(cause(&short), Some(ReconstructCause::Corrupt));
+
+    let mut trailing = copy(&staged);
+    trailing
+        .pages
+        .get_mut(&(Collection::CodexActiveTurns, 0))
+        .unwrap()
+        .push(0);
+    assert_eq!(cause(&trailing), Some(ReconstructCause::Corrupt));
+
+    // A page that starts past the slots held leaves a gap.
+    let mut gap = copy(&staged);
+    gap.pages.remove(&(Collection::CodexActiveTurns, 0));
+    assert_eq!(cause(&gap), Some(ReconstructCause::Corrupt));
+
+    let mut missing = copy(&staged);
+    missing.collections.remove(&Collection::CodexNameCounts);
+    assert_eq!(cause(&missing), Some(ReconstructCause::Incomplete));
+
+    let mut count = copy(&staged);
+    count
+        .collections
+        .get_mut(&Collection::CodexActiveTurns)
+        .unwrap()
+        .elements += 1;
+    assert_eq!(cause(&count), Some(ReconstructCause::Incomplete));
+
+    let mut geometry = copy(&staged);
+    geometry
+        .collections
+        .get_mut(&Collection::CodexActiveTurns)
+        .unwrap()
+        .elements_per_page += 1;
+    assert_eq!(cause(&geometry), Some(ReconstructCause::Incompatible));
+
+    let mut foreign = copy(&staged);
+    let meta = foreign.collections[&Collection::Signatures];
+    foreign.collections.insert(Collection::Responses, meta);
+    assert_eq!(cause(&foreign), Some(ReconstructCause::Corrupt));
+
+    // One slot twice.
+    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Codex::decode_head(staged.revision, &staged.head, &mut into).unwrap();
+    let repeat = page_bytes(
+        [
+            CodexActiveTurn {
+                turn_id: "t".into(),
+                active: true,
+            },
+            CodexActiveTurn {
+                turn_id: "t".into(),
+                active: false,
+            },
+        ]
+        .iter(),
+        |turn, e| turn.put(e),
+    )
+    .unwrap();
+    assert_eq!(
+        Codex::decode_page(Collection::CodexActiveTurns, 0, &repeat, &mut into).err(),
+        Some(ReconstructCause::Corrupt)
+    );
+
+    // The foreign compaction variant does not decode into a Codex reduction.
+    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+    let claude = encode(|e| {
+        e.varint(1)?;
+        e.varint(1)
+    })
+    .unwrap();
+    assert_eq!(
+        Codex::decode_page(Collection::Compactions, 0, &claude, &mut into).err(),
+        Some(ReconstructCause::Corrupt)
+    );
+
+    // Decisions under a head that recorded none contradict it.
+    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+    into.codex_observed_priority_turns = None;
+    let decisions = page_bytes(
+        [CodexPriorityTurn {
+            turn_id: "t".into(),
+            priority: true,
+        }]
+        .iter(),
+        |turn, e| turn.put(e),
+    )
+    .unwrap();
+    assert_eq!(
+        Codex::decode_page(Collection::PriorityTurns, 0, &decisions, &mut into).err(),
+        Some(ReconstructCause::Corrupt)
+    );
+
+    // Another source's head.
+    let (mut reduction, certificate) = parse(&lines(1));
+    reduction.accumulator_for_test().source = SnapshotSource::ClaudeCode;
+    let other_source = stage(&reduction, &certificate);
+    assert_eq!(cause(&other_source), Some(ReconstructCause::Corrupt));
+}
+
+/// [behaviour] Codex's finish list names foreign state and the bootstrap buffer;
+/// its parse-time totals, buckets and requests are ordinary head and page state.
+#[test]
+fn the_finish_list_is_codex_own() {
+    let new = || SnapshotAccumulator::new(SnapshotSource::Codex);
+    let mut acc = new();
+    acc.accepted_usage_totals.input_tokens = 1;
+    acc.session_cumulative_usage = Some(UsageTotals::default());
+    acc.usage_buckets.insert("hour".into(), Default::default());
+    assert_eq!(Codex::finish_field_nonempty(&acc), None);
+
+    let mut acc = new();
+    acc.codex_legacy_bootstrap_buffer.push(json!({}));
+    assert_eq!(
+        Codex::finish_field_nonempty(&acc),
+        Some("codex_legacy_bootstrap_buffer")
+    );
+    let mut acc = new();
+    acc.claude_usage_request_ids.insert("r".into());
+    assert_eq!(
+        Codex::finish_field_nonempty(&acc),
+        Some("claude_usage_request_ids")
+    );
+    let mut acc = new();
+    acc.claude_last_user_ts = Some(at(0));
+    assert_eq!(
+        Codex::finish_field_nonempty(&acc),
+        Some("claude_last_user_ts")
+    );
+    let mut acc = new();
+    acc.claude_fork_parent = Some("parent".into());
+    assert_eq!(
+        Codex::finish_field_nonempty(&acc),
+        Some("claude_fork_parent")
+    );
+}
+
+fn install(
+    stored: &mut SnapshotAccumulator,
+    live: &SnapshotAccumulator,
+    group_members: usize,
+) -> Result<(), LiveLoadError> {
+    Codex::install_live(
+        stored,
+        &LiveInputs {
+            accumulator: live,
+            group_members,
+        },
+    )
+}
+
+fn continuable() -> SnapshotAccumulator {
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    stored.codex_observed_priority_turns = Some(BTreeMap::new());
+    stored
+}
+
+const INCOMPATIBLE: Result<(), LiveLoadError> =
+    Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible));
+
+/// [behaviour] Every prior decision holding installs this cycle's inputs, and
+/// the fresh parser keeps its own for the read's preparation.
+#[test]
+fn install_live_installs_when_evidence_holds() {
+    let mut stored = continuable();
+    stored
+        .codex_observed_priority_turns
+        .as_mut()
+        .unwrap()
+        .extend([("priority".to_owned(), true), ("plain".to_owned(), false)]);
+    let mut traces = CodexTurnTraceMap::default();
+    traces.priority_turns.insert("priority".into());
+    let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
+    live.codex_turn_traces = Some(Arc::new(traces));
+    live.codex_sidecar_projected_next_ordinal = Some(7);
+    assert_eq!(install(&mut stored, &live, 1), Ok(()));
+    assert_eq!(stored.codex_sidecar_projected_next_ordinal, Some(7));
+    assert!(stored.codex_turn_traces.is_some());
+    assert!(live.codex_turn_traces.is_some());
+}
+
+/// [behaviour] D168: a real group and a protected receipt are counted replays,
+/// ahead of any other evidence.
+#[test]
+fn install_live_routes_groups_and_protected_tiers_to_their_replays() {
+    let live = SnapshotAccumulator::new(SnapshotSource::Codex);
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert_eq!(
+        install(&mut stored, &live, 2),
+        Err(LiveLoadError::Reconstruct(ReconstructCause::GroupReplay))
+    );
+
+    let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
+    live.codex_tier_replay = Some(codex_file_join::TierReplay::new(
+        None,
+        true,
+        "scope".to_owned(),
+    ));
+    assert_eq!(
+        install(&mut stored, &live, 1),
+        Err(LiveLoadError::Reconstruct(
+            ReconstructCause::TierPrefixReplay
+        ))
+    );
+    // No receipt, none owed: an ordinary continuation.
+    live.codex_tier_replay = Some(codex_file_join::TierReplay::new(
+        None,
+        false,
+        "scope".to_owned(),
+    ));
+    assert_eq!(install(&mut continuable(), &live, 1), Ok(()));
+}
+
+/// [money] The counting rule and the priority decisions decide reuse: absent or
+/// incomplete evidence waits, evidence that disagrees rebuilds.
+#[test]
+fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
+    let live = SnapshotAccumulator::new(SnapshotSource::Codex);
+
+    let mut stored = continuable();
+    stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
+        codex_counting_version::AckEvidence::None,
+        Some(1),
+    )));
+    assert_eq!(install(&mut stored, &live, 1), INCOMPATIBLE);
+
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert_eq!(install(&mut stored, &live, 1), INCOMPATIBLE);
+
+    let decided = |priority: bool| {
+        let mut stored = continuable();
+        stored
+            .codex_observed_priority_turns
+            .as_mut()
+            .unwrap()
+            .insert("t".into(), priority);
+        stored
+    };
+    assert_eq!(
+        install(&mut decided(true), &live, 1),
+        Err(LiveLoadError::Unavailable),
+        "no traces cannot prove a change"
+    );
+    assert_eq!(install(&mut decided(false), &live, 1), Ok(()));
+
+    let with_traces = |incomplete: bool| {
+        let traces = CodexTurnTraceMap {
+            incomplete,
+            ..Default::default()
+        };
+        let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
+        live.codex_turn_traces = Some(Arc::new(traces));
+        live
+    };
+    assert_eq!(
+        install(&mut decided(true), &with_traces(false), 1),
+        INCOMPATIBLE,
+        "complete traces prove the change"
+    );
+    assert_eq!(
+        install(&mut decided(true), &with_traces(true), 1),
+        Err(LiveLoadError::Unavailable),
+        "incomplete traces do not"
+    );
+}
+
+/// [money] A child still waiting on its parent holds until parent evidence
+/// exists, then rebuilds; it never continues past the undecided prefix.
+#[test]
+fn install_live_holds_a_child_pending_its_parent() {
+    let mut stored = continuable();
+    stored.codex_parent_ledger_consulted = true;
+    stored.codex_parent_session_ref = Some("parent".into());
+    stored.codex_ownership_boundary = CodexOwnershipBoundary::AwaitingParentPrefix;
+    let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert_eq!(
+        install(&mut stored, &live, 1),
+        Err(LiveLoadError::Unavailable)
+    );
+    live.codex_parent_signatures = Some(CodexParentPrefix::Ledger(Vec::new()));
+    assert_eq!(install(&mut stored, &live, 1), INCOMPATIBLE);
+}
+
+/// [regress] One count per executed replay with the bytes actually read, on the
+/// existing read-cause counters, including work that stopped early. No alarm
+/// input moves.
+#[test]
+fn a_replay_counts_once_with_its_actual_bytes() {
+    {
+        let mut charge = ReplayCharge::begin("codex", ReconstructCause::GroupReplay);
+        charge.add(10);
+        charge.add(5);
+    }
+    let interrupted = ReplayCharge::begin("codex", ReconstructCause::TierPrefixReplay);
+    drop(interrupted);
+    assert_eq!(counters::total("tail_reconstruct", "group_replay"), 1);
+    assert_eq!(
+        counters::total("tail_reconstruct_bytes", "group_replay"),
+        15
+    );
+    assert_eq!(counters::total("tail_reconstruct", "tier_prefix_replay"), 1);
+    assert_eq!(
+        counters::total("tail_reconstruct_bytes", "tier_prefix_replay"),
+        0
+    );
+    assert_eq!(
+        counters::total("tail_reconstruct_after_head", "group_replay"),
+        0
+    );
+}
