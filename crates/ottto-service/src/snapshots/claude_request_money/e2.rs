@@ -2326,26 +2326,10 @@ fn holder_order(
     Some((birth, location_key(key)))
 }
 
-/// Whether an earlier holder's own body can hold a copied prefix on the server.
-/// Without that, removing the prefix would count its requests nowhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    Accepted,
-    /// The daemon may still deliver its body: the prefix waits (`defer_prefix`).
-    Awaited,
-    /// A protected family's bodies stay frozen, whatever evidence is left from
-    /// them: never accepted, and no wait for an ACK that cannot come.
-    Protected,
-}
-
-fn origin_of(index: &ScanIndex, holder: &str) -> Origin {
-    if index.claude_family_listed(holder) {
-        Origin::Protected
-    } else if index.file_has_accepted_body(holder) {
-        Origin::Accepted
-    } else {
-        Origin::Awaited
-    }
+/// Without an accepted origin body, removing a prefix counts it nowhere. Protected
+/// bodies stay frozen: never accepted, and no wait for an ACK that cannot come.
+fn origin_accepted(index: &ScanIndex, holder: &str) -> bool {
+    !index.claude_family_listed(holder) && index.file_has_accepted_body(holder)
 }
 
 /// Owner direction (PR C (a)): a /branch names its original in a
@@ -2366,7 +2350,7 @@ fn parent_proves(
     member.subagent_stem.is_none()
         && member.root != session
         && index.files.contains_key(parent)
-        && origin_of(index, parent) == Origin::Accepted
+        && origin_accepted(index, parent)
         && !index
             .claude_request_census
             .get(parent)
@@ -2379,8 +2363,7 @@ fn parent_proves(
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
 /// The walk deadline, a queued size change, a holder modified since its
-/// census read, an unscanned other-session main file, and a holder with no
-/// accepted body delay a decision.
+/// census read, an unscanned other-session main file or an unaccepted holder delay it.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2455,16 +2438,12 @@ fn decide_holders(
                     {
                         continue;
                     }
-                    // The saved removal stays recorded and applies again once
-                    // the indexed holder has an accepted body. A holder no
-                    // longer indexed was checked when its removal was stored.
-                    match key.map_or(Origin::Accepted, |key| origin_of(index, key)) {
-                        Origin::Accepted => {}
-                        Origin::Awaited => {
+                    // Stays recorded; applies again once the indexed holder is accepted.
+                    if let Some(key) = key.filter(|key| !origin_accepted(index, key)) {
+                        if !index.claude_family_listed(key) {
                             unaccepted.insert(hash);
-                            continue;
                         }
-                        Origin::Protected => continue,
+                        continue;
                     }
                     stored.insert(hash);
                     if key.is_none() {
@@ -2506,7 +2485,7 @@ fn decide_holders(
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey), Origin)>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2522,25 +2501,24 @@ fn decide_holders(
                         Some((
                             evidence,
                             holder_order(store, root, key)?,
-                            origin_of(index, key),
+                            origin_accepted(index, key),
                         ))
                     });
                     match holder {
-                        Some((evidence, holder, origin)) if holder < file.order => match evidence {
+                        Some((evidence, holder, proven)) if holder < file.order => match evidence {
                             Evidence::Queued => file.waiting = true,
                             Evidence::Stale => {
                                 file.stale.insert(hash);
                             }
-                            Evidence::Current => match origin {
-                                Origin::Accepted => {
-                                    let earliest = file.covered.entry(hash).or_insert(holder);
-                                    *earliest = (*earliest).min(holder);
-                                }
-                                Origin::Awaited => {
+                            Evidence::Current if proven => {
+                                let earliest = file.covered.entry(hash).or_insert(holder);
+                                *earliest = (*earliest).min(holder);
+                            }
+                            Evidence::Current => {
+                                if !index.claude_family_listed(key) {
                                     file.unaccepted.insert(hash);
                                 }
-                                Origin::Protected => {}
-                            },
+                            }
                             Evidence::None => {}
                         },
                         _ => {}
@@ -2581,18 +2559,15 @@ fn decide_holders(
             diag("copy_removal_holder_absent_kept", absent_kept);
             record_counts(Counts::one(25, absent_kept));
         }
-        // A copy that settled with this prefix counted now loses it: until
-        // this read, its origin's later acceptance had counted it twice.
+        // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
         if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
             let late = wanted
                 .covered
                 .keys()
                 .filter(|hash| !wanted.stored.contains(hash))
                 .count() as u64;
-            if late > 0 {
-                diag("copy_prefix_late_origin_removed", late);
-                record_counts(Counts::one(26, late));
-            }
+            diag("copy_prefix_late_origin_removed", late);
+            record_counts(Counts::one(26, late));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
@@ -2626,21 +2601,15 @@ fn decide_holders(
             );
             continue;
         }
-        if uncovered
-            .iter()
-            .any(|hash| wanted.unaccepted.contains(hash))
-        {
+        if uncovered.iter().any(|h| wanted.unaccepted.contains(h)) {
             // One decision pass waited, and once per wait a copy that waits.
-            let first_pass = updates
+            let first = updates
                 .state
                 .as_ref()
                 .is_some_and(|state| !state.pending(wanted.order.1));
-            diag(
-                "copy_prefix_origin_unaccepted_copies",
-                u64::from(first_pass),
-            );
+            diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
             diag("copy_prefix_origin_unaccepted_passes", 1);
-            record_counts(Counts::one(27, u64::from(first_pass)));
+            record_counts(Counts::one(27, u64::from(first)));
             record_counts(Counts::one(28, 1));
             defer_prefix(
                 &mut items[wanted.at],
@@ -4359,11 +4328,8 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
-    // A prefix kept for an unaccepted origin, removed by the first read after
-    // that origin's late acceptance.
+    // A prefix removed after its origin's late acceptance; copies and passes waiting for one.
     "copy_prefix_late_origin_removed",
-    // Copies waiting for an origin's first accepted body, and the decision
-    // passes they waited (at most `HOLD_PASSES` per wait).
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
 ];

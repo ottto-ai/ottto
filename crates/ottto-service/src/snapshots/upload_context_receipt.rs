@@ -333,12 +333,8 @@ impl ScanIndex {
         body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
     }
 
-    /// The daemon's own evidence that the server accepted a body it sent for
-    /// this file, in any context: a receipt of a real body or an entity stamp.
-    /// Both descend only from an exact ACK of a sent body; no server-learned
-    /// head state reaches them. A settled revision is not evidence: it is
-    /// stamped at finalize, before any POST, and for below-floor and empty
-    /// files. It proves an accepted body, not each request id.
+    /// An exact ACK of a body this daemon sent, in any context; proves a body, not each id.
+    /// A settled revision (stamped before POST) and server-learned heads are not evidence.
     pub(super) fn file_has_accepted_body(&self, key: &str) -> bool {
         let Some(entry) = self.files.get(key) else {
             return false;
