@@ -459,9 +459,9 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
 
-/// The page's only permanent refusals are dominated, no holds. The
-/// first refusal and both quiet retained cycles report settled residue, never
-/// `backend_validation_error`, and the native lease outcome is unchanged.
+/// [regress] Dominated residue and retained stale-owed debt keep successful
+/// status. First refusal and quiet cycles retain the residue receipt shape;
+/// owed debt is never accepted or relabelled dominated.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -474,6 +474,52 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
         },
         true,
     );
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut progress = test_upload_progress();
+    let fingerprint = "a".repeat(64);
+    let body = "b".repeat(64);
+    progress.quarantine_permanent_body(&fingerprint, &body, "accepted_log_stale_older_upload");
+    let refusals = PermanentRefusalCounts::of(&progress);
+    assert_eq!(refusals.dominated, 0);
+    assert_eq!(refusals.exposure.owed_entities, 1);
+    assert!(matches!(
+        refused_entity_state(true, refusals, true),
+        CollectorState::Success
+    ));
+    assert_eq!(
+        progress.quarantined_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    // Existing terminal records keep their disposition, their owed custody
+    // and the same admitted successful-residue receipt across an upgrade.
+    let record = progress
+        .quarantined_fingerprints
+        .get_mut(&fingerprint)
+        .unwrap();
+    record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+    record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    record.retry_after_unix_seconds = 0;
+    let mut index = ScanIndex::default();
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    let mut counts = SyncCounts::for_policy(183).with_snapshot_terminal_counts(&index);
+    counts.census_complete = true;
+    let receipt = captured_terminal_receipt_under_hint(
+        counts,
+        refused_entity_state(true, PermanentRefusalCounts::of(&progress), true),
+        TerminalManifestSource::Withdraw,
+        183,
+        RESIDUE_ADMITTING_HINT,
+    );
+    assert_eq!(receipt["last_error_code"], "census_residue");
+    assert_eq!(receipt["last_census_residue_settled"], true);
+    assert_eq!(receipt["consecutive_failures"], 0);
+    assert!(receipt["last_success_at"].is_string());
+    assert_eq!(
+        PermanentRefusalCounts::of(&progress).exposure.owed_entities,
+        1
+    );
+    assert!(progress.stale_body(&fingerprint, &body));
+    assert!(progress.accepted_fingerprints.is_empty());
 }
 
 /// T4: a backend that does not admit `census_residue_status:v1` never

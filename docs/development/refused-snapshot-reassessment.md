@@ -3,6 +3,9 @@
 `accepted_log_stale_older_upload` keeps new refusals owed in `RetryPending`.
 A timestamp refusal alone proves neither coverage nor dominance. Existing
 records retain their dispositions and count as owed in refusal diagnostics.
+Retained stale debt alone does not make collector status fail: otherwise settled
+cycles keep successful status and the existing census-residue receipt shape.
+Status never accepts or retires the refused body.
 
 The existing refusal owner retains exact body witnesses, including older
 refused revisions. Identical refused stale bytes are never sent again. Changed
@@ -22,7 +25,8 @@ Diagnostics extend the existing refusal records, native collection page and
 StageWindow with scalar owed/held counts, known requests/tokens, unknown counts
 and oldest known age. Overlapping revisions contribute one observed revision
 per entity. Missing legacy observations stay unknown. One alarm line discloses
-a rising owed count or oldest age through the existing refusal observation.
+a rising owed count through the existing refusal observation. Growing age alone
+never triggers the alarm.
 There are no age buckets, additional observation windows, history structures,
 retention limits or diagnostic gates. Counters do not grant read authority.
 

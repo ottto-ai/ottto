@@ -2875,7 +2875,7 @@ impl SnapshotUploadProgress {
                 && !self
                     .permanent_rejections
                     .get(fingerprint)
-                    .is_some_and(PermanentSnapshotRejection::is_stale)
+                    .is_some_and(PermanentSnapshotRejection::has_stale_debt)
                 && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
             {
                 record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
@@ -4474,10 +4474,7 @@ fn log_retained_permanent_refusals(
     if previous == Some(line) {
         return;
     }
-    if previous.is_some_and(|p| {
-        retained.exposure.owed_entities > p.0.exposure.owed_entities
-            || retained.exposure.oldest_age_seconds > p.0.exposure.oldest_age_seconds
-    }) {
+    if previous.is_some_and(|p| retained.exposure.owed_entities > p.0.exposure.owed_entities) {
         eprintln!("ottto-service: refusal exposure alarm source={} reason=accepted_log_stale_older_upload owed_entities={} oldest_age_seconds={}", source.api_slug(), retained.exposure.owed_entities, retained.exposure.oldest_age_seconds);
     }
     eprintln!(
@@ -4504,15 +4501,10 @@ fn log_retained_permanent_refusals(
     );
 }
 
-/// Terminal state for a cycle that ends with deferred or refused entities.
-///
-/// A settled cycle whose every retained permanent refusal is dominated lost
-/// no usage the backend does not already own. It reports `Success`: each
-/// refused body is still bound to, and disclosed through, its terminal
-/// quarantine record, so the receipt builder names it as settled
-/// `census_residue` under the backend's admission and in the legacy shape
-/// otherwise. No refused body becomes accepted. Any other refusal, a hold, a
-/// conflict, or a refusal whose entity has a pending newer body is unchanged.
+/// Status only: an otherwise settled cycle with dominated or stale-owed
+/// refusals remains successful. Existing residue counters keep their receipt
+/// shape; stale debt remains owed in custody and diagnostics, never accepted.
+/// Other refusals and unsettled transport retain their existing status.
 fn refused_entity_state(
     permanent: bool,
     refusals: PermanentRefusalCounts,
@@ -4521,7 +4513,7 @@ fn refused_entity_state(
     if permanent
         && upload_fully_settled
         && refusals.total > 0
-        && refusals.dominated == refusals.total
+        && refusals.dominated + refusals.exposure.owed_entities == refusals.total
     {
         CollectorState::Success
     } else {
@@ -9156,7 +9148,7 @@ fn finish_sync_source(
     upload_progress
         .permanent_rejections
         .retain(|fingerprint, refusal| {
-            refusal.is_stale() || current_entities.contains(fingerprint)
+            refusal.has_stale_debt() || current_entities.contains(fingerprint)
         });
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);

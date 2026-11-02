@@ -136,7 +136,7 @@ fn old_state_decode_keeps_canonical_bytes_and_legacy_unknowns() {
     assert_eq!(serde_json::to_value(decoded).unwrap(), old);
 }
 
-/// [regress] Unchanged stale debt never acquires a retry lease or reads the
+/// [behaviour] Unchanged stale debt never acquires a retry lease or reads the
 /// transcript across passes, even after a contract change or legacy terminal
 /// disposition. Real appended input remains ordinary acquisition authority.
 #[test]
