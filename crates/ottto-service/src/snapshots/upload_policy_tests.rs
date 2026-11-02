@@ -95,10 +95,10 @@ fn seeded() -> SnapshotItem {
     fact.display_label = Some(LABEL.to_string());
     fact.display_label_source = Some("agent_label".to_string());
     item.attribution_facts = vec![fact];
-    item.session_start = Some(session_start::SnapshotSessionStart {
+    item.session_start = Some(Box::new(session_start::SnapshotSessionStart {
         start_config_fingerprint: Some(NAME.to_string()),
         ..session_start::SnapshotSessionStart::default()
-    });
+    }));
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
     item
 }
