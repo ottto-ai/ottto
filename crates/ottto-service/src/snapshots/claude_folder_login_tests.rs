@@ -342,7 +342,12 @@ fn off_writes_nothing_and_asks_nothing() {
     let scratch = crate::test_scratch::private_dir("claude-folder-login-off");
     let root = scratch.join("cfg/projects");
     let mut index = ScanIndex::default();
-    begin_page(&mut index, &ScanIndex::default(), &[root.clone()], true);
+    begin_page(
+        &mut index,
+        &ScanIndex::default(),
+        std::slice::from_ref(&root),
+        true,
+    );
     assert!(is_candidate(&folder_key(&scratch.join("cfg"))));
     let mut off = ScanIndex::default();
     begin_page(&mut off, &ScanIndex::default(), &[root], false);
