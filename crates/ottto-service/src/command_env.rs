@@ -273,6 +273,30 @@ pub(crate) fn provider_env() -> BTreeMap<String, OsString> {
     provider_env_from_sources(&current, missing_shell_env.as_ref())
 }
 
+/// The environment a stdio MCP server or the Claude CLI is spawned with,
+/// resolved ONCE per harvest cycle. The daemon runs under launchd with a
+/// minimal `PATH` (`/usr/bin:/bin:…`), so a bare `Command::new("npx")` cannot
+/// find the common MCP launchers (`npx`/`uvx`/`node`) and every such server
+/// would falsely report `reachable:false`. We resolve a launchd-safe `PATH` and
+/// the user's provider env exactly as the daemon spawns its other agent
+/// subprocesses, so the harvest sees the same servers an interactive shell
+/// (and the reference harvester) does.
+#[derive(Clone)]
+pub(crate) struct SpawnEnv {
+    pub(crate) path: Option<OsString>,
+    pub(crate) provider: BTreeMap<String, OsString>,
+}
+
+impl SpawnEnv {
+    /// Resolve once per cycle (`provider_env` may briefly consult a login shell).
+    pub(crate) fn resolve() -> Self {
+        Self {
+            path: path_env(),
+            provider: provider_env(),
+        }
+    }
+}
+
 fn current_provider_env() -> BTreeMap<String, OsString> {
     PROVIDER_ENV_KEYS
         .iter()
