@@ -30,6 +30,13 @@
 //!   uploaded.
 //! - Writes and GC require the state-directory single-writer lock
 //!   (`SingleWriter`); this layer adds no lock of its own.
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "some temp-file and record-identity helpers are reached only from tests"
+    )
+)]
 
 #[cfg(test)]
 use crate::snapshots::sampled_scan::transition_fixture::{reach, CrashPoint};
