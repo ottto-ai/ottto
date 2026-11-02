@@ -6526,22 +6526,28 @@ fn claude_fence_closed_retry_carry_observed(
     let mut carried = BTreeSet::new();
     let mut request_owners = Vec::<([u8; 32], &str)>::new();
     let roots = candidates.keys().cloned().collect::<BTreeSet<_>>();
-    state_v2::visit_usage(index, Some(&roots), &mut |root, pending| {
-        let Some((root_session_id, members)) = candidates.get_key_value(root) else {
-            return;
-        };
-        if qualifies(root_session_id, members, pending) {
-            carried.insert(root_session_id.clone());
-            request_owners.extend(pending.member_request_id_hashes.values().flatten().map(
-                |request_hash| {
-                    (
-                        lenient_decode::repair_key(request_hash),
-                        root_session_id.as_str(),
-                    )
-                },
-            ));
-        }
-    })
+    state_v2::visit_usage_ordered(
+        index,
+        Some(&roots),
+        None,
+        state_v2::SliceBudget::WHOLE,
+        &mut |root, pending| {
+            let Some((root_session_id, members)) = candidates.get_key_value(root) else {
+                return;
+            };
+            if qualifies(root_session_id, members, pending) {
+                carried.insert(root_session_id.clone());
+                request_owners.extend(pending.member_request_id_hashes.values().flatten().map(
+                    |request_hash| {
+                        (
+                            lenient_decode::repair_key(request_hash),
+                            root_session_id.as_str(),
+                        )
+                    },
+                ));
+            }
+        },
+    )
     .map_err(|_| usage_pending::Unknown)?;
     drop(roots);
     // Owners whose pending requests appear in another family's pending: a
@@ -6554,22 +6560,28 @@ fn claude_fence_closed_retry_carry_observed(
     // Pass 2: every family's requests against those owners.
     let mut shared_owners = BTreeSet::new();
     if !request_owners.is_empty() {
-        state_v2::visit_usage(index, None, &mut |root_session_id, pending| {
-            for request_hash in pending
-                .member_request_id_hashes
-                .values()
-                .flatten()
-                .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
-            {
-                let key = lenient_decode::repair_key(request_hash);
-                if let Ok(at) = request_owners.binary_search_by(|(owned, _)| owned.cmp(&key)) {
-                    let owner = request_owners[at].1;
-                    if owner != root_session_id {
-                        shared_owners.insert(owner);
+        state_v2::visit_usage_ordered(
+            index,
+            None,
+            None,
+            state_v2::SliceBudget::WHOLE,
+            &mut |root_session_id, pending| {
+                for request_hash in pending
+                    .member_request_id_hashes
+                    .values()
+                    .flatten()
+                    .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
+                {
+                    let key = lenient_decode::repair_key(request_hash);
+                    if let Ok(at) = request_owners.binary_search_by(|(owned, _)| owned.cmp(&key)) {
+                        let owner = request_owners[at].1;
+                        if owner != root_session_id {
+                            shared_owners.insert(owner);
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .map_err(|_| usage_pending::Unknown)?;
     }
     drop(request_owners);
@@ -10527,13 +10539,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 latch.quarantine_exempt_families += exempt.len() as u64;
             });
             for root in &exempt {
-                if let Some(pending) = index
-                    .claude_usage_family_pending
-                    .loaded_all_mut()
-                    .get_mut(root)
-                {
-                    pending.contract_unproven = true;
-                }
+                index.claude_usage_family_pending.mark_unproven(root);
             }
             index.claude_request_identity_contract_changed = false;
         }

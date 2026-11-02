@@ -68,6 +68,26 @@ pub(super) fn visit(
     }
     Ok(())
 }
+/// One family's only row (position 1) of `kind`, decoded, with its row
+/// digest as stored. `None`: no row. Another row under the key errs.
+pub(super) fn read_row<T: DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    name: &str,
+) -> Result<Option<(T, [u8; 32])>> {
+    let page = tx.scan_record_key(&RecordKind::parse(kind)?, name.as_bytes(), None, 2)?;
+    let Some(h) = page.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        page.len() == 1 && matches!(h.key, RowKey::Record { position: 1, .. }),
+        "state_v2_member_position"
+    );
+    let mut digests = Digests::new();
+    let value = read(tx, h, Some(&mut digests))?;
+    let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
+    Ok(Some((value, digest)))
+}
 pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<Vec<u8>> {
     ensure!(
         h.value_version == 1 && h.len <= value_cap(&h.key),

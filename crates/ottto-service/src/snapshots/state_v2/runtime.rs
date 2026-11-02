@@ -1294,6 +1294,54 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
     roots: Option<&std::collections::BTreeSet<String>>,
     f: &mut dyn FnMut(String, T, [u8; 32]) -> Result<()>,
 ) -> Result<()> {
+    read_txn(index, |tx| {
+        let expected = match roots {
+            Some(_) => None,
+            None => {
+                let h = tx
+                    .get(&mapper::key(kind, "", 0)?)?
+                    .context("state_v2_missing_manifest")?;
+                Some(mapper::read::<usize>(tx, &h, None)?)
+            }
+        };
+        let mut count = 0_usize;
+        mapper::visit(tx, kind, roots, |tx, h| {
+            let RowKey::Record {
+                key_bytes,
+                position,
+                ..
+            } = &h.key
+            else {
+                bail!("state_v2_record_key")
+            };
+            if *position == 0 {
+                ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+                return Ok(());
+            }
+            ensure!(*position == 1, "state_v2_member_position");
+            count += 1;
+            let mut digests = mapper::Digests::new();
+            let value = mapper::read(tx, &h, Some(&mut digests))?;
+            let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
+            f(mapper::family(key_bytes)?, value, digest)
+        })?;
+        ensure!(
+            expected.map_or(true, |expected| expected == count),
+            "state_v2_missing_member"
+        );
+        Ok(())
+    })
+    .map(|((), _)| ())
+}
+
+/// One short read transaction on the graph's own session, with the store
+/// stamp it read under. A graph not at the generation its save would commit
+/// over (its own, or its confirmed growth claim's), or a store changed
+/// elsewhere, holds.
+fn read_txn<R>(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut dyn Transaction) -> Result<R>,
+) -> Result<(R, (u64, u64))> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1316,41 +1364,7 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
         Hold::DbUnavailable
     );
     let mut tx = session.db.begin(TxnMode::Read)?;
-    let expected = match roots {
-        Some(_) => None,
-        None => {
-            let h = tx
-                .get(&mapper::key(kind, "", 0)?)?
-                .context("state_v2_missing_manifest")?;
-            Some(mapper::read::<usize>(&mut tx, &h, None)?)
-        }
-    };
-    let mut count = 0_usize;
-    mapper::visit(&mut tx, kind, roots, |tx, h| {
-        let RowKey::Record {
-            key_bytes,
-            position,
-            ..
-        } = &h.key
-        else {
-            bail!("state_v2_record_key")
-        };
-        if *position == 0 {
-            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-            return Ok(());
-        }
-        ensure!(*position == 1, "state_v2_member_position");
-        count += 1;
-        let mut digests = mapper::Digests::new();
-        let value = mapper::read(tx, &h, Some(&mut digests))?;
-        let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
-        f(mapper::family(key_bytes)?, value, digest)
-    })?;
-    ensure!(
-        expected.map_or(true, |expected| expected == count),
-        "state_v2_missing_member"
-    );
-    Ok(())
+    Ok((f(&mut tx)?, stamp))
 }
 
 /// Cold usage pending: load the families a page names before it
@@ -1381,24 +1395,124 @@ pub(in super::super) fn load_usage(
     Ok(())
 }
 
-/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
-/// time, as this graph holds it: its loaded value, else its stored row,
-/// which must still match its head. Keeps nothing and visits in no set
-/// order. Unknown, counted: a row unlike its head, a head without a row, or a
-/// store this graph does not hold.
-pub(in super::super) fn visit_usage(
+/// One slice of an ordered usage visit stops before the next family once it
+/// has visited `families`, or once the families it decoded measure `bytes`
+/// of heap. It always visits at least one family, so a family over `bytes`
+/// runs alone in its slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) struct SliceBudget {
+    pub(in super::super) families: usize,
+    pub(in super::super) bytes: usize,
+}
+impl SliceBudget {
+    /// The whole visit in one slice.
+    pub(in super::super) const WHOLE: Self = Self {
+        families: usize::MAX,
+        bytes: usize::MAX,
+    };
+}
+
+/// What every slice of one sliced visit, and its commit, must find equal:
+/// the store stamp the slice read under (`None`: a resident graph, nothing
+/// stored) and the family count. Each stored row is checked against its head
+/// as it is read, and the caller's visited total must equal `families`.
+/// Any difference refuses the whole decision; nothing is partial.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in super::super) struct UsageToken {
+    pub(in super::super) stamp: Option<(u64, u64)>,
+    pub(in super::super) families: usize,
+}
+
+/// How a slice ended. `last_root`: resume after it; `None`: no family is left.
+/// `decoded_bytes`: heap of the stored rows this slice decoded, measured on
+/// each decoded value (loaded values are not decoded and count none);
+/// `peak_family_bytes`: the largest of them. A layout the bound cannot
+/// measure counts as `usize::MAX`, so its family ends the slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(in super::super) struct SliceEnd {
+    pub(in super::super) last_root: Option<String>,
+    pub(in super::super) visited: usize,
+    pub(in super::super) decoded_bytes: usize,
+    pub(in super::super) peak_family_bytes: usize,
+    pub(in super::super) token: UsageToken,
+}
+
+/// Usage-pending families in ascending root order, from the first root after
+/// `after`, one slice under `budget`: every family (`None`) or the named ones
+/// (`Some`). Each is the graph's loaded value at its root position, else its
+/// stored row, which must match its head (a patched head's flag applied).
+/// Keeps nothing and installs nothing; one short read transaction per slice.
+/// Unknown, counted: a row unlike its head, a head without a row, or a store
+/// this graph does not hold.
+pub(in super::super) fn visit_usage_ordered(
     index: &ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
+    after: Option<&str>,
+    budget: SliceBudget,
     f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
-) -> Result<()> {
+) -> Result<SliceEnd> {
+    use super::super::usage_pending::{Unknown, UsageView};
     let usage = &index.claude_usage_family_pending;
-    let held = usage.resident().or(usage.cold().map(|cold| cold.loaded()));
-    for (root, family) in held.into_iter().flatten() {
-        if roots.map_or(true, |roots| roots.contains(root)) {
-            f(root.as_str(), family);
+    let families = usage.len();
+    let mut end = SliceEnd::default();
+    let mut slice = |mut tx: Option<&mut dyn Transaction>| -> Result<()> {
+        let views: Box<dyn Iterator<Item = (&String, UsageView<'_>)> + '_> = match roots {
+            None => usage.views_after(after),
+            Some(roots) => {
+                use std::ops::Bound;
+                let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+                Box::new(
+                    roots
+                        .range::<str, _>((from, Bound::Unbounded))
+                        .filter_map(|root| Some((root, usage.view(root)?))),
+                )
+            }
+        };
+        let mut views = views.peekable();
+        while let Some((root, view)) = views.next() {
+            match view {
+                UsageView::Full(family) => f(root, family),
+                UsageView::Head(head) => {
+                    let tx = tx.as_deref_mut().ok_or(Unknown)?;
+                    let (mut family, digest) = mapper::read_row::<
+                        super::super::ClaudeUsageFamilyPending,
+                    >(tx, "usage.pending", root)?
+                    .ok_or(Unknown)?;
+                    ensure!(digest == head.digest, Unknown);
+                    if usage.cold().is_some_and(|cold| cold.patched(root)) {
+                        family.contract_unproven = true;
+                    }
+                    let bytes = crate::heap_layout_bound::completed_bound(&family, usize::MAX)
+                        .unwrap_or(usize::MAX);
+                    f(root, &family);
+                    end.decoded_bytes = end.decoded_bytes.saturating_add(bytes);
+                    end.peak_family_bytes = end.peak_family_bytes.max(bytes);
+                }
+            }
+            end.visited += 1;
+            if views.peek().is_some()
+                && (end.visited >= budget.families || end.decoded_bytes >= budget.bytes)
+            {
+                end.last_root = Some(root.clone());
+                break;
+            }
+        }
+        Ok(())
+    };
+    let result = match usage.cold() {
+        None => slice(None).map(|()| None),
+        Some(_) => read_txn(index, |tx| slice(Some(tx))).map(|((), stamp)| Some(stamp)),
+    };
+    match result {
+        Ok(stamp) => {
+            end.token = UsageToken { stamp, families };
+            Ok(end)
+        }
+        Err(error) => {
+            telemetry::count("usage_pending_unknown", 1);
+            Err(error)
         }
     }
-    read_unloaded(index, roots, false, &mut |root, value, _| f(&root, &value))
 }
 
 /// The cold families `roots` names (`None`: every head) that this graph has
@@ -1435,6 +1549,10 @@ fn read_unloaded(
             }
             cold.admits(&root, digest)?;
             seen += 1;
+            let mut value = value;
+            if cold.patched(&root) {
+                value.contract_unproven = true;
+            }
             f(root, value, digest);
             Ok(())
         },
@@ -1460,6 +1578,9 @@ pub(in super::super) fn settle_usage(
     }
 }
 
+#[cfg(test)]
+#[path = "usage_ordered_tests.rs"]
+mod ordered_tests;
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;

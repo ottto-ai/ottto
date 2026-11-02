@@ -836,14 +836,16 @@ pub(super) fn mark_unproven_at_latch_clear(index: &mut ScanIndex, census_window_
         return;
     }
     let current = EvidenceContract::current(index);
-    for pending in index
-        .claude_usage_family_pending
-        .loaded_all_mut()
-        .values_mut()
-    {
-        if pending.census_window_end != census_window_end || pending.identity_contract != current {
-            pending.contract_unproven = true;
-        }
+    let usage = &mut index.claude_usage_family_pending;
+    let marked: Vec<String> = usage
+        .views()
+        .filter(|(_, family)| {
+            family.window() != census_window_end || family.identity_contract() != current
+        })
+        .map(|(root, _)| root.clone())
+        .collect();
+    for root in &marked {
+        usage.mark_unproven(root);
     }
 }
 

@@ -250,14 +250,18 @@ pub(super) struct ColdUsage {
     complete: bool,
     /// Occurrences summed over every head.
     head_occurrences: usize,
+    /// Heads marked `contract_unproven` but not loaded: the save rewrites
+    /// only these rows with the flag set, and a read applies it.
+    unproven: std::collections::BTreeSet<String>,
 }
-crate::heap_layout_bound::fields!(ColdUsage; heads, loaded, complete, head_occurrences);
+crate::heap_layout_bound::fields!(ColdUsage; heads, loaded, complete, head_occurrences, unproven);
 impl std::fmt::Debug for ColdUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColdUsage")
             .field("heads", &self.heads.len())
             .field("loaded", &self.loaded.len())
             .field("complete", &self.complete)
+            .field("unproven", &self.unproven.len())
             .finish_non_exhaustive()
     }
 }
@@ -275,6 +279,10 @@ impl ColdUsage {
     pub(super) fn head_roots(&self) -> impl Iterator<Item = &String> + '_ {
         self.heads.keys()
     }
+    /// Whether `root`'s stored row is patched `contract_unproven` at save.
+    pub(super) fn patched(&self, root: &str) -> bool {
+        self.unproven.contains(root)
+    }
     fn set_head(&mut self, root: &str, head: UsageHead) {
         self.head_occurrences = self.head_occurrences.saturating_add(head.occurrences);
         if let Some(old) = self.heads.insert(root.to_owned(), head) {
@@ -282,6 +290,7 @@ impl ColdUsage {
         }
     }
     fn drop_head(&mut self, root: &str) {
+        self.unproven.remove(root);
         if let Some(old) = self.heads.remove(root) {
             self.head_occurrences = self.head_occurrences.saturating_sub(old.occurrences);
         }
@@ -377,13 +386,40 @@ impl ColdUsage {
         for (root, head) in heads {
             self.set_head(&root, head);
         }
+        // A patched head is the row the save rewrote; one it did not write
+        // stays patched for the next save.
+        for root in std::mem::take(&mut self.unproven) {
+            if self.loaded.contains_key(&root) {
+                continue;
+            }
+            match (committed(&root), self.heads.get_mut(&root)) {
+                (Some(digest), Some(head)) => head.digest = digest,
+                (None, Some(_)) => {
+                    self.unproven.insert(root);
+                }
+                (_, None) => {}
+            }
+        }
     }
 }
 
-/// Sorted merge of the head and loaded keys; a loaded value wins.
-fn merged<'a>(cold: &'a ColdUsage) -> impl Iterator<Item = (&'a String, UsageView<'a>)> + 'a {
-    let mut heads = cold.heads.iter().filter(|_| !cold.complete).peekable();
-    let mut loaded = cold.loaded.iter().peekable();
+/// Sorted merge of the head and loaded keys after `after`; a loaded value
+/// wins.
+fn merged<'a>(
+    cold: &'a ColdUsage,
+    after: Option<&str>,
+) -> impl Iterator<Item = (&'a String, UsageView<'a>)> + 'a {
+    use std::ops::Bound;
+    let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut heads = cold
+        .heads
+        .range::<str, _>((lower, Bound::Unbounded))
+        .filter(|_| !cold.complete)
+        .peekable();
+    let mut loaded = cold
+        .loaded
+        .range::<str, _>((lower, Bound::Unbounded))
+        .peekable();
     std::iter::from_fn(move || match (heads.peek(), loaded.peek()) {
         (None, None) => None,
         (Some(_), None) => heads.next().map(|(r, h)| (r, UsageView::Head(h))),
@@ -427,7 +463,15 @@ impl UsagePending {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Resident(families) => families.len(),
-            Self::Cold(_) => self.views().count(),
+            Self::Cold(cold) if cold.complete => cold.loaded.len(),
+            Self::Cold(cold) => {
+                cold.heads.len()
+                    + cold
+                        .loaded
+                        .keys()
+                        .filter(|root| !cold.heads.contains_key(*root))
+                        .count()
+            }
         }
     }
     pub(super) fn is_empty(&self) -> bool {
@@ -451,11 +495,24 @@ impl UsagePending {
     }
     /// Every family in root order, as summary readers see it.
     pub(super) fn views(&self) -> Box<dyn Iterator<Item = (&String, UsageView<'_>)> + '_> {
+        self.views_after(None)
+    }
+    /// `views` from the first root after `after`.
+    pub(super) fn views_after<'a>(
+        &'a self,
+        after: Option<&'a str>,
+    ) -> Box<dyn Iterator<Item = (&'a String, UsageView<'a>)> + 'a> {
         match self {
             Self::Resident(families) => {
-                Box::new(families.iter().map(|(root, f)| (root, UsageView::Full(f))))
+                use std::ops::Bound;
+                let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+                Box::new(
+                    families
+                        .range::<str, _>((from, Bound::Unbounded))
+                        .map(|(root, f)| (root, UsageView::Full(f))),
+                )
             }
-            Self::Cold(cold) => Box::new(merged(cold)),
+            Self::Cold(cold) => Box::new(merged(cold, after)),
         }
     }
     /// A family's evidence. Cold: Unknown while it has a head but was not
@@ -559,6 +616,31 @@ impl UsagePending {
     pub(super) fn add_absent(&mut self, root: String, family: ClaudeUsageFamilyPending) {
         if !self.contains_key(&root) {
             self.add(root, family);
+        }
+    }
+    /// Mark a family's evidence `contract_unproven`. A cold family that is
+    /// not loaded stays unloaded: its head takes the flag and the save
+    /// rewrites only its row (patch at save).
+    pub(super) fn mark_unproven(&mut self, root: &str) {
+        match self {
+            Self::Resident(families) => {
+                if let Some(family) = families.get_mut(root) {
+                    family.contract_unproven = true;
+                }
+            }
+            Self::Cold(cold) => {
+                if let Some(family) = cold.loaded.get_mut(root) {
+                    family.contract_unproven = true;
+                } else if !cold.complete {
+                    let ColdUsage {
+                        heads, unproven, ..
+                    } = &mut **cold;
+                    if let Some(head) = heads.get_mut(root).filter(|h| !h.contract_unproven) {
+                        head.contract_unproven = true;
+                        unproven.insert(root.to_owned());
+                    }
+                }
+            }
         }
     }
     /// Remove a whole family; the next save deletes its row.

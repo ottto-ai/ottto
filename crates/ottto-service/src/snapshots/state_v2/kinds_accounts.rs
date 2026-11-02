@@ -1,6 +1,6 @@
 //! Account families share the generic mapper; only window positions need policy.
 use super::super::account_pending_retention::{Archived, ArchivedWindows, ColdFold, ColdWindows};
-use super::super::usage_pending::{ColdUsage, UsagePending};
+use super::super::usage_pending::{ColdUsage, Unknown, UsagePending};
 use super::super::{
     ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow, ClaudeUsageFamilyPending,
 };
@@ -197,7 +197,10 @@ pub(super) fn rows(
 /// Usage pending, one row per family. A cold family not loaded this pass is
 /// carried by its head's digest (`keep` refuses anything it cannot prove); a
 /// loaded one is rewritten through `put`, where an equal digest writes
-/// nothing; a removed one is absent, so `finish` deletes its row.
+/// nothing; a removed one is absent, so `finish` deletes its row. A patched
+/// head (`mark_unproven`) rewrites only its own row, read here in the save's
+/// transaction: it must still be the head's row (else Unknown), and only
+/// `contract_unproven` changes.
 fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     let usage = &next.claude_usage_family_pending;
     let Some(cold) = usage.cold() else {
@@ -208,10 +211,22 @@ fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     for (root, _) in usage.views() {
         families += 1;
         let key = mapper::key("usage.pending", root, 1)?;
-        match cold.loaded().get(root) {
-            Some(family) => rows.put(key, family)?,
-            None => rows.keep(key, cold.head(root).context("state_v2_usage_head")?.digest)?,
+        if let Some(family) = cold.loaded().get(root) {
+            rows.put(key, family)?;
+            continue;
         }
+        let head = cold.head(root).context("state_v2_usage_head")?.digest;
+        if !cold.patched(root) {
+            rows.keep(key, head)?;
+            continue;
+        }
+        let tx = rows.tx.as_deref_mut().ok_or(Unknown)?;
+        let (mut family, digest) =
+            mapper::read_row::<ClaudeUsageFamilyPending>(tx, "usage.pending", root)?
+                .ok_or(Unknown)?;
+        ensure!(digest == head, Unknown);
+        family.contract_unproven = true;
+        rows.put(key, &family)?;
     }
     rows.put(mapper::key("usage.pending", "", 0)?, &families)
 }
@@ -344,6 +359,9 @@ pub(super) fn materialize(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Re
         let mut families =
             mapper::read_map::<ClaudeUsageFamilyPending>(tx, "usage.pending", None, None)?;
         families.retain(|root, _| usage.contains_key(root));
+        for (root, family) in &mut families {
+            family.contract_unproven |= cold.patched(root);
+        }
         families.extend(cold.loaded().clone());
         index.claude_usage_family_pending = families.into();
     }
