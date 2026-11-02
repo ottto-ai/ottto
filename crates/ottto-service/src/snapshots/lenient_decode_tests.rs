@@ -1436,6 +1436,11 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "bodies":{"d".repeat(64):"e".repeat(64)},
                 "pending_bodies":{"a".repeat(64):"b".repeat(64)}
             }),
+            "archive_deferred_alarm_count" => serde_json::json!(1),
+            "archives" => serde_json::json!({"archive": {
+                "stamp":{"length":1,"device":1,"inode":2,"modified":[3,4],"changed":[0,0]},
+                "disposition":{"Held":{"cause":CodexZstCause::OwnerUnproven,"quiet":true}}
+            }}),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
             }
@@ -1620,8 +1625,14 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
-    let current = serde_json::to_value(&seed).unwrap();
-    let fields = lenient_decode::FIELDS;
+    let mut current = serde_json::to_value(&seed).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
         &fields[fields.len() - 6..],
         &[
@@ -1737,8 +1748,14 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
     let _on = RestartRestoreForTest::enabled();
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
-    let fields = lenient_decode::FIELDS;
+    let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
     assert_eq!(fields[tombstone_slot], DESKTOP_INVENTORY);
     assert_eq!(fields[tombstone_slot + 1], "claude_copy_removals");
@@ -1780,7 +1797,9 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[86], DESKTOP_INVENTORY);
     assert_eq!(fields[87], "claude_copy_removals");
     assert_eq!(fields[88], "upload_context_proof");
-    assert_eq!(fields.len(), 89);
+    assert_eq!(fields[89], "archives");
+    assert_eq!(fields[90], "archive_deferred_alarm_count");
+    assert_eq!(fields.len(), 91);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1799,7 +1818,12 @@ fn growth_retention_keeps_existing_positional_index_slots() {
 
 #[test]
 fn copy_removals_keep_existing_positional_index_slots() {
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    current.as_object_mut().unwrap().remove("archives");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("archive_deferred_alarm_count");
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -1809,7 +1833,8 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("upload_context_proof");
-    let fields = lenient_decode::FIELDS;
+    // Exercise the historical schema, before the appended archive slots.
+    let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(fields[fields.len() - 2], "claude_copy_removals");
     assert_eq!(fields.last(), Some(&"upload_context_proof"));
     for (expected, slots) in [(&legacy, &fields[..fields.len() - 2]), (&current, fields)] {
@@ -4460,6 +4485,8 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
             "upload_context_proof",
+            "archives",
+            "archive_deferred_alarm_count",
         ]
     );
 }
