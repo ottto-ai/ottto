@@ -106,8 +106,8 @@ fn committed(view: &ScanIndex) -> Value {
 /// [money] Over one family per slice the streamed terminal emits and commits
 /// what one whole visit does: the money oracle (totals and placement) holds
 /// on the page, and the committed census state, saved and reloaded, is
-/// equal. The child's legacy prefix is excluded in both (its raw item counts
-/// the parent's request), so the cross-family joins ran on both arms.
+/// equal. Both arms ran the targeted visit (the shared request), which the
+/// sliced arm read one family per slice.
 #[test]
 fn streamed_terminal_equals_one_whole_visit() {
     let (dir, child, api, trace, index) = accumulated();
@@ -129,7 +129,10 @@ fn streamed_terminal_equals_one_whole_visit() {
         let _ = fs::remove_dir_all(scratch);
     }
     let (sliced, whole) = (arms.pop().unwrap(), arms.pop().unwrap());
-    assert_eq!(whole.0[0].request_count, 2, "the prefix is the parent's");
+    assert_eq!(
+        whole.1.terminal_stream.terminal_slices, 2,
+        "one sweep slice and one targeted visit"
+    );
     super::stale_family_carry_tests::assert_bodies_equal_a_full(&whole.0, &sliced.0);
     assert_eq!(sliced.2, whole.2, "committed census state");
     assert_eq!(

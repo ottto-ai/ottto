@@ -251,6 +251,10 @@ impl Page {
             &disposition,
             &backfill,
         );
+        // The streamed terminal's local counters depend on the store's
+        // representation (resident or cold) and are logged only; the arms
+        // compare what the fold decided.
+        disposition.terminal_stream = Default::default();
         self.disposition = disposition.clone();
         disposition
     }

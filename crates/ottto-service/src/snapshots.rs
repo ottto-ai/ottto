@@ -5438,15 +5438,13 @@ pub(crate) enum ClaudeTerminalOutcome {
     Refused,
 }
 
-/// The streamed terminal's visitor slices, time and memory, and how long the Claude
+/// The streamed terminal's visitor slices and memory, and how long the Claude
 /// duplicate fence has been closed (census clock seconds since a fold first
 /// saw it closed). Logged beside the duplicate census; absent while empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTerminalStreamCounts {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal_slices: u64,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub terminal_ms: u64,
     /// The most stored-row bytes one slice decoded.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal_peak_slice_bytes: u64,
@@ -9784,7 +9782,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     let mut terminal = None;
     let mut terminal_stream = ClaudeTerminalStreamCounts::default();
     if census_complete {
-        let started = std::time::Instant::now();
         let owed_roots = evidence_owed::owed_roots(index);
         let inputs = terminal_join::TerminalInputs {
             census_window_end,
@@ -9802,8 +9799,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 terminal_stream.terminal_slices = join.slices as u64;
                 terminal_stream.terminal_peak_slice_bytes = join.peak_slice_bytes as u64;
                 terminal_stream.terminal_installed_families = join.installed_families as u64;
-                terminal_stream.terminal_ms =
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 terminal = Some(join);
             }
             Err(terminal_join::Refused) => {
@@ -10456,7 +10451,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                         && !join.member_hashes_meet(
                             root_session_id,
                             source_session_id,
-                            &terminal_join::keys([&*request_hash]),
+                            &terminal_join::keys([request_hash]),
                         )
                     {
                         owners.remove(&owner);
@@ -67057,6 +67052,10 @@ mod tests {
         disposition.posture_admissions.clear();
         // Local-only context basis counters, logged and never persisted.
         disposition.context_file_birth = Default::default();
+        // The terminal outcome (read by the scan wrapper) and its local
+        // stream counters (logged only).
+        disposition.terminal = Default::default();
+        disposition.terminal_stream = Default::default();
         assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
         let index_json = serde_json::to_string(&index).expect("serialize index");
         let items_json = serde_json::to_string(&items).expect("serialize items");
