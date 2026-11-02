@@ -2536,16 +2536,6 @@ fn launch_command(config_dir: &str) -> String {
     )
 }
 
-/// Safe legacy fallback for one exact daemon-owned Claude root. The command
-/// opens the official interactive CLI; the customer still types `/login` and
-/// Ottto never receives provider credentials or one-time codes.
-pub fn claude_legacy_launch_command(
-    config_dir: &str,
-) -> Result<String, ClaudeConfigSlotSettingsError> {
-    validate_managed_claude_auth_root(config_dir)?;
-    Ok(launch_command(config_dir))
-}
-
 fn status_contract(persisted: &PersistedClaudeConfigSlotSettingsV1) -> ClaudeAccountsStatusV1 {
     status_contract_with_selected_operation(persisted, None)
 }

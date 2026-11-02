@@ -23,8 +23,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
-// Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
-const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1862,6 +1860,54 @@ fn require_cloud_session_success(
     }
 }
 
+/// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
+/// error so the caller can refresh credentials; 400/422 means the `label`
+/// contract drifted.
+fn relay_token_upload_response(
+    sent: std::result::Result<ureq::Response, ureq::Error>,
+    label: &str,
+) -> Result<Value> {
+    match sent {
+        Ok(response) => response
+            .into_json()
+            .map_err(|error| anyhow!("parse {label} response failed: {error}")),
+        Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+            Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                status: code,
+                suppressed: false,
+            }))
+        }
+        Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+            Err(anyhow!("backend rejected {label}: HTTP {code}"))
+        }
+        Err(error) => Err(anyhow!("upload {label} failed: {error}")),
+    }
+}
+
+/// A failed cloud-session request: 401/403 is an authorization rejection,
+/// 400/404/409/422 a contract rejection; any other status or a transport
+/// failure carries upload diagnostics. Response bodies are never kept.
+fn cloud_session_request_error(
+    error: ureq::Error,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code @ (401 | 403), _response) => {
+            anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
+        }
+        ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response) => {
+            anyhow::Error::new(CloudSessionContractRejected { status: code })
+        }
+        ureq::Error::Status(code, response) => anyhow::Error::new(UploadFailureDiagnostics::http(
+            operation, endpoint, code, &response,
+        )),
+        error => anyhow::Error::new(UploadFailureDiagnostics::transport(
+            operation, endpoint, &error,
+        )),
+    }
+}
+
 type NicknameGenerations = std::sync::Arc<
     std::sync::Mutex<std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>>,
 >;
@@ -1895,13 +1941,6 @@ impl SnapshotApiClient {
     }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
-    }
-
-    pub fn from_env() -> Self {
-        Self::new(
-            std::env::var("OTTTO_API_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
-        )
     }
 
     pub fn new(api_base_url: impl Into<String>) -> Self {
@@ -2782,64 +2821,30 @@ impl SnapshotApiClient {
     /// 401/403 surfaces as a relay-authorization error so the caller can refresh
     /// credentials; 400/422 means the inventory contract drifted.
     pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/mcp/inventory"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse mcp inventory response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected mcp inventory: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload mcp inventory failed: {error}")),
-        }
+        let sent = self
+            .relay_token_post("/api/v1/mcp/inventory", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "mcp inventory")
     }
 
     pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/context-footprint/snapshot"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse context footprint response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected context footprint: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload context footprint failed: {error}")),
-        }
+        let sent = self
+            .relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "context footprint")
     }
 
+    /// A POST with the source-scoped relay token; see
+    /// `relay_token_upload_response` for its outcome.
+    fn relay_token_post(&self, path: &str, relay_token: &str) -> ureq::Request {
+        self.agent
+            .post(&self.api_url(path))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
     /// Upload one bounded, content-free cloud-session batch using the same
     /// source-scoped relay principal as local snapshots. Response bodies are
     /// never retained on auth/contract failures.
-    pub fn upload_cloud_session_batch(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        self.upload_cloud_session_batch_with_timeout(
-            relay_token,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn upload_cloud_session_batch_with_timeout(
         &self,
         relay_token: &str,
@@ -2865,29 +2870,11 @@ impl SnapshotApiClient {
                 validate_cloud_session_heartbeat_receipt(request, &receipt)?;
                 Ok(receipt)
             }
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session upload",
-                    "cloud_session_batch",
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session upload",
                 "cloud_session_batch",
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -2921,29 +2908,11 @@ impl SnapshotApiClient {
             )?
             .into_json()
             .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session authority read",
-                    "cloud_session_authority",
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session authority read",
                 "cloud_session_authority",
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -2980,20 +2949,6 @@ impl SnapshotApiClient {
     }
 
     /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
-    pub fn finalize_cloud_session_scan(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        self.finalize_cloud_session_scan_with_timeout(
-            relay_token,
-            scan_id,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
     pub fn finalize_cloud_session_scan_with_timeout(
         &self,
         relay_token: &str,
@@ -3047,29 +3002,11 @@ impl SnapshotApiClient {
                 validate_cloud_session_scan_receipt(action, request, &receipt)?;
                 Ok(receipt)
             }
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
-                Err(anyhow::Error::new(CloudSessionContractRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "cloud-session scan upload",
-                    operation,
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(cloud_session_request_error(
+                error,
                 "cloud-session scan upload",
                 operation,
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -3082,28 +3019,11 @@ impl SnapshotApiClient {
     /// Sends the serialized body, so the bytes the run counts are the bytes
     /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/context-composition/snapshot"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
+        let sent = self
+            .relay_token_post("/api/v1/context-composition/snapshot", relay_token)
             .set("Content-Type", "application/json")
-            .send_bytes(body)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected context composition: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
-        }
+            .send_bytes(body);
+        relay_token_upload_response(sent, "context composition")
     }
 
     /// The daily composition run health: one request, never retried. A
@@ -3113,20 +3033,8 @@ impl SnapshotApiClient {
         relay_token: &str,
         body: &Value,
     ) -> Result<Value> {
-        self.post_context_composition_run_health_with_timeout(
-            relay_token,
-            body,
-            Duration::from_secs(10),
-        )
-    }
-
-    pub(crate) fn post_context_composition_run_health_with_timeout(
-        &self,
-        relay_token: &str,
-        body: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
-        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        let (agent, request_timeout) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(10))?;
         match agent
             .post(&self.api_url("/api/v1/context-composition/run-health"))
             .timeout(request_timeout)
@@ -3148,28 +3056,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &MachineRuntimeHeartbeatV1,
     ) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/apps/health/heartbeat"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse local health heartbeat response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
-                    status: code,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow::Error::new(LocalHealthProjectionRejected {
-                    status: code,
-                }))
-            }
-            Err(error) => Err(anyhow!("upload local health heartbeat failed: {error}")),
-        }
+        self.upload_local_health(relay_token, "heartbeat", request)
     }
 
     pub fn upload_local_health_projection(
@@ -3177,16 +3064,26 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &LocalMachineHealthV1,
     ) -> Result<Value> {
+        self.upload_local_health(relay_token, "projection", request)
+    }
+
+    /// POST to `/api/v1/apps/health/{kind}` with the relay token.
+    fn upload_local_health(
+        &self,
+        relay_token: &str,
+        kind: &str,
+        request: &impl Serialize,
+    ) -> Result<Value> {
         match self
             .agent
-            .post(&self.api_url("/api/v1/apps/health/projection"))
+            .post(&self.api_url(&format!("/api/v1/apps/health/{kind}")))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
         {
             Ok(response) => response
                 .into_json()
-                .map_err(|error| anyhow!("parse local health projection response failed: {error}")),
+                .map_err(|error| anyhow!("parse local health {kind} response failed: {error}")),
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
                     status: code,
@@ -3197,7 +3094,7 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            Err(error) => Err(anyhow!("upload local health projection failed: {error}")),
+            Err(error) => Err(anyhow!("upload local health {kind} failed: {error}")),
         }
     }
 

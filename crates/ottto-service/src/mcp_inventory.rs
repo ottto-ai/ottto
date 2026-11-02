@@ -18,6 +18,7 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+use crate::command_env::SpawnEnv;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
@@ -917,28 +918,7 @@ fn discover_servers(home: &Path, source: SnapshotSource) -> Vec<ConfiguredServer
 // stdio MCP handshake
 // ---------------------------------------------------------------------------
 
-/// The environment a stdio MCP server is spawned with, resolved ONCE per harvest
-/// cycle. The daemon runs under launchd with a minimal `PATH`
-/// (`/usr/bin:/bin:…`), so a bare `Command::new("npx")` cannot find the common
-/// MCP launchers (`npx`/`uvx`/`node`) and every such server would falsely report
-/// `reachable:false`. We resolve a launchd-safe `PATH` and the user's provider
-/// env exactly as the daemon spawns its other agent subprocesses, so the harvest
-/// sees the same servers an interactive shell (and the reference harvester) does.
-#[derive(Clone)]
-struct SpawnEnv {
-    path: Option<OsString>,
-    provider: BTreeMap<String, OsString>,
-}
-
 impl SpawnEnv {
-    /// Resolve once per cycle (`provider_env` may briefly consult a login shell).
-    fn resolve() -> Self {
-        Self {
-            path: crate::command_env::path_env(),
-            provider: crate::command_env::provider_env(),
-        }
-    }
-
     /// Resolve `command` to an absolute path against the launchd-safe search dirs
     /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
     /// child (so the launched server and its own subprocesses resolve too).
@@ -1984,9 +1964,6 @@ fn clear_org_disabled_marker(path: &Path) {
 /// Gating is implicit and safe: harvest only runs for sources the relay device
 /// has been granted (`enabled_snapshot_sources`), and only when the device is
 /// registered at all — so telemetry-off ⇒ no device/sources ⇒ no harvest.
-pub fn spawn_mcp_inventory_sync() -> Result<()> {
-    spawn_inventory_sync(None)
-}
 pub fn spawn_mcp_inventory_sync_for_daemon(daemon: &crate::LocalDaemon) -> Result<()> {
     spawn_inventory_sync(Some(daemon.codex_versions.clone()))
 }

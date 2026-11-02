@@ -105,6 +105,40 @@ macro_rules! discovery_retention {
     };
 }
 
+/// `fn $with(body)` runs `body` on one process-wide value: a `static Mutex`
+/// in the daemon, whose poisoned value is used as is (`clear_poison: true`
+/// also clears the poison); each test thread has its own copy, since tests
+/// share one process.
+macro_rules! process_state {
+    (
+        $(#[$attr:meta])*
+        $vis:vis fn $with:ident: $ty:ty = $init:expr; clear_poison: $clear:literal
+    ) => {
+        $(#[$attr])*
+        $vis fn $with<T>(body: impl FnOnce(&mut $ty) -> T) -> T {
+            #[cfg(not(test))]
+            {
+                static STATE: std::sync::Mutex<$ty> = std::sync::Mutex::new($init);
+                let mut state = STATE.lock().unwrap_or_else(|poisoned| {
+                    if $clear {
+                        STATE.clear_poison();
+                    }
+                    poisoned.into_inner()
+                });
+                body(&mut state)
+            }
+            #[cfg(test)]
+            {
+                thread_local! {
+                    static STATE: std::cell::RefCell<$ty> =
+                        const { std::cell::RefCell::new($init) };
+                }
+                STATE.with(|state| body(&mut state.borrow_mut()))
+            }
+        }
+    };
+}
+
 pub(crate) mod account_pending_retention;
 use account_pending_retention::ArchivedWindows;
 pub(crate) mod cache_observations;
@@ -4239,6 +4273,12 @@ pub struct ScanIndex {
     /// source-wide, while reacquisition is restricted to requested files.
     #[serde(skip)]
     pub(crate) copy_prefix_base_upload_context: Option<String>,
+    /// Local destination-scoped publication authority, saved with re-owed marks.
+    #[serde(default)]
+    pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
+    /// Accepted intent members still owing revision debt; rebuilt each prepare.
+    #[serde(skip)]
+    pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4454,6 +4494,8 @@ impl Default for ScanIndex {
             upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
+            copy_prefix_last_accepted_nonce: None,
+            copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -11867,38 +11909,11 @@ impl ClaudeAbsentFamilyFallbackCursors {
     }
 }
 
-#[cfg(not(test))]
-static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS: std::sync::Mutex<ClaudeAbsentFamilyFallbackCursors> =
-    std::sync::Mutex::new(ClaudeAbsentFamilyFallbackCursors::new());
-
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS_FOR_TEST: std::cell::RefCell<
-        ClaudeAbsentFamilyFallbackCursors,
-    > = const { std::cell::RefCell::new(ClaudeAbsentFamilyFallbackCursors::new()) };
-}
-
-/// Every critical section reads or writes one whole cursor entry, so a
-/// poisoned lock's map is consistent and is recovered at once.
-#[cfg(not(test))]
-fn with_claude_absent_family_fallback_cursors<T>(
-    use_cursors: impl FnOnce(&mut ClaudeAbsentFamilyFallbackCursors) -> T,
-) -> T {
-    let mut cursors = CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS.clear_poison();
-            poisoned.into_inner()
-        });
-    use_cursors(&mut cursors)
-}
-
-#[cfg(test)]
-fn with_claude_absent_family_fallback_cursors<T>(
-    use_cursors: impl FnOnce(&mut ClaudeAbsentFamilyFallbackCursors) -> T,
-) -> T {
-    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS_FOR_TEST
-        .with(|cursors| use_cursors(&mut cursors.borrow_mut()))
+process_state! {
+    /// Every critical section reads or writes one whole cursor entry, so a
+    /// poisoned lock's map is consistent and is recovered at once.
+    fn with_claude_absent_family_fallback_cursors: ClaudeAbsentFamilyFallbackCursors =
+        ClaudeAbsentFamilyFallbackCursors::new(); clear_poison: true
 }
 
 /// Path-(a) absence retirement: the most retired family
@@ -11952,37 +11967,11 @@ impl ClaudeUnverifiedHistoryIndexes {
     }
 }
 
-#[cfg(not(test))]
-static CLAUDE_UNVERIFIED_HISTORY_INDEXES: std::sync::Mutex<ClaudeUnverifiedHistoryIndexes> =
-    std::sync::Mutex::new(ClaudeUnverifiedHistoryIndexes::new());
-
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_UNVERIFIED_HISTORY_INDEXES_FOR_TEST: std::cell::RefCell<
-        ClaudeUnverifiedHistoryIndexes,
-    > = const { std::cell::RefCell::new(ClaudeUnverifiedHistoryIndexes::new()) };
-}
-
-/// Every critical section is one whole lookup or insert, so a poisoned lock's
-/// set is consistent and is recovered at once.
-#[cfg(not(test))]
-fn with_claude_unverified_history_indexes<T>(
-    body: impl FnOnce(&mut ClaudeUnverifiedHistoryIndexes) -> T,
-) -> T {
-    let mut indexes = CLAUDE_UNVERIFIED_HISTORY_INDEXES
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            CLAUDE_UNVERIFIED_HISTORY_INDEXES.clear_poison();
-            poisoned.into_inner()
-        });
-    body(&mut indexes)
-}
-
-#[cfg(test)]
-fn with_claude_unverified_history_indexes<T>(
-    body: impl FnOnce(&mut ClaudeUnverifiedHistoryIndexes) -> T,
-) -> T {
-    CLAUDE_UNVERIFIED_HISTORY_INDEXES_FOR_TEST.with(|indexes| body(&mut indexes.borrow_mut()))
+process_state! {
+    /// Every critical section is one whole lookup or insert, so a poisoned
+    /// lock's set is consistent and is recovered at once.
+    fn with_claude_unverified_history_indexes: ClaudeUnverifiedHistoryIndexes =
+        ClaudeUnverifiedHistoryIndexes::new(); clear_poison: true
 }
 
 /// Test seam: a daemon restart, which forgets every fresh load. Index loads
@@ -12027,9 +12016,8 @@ pub(crate) struct ClaudeAbsenceCounters {
     pub(crate) fence_lowering_skipped_scratch_fallback: u64,
 }
 
-#[cfg(not(test))]
-static CLAUDE_ABSENCE_COUNTERS: std::sync::Mutex<ClaudeAbsenceCounters> =
-    std::sync::Mutex::new(ClaudeAbsenceCounters {
+process_state! {
+    fn with_claude_absence_counters: ClaudeAbsenceCounters = ClaudeAbsenceCounters {
         absent_families_retired: 0,
         tombstone_hits: 0,
         retirements_refused: 0,
@@ -12039,43 +12027,7 @@ static CLAUDE_ABSENCE_COUNTERS: std::sync::Mutex<ClaudeAbsenceCounters> =
         tombstone_fence_raised_on_upgrade: 0,
         absent_family_tombstone_aged_out: 0,
         fence_lowering_skipped_scratch_fallback: 0,
-    });
-
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_ABSENCE_COUNTERS_FOR_TEST: std::cell::Cell<ClaudeAbsenceCounters> =
-        const {
-            std::cell::Cell::new(ClaudeAbsenceCounters {
-                absent_families_retired: 0,
-                tombstone_hits: 0,
-                retirements_refused: 0,
-                tombstone_decode_drops: 0,
-                tombstones_cleared: 0,
-                tombstone_capacity_refusals: 0,
-                tombstone_fence_raised_on_upgrade: 0,
-                absent_family_tombstone_aged_out: 0,
-                fence_lowering_skipped_scratch_fallback: 0,
-            })
-        };
-}
-
-#[cfg(not(test))]
-fn with_claude_absence_counters<T>(body: impl FnOnce(&mut ClaudeAbsenceCounters) -> T) -> T {
-    body(
-        &mut CLAUDE_ABSENCE_COUNTERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-}
-
-#[cfg(test)]
-fn with_claude_absence_counters<T>(body: impl FnOnce(&mut ClaudeAbsenceCounters) -> T) -> T {
-    CLAUDE_ABSENCE_COUNTERS_FOR_TEST.with(|cell| {
-        let mut counters = cell.get();
-        let result = body(&mut counters);
-        cell.set(counters);
-        result
-    })
+    }; clear_poison: false
 }
 
 #[cfg(test)]
@@ -12670,20 +12622,19 @@ enum ClaudeFenceAlarm {
     ClosedAge = 1,
 }
 
-#[cfg(not(test))]
-static CLAUDE_TOMBSTONE_FENCE_KEPT_LAST_ALARM: std::sync::Mutex<[Option<std::time::Instant>; 2]> =
-    std::sync::Mutex::new([None; 2]);
-
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_TOMBSTONE_FENCE_KEPT_LAST_ALARM: std::cell::Cell<[Option<std::time::Instant>; 2]> =
-        const { std::cell::Cell::new([None; 2]) };
+process_state! {
+    fn with_claude_fence_last_alarms: [Option<std::time::Instant>; 2] = [None; 2];
+    clear_poison: false
 }
 
-fn claude_fence_alarm_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    let due = last.map_or(true, |at| {
-        now.saturating_duration_since(at) >= CLAUDE_TOMBSTONE_FENCE_KEPT_ALARM_INTERVAL
-    });
+/// Whether a throttled alarm last raised at `last` is due at `now`, at least
+/// `interval` later; takes its slot when it is.
+fn take_throttled_alarm_slot(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    let due = last.map_or(true, |at| now.saturating_duration_since(at) >= interval);
     if due {
         *last = Some(now);
     }
@@ -12691,21 +12642,10 @@ fn claude_fence_alarm_due(last: &mut Option<std::time::Instant>, now: std::time:
 }
 
 /// Whether `alarm` is due at `now`; takes its slot when it is.
-#[cfg(not(test))]
 fn take_claude_fence_alarm_slot(alarm: ClaudeFenceAlarm, now: std::time::Instant) -> bool {
-    let mut last = CLAUDE_TOMBSTONE_FENCE_KEPT_LAST_ALARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    claude_fence_alarm_due(&mut last[alarm as usize], now)
-}
-
-#[cfg(test)]
-fn take_claude_fence_alarm_slot(alarm: ClaudeFenceAlarm, now: std::time::Instant) -> bool {
-    CLAUDE_TOMBSTONE_FENCE_KEPT_LAST_ALARM.with(|cell| {
-        let mut last = cell.get();
-        let due = claude_fence_alarm_due(&mut last[alarm as usize], now);
-        cell.set(last);
-        due
+    with_claude_fence_last_alarms(|last| {
+        let interval = CLAUDE_TOMBSTONE_FENCE_KEPT_ALARM_INTERVAL;
+        take_throttled_alarm_slot(&mut last[alarm as usize], now, interval)
     })
 }
 
@@ -28549,7 +28489,7 @@ impl OwnedSourceScan {
                         // §d.1.2 c: a paused or active cursor job owns a
                         // member. Its selected members stay pending (holding
                         // the census) and are not read again while it lives.
-                        if let Some(context) = sampling.as_ref().filter(|context| {
+                        if sampling.as_ref().is_some_and(|context| {
                             group.members.iter().any(|member| {
                                 context
                                     .cache
@@ -28561,9 +28501,6 @@ impl OwnedSourceScan {
                                 .iter()
                                 .filter(|member| selected.contains(&local_index_key(&member.path)))
                                 .collect::<Vec<_>>();
-                            for _ in &owned {
-                                context.cache.note_join_in_progress();
-                            }
                             sampled_scan::codex_cursor::requeue_members(
                                 index,
                                 &codex_selected_flags,
@@ -32069,6 +32006,8 @@ impl OwnedSourceScan {
                     } else if !held_progress_audit || (source_verified && parse_complete) {
                         // An unsuccessful virtual audit keeps its old hold:
                         // it has no sampled marker carrying the obligation.
+                        let accepted_recovery_member =
+                            index.copy_prefix_recovery_scope.contains(&candidate.path);
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -32101,6 +32040,7 @@ impl OwnedSourceScan {
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
+                                accepted_recovery_member,
                             },
                             &parsed,
                         );
@@ -33751,7 +33691,6 @@ impl OwnedSourceScan {
                     // The paused or active cursor job owns this file (a group
                     // job owns every member); it stays pending (holding the
                     // census) until that job's attempt ends (§d.1.2 c).
-                    context.cache.note_join_in_progress();
                     sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
                     pending!();
                 }
@@ -48954,29 +48893,9 @@ struct ClaudeReemissionStopAlarm {
     over_bound_root_refs: Vec<String>,
 }
 
-#[cfg(not(test))]
-static CLAUDE_REEMISSION_STOP: Mutex<ClaudeReemissionStop> =
-    Mutex::new(ClaudeReemissionStop::new());
-
-// Tests share one process, so each test thread keeps its own latch.
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_REEMISSION_STOP: std::cell::RefCell<ClaudeReemissionStop> =
-        const { std::cell::RefCell::new(ClaudeReemissionStop::new()) };
-}
-
-#[cfg(not(test))]
-fn with_claude_reemission_stop<T>(body: impl FnOnce(&mut ClaudeReemissionStop) -> T) -> T {
-    body(
-        &mut CLAUDE_REEMISSION_STOP
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-}
-
-#[cfg(test)]
-fn with_claude_reemission_stop<T>(body: impl FnOnce(&mut ClaudeReemissionStop) -> T) -> T {
-    CLAUDE_REEMISSION_STOP.with(|stop| body(&mut stop.borrow_mut()))
+process_state! {
+    fn with_claude_reemission_stop: ClaudeReemissionStop = ClaudeReemissionStop::new();
+    clear_poison: false
 }
 
 /// Called after every Claude fold with that fold's counts.
@@ -54670,6 +54589,8 @@ impl ScanIndex {
             upload_context_proof: self.upload_context_proof.clone(),
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
+            copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
+            copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,

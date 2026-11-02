@@ -1603,14 +1603,13 @@ macro_rules! cursor_counters {
             /// Largest `now - due` of an `audit_overdue` completion, in seconds.
             pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
             /// P2 (RAM only; not yet in the diagnostics projection): group cursor
-            /// jobs started, group memo hits, entries skipped because a job owns
-            /// them (L1), group attempts skipped by the generation fence, groups
-            /// whose probe hit `PROBE_BYTES` or the boot's probe allowance
+            /// jobs started, group memo hits, group attempts skipped by the
+            /// generation fence, groups whose probe hit `PROBE_BYTES` or the
+            /// boot's probe allowance
             /// (chronological order kept), and group refusals by `JoinRefusal` slot
             /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
             pub(in crate::snapshots) groups_started: u64,
             pub(in crate::snapshots) group_memo_hits: u64,
-            pub(in crate::snapshots) join_in_progress_members: u64,
             pub(in crate::snapshots) groups_fenced: u64,
             pub(in crate::snapshots) probe_bound: u64,
             pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
@@ -1632,10 +1631,9 @@ macro_rules! cursor_counters {
             pub(in crate::snapshots) deferred_paced: u64,
         }
         crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds,
-            groups_started, group_memo_hits, join_in_progress_members, groups_fenced, probe_bound,
-            join_terminal_debt, parent_witness_refused, parent_witness_evicted,
-            parent_namespace_refused, parent_restart_slot_evicted, parent_match_unmarked,
-            deferred_paced);
+            groups_started, group_memo_hits, groups_fenced, probe_bound, join_terminal_debt,
+            parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
+            parent_restart_slot_evicted, parent_match_unmarked, deferred_paced);
     };
 }
 crate::local_resource_diagnostics::codex_cursor_events!(cursor_counters);
@@ -4663,11 +4661,6 @@ impl SharedCache {
     pub(in crate::snapshots) fn counters_for_test(&self) -> Counters {
         self.with_cursor(|cursor| cursor.counters)
             .unwrap_or_default()
-    }
-
-    /// Count one selected entry skipped because a job owns it (L1).
-    pub(in crate::snapshots) fn note_join_in_progress(&self) {
-        self.with_cursor(|cursor| cursor.counters.join_in_progress_members += 1);
     }
 
     /// Terminal group debt by reason (§d.1.1 S11 counter).

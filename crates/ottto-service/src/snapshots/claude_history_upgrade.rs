@@ -969,40 +969,14 @@ struct OwedWithoutListAlarm<'a> {
     list: &'static str,
 }
 
-#[cfg(not(test))]
-static OWED_WITHOUT_LIST_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static OWED_WITHOUT_LIST_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
+process_state! {
+    fn with_owed_without_list_last_alarm: Option<std::time::Instant> = None;
+    clear_poison: false
 }
 
-#[cfg(not(test))]
 fn take_alarm_slot(now: std::time::Instant) -> bool {
-    let mut last = OWED_WITHOUT_LIST_LAST_ALARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let due = last.map_or(true, |at| {
-        now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-    });
-    if due {
-        *last = Some(now);
-    }
-    due
-}
-
-#[cfg(test)]
-fn take_alarm_slot(now: std::time::Instant) -> bool {
-    OWED_WITHOUT_LIST_LAST_ALARM.with(|last| {
-        let due = last.get().map_or(true, |at| {
-            now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-        });
-        if due {
-            last.set(Some(now));
-        }
-        due
+    with_owed_without_list_last_alarm(|last| {
+        super::take_throttled_alarm_slot(last, now, OWED_WITHOUT_LIST_ALARM_INTERVAL)
     })
 }
 
@@ -1112,42 +1086,14 @@ struct ActivationRefusedAlarm {
     history_activation_refused: u64,
 }
 
-#[cfg(not(test))]
-static ACTIVATION_REFUSED_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static ACTIVATION_REFUSED_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
+process_state! {
+    fn with_activation_refused_last_alarm: Option<std::time::Instant> = None;
+    clear_poison: false
 }
 
-fn activation_alarm_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last.map_or(true, |at| {
-        now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-    })
-}
-
-#[cfg(not(test))]
 fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
-    let mut last = ACTIVATION_REFUSED_LAST_ALARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let due = activation_alarm_due(*last, now);
-    if due {
-        *last = Some(now);
-    }
-    due
-}
-
-#[cfg(test)]
-fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
-    ACTIVATION_REFUSED_LAST_ALARM.with(|last| {
-        let due = activation_alarm_due(last.get(), now);
-        if due {
-            last.set(Some(now));
-        }
-        due
+    with_activation_refused_last_alarm(|last| {
+        super::take_throttled_alarm_slot(last, now, OWED_WITHOUT_LIST_ALARM_INTERVAL)
     })
 }
 
@@ -1185,33 +1131,8 @@ struct UnverifiedSince {
     last_alarm: Option<std::time::Instant>,
 }
 
-#[cfg(not(test))]
-static PRIOR_HISTORY_UNVERIFIED: std::sync::Mutex<Option<UnverifiedSince>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static PRIOR_HISTORY_UNVERIFIED: std::cell::Cell<Option<UnverifiedSince>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(not(test))]
-fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
-    access(
-        &mut PRIOR_HISTORY_UNVERIFIED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-}
-
-#[cfg(test)]
-fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
-    PRIOR_HISTORY_UNVERIFIED.with(|slot| {
-        let mut seen = slot.get();
-        let result = access(&mut seen);
-        slot.set(seen);
-        result
-    })
+process_state! {
+    fn with_unverified_since: Option<UnverifiedSince> = None; clear_poison: false
 }
 
 #[derive(serde::Serialize)]
@@ -1251,13 +1172,10 @@ fn note_prior_history_unverified_at(
             last_alarm: None,
         });
         seen.claude_cycles = seen.claude_cycles.saturating_add(1);
-        let due = seen.last_alarm.map_or(true, |at| {
-            now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
-        });
-        if !due {
+        let interval = OWED_WITHOUT_LIST_ALARM_INTERVAL;
+        if !super::take_throttled_alarm_slot(&mut seen.last_alarm, now, interval) {
             return None;
         }
-        seen.last_alarm = Some(now);
         Some(PriorHistoryUnverifiedAlarm {
             unverified_since_unix_seconds: seen.since_unix_seconds,
             unverified_for_seconds: now_unix_seconds.saturating_sub(seen.since_unix_seconds),

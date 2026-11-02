@@ -1546,7 +1546,7 @@ pub(super) fn evaluate_page<'p>(
 }
 
 /// The retained worst case of one `Runtime`, in bytes, with the key length
-/// assumption spelled out. See `RUNTIME`.
+/// assumption spelled out. See `with_runtime`.
 #[cfg(test)]
 pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
     const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
@@ -1561,51 +1561,33 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
         + 2 * LONGEST_KEY
 };
 
-/// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
-/// no cycle or overlap budget charges it, so its bound is stated here and
-/// reported per page as `cost.runtime_heap_bytes`.
-///
-/// Retained heap, worst case, with every cap full (no maps: sorted vectors
-/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
-/// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
-/// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
-/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
-/// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
-/// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
-/// typical lengths), plus at most 4 MiB for enlarged stamp transients with
-/// per-entry classification, outside `runtime_heap_bytes`;
-/// no separate gauge-dedup allocation, outside `runtime_heap_bytes`. Counts only, so nothing is
-/// refused at the bound.
-///
-/// `observe_page` holds this lock for its whole evaluation and each equality
-/// Skip for its own attestation, so every update is whole: a sticky veto,
-/// attestation or cap meter is never overwritten, and one state exists. The
-/// hold is bounded by the page budgets (16,384 member advances, 8,192 root
-/// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
-#[cfg(not(test))]
-static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
-
-#[cfg(test)]
-thread_local! {
-    static RUNTIME_FOR_TEST: std::cell::RefCell<Runtime> =
-        const { std::cell::RefCell::new(Runtime::new()) };
-}
-
-#[cfg(not(test))]
-fn with_runtime<T>(body: impl FnOnce(&mut Runtime) -> T) -> T {
-    // Each critical section is one whole update; a poisoned value is still
-    // bounded and only feeds counts.
-    let mut runtime = RUNTIME.lock().unwrap_or_else(|poisoned| {
-        RUNTIME.clear_poison();
-        poisoned.into_inner()
-    });
-    body(&mut runtime)
-}
-
-#[cfg(test)]
-fn with_runtime<T>(body: impl FnOnce(&mut Runtime) -> T) -> T {
-    RUNTIME_FOR_TEST.with(|runtime| body(&mut runtime.borrow_mut()))
+process_state! {
+    /// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
+    /// no cycle or overlap budget charges it, so its bound is stated here and
+    /// reported per page as `cost.runtime_heap_bytes`.
+    ///
+    /// Retained heap, worst case, with every cap full (no maps: sorted vectors
+    /// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
+    /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
+    /// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
+    /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
+    /// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
+    /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
+    /// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
+    /// typical lengths), plus at most 4 MiB for enlarged stamp transients with
+    /// per-entry classification, outside `runtime_heap_bytes`;
+    /// no separate gauge-dedup allocation, outside `runtime_heap_bytes`. Counts only, so nothing is
+    /// refused at the bound.
+    ///
+    /// `observe_page` holds this lock for its whole evaluation and each equality
+    /// Skip for its own attestation, so every update is whole: a sticky veto,
+    /// attestation or cap meter is never overwritten, and one state exists. The
+    /// hold is bounded by the page budgets (16,384 member advances, 8,192 root
+    /// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
+    ///
+    /// Each critical section is one whole update; a poisoned value is still
+    /// bounded and only feeds counts.
+    fn with_runtime: Runtime = Runtime::new(); clear_poison: true
 }
 
 fn scope_of(sampling: &Option<sampled_scan::Context>) -> &str {

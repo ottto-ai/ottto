@@ -1579,6 +1579,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "resume_upper_bound_path"
             | "resume_census_window_end"
             | "historical_replay_generation"
+            | "copy_prefix_last_accepted_nonce"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
@@ -1631,6 +1632,10 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
@@ -1754,6 +1759,10 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
@@ -1799,7 +1808,8 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[88], "upload_context_proof");
     assert_eq!(fields[89], "archives");
     assert_eq!(fields[90], "archive_deferred_alarm_count");
-    assert_eq!(fields.len(), 91);
+    assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
+    assert_eq!(fields.len(), 92);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1824,6 +1834,10 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("archive_deferred_alarm_count");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("copy_prefix_last_accepted_nonce");
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -4213,6 +4227,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "upload_context_proof",
             "archives",
             "archive_deferred_alarm_count",
+            "copy_prefix_last_accepted_nonce",
         ]
     );
 }

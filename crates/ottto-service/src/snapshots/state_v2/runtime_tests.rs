@@ -24,7 +24,7 @@ fn save_with_mode(
     claim_only: bool,
     owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
-    save_with_custody(path, index, claim_only, owner, published(path)?)
+    save_locked(path, index, claim_only, owner, published(path)?)
 }
 
 /// Generation of a freshly imported native fixture store.

@@ -84,8 +84,9 @@ macro_rules! scan_index_fields {
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2] side,
-            archives => Misc (runtime none) [] side,
-            archive_deferred_alarm_count => Misc (runtime none) [] side,
+            // Codex archive custody: rows only while held (kinds_misc::ARCHIVE_KINDS).
+            archives => Misc (hook check_field) ["v1_field.archives" => 2] side,
+            archive_deferred_alarm_count => Misc (hook check_field) ["v1_field.archive_deferred_alarm_count" => 2] side,
             archive_pass => Misc (runtime none) [] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_account_family_witnesses" => 1, "raw_hold.claude_account_family_pending" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_family_pending" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,
             files => Files (map check_map) ["file.progress" => 1] own,
@@ -142,6 +143,8 @@ macro_rules! scan_index_fields {
             claude_history_emission => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
+            copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
+            copy_prefix_recovery_scope => Misc (runtime none) [] side,
         }
     };
     (@apply [each $m:ident] $($f:ident => $g:ident $store:tt [$($kind:literal => $introduced:literal),*] $heap:ident,)*) => {
@@ -170,7 +173,7 @@ pub(super) enum Group {
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 2;
+pub(super) const LAYOUT: u32 = 3;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS

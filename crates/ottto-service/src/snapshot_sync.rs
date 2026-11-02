@@ -6644,10 +6644,11 @@ fn prepare_sync_source_inner(
     }
 
     // The configured-MCP context-footprint harvest runs on its own slower
-    // schedule (run-at-start + every 6 h, `spawn_mcp_inventory_sync`), NOT on the
-    // 5-minute snapshot sync: each harvest spawns every configured MCP server's
-    // stdio process, so doing it every cycle would be needlessly intrusive and
-    // re-POST unchanged inventories 12×/hour. See `crate::mcp_inventory`.
+    // schedule (run-at-start + every 6 h, `spawn_mcp_inventory_sync_for_daemon`),
+    // NOT on the 5-minute snapshot sync: each harvest spawns every configured
+    // MCP server's stdio process, so doing it every cycle would be needlessly
+    // intrusive and re-POST unchanged inventories 12×/hour. See
+    // `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
         withdraw_source_manifest(

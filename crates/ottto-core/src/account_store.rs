@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ottto_protocol::{LocalAccountBinding, SourceHealth};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -201,323 +202,257 @@ pub struct LocalSourceState {
     pub last_health: Option<SourceHealth>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileAccountStore {
-    path: PathBuf,
+/// How a store reads its file: stores differ in whether the read is capped and in
+/// the error context a failed open reports.
+enum BodyRead {
+    Uncapped,
+    /// Capped; a failed open reports `open <noun> <path>`.
+    Capped(crate::CredentialFileCapRefused),
+    /// Capped; a failed open reports `read <noun> <path>`.
+    CappedOpenAsRead(crate::CredentialFileCapRefused),
 }
 
-impl FileAccountStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
+/// One store's JSON file: its path, the noun its error messages use and how its
+/// body is read.
+struct JsonFile<'a> {
+    path: &'a Path,
+    noun: &'static str,
+    read: BodyRead,
+}
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn load(&self) -> Result<LocalAccountBinding> {
-        if !self.path.exists() {
-            return Ok(LocalAccountBinding::not_connected());
+impl JsonFile<'_> {
+    fn read_body(&self) -> Result<String> {
+        let path = self.path;
+        let noun = self.noun;
+        match self.read {
+            BodyRead::Uncapped => {
+                fs::read_to_string(path).with_context(|| format!("read {noun} {}", path.display()))
+            }
+            BodyRead::Capped(cap) => {
+                let file = fs::File::open(path)
+                    .with_context(|| format!("open {noun} {}", path.display()))?;
+                crate::credential_file::read(file, cap)
+                    .with_context(|| format!("read {noun} {}", path.display()))
+            }
+            BodyRead::CappedOpenAsRead(cap) => fs::File::open(path)
+                .and_then(|file| crate::credential_file::read(file, cap))
+                .with_context(|| format!("read {noun} {}", path.display())),
         }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read account binding {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse account binding {}", self.path.display()))
     }
 
-    pub fn save(&self, account: &LocalAccountBinding) -> Result<()> {
+    /// Parses the file into `T`, or returns `missing()` when there is no file.
+    fn load_or<T: DeserializeOwned>(&self, missing: impl FnOnce() -> T) -> Result<T> {
+        self.load_or_parsing_as(self.noun, missing)
+    }
+
+    /// [`Self::load_or`] with a different noun in the parse error only.
+    fn load_or_parsing_as<T: DeserializeOwned>(
+        &self,
+        parse_noun: &str,
+        missing: impl FnOnce() -> T,
+    ) -> Result<T> {
+        if !self.path.exists() {
+            return Ok(missing());
+        }
+        let body = self.read_body()?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("parse {parse_noun} {}", self.path.display()))
+    }
+
+    fn save<T: Serialize>(&self, value: &T) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             create_secret_dir(parent)?;
         }
-        let body = serde_json::to_vec_pretty(account)?;
-        write_user_only(&self.path, &body)
+        let body = serde_json::to_vec_pretty(value)?;
+        write_user_only(self.path, &body)
     }
 
-    pub fn reset(&self) -> Result<Option<LocalAccountBinding>> {
+    /// Loads the file and then removes it; `None` when there is no file. A file
+    /// that does not load stays in place.
+    fn take<T>(&self, load: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
         if !self.path.exists() {
             return Ok(None);
         }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove account binding {}", self.path.display()))?;
+        let existing = load()?;
+        fs::remove_file(self.path)
+            .with_context(|| format!("remove {} {}", self.noun, self.path.display()))?;
         Ok(Some(existing))
     }
 }
 
-impl Default for FileAccountStore {
-    fn default() -> Self {
-        Self::new(default_account_path())
+/// The part every file store shares: the struct, `new`, `path`, `save`, and
+/// `Default` when the store has a default path. Each store writes its own `load`
+/// and `reset`, whose missing-file results differ.
+macro_rules! json_file_store {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident {
+            noun: $noun:literal,
+            read: $read:expr,
+            saves: $saved:ty,
+            $(default_path: $default_path:ident,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $name {
+            path: PathBuf,
+        }
+
+        impl $name {
+            pub fn new(path: impl Into<PathBuf>) -> Self {
+                Self { path: path.into() }
+            }
+
+            pub fn path(&self) -> &Path {
+                &self.path
+            }
+
+            pub fn save(&self, value: &$saved) -> Result<()> {
+                self.file().save(value)
+            }
+
+            fn file(&self) -> JsonFile<'_> {
+                JsonFile {
+                    path: &self.path,
+                    noun: $noun,
+                    read: $read,
+                }
+            }
+        }
+
+        $(
+            impl Default for $name {
+                fn default() -> Self {
+                    Self::new($default_path())
+                }
+            }
+        )?
+    };
+}
+
+json_file_store! {
+    pub struct FileAccountStore {
+        noun: "account binding",
+        read: BodyRead::Uncapped,
+        saves: LocalAccountBinding,
+        default_path: default_account_path,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileConnectionStore {
-    path: PathBuf,
+impl FileAccountStore {
+    pub fn load(&self) -> Result<LocalAccountBinding> {
+        self.file().load_or(LocalAccountBinding::not_connected)
+    }
+
+    pub fn reset(&self) -> Result<Option<LocalAccountBinding>> {
+        self.file().take(|| self.load())
+    }
+}
+
+json_file_store! {
+    pub struct FileConnectionStore {
+        noun: "connection binding",
+        read: BodyRead::Capped(crate::CredentialFileCapRefused::ConnectionBinding),
+        saves: LocalConnectionBinding,
+        default_path: default_connection_path,
+    }
 }
 
 impl FileConnectionStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn load(&self) -> Result<Option<LocalConnectionBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = crate::credential_file::read(
-            fs::File::open(&self.path)
-                .with_context(|| format!("open connection binding {}", self.path.display()))?,
-            crate::CredentialFileCapRefused::ConnectionBinding,
-        )
-        .with_context(|| format!("read connection binding {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse connection binding {}", self.path.display()))
-    }
-
-    pub fn save(&self, connection: &LocalConnectionBinding) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(connection)?;
-        write_user_only(&self.path, &body)
+        self.file().load_or(|| None)
     }
 
     pub fn reset(&self) -> Result<Option<LocalConnectionBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove connection binding {}", self.path.display()))?;
-        Ok(existing)
+        self.file().take(|| self.load()).map(Option::flatten)
     }
 }
 
-impl Default for FileConnectionStore {
-    fn default() -> Self {
-        Self::new(default_connection_path())
+json_file_store! {
+    /// Reads and writes one source's `<support>/sources/<slug>-state.json` file,
+    /// mirroring `FileConnectionStore`. There is no `Default` because the path is
+    /// per-source; build it from `default_sources_dir()` +
+    /// `source_state_file_name(slug)`.
+    pub struct FileSourceStateStore {
+        noun: "source state",
+        read: BodyRead::Uncapped,
+        saves: LocalSourceState,
     }
-}
-
-/// Reads and writes one source's `<support>/sources/<slug>-state.json` file,
-/// mirroring `FileConnectionStore`. There is no `Default` because the path is
-/// per-source; build it from `default_sources_dir()` +
-/// `source_state_file_name(slug)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSourceStateStore {
-    path: PathBuf,
 }
 
 impl FileSourceStateStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn load(&self) -> Result<Option<LocalSourceState>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read source state {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse source state {}", self.path.display()))
-    }
-
-    pub fn save(&self, state: &LocalSourceState) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(state)?;
-        write_user_only(&self.path, &body)
+        self.file().load_or(|| None)
     }
 
     pub fn reset(&self) -> Result<Option<LocalSourceState>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove source state {}", self.path.display()))?;
-        Ok(existing)
+        self.file().take(|| self.load()).map(Option::flatten)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileDeviceStore {
-    path: PathBuf,
+json_file_store! {
+    pub struct FileDeviceStore {
+        noun: "device binding",
+        read: BodyRead::CappedOpenAsRead(crate::CredentialFileCapRefused::DeviceBinding),
+        saves: LocalDeviceBinding,
+        default_path: default_device_path,
+    }
 }
 
 impl FileDeviceStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn read_bounded(&self) -> Result<String> {
-        crate::credential_file::read(
-            fs::File::open(&self.path)?,
-            crate::CredentialFileCapRefused::DeviceBinding,
-        )
-        .map_err(Into::into)
-    }
-
     pub fn load(&self) -> Result<Option<LocalDeviceBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = self
-            .read_bounded()
-            .with_context(|| format!("read device binding {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse device binding {}", self.path.display()))
-    }
-
-    pub fn save(&self, device: &LocalDeviceBinding) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(device)?;
-        write_user_only(&self.path, &body)
+        self.file().load_or(|| None)
     }
 
     pub fn load_with_credential_generation(&self) -> Result<Option<LocalDeviceCredentialBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = self
-            .read_bounded()
-            .with_context(|| format!("read device binding {}", self.path.display()))?;
-        serde_json::from_str(&body).with_context(|| {
-            format!(
-                "parse generation-bound device binding {}",
-                self.path.display()
-            )
-        })
+        self.file()
+            .load_or_parsing_as("generation-bound device binding", || None)
     }
 
     pub fn save_with_credential_generation(
         &self,
         device: &LocalDeviceCredentialBinding,
     ) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(device)?;
-        write_user_only(&self.path, &body)
+        self.file().save(device)
     }
 
     pub fn reset(&self) -> Result<Option<LocalDeviceBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove device binding {}", self.path.display()))?;
-        Ok(existing)
+        self.file().take(|| self.load()).map(Option::flatten)
     }
 }
 
-impl Default for FileDeviceStore {
-    fn default() -> Self {
-        Self::new(default_device_path())
+json_file_store! {
+    pub struct FilePendingDeviceCredentialStore {
+        noun: "pending device credential",
+        read: BodyRead::Capped(crate::CredentialFileCapRefused::PendingDeviceCredential),
+        saves: PendingDeviceCredentialPreparation,
+        default_path: default_pending_device_credential_path,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilePendingDeviceCredentialStore {
-    path: PathBuf,
 }
 
 impl FilePendingDeviceCredentialStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn load(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = crate::credential_file::read(
-            fs::File::open(&self.path).with_context(|| {
-                format!("open pending device credential {}", self.path.display())
-            })?,
-            crate::CredentialFileCapRefused::PendingDeviceCredential,
-        )
-        .with_context(|| format!("read pending device credential {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse pending device credential {}", self.path.display()))
-    }
-
-    pub fn save(&self, pending: &PendingDeviceCredentialPreparation) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(pending)?;
-        write_user_only(&self.path, &body)
+        self.file().load_or(|| None)
     }
 
     pub fn reset(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove pending device credential {}", self.path.display()))?;
-        Ok(existing)
+        self.file().take(|| self.load()).map(Option::flatten)
     }
 }
 
-impl Default for FilePendingDeviceCredentialStore {
-    fn default() -> Self {
-        Self::new(default_pending_device_credential_path())
+json_file_store! {
+    pub struct FileMachineStore {
+        noun: "machine binding",
+        read: BodyRead::Uncapped,
+        saves: LocalMachineBinding,
+        default_path: default_machine_path,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileMachineStore {
-    path: PathBuf,
 }
 
 impl FileMachineStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn load(&self) -> Result<Option<LocalMachineBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read machine binding {}", self.path.display()))?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("parse machine binding {}", self.path.display()))
-    }
-
-    pub fn save(&self, machine: &LocalMachineBinding) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            create_secret_dir(parent)?;
-        }
-        let body = serde_json::to_vec_pretty(machine)?;
-        write_user_only(&self.path, &body)
+        self.file().load_or(|| None)
     }
 
     pub fn load_or_create(
@@ -537,19 +472,7 @@ impl FileMachineStore {
     }
 
     pub fn reset(&self) -> Result<Option<LocalMachineBinding>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let existing = self.load()?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("remove machine binding {}", self.path.display()))?;
-        Ok(existing)
-    }
-}
-
-impl Default for FileMachineStore {
-    fn default() -> Self {
-        Self::new(default_machine_path())
+        self.file().take(|| self.load()).map(Option::flatten)
     }
 }
 
