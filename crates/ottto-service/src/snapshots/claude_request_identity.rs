@@ -2767,6 +2767,17 @@ pub(crate) struct KeyRef<'k> {
     basis: &'static str,
 }
 
+impl<'k> KeyRef<'k> {
+    /// The login this key tags with; read-only, for local review receipts.
+    pub(crate) fn login(&self) -> Option<&'k str> {
+        self.login
+    }
+
+    pub(crate) fn basis(&self) -> &'static str {
+        self.basis
+    }
+}
+
 impl KeyRef<'_> {
     fn matches(&self, key: &AuthorityKey) -> bool {
         self.basis == key.basis

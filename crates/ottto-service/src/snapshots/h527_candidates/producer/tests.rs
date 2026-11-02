@@ -175,6 +175,7 @@ fn fixture() -> Fixture {
             prior_refusal_body_witness: sha256_hex(format!("refused-{ordinal}").as_bytes()),
             transcript_path: path,
             b2_first_ack_order: (ordinal == 3).then_some(1),
+            contract5_evidence: None,
         });
     }
     write_transcript(
@@ -1795,4 +1796,253 @@ fn synthetic_zero_peer_excludes_only_a_synthetic_zero_target() {
         }
         fs::remove_dir_all(fixture.root).unwrap();
     }
+}
+
+// --- Contract 5 from a target's own local request evidence -----------------
+
+const C5_ORDINAL: u64 = 18;
+
+fn c5_login(fill: char) -> String {
+    fill.to_string().repeat(64)
+}
+
+/// Target 18 gets four own requests; its sidecars name a login for `a`, `b`
+/// and `d` only (`c` falls in a capture gap). Returns the named sidecars.
+fn c5_fixture(fixture: &Fixture) -> InputContract5Evidence {
+    let index = (C5_ORDINAL - 1) as usize;
+    let session = fixture.input.targets[index].source_session_id.clone();
+    write_transcript(
+        &fixture.input.targets[index].transcript_path,
+        &session,
+        &[
+            ("req-t18-a", 11, 2, 100),
+            ("req-t18-b", 12, 2, 100),
+            ("req-t18-c", 13, 2, 100),
+            ("req-t18-d", 14, 2, 100),
+        ],
+    );
+    let support = fixture.root.join("support");
+    let file = format!("{}.jsonl", sha256_hex(session.as_bytes()));
+    let api_path = support
+        .join(crate::claude_local_otel::STORE_DIR)
+        .join(&file);
+    let trace_path = support
+        .join(crate::claude_local_otel::TRACE_STORE_DIR)
+        .join(&file);
+    let evidenced = [("req-t18-a", 'a'), ("req-t18-b", 'b'), ("req-t18-d", 'a')];
+    let api = evidenced
+        .iter()
+        .enumerate()
+        .map(|(sequence, (request_id, login))| {
+            let mut row = crate::snapshots::tests::complete_api_row(
+                &session,
+                request_id,
+                sequence as u64 + 1,
+                10,
+                10,
+                0,
+            );
+            row.account_identifier_hash = Some(c5_login(*login));
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).expect("row"))
+            );
+            serde_json::to_string(&row).expect("row") + "\n"
+        })
+        .collect::<String>();
+    let trace = evidenced
+        .iter()
+        .map(|(request_id, _)| {
+            serde_json::to_string(&crate::snapshots::tests::complete_trace_row(
+                &session, request_id, "",
+            ))
+            .expect("row")
+                + "\n"
+        })
+        .collect::<String>();
+    for (path, rows) in [(&api_path, api), (&trace_path, trace)] {
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, rows).expect("write sidecar");
+    }
+    InputContract5Evidence {
+        api_sidecar_path: fs::canonicalize(api_path).expect("canonical"),
+        trace_sidecar_path: fs::canonicalize(trace_path).expect("canonical"),
+    }
+}
+
+fn without_identity(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| {
+                    !["account_identifier_hash", "evidence_ref", "identity_parts"]
+                        .contains(&key.as_str())
+                })
+                .map(|(key, value)| (key.clone(), without_identity(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(without_identity).collect()),
+        other => other.clone(),
+    }
+}
+
+/// [regress] Only requests with their own local request evidence are tagged,
+/// from that evidence; the one in the capture gap stays untagged (no carry
+/// from its neighbours), and a missing paired sidecar holds without tags.
+#[test]
+fn contract5_target_tags_own_evidenced_requests_and_leaves_the_gap_untagged() {
+    let fixture = fixture();
+    let named = c5_fixture(&fixture);
+    let mut input = fixture.input.clone();
+    input.targets[(C5_ORDINAL - 1) as usize].contract5_evidence = Some(named.clone());
+    let output = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
+    let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
+    let report = target_report(&artifact, C5_ORDINAL);
+    assert_eq!(
+        report["candidate_status"], "computed_unqualified",
+        "{report}"
+    );
+    let c5 = &report["contract5"];
+    assert_eq!(c5["counted_request_count"], 4, "{c5}");
+    assert_eq!(c5["tagged_request_count"], 3);
+    assert_eq!(c5["untagged_request_count"], 1);
+    assert_eq!(c5["tagged_request_counts_by_login_desc"], json!([2, 1]));
+    assert_eq!(
+        c5["binding_change"].as_str().map(|t| t.starts_with("none")),
+        Some(true)
+    );
+    let item = body_item(report);
+    assert_eq!(item["request_evidence"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        item["request_evidence"][0]["identity_basis"],
+        "telemetry_login"
+    );
+    let rows = item["usage_buckets"][0]["model_usage"]
+        .as_array()
+        .expect("rows");
+    assert_eq!(rows.len(), 1);
+    let parts = rows[0]["identity_parts"].as_array().expect("parts");
+    let part = |login: Option<String>| {
+        parts
+            .iter()
+            .find(|part| {
+                part.get("account_identifier_hash").and_then(Value::as_str) == login.as_deref()
+            })
+            .unwrap_or_else(|| panic!("part for {login:?}: {parts:?}"))
+    };
+    assert_eq!(part(Some(c5_login('a')))["request_count"], 2);
+    assert_eq!(part(Some(c5_login('a')))["input_tokens"], 11 + 14);
+    assert_eq!(part(Some(c5_login('b')))["request_count"], 1);
+    // The gap request between `b` and `d` is untagged and carries no login.
+    let gap = part(None);
+    assert_eq!(gap["request_count"], 1);
+    assert_eq!(gap["input_tokens"], 13);
+    assert!(gap.get("evidence_ref").map_or(true, Value::is_null));
+    assert_eq!(parts.len(), 3);
+
+    // A missing paired sidecar never tags: the target holds without a body.
+    fs::remove_file(&named.trace_sidecar_path).expect("remove trace");
+    let output = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
+    let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
+    let report = target_report(&artifact, C5_ORDINAL);
+    assert_eq!(report["candidate_status"], "held");
+    assert!(report["held_detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("contract-5")));
+    assert!(report.get("body").is_none());
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+/// [money] A target without the field is byte-identical whether or not
+/// another target carries it, an input without the field still parses, and
+/// tagging moves no usage: totals and identity-free rows are unchanged.
+#[test]
+fn contract5_is_opt_in_per_target_and_moves_no_money() {
+    let fixture = fixture();
+    let named = c5_fixture(&fixture);
+    let plain = produce(&fixture.input, &"0".repeat(64), &fixture_build()).expect("produce");
+    let mut input = fixture.input.clone();
+    input.targets[(C5_ORDINAL - 1) as usize].contract5_evidence = Some(named);
+    let tagged = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
+    let (mut plain_artifact, mut tagged_artifact): (Value, Value) = (
+        serde_json::from_str(&plain.artifact_json).expect("artifact"),
+        serde_json::from_str(&tagged.artifact_json).expect("artifact"),
+    );
+    for ordinal in 1..C5_ORDINAL {
+        assert_eq!(
+            serde_json::to_string(target_report(&plain_artifact, ordinal)).unwrap(),
+            serde_json::to_string(target_report(&tagged_artifact, ordinal)).unwrap(),
+            "target {ordinal}"
+        );
+    }
+    let plain_report = target_report(&plain_artifact, C5_ORDINAL).clone();
+    let tagged_report = target_report(&tagged_artifact, C5_ORDINAL).clone();
+    assert!(plain_report.get("contract5").is_none());
+    let (plain_item, tagged_item) = (body_item(&plain_report), body_item(&tagged_report));
+    assert!(serialized_request_identity(
+        plain_report["body"]["unqualified_batch_request_json"]
+            .as_str()
+            .unwrap()
+    )
+    .unwrap()
+    .untagged());
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "request_count",
+    ] {
+        assert_eq!(plain_item[field], tagged_item[field], "{field}");
+    }
+    assert_eq!(
+        without_identity(&plain_item["usage_buckets"]),
+        without_identity(&tagged_item["usage_buckets"])
+    );
+    assert_eq!(
+        without_identity(&plain_item["model_usage"]),
+        without_identity(&tagged_item["model_usage"])
+    );
+    assert_eq!(plain_report["partition"], tagged_report["partition"]);
+    // No session account binding is emitted or changed by tagging.
+    assert_eq!(
+        plain_item.get("session_account_evidence"),
+        tagged_item.get("session_account_evidence")
+    );
+    // Everything outside target 18's own report and binding is identical.
+    for artifact in [&mut plain_artifact, &mut tagged_artifact] {
+        let object = artifact.as_object_mut().expect("artifact");
+        object.remove("targets");
+        let bindings = object["qualification_reports"]
+            .as_array_mut()
+            .expect("bindings");
+        bindings.retain(|binding| {
+            binding["session_key_sha256"] != key(&session_id(C5_ORDINAL)).as_str()
+        });
+    }
+    assert_eq!(plain_artifact, tagged_artifact);
+
+    // The v2 bundle shape without the field still parses; the field is
+    // optional per target and strict inside.
+    let target = json!({
+        "source_session_id": session_id(1),
+        "session_key_sha256": key(&session_id(1)),
+        "prior_refusal_body_witness": "w",
+        "transcript_path": "/x.jsonl",
+        "b2_first_ack_order": null,
+    });
+    let parsed: InputTarget = serde_json::from_value(target.clone()).expect("v2 target");
+    assert!(parsed.contract5_evidence.is_none());
+    let mut with = target.clone();
+    with["contract5_evidence"] = json!({"api_sidecar_path": "/a", "trace_sidecar_path": "/t"});
+    assert!(serde_json::from_value::<InputTarget>(with.clone())
+        .expect("c5 target")
+        .contract5_evidence
+        .is_some());
+    with["contract5_evidence"]["extra"] = json!(1);
+    assert!(serde_json::from_value::<InputTarget>(with).is_err());
+    let _ = fs::remove_dir_all(&fixture.root);
 }

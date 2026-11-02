@@ -3,9 +3,10 @@
 //!
 //! It reads only the files the bundle names: the 18 target transcripts and
 //! every `.jsonl` file under the named peer roots, plus an optional read-only
-//! snapshot of the existing census index. It never touches upload progress,
-//! sidecars or network, and writes only
-//! to its own new output directory.
+//! snapshot of the existing census index and, for a target that names them,
+//! its own paired local OTEL request sidecars (read only). It never touches
+//! upload progress or network, and writes only to its own new output
+//! directory.
 //!
 //! Steps, in this order:
 //!
@@ -35,10 +36,15 @@
 //!    totals and usage rows exactly. The ordinary daemon serializer then writes
 //!    the one-item batch body.
 //! 6. Record, for every kept shared request, the keeping root and its tag
-//!    state. This producer never applies a Contract-5 request-identity permit
-//!    (pinned here, whatever the ordinary pipeline does), so every request
-//!    stays untagged under its starting subscription; a parsed, rebuilt or
-//!    serialized body carrying request identity is held as unsupported.
+//!    state. A target without `contract5_evidence` gets no Contract-5
+//!    request-identity permit (pinned here, whatever the ordinary pipeline
+//!    does): every request stays untagged under its starting subscription,
+//!    and a parsed, rebuilt or serialized body carrying request identity is
+//!    held as unsupported. A target with it is tagged by the ordinary
+//!    contract-5 transcript classifier and grouping from its own sidecars
+//!    only: a request without its own evidence stays untagged (no carry),
+//!    usage and totals are unchanged (placement only), and no session account
+//!    binding is emitted or changed.
 //!
 //! Bodies go only into the unqualified diagnostic artifact. The operator
 //! packet for the same run keeps every member held without a body.
@@ -492,6 +498,22 @@ pub(crate) struct InputTarget {
     /// SOURCE's first-ACK order for this session's accepted history, if known.
     /// Lower is earlier. Absent sorts after every known value.
     pub(crate) b2_first_ack_order: Option<u64>,
+    /// Optional: this target's own local request evidence. Only a target that
+    /// names it gets contract-5 per-request tags; every other target's output
+    /// is unchanged.
+    #[serde(default)]
+    pub(crate) contract5_evidence: Option<InputContract5Evidence>,
+}
+
+/// The target's own paired local OTEL sidecars, at the ordinary daemon paths
+/// for its request-owner root (`<support>/local-otel/claude-code-effort/` and
+/// `<support>/local-otel/claude-code-trace-ownership/`, file
+/// `<sha256(root)>.jsonl`). Read only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputContract5Evidence {
+    pub(crate) api_sidecar_path: PathBuf,
+    pub(crate) trace_sidecar_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3134,6 +3156,25 @@ fn build_target(
         );
     }
 
+    // Contract 5 only for a target whose input names its own local request
+    // evidence; every other target keeps today's untagged body.
+    let contract5 = match target.contract5_evidence.as_ref() {
+        None => None,
+        Some(named) => match apply_contract5(
+            target,
+            member,
+            named,
+            &mut item,
+            &allocation.kept_shared[index],
+            &peers.hits[index],
+        ) {
+            Ok(applied) => Some(applied),
+            Err(detail) => {
+                return hold(report, TargetHold::new(HeldReason::MissingEvidence, detail))
+            }
+        },
+    };
+
     // Ordinary upload policy and serializer; cache upload stays disabled.
     apply_upload_policy(
         SnapshotSource::ClaudeCode,
@@ -3150,7 +3191,13 @@ fn build_target(
     // Pinned untagged: checked on the exact bytes, not inferred from the
     // pipeline stages this producer happens to skip.
     let body_identity = match serialized_request_identity(&body) {
-        Ok(identity) if identity.untagged() => identity,
+        Ok(identity)
+            if contract5
+                .as_ref()
+                .map_or(identity.untagged(), |applied| applied.matches_body(&identity)) =>
+        {
+            identity
+        }
         Ok(_) => {
             return hold(
                 report,
@@ -3178,6 +3225,18 @@ fn build_target(
             ),
         );
     }
+    if contract5
+        .as_ref()
+        .is_some_and(|applied| !applied.sidecars_unchanged())
+    {
+        return hold(
+            report,
+            TargetHold::new(
+                HeldReason::MissingEvidence,
+                "contract-5 request evidence changed during the run",
+            ),
+        );
+    }
 
     // SI: every kept shared request, its keeping root and tag state.
     let receipt_entries = allocation.kept_shared[index]
@@ -3188,15 +3247,25 @@ fn build_target(
                 .map(|other| members[*other].session_key_sha256.clone())
                 .collect::<Vec<_>>();
             other_keys.sort();
+            let basis = contract5
+                .as_ref()
+                .and_then(|applied| applied.tags.get(request_id))
+                .map(|(_, basis)| *basis);
+            let evidence_root = match basis {
+                Some(_) => json!(contract5
+                    .as_ref()
+                    .and_then(|applied| applied.evidence_root_session_key_sha256.as_deref())),
+                None => Value::Null,
+            };
             (
                 sha256_hex(request_id.as_bytes()),
                 json!({
                     "request_sha256": sha256_hex(request_id.as_bytes()),
                     "keeping_root_session_key_sha256": member.session_key_sha256,
                     "other_holder_session_key_sha256s": other_keys,
-                    "tag_state": "untagged",
-                    "evidence_root_session_key_sha256": Value::Null,
-                    "evidence_basis": Value::Null,
+                    "tag_state": if basis.is_some() { "tagged" } else { "untagged" },
+                    "evidence_root_session_key_sha256": evidence_root,
+                    "evidence_basis": basis,
                 }),
             )
         })
@@ -3215,19 +3284,30 @@ fn build_target(
             )
         }
     };
+    let receipt_tagged = receipt_entries
+        .iter()
+        .filter(|entry| entry["tag_state"] == "tagged")
+        .count();
     report["identity_receipt"] = json!({
         "identity_rule": super::B2_IDENTITY_RULE,
         "kept_shared_request_count": receipt_entries.len(),
-        "tagged_count": 0,
-        "untagged_count": receipt_entries.len(),
+        "tagged_count": receipt_tagged,
+        "untagged_count": receipt_entries.len() - receipt_tagged,
         "group_sha256": receipt_group_sha256,
         "entries": receipt_entries,
         "body_request_evidence_count": body_identity.request_evidence,
         "body_rows_with_identity": body_identity.rows_with_identity,
         "body_session_account_evidence_present": item.session_account_evidence.is_some(),
         "allocation_identity_changes": identity_changes,
-        "note": "no Contract-5 permit in this producer: every kept request is untagged under its starting subscription; an identity-less body cannot authorize replacing an existing name",
+        "note": if contract5.is_some() {
+            "contract-5 tags from this target's own local request evidence only: a request without it stays untagged, and no session account binding is emitted or changed"
+        } else {
+            "no Contract-5 permit in this producer: every kept request is untagged under its starting subscription; an identity-less body cannot authorize replacing an existing name"
+        },
     });
+    if let Some(applied) = &contract5 {
+        report["contract5"] = applied.report.clone();
+    }
     let estimate = if matched.is_empty() {
         estimate_dollars(input.catalog_prices.as_ref(), original, &excluded_ids)
     } else {
@@ -3317,6 +3397,302 @@ fn serialized_request_identity(body: &str) -> Result<BodyIdentity, String> {
             .count() as u64;
     }
     Ok(identity)
+}
+
+/// A target's contract-5 tags, applied from its own local request evidence.
+struct Contract5Applied {
+    /// Kept request id -> (login, basis) for each request the body tags.
+    tags: BTreeMap<String, (String, &'static str)>,
+    /// The target's own key when it is its sidecars' request-owner root.
+    evidence_root_session_key_sha256: Option<String>,
+    /// (path, size, sha256) of each sidecar as read.
+    sidecars: Vec<(PathBuf, u64, String)>,
+    report: Value,
+}
+
+impl Contract5Applied {
+    /// The serialized body carries identity exactly when a request is tagged.
+    fn matches_body(&self, identity: &BodyIdentity) -> bool {
+        let tagged = !self.tags.is_empty();
+        (identity.request_evidence > 0) == tagged && (identity.rows_with_identity > 0) == tagged
+    }
+
+    fn sidecars_unchanged(&self) -> bool {
+        self.sidecars.iter().all(|(path, size, sha)| {
+            hash_file(path, PEER_FILE_BYTES_CEILING)
+                .is_ok_and(|(now_size, now_sha)| now_size == *size && now_sha == *sha)
+        })
+    }
+}
+
+/// The support directory both named sidecars sit under, at the ordinary
+/// daemon paths for `root`; anything else is refused.
+fn contract5_support_dir(root: &str, named: &InputContract5Evidence) -> Result<PathBuf, String> {
+    let file = format!("{}.jsonl", sha256_hex(root.as_bytes()));
+    let refused = || "contract-5 evidence paths are not this target's own sidecars".to_string();
+    let support = named
+        .api_sidecar_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(refused)?
+        .to_path_buf();
+    let api = support
+        .join(crate::claude_local_otel::STORE_DIR)
+        .join(&file);
+    let trace = support
+        .join(crate::claude_local_otel::TRACE_STORE_DIR)
+        .join(&file);
+    if api != named.api_sidecar_path || trace != named.trace_sidecar_path {
+        return Err(refused());
+    }
+    for path in [&api, &trace] {
+        if fs::canonicalize(path).ok().as_ref() != Some(path) {
+            return Err("contract-5 evidence path is missing or not canonical".to_string());
+        }
+    }
+    Ok(support)
+}
+
+/// Contract 5 for one target, as the ordinary daemon tags it: the strict
+/// paired sidecar reads, the ordinary transcript classifier and the existing
+/// grouping (`apply_scan_with_ownership`, which feeds `Grouping::add_at` and
+/// `apply_grouped`). Own rows only: requests are keyed by this target's
+/// request-owner root, and one without its own evidence stays untagged. On
+/// any refusal `item` is left exactly as it was.
+fn apply_contract5(
+    target: &InputTarget,
+    member: &ApprovedMember,
+    named: &InputContract5Evidence,
+    item: &mut SnapshotItem,
+    kept_shared: &BTreeMap<String, Vec<usize>>,
+    peer_hits: &BTreeMap<String, PeerHit>,
+) -> Result<Contract5Applied, String> {
+    use crate::snapshots::claude_request_identity as identity;
+    let root = root_id(&target.source_session_id);
+    let support = contract5_support_dir(root, named)?;
+    let mut sidecars = Vec::with_capacity(2);
+    for path in [&named.api_sidecar_path, &named.trace_sidecar_path] {
+        let (size, sha) = hash_file(path, PEER_FILE_BYTES_CEILING)
+            .map_err(|_| "contract-5 request evidence unreadable".to_string())?;
+        sidecars.push((path.clone(), size, sha));
+    }
+    let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
+        &support,
+        [root.to_string()],
+    );
+    let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+        &support,
+        [root.to_string()],
+    );
+    if !api.health.is_complete() || !trace.is_complete() {
+        return Err("contract-5 request evidence read incomplete; no tags".to_string());
+    }
+    // The duplicate witness: requests another local transcript also carries.
+    // Only key presence is read.
+    let mut index = ScanIndex::default();
+    let owner = crate::snapshots::claude_duplicate_request_owner(root, &target.source_session_id);
+    for request_id in kept_shared.keys().chain(peer_hits.keys()) {
+        index
+            .claude_duplicate_request_owners
+            .entry(sha256_hex(request_id.as_bytes()))
+            .or_default()
+            .insert(owner.clone());
+    }
+    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let ownership = identity::TranscriptOwnership::after_census(
+        &index,
+        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+    );
+    let before = item.clone();
+    let tags = contract5_request_tags(
+        &before,
+        root,
+        &evidence,
+        &index.claude_duplicate_request_owners,
+    );
+    let outcome = identity::apply_scan_with_ownership(
+        std::slice::from_mut(item),
+        &evidence,
+        BTreeMap::new(),
+        &ownership,
+    );
+    let refusal = if outcome.sent != 1 {
+        Some("contract-5 tags not reproduced for this target; no tags")
+    } else if !placement_only(&before, item) {
+        Some("contract-5 tagging changed usage; placement only")
+    } else if before.session_account_evidence != item.session_account_evidence
+        || before.origin != item.origin
+    {
+        Some("contract-5 tagging would change the session account binding")
+    } else if tagged_requests_by_login(item) != tags_by_login(&tags) {
+        Some("contract-5 row tags differ from the per-request classification")
+    } else {
+        None
+    };
+    if let Some(refusal) = refusal {
+        *item = before;
+        return Err(refusal.to_string());
+    }
+    let counted = before
+        .claude_usage_occurrences
+        .values()
+        .filter(|occurrence| !occurrence.usage.is_zero())
+        .count();
+    let mut per_login = tags_by_login(&tags).into_values().collect::<Vec<_>>();
+    per_login.sort_unstable_by(|left, right| right.cmp(left));
+    let sidecar = |(path, size, sha): &(PathBuf, u64, String)| json!({"path_sha256": path_sha256(path), "size_bytes": size, "content_sha256": sha});
+    let report = json!({
+        "applied": "ordinary contract-5 transcript classifier and grouping",
+        "evidence_input": "contract5_evidence",
+        "api_sidecar": sidecar(&sidecars[0]),
+        "trace_sidecar": sidecar(&sidecars[1]),
+        "api_row_count": api.evidence.values().map(Vec::len).sum::<usize>(),
+        "trace_row_count": trace.evidence.values().map(Vec::len).sum::<usize>(),
+        "counted_request_count": counted,
+        "tagged_request_count": tags.len(),
+        "untagged_request_count": counted.saturating_sub(tags.len()),
+        "tagged_login_count": per_login.len(),
+        "tagged_request_counts_by_login_desc": per_login,
+        "body_request_identity_refusals": item.request_identity_refusals,
+        "carry": "none: a request without its own local request evidence stays untagged",
+        "binding_change": "none: no session account evidence is emitted or changed",
+        "usage_change": "none: rows, grain and totals are unchanged (placement only)",
+        "lifted_not_reproduced_stage": NOT_REPRODUCED_STAGES[0],
+        "still_not_reproduced": [
+            "org markers and status coverage are not attached; transcript bases are withdrawn before install either way",
+            "effort attachment is not applied; row grain is unchanged",
+            "session_account_binding",
+        ],
+    });
+    Ok(Contract5Applied {
+        tags,
+        evidence_root_session_key_sha256: (root == target.source_session_id)
+            .then(|| member.session_key_sha256.clone()),
+        sidecars,
+        report,
+    })
+}
+
+/// Each counted request's final tag, from the ordinary classifier with the
+/// facts the transcript sink gives it. Only telemetry bases survive the
+/// transcript-tag withdrawal, so only they are tags. Cross-checked against
+/// the installed rows before use.
+fn contract5_request_tags(
+    item: &SnapshotItem,
+    root: &str,
+    evidence: &crate::snapshots::claude_request_identity::ScanEvidence<'_>,
+    duplicates: &BTreeMap<String, BTreeSet<crate::snapshots::ClaudeDuplicateRequestOwner>>,
+) -> BTreeMap<String, (String, &'static str)> {
+    use crate::snapshots::claude_request_identity::{
+        classify_ref, IdentityRef, MarkerVerdict, RequestFacts, TELEMETRY, TELEMETRY_LOGIN,
+    };
+    use crate::snapshots::rfc3339_unix_seconds;
+    let desktop = item
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.entrypoint.as_deref())
+        == Some("claude-desktop");
+    let scan_unix_seconds = rfc3339_unix_seconds(&item.collected_at);
+    let session_start_unix_seconds = item
+        .source_started_at
+        .as_deref()
+        .and_then(rfc3339_unix_seconds);
+    let markers = item.claude_org_markers.as_deref();
+    let mut tags = BTreeMap::new();
+    for (request_id, occurrence) in &item.claude_usage_occurrences {
+        if occurrence.usage.is_zero() {
+            continue;
+        }
+        let facts = RequestFacts {
+            root,
+            source_session_id: &item.source_session_id,
+            request_id,
+            terminal_unix_seconds: occurrence
+                .timestamp
+                .as_deref()
+                .and_then(rfc3339_unix_seconds),
+            event_clock_complete: occurrence.event_clock_complete,
+            marker: markers.map_or(MarkerVerdict::None, |markers| {
+                markers.verdict(occurrence.sequence, desktop)
+            }),
+            desktop,
+            scan_unix_seconds,
+            email_home: markers.and_then(|markers| markers.email_home(occurrence.sequence)),
+            session_start_unix_seconds,
+            duplicated_elsewhere: !duplicates.is_empty()
+                && duplicates.contains_key(&sha256_hex(request_id.as_bytes())),
+        };
+        if let IdentityRef::Tagged(key) = classify_ref(evidence, &facts) {
+            if let (Some(login), basis @ (TELEMETRY | TELEMETRY_LOGIN)) = (key.login(), key.basis())
+            {
+                tags.insert(request_id.clone(), (login.to_string(), basis));
+            }
+        }
+    }
+    tags
+}
+
+fn tags_by_login(tags: &BTreeMap<String, (String, &'static str)>) -> BTreeMap<String, u64> {
+    let mut by_login = BTreeMap::new();
+    for (login, _) in tags.values() {
+        *by_login.entry(login.clone()).or_insert(0_u64) += 1;
+    }
+    by_login
+}
+
+/// Requests per login the installed bucket rows carry.
+fn tagged_requests_by_login(item: &SnapshotItem) -> BTreeMap<String, u64> {
+    let mut by_login = BTreeMap::new();
+    for row in item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+    {
+        match (&row.identity_parts, &row.account_identifier_hash) {
+            (Some(parts), _) => {
+                for part in parts {
+                    if let Some(login) = &part.account_identifier_hash {
+                        *by_login.entry(login.clone()).or_insert(0_u64) += part.request_count;
+                    }
+                }
+            }
+            (None, Some(login)) => {
+                *by_login.entry(login.clone()).or_insert(0_u64) += row.request_count;
+            }
+            (None, None) => {}
+        }
+    }
+    by_login
+}
+
+/// Tagging moves no usage: totals, buckets and every row equal the untagged
+/// item's once identity fields are removed.
+fn placement_only(before: &SnapshotItem, after: &SnapshotItem) -> bool {
+    fn rows(item: &SnapshotItem) -> Vec<Vec<crate::snapshots::SnapshotModelUsage>> {
+        let strip = |row: &crate::snapshots::SnapshotModelUsage| {
+            let mut row = row.clone();
+            row.account_identifier_hash = None;
+            row.evidence_ref = None;
+            row.identity_parts = None;
+            row
+        };
+        std::iter::once(item.model_usage.iter().map(strip).collect::<Vec<_>>())
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .map(|bucket| bucket.model_usage.iter().map(strip).collect::<Vec<_>>()),
+            )
+            .collect()
+    }
+    let starts = |item: &SnapshotItem| {
+        item.usage_buckets
+            .iter()
+            .map(|bucket| bucket.bucket_start.clone())
+            .collect::<Vec<_>>()
+    };
+    Dims::of_item(before) == Dims::of_item(after)
+        && starts(before) == starts(after)
+        && rows(before) == rows(after)
 }
 
 fn request_set_fingerprint(request_ids: &BTreeSet<String>) -> String {

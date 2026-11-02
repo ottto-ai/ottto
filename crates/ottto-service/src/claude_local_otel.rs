@@ -30,7 +30,7 @@ pub(crate) mod support_health;
 mod bounded_read;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
-const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
+pub(crate) const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 // Keep the usage-ledger revision: request_identity is additive local evidence,
