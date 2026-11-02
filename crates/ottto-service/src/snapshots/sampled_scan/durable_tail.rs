@@ -286,6 +286,19 @@ const PACE_SECS: u64 = 3600;
 const PACE_SANITY_SECS: u64 = 7 * 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
 
+/// Test clock: seconds a harness adds to every restart-restore pace read.
+/// Process-wide because a pass can run on a worker thread; zero unless set.
+#[cfg(test)]
+static PACE_CLOCK_ADVANCE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) fn set_pace_clock_advance(seconds: u64) {
+    PACE_CLOCK_ADVANCE_SECS.store(seconds, Ordering::Relaxed);
+}
+#[cfg(test)]
+fn pace_clock_advance() -> std::time::Duration {
+    std::time::Duration::from_secs(PACE_CLOCK_ADVANCE_SECS.load(Ordering::Relaxed))
+}
+
 fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
     // Backwards and implausibly large forwards jumps both EXPIRE.
     now.duration_since(at).is_ok_and(|age| {
@@ -1547,6 +1560,8 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::Instant,
     ) -> Result<RetailAttempt, RetailHold> {
+        #[cfg(test)]
+        let now = now + pace_clock_advance();
         if custody_node_bytes().map_or(true, |n| n > 1024) {
             return Err(RetailHold::AccountingLost);
         }
@@ -1717,7 +1732,7 @@ impl SharedCache {
             return false;
         };
         #[cfg(test)]
-        let now = stores.retail_full_now.unwrap_or(now);
+        let now = stores.retail_full_now.unwrap_or(now) + pace_clock_advance();
         let key = full_pace_key(source, key);
         // A held replay key keeps its Full spend in never-evicted custody.
         // The pace stamp remains the overflow fallback for unfunded keys.
@@ -3424,7 +3439,7 @@ impl SharedCache {
         }
         let now = SystemTime::now();
         #[cfg(test)]
-        let now = stores.retail_full_now.unwrap_or(now);
+        let now = stores.retail_full_now.unwrap_or(now) + pace_clock_advance();
         let extent =
             u32::try_from(extent).map_err(|_| Failure::Resource("rederive_unsupported"))?;
         let absent = !stores.retail_full_at.contains_key(&digest);

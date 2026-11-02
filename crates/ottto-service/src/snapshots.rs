@@ -298,6 +298,8 @@ pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec
 
 #[cfg(test)]
 pub(crate) use restart_restore::RestartRestoreForTest;
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::set_pace_clock_advance;
 mod sampled_audit;
 mod sampled_jsonl;
 #[cfg(test)]
