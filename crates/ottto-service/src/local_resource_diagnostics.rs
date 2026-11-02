@@ -1043,6 +1043,10 @@ struct Observation {
     footprint: footprint::Observation,
 }
 impl Observation {
+    /// A zero-window event: a timestamp and no resource measurements.
+    fn point() -> Self {
+        Self::between(0, None, None)
+    }
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
         Self {
             observed_unix_ms: SystemTime::now()
@@ -1169,17 +1173,7 @@ pub(crate) fn codex_census_fence(
         source: Source::Codex,
         // A point observation has no measured resource window. Do not take
         // extra CPU/RSS samples or invent numeric measurements for this event.
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts: Counts {
             phase,
             outcome,
@@ -1459,17 +1453,7 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
         process_id: std::process::id(),
         stage,
         source: Source::from_slug(source),
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts,
     });
 }
@@ -1858,17 +1842,7 @@ pub(crate) fn sampled_audit_comparison(
         process_id: std::process::id(),
         stage: "sampled_audit_comparison",
         source: Source::from_slug(source),
-        observation: Observation {
-            observed_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
-            wall_elapsed_us: 0,
-            footprint: Default::default(),
-            shared_process_cpu_delta_us: None,
-            process_lifetime_max_rss_bytes: None,
-            process_lifetime_max_rss_before_bytes: None,
-        },
+        observation: Observation::point(),
         counts: Counts {
             body_comparison_available: additive.1.is_some(),
             effective_body_changed: additive.0 != additive.1,

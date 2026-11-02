@@ -281,6 +281,27 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// The live route over a freshly opened session.
+fn active(
+    db: sqlite::Sqlite,
+    cx: KindCx,
+    identity: Identity,
+    path: &Path,
+    stamp: (u64, u64),
+) -> Arc<Runtime> {
+    Arc::new(Runtime {
+        active: true,
+        session: Mutex::new(Some(Session {
+            db,
+            cx,
+            identity,
+            path: path.to_owned(),
+            reload: false,
+            stamp,
+        })),
+    })
+}
+
 fn held<T>(result: Result<T>) -> Result<T> {
     let result = result.map_err(Hold::storage);
     if let Err(error) = &result {
@@ -395,17 +416,7 @@ fn load_with_custody(
             normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
             state.save_digests = Some(digests);
-            index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
-                active: true,
-                session: Mutex::new(Some(Session {
-                    db,
-                    cx,
-                    identity,
-                    path: path.to_owned(),
-                    reload: false,
-                    stamp,
-                })),
-            }));
+            index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
             register(state, &index)?;
             state.report_hold();
             telemetry::event("route", &"v2");
@@ -570,17 +581,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         );
         index.generation = stamp.0;
         let digests = kinds::baseline(index, &mut cx)?;
-        index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
-            active: true,
-            session: Mutex::new(Some(Session {
-                db,
-                cx,
-                identity,
-                path: path.to_owned(),
-                reload: false,
-                stamp,
-            })),
-        }));
+        index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
         telemetry::pass_start();
         register(state, index)?;
         state.save_digests = Some(digests);
@@ -593,15 +594,6 @@ fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Bind
 
 /// All save routes check independent evidence before any v1 CAS or publication.
 pub(in super::super) fn save_locked(
-    path: &Path,
-    index: &mut ScanIndex,
-    claim_only: bool,
-    progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
-    custody: bool,
-) -> Result<bool> {
-    save_with_custody(path, index, claim_only, progress_owner, custody)
-}
-fn save_with_custody(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,

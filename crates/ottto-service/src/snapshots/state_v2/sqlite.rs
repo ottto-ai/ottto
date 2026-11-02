@@ -390,13 +390,17 @@ fn lock_owner(path: &Path) -> Result<File> {
     let owned = file.metadata()?;
     let named = fs::symlink_metadata(&path)?;
     ensure!(
-        owned.dev() == named.dev() && owned.ino() == named.ino() && owned.nlink() == 1,
+        same_object(&owned, &named) && owned.nlink() == 1,
         "state_v2_object_changed"
     );
     private_file(&path)?;
     Ok(file)
 }
 
+/// Two metadata reads name the same filesystem object.
+fn same_object(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
 fn private_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
@@ -501,6 +505,27 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
 impl Sqlite {
     /// Journal OFF is confined to an unpublished O_EXCL .import database. A
     /// failed/partial import is discarded, never recovered or published.
+    /// A store over a just-opened connection; only `import` differs by route.
+    fn fresh(conn: Connection, path: &Path, import: bool, owner: File, owner_lock: File) -> Self {
+        Self {
+            conn: Some(conn),
+            path: path.into(),
+            import,
+            debt: false,
+            reload: false,
+            purge_policy: PurgePolicy::default(),
+            stats: MaintenanceStats::default(),
+            last_purge_attempt: None,
+            last_collection_check: None,
+            recovery_attempts_left: 0,
+            paths: kinds::private_paths,
+            references: kinds::references,
+            owner,
+            _owner_lock: owner_lock,
+            clean: false,
+            save_failure: None,
+        }
+    }
     pub(super) fn create_import(path: &Path) -> Result<Self> {
         ensure!(
             path.as_os_str()
@@ -527,28 +552,8 @@ impl Sqlite {
         private_file(path)?;
         let owned = file.metadata()?;
         let named = fs::symlink_metadata(path)?;
-        ensure!(
-            owned.dev() == named.dev() && owned.ino() == named.ino(),
-            "state_v2_object_changed"
-        );
-        let mut store = Self {
-            conn: Some(conn),
-            path: path.into(),
-            import: true,
-            debt: false,
-            reload: false,
-            purge_policy: PurgePolicy::default(),
-            stats: MaintenanceStats::default(),
-            last_purge_attempt: None,
-            last_collection_check: None,
-            recovery_attempts_left: 0,
-            paths: kinds::private_paths,
-            references: kinds::references,
-            owner: file,
-            _owner_lock: owner_lock,
-            clean: false,
-            save_failure: None,
-        };
+        ensure!(same_object(&owned, &named), "state_v2_object_changed");
+        let mut store = Self::fresh(conn, path, true, file, owner_lock);
         store.control("limits", &StorageLimits::current())?;
         super::telemetry::event("schema_layout", &"four_tables");
         Ok(store)
@@ -573,10 +578,7 @@ impl Sqlite {
         migrations::writer_supported(self.conn()?)?;
         let named = fs::symlink_metadata(&self.path)?;
         let owned = self.owner.metadata()?;
-        ensure!(
-            named.dev() == owned.dev() && named.ino() == owned.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&named, &owned), "state_v2_object_changed");
         Ok((
             self.read_control::<u64>("generation")?
                 .context("state_v2_generation_missing")?,
@@ -684,10 +686,7 @@ impl Sqlite {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let after = fs::symlink_metadata(path)?;
-        ensure!(
-            before.dev() == after.dev() && before.ino() == after.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&before, &after), "state_v2_object_changed");
         migrations::supported(&conn)?;
         settings(&conn, false)?;
         migrations::run(&conn)?;
@@ -712,24 +711,7 @@ impl Sqlite {
                 maintenance::size_budget(before.len().max(pages.saturating_mul(4096)), 10),
             )?;
         }
-        let mut store = Self {
-            conn: Some(conn),
-            path: path.into(),
-            import: false,
-            debt: false,
-            reload: false,
-            purge_policy: PurgePolicy::default(),
-            stats: MaintenanceStats::default(),
-            last_purge_attempt: None,
-            last_collection_check: None,
-            recovery_attempts_left: 0,
-            paths: kinds::private_paths,
-            references: kinds::references,
-            owner: file,
-            _owner_lock: owner_lock,
-            clean: false,
-            save_failure: None,
-        };
+        let mut store = Self::fresh(conn, path, false, file, owner_lock);
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
@@ -1775,10 +1757,7 @@ impl Sqlite {
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .context("state_v2_generation_missing")?;
         let after = fs::symlink_metadata(path)?;
-        ensure!(
-            before.dev() == after.dev() && before.ino() == after.ino(),
-            "state_v2_object_changed"
-        );
+        ensure!(same_object(&before, &after), "state_v2_object_changed");
         ensure!(
             generation >= identity.fence_generation,
             "state_v2_generation_rollback"
