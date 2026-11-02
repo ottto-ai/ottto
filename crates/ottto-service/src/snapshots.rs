@@ -705,22 +705,14 @@ pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
-const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
-/// (raw CC key, canonical selector key). Subagent first (priority dimension).
-const CLAUDE_ATTRIBUTION_FIELDS: [(&str, &str); 5] = [
-    ("attributionAgent", "attribution_subagent"),
-    ("attributionSkill", "attribution_skill"),
-    ("attributionPlugin", "attribution_plugin"),
-    ("attributionMcpServer", "attribution_mcp_server"),
-    ("attributionMcpTool", CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD),
-];
-/// The selector keys attribution capture writes: raw names, never persisted.
+/// Retired attribution selector keys, kept only for the pinned
+/// `SelectorCapture` shape and its refusal.
 const CLAUDE_ATTRIBUTION_SELECTOR_KEYS: [&str; 5] = [
-    CLAUDE_ATTRIBUTION_FIELDS[0].1,
-    CLAUDE_ATTRIBUTION_FIELDS[1].1,
-    CLAUDE_ATTRIBUTION_FIELDS[2].1,
-    CLAUDE_ATTRIBUTION_FIELDS[3].1,
-    CLAUDE_ATTRIBUTION_FIELDS[4].1,
+    "attribution_subagent",
+    "attribution_skill",
+    "attribution_plugin",
+    "attribution_mcp_server",
+    "attribution_mcp_tool",
 ];
 /// The backend's admission bound on `model_usage` rows per item and per bucket.
 const MAX_MODEL_USAGE_ROWS: usize = 100;
