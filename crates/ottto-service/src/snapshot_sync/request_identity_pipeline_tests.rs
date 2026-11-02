@@ -174,8 +174,7 @@ fn identity_pipeline_cycle(
         }
     };
     apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
-    let (preparation, mut index, mut scan) =
-        collect_native_preparation_with_rotation(preparation, false);
+    let (preparation, mut index, mut scan) = collect_native_preparation_with_rotation(preparation);
     let scanned_index = index.clone();
     let prepared_before_body = preparation.prepared_claude_evidence.is_some();
     apply_claude_local_evidence_to_scan_with_prepared(
@@ -715,7 +714,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
             }
         }
         previous_context = Some(context);
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         assert!(preparation.prepared_claude_evidence.is_some());
         assert!(scan.census_complete);
         assert_eq!(

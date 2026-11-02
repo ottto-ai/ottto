@@ -2316,6 +2316,8 @@ mod tests {
         fixture.wait_settled();
     }
 
+    /// [regress] A held stdout must reach the deadline even if the shell exits
+    /// before initialize is written (Linux CI failures on several PRs).
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -2325,13 +2327,15 @@ mod tests {
             if fill {
                 set_probe_fault(ProbeFault::FillStdin);
             }
+            let timeout = Duration::from_millis(500);
             let started = Instant::now();
-            assert!(probe_mcp(&fixture, false, Duration::from_millis(500))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("timed out"));
-            assert!(started.elapsed() < Duration::from_secs(2));
+            let error = probe_mcp(&fixture, false, timeout).unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= timeout,
+                "{mode}: probe failed before its deadline: {error:#}"
+            );
+            assert!(elapsed < Duration::from_secs(2));
             fixture.wait_started();
             assert!(!ProbeFixture::alive(fixture.pid("direct")));
             if fill {

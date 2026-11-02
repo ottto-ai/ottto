@@ -1551,6 +1551,20 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         {
             let mut stores = cache.durable().unwrap();
             let slot = stores.slot(ds).as_mut().unwrap();
+            // Consent erasure runs even while ordinary store work is disabled.
+            // Establish its verified-empty inventory before forbidding mutations;
+            // the synthetic pending records below contain no private labels.
+            let purge = slot
+                .store
+                .purge_private_labels(lock, |body| {
+                    codec::body_has_skill_labels(body).unwrap_or(true)
+                })
+                .unwrap();
+            assert_eq!((purge.erased, purge.refused), (0, 0));
+            assert_eq!(
+                slot.store.private_label_keys().unwrap(),
+                Some(BTreeSet::new())
+            );
             for record in &records {
                 assert_eq!(
                     slot.store
@@ -1621,10 +1635,21 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 slot.store.counters(),
             )
         };
-        // These hooks prove no write/unlink/sync, in addition to full disk equality.
-        store::test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("disabled rename"))));
-        store::test_hooks::set_before_unlink(Some(Box::new(|_| panic!("disabled unlink"))));
-        store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
+        // Count and refuse every mutation, including cleanup during unwinding.
+        // Panicking in these hooks can double-panic from a temp-file Drop.
+        let mutations = std::rc::Rc::new(std::cell::RefCell::new([0u64; 3]));
+        let reject_mutation = {
+            let mutations = mutations.clone();
+            move |kind: usize| {
+                mutations.borrow_mut()[kind] += 1;
+                Err(std::io::Error::other("disabled store mutation"))
+            }
+        };
+        let reject = reject_mutation.clone();
+        store::test_hooks::set_before_rename(Some(Box::new(move |_, _| reject(0))));
+        let reject = reject_mutation.clone();
+        store::test_hooks::set_before_unlink(Some(Box::new(move |_| reject(1))));
+        store::test_hooks::set_before_dir_sync(Some(Box::new(move |_| reject_mutation(2))));
         assert_eq!(cache.reconcile_pending_key(source, &key), None);
         assert_eq!(cache.durable_hold(source, &key, &index, &mut None), None);
         let ((mut index, degraded), events) = crate::local_resource_diagnostics::capture(|| {
@@ -1687,6 +1712,11 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             0
         );
         cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(
+            *mutations.borrow(),
+            [0; 3],
+            "disabled store performs no I/O"
+        );
         assert_eq!(store_snapshot(&dir), before);
         let mut stores = cache.durable().unwrap();
         assert_eq!(
@@ -1887,6 +1917,28 @@ pub(super) fn native_record_of(
         _ => apply_claude_code_line,
     };
     let mut parser = fixture::parser(source, path, File::open(path).unwrap(), apply);
+    parser
+        .prepare_acquisition(None, scope, None, 1_800_000_000)
+        .unwrap();
+    fixture::finish_record(&mut parser, scope, 1_800_000_000)
+}
+
+/// The Codex record as the production singleton read builds it: the active
+/// counting view is configured before the read (as the scan's group job does).
+pub(super) fn counted_codex_record_of(
+    path: &Path,
+    scope: &Scope,
+) -> (CachedJsonlReduction, Checkpoint) {
+    let mut parser = fixture::parser(
+        SnapshotSource::Codex,
+        path,
+        File::open(path).unwrap(),
+        apply_codex_line,
+    );
+    codex_counting_version::configure_group_once(
+        &mut parser.accumulator,
+        codex_counting_version::AckEvidence::None,
+    );
     parser
         .prepare_acquisition(None, scope, None, 1_800_000_000)
         .unwrap();
@@ -4356,10 +4408,19 @@ fn other_source_restore_after_return_release(
     index.save(&index_path).unwrap();
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let interp = Interpretation::of(source, &key, &index, false, &namespace);
-    let binding = expected(ds, source, &key, &scope, &index, &interp, None)
+    let (reduction, _) = counted_codex_record_of(&path, &scope);
+    let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
         .unwrap()
         .binding;
-    let (reduction, _) = native_record_of(&path, &scope, source);
+    // Format-3 scope binds the body's immutable (configured) counting.
+    binding.scope = v3_replay_scope(
+        source,
+        &scope,
+        &index,
+        &interp,
+        effective_revision(source),
+        &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
+    );
     let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
     let mut disk = fixture::store(&index_path, ds);
     assert_eq!(
@@ -4380,6 +4441,15 @@ fn other_source_restore_after_return_release(
         1
     );
     move || {
+        // Scoped restore requires real growth; a quiet file is a zero-input hold.
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
         let interp = Interpretation::of(source, &key, &index, false, &namespace);
         let restored = cache
             .durable_restore(
@@ -4428,6 +4498,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
         fn drop(&mut self) {
             super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
             crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|v| v.set(false));
+            crate::transcript_acquisition::OLD_CHECKPOINT_INVALID.with(|v| v.set(false));
             sampled_jsonl::preparation_tests::set(None);
         }
     }
@@ -4526,6 +4597,10 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     .with(|v| v.set(matches!(refusal, "dependency" | "large_dependency")));
                 crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
                     .with(|v| v.set(refusal == "prepare_io"));
+                // Audit debt never plans Full for a checkpoint (#870); an
+                // invalid one does, and keeps the original with its custody.
+                crate::transcript_acquisition::OLD_CHECKPOINT_INVALID
+                    .with(|v| v.set(refusal == "prepare_full"));
                 let mut header_removed = false;
                 let mut full_checked = false;
                 let mut metrics = (0, 0, 0);
@@ -4664,7 +4739,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 cache.retained().unwrap().peek(&key).is_some(),
                 "actual resident premise"
             );
-            let (mut index, idle, metrics) = run(
+            let (index, idle, metrics) = run(
                 index,
                 Some(cache.clone()),
                 "original",
@@ -4756,11 +4831,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 assert!(cache
                     .return_prepared_taken(key.clone(), Box::new(original))
                     .is_ok());
-                index
-                    .files
-                    .get_mut(&key)
-                    .unwrap()
-                    .set_unverified_deadline(1);
                 let facts = guard_facts.clone();
                 let checks = guard_checks.clone();
                 sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
@@ -4880,6 +4950,9 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     .any(|event| event["counts"]["active_current_bytes"] == 0));
                 sampled_jsonl::preparation_tests::set(None);
             }
+            // Request the fresh metadata census this quiet >=W step models; a
+            // refused census otherwise resumes its traversal and its 2026 clock.
+            index.traversal = None;
             // A quiet period longer than W cannot hide unread suffix: growth
             // was already fully counted and committed before entering quiet.
             let (next, quiet, metrics) = run(
@@ -4970,17 +5043,126 @@ fn assert_native_write_before_save(
     assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
 
+// Failure context contains only synthetic stages, closed selector kinds and counts.
+fn native_restore_context(
+    stage: String,
+    modes: impl std::fmt::Debug,
+    scan: &SourceScanResult,
+    cache: &SharedCache,
+    selector: Option<CandidateParseReason>,
+) -> serde_json::Value {
+    let counters = cache
+        .durable_counters(SnapshotSource::ClaudeCode)
+        .map(|(c, _)| {
+            serde_json::json!({
+                "restore_attempts": c.restore_attempts, "restored": c.restored,
+                "retail_full": c.retail_full, "stale_full": c.stale_full,
+                "active_bound_full_paced": c.active_bound, "resource_full": c.resource_full,
+                "ineligible": c.ineligible, "certificate_refused": c.certificate_refused,
+                "not_rederived": c.not_rederived, "durable_held": c.durable_held,
+            })
+        });
+    // Before policy/finalization, report the current projection's byte count.
+    // A cold size stays null until the test has actually built that side.
+    let projection = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SnapshotSource::ClaudeCode.api_slug().into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some("fixture".into()),
+        snapshots: scan.snapshots.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    serde_json::json!({
+        "stage": stage, "modes_full_tail_unchanged": format!("{modes:?}"),
+        "emitted_actual_cold": [Some(scan.snapshots.len()), None::<usize>],
+        "wire_bytes_actual_cold": [Some(serde_json::to_vec(&projection).unwrap().len()), None::<usize>],
+        "wire_finalized": false, "selector": format!("{selector:?}"), "counters": counters,
+    })
+}
+
+// Observe the real selection without changing the index or acquisition input.
+fn native_restore_selection<T>(run: impl FnOnce() -> T) -> (T, Option<CandidateParseReason>) {
+    #[cfg(target_os = "macos")]
+    {
+        let selected = std::rc::Rc::new(std::cell::Cell::new(None));
+        let captured = selected.clone();
+        let result = crate::snapshots::sampled_scan::test_hooks::with_after_selection(
+            move |_, reason| captured.set(reason),
+            run,
+        );
+        (result, selected.get())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (run(), None)
+    }
+}
+
+// Serialize both sides before enforcing the emission premise, so a failure
+// identifies which policy/finalization stage emptied the wire body. A re-read
+// that adds no money finalizes to the accepted body: a semantic no-op on both
+// sides (`emits == false`), never a second upload of the accepted prefix.
+fn native_restore_compare_wire(
+    actual: SnapshotBatchRequest,
+    cold: SnapshotBatchRequest,
+    emits: bool,
+    mut context: serde_json::Value,
+) {
+    let actual_wire = serde_json::to_vec(&actual).unwrap();
+    let cold_wire = serde_json::to_vec(&cold).unwrap();
+    context["emitted_actual_cold"] =
+        serde_json::json!([actual.snapshots.len(), cold.snapshots.len()]);
+    context["wire_bytes_actual_cold"] = serde_json::json!([actual_wire.len(), cold_wire.len()]);
+    context["wire_finalized"] = serde_json::json!(true);
+    assert_eq!(
+        !actual.snapshots.is_empty(),
+        emits,
+        "native_restore actual_wire_emits {context:?}"
+    );
+    assert_eq!(
+        !cold.snapshots.is_empty(),
+        emits,
+        "native_restore cold_wire_emits {context:?}"
+    );
+    // The batch contract rejects an empty batch; check it on emitting bodies.
+    if emits {
+        assert!(
+            validate_snapshot_batch_request(&actual).is_ok(),
+            "native_restore actual_wire_contract {context:?}"
+        );
+        assert!(
+            validate_snapshot_batch_request(&cold).is_ok(),
+            "native_restore cold_wire_contract {context:?}"
+        );
+    }
+    assert!(
+        actual_wire == cold_wire,
+        "native_restore exact_wire {context:?}"
+    );
+}
+
 // Movable native transition rows; no replacement money reducer/comparator.
 // Compare the exact production SnapshotBatchRequest serialization on the same physical file.
 fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
+    let request = a1a_batch(support, index, scan);
+    assert!(!scan.snapshots.is_empty(), "nonempty emitted money premise");
+    validate_snapshot_batch_request(&request).unwrap();
+    serde_json::to_vec(&request).unwrap()
+}
+
+fn a1a_batch(
+    support: &Path,
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) -> SnapshotBatchRequest {
     let source = SnapshotSource::ClaudeCode;
     crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, scan, index);
     index.veto_claude_history_emission(source, &mut scan.snapshots);
     index.bind_session_accounts(source, "a1a-fixture-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     finalize_scan_after_policy(source, scan, index);
-    assert!(!scan.snapshots.is_empty(), "nonempty emitted money premise");
-    let request = SnapshotBatchRequest {
+    SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: source.api_slug().into(),
         machine_id: "a".repeat(64),
@@ -4988,9 +5170,7 @@ fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) 
         snapshots: scan.snapshots.clone(),
         upload_policy: SnapshotUploadPolicy::default(),
         client_report: crate::client_report::ClientReport::empty(),
-    };
-    validate_snapshot_batch_request(&request).unwrap();
-    serde_json::to_vec(&request).unwrap()
+    }
 }
 
 fn a1a_row(request: &str, tokens: u64) -> String {
@@ -5168,7 +5348,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         disk.restart();
         assert!(disk.cache.retained_checkpoint(&key).is_none());
         assert!(disk.index.claude_usage_family_pending.is_empty());
-        let prior = disk.index.clone();
+        let mut prior = disk.index.clone();
+        // Runtime-only (serde skip): the sync caller re-activates the current
+        // row after every load, exactly as the seed did above.
+        prior.activate_effective_upload_body_witness_revision(
+            effective_revision(source) - u64::from(change == ContractChange::BodyWitness),
+        );
         disk.cache
             .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
         let (cold_index, cold, cold_modes) = read(
@@ -5206,8 +5391,13 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         let counts = disk.cache.durable_counters(source).unwrap().0;
         match change {
             ContractChange::Unchanged => {
-                assert_eq!(counts.restored, 1);
-                assert_eq!(modes, (0, 0, 1));
+                // A quiet restore reads zero bytes; the owed selection takes
+                // its ordinary paced Full, money-equal to the cold Full.
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("old_binding_no_match"), None);
+                assert_eq!(counts.ineligible.get("rederive_quiet"), Some(&1));
+                assert_eq!(counts.resource_full.get("rederive_quiet"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
                 assert!(current.is_some());
                 assert_eq!(current, stamped);
             }
@@ -5415,14 +5605,24 @@ fn a0h_row(id: &str, input: u64) -> String {
 }
 
 fn a0h_wire(root: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
+    let request = a0h_batch(root, index, scan);
+    assert!(!scan.snapshots.is_empty(), "nonempty emitted money premise");
+    validate_snapshot_batch_request(&request).unwrap();
+    serde_json::to_vec(&request).unwrap()
+}
+
+fn a0h_batch(
+    root: &Path,
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) -> SnapshotBatchRequest {
     let source = SnapshotSource::ClaudeCode;
     crate::snapshot_sync::apply_claude_local_evidence_to_scan(root, scan, index);
     index.veto_claude_history_emission(source, &mut scan.snapshots);
     index.bind_session_accounts(source, "a0h-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     finalize_scan_after_policy(source, scan, index);
-    assert!(!scan.snapshots.is_empty());
-    let body = SnapshotBatchRequest {
+    SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: source.api_slug().into(),
         machine_id: "a".repeat(64),
@@ -5430,9 +5630,7 @@ fn a0h_wire(root: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> 
         snapshots: scan.snapshots.clone(),
         upload_policy: SnapshotUploadPolicy::default(),
         client_report: crate::client_report::ClientReport::empty(),
-    };
-    validate_snapshot_batch_request(&body).unwrap();
-    serde_json::to_vec(&body).unwrap()
+    }
 }
 
 fn a0h_scan(
@@ -5570,12 +5768,9 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                         .as_mut()
                         .unwrap()
                         .acquired_revision = revision;
-                    prior
-                        .files
-                        .get_mut(&key)
-                        .unwrap()
-                        .effective_upload_body_witness_revision = revision;
-                    prior.active_effective_upload_body_witness_revision = revision;
+                    // a0h_scan activates the current revision: keep the index
+                    // current (no history debt); only the record's acquisition
+                    // and its scope are behind.
                     assert!(!prior.effective_upload_body_witness_revision_requires_adoption(&key));
                     let i = Interpretation::of(source, &key, &prior, false, &slot.namespace);
                     record.record.binding.scope = expected(
@@ -5647,12 +5842,16 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         if reason == "restore_semantics" {
             assert_eq!(mm, (1, 0, 0), "pre-existing certificate Full");
             assert_eq!(mio.1, accepted);
+            // The re-read body is the accepted one: finalize's semantic no-op
+            // publishes nothing, exactly as the cold Full does.
             let cold = E2ScanFixture::default();
             let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
             assert_eq!(
-                a0h_wire(&root, &mut mi, &mut ms),
-                a0h_wire(&root, &mut ci, &mut cs)
+                serde_json::to_vec(&a0h_batch(&root, &mut mi, &mut ms)).unwrap(),
+                serde_json::to_vec(&a0h_batch(&root, &mut ci, &mut cs)).unwrap()
             );
+            assert!(ms.snapshots.is_empty());
+            assert!(ms.semantic_noop_count > 0);
         } else {
             assert_eq!(mm.0, 0, "{reason}: never reaches certificate fallback");
             assert_eq!(mio, (0, 0));
@@ -5675,8 +5874,18 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
-        assert_eq!(modes, (1, 0, 0), "{reason}: real native Full");
-        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
+        // An undecodable body is a store-level T14 rebuild, not a stale cause:
+        // its one Full publishes, the key then holds without RAM until the
+        // post-save replacement, and the corrupt record itself survives.
+        let corrupt = reason == "restore_semantics";
+        let len = || std::fs::metadata(&path).unwrap().len();
+        let survivor = || assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        let context = |stage: &str, modes: (usize, usize, usize), scan: &SourceScanResult| {
+            native_restore_context(stage.into(), modes, scan, &owner.cache, None)
+        };
+        let c = context("stale/growth", modes, &scan);
+        assert_eq!(modes, (1, 0, 0), "{reason}: real native Full {c:?}");
+        assert_eq!(io.1, len());
         let body = a0h_wire(&root, &mut index, &mut scan);
         assert_eq!(
             (
@@ -5690,13 +5899,24 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            1
+            u64::from(!corrupt)
         );
         let ((), alarm) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
-        assert_eq!(alarm.len(), 1);
-        assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
-        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        // durable_alarm emits the store snapshot and a separate cause delta.
+        let alarm = alarm
+            .into_iter()
+            .filter(|alarm| alarm["counts"][reason].is_array())
+            .collect::<Vec<_>>();
+        if corrupt {
+            assert!(alarm
+                .iter()
+                .all(|alarm| alarm["counts"][reason] == serde_json::json!([0, 0])));
+        } else {
+            assert_eq!(alarm.len(), 1);
+            assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
+        }
+        survivor();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -5744,22 +5964,30 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             Some(pace_time(now + std::time::Duration::from_secs(21600)));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
-        let body = a0h_wire(&root, &mut index, &mut scan);
-        assert_eq!(
-            (
-                scan.snapshots[0].input_tokens,
-                scan.snapshots[0].request_count
-            ),
-            (700, 3)
-        );
-        let cold = E2ScanFixture::default();
-        let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
-        assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        let c = context("stale/release", modes, &scan);
+        if corrupt {
+            // The started rebuild holds the key without RAM until index save.
+            assert_eq!(modes, (0, 0, 0), "{c:?}");
+            assert_eq!(io, (0, 0));
+            assert!(scan.snapshots.is_empty());
+        } else {
+            assert_eq!(modes, (1, 0, 0), "{c:?}");
+            assert_eq!(io.1, len());
+            let body = a0h_wire(&root, &mut index, &mut scan);
+            assert_eq!(
+                (
+                    scan.snapshots[0].input_tokens,
+                    scan.snapshots[0].request_count
+                ),
+                (700, 3)
+            );
+            let cold = E2ScanFixture::default();
+            let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+            assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        }
         assert_eq!(
             owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
-            2
+            if corrupt { 0 } else { 2 }
         );
         assert!(index.files.contains_key(&key));
         assert_eq!(
@@ -5771,13 +5999,24 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             0
         );
         owner.cache.durable_gc(lock, source, &prior).unwrap();
-        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        survivor();
         let restarted = E2ScanFixture::default();
         restarted.begin_durable(source, &root, &index_path);
-        let ((_, _, modes), io) =
+        let ((mut ri, mut rs, modes), io) =
             a0h_observe(|| a0h_scan(&restarted, &roots, &root, prior.clone()));
-        assert_eq!(modes.0, 1);
+        let c = native_restore_context("stale/restart".into(), modes, &rs, &restarted.cache, None);
+        assert_eq!(modes.0, 1, "{c:?}");
         assert!(io.1 > 0);
+        if corrupt {
+            // A fresh store re-authorizes T14; no ACK, so the growth republishes
+            // the exact cold body.
+            let body = a0h_wire(&root, &mut ri, &mut rs);
+            let s = &rs.snapshots[0];
+            assert_eq!((s.input_tokens, s.request_count), (700, 3));
+            let (mut ci, mut cs, _) =
+                a0h_scan(&E2ScanFixture::default(), &roots, &root, prior.clone());
+            assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        }
         assert_eq!(
             restarted
                 .cache
@@ -5785,7 +6024,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 .unwrap()
                 .0
                 .stale_full[cause],
-            1
+            u64::from(!corrupt)
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5876,11 +6115,13 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
         if arm == "capacity" {
             let mut stores = owner.cache.durable().unwrap();
+            let spent_at = std::time::Instant::now();
             for n in 0..2 * store::MAX_RECORDS {
-                assert!(stores.fund_key(store::key_digest(
-                    DurableSource::ClaudeCode,
-                    &format!("other-{n}")
-                )));
+                let digest = store::key_digest(DurableSource::ClaudeCode, &format!("other-{n}"));
+                assert!(stores.fund_key(digest));
+                // A real spent-read high water retains authority across begin_pass;
+                // empty reservations are correctly reclaimed before growth.
+                stores.retail_spent.get_mut(&digest).unwrap().spent = Some((1, spent_at));
             }
             assert_eq!(stores.retail_spent.len(), 2 * store::MAX_RECORDS);
         }
@@ -5895,22 +6136,55 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .unwrap()
             .set_modified(mtime + std::time::Duration::from_secs(2))
             .unwrap();
-        let ((mut held, mut changed, mode), read) =
-            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+        let (((mut held, mut changed, mode), read), selector) = native_restore_selection(|| {
+            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed))
+        });
+        let context = native_restore_context(
+            format!("b1g/{arm}/same-size"),
+            mode,
+            &changed,
+            &owner.cache,
+            selector,
+        );
         assert_eq!(
             mode,
             (1, 0, 0),
-            "{arm}: absent record cannot disprove a same-size edit"
+            "native_restore same_size_modes {context:?}"
         );
-        assert_eq!(read.1, std::fs::metadata(&path).unwrap().len());
-        assert_eq!(changed.snapshots.len(), 1);
-        assert_eq!(changed.snapshots[0].input_tokens, 100);
-        assert_eq!(changed.snapshots[0].request_count, 1);
-        let cold = E2ScanFixture::default();
-        let (mut cold_index, mut cold_scan, _) = a0h_scan(&cold, &roots, &root, committed.clone());
         assert_eq!(
-            a0h_wire(&root, &mut held, &mut changed),
-            a0h_wire(&root, &mut cold_index, &mut cold_scan)
+            read.1,
+            std::fs::metadata(&path).unwrap().len(),
+            "native_restore same_size_bytes {context:?}"
+        );
+        assert_eq!(
+            changed.snapshots.len(),
+            1,
+            "native_restore same_size_emitted {context:?}"
+        );
+        assert_eq!(
+            changed.snapshots[0].input_tokens, 100,
+            "native_restore same_size_money {context:?}"
+        );
+        assert_eq!(
+            changed.snapshots[0].request_count, 1,
+            "native_restore same_size_requests {context:?}"
+        );
+        let cold = E2ScanFixture::default();
+        let (mut cold_index, mut cold_scan, cold_modes) =
+            a0h_scan(&cold, &roots, &root, committed.clone());
+        // An mtime-only touch re-reads the accepted 100-token body; the final
+        // policy suppresses it as a semantic no-op on both sides.
+        native_restore_compare_wire(
+            a0h_batch(&root, &mut held, &mut changed),
+            a0h_batch(&root, &mut cold_index, &mut cold_scan),
+            false,
+            native_restore_context(
+                format!("b1g/{arm}/same-size/wire"),
+                (mode, cold_modes),
+                &changed,
+                &owner.cache,
+                selector,
+            ),
         );
         assert_eq!(
             held.files[&key].size_bytes,
@@ -5958,17 +6232,29 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
                     committed = ScanIndex::load(&index_path).unwrap();
                 }
             }
-            let (page, body) =
-                observe_consumed(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+            let ((page, body), selector) = native_restore_selection(|| {
+                observe_consumed(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed))
+            });
             let (mut index, mut scan, mode) = page;
-            assert_eq!(
+            let context = native_restore_context(
+                format!("b1g/{arm}/{id}/release"),
                 mode,
-                (1, 0, 0),
-                "{arm}: counted native Full after paced release"
+                &scan,
+                &owner.cache,
+                selector,
             );
-            assert_eq!(body, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(mode, (1, 0, 0), "native_restore growth_modes {context:?}");
+            assert_eq!(
+                body,
+                std::fs::metadata(&path).unwrap().len(),
+                "native_restore growth_bytes {context:?}"
+            );
 
-            let actual = a0h_wire(&root, &mut index, &mut scan);
+            let actual = a0h_batch(&root, &mut index, &mut scan);
+            assert!(
+                !scan.snapshots.is_empty(),
+                "native_restore growth_emitted {context:?}"
+            );
             assert_eq!(
                 (
                     scan.snapshots[0].input_tokens,
@@ -5976,10 +6262,22 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
                 ),
                 (total, requests)
             );
+            let actual_mode = mode;
             let cold = E2ScanFixture::default();
             let (mut ci, mut cs, mode) = a0h_scan(&cold, &roots, &root, committed.clone());
             assert_eq!(mode.0, 1);
-            assert_eq!(actual, a0h_wire(&root, &mut ci, &mut cs));
+            native_restore_compare_wire(
+                actual,
+                a0h_batch(&root, &mut ci, &mut cs),
+                true,
+                native_restore_context(
+                    format!("b1g/{arm}/{id}/wire"),
+                    (actual_mode, mode),
+                    &scan,
+                    &owner.cache,
+                    selector,
+                ),
+            );
             assert!(index.files.contains_key(&key));
             assert_eq!(scan.unreadable_path_count, 0);
             // Valid ACK advances accepted size, but record capacity stays absent.
@@ -5995,7 +6293,8 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             if arm == "capacity" {
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent.len(),
-                    2 * store::MAX_RECORDS
+                    2 * store::MAX_RECORDS,
+                    "native_restore capacity_spent_authority {context:?}"
                 );
             }
         }
@@ -6763,7 +7062,8 @@ impl O3Fixture {
         owner
             .cache
             .durable_write_after_save(
-                test_locks::hold(&self.root),
+                // The fixture already holds this scratch state dir's lock.
+                crate::locked_state_dir::held_for(&self.root).unwrap(),
                 SnapshotSource::ClaudeCode,
                 index,
             )
@@ -7160,12 +7460,21 @@ fn b4_structural_transition(near_cap: bool) {
     std::fs::create_dir(&sessions).unwrap();
     let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
     native_fixture(&path);
+    // Freeze a real creation time before the certificate. The later idle
+    // mtime stamp must not move APFS birth (a replaced object) after sealing.
+    let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_542_400))
+        .unwrap();
+    file.set_modified(written).unwrap();
+    drop(file);
     let source = SnapshotSource::ClaudeCode;
     let key = local_index_key(&path);
     let namespace = Scope("b4-structural".into());
     let index_path = root.join("index.json");
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let unchanged_files = std::cell::Cell::new(0);
     let run = |cache: Arc<SharedCache>, mut index: ScanIndex, at: &str| {
         index.activate_effective_upload_body_witness_revision(effective_revision(source));
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
@@ -7183,7 +7492,11 @@ fn b4_structural_transition(near_cap: bool) {
                 true,
             )
             .with_sampled_acquisition(cache, namespace.clone());
-            fixture::scan_reads(scan, 10_000)
+            {
+                let (index, scan, modes, bytes) = fixture::scan(scan, 10_000);
+                unchanged_files.set(modes.2);
+                (index, scan, (modes.0, modes.1, bytes))
+            }
         })
     };
     let (mut index, mut first, _) =
@@ -7209,6 +7522,27 @@ fn b4_structural_transition(near_cap: bool) {
     assert_native_write_before_save(&cache, lock, source, &index, &key);
     cache.retained().unwrap().clear();
     let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    // Typed restore and retained admission need more credit than the native
+    // stream writer. A structural Full may therefore receipt a successor even
+    // though it cannot retain or restore the graph. No quarantine is allowed.
+    let assert_successor = |cache: &SharedCache, end: u64, written: u64| {
+        let disk = store_snapshot(&store::store_dir_for_index(&index_path));
+        assert!(
+            disk.keys().eq(original_disk.keys()),
+            "native_restore structural_no_quarantine entries={}",
+            disk.len()
+        );
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+        assert_eq!(slot.store.counters().records_written, written);
+        let record = store::tests::found(
+            slot.store
+                .read(&store::key_digest(DurableSource::ClaudeCode, &key)),
+        );
+        assert_eq!(record.format, store::FORMAT_V3);
+        assert_eq!(record.record.certificate.length, end);
+    };
+    let sealed_birth = std::fs::metadata(&path).unwrap().created().unwrap();
     let append =
         |id: &str| {
             let text = a0h_row(id, 25).replace(
@@ -7241,32 +7575,59 @@ fn b4_structural_transition(near_cap: bool) {
         - 1;
     store::active::set_active_budget_for_test(Some(limit));
     let oracle_prior = index.clone();
-    let ((mut next, mut caught, modes), reads) =
-        a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
-    assert_eq!(modes, (1, 0, end));
-    assert_eq!(reads.1, end, "actual single Full input extent");
-    assert_eq!(caught.snapshots[0].input_tokens, 125);
+    let (((mut next, mut caught, modes), reads), selector) = native_restore_selection(|| {
+        a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
+    });
+    let metadata = std::fs::metadata(&path).unwrap();
+    let birth_changed = metadata.created().unwrap() != sealed_birth;
+    let mtime_before_birth = metadata.modified().unwrap() < metadata.created().unwrap();
+    let actual_modes = (modes.0, modes.1, unchanged_files.get());
+    let context = native_restore_context(
+        format!("b4/near-cap-{near_cap}/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"),
+        (modes.0, modes.1, unchanged_files.get()), &caught, &cache, selector,
+    );
+    assert!(
+        !birth_changed,
+        "native_restore structural_birth_stable {context:?}"
+    );
+    assert_eq!(
+        modes,
+        (1, 0, end),
+        "native_restore structural_modes {context:?}"
+    );
+    assert_eq!(reads.1, end, "native_restore structural_bytes {context:?}");
+    assert_eq!(
+        caught.snapshots.first().map(|item| item.input_tokens),
+        Some(125),
+        "native_restore structural_money {context:?}"
+    );
     assert_eq!(
         next.files[&key].size_bytes, end,
-        "paced read commits catch-up"
+        "native_restore structural_extent {context:?}"
     );
     assert!(
         cache.retained().unwrap().peek(&key).is_none(),
-        "no-record publication"
+        "native_restore structural_no_retained_copy {context:?}"
     );
-    assert_eq!(
-        store_snapshot(&store::store_dir_for_index(&index_path)),
-        original_disk
-    );
-    let actual = a0h_wire(&root, &mut next, &mut caught);
+    assert_successor(&cache, end, 2);
+    let actual = a0h_batch(&root, &mut next, &mut caught);
     let (mut oracle_index, mut oracle, oracle_modes) = run(
         Arc::new(SharedCache::default()),
         oracle_prior,
         "2026-10-29T12:00:00Z",
     );
-    assert_eq!(oracle_modes, (1, 0, end), "independent cold Full control");
-    assert_eq!(oracle.snapshots.len(), 1);
-    assert_eq!(actual, a0h_wire(&root, &mut oracle_index, &mut oracle));
+    assert_eq!(
+        oracle_modes,
+        (1, 0, end),
+        "native_restore structural_cold_modes {context:?}"
+    );
+    assert_eq!(
+        oracle.snapshots.len(),
+        1,
+        "native_restore structural_cold_emitted {context:?}"
+    );
+    native_restore_compare_wire(actual, a0h_batch(&root, &mut oracle_index, &mut oracle), true,
+        native_restore_context(format!("b4/near-cap-{near_cap}/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"), (actual_modes, (oracle_modes.0, oracle_modes.1, unchanged_files.get())), &caught, &cache, selector));
     next.record_accepted_snapshot_fingerprints(
         &caught
             .snapshots
@@ -7335,6 +7696,7 @@ fn b4_structural_transition(near_cap: bool) {
         assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
         assert_eq!(caught.snapshots[0].input_tokens, 175);
         assert_eq!(caught_index.files[&key].size_bytes, high);
+        assert_successor(&cache, high, 3);
         assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
             && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
         append("growth-4");
@@ -7357,6 +7719,7 @@ fn b4_structural_transition(near_cap: bool) {
     assert_eq!(modes, (1, 0, final_end));
     assert_eq!(caught.snapshots[0].input_tokens, 150);
     assert_eq!(index.files[&key].size_bytes, final_end);
+    assert_successor(&cache, final_end, 3);
     assert_eq!(cache.durable().unwrap().counters.active_bound[0], [2, 2]);
     index.save(&index_path).unwrap();
     drop(cache);
@@ -7545,7 +7908,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let index_path = root.join("index.json");
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let admit = |fingerprint: &str| {
-        let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+        let (reduction, checkpoint) = counted_codex_record_of(&path, &scope);
         let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
         assert!(cache.insert_admitted(
             key.clone(),
@@ -7689,6 +8052,10 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
     lease.release();
     let mut parser = owned_parser(source, &path, file);
+    codex_counting_version::configure_group_once(
+        &mut parser.accumulator,
+        codex_counting_version::AckEvidence::None,
+    );
     assert_eq!(
         parser
             .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
@@ -9045,7 +9412,8 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     owner
         .cache
         .durable_write_after_save(
-            test_locks::hold(&f.root),
+            // The fixture already holds this scratch state dir's lock.
+            crate::locked_state_dir::held_for(&f.root).unwrap(),
             SnapshotSource::ClaudeCode,
             &index,
         )
@@ -9570,7 +9938,7 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 prior.traversal = None;
                 let owner = E2ScanFixture::default();
                 owner.begin_durable(source, &root, &index_path);
-                let ((page, consumed), samples) =
+                let (((page, consumed), samples), selector) = native_restore_selection(|| {
                     crate::transcript_acquisition::capture_sample_reads(|| {
                         observe_consumed(|| {
                             a1a_scan_at(
@@ -9585,12 +9953,20 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                                 },
                             )
                         })
-                    });
+                    })
+                });
                 let (mut restored_index, mut restored, modes) = page;
+                let context = native_restore_context(
+                    format!("a1a/{arm}/{pin}/restart-{restart}/restore"),
+                    modes,
+                    &restored,
+                    &owner.cache,
+                    selector,
+                );
                 assert_eq!(
                     modes,
                     if restart == 0 { (0, 1, 0) } else { (0, 0, 1) },
-                    "{arm} {pin} restart {restart}"
+                    "native_restore restore_modes {context:?}"
                 );
                 assert_eq!(
                     consumed,
@@ -9600,7 +9976,8 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                         a1a_row("second", 200).len() as u64
                     } else {
                         3
-                    }
+                    },
+                    "native_restore restore_consumed {context:?}"
                 );
                 let certificate_end = if restart == 0 {
                     sealed
@@ -9633,7 +10010,10 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 let counts = owner.cache.durable_counters(source).unwrap().0;
                 assert_eq!(counts.restored, 1);
                 assert_eq!(counts.durable_restore_after_selection_clear, 1);
-                assert!(restored.census_complete, "fresh-window census: {arm}");
+                assert!(
+                    restored.census_complete,
+                    "native_restore restore_census_complete {context:?}"
+                );
                 assert_eq!(
                     restored.census_window_end,
                     if restart == 0 {
@@ -9642,7 +10022,10 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                         "2026-08-02T08:02:00Z"
                     }
                 );
-                assert!(restored_index.claude_request_census.get(&key).is_some());
+                assert!(
+                    restored_index.claude_request_census.get(&key).is_some(),
+                    "native_restore restore_census_present {context:?}"
+                );
                 let cold = E2ScanFixture::default();
                 let (mut cold_index, mut cold_scan, cold_modes) = a1a_scan_at(
                     &cold,
@@ -9655,11 +10038,22 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                         "2026-08-02T08:02:00Z"
                     },
                 );
-                assert_eq!(cold_modes.0, 1);
-                assert_eq!(
-                    a1a_wire(&root, &mut restored_index, &mut restored),
-                    a1a_wire(&root, &mut cold_index, &mut cold_scan),
-                    "exact production emitted body: {arm} {pin}"
+                let mut context = native_restore_context(
+                    format!("a1a/{arm}/{pin}/restart-{restart}/wire"),
+                    (modes, cold_modes),
+                    &restored,
+                    &owner.cache,
+                    selector,
+                );
+                context["emitted_actual_cold"][1] = serde_json::json!(cold_scan.snapshots.len());
+                assert_eq!(cold_modes.0, 1, "native_restore cold_modes {context:?}");
+                // An inert append adds no money: the accepted body is a
+                // semantic no-op on both sides, never uploaded twice.
+                native_restore_compare_wire(
+                    a1a_batch(&root, &mut restored_index, &mut restored),
+                    a1a_batch(&root, &mut cold_index, &mut cold_scan),
+                    grow,
+                    context,
                 );
                 // The first Tail receipted its successor before the lost index
                 // save. The second restart must use that exact successor.
@@ -9696,6 +10090,22 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
             }
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+}
+
+// A grown file behind a no-match record first probes the old certificate for
+// an independent edit: its head and boundary samples of the sealed extent.
+fn assert_no_match_edit_probe(samples: &[crate::transcript_acquisition::SampleRead], sealed: u64) {
+    let window = sealed.min(4096);
+    for (read, offset) in samples
+        .chunks_exact(2)
+        .flat_map(|pair| pair.iter().zip([0, sealed - window]))
+    {
+        assert_eq!(read.offset, Ok(offset));
+        assert_eq!(
+            (read.requested, read.result),
+            (window as usize, Ok(window as usize))
+        );
     }
 }
 
@@ -9880,10 +10290,11 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     let length = std::fs::metadata(&path).unwrap().len();
     assert!(length > prior.files[&key].size_bytes);
     // A higher selector reason must not mask growth into a hold. A due audit
-    // reaches the no-match restore and takes the counted Full; owed adoption
-    // is refused before the record is read ("history_owed"), so it takes the
-    // ordinary uncounted Miss Full. Neither drops the appended usage: each
-    // arm emits the same wire as a cold Full under the same index.
+    // reaches the no-match restore; its refused stale record cannot hold the
+    // due audit, so it takes the owed uncounted Full. Owed adoption is refused
+    // before the record is read ("history_owed"), so it takes the ordinary
+    // uncounted Miss Full. Neither drops the appended usage: each arm emits
+    // the same wire as a cold Full under the same index.
     for arm in ["audit", "adoption"] {
         let mut selected = ScanIndex::load(&index_path).unwrap();
         let entry = selected.files.get_mut(&key).unwrap();
@@ -9902,30 +10313,49 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         }
         let owner = E2ScanFixture::default();
         owner.begin_durable(source, &root, &index_path);
-        let ((page, body), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
-            observe_consumed(|| {
-                a1a_scan_at(
-                    &owner,
-                    &roots,
-                    &root,
-                    selected.clone(),
-                    "2026-08-02T08:01:30Z",
-                )
+        let (((page, body), samples), selector) = native_restore_selection(|| {
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                observe_consumed(|| {
+                    a1a_scan_at(
+                        &owner,
+                        &roots,
+                        &root,
+                        selected.clone(),
+                        "2026-08-02T08:01:30Z",
+                    )
+                })
             })
         });
         let (mut index, mut scan, modes) = page;
-        assert_eq!(modes, (1, 0, 0), "{arm}: growth is read once, never held");
-        assert_eq!(body, length, "{arm}");
-        assert!(samples.is_empty(), "{arm}");
+        let context = native_restore_context(
+            format!("a1t-growth/{arm}/acquired"),
+            modes,
+            &scan,
+            &owner.cache,
+            selector,
+        );
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "native_restore no_match_growth_modes {context:?}"
+        );
+        assert_eq!(
+            body, length,
+            "native_restore no_match_growth_bytes {context:?}"
+        );
+        assert_eq!(
+            samples.len(),
+            if arm == "audit" { 2 } else { 0 },
+            "native_restore no_match_growth_samples {context:?}"
+        );
+        assert_no_match_edit_probe(&samples, prior.files[&key].size_bytes);
         assert_eq!(scan.unreadable_path_count, 0, "{arm}");
         let counts = owner.cache.durable_counters(source).unwrap().0;
-        let transitional = if arm == "audit" {
+        if arm == "audit" {
             assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
-            1
         } else {
             assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
-            0
-        };
+        }
         let ((), alarms) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
         let alarms = alarms
@@ -9936,8 +10366,8 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             alarms
                 .first()
                 .map(|a| a["counts"]["old_binding_no_match"].clone()),
-            (transitional == 1).then(|| serde_json::json!([1, 1])),
-            "{arm}"
+            None,
+            "native_restore no_match_growth_alarm {context:?}"
         );
         assert!(alarms
             .iter()
@@ -10026,10 +10456,10 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             body, length,
             "complete fresh accumulator, not old reduction plus Full"
         );
-        assert!(
-            samples.is_empty(),
-            "no restored checkpoint silently supplies a prefix"
-        );
+        // Only the old certificate's bounded edit probe; no restored
+        // checkpoint silently supplies a prefix (body == length above).
+        assert_eq!(samples.len(), 2);
+        assert_no_match_edit_probe(&samples, prior.files[&key].size_bytes);
         assert_eq!(scan.unreadable_path_count, 0);
         let counts = owner.cache.durable_counters(source).unwrap().0;
         assert_eq!((counts.restore_attempts, counts.restored), (1, 0));
@@ -10373,18 +10803,37 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     for seconds in [2, 21599] {
         owner.cache.durable().unwrap().retail_full_now =
             Some(pace_time(now + std::time::Duration::from_secs(seconds)));
-        let ((held, scan, modes), io) = a0h_observe(|| {
-            a1a_scan_at(
-                &owner,
-                &roots,
-                &root,
-                committed.clone(),
-                "2026-08-02T08:03:00Z",
-            )
+        let (((held, scan, modes), io), selector) = native_restore_selection(|| {
+            a0h_observe(|| {
+                a1a_scan_at(
+                    &owner,
+                    &roots,
+                    &root,
+                    committed.clone(),
+                    "2026-08-02T08:03:00Z",
+                )
+            })
         });
-        assert_eq!(modes.0, 0);
-        assert_eq!(io, (0, 0), "paced no-match performs no native body read");
-        assert!(scan.snapshots.is_empty(), "held body is absent, not $0");
+        let context = native_restore_context(
+            format!("a1t-shared/paced-{seconds}"),
+            modes,
+            &scan,
+            &owner.cache,
+            selector,
+        );
+        assert_eq!(
+            modes.0, 0,
+            "native_restore no_match_paced_modes {context:?}"
+        );
+        assert_eq!(
+            io,
+            (0, 0),
+            "native_restore no_match_paced_bytes {context:?}"
+        );
+        assert!(
+            scan.snapshots.is_empty(),
+            "native_restore no_match_paced_emitted {context:?}"
+        );
         assert_eq!(scan.unreadable_path_count, 0);
         assert_eq!(held.files[&key].size_bytes, accepted);
         assert_eq!(held.files[&key].last_upload_body_witness, witness);
@@ -10403,12 +10852,19 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
             fingerprint_birth_nanos: 0,
             withheld_content_stamp: None,
         };
+        // Use the acquisition clock: time zero makes its retained future audit
+        // deadline invalid and selects Audit instead of testing growth pacing.
+        let decision = held.candidate_decision_with_reason_at(
+            &candidate,
+            crate::snapshots::sampled_scan::now_seconds(),
+        );
         assert_eq!(
-            held.candidate_decision_with_reason_at(&candidate, 0),
+            decision,
             (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::TranscriptChanged)
-            )
+            ),
+            "native_restore no_match_paced_selector {context:?} decision={decision:?}"
         );
         assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
     }
@@ -10492,16 +10948,36 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     let cold = E2ScanFixture::default();
     let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, before, "2026-08-02T14:03:00Z");
     assert_eq!(restarted_body, a1a_wire(&root, &mut ci, &mut cs));
+    // The released Full verified an accepted extent past the survivor's seal.
+    // Restore refuses that older record before its binding (entry_changed):
+    // an ordinary Full from byte zero, not a counted no-match Full.
+    let context = native_restore_context(
+        "a1t-shared/restart".into(),
+        modes,
+        &scan,
+        &restarted.cache,
+        None,
+    );
+    assert_eq!(
+        restarted
+            .cache
+            .durable_counters(source)
+            .unwrap()
+            .0
+            .ineligible
+            .get("entry_changed"),
+        Some(&1),
+        "native_restore no_match_restart_entry_changed {context:?}"
+    );
     let ((), alarms) =
         crate::local_resource_diagnostics::capture(|| restarted.cache.durable_alarm(source));
     let alarms = alarms
         .into_iter()
         .filter(|alarm| alarm["counts"]["old_binding_no_match"].is_array())
         .collect::<Vec<_>>();
-    assert_eq!(alarms.len(), 1);
-    assert_eq!(
-        alarms[0]["counts"]["old_binding_no_match"],
-        serde_json::json!([1, 1])
+    assert!(
+        alarms.is_empty(),
+        "native_restore no_match_restart_alarm {context:?}"
     );
     assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
     let _ = std::fs::remove_dir_all(root);
@@ -10567,14 +11043,61 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 .unwrap();
             let owner = f.owner();
             let mut prior = ScanIndex::load(&f.index_path).unwrap();
+            // The active revision is runtime-only; sync activates it after every
+            // load (as a1a_scan_at does). Revision 0 denies every request-owned item.
+            prior.activate_effective_upload_body_witness_revision(effective_revision(
+                SnapshotSource::ClaudeCode,
+            ));
             let accepted_witness = prior.files[&f.key].last_upload_body_witness.clone();
             let before = prior.clone();
+            // The same synthetic pre-August birth as the seed and the cold oracle.
+            let scan_at = |owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+                           prior: &mut ScanIndex| {
+                claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                    f.scan_at(owner, prior, "2026-08-02T08:00:00Z", 1)
+                })
+            };
+            let mut expected_tokens = 900;
+            if edit == "shorter_object" {
+                // S2: an unproved new object below the accepted end holds at the
+                // accepted floor; no shorter body is published. Growth catches up.
+                let entry = serde_json::to_value(&prior.files[&f.key]).unwrap();
+                let held_owner = f.owner();
+                let ((held, body, modes), rows) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        scan_at(&held_owner, &mut prior.clone())
+                    });
+                assert_eq!(modes, (0, 0, 0), "{binding}: floor holds, no Full/Tail");
+                assert!(body.snapshots.is_empty());
+                assert_eq!(body.unreadable_path_count, 0);
+                assert_eq!(serde_json::to_value(&held.files[&f.key]).unwrap(), entry);
+                assert_eq!(std::fs::read(&f.record_path).unwrap(), survivor);
+                assert_eq!(
+                    rows.iter()
+                        .filter_map(|r| r["counts"]["restored_behind_accepted"]["held"].as_u64())
+                        .sum::<u64>(),
+                    1,
+                    "{binding}: actual floor diagnostic"
+                );
+                drop(held_owner);
+                f.append("short-growth", 100);
+                File::options()
+                    .write(true)
+                    .open(&f.path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_657_600),
+                    )
+                    .unwrap();
+                assert!(std::fs::metadata(&f.path).unwrap().len() >= old_length);
+                expected_tokens = 1000;
+            }
             let ((mut index, mut scan, mode), bytes) =
-                observe_consumed(|| f.scan_at(&owner, &mut prior, "2026-08-02T08:00:00Z", 1));
+                observe_consumed(|| scan_at(&owner, &mut prior));
             assert_eq!(mode.0, 1, "{binding}/{edit}: independent A2 Full");
             assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
             assert!(!scan.snapshots.is_empty());
-            assert_eq!(scan.snapshots[0].input_tokens, 900);
+            assert_eq!(scan.snapshots[0].input_tokens, expected_tokens);
             assert_eq!(
                 index.files[&f.key].last_upload_body_witness, accepted_witness,
                 "no manufactured ACK"
@@ -10593,7 +11116,7 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 owner
                     .cache
                     .durable_write_after_save(
-                        test_locks::hold(&f.root),
+                        crate::locked_state_dir::held_for(&f.root).unwrap(),
                         SnapshotSource::ClaudeCode,
                         &index
                     )
@@ -10605,6 +11128,9 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
             drop(owner);
             let restarted = f.owner();
             let mut loaded = ScanIndex::load(&f.index_path).unwrap();
+            loaded.activate_effective_upload_body_witness_revision(effective_revision(
+                SnapshotSource::ClaudeCode,
+            ));
             let ((held, later, modes), bytes) = observe_consumed(|| {
                 f.scan_at(&restarted, &mut loaded, "2026-08-04T08:00:00Z", 183)
             });
@@ -10670,9 +11196,11 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             .write_all(suffix.as_bytes())
             .unwrap();
         // Freeze creation before the certificate. A later fixed-time mtime
-        // edit must not also change creation time on APFS.
+        // edit must not also change creation time on APFS. Use a real birth:
+        // one at or before 2020 is a placeholder, so the census would hold no
+        // object identity and could never prove the truncate's shrink.
         let file = File::options().write(true).open(&path).unwrap();
-        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_542_400))
             .unwrap();
         file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_200))
             .unwrap();
@@ -10682,6 +11210,7 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
         let namespace = Scope("p3-a2-resource".into());
         let cache = Arc::new(SharedCache::default());
         cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let unchanged_files = std::cell::Cell::new(0);
         let run = |cache: Arc<SharedCache>, index, at: &str| {
             let scan = OwnedSourceScan::new_with_identity_capture(
                 source,
@@ -10697,7 +11226,11 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 true,
             )
             .with_sampled_acquisition(cache, namespace.clone());
-            let (mut index, mut scan, modes) = fixture::scan_reads(scan, 10_000);
+            let (mut index, mut scan, modes) = {
+                let (index, scan, modes, bytes) = fixture::scan(scan, 10_000);
+                unchanged_files.set(modes.2);
+                (index, scan, (modes.0, modes.1, bytes))
+            };
             finalize_scan_after_policy(source, &mut scan, &mut index);
             (index, scan, modes)
         };
@@ -10758,19 +11291,39 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
             ))
             .unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().created().unwrap(), birth);
+        assert!(
+            std::fs::metadata(&path).unwrap().created().unwrap() == birth,
+            "native_restore edit_birth_stable arm={edit}"
+        );
         // Preserve the real census: removing it forces an authority-family
         // replay and bypasses optional restore even for the equal-size row.
-        let ((mut changed, body, modes), events) =
+        let (((mut changed, body, modes), events), selector) = native_restore_selection(|| {
             crate::local_resource_diagnostics::capture(|| {
                 run(cache.clone(), index, "2026-10-29T12:00:00Z")
-            });
-        assert_eq!(body.snapshots.len(), 1, "{edit}: changed body acquired");
+            })
+        });
+        let context = native_restore_context(
+            format!("content-v3/{edit}/acquired"),
+            (modes.0, modes.1, unchanged_files.get()),
+            &body,
+            &cache,
+            selector,
+        );
+        assert_eq!(
+            body.snapshots.len(),
+            1,
+            "native_restore edit_emitted {context:?}"
+        );
         assert_eq!(
             body.snapshots[0].input_tokens,
-            if edit == "equal" { 175 } else { 100 }
+            if edit == "equal" { 175 } else { 100 },
+            "native_restore edit_money {context:?}"
         );
-        assert_eq!(modes, (1, 0, std::fs::metadata(&path).unwrap().len()));
+        assert_eq!(
+            modes,
+            (1, 0, std::fs::metadata(&path).unwrap().len()),
+            "native_restore edit_modes {context:?}"
+        );
         assert_eq!(body.unreadable_path_count, 0);
         assert!(!changed.files[&key].has_unverified_source());
         let counters = cache.durable_counters(source).unwrap().0;

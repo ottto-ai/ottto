@@ -644,8 +644,7 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
     }
     let mut last_error = None;
     for port in ports {
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        match TcpListener::bind(bind_addr) {
+        match bind_relay_port(port) {
             Ok(listener) => {
                 if port != LOCAL_RELAY_DEFAULT_PORT {
                     relay_log!("local OTLP relay using per-user port {port}");
@@ -662,6 +661,14 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow!("no local OTLP relay ports were available"));
     Err(error).context("bind local OTLP relay")
+}
+
+fn bind_relay_port(port: u16) -> io::Result<TcpListener> {
+    #[cfg(test)]
+    if let Some(result) = tests::planned_bind(port) {
+        return result;
+    }
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 /// Apply the read and write timeout to an accepted relay stream. A best-effort
@@ -1626,7 +1633,7 @@ fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ControlToken;
     use ottto_protocol::{
@@ -1635,6 +1642,46 @@ mod tests {
     };
 
     const TOKEN: &str = "test-control-token";
+
+    // The relay candidates are fixed numbers inside the Linux ephemeral range,
+    // so a parallel test's ephemeral listener or outbound connection can hold
+    // one at any moment. A plan feeds each candidate bind its result in order.
+    type BindPlan = std::collections::VecDeque<(u16, io::Result<TcpListener>)>;
+
+    thread_local! {
+        static BIND_PLAN: std::cell::RefCell<Option<BindPlan>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn planned_bind(port: u16) -> Option<io::Result<TcpListener>> {
+        BIND_PLAN.with(|plan| {
+            let mut plan = plan.borrow_mut();
+            let (expected, result) = plan.as_mut()?.pop_front().expect("unexpected relay bind");
+            assert_eq!(port, expected, "relay binds follow the candidate order");
+            Some(result)
+        })
+    }
+
+    pub(crate) fn with_bind_plan<T>(
+        plan: impl IntoIterator<Item = (u16, io::Result<TcpListener>)>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<BindPlan>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BIND_PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+            }
+        }
+        let plan = plan.into_iter().collect();
+        let _reset = Reset(BIND_PLAN.with(|slot| slot.replace(Some(plan))));
+        let value = run();
+        BIND_PLAN.with(|plan| {
+            assert!(
+                plan.borrow().as_ref().unwrap().is_empty(),
+                "every planned relay bind must be attempted"
+            );
+        });
+        value
+    }
 
     pub(super) fn test_daemon() -> LocalDaemon {
         LocalDaemon::new(

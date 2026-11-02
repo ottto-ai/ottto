@@ -3338,6 +3338,34 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// email, and is never uploaded. Older clients ignore this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_notice: Option<String>,
+    /// Default home only: the account and organization proven to own the
+    /// stored token, and the ones its `.claude.json` cache names. Hashes and
+    /// a time only; older clients ignore these additive fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_proven_at: Option<Rfc3339Timestamp>,
+    /// The default home's token belongs to another known account: the
+    /// existing add-account sign-in into a new slot, expecting
+    /// `adopt_target_account_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_action: Option<ClaudeConfigSlotRecommendedActionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_target_account_hash: Option<String>,
+}
+
+/// A slot status's recommended action. Closed: clients ignore values they do
+/// not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotRecommendedActionV1 {
+    ClaudeAdoptDefaultLogin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

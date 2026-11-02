@@ -701,13 +701,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Whether `digest` has `sha256_hex`'s shape: 64 lowercase hex digits.
-fn digest_shaped(digest: &str) -> bool {
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+use crate::hex::is_sha256_lower as digest_shaped;
 
 /// The parts of a prior certificate `prepare`'s decision reads, borrowed from
 /// a `Checkpoint` or a `PrefixSeal`.
@@ -839,31 +833,30 @@ impl ReadPlan {
         let stamp = FileStamp::capture(file.metadata()?)?;
         let debt = earlier_debt(durable_debt, checkpoint.and_then(Checkpoint::audit_debt));
         let mut guard_bytes_read = 0;
-        let mode = select_mode(
-            checkpoint.map(Checkpoint::view),
-            debt,
-            &stamp,
-            scope,
-            now,
-            |at| {
-                #[cfg(test)]
-                if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
-                    return Err(io::Error::other(
-                        "injected persistent old-checkpoint sample I/O",
-                    ));
-                }
-                let old = checkpoint.expect("samples are compared only with a checkpoint");
-                match at {
-                    SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
-                    SampleAt::Boundary => sample_at(
-                        file,
-                        old.samples.sealed_offset - old.samples.boundary.len() as u64,
-                        &old.samples.boundary,
-                        &mut guard_bytes_read,
-                    ),
-                }
-            },
-        )?;
+        let view = checkpoint.map(Checkpoint::view);
+        #[cfg(test)]
+        let view = view.map(|mut view| {
+            view.samples_valid &= !OLD_CHECKPOINT_INVALID.with(std::cell::Cell::get);
+            view
+        });
+        let mode = select_mode(view, debt, &stamp, scope, now, |at| {
+            #[cfg(test)]
+            if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
+                return Err(io::Error::other(
+                    "injected persistent old-checkpoint sample I/O",
+                ));
+            }
+            let old = checkpoint.expect("samples are compared only with a checkpoint");
+            match at {
+                SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
+                SampleAt::Boundary => sample_at(
+                    file,
+                    old.samples.sealed_offset - old.samples.boundary.len() as u64,
+                    &old.samples.boundary,
+                    &mut guard_bytes_read,
+                ),
+            }
+        })?;
         #[cfg(test)]
         between_guards();
         if !FileStamp::capture(file.metadata()?)?.same_content(&stamp) {
@@ -1767,6 +1760,8 @@ impl DurableCertificate {
 #[cfg(test)]
 thread_local! {
     pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A retained checkpoint `prepare` must refuse as `InvalidCheckpoint`.
+    pub(crate) static OLD_CHECKPOINT_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };

@@ -4179,11 +4179,19 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
             result.unwrap_err().downcast_ref::<harvest::WorkerError>(),
             Some(&expected)
         );
-        let pid: i32 = fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // The 250 ms timeout can kill /bin/sh before `echo $$` writes the
+        // pid (missing or empty file); that only happens in a timeout phase.
+        let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        else {
+            assert!(
+                matches!(phase, "input" | "work"),
+                "{phase}: worker exited without writing its pid"
+            );
+            fs::remove_dir_all(dir).unwrap();
+            continue;
+        };
         // The worker is reaped by its own thread, never by the caller:
         // once gone, it is not left as a zombie.
         let deadline = Instant::now() + Duration::from_secs(10);

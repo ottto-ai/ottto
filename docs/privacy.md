@@ -65,24 +65,8 @@ Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
 
-For local Codex and Claude Code sessions, snapshots may also carry a bounded
-`session_context_curve:v1` object. It contains only owned request ordinals,
-timestamps, effective input-token counts, safe model/window evidence, segment
-ordinals, compaction adjacency, coverage/revision labels, and retention flags.
-It is capped at 256 points, 64 compaction boundaries, 16 model-window records,
-and 64 KiB. Deterministic sampling preserves early anchors, retained
-compaction-adjacent requests, the peak, and the tail. Missing ownership proof,
-unsupported parser shapes, and pre-capture history emit an explicit zero-data
-coverage object instead of a guessed curve. If the optional curve would push
-the complete snapshot over its 640 KiB item budget, fill-only points are
-removed first; mandatory evidence then yields to a zero-data
-`payload_budget_exceeded` object using a narrow 641 KiB explicit-clear reserve,
-so ordinary usage still
-uploads. The reserve is unavailable to populated curves and does not change
-the 4 MiB batch cap. The curve never contains prompts,
-responses, tool results, commands, paths, URLs, screenshots, or reasoning.
-Collection and historical replay remain off unless the server explicitly
-advertises durable `session_context_curve:v1` accepted-log admission.
+The snapshot format keeps an optional `session_context_curve:v1` field, but
+the daemon builds and fits no context curves, so none are uploaded.
 
 Agent status collection also reports display-safe runtime defaults read from an
 agent's own configuration files: Codex `config.toml`, and Claude Code's
@@ -101,7 +85,7 @@ none of these keys uploads no defaults at all rather than an empty record, so
 
 When a scan needs multiple uploads, `ottto-service` stores a temporary local
 resume checkpoint containing only the semantic hashes of snapshots the backend
-already accepted, their hash-neutral context-curve body witnesses, and a
+already accepted, their hash-neutral body witnesses, and a
 one-way hash that binds the checkpoint to its relay device. It does not store
 raw account/device identifiers, titles, prompts,
 responses, paths, session ids, usage payloads, or attribution labels. The

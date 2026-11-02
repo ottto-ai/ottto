@@ -272,7 +272,7 @@ crate::heap_layout_bound::fields!(NativeCensusCompletion; census_window_end);
 pub(super) fn select_recovery_before_audits(
     queue: &mut VecDeque<ScanTraversalPath>,
     selected: &mut Vec<ScanTraversalPath>,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     recovery_paths: &[PathBuf],
     limit: usize,
 ) {

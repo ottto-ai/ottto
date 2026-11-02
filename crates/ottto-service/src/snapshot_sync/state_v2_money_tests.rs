@@ -1,7 +1,8 @@
 // Lead B condition b: synthetic v1 custody -> composed rows -> mapper hydrate
 // -> real scan, identity qualification, finalization and upload encoding.
 use super::money_equivalence_tests::{
-    compare_claude_uploads, corpus, finish_claude_pages, grow, input_clock, receipt_with_output,
+    claude_change, claude_corpus, compare_claude_uploads, corpus, finish_claude_pages, grow,
+    input_clock, receipt_with_output,
 };
 use super::*;
 use serde_json::Value;
@@ -11,11 +12,18 @@ fn tagged_api(
     tokens: u64,
     account: Option<&str>,
 ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    tag(api(request, tokens, tokens * 10), account)
+}
+
+/// A telemetry row that names `account` (None: a present but invalid login).
+fn tag(
+    mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence,
+    account: Option<&str>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence as Attribute, ClaudeIdentityAttributeOrigin as Origin,
         ClaudeIdentityDisposition as Disposition, ClaudeRequestIdentityEvidence,
     };
-    let mut row = api(request, tokens, tokens * 10);
     row.account_identity_checked = true;
     row.account_identifier_hash = account.map(str::to_owned);
     row.request_identity = Some(ClaudeRequestIdentityEvidence {
@@ -191,10 +199,21 @@ fn condition_b(class: &str) {
         // flags. Only the candidate passes through composed populate/hydrate.
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        let v2 =
-            crate::snapshots::state_v2_money_roundtrip(&v1, &c.base.canonicalize().unwrap().join("money.v2.sqlite.import"));
+        // The restore arm loads as a live pass does, archives cold; its
+        // resident view is read back for the custody comparison only.
+        let (mut store, v2, v2_view) = crate::snapshots::StateV2ColdStore::roundtrip(
+            &v1,
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("money.v2.sqlite.import"),
+        );
         v1.generation = v2.generation;
-        assert_eq!(canonical(&v1), canonical(&v2), "all custody and join keys");
+        assert_eq!(
+            canonical(&v1),
+            canonical(&v2_view),
+            "all custody and join keys"
+        );
         grow(&path, "r2", 20);
         c.evidence(
             &[
@@ -323,11 +342,122 @@ fn condition_b(class: &str) {
                 assert!(sent.is_empty());
             }
         }
+        if class == "pending" {
+            // Restart arm: the family rolls inside the page; the cold page
+            // saves through the production delta, reloads cold and scans the
+            // next page. v1 takes the same rollover in RAM and through a real
+            // v1 save and load. The rollover is the scan's own `archive()`
+            // applied directly: this corpus pins the census window (input
+            // clock), so no scan advances it.
+            let end = "2026-10-30T00:00:00Z";
+            let mut ram: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
+            crate::snapshots::state_v2_roll_account_families(&mut ram, end);
+            let ram: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&ram).unwrap()).unwrap();
+            let restart = {
+                let dir = c.base.join("v1-restart");
+                std::fs::create_dir_all(&dir).unwrap();
+                crate::locked_state_dir::test_locks::hold(&dir);
+                let index_path = dir.join("scan-index.json");
+                let mut saved = ram.clone();
+                // `ram` carries the v2 store's generation; a v1 save creates
+                // a new file only from generation 0.
+                saved.generation = 0;
+                saved.save(&index_path).unwrap();
+                ScanIndex::load(&index_path).unwrap()
+            };
+            let [_, _, disk] = pages;
+            let mut page = disk.index;
+            let (cold, view) = store.roll_save_reload(&mut page, end);
+            assert!(crate::snapshots::state_v2_has_cold_archive(&cold));
+            let placement = |index: &ScanIndex| {
+                serde_json::to_value(index).unwrap()["claude_account_family_pending"].clone()
+            };
+            assert_eq!(placement(&view), placement(&ram), "account placement");
+            // The next page switches account and captures identity, so its
+            // rows are tagged and accepted shares are recorded.
+            grow(&path, "r3", 30);
+            c.evidence(
+                &[
+                    tagged_api("r1", 10, Some(&"a".repeat(64))),
+                    tagged_api("r2", 20, None),
+                    tagged_api("r3", 30, Some(&"b".repeat(64))),
+                ],
+                &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
+            );
+            // The first page's growth claim on the live v2 session paces a
+            // second growth Full of this file for six hours; v1 has no growth
+            // pacing. Scan the next page past that interval, every arm alike.
+            let scan = || {
+                let mut next = [ram, restart, cold].map(|prior| {
+                    c.raw(
+                        &E2ScanFixture::with_identity_capture(true),
+                        prior,
+                        100,
+                        false,
+                        &[],
+                    )
+                });
+                finish_claude_pages(&c, &mut next);
+                next
+            };
+            #[cfg(unix)]
+            let next = crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 7 * 60 * 60,
+                scan,
+            );
+            #[cfg(not(unix))]
+            let next = scan();
+            for candidate in &next[1..] {
+                assert_eq!(candidate.receipt(), next[0].receipt(), "restart join keys");
+                assert_eq!(
+                    canonical(&candidate.scan.snapshots),
+                    canonical(&next[0].scan.snapshots),
+                    "restart totals and account tags"
+                );
+            }
+            assert!(
+                next[0]
+                    .scan
+                    .snapshots
+                    .iter()
+                    .any(|item| !item.request_evidence.is_empty()),
+                "positive control: tagged rows reach the restart page"
+            );
+            compare_claude_uploads(&next);
+            let accepted = next.each_ref().map(|page| {
+                let mut progress = e2_progress();
+                progress
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(!sent.is_empty());
+                assert!(
+                    !progress.accepted_identity_buckets.is_empty(),
+                    "positive control: accepted identity shares"
+                );
+                serde_json::to_vec(&progress).unwrap()
+            });
+            assert_eq!(
+                accepted[0], accepted[1],
+                "v1 restart accepted identity buckets"
+            );
+            assert_eq!(
+                accepted[0], accepted[2],
+                "cold restart accepted identity buckets"
+            );
+        }
     });
 }
 
 macro_rules! classes {
-    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class."] #[test] fn $test() { condition_b($class); })+};
+    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class, restored cold."] #[test] fn $test() { condition_b($class); })+};
 }
 classes! {
     v2_census_and_920_keep_emit_identical_next_body => "census_keep",
@@ -395,7 +525,10 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         recovery.adopt_synthetic(Some(&bytes));
         let v2 = crate::snapshots::state_v2_money_roundtrip(
             &warm.index,
-            &c.base.canonicalize().unwrap().join("accepted.v2.sqlite.import"),
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("accepted.v2.sqlite.import"),
         );
         recovery.recover(&progress_path).unwrap();
         assert_eq!(
@@ -448,4 +581,169 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         );
         assert_eq!(std::fs::read(&progress_path).unwrap(), bytes);
     });
+}
+
+/// A4: two accounts, shared by every cold row. The row's telemetry (r1 alone
+/// when the row has none) answers on account a, and two more root requests
+/// answer on accounts a and b. Telemetry tags a request only with its trace
+/// ownership row, so each added request carries one; the row's own traces
+/// are kept, so its ownership cases are unchanged.
+#[cfg(unix)]
+fn second_account(c: &Corpus, path: &Path) {
+    fn rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
+        let path = c
+            .support
+            .join("local-otel")
+            .join(directory)
+            .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+        std::fs::read_to_string(path)
+            .map(|text| {
+                text.lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let mut effort: Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence> =
+        rows(c, "claude-code-effort");
+    if effort.is_empty() {
+        effort.push(api("r1", 10, 100));
+    }
+    let mut effort: Vec<_> = effort
+        .into_iter()
+        .map(|row| tag(row, Some(&"a".repeat(64))))
+        .collect();
+    let mut traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
+        rows(c, "claude-code-trace-ownership");
+    for (request, tokens, account) in [("r-account-a", 40, "a"), ("r-account-b", 50, "b")] {
+        append(path, &line(ROOT, request, AT, tokens));
+        effort.push(tagged_api(request, tokens, Some(&account.repeat(64))));
+        traces.push(trace(request, ""));
+    }
+    c.evidence(&effort, &traces);
+}
+
+/// The page's real upload with ACK, as the placement oracle reads it.
+#[cfg(unix)]
+fn routed(page: &Page) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    use crate::snapshots::sampled_scan::transition_fixture::{Mode, RouteResult};
+    let mut progress = e2_progress();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let (result, bodies, _) = upload(&page.scan.snapshots, &mut progress, ack);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    let mut route = RouteResult::emitted(
+        Mode::ColdFull,
+        SnapshotSource::ClaudeCode,
+        bodies,
+        &page.scan.snapshots,
+    );
+    route.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    route
+}
+
+/// An E2 money row from the same v1 bytes, resident and restored cold on a
+/// live session: stored usage pending loads as cold heads, the page loads
+/// its families by key and the stale-family carry loads the whole kind.
+/// Both arms emit the same bodies, totals and account placement.
+#[cfg(unix)]
+fn cold_row(name: &str) {
+    if !crate::heap_layout_bound::layout_supported() {
+        println!("STATE_V2_COLD_ROW {name} UNEXECUTED: native retained layout unavailable");
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = claude_corpus(name);
+        let scanner = || E2ScanFixture::with_identity_capture(true);
+        let mut warm = c.raw(&scanner(), ScanIndex::default(), 100, false, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let mut prior = warm.index;
+        add_class(&mut prior, &path, "pending");
+        claude_change(&c, &path, name);
+        second_account(&c, &path);
+        input_clock(&path);
+        let mut v1: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
+        let (custody, v2) = crate::snapshots::StateV2ColdSession::publish(
+            &v1,
+            &c.base.canonicalize().unwrap().join("cold-session"),
+        );
+        assert!(
+            crate::snapshots::state_v2_cold_usage_families(&v2).is_some_and(|n| n > 0),
+            "positive control: stored usage pending loads cold"
+        );
+        v1.generation = v2.generation;
+        let mut pages = [v1, v2].map(|prior| c.raw(&scanner(), prior, 100, false, &[]));
+        for page in &mut pages {
+            page.enrich(&c);
+            page.finish();
+        }
+        // The pass's growth claim saved the store one generation past the
+        // page graph before the page ran; its loads still read at the claim.
+        assert!(
+            custody.claimed_ahead(&pages[1].index),
+            "a claim-only save precedes the cold page"
+        );
+        // The cold page read ROOT's stored value: it is loaded (or removed
+        // by a decision that loaded it), never left as an unread head.
+        assert!(
+            !crate::snapshots::state_v2_usage_head_only(&pages[1].index, ROOT),
+            "the cold page loads its stored family"
+        );
+        // Account placement is per usage row and identity part; request
+        // evidence carries only the organization.
+        let accounts = pages[0]
+            .scan
+            .snapshots
+            .iter()
+            .flat_map(|item| {
+                item.model_usage
+                    .iter()
+                    .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+            })
+            .flat_map(|row| {
+                row.account_identifier_hash.iter().chain(
+                    row.identity_parts
+                        .iter()
+                        .flatten()
+                        .filter_map(|part| part.account_identifier_hash.as_ref()),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(accounts.len() >= 2, "positive control: two accounts placed");
+        let [resident, cold] = pages.each_ref().map(routed);
+        crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+            &resident, &cold,
+        );
+    });
+}
+
+macro_rules! cold_rows {
+    ($($test:ident => $row:literal),+ $(,)?) => {$(#[doc = "[money] A4: this E2 money row emits the same bodies and account placement restored cold on a live session."] #[cfg(unix)] #[test] fn $test() { cold_row($row); })+};
+}
+cold_rows! {
+    v2_cold_duplicate_request_ids_place_money_identically => "duplicate_request_ids",
+    v2_cold_progressive_response_places_money_identically => "progressive_response",
+    v2_cold_resolver_conflict_places_money_identically => "resolver_conflict",
+    v2_cold_side_owner_places_money_identically => "side_owner",
+    v2_cold_side_without_owner_places_money_identically => "side_without_owner",
+    v2_cold_side_owner_directory_unlisted_places_money_identically => "side_owner_directory_unlisted",
 }
