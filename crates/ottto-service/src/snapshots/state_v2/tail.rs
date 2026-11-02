@@ -384,14 +384,15 @@ fn decode_head(bytes: &[u8]) -> Result<TailHead> {
     let mut table = MembershipTable::new();
     for _ in 0..entries {
         let [collection, shape] = input.take::<2>()?;
-        // An id this build does not know was written by a newer one.
-        let collection = *Collection::ALL
-            .get(usize::from(collection))
-            .ok_or(Hold::Future)?;
-        let shape = [Shape::Slot, Shape::Log, Shape::Hour]
+        let known = [Shape::Slot, Shape::Log, Shape::Hour]
             .into_iter()
-            .find(|known| *known as u8 == shape)
-            .ok_or(Hold::Future)?;
+            .find(|known| *known as u8 == shape);
+        // An id this build does not know was written by a newer one.
+        let (Some(&collection), Some(shape)) =
+            (Collection::ALL.get(usize::from(collection)), known)
+        else {
+            bail!(Hold::Future);
+        };
         let entry = Membership {
             meta: CollectionMeta {
                 shape,
@@ -491,6 +492,11 @@ struct Applied {
     set_aside: u64,
     retired: u64,
 }
+fn member(table: &mut MembershipTable, collection: Collection) -> Result<&mut Membership> {
+    table
+        .get_mut(&collection)
+        .context("state_v2_tail_membership")
+}
 /// Replace one file's head and changed rows, adjusting membership from row
 /// headers alone: no other page is read.
 fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result<Applied> {
@@ -520,17 +526,13 @@ fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result
     for &(collection, page) in &staged.obsolete {
         let page_key = row(collection.kind(), file, page)?;
         if let Some(old) = tx.get(&page_key)? {
-            let entry = table
-                .get_mut(&collection)
-                .context("state_v2_tail_membership")?;
+            let entry = member(&mut table, collection)?;
             subtract(
                 &mut entry.commit,
                 &term(collection.kind(), page, &old.digest),
             );
-            entry.pages = entry
-                .pages
-                .checked_sub(1)
-                .context("state_v2_tail_membership")?;
+            // A wrong stored count fails `load`'s one membership check.
+            entry.pages = entry.pages.wrapping_sub(1);
             tx.delete(&page_key)?;
             delete_fragments(tx, file, collection.owner(), page, 0)?;
             tx.mark_erasure()?;
@@ -542,9 +544,7 @@ fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result
         ..Default::default()
     };
     for (&(collection, page), value) in &staged.pages {
-        let entry = table
-            .get_mut(&collection)
-            .context("state_v2_tail_membership")?;
+        let entry = member(&mut table, collection)?;
         let page_key = row(collection.kind(), file, page)?;
         if let Some(old) = tx.get(&page_key)? {
             subtract(
