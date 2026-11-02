@@ -33785,10 +33785,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
         );
         assert_eq!(
-            raced
-                .diagnostics
-                .first()
-                .map(|diagnostic| diagnostic.code.clone()),
+            raced.diagnostics.first().map(|diagnostic| diagnostic.code),
             Some(ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation)
         );
         assert_eq!(
