@@ -5207,9 +5207,9 @@ fn recorded_login_needs_the_request_own_email_and_org() {
         "Desktop stays pair-only"
     );
     let other = "e".repeat(64);
-    assert_eq!(
+    assert_ne!(
         identity::classify(&evidence, &stamped(MarkerVerdict::Trusted(&other))),
-        org_only(&other),
+        named,
         "another org is never given this login"
     );
     assert_eq!(

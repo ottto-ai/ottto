@@ -36916,12 +36916,14 @@ struct ParserPending {
     pending_returns: u8,
     /// Organizations and addresses this read saw, inherited lines included.
     folder_trace: Option<Box<claude_folder_login::FolderTrace>>,
+    /// This read resumed past the file's first byte.
+    folder_read_resumed: bool,
     // Drop the original graph before releasing its funding.
     #[cfg(unix)]
     pending_funding: Option<crate::durable_tail_store::ActiveLease>,
 }
 crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
-    pending_taken, pending_returns, folder_trace, #[cfg(unix)] pending_funding);
+    pending_taken, pending_returns, folder_trace, folder_read_resumed, #[cfg(unix)] pending_funding);
 
 struct OwnedJsonlParser {
     #[cfg(test)]
@@ -37176,6 +37178,17 @@ impl OwnedJsonlParser {
         drive: impl FnOnce(&mut ParserReader, LineSink<'_>) -> T,
     ) -> T {
         let source = self.source;
+        if source == SnapshotSource::ClaudeCode
+            && self
+                .reader
+                .acquisition
+                .as_ref()
+                .is_some_and(|plan| plan.start_offset() > 0)
+        {
+            self.pending
+                .get_or_insert_with(Default::default)
+                .folder_read_resumed = true;
+        }
         let accumulator = &mut self.accumulator;
         let recognized_usage_drop_count = &mut self.recognized_usage_drop_count;
         let positive_recognized_usage_count = &mut self.positive_recognized_usage_count;
@@ -37389,11 +37402,10 @@ impl OwnedJsonlParser {
             .pending
             .as_mut()
             .and_then(|pending| pending.folder_trace.take());
-        let whole_read = self
-            .reader
-            .acquisition
+        let whole_read = !self
+            .pending
             .as_ref()
-            .map_or(true, |plan| plan.start_offset() == 0);
+            .is_some_and(|pending| pending.folder_read_resumed);
         let Self {
             reader: bounded,
             mut accumulator,

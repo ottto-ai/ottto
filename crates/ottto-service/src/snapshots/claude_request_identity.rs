@@ -5077,9 +5077,6 @@ fn transcript_identity<'k>(
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
     };
-    if let Some(refusal) = email_refusal(evidence, facts, org) {
-        return Some(IdentityRef::Refused(refusal));
-    }
     // Both recorded before this request, in this file, unchanged. Desktop stays
     // pair-only.
     if let Some(folder) = facts
@@ -5092,6 +5089,9 @@ fn transcript_identity<'k>(
             basis: TRANSCRIPT_RECORDED_LOGIN,
             account_source: None,
         }));
+    }
+    if let Some(refusal) = email_refusal(evidence, facts, org) {
+        return Some(IdentityRef::Refused(refusal));
     }
     Some(IdentityRef::Tagged(KeyRef {
         login: None,

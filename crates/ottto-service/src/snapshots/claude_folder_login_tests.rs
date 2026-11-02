@@ -344,7 +344,12 @@ fn two_folders_are_judged_alone_and_the_mixed_one_stays_owed() {
 }
 
 fn proof_wanted_after_page(index: &mut ScanIndex, f: &Folder) -> bool {
-    begin_page(index, &ScanIndex::default(), &[f.root.clone()], true);
+    begin_page(
+        index,
+        &ScanIndex::default(),
+        std::slice::from_ref(&f.root),
+        true,
+    );
     proof_wanted(&f.key)
 }
 
