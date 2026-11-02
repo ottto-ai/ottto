@@ -285,7 +285,14 @@ fn start_walk(source: SnapshotSource, root: &Path, index: &mut ScanIndex) {
 }
 
 fn walk_page(source: SnapshotSource, index: &mut ScanIndex) {
-    advance_bounded_directory_traversal_with_budget(source, index, BACKFILL_WINDOW_DAYS, 2, None);
+    advance_bounded_directory_traversal_with_budget(
+        source,
+        index,
+        BACKFILL_WINDOW_DAYS,
+        2,
+        None,
+        None,
+    );
 }
 
 /// [regress] The old gauge restarted with the process: the first walk of a new process
