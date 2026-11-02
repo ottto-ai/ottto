@@ -76,12 +76,10 @@ pub(crate) fn snapshot() -> BTreeMap<String, OwnerReport> {
 }
 
 /// Sync pass: whether the capability is on, and which folders are sticky.
-pub(crate) fn set_wanted(enabled: bool, stopped: Option<BTreeSet<String>>) {
+pub(crate) fn set_wanted(enabled: bool, stopped: BTreeSet<String>) {
     with_ledger(|ledger| {
         ledger.enabled = enabled;
-        if let Some(stopped) = stopped {
-            ledger.stopped = stopped;
-        }
+        ledger.stopped = stopped;
     });
 }
 
