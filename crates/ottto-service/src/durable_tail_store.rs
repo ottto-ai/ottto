@@ -134,6 +134,7 @@ pub(crate) trait SingleWriter {
 pub(crate) enum DurableSource {
     ClaudeCode,
     Codex,
+    Pi,
 }
 impl DurableSource {
     fn tag(self) -> u8 {
@@ -244,6 +245,8 @@ fn retired_pin(source: DurableSource, format: u16, pin: &Digest32) -> bool {
             "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
         }
         DurableSource::Codex => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        // No shipped build persisted a Pi record, so Pi has no retired v1 pin.
+        DurableSource::Pi => return false,
     };
     format == FORMAT_V1 && parse_hex_digest(retired).as_ref() == Some(pin)
 }

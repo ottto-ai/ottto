@@ -31,7 +31,7 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::durable_tail_codec::durable_struct!(CachedJsonlReduction {
+crate::durable_tail_codec::durable_struct!(borrowed CachedJsonlReduction {
     D accumulator: SnapshotAccumulator,
     D report: JsonlReadReport,
     N recognized_usage_drop_count: usize,
