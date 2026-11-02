@@ -713,6 +713,24 @@ pub(crate) mod money_oracle {
         }
     }
 
+    // Commit 6's oracle rows hold this comparator.
+    #[allow(dead_code)]
+    /// Caller supplies independently known extent/revision regression; money
+    /// shrink is not inferred from tokens (legitimate corrections exist).
+    pub(crate) fn assert_no_smaller_reemit(
+        entity: &str,
+        prior: &RouteResult,
+        candidate: &RouteResult,
+        cold: &RouteResult,
+        behind_accepted: bool,
+    ) {
+        if behind_accepted {
+            assert_held(entity, prior, candidate, cold);
+        } else {
+            assert_equivalent(cold, candidate);
+        }
+    }
+
     /// `entity` is held in `other`; every emitted sibling must still equal cold.
     pub(crate) fn assert_held(
         entity: &str,

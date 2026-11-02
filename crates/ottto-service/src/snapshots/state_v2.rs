@@ -23,7 +23,9 @@ mod runtime;
         reason = "R1 consumes this staged crate-visible erasure seam"
     )
 )]
-pub(in super::super) use runtime::{remove_retired_record_dir, retired_record_dir};
+pub(crate) use runtime::{
+    erase_source, remove_retired_record_dir, retired_record_dir, source_erasure_alarm,
+};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;

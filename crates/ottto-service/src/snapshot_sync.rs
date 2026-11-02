@@ -6978,7 +6978,6 @@ fn prepare_sync_source_inner(
         watcher_hints.overflowed,
         request_identity_capture,
         &copy_prefix_scope,
-        &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass)

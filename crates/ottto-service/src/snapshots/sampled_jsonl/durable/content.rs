@@ -120,7 +120,7 @@ impl Decoded {
         let boundary = stored.codex_ownership_boundary;
         let session_end = stored.session_start.durable_content_end().unwrap_or(0);
         let mut head = vec![0; plan.end as usize];
-        read_at(file, source, &mut head, 0)?;
+        read_at(file, &mut head, 0)?;
         let mut window = ClaudeResponseWindow::default();
         let mut offset = 0;
         let mut peak = 0;
@@ -129,149 +129,135 @@ impl Decoded {
                 return Err(Refuse::NotRederivable("head_line"));
             }
             offset += line.len() as u64;
-            replay_line(
-                source,
-                &line[..line.len() - 1],
-                &mut peak,
-                |value, meter| {
-                    let opening = self.rederive.session_start.is_some() && offset <= session_end;
-                    let shell_line = match source {
-                        SnapshotSource::ClaudeCode => value
-                            .pointer("/message/content")
-                            .and_then(Value::as_array)
-                            .is_some_and(|items| {
-                                items.iter().any(|item| {
-                                    string_eq_at(item, &["type"], "tool_use")
-                                        && string_eq_at(item, &["name"], "Bash")
-                                })
-                            }),
-                        SnapshotSource::Codex => string_at(value, &["payload", "type"])
-                            .or_else(|| string_at(value, &["type"]))
-                            .is_some_and(|kind| {
-                                matches!(kind.as_str(), "exec_command_end" | "item_completed")
-                            }),
-                        SnapshotSource::Pi => false,
-                    };
-                    if opening && fresh.session_start.content_window_open() && shell_line {
-                        // Shell token fan-out is derived from a string, not from a
-                        // charged Value array. Pay it separately before the fold.
-                        let separators = line
-                            .iter()
-                            .filter(|b| {
-                                b.is_ascii_whitespace()
-                                    || matches!(
-                                        **b,
-                                        b'\\'
-                                            | b'\''
-                                            | b'"'
-                                            | b';'
-                                            | b'|'
-                                            | b'&'
-                                            | b'('
-                                            | b')'
-                                            | b'<'
-                                            | b'>'
-                                            | b'`'
-                                    )
-                                    || **b >= 128
+            replay_line(&line[..line.len() - 1], &mut peak, |value, meter| {
+                let opening = self.rederive.session_start.is_some() && offset <= session_end;
+                let shell_line = match source {
+                    SnapshotSource::ClaudeCode => value
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                string_eq_at(item, &["type"], "tool_use")
+                                    && string_eq_at(item, &["name"], "Bash")
                             })
-                            .count() as u64;
-                        meter.charge::<serde_json::Error>(separators.checked_mul(48))?;
-                    }
-                    match source {
-                        SnapshotSource::ClaudeCode => {
-                            match claude_fork_line_provenance(value) {
-                                ClaudeForkLineProvenance::Inherited => {
-                                    fresh.session_start.note_inherited_prefix();
-                                    return Ok(());
-                                }
-                                ClaudeForkLineProvenance::Invalid => return Ok(()),
-                                ClaudeForkLineProvenance::None => {}
-                            }
-                            claude_prompt_content(value, &mut fresh);
-                            claude_workspace_content(value, &mut fresh);
-                            window.observe(value);
-                            if opening {
-                                fresh.session_start.observe_claude_line(
-                                    value,
-                                    window.sequence,
-                                    fresh.workspace_path.as_deref(),
-                                );
-                            }
-                        }
-                        SnapshotSource::Codex => {
-                            if let Some(meta) = codex_session_meta_payload(value) {
-                                if !fresh.codex_session_meta_seen {
-                                    if let Some(src) = meta.get("source").filter(|v| v.is_object())
-                                    {
-                                        codex_agent_content(src, &mut fresh);
-                                    }
-                                    codex_header_workspace_content(meta, &mut fresh);
-                                    fresh.codex_session_meta_seen = true;
-                                    fresh.codex_ownership_boundary = boundary;
-                                }
-                            }
-                            if opening && string_eq_at(value, &["type"], "session_meta") {
-                                fresh.session_start.note_codex_session_meta(value);
-                            }
-                            if !fresh.codex_record_is_owned(value) {
+                        }),
+                    SnapshotSource::Codex => string_at(value, &["payload", "type"])
+                        .or_else(|| string_at(value, &["type"]))
+                        .is_some_and(|kind| {
+                            matches!(kind.as_str(), "exec_command_end" | "item_completed")
+                        }),
+                    SnapshotSource::Pi => false,
+                };
+                if opening && fresh.session_start.content_window_open() && shell_line {
+                    // Shell token fan-out is derived from a string, not from a
+                    // charged Value array. Pay it separately before the fold.
+                    let separators = line
+                        .iter()
+                        .filter(|b| {
+                            b.is_ascii_whitespace()
+                                || matches!(
+                                    **b,
+                                    b'\\'
+                                        | b'\''
+                                        | b'"'
+                                        | b';'
+                                        | b'|'
+                                        | b'&'
+                                        | b'('
+                                        | b')'
+                                        | b'<'
+                                        | b'>'
+                                        | b'`'
+                                )
+                                || **b >= 128
+                        })
+                        .count() as u64;
+                    meter.charge::<serde_json::Error>(separators.checked_mul(48))?;
+                }
+                match source {
+                    SnapshotSource::ClaudeCode => {
+                        match claude_fork_line_provenance(value) {
+                            ClaudeForkLineProvenance::Inherited => {
+                                fresh.session_start.note_inherited_prefix();
                                 return Ok(());
                             }
-                            if opening {
-                                codex_opening_content(value, &mut fresh);
+                            ClaudeForkLineProvenance::Invalid => return Ok(()),
+                            ClaudeForkLineProvenance::None => {}
+                        }
+                        claude_prompt_content(value, &mut fresh);
+                        claude_workspace_content(value, &mut fresh);
+                        window.observe(value);
+                        if opening {
+                            fresh.session_start.observe_claude_line(
+                                value,
+                                window.sequence,
+                                fresh.workspace_path.as_deref(),
+                            );
+                        }
+                    }
+                    SnapshotSource::Codex => {
+                        if let Some(meta) = codex_session_meta_payload(value) {
+                            if !fresh.codex_session_meta_seen {
+                                if let Some(src) = meta.get("source").filter(|v| v.is_object()) {
+                                    codex_agent_content(src, &mut fresh);
+                                }
+                                codex_header_workspace_content(meta, &mut fresh);
+                                fresh.codex_session_meta_seen = true;
+                                fresh.codex_ownership_boundary = boundary;
                             }
-                            if string_eq_at(value, &["payload", "type"], "task_started") {
-                                codex_user_turn_content(value, &mut fresh);
-                            }
-                            codex_prompt_content(value, &mut fresh);
-                            codex_workspace_content(value, &mut fresh);
-                            fresh.observe_codex_content_counting(value);
-                            if let Some(usage) = codex_total_usage(value) {
-                                let last = codex_last_usage(value);
-                                let identity = codex_usage_event_identity(value);
-                                let count =
-                                    (!codex_total_usage_has_request_count(value)).then_some(1);
-                                let admitted = if fresh.codex_counting_v2() {
-                                    fresh
-                                        .decide_codex_usage(
-                                            None,
-                                            usage,
-                                            last.clone(),
-                                            identity,
-                                            count,
-                                        )
-                                        .is_some()
-                                } else {
-                                    fresh
-                                        .decide_codex_legacy_usage(
-                                            None,
-                                            usage,
-                                            last.clone(),
-                                            identity,
-                                            count,
-                                        )
-                                        .is_some()
-                                };
-                                if opening && admitted {
-                                    if let Some(last) = last {
-                                        fresh.session_start.note_codex_request(&last);
-                                    }
+                        }
+                        if opening && string_eq_at(value, &["type"], "session_meta") {
+                            fresh.session_start.note_codex_session_meta(value);
+                        }
+                        if !fresh.codex_record_is_owned(value) {
+                            return Ok(());
+                        }
+                        if opening {
+                            codex_opening_content(value, &mut fresh);
+                        }
+                        if string_eq_at(value, &["payload", "type"], "task_started") {
+                            codex_user_turn_content(value, &mut fresh);
+                        }
+                        codex_prompt_content(value, &mut fresh);
+                        codex_workspace_content(value, &mut fresh);
+                        fresh.observe_codex_content_counting(value);
+                        if let Some(usage) = codex_total_usage(value) {
+                            let last = codex_last_usage(value);
+                            let identity = codex_usage_event_identity(value);
+                            let count = (!codex_total_usage_has_request_count(value)).then_some(1);
+                            let admitted = if fresh.codex_counting_v2() {
+                                fresh
+                                    .decide_codex_usage(None, usage, last.clone(), identity, count)
+                                    .is_some()
+                            } else {
+                                fresh
+                                    .decide_codex_legacy_usage(
+                                        None,
+                                        usage,
+                                        last.clone(),
+                                        identity,
+                                        count,
+                                    )
+                                    .is_some()
+                            };
+                            if opening && admitted {
+                                if let Some(last) = last {
+                                    fresh.session_start.note_codex_request(&last);
                                 }
                             }
                         }
-                        SnapshotSource::Pi => {
-                            pi_content_line(value, pi_message_role(value).as_deref(), &mut fresh)
-                        }
                     }
-                    Ok(())
-                },
-            )?;
+                    SnapshotSource::Pi => {
+                        pi_content_line(value, pi_message_role(value).as_deref(), &mut fresh)
+                    }
+                }
+                Ok(())
+            })?;
         }
         if let Some((offset, len)) = plan.title {
             let mut line = vec![0; len as usize];
-            read_at(file, source, &mut line, offset)?;
+            read_at(file, &mut line, offset)?;
             replay_line(
-                source,
                 line.strip_suffix(b"\n").unwrap_or(&line),
                 &mut peak,
                 |value, _| {
@@ -370,7 +356,7 @@ impl ClaudeResponseWindow {
         }
     }
 }
-fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
+fn read_at(file: &File, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
     let mut offset = 0;
     while offset < bytes.len() {
         let n = match file.read_at(&mut bytes[offset..], at + offset as u64) {
@@ -385,7 +371,6 @@ fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Re
 }
 #[inline(never)]
 fn replay_line(
-    source: SnapshotSource,
     bytes: &[u8],
     peak: &mut u64,
     fold: impl FnOnce(&Value, &mut LineMeter) -> Result<(), serde_json::Error>,

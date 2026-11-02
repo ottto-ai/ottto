@@ -3086,7 +3086,3 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             .is_none());
     }
 }
-
-#[cfg(unix)]
-#[path = "sampled_audit/quiet_retirement_equivalence_tests.rs"]
-mod quiet_retirement_equivalence_tests;

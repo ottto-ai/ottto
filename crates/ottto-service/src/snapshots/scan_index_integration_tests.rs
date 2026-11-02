@@ -566,7 +566,6 @@ fn recovery_emission_boundaries(
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
         stored_reuse: None,
-        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,

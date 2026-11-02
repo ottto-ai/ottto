@@ -10,7 +10,7 @@ use std::fs::File;
 pub(crate) mod pl_text;
 
 use super::*;
-use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, Refuse, Shape};
+use crate::durable_tail_codec::{Durable, Enc, Refuse};
 
 /// Digests (`H`) of the re-derived values. `None`: the field is empty.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -198,4 +198,23 @@ impl Decoded {
             .ok_or(Refuse::NotRederivable("SnapshotAccumulator.title"))?;
         Ok((offset.saturating_add(len) > head_end).then_some((offset, len)))
     }
+}
+
+/// The finished parser's upload items, as the money tests compare them.
+#[cfg(test)]
+pub(in crate::snapshots) fn test_finish_items(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+) -> Value {
+    items(parser, path, source)
+}
+
+#[cfg(test)]
+/// The finished upload items of a parser that read to completion. Claude
+/// finishes with the money context the scan passes (the `e2` fold's read
+/// context over an index holding the file), so the money fold is compared
+/// too.
+fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    items_at(parser, path, source, None)
 }

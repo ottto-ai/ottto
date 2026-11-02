@@ -2987,7 +2987,7 @@ fn insert_transcript_record(
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
             let held = |key: &str| {
-                (page_held.contains(key)
+                page_held.contains(key)
                     || index
                         .traversal
                         .as_ref()
@@ -2995,7 +2995,7 @@ fn insert_transcript_record(
                     || index
                         .scan_residue_witness
                         .as_ref()
-                        .is_some_and(|witness| witness.index_keys.contains(key)))
+                        .is_some_and(|witness| witness.index_keys.contains(key))
             };
             let excluded = |key: &str| {
                 active

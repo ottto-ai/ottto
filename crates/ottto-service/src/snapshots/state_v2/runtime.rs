@@ -1255,13 +1255,13 @@ pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
 }
 
 /// The retired restart-record directory beside a scan index.
-pub(in super::super) fn retired_record_dir(index_path: &Path) -> PathBuf {
+pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
     index_path.with_extension("durable-tail")
 }
 
 /// Removes that directory, never following a link, and syncs its parent.
 /// `Ok(false)`: nothing was there.
-pub(in super::super) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
+pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
     match fs::symlink_metadata(records) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
         Ok(_) => fs::remove_file(records)?,

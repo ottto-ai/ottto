@@ -731,7 +731,6 @@ impl OwnedSourceScan {
 /// where another implies it today.
 fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
     active.sampling.is_none()
-        && !active.parser.return_pending()
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()

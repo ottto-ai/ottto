@@ -6918,7 +6918,6 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     }
     targets.pending_finalization.push(PendingIndexFinalization {
         stored_reuse: None,
-        restored_behind_accepted: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index
