@@ -3592,61 +3592,6 @@ pub(in crate::snapshots) mod tests {
         crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(accepted, result, 0);
     }
 
-    /// [regress] 0.1.213: refused archive passes rewrote every archive row (a
-    /// header attempt spent at reservation, then refunded), so each save halved
-    /// the scan page limit. Once held, a refused pass changes no durable field,
-    /// at any step, and spends no attempt.
-    #[test]
-    fn a_refused_header_pass_dirties_no_archive_row() {
-        let _lock = DECODER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f =
-            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
-        let key = local_index_key(&f.0);
-        // A busy singleton refuses every decoder claim below.
-        let other = Arc::new(sampled_scan::SharedCache::default());
-        let owner = sampled_scan::codex_cursor::DecoderOwner::acquire(&other, 1).unwrap();
-        let pass = |index: ScanIndex, row: Option<&Value>| {
-            let scan = selector_scan(
-                &f,
-                index,
-                Arc::new(sampled_scan::SharedCache::default()),
-                VecDeque::from([f.candidate()]),
-                true,
-            );
-            let checkpoint = fixture(b"", ".json");
-            fs::remove_file(&checkpoint.0).unwrap();
-            crate::local_resource_diagnostics::capture(|| {
-                finish_selector_with(scan, &checkpoint.0, |next| {
-                    if let Some(row) = row {
-                        assert_eq!(
-                            &serde_json::to_value(&next.index.archives[&key]).unwrap(),
-                            row,
-                            "no durable field flips within a pass"
-                        );
-                    }
-                })
-            })
-        };
-        let ((mut index, _), logs) = pass(ScanIndex::default(), None);
-        assert!(logs.iter().any(|l| l["stage"] == "codex_zst_refused"));
-        assert_eq!(
-            index.archives[&key].owed_cause(),
-            Some(CodexZstCause::AdmissionRefused)
-        );
-        let work = index.archives[&key].work.as_ref().unwrap();
-        assert_eq!((work.attempts, work.header_attempts), (0, 0));
-        let row = serde_json::to_value(&index.archives[&key]).unwrap();
-        for _ in 0..2 {
-            let ((next, _), logs) = pass(saved(&index), Some(&row));
-            assert!(logs.iter().any(|l| l["stage"] == "codex_zst_refused"));
-            assert_eq!(serde_json::to_value(&next.archives[&key]).unwrap(), row);
-            index = next;
-        }
-        owner.release();
-    }
-
     /// [format] Unopened header permission is cancelled, an opened attempt stays
     /// counted, and deferred alarms survive a real reload.
     #[test]

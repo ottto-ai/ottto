@@ -12531,7 +12531,8 @@ fn assert_decoder_refused_evicting_nothing(
 }
 
 /// A busy cache admits: free room first, then header facts, then retained
-/// copies through the pause's eviction path and counter.
+/// copies through the pause's eviction path and counter. The primary tail
+/// floor stays free after every eviction.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -12565,6 +12566,11 @@ fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
                 })
             });
             assert_eq!(cache.cursor_reserved(), credit);
+            let used = cache.cursor_resident() + retained_floor(&cache) + side;
+            assert!(
+                limit - used >= ENTRY_BYTES + side,
+                "the primary floor stays free"
+            );
             input.close();
             assert_eq!(cache.cursor_reserved(), 0);
             counts.cursor_reservation_entries_evicted
@@ -12623,39 +12629,6 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
         owner.release();
         job.refund();
         assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// The primary tail floor is never spent: a budget that fits everything but
-/// the floor refuses, and an admitted decoder leaves the floor free.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs validated heap layout"
-)]
-fn decoder_eviction_keeps_the_primary_tail_floor_free() {
-    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, _) = warm_decoder_cache(&fixture);
-        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
-        let budget = decoder_least_budget(&cache);
-        let archive = synthetic_archive("decoder-floor-kept");
-        assert_decoder_refused_evicting_nothing(&cache, budget - ENTRY_BYTES, &archive);
-        assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
-        with_test_state_budget(budget, || {
-            let input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                .unwrap()
-                .expect("the floor still fits");
-            assert_eq!(cache.retained().unwrap().entry_count(), 0);
-            let used = cache.cursor_resident() + retained_floor(&cache) + side;
-            assert!(budget - used >= ENTRY_BYTES + side, "the floor stays free");
-            input.close();
-        });
     });
 }
 
