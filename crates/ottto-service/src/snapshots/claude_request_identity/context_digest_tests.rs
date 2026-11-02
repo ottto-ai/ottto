@@ -127,8 +127,85 @@ fn missing_digest_is_a_first_sentence_and_a_real_change_still_flips() {
     assert_eq!(first_after_marker.unwrap().context_flip_position, None);
 }
 
-/// A key change is reported, and it drops retained parses. A process's first
-/// bind is not one: Codex scans first, and must keep what it just retained.
+/// Each post-first-bind key change: a scrubbed parse takes the next sentence as a
+/// fresh baseline, so the next org flip is not trusted, even if the sentence did
+/// change. With a key, a real change after that baseline still explains a flip.
+#[test]
+fn scrubbed_digest_is_a_fresh_baseline_and_trusts_no_flip() {
+    for (from, to) in [(Some(1), Some(2)), (Some(1), None), (None, Some(2))] {
+        for next in ["one@example.invalid", "two@example.invalid"] {
+            bind_session_context_key(from.map(attribution).as_ref());
+            let mut markers = None;
+            note_marker_line(&mut markers, &sentence("one@example.invalid"), 0);
+            note_marker_line(&mut markers, &org(ORG_1), 0);
+            assert!(bind_session_context_key(to.map(attribution).as_ref()));
+            markers.as_mut().unwrap().scrub_context_digest();
+            let state = markers.as_ref().unwrap();
+            assert_eq!(state.context_digest, None);
+            assert!(!state.context_changed);
+            assert_eq!(state.entries.len(), 1, "markers are kept");
+            assert!(matches!(state.verdict(0, false), MarkerVerdict::Trusted(_)));
+
+            note_marker_line(&mut markers, &sentence(next), 1);
+            assert!(!markers.as_ref().unwrap().context_changed);
+            assert_eq!(markers.as_ref().unwrap().context_flip_position, Some(1));
+            note_marker_line(&mut markers, &org(ORG_2), 1);
+            assert_eq!(
+                markers.as_ref().unwrap().verdict(1, false),
+                MarkerVerdict::UntrustedFlip
+            );
+
+            if to.is_some() {
+                note_marker_line(&mut markers, &org(ORG_2), 2);
+                note_marker_line(&mut markers, &sentence("three@example.invalid"), 3);
+                assert!(markers.as_ref().unwrap().context_changed);
+                note_marker_line(&mut markers, &org(ORG_1), 3);
+                assert!(matches!(
+                    markers.as_ref().unwrap().verdict(3, false),
+                    MarkerVerdict::Trusted(_)
+                ));
+            }
+        }
+    }
+}
+
+/// A change seen under the old key but not yet spent on a flip does not survive
+/// the scrub, and neither does a blank sentence's digest pass as a first sentence.
+#[test]
+fn scrub_drops_a_pending_change_and_remembers_a_blank_sentence() {
+    bind_session_context_key(Some(&attribution(1)));
+    let mut markers = None;
+    note_marker_line(&mut markers, &sentence("one@example.invalid"), 0);
+    note_marker_line(&mut markers, &org(ORG_1), 0);
+    note_marker_line(&mut markers, &sentence("two@example.invalid"), 1);
+    assert!(markers.as_ref().unwrap().context_changed);
+    bind_session_context_key(Some(&attribution(2)));
+    markers.as_mut().unwrap().scrub_context_digest();
+    note_marker_line(&mut markers, &sentence("two@example.invalid"), 2);
+    note_marker_line(&mut markers, &org(ORG_2), 2);
+    assert_eq!(
+        markers.as_ref().unwrap().verdict(2, false),
+        MarkerVerdict::UntrustedFlip
+    );
+
+    let mut blank = None;
+    note_marker_line(&mut blank, &sentence(""), 0);
+    note_marker_line(&mut blank, &org(ORG_1), 0);
+    bind_session_context_key(Some(&attribution(1)));
+    blank.as_mut().unwrap().scrub_context_digest();
+    note_marker_line(&mut blank, &sentence(""), 1);
+    assert!(!blank.as_ref().unwrap().context_changed);
+    note_marker_line(&mut blank, &org(ORG_2), 1);
+    let mut blank = blank.unwrap();
+    assert_eq!(blank.verdict(1, false), MarkerVerdict::UntrustedFlip);
+    blank.home = Some(crate::claude_status_coverage::home_key(
+        std::path::Path::new("/synthetic/home"),
+    ));
+    assert!(blank.email_home(1).is_none());
+}
+
+/// A key change is reported, and it scrubs retained digests. A process's first
+/// bind is not one: no Claude parse can exist before it.
 #[test]
 fn bind_reports_only_a_key_change() {
     accepted::unbind_test_session_context_key();

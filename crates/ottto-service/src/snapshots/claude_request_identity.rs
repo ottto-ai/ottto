@@ -2907,12 +2907,18 @@ pub(crate) fn note_marker_line(
                         state.context_flip_position.get_or_insert(response_position);
                     }
                 }
+                // An earlier email with no digest (no key then, or scrubbed on a
+                // key change) cannot be compared: this sentence is a fresh
+                // baseline. It explains no organization change and ends that email.
                 Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
-                    if state.context_digest.is_some() && state.context_flip_position.is_none() {
+                    let compared = state.context_digest.is_some();
+                    if (compared || state.context_position.is_some())
+                        && state.context_flip_position.is_none()
+                    {
                         state.context_flip_position = Some(response_position);
                     }
                     state.context_changed =
-                        state.context_digest.is_some() || !state.entries.is_empty();
+                        compared || (state.context_position.is_none() && !state.entries.is_empty());
                     state.context_digest = Some(digest);
                 }
                 Some(_) => {}
@@ -2969,6 +2975,20 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Ends comparison with sentences digested under another key, keeping the
+    /// markers and their earlier verdicts. A sentence seen earlier stays on
+    /// record, as position 0 if it was blank, so the next one is a fresh baseline
+    /// rather than a first sentence, and any email basis stays refused.
+    pub(crate) fn scrub_context_digest(&mut self) {
+        let sentence_seen =
+            self.context_digest.take().is_some() || self.context_flip_position.is_some();
+        self.context_changed = false;
+        if sentence_seen && self.context_position.is_none() {
+            self.context_position = Some(0);
+            self.context_flip_position = Some(0);
+        }
+    }
+
     /// Binds the registered-folder key once the item's path is known.
     pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
         if self.context_position.is_some() {

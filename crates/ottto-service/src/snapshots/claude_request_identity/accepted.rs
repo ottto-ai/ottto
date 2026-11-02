@@ -337,8 +337,8 @@ fn with_session_context_key<R>(
 }
 
 /// Binds the cycle's attribution key; true when it changed, which ends what any
-/// retained parse's digest can be compared with. The process's first bind is no
-/// change: no Claude parse exists before it, but an earlier source's may.
+/// retained parse's digest can be compared with, so the caller scrubs those
+/// digests. The process's first bind is no change: no Claude parse exists before it.
 pub(crate) fn bind_session_context_key(
     context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> bool {

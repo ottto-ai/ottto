@@ -279,12 +279,12 @@ impl SharedCache {
     }
 }
 impl SharedCache {
-    /// Drops every retained parse: a miss only re-reads. For a change of the
-    /// key their digests were made under.
-    pub(crate) fn forget_retained_transcripts(&self) {
+    /// A change of the key retained digests were made under. Keeps every parse:
+    /// a server hint can change the key, and that must never cause a re-read.
+    pub(crate) fn scrub_retained_context_digests(&self) {
         self.retained()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .scrub_states(sampled_jsonl::CachedJsonlReduction::scrub_context_digest);
     }
 
     /// Bind before constructor-time discovery/selection, which consults CONTENT.

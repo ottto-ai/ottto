@@ -6650,7 +6650,7 @@ fn prepare_sync_source_inner(
             attribution_context.as_ref(),
         )
     {
-        daemon.transcript_cache.forget_retained_transcripts();
+        daemon.transcript_cache.scrub_retained_context_digests();
     }
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: activity_hint.session_titles_enabled,
