@@ -1,17 +1,18 @@
 // The streamed Claude terminal over a real cold session (the state-v2
 // money harness): sliced one family at a time it decides what one whole
 // visit decides, it installs only the page's families, a changed token
-// refuses the sweep, and a refused terminal keeps the census open with its
-// traversal. The fixture is the legacy fork: the child's first request is
-// the parent's `req_shared`, so the two families share a request and a
-// legacy divergent prefix, in two different slices.
+// refuses the sweep, a refused terminal keeps the census open with its
+// traversal, and a patched head is read and saved with its flag. The
+// fixture is the legacy fork: the child's first request is the parent's
+// `req_shared`, so the two families share a request and a legacy divergent
+// prefix, in two different slices.
 use super::claude_request_identity_tests::{
     legacy_fork_fixture, LEGACY_CHILD, LEGACY_PARENT, LEGACY_WINDOW,
 };
 use super::*;
 use crate::claude_local_otel::{ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport};
 use crate::snapshots::state_v2::money_test_support as v2;
-use crate::snapshots::state_v2::SliceBudget;
+use crate::snapshots::state_v2::{visit_usage_ordered, SliceBudget};
 use crate::snapshots::terminal_join as tj;
 
 const ONE_FAMILY: SliceBudget = SliceBudget {
@@ -278,5 +279,69 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_commits() {
         arms[1].1, arms[0].1,
         "the retry commits what the whole visit does"
     );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// [behaviour] A head patched `contract_unproven` with nothing loaded is read
+/// from its row with the flag, in one whole visit and one family per slice
+/// alike; the save rewrites only that row and installs nothing. A row gone
+/// from the store is Unknown, counted.
+#[test]
+fn a_patched_head_is_read_and_saved_with_its_flag() {
+    let (dir, _, _, _, index) = accumulated();
+    let scratch = crate::test_scratch::canonical_private_dir("terminal-join-patched");
+    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let mut expected = v2::resident(&cold);
+    assert!(!expected.claude_usage_family_pending[LEGACY_PARENT].contract_unproven);
+    cold.claude_usage_family_pending
+        .mark_unproven(LEGACY_PARENT);
+    expected
+        .claude_usage_family_pending
+        .mark_unproven(LEGACY_PARENT);
+    let stored = expected
+        .claude_usage_family_pending
+        .resident()
+        .unwrap()
+        .iter()
+        .map(|(root, family)| (root.clone(), family.contract_unproven))
+        .collect::<BTreeMap<_, _>>();
+    let flags = |budget| {
+        let mut flags = BTreeMap::new();
+        let mut after: Option<String> = None;
+        loop {
+            let end = visit_usage_ordered(&cold, None, after.as_deref(), budget, &mut |root, f| {
+                flags.insert(root.to_owned(), f.contract_unproven);
+            });
+            after = end.unwrap().last_root;
+            if after.is_none() {
+                return flags;
+            }
+        }
+    };
+    assert!(stored[LEGACY_PARENT]);
+    assert_eq!(flags(SliceBudget::WHOLE), stored);
+    assert_eq!(flags(ONE_FAMILY), stored);
+    let (reloaded, view) = custody.save_reload(&mut cold);
+    assert!(
+        v2::usage_head_only(&cold, LEGACY_PARENT),
+        "nothing installed"
+    );
+    assert!(!cold
+        .claude_usage_family_pending
+        .cold()
+        .unwrap()
+        .patched(LEGACY_PARENT));
+    assert_eq!(
+        serde_json::to_value(&view.claude_usage_family_pending).unwrap(),
+        serde_json::to_value(&expected.claude_usage_family_pending).unwrap()
+    );
+
+    v2::delete_usage_row_in_session(&reloaded, LEGACY_PARENT);
+    let unknown = v2::usage_unknown_count();
+    let mut none = |_: &str, _: &ClaudeUsageFamilyPending| {};
+    assert!(visit_usage_ordered(&reloaded, None, None, SliceBudget::WHOLE, &mut none).is_err());
+    assert!(v2::usage_unknown_count() > unknown, "counted");
+    drop(custody);
+    let _ = fs::remove_dir_all(scratch);
     let _ = fs::remove_dir_all(dir);
 }

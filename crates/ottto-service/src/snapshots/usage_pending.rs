@@ -288,32 +288,34 @@ impl ColdUsage {
             self.head_occurrences = self.head_occurrences.saturating_sub(old.occurrences);
         }
     }
-    /// Install a stored value read for this pass. Its digest must be the
-    /// head's: anything else is a row this graph does not know (Unknown).
+    /// Install a stored value read for this pass, unless it is loaded
+    /// already. Its digest must be the head's: anything else, a removed
+    /// family's row included, is a row this graph does not know (Unknown).
     pub(super) fn install(
         &mut self,
         root: String,
         family: ClaudeUsageFamilyPending,
         digest: [u8; 32],
     ) -> Result<(), Unknown> {
-        self.admits(&root, digest)?;
-        if !self.loaded.contains_key(&root) && self.heads.contains_key(&root) {
-            self.loaded.insert(root, family);
+        if self.heads.get(&root).map(|head| head.digest) != Some(digest) {
+            return Err(Unknown);
         }
+        self.loaded.entry(root).or_insert(family);
         Ok(())
     }
-    /// Whether `install` would accept this row: its digest is the head's, or
-    /// the family is loaded already or was removed by this graph.
-    pub(super) fn admits(&self, root: &str, digest: [u8; 32]) -> Result<(), Unknown> {
-        if self.loaded.contains_key(root) {
-            return Ok(());
+    /// `root`'s stored row as read: it must be its head's row (else Unknown),
+    /// with a patched head's `contract_unproven` applied.
+    pub(super) fn head_row(
+        &self,
+        root: &str,
+        row: Option<(ClaudeUsageFamilyPending, [u8; 32])>,
+    ) -> Result<(ClaudeUsageFamilyPending, [u8; 32]), Unknown> {
+        let (mut family, digest) = row.ok_or(Unknown)?;
+        if self.heads.get(root).map(|head| head.digest) != Some(digest) {
+            return Err(Unknown);
         }
-        match self.heads.get(root) {
-            Some(head) if head.digest == digest => Ok(()),
-            // A row this graph removed stays removed.
-            None => Ok(()),
-            Some(_) => Err(Unknown),
-        }
+        family.contract_unproven |= self.patched(root);
+        Ok((family, digest))
     }
     /// End a decision that loaded families: loaded values still equal to
     /// their row return to heads, except the `keep` families the caller's

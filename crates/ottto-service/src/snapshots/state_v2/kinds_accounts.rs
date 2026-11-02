@@ -221,11 +221,7 @@ fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
             continue;
         }
         let tx = rows.tx.as_deref_mut().ok_or(Unknown)?;
-        let (mut family, digest) =
-            mapper::read_row::<ClaudeUsageFamilyPending>(tx, "usage.pending", root)?
-                .ok_or(Unknown)?;
-        ensure!(digest == head, Unknown);
-        family.contract_unproven = true;
+        let (family, _) = cold.head_row(root, mapper::read_row(tx, "usage.pending", root)?)?;
         rows.put(key, &family)?;
     }
     rows.put(mapper::key("usage.pending", "", 0)?, &families)

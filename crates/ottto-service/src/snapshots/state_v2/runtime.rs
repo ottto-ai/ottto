@@ -1325,7 +1325,6 @@ pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    use super::super::usage_pending::Unknown;
     let usage = &index.claude_usage_family_pending;
     let Some(cold) = usage.cold() else {
         return Ok(());
@@ -1337,16 +1336,8 @@ pub(in super::super) fn load_usage(
     let read = read_txn(index, |tx| {
         let mut read = Vec::with_capacity(unread.len());
         for root in unread {
-            let (mut value, digest) = mapper::read_row::<super::super::ClaudeUsageFamilyPending>(
-                tx,
-                "usage.pending",
-                &root,
-            )?
-            .ok_or(Unknown)?;
-            cold.admits(&root, digest)?;
-            if cold.patched(&root) {
-                value.contract_unproven = true;
-            }
+            let (value, digest) =
+                cold.head_row(&root, mapper::read_row(tx, "usage.pending", &root)?)?;
             read.push((root, value, digest));
         }
         Ok(read)
@@ -1397,15 +1388,14 @@ pub(in super::super) struct UsageToken {
 
 /// How a slice ended. `last_root`: resume after it; `None`: no family is left.
 /// `decoded_bytes`: heap of the stored rows this slice decoded, measured on
-/// each decoded value (loaded values are not decoded and count none);
-/// `peak_family_bytes`: the largest of them. A layout the bound cannot
-/// measure counts as `usize::MAX`, so its family ends the slice.
+/// each decoded value (loaded values are not decoded and count none). A
+/// layout the bound cannot measure counts as `usize::MAX`, so its family
+/// ends the slice.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in super::super) struct SliceEnd {
     pub(in super::super) last_root: Option<String>,
     pub(in super::super) visited: usize,
     pub(in super::super) decoded_bytes: usize,
-    pub(in super::super) peak_family_bytes: usize,
     pub(in super::super) token: UsageToken,
 }
 
@@ -1413,8 +1403,9 @@ pub(in super::super) struct SliceEnd {
 /// `after`, one slice under `budget`: every family (`None`) or the named ones
 /// (`Some`). Each is the graph's loaded value at its root position, else its
 /// stored row, which must match its head (a patched head's flag applied).
-/// Keeps nothing and installs nothing; one short read transaction per slice.
-/// Unknown, counted: a row unlike its head, a head without a row, or a store
+/// Keeps nothing and installs nothing; one short read transaction per slice,
+/// over one ascending range of rows for a whole visit, keyed for a targeted
+/// one. Unknown, counted: a row unlike its head, a head without a row, or a store
 /// this graph does not hold.
 pub(in super::super) fn visit_usage_ordered(
     index: &ScanIndex,
@@ -1428,6 +1419,13 @@ pub(in super::super) fn visit_usage_ordered(
     let families = usage.len();
     let mut end = SliceEnd::default();
     let mut slice = |mut tx: Option<&mut dyn Transaction>| -> Result<()> {
+        // A stored whole visit reads its rows over one ascending range per
+        // slice; a targeted one reads only its named keys.
+        let limit = budget.families.saturating_add(1).min(128);
+        let mut range = match (roots, &tx) {
+            (None, Some(_)) => Some(mapper::KeyRows::new("usage.pending", after, limit)?),
+            _ => None,
+        };
         let views: Box<dyn Iterator<Item = (&String, UsageView<'_>)> + '_> = match roots {
             None => usage.views_after(after),
             Some(roots) => {
@@ -1444,21 +1442,21 @@ pub(in super::super) fn visit_usage_ordered(
         while let Some((root, view)) = views.next() {
             match view {
                 UsageView::Full(family) => f(root, family),
-                UsageView::Head(head) => {
+                UsageView::Head(_) => {
                     let tx = tx.as_deref_mut().ok_or(Unknown)?;
-                    let (mut family, digest) = mapper::read_row::<
-                        super::super::ClaudeUsageFamilyPending,
-                    >(tx, "usage.pending", root)?
-                    .ok_or(Unknown)?;
-                    ensure!(digest == head.digest, Unknown);
-                    if usage.cold().is_some_and(|cold| cold.patched(root)) {
-                        family.contract_unproven = true;
-                    }
+                    let row = match range.as_mut() {
+                        Some(range) => range
+                            .row(tx, root)?
+                            .map(|h| mapper::read_digest(tx, &h))
+                            .transpose()?,
+                        None => mapper::read_row(tx, "usage.pending", root)?,
+                    };
+                    let cold = usage.cold().ok_or(Unknown)?;
+                    let (family, _) = cold.head_row(root, row)?;
                     let bytes = crate::heap_layout_bound::completed_bound(&family, usize::MAX)
                         .unwrap_or(usize::MAX);
                     f(root, &family);
                     end.decoded_bytes = end.decoded_bytes.saturating_add(bytes);
-                    end.peak_family_bytes = end.peak_family_bytes.max(bytes);
                 }
             }
             end.visited += 1;
@@ -1498,9 +1496,6 @@ pub(in super::super) fn settle_usage(
     }
 }
 
-#[cfg(test)]
-#[path = "usage_ordered_tests.rs"]
-mod ordered_tests;
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;

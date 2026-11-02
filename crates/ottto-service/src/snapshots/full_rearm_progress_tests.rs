@@ -556,16 +556,8 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     // `contract_unproven`: it re-stamps only through its own stamp, so this
     // unstamped one is read.
     spent.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
-    rearm.fold(
-        &mut spent,
-        &rearm.items,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
-    assert!(
-        !spent.claude_request_identity_contract_changed,
-        "main's clear"
-    );
+    rearm.fold(&mut spent, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+    assert!(!spent.claude_request_identity_contract_changed, "main's clear");
     let pending = &spent.claude_usage_family_pending[OTHER_ROOT];
     assert!(pending.contract_unproven && pending.identity_contract.is_none());
     evidence_owed::clear(spent.files.get_mut(&other_key).unwrap());
@@ -648,12 +640,7 @@ fn identity_contract_rearm_owes_and_drains_to_a_full() {
         let mut index = latched_with_older_evidence(&mut rearm, index);
         index.bounded_sweep_had_unsettled_upload = held;
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        rearm.fold(
-            &mut index,
-            &rearm.items,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
         let owed = scope.finish().contract.evidence_owed;
         assert_eq!(
             owed.identity_contract_owed,
@@ -754,9 +741,10 @@ fn hex_sources(rearm: &mut Rearm, index: &mut ScanIndex) {
 /// [regress] While the identity-contract latch holds (an unsettled sweep),
 /// main clears and re-reads every family file at each complete census.
 /// Owed instead, a member read under the recorded contract is not owed again
-/// at any later completion: one read clears that debt. Three completions in three windows: the member read
-/// in the walk after the first is owed neither at the second nor at the
-/// third. Members not yet read stay owed and are not counted twice.
+/// at any later completion: one read clears that debt. Three completions in
+/// three windows: the member read in the walk after the first is owed
+/// neither at the second nor at the third. Members not yet read stay owed
+/// and are not counted twice.
 #[test]
 fn identity_owed_member_is_read_once_under_the_latch() {
     const NEXT: &str = "2026-08-02T07:11:00Z";
@@ -768,12 +756,7 @@ fn identity_owed_member_is_read_once_under_the_latch() {
     let mut index = latched_with_older_evidence(&mut rearm, index);
     hex_sources(&mut rearm, &mut index);
     index.bounded_sweep_had_unsettled_upload = true;
-    rearm.fold(
-        &mut index,
-        &rearm.items,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
     assert!(index.claude_request_identity_contract_changed);
     assert!(rearm
         .sources
@@ -928,12 +911,7 @@ fn evidence_owed_first_census_fold_owes_instead_of_clearing() {
         let rearm = Rearm::new();
         let mut index = rearm.index();
         index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let first = rearm.fold(
-            &mut index,
-            &rearm.items,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        let first = rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
         assert!(first.duplicate_census.full_rearm, "on={on}");
         for key in rearm.sources.keys() {
             let entry = &index.files[key];

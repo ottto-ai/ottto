@@ -149,11 +149,13 @@ fn cold_pages_accumulate_only_into_loaded_families() {
         .install("a".into(), rows["a"].clone(), digest(&rows["a"]))
         .unwrap();
     usage.discard("b");
-    usage
-        .cold_mut()
-        .unwrap()
-        .install("b".into(), rows["b"].clone(), digest(&rows["b"]))
-        .unwrap();
+    assert_eq!(
+        usage
+            .cold_mut()
+            .unwrap()
+            .install("b".into(), rows["b"].clone(), digest(&rows["b"])),
+        Err(Unknown)
+    );
     assert!(!usage.contains_key("b"));
     let page = usage.page_mut(["a", "new"]).unwrap();
     page.insert("new".into(), family("w1", 2, false));

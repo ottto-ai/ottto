@@ -4434,10 +4434,7 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
             reads.push(candidate.path.clone());
         }
     }
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| reads.contains(&candidate.path))
-    {
+    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
         index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
     }
     reads
