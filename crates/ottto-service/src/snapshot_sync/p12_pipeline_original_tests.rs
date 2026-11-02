@@ -795,7 +795,7 @@ impl RearmFixture {
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index_with_comparison(
+            checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
                 &progress,
@@ -810,6 +810,8 @@ impl RearmFixture {
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
                 Some(UnsettledUploadCause::Shed),
+                None,
+                Default::default(),
             )
             .expect("checkpoint shed page");
             return RearmPage {

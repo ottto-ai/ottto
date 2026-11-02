@@ -10038,6 +10038,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // A witnessed family rebuilt from the reports; one the reports name but
+    // cannot rebuild is an ignored veto.
+    let reconstruct =
+        |root_session_id: &String, witness: &ClaudeUsageFamilyWitness, ignored_vetoes: &mut u16| {
+            let family = reconstruct_claude_usage_family(
+                root_session_id,
+                witness,
+                api_report,
+                trace_report,
+                legacy_request_owners,
+            );
+            if family.is_none()
+                && (api_report.evidence.contains_key(root_session_id)
+                    || trace_report.evidence.contains_key(root_session_id))
+            {
+                *ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
+            }
+            family.map(|family| (root_session_id.clone(), family))
+        };
     if let Some(join) = terminal.as_mut().filter(|_| reports_healthy) {
         // Owed evidence (a terminal-retry re-arm) proves nothing until it
         // resolves (the sweep skipped owed and uncertified roots).
@@ -10052,20 +10071,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !proven.contains_key(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
         // Path-(a) tombstone: a retired family keeps its witness
@@ -10115,20 +10121,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !uncertified_roots.contains(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
     }
@@ -21212,16 +21205,17 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
-    /// Admission only. The native caller owns publication; bounded replay
-    /// uses the same ordered state transition without constructing money rows.
-    fn decide_codex_legacy_usage(
+    /// Admission steps shared by the legacy and v2 decisions, in their
+    /// order: the model carries forward, an exact repeated usage event is
+    /// skipped (`None`), a cumulative reset is counted and `usage` becomes
+    /// the cumulative total. Returns the resolved model, the previous
+    /// cumulative total and whether `usage` reset it.
+    fn admit_codex_cumulative_usage(
         &mut self,
         model: Option<String>,
-        usage: UsageTotals,
-        last_usage: Option<UsageTotals>,
+        usage: &UsageTotals,
         usage_event_identity: Option<String>,
-        implicit_request_count: Option<u64>,
-    ) -> Option<(String, UsageTotals)> {
+    ) -> Option<(String, Option<UsageTotals>, bool)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -21240,24 +21234,40 @@ impl SnapshotAccumulator {
         if usage_event_identity.is_some() {
             self.codex_last_usage_event_identity = usage_event_identity;
         }
+        let reset = self
+            .session_cumulative_usage
+            .as_ref()
+            .is_some_and(|previous| !usage.is_monotonic_after(previous));
+        if reset {
+            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
+        }
+        let previous = self.session_cumulative_usage.replace(usage.clone());
+        Some((resolved_model, previous, reset))
+    }
 
+    /// Admission only. The native caller owns publication; bounded replay
+    /// uses the same ordered state transition without constructing money rows.
+    fn decide_codex_legacy_usage(
+        &mut self,
+        model: Option<String>,
+        usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
+        implicit_request_count: Option<u64>,
+    ) -> Option<(String, UsageTotals)> {
+        let (resolved_model, previous, reset) =
+            self.admit_codex_cumulative_usage(model, &usage, usage_event_identity)?;
         // `last_token_usage` is Codex's exact current-response usage and stays
         // correct across compaction/restart resets. Older rollouts lack it; in
         // that case use a cumulative delta, beginning a new additive epoch on
         // a reset. Never erase usage already accepted from the same rollout.
-        let previous = self.session_cumulative_usage.as_ref();
-        let reset = previous.is_some_and(|previous| !usage.is_monotonic_after(previous));
-        if reset {
-            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
-        }
         let mut delta = match last_usage {
             Some(last) => last,
-            None => match previous {
+            None => match &previous {
                 Some(previous) if !reset => usage.delta_from(previous),
                 Some(_) | None => usage.clone(),
             },
         };
-        self.session_cumulative_usage = Some(usage.clone());
         if !delta.is_zero() {
             if let Some(count) = implicit_request_count {
                 delta.request_count = count;
@@ -35145,9 +35155,9 @@ impl OwnedSourceScan {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
                                             }
-                                            stale_selection_pending = matches!(class,
-                                                sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
+                                        stale_selection_pending = matches!(class,
+                                            sampled_scan::durable_tail::MissClass::StaleSelection);
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
@@ -35881,14 +35891,13 @@ impl OwnedSourceScan {
                 }
             }
             // There is one shared admission for this actual Full. Earlier
-            // grants and later structural/stale-selection owners take priority.
+            // grants and the later structural owner take priority.
             #[cfg(unix)]
-            let resource_full_pending =
-                if paced_full_granted || active_bound_degraded || stale_selection_pending {
-                    None
-                } else {
-                    resource_full_pending
-                };
+            let resource_full_pending = if paced_full_granted || active_bound_degraded {
+                None
+            } else {
+                resource_full_pending
+            };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -35933,15 +35942,19 @@ impl OwnedSourceScan {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
                 {
-                    let key = local_index_key(&active.candidate.path);
-                    if !context.cache.start_stale_selection_full(
-                        source,
-                        &key,
-                        active.parser.reader.reader.get_ref(),
-                    ) {
-                        residue_index_keys.insert(key);
-                        drop(codex_cursor_lease.take());
-                        pending!();
+                    if source == SnapshotSource::Codex {
+                        let key = local_index_key(&active.candidate.path);
+                        if !context.cache.start_stale_selection_full(
+                            source,
+                            &key,
+                            active.parser.reader.reader.get_ref(),
+                        ) {
+                            residue_index_keys.insert(key);
+                            drop(codex_cursor_lease.take());
+                            pending!();
+                        }
+                    } else {
+                        context.cache.note_stale_selection_full();
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {
