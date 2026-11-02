@@ -70,6 +70,7 @@ const WAITER_FORGET_PAGES: u64 = 64;
 const ROTATION_KEYS: usize = 64;
 /// Owners with B's blocked-owner provenance (§d.1.3, L-1).
 const JOIN_OWNERS: usize = 64;
+const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -267,6 +268,68 @@ pub(in crate::snapshots) enum StartRefusal {
     Unstartable,
 }
 
+/// Archive catch-up pacing for one ordinary page and its continuation
+/// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
+/// durable authority. A refusal never resets it; unknown CPU denies, as
+/// continuation treats any non-`Allowed` platform answer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArchivePass {
+    pub(crate) started: bool,
+    pub(crate) cpu: u64,
+    pub(crate) work: u64,
+    pub(crate) power: bool,
+    /// Continuation's platform gates; a pass and its pages share them.
+    pub(crate) gates: crate::snapshot_sync::ArchiveGates,
+    pub(crate) dirty: bool,
+    pub(crate) prepared: bool,
+    pub(crate) headers_prepared: bool,
+    pub(crate) deferred: std::collections::BTreeSet<String>,
+}
+crate::heap_layout_bound::split_fields!(ArchivePass;
+    inline: [started, cpu, work, power, dirty, prepared, headers_prepared];
+    heap: [deferred]; shared: [gates]);
+
+impl ArchivePass {
+    /// A new ordinary pass: fresh counters and the prepare-time power gate;
+    /// the cached-archive walk position and the gates carry over.
+    pub(crate) fn prepare(&mut self) {
+        let Self {
+            started,
+            cpu,
+            work,
+            power,
+            gates,
+            ..
+        } = self;
+        (*started, *cpu, *work) = (
+            false,
+            if crate::context_composition::thread_cpu_micros().is_some() {
+                0
+            } else {
+                u64::MAX
+            },
+            0,
+        );
+        *power = gates.power_ready();
+    }
+
+    /// Archive work may start now: prepare-time and live power, the pass's
+    /// CPU and work (continuation's contention threshold), and `remaining`
+    /// page bytes.
+    pub(crate) fn ready(&self, remaining: u64) -> bool {
+        self.power
+            && self.cpu < ARCHIVE_PASS_CPU_MICROS
+            && remaining > 0
+            && crate::snapshot_sync::archive_work_ready(self.work)
+    }
+}
+
+impl PageBudget {
+    pub(in crate::snapshots) fn archive_ready(&self, pass: &ArchivePass) -> bool {
+        pass.ready(self.singleton_remaining(Limits::current()))
+    }
+}
+
 impl PageBudget {
     /// A page whose start enqueued `hints` watcher hints as next-generation
     /// evidence (G1).
@@ -301,6 +364,11 @@ impl PageBudget {
     pub(in crate::snapshots) fn deadline_passed(&self) -> bool {
         self.deadline
             .is_some_and(|InlineInstant(deadline)| pace_now() >= deadline)
+    }
+
+    /// Continue a paid archive without resetting the page's other claims.
+    pub(in crate::snapshots) fn continue_singleton(&mut self) {
+        self.singleton_decoded = 0;
     }
 
     /// Singleton-budget bytes this page may still read (group probes, R2-N2).
@@ -470,6 +538,12 @@ crate::heap_layout_bound::fields!(ContentStamp; dev, ino, extent, modified);
 impl ContentStamp {
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
+    }
+    pub(in crate::snapshots) fn matches_acquisition(
+        &self,
+        stamp: &crate::transcript_acquisition::FileStamp,
+    ) -> bool {
+        stamp.same_listing(self.dev, self.ino, self.extent, self.modified)
     }
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
         self == other
@@ -4605,6 +4679,21 @@ impl SharedCache {
                 lifetime_audit_overdue_max_age_seconds: fixed(now.audit_overdue_max_age_seconds),
             },
         }))
+    }
+
+    /// A Codex copy about to be erased: its paused job and suspended proof, with
+    /// their open readers, and header facts. The caller holds the sync cycle
+    /// lock, so no lease is active.
+    pub(crate) fn forget_codex_jobs(&self) {
+        // The paused job drops after the lock: its reader and credit may settle on drop.
+        drop(self.with_cursor(|cursor| {
+            retire_holder(cursor);
+            cursor.slot_key = None;
+            cursor.slot_members.clear();
+            cursor.slot_charge = 0;
+            cursor.headers.clear();
+            std::mem::replace(&mut cursor.slot, Slot::Empty)
+        }));
     }
 
     pub(in crate::snapshots) fn cursor_slot_free(&self) -> bool {

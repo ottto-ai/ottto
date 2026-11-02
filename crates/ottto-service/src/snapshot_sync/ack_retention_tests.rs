@@ -127,7 +127,9 @@ impl AckFixture {
     }
 }
 
-fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn exact_ack(
+    items: Vec<SnapshotItem>,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
@@ -1896,6 +1898,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &progress,
                 &holds,
                 other == "rejected",
+                None,
             ),
         };
         assert!(!settlement.fully_settled, "{outcome}");

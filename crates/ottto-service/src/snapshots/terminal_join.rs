@@ -70,7 +70,7 @@ pub(super) struct TerminalInputs<'a> {
     pub(super) complete_families: &'a BTreeMap<String, BTreeSet<String>>,
     /// Roots of this page's items: only their proofs keep provider rows.
     pub(super) item_roots: &'a BTreeSet<String>,
-    pub(super) legacy_request_owners: Option<&'a BTreeMap<String, ClaudeLegacyRequestOwner>>,
+    pub(super) legacy_request_owners: Option<&'a ClaudeLegacyRequestOwners>,
     /// Healthy reports only: the family proof's inputs.
     pub(super) proof: Option<ProofInputs<'a>>,
 }
@@ -78,6 +78,8 @@ pub(super) struct TerminalInputs<'a> {
 pub(super) struct ProofInputs<'a> {
     pub(super) api_report: &'a crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     pub(super) trace_report: &'a crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    /// Where a root outside the reports finds its rows (a strict reread).
+    pub(super) evidence_rows: ClaudeEvidenceRows<'a>,
     /// Uncertified or owed roots: proven by nothing this terminal.
     pub(super) skipped: BTreeSet<String>,
 }
@@ -100,8 +102,8 @@ pub(super) struct TerminalJoin {
     /// waits for the legacy-prefix join.
     candidates: BTreeSet<String>,
     pub(super) proven: BTreeMap<String, ProvenClaudeUsageFamily>,
-    /// A family with report rows failed its proof.
-    pub(super) proof_failed: bool,
+    /// Why families with rows were not proven (`IgnoredVeto` bits).
+    pub(super) ignored_vetoes: u16,
     /// Requests two current-window owners' occurrences share, by hash.
     pub(super) native_duplicate_request_owners:
         BTreeMap<String, BTreeSet<ClaudeDuplicateRequestOwner>>,
@@ -352,7 +354,7 @@ impl TerminalJoin {
                 .keys()
                 .filter_map(|hash| request_owners.get(hash))
                 .filter(|owner| owner.root_session_id != root)
-                .map(|owner| owner.root_session_id.clone())
+                .map(|owner| owner.root_session_id.to_owned())
                 .collect::<BTreeSet<_>>();
             if !foreign.is_empty() {
                 self.foreign_owner_roots.insert(root.to_owned(), foreign);
@@ -413,18 +415,27 @@ impl TerminalJoin {
         {
             return;
         }
+        let (api_rows, trace_rows) =
+            match proof
+                .evidence_rows
+                .proof_rows(root, proof.api_report, proof.trace_report)
+            {
+                Ok(pair) => pair,
+                Err(refusal) => {
+                    self.ignored_vetoes |= refusal.bit();
+                    return;
+                }
+            };
         let Some(mut family) = prove_claude_usage_family(
             root,
             members,
             &pending,
-            proof.api_report.evidence.get(root),
-            proof.trace_report.evidence.get(root),
+            api_rows.as_deref(),
+            trace_rows.as_deref(),
             exclusion,
         ) else {
-            if proof.api_report.evidence.contains_key(root)
-                || proof.trace_report.evidence.contains_key(root)
-            {
-                self.proof_failed = true;
+            if api_rows.is_some() || trace_rows.is_some() {
+                self.ignored_vetoes |= IgnoredVeto::ProofFailure.bit();
             }
             return;
         };

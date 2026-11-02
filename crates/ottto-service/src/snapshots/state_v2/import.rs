@@ -62,7 +62,7 @@ pub(super) fn import_graph(
     anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
-    cx.presence = original.presence.clone();
+    cx.presence = original.claude_presence();
     kinds::populate(index, &mut tx, &mut cx)?;
     anyhow::ensure!(
         tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
@@ -117,6 +117,7 @@ pub(super) fn save(
         next.retire_committed_claude_account_pending_windows();
     }
     super::super::lenient_decode::check_held_output(next)?;
+    cx.compact_allowance = (!claim_only).then_some(128);
     kinds::save_graph(db, identity, previous, next, cx)
 }
 
@@ -331,6 +332,9 @@ impl OriginalFile {
 /// Stream root presence and validate JSON grammar without allocating leaf
 /// strings. The hashing pass separately validates their Unicode encoding.
 struct Presence;
+fn claude_original_field(name: &str) -> bool {
+    !matches!(name, "archives" | "archive_deferred_alarm_count")
+}
 impl<'de> serde::de::Visitor<'de> for Presence {
     type Value = std::collections::BTreeMap<String, bool>;
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -342,6 +346,7 @@ impl<'de> serde::de::Visitor<'de> for Presence {
     ) -> std::result::Result<Self::Value, A::Error> {
         let mut fields = super::super::lenient_decode::FIELDS
             .iter()
+            .filter(|name| claude_original_field(name))
             .map(|f| ((*f).into(), false))
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
@@ -365,7 +370,9 @@ impl<'de> serde::de::Visitor<'de> for Presence {
         for name in super::super::lenient_decode::FIELDS {
             let present = !ended && seq.next_element::<serde::de::IgnoredAny>()?.is_some();
             ended |= !present;
-            fields.insert((*name).into(), present);
+            if claude_original_field(name) {
+                fields.insert((*name).into(), present);
+            }
         }
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(serde::de::Error::custom("unknown original slot"));
@@ -456,6 +463,13 @@ fn original_schema(file: &mut std::fs::File) -> Result<u16> {
     schema.get().ok_or_else(|| Pause::Malformed.into())
 }
 impl Original {
+    fn claude_presence(&self) -> std::collections::BTreeMap<String, bool> {
+        self.presence
+            .iter()
+            .filter(|(name, _)| claude_original_field(name))
+            .map(|(name, present)| (name.clone(), *present))
+            .collect()
+    }
     pub(super) fn read(path: &Path) -> std::result::Result<Self, Pause> {
         Self::read_inner(path).map_err(|e| {
             e.downcast_ref::<Pause>().copied().unwrap_or_else(|| {
@@ -723,7 +737,7 @@ fn verify_normalized_at(
     };
     let mut cx = KindCx::default();
     cx.binding = Some(binding);
-    cx.presence = original.presence.clone();
+    cx.presence = original.claude_presence();
     kinds::populate(index, &mut proof, &mut cx)?;
     let mut count = 0_u64;
     let mut after = None;
@@ -1219,6 +1233,91 @@ mod application_cases {
         assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
     }
 
+    /// [format] production Claude imports retain pre-archive presence bytes and row commitments.
+    #[test]
+    fn production_import_preserves_pre_archive_presence_and_rows() {
+        // Preserve the historical inventory boundary independently of the
+        // production exclusion predicate and its appended v1 decoder slots.
+        let fields = &super::super::super::lenient_decode::FIELDS[..89];
+        assert_eq!(fields.last(), Some(&"upload_context_proof"));
+        let positional = original_presence(b"[2,0,null,{}]".as_slice()).unwrap();
+        let positional_expected: BTreeMap<String, bool> = fields
+            .iter()
+            .enumerate()
+            .map(|(slot, name)| ((*name).into(), slot < 4))
+            .collect();
+        assert_eq!(positional, positional_expected);
+        for shape in ["object", "sharded"] {
+            let c = Corpus::new();
+            let logical = if shape == "sharded" {
+                c.sharded();
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+                ))
+                .unwrap();
+                fixture["logical"].clone()
+            } else {
+                let value = serde_json::json!({
+                    "schema_version": 2, "generation": 0,
+                    "upload_context_fingerprint": null, "files": {}
+                });
+                ottto_core::write_owner_only_file_atomic(
+                    &c.path,
+                    &serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+                value
+            };
+            let expected: BTreeMap<String, bool> = fields
+                .iter()
+                .map(|name| ((*name).into(), logical.get(*name).is_some()))
+                .collect();
+            let original = Original::read(&c.path).unwrap();
+            assert_eq!(original.presence, expected, "{shape}");
+            let index = ScanIndex::load(&c.path).unwrap();
+            let mut db =
+                sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
+                    .unwrap();
+            db.path_extractor(kinds::private_paths);
+            db.reference_extractor(kinds::references);
+            db.control(
+                "identity",
+                &Identity {
+                    format: FORMAT,
+                    db_id: "synthetic-proof".into(),
+                    binding: c.binding(),
+                    fence_generation: index.generation + 1,
+                },
+            )
+            .unwrap();
+            db.control("generation", &index.generation).unwrap();
+            import_graph(&mut db, &index, Some(&original)).unwrap();
+            let presence: BTreeMap<String, bool> =
+                db.read_control("field_presence").unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&presence).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            // Main's hydration rule accepts only its original field names.
+            assert!(presence.keys().all(|name| fields.contains(&name.as_str())));
+            let (restored, mut actual) = hydrate_context(&mut db).unwrap();
+            let mut control = KindCx::default();
+            control.binding = Some(c.binding());
+            control.presence = expected;
+            control.layout = actual.layout;
+            control.layout_recorded = actual.layout_recorded;
+            // Baseline enumeration consumes the hydrated ordinal inventory;
+            // both projections refer to this same committed store's windows.
+            control.account_ids = actual.account_ids.clone();
+            control.account_controls = actual.account_controls;
+            let actual = kinds::baseline(&restored, &mut actual).unwrap().rows;
+            let mut control_index = index.clone();
+            control_index.generation += 1;
+            let control = kinds::baseline(&control_index, &mut control).unwrap().rows;
+            assert_eq!(actual, control, "{shape}: every row value commitment");
+        }
+    }
+
     /// [format] desktop inventory conversion keeps original presence; only a
     /// versioned cursor fence keeps custody, like the v1 serializer.
     #[test]
@@ -1285,9 +1384,9 @@ mod application_cases {
         for bytes in [
             br#"{"schema_version":2,"files":{},"future_money":{"n":1}}"#.as_slice(),
             br#"{"schema_version":2,"files":{},"files":{}}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\q"}"#,
-            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\ud800"}"#,
-            b"{\"schema_version\":2,\"files\":{},\"upload_context_fingerprint\":\"\xff\"}",
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\q"}"#,
+            br#"{"schema_version":2,"files":{},"historical_replay_generation":"\ud800"}"#,
+            b"{\"schema_version\":2,\"files\":{},\"historical_replay_generation\":\"\xff\"}",
             br#"{"schema_version":2,"files":{},"claude_request_census":{"~lost":{}}}"#,
         ] {
             let c = Corpus::new();

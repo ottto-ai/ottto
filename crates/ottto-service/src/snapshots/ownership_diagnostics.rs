@@ -6,7 +6,7 @@ pub(super) const ABSENT: usize = 3;
 pub(super) const GROUP: usize = 4;
 pub(super) const PARSER: usize = 5;
 const N: usize = PARSER + 1;
-const NAMES: &str = "inventory_hold created_thread_proof parent_unresolvable protected_absent other_group_receipt_legacy other_parser";
+const NAMES: &str = "inventory_hold created_thread_proof parent_unresolvable protected_absent other_group_receipt_legacy other_parser archive_owed";
 pub(crate) type Summary = ([usize; N + 2], [usize; 3]);
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,7 +57,13 @@ impl Counts {
             c.observation[0],
             c.observation[1],
         ];
+        c.contributions[N] = 0;
         (c.contributions, meta)
+    }
+    pub(crate) fn summary_with_archive(&self, total: usize, archives: usize) -> Summary {
+        let (mut counts, meta) = self.summary(total);
+        counts[N] = archives;
+        (counts, meta)
     }
 }
 pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String {
@@ -65,7 +71,7 @@ pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String 
     for (name, count) in NAMES
         .split(' ')
         .chain(["unattributed"])
-        .zip(c[..N].iter().copied().chain([unattributed]))
+        .zip(c[..=N].iter().copied().chain([unattributed]))
     {
         if count != 0 {
             line.push_str(&format!(

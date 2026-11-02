@@ -1851,7 +1851,7 @@ fn destination_identity(
     format!("{}|{}|{}", device.device_id, machine_id, api_base_url)
 }
 
-fn cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+pub(crate) fn cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("mcp_inventory")
         .join(format!("{}.json", source.api_slug()))

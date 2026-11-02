@@ -391,8 +391,9 @@ fn carry_controls() -> Vec<CarryControl> {
         carry_control("accepted_ledger_rebuilding", |index| {
             index.legacy_settlement_reconcile_after_fingerprint = Some("rebuild".to_string());
         }),
-        carry_control("upload_context_not_active", |index| {
-            index.upload_context_fingerprint = Some("older-context".to_string());
+        carry_control("upload_context_not_proven", |index| {
+            // No member holds a receipt under the newly active context.
+            index.activate_upload_context("newer-context".to_string());
         }),
         carry_control("full_retry_could_reopen", |index| {
             index.files.remove(&carry_key(CARRY_OTHER, None));
@@ -2112,6 +2113,8 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         .unwrap();
     record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
     record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+    // A terminal verdict formed after the E2 cutover keeps its hold.
+    record.retry_after_unix_seconds = PRE_E2_TERMINAL_DEADLINE_CUTOFF + 1;
     let holds = fixture.index.claude_usage_authority_quarantine.clone();
     let bindings = fixture.index.session_account_bindings.clone();
     let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);

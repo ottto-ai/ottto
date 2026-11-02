@@ -49,6 +49,8 @@ sparse_lifetime_counters! {
     // Pi source-field parsing observations, independent of retention decisions.
     pi_cost_refused_overflow: PiCostRefusedOverflow,
     pi_cost_precision_rounded: PiCostPrecisionRounded,
+    // Codex thread-settings snapshots asking for a non-default tier.
+    codex_non_default_thread_tier: CodexNonDefaultThreadTier,
 }
 
 pub(crate) fn snapshot() -> Counts {
