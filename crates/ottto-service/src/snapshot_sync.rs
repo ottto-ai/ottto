@@ -7830,6 +7830,31 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
+    // The Companion uses machine-local labels before upload policy clears them.
+    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
+        scan_agent_status,
+        &current_codex_bindings,
+        cached_codex_login_changed,
+    );
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
+    if crate::active_sessions::reconcile_active_sessions(
+        support_dir,
+        source,
+        &scan_result.snapshots,
+        Some(&reconciliation_status),
+        upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
+        &current_rfc3339(),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "local active-session cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
@@ -7965,29 +7990,6 @@ fn finish_sync_source(
         scan_result.local_codex_diagnostics.as_mut(),
     ) {
         upload_progress.save(&upload_progress_path)?;
-    }
-    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
-        scan_agent_status,
-        &current_codex_bindings,
-        cached_codex_login_changed,
-    );
-    // Claude activity remains recent relative to the scan's observation
-    // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
-        support_dir,
-        source,
-        &scan_result.snapshots,
-        Some(&reconciliation_status),
-        upload_policy,
-        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
-    )
-    .is_err()
-    {
-        eprintln!(
-            "local active-session cache update skipped for {}",
-            source.api_slug()
-        );
     }
     if !scan_result.census_complete {
         // A stale prior manifest must not survive a lossy census. The healthy
@@ -10033,17 +10035,26 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
+    // Summed CPU/wall sub-windows of evidence_read: strict per-root decode and
+    // the cross-root summary build. One record each per pass.
+    let mut decode_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
+    let mut cross_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
     for root_session_id in usage_roots {
-        let generation =
-            crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
-        let mut api = api_read.take_strict_report(support_dir, &root_session_id);
-        let mut trace = match prepared.as_mut() {
-            Some(read) => read.take_trace(support_dir, &root_session_id),
-            None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                support_dir,
-                [root_session_id.clone()],
-            ),
-        };
+        let (generation, mut api, mut trace) = decode_window.time(|| {
+            let generation =
+                crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
+            let api = api_read.take_strict_report(support_dir, &root_session_id);
+            let trace = match prepared.as_mut() {
+                Some(read) => read.take_trace(support_dir, &root_session_id),
+                None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                    support_dir,
+                    [root_session_id.clone()],
+                ),
+            };
+            (generation, api, trace)
+        });
         if !api.health.is_complete() {
             stats.api_incomplete_root_count += 1;
         }
@@ -10117,7 +10128,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
-        cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref());
+        cross_window
+            .time(|| cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref()));
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
@@ -10135,7 +10147,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
-    cross.finish();
+    cross_window.time(|| cross.finish());
+    drop(decode_window);
+    drop(cross_window);
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");

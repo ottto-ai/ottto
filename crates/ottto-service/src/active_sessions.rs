@@ -44,10 +44,6 @@ struct ActiveSessionCache {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registration_evidence:
         BTreeMap<String, crate::claude_session_registrations::RegistrationEvidence>,
-    /// Upload privacy policy the listed rows were derived under. A row is
-    /// carried without re-reading its transcript only under the same policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    listed_under_policy: Option<String>,
 }
 
 pub fn active_session_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
@@ -68,11 +64,10 @@ pub fn reconcile_active_sessions(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
-    upload_policy: SnapshotUploadPolicy,
+    _upload_policy: SnapshotUploadPolicy,
     scan_started_at: Option<&str>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
-    let policy = serde_json::to_string(&upload_policy)?;
     reconcile_with_registrations(
         support_dir,
         source,
@@ -80,7 +75,7 @@ pub fn reconcile_active_sessions(
         agent_status,
         scan_started_at,
         reconciled_at,
-        Some(&policy),
+        Some("local"),
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -203,8 +198,6 @@ fn reconcile_with_registrations(
         .take()
         .map(|reconciliation| reconciliation.sessions)
         .unwrap_or_default();
-    let carry_unobserved =
-        carry_policy.is_some_and(|policy| cache.listed_under_policy.as_deref() == Some(policy));
     let mut carried = Vec::new();
     if carry_policy.is_some() {
         for mut session in previous {
@@ -218,7 +211,7 @@ fn reconcile_with_registrations(
             }
             let recent = OffsetDateTime::parse(&session.source_last_activity_at, &Rfc3339)
                 .is_ok_and(|at| at >= activity_cutoff && at <= activity_ceiling);
-            if !carry_unobserved || !recent {
+            if !recent {
                 continue;
             }
             if let Some(status) = agent_status {
@@ -232,7 +225,6 @@ fn reconcile_with_registrations(
             carried.push(session);
         }
     }
-    cache.listed_under_policy = carry_policy.map(str::to_string);
     if source == SnapshotSource::ClaudeCode && !sessions.is_empty() {
         let registrations = registrations();
         for session in &mut sessions {
@@ -256,9 +248,8 @@ fn reconcile_with_registrations(
                 entrypoint: None,
                 process_witness: "pid_start_match".to_string(),
             };
-            // A policy-cleared title has no consent witness. Intentional or
-            // provenance-unknown existing names always win; never compare
-            // unrelated rename/process clocks to manufacture precedence.
+            // Intentional or provenance-unknown existing names always win;
+            // never compare unrelated rename/process clocks to manufacture precedence.
             let generated = matches!(
                 snapshot.session_display_name_source.as_deref(),
                 Some("first_prompt" | "ai_title" | "summary")
@@ -1644,20 +1635,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// [regress] local labels survive upload settings and quiet scans.
     #[test]
-    fn does_not_carry_unread_sessions_across_an_upload_policy_change() {
+    fn local_labels_survive_disabled_uploads_and_quiet_policy_changes() {
         let dir = temp_dir("policy-change");
         let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
-        reconcile_active_sessions(
+        let local = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                ..test_policy()
+            },
             None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
+        assert_eq!(
+            local.sessions[0].session_display_name,
+            snapshot.session_display_name
+        );
+        let mut uploaded = vec![snapshot.clone()];
+        crate::snapshots::apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut uploaded,
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                ..test_policy()
+            },
+        );
+        assert!(uploaded[0].session_display_name.is_none());
         let policy = SnapshotUploadPolicy {
             workspace_labels_enabled: false,
             ..test_policy()
@@ -1672,7 +1681,15 @@ mod tests {
             "2026-07-19T10:08:00Z",
         )
         .expect("policy-change reconciliation");
-        assert!(changed.sessions.is_empty());
+        assert_eq!(changed.sessions.len(), 1);
+        assert_eq!(
+            changed.sessions[0].session_display_name,
+            local.sessions[0].session_display_name
+        );
+        assert_eq!(
+            changed.sessions[0].workspace_display_label,
+            local.sessions[0].workspace_display_label
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
