@@ -1843,7 +1843,7 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
     assert_eq!(admits(&replaced, &cert_r), Err(FullReason::Replaced));
 }
 
-/// SOURCE P2-5: both certificate samples are stored as the
+/// Both certificate samples are stored as the
 /// `ottto-dt-sample:v1` domain-separated SHA-256 of their window. For a file
 /// shorter than one window, the head sample is the whole file, yet neither
 /// digest is the file's plain SHA-256, and the envelope holds neither raw
@@ -4212,7 +4212,7 @@ fn verified_retirement_requeues_the_unwritten_successor() {
     assert_eq!(retried.completed.len(), 1);
 }
 
-/// Distinguish the D3 input from a write failure whose fallback really cleaned
+/// Distinguish a double cleanup failure from a write failure whose fallback really cleaned
 /// up. This exercises the I/O boundary only, not native publication authority.
 /// [format] atomic write reports double failure only after both cleanup boundaries fail.
 #[test]

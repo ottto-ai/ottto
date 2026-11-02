@@ -68,9 +68,9 @@ impl Site {
 /// entry. Content-free and process-only, like the site split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Vanished {
-    /// Its unverified audit debt (SOURCE N2).
+    /// Its unverified audit debt.
     AuditDebtDropped,
-    /// Its request-census record (SOURCE N1).
+    /// Its request-census record.
     RequestCensusRemoved,
 }
 const VANISHED: usize = 2;
@@ -688,7 +688,7 @@ pub(super) mod tests {
         );
     }
 
-    /// N-T1: a walk-queued Claude member is deleted after the walk queued it
+    /// A walk-queued Claude member is deleted after the walk queued it
     /// and its remove hint is dropped by the queue's dedupe, so the member
     /// reaches its candidate stat without the hint flag. It retires as a
     /// removal: no disappeared count, a complete census, the entry gone.
@@ -788,8 +788,8 @@ pub(super) mod tests {
 
     /// [behaviour] N-T3: main records the forced member's NotFound as loss in every such
     /// generation. With the parent present the first one is a removal that
-    /// retires the entry together with its unverified audit marker (SOURCE N2,
-    /// counted), so the next generation no longer enumerates the member and
+    /// retires the entry together with its unverified audit marker
+    /// (counted), so the next generation no longer enumerates the member and
     /// records no NotFound at all.
     #[cfg(unix)]
     #[test]
@@ -1167,7 +1167,7 @@ pub(super) mod tests {
         assert!(record.failed_reconstruction_count <= failures_before.saturating_add(1));
     }
 
-    /// SOURCE N1: the request-census (D1) record of a member retired as a
+    /// The request-census record of a member retired as a
     /// removal goes with its entry, and that removal is counted.
     #[test]
     fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
@@ -1206,8 +1206,8 @@ pub(super) mod tests {
         assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
     }
 
-    /// [behaviour] The audit-debt path (SOURCE N2) also drops the member's request-census
-    /// (D1) record with its entry and counts both retirements, while the
+    /// [behaviour] The audit-debt path also drops the member's request-census
+    /// record with its entry and counts both retirements, while the
     /// member's snapshot fingerprints stay (N3).
     #[test]
     fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
@@ -1305,7 +1305,7 @@ pub(super) mod tests {
         }
     }
 
-    /// D11 through the real pipeline: an indexed Claude file is in the frozen
+    /// Through the real pipeline: an indexed Claude file is in the frozen
     /// selection and is deleted beneath its present parent before the page's
     /// safe open. The page merge retires its entry and its request-census
     /// record (counted), the generation finishes healthy, and the next one is

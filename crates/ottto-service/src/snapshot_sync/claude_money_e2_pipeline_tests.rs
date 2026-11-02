@@ -1,4 +1,4 @@
-// E2 acceptance from synthetic files through the production scan, fresh
+// `e2` acceptance from synthetic files through the production scan, fresh
 // sidecar read, native finalize, emission, policy, batch and ACK settlement.
 // No supplied accumulators, literal bodies or money totals stand in for reads.
 // Terminal policy is the production default. Quiet-context controls also need
@@ -1267,7 +1267,7 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
-/// R1: each walk meets both path twins, but a settled twin does not pull its
+/// Each walk meets both path twins, but a settled twin does not pull its
 /// family into the page. Only a twin the page reads does; otherwise the
 /// family is read again and one batch is sent on every walk.
 #[test]
@@ -1396,7 +1396,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         std::fs::remove_file(original).unwrap();
         let stored = stored_bodies(&prior);
         let mut left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        // R1 (owner-authorized): the unchanged survivor is not read again
+        // The unchanged survivor is not read again
         // (latest wins); it re-emits on its next real change.
         assert!(
             left.scan.snapshots.is_empty(),
@@ -2002,7 +2002,7 @@ fn restored_twins(reverse: bool, equal: bool) {
         let stored = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
         let mut again = ready(&c, &scanner, prior, 100, false);
-        // R1 (owner-authorized): an unchanged repeated page reads and sends
+        // An unchanged repeated page reads and sends
         // nothing (latest wins); a real change re-emits the twin group.
         assert!(
             again.scan.snapshots.is_empty(),
@@ -2236,7 +2236,7 @@ fn assert_withheld(page: &Page, session: &str, why: &str) {
     );
 }
 
-/// Owner ruling 1 (Codex P1-1 case 1): an earlier twin rewritten IN PLACE
+/// An earlier twin rewritten IN PLACE
 /// (same inode, size kept) no longer holds H. Its stale identity cannot
 /// remove H from the later twin: H counts once, from the twin.
 fn rewritten_original(reverse: bool) {
@@ -2311,7 +2311,7 @@ fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() 
     rewritten_original(true);
 }
 
-/// Owner ruling 1 (Codex P1-1 case 2): restored same-session histories H1
+/// Restored same-session histories H1
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
 /// the first page in either discovery order and through settlement.
 fn overlapping_restored(reverse: bool) {
@@ -2361,7 +2361,7 @@ fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
     overlapping_restored(true);
 }
 
-/// Owner ruling 2: an all-copied /branch is skipped on the request ids its
+/// An all-copied /branch is skipped on the request ids its
 /// earlier other-session holder has, whatever version wrote the lines.
 fn branch_by(version: &str) {
     with_e2(|| {
@@ -2394,11 +2394,11 @@ fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request
 }
 #[test]
 fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
-    // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
+    // `claude --version` observed on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
 
-/// Owner ruling 3: a /branch read before its original on a fresh index
+/// A /branch read before its original on a fresh index
 /// cannot decide: it is held (never counted), and a later page that reads
 /// the original skips it. Both discovery orders.
 fn branch_before_original(copy_first: bool) {
@@ -2638,7 +2638,7 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
     });
 }
 
-/// Owner ruling 3: the census walk deadline decides nothing: the /branch is
+/// The census walk deadline decides nothing: the /branch is
 /// held, then the next page's walk skips it.
 #[test]
 fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
@@ -2671,7 +2671,7 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
     });
 }
 
-/// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
+/// The legacy fork-prefix exclusion and the `e2` copy
 /// skip never both remove a copied request. A legacy fork child whose
 /// leading request telemetry assigns to its parent, with a divergent parent
 /// prefix (the exclusion's exact shape, derived on this page), publishes
@@ -2798,7 +2798,7 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
-/// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
+/// Stopgap, demo chain: the copy-only resume `COPY` repeats requests its
 /// original `ROOT` still holds. When both records are past 35 days, a
 /// complete terminal keeps both (they share ids), so a later re-read of the
 /// copy still proves its copies against the original instead of counting
@@ -2980,7 +2980,7 @@ fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() 
     copy_waits_for_queued_holder(false);
 }
 
-/// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
+/// A file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
 fn conflict_only(subagent: bool) {
@@ -3256,7 +3256,7 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     }
 }
 
-// Copy-family fix (Lead B 2026-10-30, brief e2-copyfamily-r1): resumed
+// Copy-family fix: resumed
 // files written by Claude Code versions outside the writer allowlist, with
 // turns of their own after the copied prefix (the demo 2026-08-12 shape).
 const THIRD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -3276,7 +3276,7 @@ const A: (&str, &str, &str) = ("a", "2026-08-02T07:00:10Z", OLD_WRITER);
 const B: (&str, &str, &str) = ("b", "2026-08-02T07:00:20Z", OLD_WRITER);
 const C: (&str, &str, &str) = ("c", "2026-08-02T07:03:10Z", RESUME_WRITER);
 const D: (&str, &str, &str) = ("d", "2026-08-02T07:06:10Z", RESUME_WRITER);
-/// The page's E2 diagnostics for these keys (test-only tally).
+/// The page's `e2` diagnostics for these keys (test-only tally).
 fn copy_diag(keys: &[&str]) -> Vec<u64> {
     let diag = e2::take_diag();
     keys.iter()
@@ -3892,7 +3892,7 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
                     (third.request_count, third.removed_request_count),
                     if retired { (5, Some(0)) } else { (2, Some(3)) }
                 );
-                // Lead B F4: an absent field reads as an empty store, never lost.
+                // An absent field reads as an empty store, never lost.
                 assert_eq!(
                     copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
                     if retired {
@@ -4435,7 +4435,7 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
                 today.iter().map(|row| row.4).collect::<Vec<_>>(),
                 [false, true]
             );
-            // X-B1 (Lead B 2026-10-31): `copy_invalidated` per bucket row.
+            // `copy_invalidated` per bucket row.
             let flags = |item: &SnapshotItem| {
                 item.usage_buckets
                     .iter()
@@ -4845,10 +4845,10 @@ fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
     }
 }
 
-/// [money] Lead B Addendum 4: a row frozen {X} by a copied marker, whose
+/// [money] A row frozen {X} by a copied marker, whose
 /// latest proof is the own account B, is not tombstoned while this pass
 /// cannot read the session's own evidence (a partial telemetry sidecar pair).
-/// #909 / option (ii) protection stays, counted; money and account unchanged.
+/// #909 protection stays, counted; money and account unchanged.
 /// Composed with #947: the unhealthy root's no-fallback branch leaves every
 /// loan unread, so the row is skipped, never tombstoned.
 #[test]
@@ -4938,7 +4938,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
     }
 }
 
-/// Lead B F3: a prefix hold over buckets #909 accepted defers the whole
+/// A prefix hold over buckets #909 accepted defers the whole
 /// session (no shrunken revision, no ledger change) under the same
 /// three-pass bound; a never-accepted session keeps the prefix-only hold.
 #[test]
@@ -5014,7 +5014,7 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
     }
 }
 
-/// Lead B F4: an empty removal store is not written, and its restart is not
+/// An empty removal store is not written, and its restart is not
 /// lost metadata; damaged metadata is lost, and survives the restart.
 #[test]
 fn e2_pipeline_empty_removal_store_restart_is_not_lost_metadata_but_damage_is() {
@@ -5045,7 +5045,7 @@ fn e2_pipeline_empty_removal_store_restart_is_not_lost_metadata_but_damage_is() 
     }
 }
 
-/// Lead B F5: holders whose transcripts left the index cannot disprove a
+/// Holders whose transcripts left the index cannot disprove a
 /// recorded removal. The resumed file's re-read keeps its copies removed,
 /// counted, and the decision stays recorded.
 #[test]

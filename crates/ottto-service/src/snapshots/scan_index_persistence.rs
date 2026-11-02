@@ -5,7 +5,7 @@
 //!
 //! Payloads are immutable JSON objects. A seekable logical JSON view splices their
 //! interiors without decoding values or materializing the reconstructed index.
-//! Candidate format constants/domains require SOURCE signoff before integration.
+//! Candidate format constants/domains require signoff before integration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

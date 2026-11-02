@@ -319,7 +319,7 @@ pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> 
         .is_some_and(|record| record.identity_incomplete_hold())
 }
 
-/// Option B (SOURCE rule 3: a hold may delay a re-offer, never cancel it). A
+/// A hold may delay a re-offer, never cancel it. A
 /// marker-erasing daemon (0.1.189's parse-free migrate) rewrote held entries
 /// to plain v2, dropping their audit deadline; an unchanged file then skips
 /// forever and an aged one leaves discovery. Re-derive the marker from the
@@ -456,7 +456,7 @@ fn progress_slot(key: String, due: u64, previous: Option<&HeldAuditProgress>) ->
     }
 }
 
-/// GUARDRAILS rule 5: a progress Full whose secure open keeps failing backs
+/// A progress Full whose secure open keeps failing backs
 /// off instead of retrying every page: 1 page after the first failure,
 /// doubling, each wait capped at 6 h. The eighth consecutive failure parks
 /// the key (one alarm); a parked key is retried only after its stat changes,
@@ -466,7 +466,7 @@ const OPEN_PARK_FAILURES: u8 = 8;
 const OPEN_BACKOFF_CAP_SECONDS: u64 = 6 * 60 * 60;
 /// Census keys are at most 4 KiB, so the map stays bounded (about 1 MiB at
 /// worst). On overflow the longest-quiet entry is evicted (counted) and that
-/// key may retry (rule 7: fail toward reading); its owed due moves into the
+/// key may retry (fail toward reading); its owed due moves into the
 /// slot with it, so the debt is never dropped or moved later.
 const OPEN_BACKOFF_KEYS: usize = 256;
 
@@ -678,7 +678,7 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
         });
     }
     let previous = index.held_audit_progress.take();
-    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
+    // An overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
     let (evicted, evicted_due) = recorded.evicted.unzip();
     index.held_audit_progress = evicted
@@ -1452,7 +1452,7 @@ mod provenance_tests {
     }
 
     /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
-    /// or legacy entry (never a prefix, SOURCE Option 1) re-recorded without
+    /// or legacy entry (never a prefix) re-recorded without
     /// verification or obligation becomes the clean identity; the same
     /// completion's FE mark still tags `p`.
     #[test]

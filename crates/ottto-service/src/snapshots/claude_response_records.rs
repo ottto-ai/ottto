@@ -153,12 +153,12 @@ pub(super) struct CompletionBounds {
     /// these responses, with their finalize scratch; `None` when it cannot
     /// be bounded.
     pub(super) output: Option<usize>,
-    /// What a gate-on E2 fold's grain keys copy from the same responses;
+    /// What a gate-on `e2` fold's grain keys copy from the same responses;
     /// present exactly when `output` is.
     pub(super) fold: Option<FoldKeys>,
 }
 
-/// The responses' share of a gate-on E2 fold's grain keys (`live_key`),
+/// The responses' share of a gate-on `e2` fold's grain keys (`live_key`),
 /// for X_out's E term: every response its own key, worst case.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FoldKeys {
@@ -344,7 +344,7 @@ impl BookOutput {
         let selector_nodes = entries
             .checked_add(2)?
             .checked_add(row_entries.checked_add(2)?.checked_mul(ROW_COPIES)?)?;
-        // E2's key: the context (and a `context_bucket`), then the effort.
+        // `e2`'s key: the context (and a `context_bucket`), then the effort.
         let key_strings = context_bytes
             .checked_add("context_bucket".len() + "short".len())?
             .checked_add(effort)?
@@ -681,7 +681,7 @@ pub(super) struct CompactClaudeResponseRecord {
 }
 
 /// One retained tool use: the provider tool-use id apart from the tool
-/// name, so a durable record's `L` span is the id alone (M1, SOURCE P2-5).
+/// name, so a durable record's `L` span is the id alone.
 #[derive(Debug, Clone)]
 struct ClaudeToolUse {
     id: String,
@@ -790,7 +790,7 @@ impl CompactClaudeResponseRecord {
 ///
 /// The record's output term (`RecordBounds::output`) is measured on its own
 /// counter against `output_limit`, never against `limit`'s remainder, so it
-/// cannot change the decoded bound or its `None` (R1a R1, R2).
+/// cannot change the decoded bound or its `None`.
 fn decoded_record_heap_bound(
     record: &CompactClaudeResponseRecord,
     first: Option<&CompactClaudeResponseRecord>,
@@ -947,7 +947,7 @@ fn record_output(
 }
 
 /// `decoded_response_peak_bound`'s peak, and the response's merged output
-/// term. The output never decides `None` (R1a R1): its failure is
+/// term. The output never decides `None`: its failure is
 /// `output: None`.
 fn decoded_response_bounds(
     records: &OwnedVec<CompactClaudeResponseRecord>,
@@ -1099,7 +1099,7 @@ crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
 mod output_tests {
     use super::*;
 
-    /// M1, SOURCE P2-5: a retained tool use is `{L id, U name}`. Its only `L`
+    /// A retained tool use is `{L id, U name}`. Its only `L`
     /// span is the id, so an id copied into the name half would sit outside
     /// every `L` span and fail the privacy canary.
     #[test]
@@ -1128,7 +1128,7 @@ mod output_tests {
         assert!(at(name) >= end || at(name) + name.len() <= start);
     }
 
-    /// R1a R1, R5, R7: output arithmetic that overflows is `None` (never a
+    /// Output arithmetic that overflows is `None` (never a
     /// wrap or a panic), and a response that resolves to nothing adds nothing.
     #[test]
     fn output_overflow_is_none_and_empty_responses_add_nothing() {

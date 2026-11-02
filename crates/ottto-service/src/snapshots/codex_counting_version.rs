@@ -104,7 +104,7 @@ impl AckEvidence {
     }
 
     /// The session view: the candidate entry plus any twin/alias/member
-    /// entries the caller owns (COST rule 2). Any Legacy-acknowledged entry
+    /// entries the caller owns. Any Legacy-acknowledged entry
     /// (ACK facts without a V2 mark) forces Legacy, whatever else is marked;
     /// otherwise any V2 mark selects V2; entries without ACK facts are neutral.
     pub(super) fn of_view<'a>(entries: impl IntoIterator<Item = &'a ScanIndexEntry>) -> Self {
@@ -684,7 +684,7 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     view(evidence, cutover)
 }
 
-/// `singleton_view` by index key: the counting view an M1 durable record
+/// `singleton_view` by index key: the counting view a durable record
 /// binds to (written after a save and checked at restore, without a
 /// candidate).
 #[cfg(unix)]

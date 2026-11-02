@@ -40,8 +40,8 @@ lifetime_counters! {
     // another index's take, a held lease dropped unfinished (not counting
     // `side_proof_release_drops`).
     side_proof_drops: ProofDrop,
-    // M1's release to fit retired a suspended proof before evicting any
-    // retained copy (D6(e)); never a retained release cause.
+    // The release to fit retired a suspended proof before evicting any
+    // retained copy; never a retained release cause.
     side_proof_release_drops: ProofReleaseDrop,
 }
 

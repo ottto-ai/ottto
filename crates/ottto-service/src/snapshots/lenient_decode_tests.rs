@@ -1041,7 +1041,7 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
     }
 }
 
-// SI R1: valid native empty/optional cells are explicit controls, not damage.
+// Valid native empty/optional cells are explicit controls, not damage.
 #[test]
 fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
     let fields = [
@@ -1310,7 +1310,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
         ScanIndexRebuildOverride::NotPaused
     );
     // Hold-budget damage: its session-identity fields are strictly
-    // recoverable, so a press may rebuild past the guard (SI-718-O1).
+    // recoverable, so a press may rebuild past the guard.
     let damage = whole_index_damage("budget");
     fs::write(&path, &damage).unwrap();
     refused(&damage);
@@ -1622,7 +1622,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let _on = RestartRestoreForTest::enabled();
-    // Main shipped audit progress first. The earlier E2 writer saved a named
+    // Main shipped audit progress first. The earlier `e2` writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
     let mut current = serde_json::to_value(&seed).unwrap();
@@ -1661,7 +1661,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         });
         let mut forms = vec![legacy.clone()];
         if !earlier_e2 {
-            // The main positional schema ends at audit progress; appending E2
+            // The main positional schema ends at audit progress; appending `e2`
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
                 fields[..fields.len() - 4]
@@ -2344,7 +2344,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
     }
 }
 
-// SI-718-O1/O2: the user Repair override keeps the session-identity state the
+// The user Repair override keeps the session-identity state the
 // seven-day guard was protecting, and its cooldown is source-wide.
 const OVERRIDE_OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OVERRIDE_OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -3156,7 +3156,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
     );
 }
 
-/// SI O3: a real walk reaches its raw terminal without visiting a held family
+/// A real walk reaches its raw terminal without visiting a held family
 /// member. Neither that terminal nor save/reload may retire the original carry.
 #[test]
 #[serial_test::serial(source_manifests)]

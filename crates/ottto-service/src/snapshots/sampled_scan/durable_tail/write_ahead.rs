@@ -1,11 +1,11 @@
-//! M3 G1/G2: the native write-ahead facade over the store's stream API.
+//! The native write-ahead facade over the store's stream API.
 //!
 //! Order (root contract): prepare under Stores, body stream outside Stores,
 //! register the compact pending commit under Stores, rename outside Stores,
 //! then the exact receipt under Stores. No body Vec, graph clone or forged
 //! receipt exists on this path; every non-receipt outcome is explicit.
 //!
-//! D3 source split: a Codex fault that leaves any survivor degrades with a
+//! Source split: a Codex fault that leaves any survivor degrades with a
 //! strict retained-entry rebind the native owner saves before ACK; a Claude key
 //! whose stale predecessor survives is held per key until its next successful
 //! write or a content change, while other keys keep publishing.
@@ -127,7 +127,7 @@ pub(crate) enum HeldCause {
     ReceiptPending,
     CustodyBound,
     Incompatible,
-    /// D3 Claude: this key's stale predecessor survived; hold this key only.
+    /// Claude: this key's stale predecessor survived; hold this key only.
     StaleSurvivor,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +138,7 @@ pub(crate) enum DegradedCause {
     StoreUntouched,
     /// A proved content change: the surviving predecessor cannot bind.
     PriorUnbindable,
-    /// D3 Codex: the native owner must durably save the retained entry with
+    /// Codex: the native owner must durably save the retained entry with
     /// its source fingerprint cleared BEFORE ACK, keeping key, audit debt and
     /// membership, so no surviving record can bind after restart.
     StrictRebind,
@@ -692,7 +692,7 @@ impl SharedCache {
             };
             // Reserve correctness state before I/O can create a surviving-A
             // hold. Allocation refusal is an unstarted budget deferral, never
-            // an unfunded D3 disposition or a source-wide hold. Successful
+            // an unfunded per-key hold or a source-wide hold. Successful
             // settlement releases this empty reservation through clear_owed.
             if stores.fund_debt(chain.binding().key).is_none() {
                 return PrepareOutcome::NotPersisted(NotPersisted::PassBudget);
@@ -1098,7 +1098,7 @@ impl SharedCache {
     }
 
     /// Selection-time reconciliation of an outstanding pending receipt. Root
-    /// settles native streams synchronously; the funded M1 reconciler retains
+    /// settles native streams synchronously; the funded reconciler retains
     /// a verified completion in the store for its exact ACK delivery.
     pub(crate) fn reconcile_receipt(&self, source: SnapshotSource, key: &str) -> ReconcileOutcome {
         let Some(ds) = durable_source(source) else {
@@ -1211,7 +1211,7 @@ impl SharedCache {
     /// The native classifier proved a genuine content change (real edit or
     /// replacement): the surviving predecessor can no longer bind.
     pub(in crate::snapshots) fn durable_release_hold(&self, source: SnapshotSource, key: &str) {
-        // Only Claude has D3 holds. Codex real edits must not fill this map
+        // Only Claude has per-key holds. Codex real edits must not fill this map
         // with inactive Claude content-change proofs.
         if source != SnapshotSource::ClaudeCode {
             return;
@@ -1263,7 +1263,7 @@ fn unprepared_write(disposition: UnpreparedDisposition) -> WriteOutcome {
 }
 
 /// The exact receipt is the next successful write for this key: it releases a
-/// D3 hold and consumes the P2 original witness through the exact ACK adapter.
+/// per-key hold and consumes the P2 original witness through the exact ACK adapter.
 fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, receipt: &ReceiptProof) {
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
@@ -1283,7 +1283,7 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     stores.release_idle_custody(&digest);
 }
 
-// Process-lifetime D3 hold counts on the existing durable-tail diagnostics line. Store
+// Process-lifetime per-key hold counts on the existing durable-tail diagnostics line. Store
 // faults, degraded publishes, stale refusals and pause seconds are store counters.
 pub(super) const D3_HOLD_GROWTH_BYTES: usize = 0;
 pub(super) const D3_RELEASED_WRITE: usize = 1;
@@ -1313,7 +1313,7 @@ pub(super) enum HoldRelease {
     Content,
 }
 
-/// The first D3 hold in this process alarms once, on the next report.
+/// The first per-key hold in this process alarms once, on the next report.
 #[derive(Default)]
 pub(super) struct D3State {
     hold_alarmed: bool,

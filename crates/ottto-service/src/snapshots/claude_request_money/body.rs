@@ -1,4 +1,4 @@
-//! Shared types and reported enrichment for live E2 money.
+//! Shared types and reported enrichment for live `e2` money.
 
 use super::super::{insert_selector_raw, SelectorCapture, CLAUDE_EFFORT_TIERS};
 use super::ClaudeMoneyTokens;
@@ -23,7 +23,7 @@ pub(crate) enum ClaudeRequestUsageOrigin {
 /// (the reduced selector context plus the row's billing fields).
 pub(crate) type ClaudeLiveKey = (String, String, BTreeMap<String, String>);
 
-/// Reported enrichment for E2 native placement and emitted row effort.
+/// Reported enrichment for `e2` native placement and emitted row effort.
 pub(super) struct ReportedInputs<'a> {
     pub(super) selector: SelectorCapture,
     pub(super) effort: Option<&'a str>,

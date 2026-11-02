@@ -194,9 +194,8 @@ pub(super) fn retiring(
         unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
-        /// Claude only: path-(a) absence retirement process totals (SOURCE
-        /// Rounds 11-13, COST names), and the index's tombstone uncertainty
-        /// fence.
+        /// Claude only: path-(a) absence retirement process totals, and the
+        /// index's tombstone uncertainty fence.
         #[serde(skip_serializing_if = "Option::is_none")]
         absent_retry_pending_retired: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1037,9 +1036,9 @@ mod tests {
             assert_complete_max_row(rows[0].clone());
         }
     }
-    // SOURCE Round 13 F3: the Claude retiring row names every absence total
-    // and the fence state with their values (Round 15: and the upgrade fence
-    // count; Round 16, SOURCE h733: the aged-out tombstone and refused-drain
+    // The Claude retiring row names every absence total
+    // and the fence state with their values (and the upgrade fence
+    // count, the aged-out tombstone and refused-drain
     // counts); other sources omit them all.
     #[test]
     fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {

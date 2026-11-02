@@ -98,7 +98,7 @@ static OWED_LOGGED_AT: [std::sync::atomic::AtomicU64; 3] =
 
 /// Captured from the final admitted bodies under their own context, before POST.
 /// Never serialized. A restored ACK counts only through `prior_acks`: its
-/// durable stamp of this same mode context and exact body (Lead B Q1).
+/// durable stamp of this same mode context and exact body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Candidate {
     key: String,
@@ -117,7 +117,7 @@ pub(crate) struct Candidate {
 }
 
 impl Candidate {
-    /// Lead B Q1 (2026-10-31): a file's ACKs may split across passes; its
+    /// A file's ACKs may split across passes; its
     /// receipt still waits until every body is exact-ACKed in this context.
     pub(crate) fn with_split_evidence(
         mut self,
@@ -180,7 +180,7 @@ pub(crate) struct RearmCounts {
     pub files: u64,
     pub bytes: u64,
     pub local_bytes: u64,
-    /// Files left owed after this pass deferred part of their ACK set (Lead B Q1).
+    /// Files left owed after this pass deferred part of their ACK set.
     pub context_split_files: u64,
 }
 impl RearmCounts {
@@ -348,7 +348,7 @@ impl ScanIndex {
                 })
     }
 
-    /// P1/P2: THIS file's receipt from durable entity stamps, never from
+    /// THIS file's receipt from durable entity stamps, never from
     /// stamps alone. The caller found a complete parse of the current
     /// revision whose every entity is stamp-proven with this body, under the
     /// A1-A3 exclusions: a carried revision-only move, or the exact carried
@@ -524,7 +524,7 @@ impl ScanIndex {
 
     /// Called on the final selected index, using only exact ACKs of the active
     /// context: this cycle's, or an earlier pass's by its durable stamp of the
-    /// same body (Lead B Q1). Stamps are cleared on every replay-generation
+    /// same body. Stamps are cleared on every replay-generation
     /// change, which carries the curve epoch. No parse/finalize/quarantine/
     /// old-context path has this authority.
     pub(crate) fn accept_file_upload_context_acks(

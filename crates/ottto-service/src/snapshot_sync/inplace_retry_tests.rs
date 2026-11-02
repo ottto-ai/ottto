@@ -63,7 +63,7 @@ fn drive(
     }
 }
 
-/// T1: a shed whose Retry-After is at most 5 s is resent in place after the
+/// A shed whose Retry-After is at most 5 s is resent in place after the
 /// server's own wait (plus at most 20 %, never past 5 s), and the page settles
 /// exactly as a first-try success would.
 #[test]

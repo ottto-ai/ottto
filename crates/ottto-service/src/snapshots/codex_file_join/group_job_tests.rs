@@ -139,7 +139,7 @@ fn plan_sized(
     plan_group(&headers, &keys)
 }
 
-/// R1-L2: byte-identical line 0 at an equal size is one copied candidate
+/// Byte-identical line 0 at an equal size is one copied candidate
 /// (`CandidateCopy`), never a chain; the same line 0 at another size is not.
 #[test]
 fn plan_refuses_an_equal_header_and_size_as_a_candidate_copy() {
@@ -281,7 +281,7 @@ fn refused_fixture() -> PathBuf {
     root
 }
 
-/// G1 (review of #751, P1): a processed group re-hinted through one member
+/// #751: a processed group re-hinted through one member
 /// is a re-read group. On every page it would take the whole file allowance
 /// (two files) and evict the waiting census-member singleton `c`, so the
 /// census never closed. It now waits for a page without a waiting member,
@@ -741,7 +741,7 @@ fn fork_first_member_held_from_headers() {
     assert_eq!(reason, JoinRefusal::ForkedFromOtherSession);
     fs::remove_dir_all(root).unwrap();
     // A first member continuing a thread outside the inventory (typically a
-    // compressed predecessor) is a missing predecessor, never a fork (R1-M3).
+    // compressed predecessor) is a missing predecessor, never a fork.
     let continued = meta(
         OWNER,
         "2026-10-01T10:00:00Z",
@@ -903,7 +903,7 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
         "without loss the gap is terminal proof debt"
     );
     // The same gap after a skipped (malformed) line may be the loss's own
-    // effect: strict, never settleable or memoized (R1-B1).
+    // effect: strict, never settleable or memoized.
     let body = rows
         .iter()
         .enumerate()
@@ -1000,7 +1000,7 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     let refused = counters(&cache);
     assert_eq!(refused.join_terminal_debt[unmatched], 1, "{refused:?}");
     assert_eq!(refused.memo_records, 1, "recorded with an exact stamp");
-    // Unchanged: the next generation does not re-read the group (R2-M1).
+    // Unchanged: the next generation does not re-read the group.
     let (index, _) = next_generation(&root, index, &cache, 1);
     let unchanged = counters(&cache);
     assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
@@ -1017,7 +1017,7 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Round-3 R1-M1: a live-member `Gap` raised mid-stream stops the reader
+/// A live-member `Gap` raised mid-stream stops the reader
 /// before the file's end; bytes after it cannot cure it, so the exact-stamp
 /// entry is recorded and an unchanged group is not re-read.
 #[test]
@@ -1204,7 +1204,7 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// E1 S3: a metadata-only change of a member already read, while the job
+/// A metadata-only change of a member already read, while the job
 /// is paused in its live member, is not a member change: the job resumes
 /// without invalidation or a second group start and counts the unpaged
 /// body. A moved mtime at the same length still invalidates it.
@@ -1363,7 +1363,7 @@ fn upload_context_change_invalidates_paused_group() {
         let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
             counters(&cache).jobs_paused > 0
         });
-        // §p (R1-M1): receipts must not mix upload scopes.
+        // Receipts must not mix upload scopes.
         index.active_upload_context_fingerprint = Some("other-upload-context".into());
         let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
         assert!(!done.snapshots.is_empty());
@@ -1458,7 +1458,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
     *owned.active_file = Some(job);
-    // R2-M2: the group read without the cursor is charged by bytes
+    // The group read without the cursor is charged by bytes
     // (`completed_bound`, tee inputs taken out), never refused by the
     // per-line visit walk, so retained singleton copies survive.
     assert!(owned.sampled_copy_budget() > 0);
@@ -1485,7 +1485,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     });
     assert_eq!(lifecycle.clear_other_active, 1);
     assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-    // P1-RETAIN R0 (T-R0d): given a Tail acquisition and with every other
+    // Given a Tail acquisition and with every other
     // borrowed-state conjunct cleared, the group conjunct alone keeps the job
     // off shape F, so its refusal keeps ClearOtherActive and its completion
     // never reaches R0's release.
@@ -1545,10 +1545,10 @@ fn group_with_legacy_tee_is_byte_charged() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// M1 review F2: a byte-charged group job whose real charge overflows the
+/// A byte-charged group job whose real charge overflows the
 /// state budget beside full residents is walked to the whole state budget,
 /// so its refusal evicts to fit on that charge: one entry for an overflow
-/// below one entry's charge, never a wipe-all clear. Its E3 record is that
+/// below one entry's charge, never a wipe-all clear. Its copy-budget record is that
 /// walk, not `usize::MAX`, so the next step's estimate opens the budget and
 /// nothing is released again.
 ///
@@ -1657,7 +1657,7 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// R1-H1 (round 2): an append-curable refusal at a paged group's frozen cut
+/// An append-curable refusal at a paged group's frozen cut
 /// is not memoized while the live member already holds bytes past the cut:
 /// they may cure it, so the next generation reads them and accepts.
 #[test]
@@ -1705,7 +1705,7 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// R2-N1: E1 for a paged group's live member. A quiescent live member
+/// EOF-record handling for a paged group's live member. A quiescent live member
 /// ending in a valid unterminated record has it applied at its genuine
 /// unchanged EOF, like a singleton: counted once, verified, and the next
 /// generation reads nothing (no hourly audit debt).
@@ -1747,7 +1747,7 @@ fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// R1-M1 / R2-N2: probes are capped by the page's remaining singleton
+/// Probes are capped by the page's remaining singleton
 /// budget. Past it the group keeps chronological order; a refusal in that
 /// order is our own artifact: strict `ProbeBudgetOrder`, never settleable
 /// or memoized. With the budget, the probes order the same group and it is
@@ -1862,7 +1862,7 @@ fn first_group_owner(root: &Path) -> String {
         .owner
 }
 
-/// Round 4 (L4): the own-page cure. A group read first leaves the shared
+/// The own-page cure. A group read first leaves the shared
 /// page's singleton remainder short of this paged group's probes
 /// (`ProbeBudgetOrder`); on its own page the remainder covers them, the
 /// probes order it and the join is accepted once, equal to the unpaged scan.
@@ -1943,8 +1943,8 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Round 3 (R2-M1): a memoized group larger than the singleton budget
-/// reaches its memo hit without the cursor slot while a P1 singleton's job
+/// A memoized group larger than the singleton budget
+/// reaches its memo hit without the cursor slot while a singleton's job
 /// holds it: no deferral, no rotation waiter, no group job; the singleton
 /// completes.
 #[test]
@@ -1971,7 +1971,7 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
             "{recorded:?}"
         );
         assert_eq!(recorded.groups_started, 1, "{recorded:?}");
-        // A large P1 singleton takes the slot and pauses in it.
+        // A large singleton takes the slot and pauses in it.
         write_rows(
             &root.join("sessions/s.jsonl"),
             &chain_rows(OTHER, "s", "2026-10-01T11:00:00Z", 0, 30),
@@ -2001,7 +2001,7 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
 /// #603 integration: the group parser is configured once from every member's
 /// evidence and the proof follows the accumulator's own V2 decision (made on
 /// the first owned record, after the proof was built). The #603 fixture's UI
-/// is unbound-span, which §k.3 rule 5 holds under V2; inactive, it replays.
+/// is unbound-span, which a V2 group holds; inactive, it replays.
 #[test]
 fn counting_v2_decision_reaches_the_group_proof() {
     let (root, _) = counting_v2_unbound_fixture();
@@ -2060,7 +2060,7 @@ fn active_cutover_resume_follows_every_member_ack() {
     }
 }
 
-// #641 L-1 join release (H1-H9): J-T2..J-T6 and J-T12 beside J-T1 above.
+// #641 join release: J-T2..J-T6 and J-T12 beside J-T1 above.
 
 /// `owner` is blocked: no state-only body publishes for it.
 fn held_owner(index: &ScanIndex, owner: &str) -> bool {
@@ -2287,7 +2287,7 @@ fn join_provenance_refused_at_admission_keeps_the_owner_blocked() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// R2-M1: J-T1's parity holds under one oversized job. A later group whose
+/// J-T1's parity holds under one oversized job. A later group whose
 /// pause can never fit (`JoinStateBound`, another root on the same cache)
 /// forgets no provenance, so `OWNER` is still released when its members
 /// leave. Before the fix the hopeless reserve evicted every entry first.
@@ -2916,7 +2916,7 @@ fn group_pass(
     })
 }
 
-/// #865 P1 / SOURCE Addendum 6: reset + debt-bearing joined members (the
+/// #865: reset + debt-bearing joined members (the
 /// non-live alias `a` and the live member `b`) + complete join inventory +
 /// incomplete sidecar census. The group publishes unverified; each member's
 /// own native entry carries its own deadline through save, post-save GC and
@@ -3138,7 +3138,7 @@ fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// R1: a paged group captures its dues while both members are indexed (none
+/// A paged group captures its dues while both members are indexed (none
 /// owed), then parks; the per-pass index loses their entries (a fresh load).
 /// On resume the job keeps its progress, and settlement re-probes each absent
 /// member's record and stages its own marker, counted once. The singleton

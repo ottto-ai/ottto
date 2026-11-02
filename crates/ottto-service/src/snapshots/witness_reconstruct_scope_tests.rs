@@ -51,7 +51,7 @@ fn proven_families(name: &str, count: usize) -> Families {
         .remove(0);
         assert!(item.claude_money.is_none(), "ordinary money");
         if family == 0 {
-            // Positive control: without the paused input, E2 owns the money.
+            // Positive control: without the paused input, `e2` owns the money.
             let request_owned =
                 parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "control".into())
                     .expect("parse family fixture")

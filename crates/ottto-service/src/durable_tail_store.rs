@@ -1,4 +1,4 @@
-//! Durable warm-cache store (M1, store layer). A separate, local, owner-only
+//! Durable warm-cache store (store layer). A separate, local, owner-only
 //! directory beside a source's scan index that keeps one record per retained
 //! transcript entry, so a restart can continue from where the RAM cache
 //! stopped. This module owns only the envelope, the crash-safe file writes,
@@ -107,7 +107,7 @@ pub(crate) const BODY_BYTES: usize = RECORD_BYTES - HEADER_BYTES - TRAILER_BYTES
 /// Every 32-byte digest in the envelope (outside the codec body), as
 /// `Type.field`. Each is a domain-separated SHA-256; the H audit
 /// (`h_fields_are_audited`) pins what fills each one alongside the body's
-/// `H` fields (M1, SOURCE P2-5). The SHA-256 trailer is an integrity
+/// `H` fields. The SHA-256 trailer is an integrity
 /// checksum over the record's own bytes, not a value, so it is not listed.
 #[cfg(test)]
 pub(crate) const ENVELOPE_H: [&str; 7] = [
@@ -1279,7 +1279,7 @@ impl DurableTailStore {
         self.full_guard(key, start, true, &[0; 32]).err()
     }
 
-    /// Settlement re-probe (R1): an entry-less key's validated same-context
+    /// Settlement re-probe: an entry-less key's validated same-context
     /// debt, read only. No T14 breaker accounting, rebuild authorization or
     /// hold; refusals and foreign contexts contribute nothing.
     pub(crate) fn carrier_debt(&mut self, key: &Digest32, live_context: &Digest32) -> Option<u64> {
@@ -3415,7 +3415,7 @@ impl Drop for TempRecord<'_> {
     }
 }
 
-/// The M1 caller shares the owned leaf engine and its source-slot counters.
+/// The durable-tail caller shares the owned leaf engine and its source-slot counters.
 fn write_atomic<W: SingleWriter>(
     writer: &W,
     dir: &Path,
@@ -3424,7 +3424,7 @@ fn write_atomic<W: SingleWriter>(
     prior: Option<Stamp>,
     cleanup: Arc<TempCleanupCounts>,
 ) -> io::Result<Stamp> {
-    // M1's stack-bound writer can unwind before returning. It remains a real
+    // The stack-bound writer can unwind before returning. It remains a real
     // proof for this short scope; the native stage uses the unborrowed owner.
     struct Attempt<'a, W: SingleWriter> {
         temp: OwnedTemp,

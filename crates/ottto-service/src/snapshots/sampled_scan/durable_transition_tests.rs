@@ -77,7 +77,7 @@ impl M1 {
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
         // Install an archived body/old pin, relocating only its scratch-path key.
-        // M3 dispatches this as a missing reduction (Repin), not a restore.
+        // The native engine dispatches this as a missing reduction (Repin), not a restore.
         // Only key/checksum relocation is allowed: this is a rebuild fixture.
         let key = fixture::local_key(&path);
         let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, pin);
@@ -988,7 +988,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
     if !supported("shared_crash") {
         return;
     }
-    // M3 is plain flush: the retired M1 temp-write/file-fsync/dir-fsync
+    // The native engine is plain flush: the retired old-writer temp-write/file-fsync/dir-fsync
     // rows have no corresponding boundary. Keep every real native/driver edge.
     for point in [
         CrashPoint::OldWriter,
@@ -1505,7 +1505,7 @@ struct Codex24b {
 }
 
 /// A restarted owner. A published v2 index stays at its bound custody path:
-/// M3's fork moves it to an unbound path whose save is refused as foreign.
+/// The native engine's fork moves it to an unbound path whose save is refused as foreign.
 /// Each 24b commit has one durable arm, so the committed store is already
 /// every arm's predecessor.
 fn owner_24b(disk: &mut Disk, source: SnapshotSource, v2: bool) -> E2ScanFixture {
@@ -1747,8 +1747,8 @@ fn codex_24b_old_writer_row(v2: bool) {
             v2
         );
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
-        // M3's unchanged restart performs no acquisition/body decode. The
-        // M1 raw-restored-EOF/version-observation subarm has no M3 equivalent.
+        // The native engine's unchanged restart performs no acquisition/body decode. The
+        // old writer's raw-restored-EOF/version-observation subarm has no native equivalent.
         let owner = owner_24b(&mut driver.disk, source, v2);
         let (quiet_index, quiet, modes) =
             other_page(&driver.c, &owner, source, driver.prior.clone());
@@ -1797,7 +1797,7 @@ fn shared_24b_old_writer_on_published_state_v2_matches_money() {
     codex_24b_old_writer_row(true);
 }
 
-/// M3 uses the shared native pipeline and its single money oracle. Each
+/// The native engine uses the shared native pipeline and its single money oracle. Each
 /// comparison arm starts from the same accepted index and exact predecessor,
 /// rather than letting an earlier arm's pre-ACK write seed a later arm.
 struct M3 {

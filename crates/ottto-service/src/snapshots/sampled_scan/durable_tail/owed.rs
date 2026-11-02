@@ -1,7 +1,7 @@
 //! Receipt debt owns acquisition facts, never parsed output or an ACK.
 //!
 //! One non-Clone debt per acquisition lives in the existing DurableCustody;
-//! the content-free per-key marker and the D3 hold live in one bounded
+//! the content-free per-key marker and the hold live in one bounded
 //! `KeyDebt` node, outside the A0-h custody node. A candidate-less debt
 //! deliberately cannot match any receipt.
 use super::write_ahead::{ClaudeHold, FinishAcquisition};
@@ -24,7 +24,7 @@ pub(super) enum OwedMark {
     Hold(DurableSource),
 }
 
-/// Per-key M3 state outside the prepaid A0-h custody node. Boxed so one map
+/// Per-key state outside the prepaid A0-h custody node. Boxed so one map
 /// node stays within its 1024-byte charge (`KEY_RESERVE_BYTES`).
 #[derive(Default)]
 pub(super) struct KeyDebt {
@@ -38,7 +38,7 @@ pub(super) struct KeyDebt {
     pub(super) off_v1_failed_since: Option<(DurableSource, std::time::Instant)>,
     pub(super) retire_source: Option<DurableSource>,
     pub(super) retire_sync: bool,
-    /// D3: this Claude key's stale predecessor survived a failed write.
+    /// This Claude key's stale predecessor survived a failed write.
     hold: Option<ClaudeHold>,
 }
 #[derive(Clone, Copy)]
@@ -71,7 +71,7 @@ impl KeyDebt {
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
 /// key count. Native writes reserve a node before any fault can create a
-/// D3 hold. A map full of live custody defers an unstarted write as NotPersisted;
+/// per-key hold. A map full of live custody defers an unstarted write as NotPersisted;
 /// existing receipt/debt overflow retains the conservative discovery bit.
 const KEY_DEBT_KEYS: usize = store::MAX_RECORDS;
 pub(super) fn key_debt_node_bytes() -> Option<usize> {
@@ -254,7 +254,7 @@ impl Stores {
             .map_or(OwedMark::None, |debt| debt.owed)
     }
 
-    /// D3: `digest`'s hold, if any.
+    /// `digest`'s hold, if any.
     pub(super) fn hold(&self, digest: &store::Digest32) -> Option<&ClaudeHold> {
         self.hold_proof(digest).filter(|hold| hold.active())
     }
@@ -289,7 +289,7 @@ impl Stores {
         self.release_idle_debt(digest);
         hold
     }
-    /// Every current D3 hold: a walk of at most `KEY_DEBT_KEYS` nodes.
+    /// Every current per-key hold: a walk of at most `KEY_DEBT_KEYS` nodes.
     pub(super) fn holds(&self) -> impl Iterator<Item = &ClaudeHold> + '_ {
         self.key_debt
             .values()
@@ -615,7 +615,7 @@ impl SharedCache {
         }
     }
 
-    /// Age-independent: debt, a pending receipt, a D3 hold or the source-wide
+    /// Age-independent: debt, a pending receipt, a per-key hold or the source-wide
     /// conservative bit keeps the key discoverable.
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
         if !crate::snapshots::restart_restore::enabled() {

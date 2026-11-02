@@ -688,7 +688,7 @@ fn summarize(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
 }
 
 /// Provider readiness for saved resets, passed through and never derived
-/// (design R6; contract v2.2 §11.1).
+/// (contract v2.2 §11.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ReadinessInput {
     pub(crate) eligible: Field<bool>,
@@ -942,7 +942,7 @@ struct CacheEntry {
 /// oldest-stored entry is the stalest; evicting it emits a diagnostic.
 const SECTION_CACHE_MAX_ENTRIES: usize = 64;
 
-/// Sender stability across read cadence (design R7b; contract v2.2 §11.5,
+/// Sender stability across read cadence (contract v2.2 §11.5,
 /// §11.7 C8/C9).
 ///
 /// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. A

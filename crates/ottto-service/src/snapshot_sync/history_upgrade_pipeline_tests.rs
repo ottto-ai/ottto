@@ -1,4 +1,4 @@
-// Executed-shape regressions for the Claude history-upgrade gate (SOURCE P1).
+// Executed-shape regressions for the Claude history-upgrade gate.
 // At the 0.1.189 start the Claude index was empty after a quarantine, so every
 // file came back as a new file and was re-sent under body-witness revision 2
 // without the protected list, the no-list hold, the latch or the pacing.
@@ -9,9 +9,8 @@
 // in-process upload and settlement, then a durable save and reload.
 // Fixtures are synthetic; the cutoff seam makes every fixture birth "old".
 // Where no list is intended, only an unverified Mac (or a move under a claim
-// policy other than `full`) holds history; elsewhere it is paced (SOURCE
-// Amendment 16, StateMissing N1), so the held-shape tests corrupt the
-// backfill state.
+// policy other than `full`) holds history; elsewhere it is paced, so the
+// held-shape tests corrupt the backfill state.
 
 use super::*;
 
@@ -699,10 +698,10 @@ fn rearmed_unchanged_history_is_held_and_settles() {
     });
 }
 
-/// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (a
+/// A genuinely fresh install (a
 /// positively empty support state: no backfill state, no quarantined index,
 /// no upload ledger, no seen-marker) ingests new files normally, even with
-/// old births. A quarantined index is prior history (SOURCE F1a), so this
+/// old births. A quarantined index is prior history, so this
 /// fixture no longer starts from one.
 #[test]
 fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
@@ -753,7 +752,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     });
 }
 
-/// SI-718-O1: the override rebuild keeps the retained owner through a
+/// The override rebuild keeps the retained owner through a
 /// replacement cycle whose upload is only server-deferred (a partial
 /// settlement), and held history still uploads nothing.
 #[test]
@@ -850,7 +849,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
     });
 }
 
-/// MONEY P1: seed genuine accepted incidence immediately before the override,
+/// Seed genuine accepted incidence immediately before the override,
 /// not before a syntax rebuild that would already have erased the ACK ledger.
 /// Retain it through complete census and files held without further parses;
 /// release must reconstruct those files with zero re-offer of accepted history.
@@ -968,7 +967,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     });
 }
 
-/// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
+/// Vanished history releases only on a healthy complete terminal.
 #[test]
 fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     use crate::snapshots::ScanIndexRebuildOverride;
@@ -1074,7 +1073,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     });
 }
 
-/// SOURCE Amendment 14 (owner B ruling 1): under revision 3 a LISTED root's
+/// Under revision 3 a LISTED root's
 /// genuine transcript change emits its ORDINARY body; no request-owned
 /// literal item and no revision-3 stamp reaches that file, and
 /// `history_emission_denied{reason=listed_literal}` counts it. Unlisted
@@ -1138,7 +1137,7 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
     });
 }
 
-/// Owner B ruling 3 through the pipeline: MONEY's census re-owes a stored 3
+/// Through the pipeline: a census re-owes a stored 3
 /// (as #699's selection-loss path will); the file is owed again, a listed
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
@@ -1300,7 +1299,7 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     });
 }
 
-/// SOURCE F1a, StateMissing H1: an unreadable backfill state is prior
+/// An unreadable backfill state is prior
 /// history, not a fresh install. With a quarantined index, or with the index
 /// gone and no other evidence, no history is emitted; the state keeps its
 /// marker and arms no bootstrap.
@@ -1360,7 +1359,7 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
     }
 }
 
-/// SOURCE F1b and its cross-org move ruling: a re-pair to a new destination
+/// A re-pair to a new destination
 /// finds history born before the claim owed and gated, never re-sent
 /// ungated: the other destination's completed bootstrap is prior history.
 /// With no list and a claim policy other than an explicit `full` it is held
@@ -1407,7 +1406,7 @@ fn new_destination_holds_history_born_before_the_claim() {
     }
 }
 
-/// SOURCE ruling (cross-org `full` move, no list), the named policy row: the
+/// Cross-org `full` move, no list: the
 /// other destination's history is paced through the budget, counted, only
 /// because the last claim was an explicit `full`.
 #[test]
@@ -1451,7 +1450,7 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
     );
 }
 
-/// SOURCE F1b: on the destination of the claim that recorded a
+/// On the destination of the claim that recorded a
 /// different-user cutoff, the previous user's history stays excluded by the
 /// cutoff, as before, not by the history gate: a session with activity after
 /// the cutoff is still sent whole. The claim binds its own destination
@@ -1495,7 +1494,7 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
     );
 }
 
-/// SOURCE h695 N1: a same-user re-claim keeps the cutoff (the server answers
+/// A same-user re-claim keeps the cutoff (the server answers
 /// `full`) but mints a new destination. The cutoff belongs to the destination
 /// of the claim that set it, so on the new one the history already sent to
 /// that destination is prior history: gated and paced, never re-sent
@@ -1625,7 +1624,7 @@ fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
     );
 }
 
-/// SOURCE h695 N2: a quarantined ledger of this index, a quarantined legacy
+/// A quarantined ledger of this index, a quarantined legacy
 /// Claude index and an unreadable seen-marker path are prior history (fail
 /// closed); a clean support state is not.
 #[test]
@@ -1678,7 +1677,7 @@ fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
     );
 }
 
-/// SOURCE F1a, StateMissing N1: a server-attested record in this
+/// A server-attested record in this
 /// destination's ledger is prior history. A generation or replay claim alone
 /// is not: the ledger saves it before the scan, so a fresh install killed
 /// before its first index save would otherwise hold its own history.
@@ -1712,7 +1711,7 @@ fn only_server_attested_ledger_records_are_prior_history() {
     assert_eq!(prior(&progress), crate::snapshots::PriorHistory::Here);
 }
 
-/// SOURCE F1b, StateMissing M3 and N1 (a): a re-pair resuming a partial
+/// A re-pair resuming a partial
 /// index that a pre-gate daemon saved for the new destination loads as
 /// `Loaded`, drops no entries and has no cutoff. Another destination's
 /// completed bootstrap records the cutoff on this first gated load, at the
@@ -1787,7 +1786,7 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
     );
 }
 
-/// SOURCE F1b (AutoReview): a bootstrap interrupted before a re-pair leaves
+/// A bootstrap interrupted before a re-pair leaves
 /// only its own destination's Claude index or ledger. That is prior history
 /// for the new destination; the new destination's own files are not.
 #[test]
@@ -1826,7 +1825,7 @@ fn another_destinations_claude_state_is_prior_history() {
         crate::snapshots::PriorHistory::None,
         "a same-destination legacy leftover is not another destination"
     );
-    // SOURCE h732 C3: an unscoped pre-scoping index names no destination, so
+    // An unscoped pre-scoping index names no destination, so
     // it is not a move, but it is this Mac's history: Here, so a cutoff keeps
     // it owed, list-gated and paced.
     std::fs::write(
@@ -1888,7 +1887,7 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     );
 }
 
-/// SOURCE addendum 8, the incident M4 shape with the list intended: prior
+/// The incident shape with the list intended: prior
 /// uploads, the list installed (one family listed) and its seen-marker
 /// written, then the index quarantined. The rebuild latches (#700): nothing
 /// is emitted. After a restart, the listed family is never emitted and the
@@ -2036,7 +2035,7 @@ fn family_closure_root_absent_excluded(lines: &[serde_json::Value]) -> u64 {
         .sum()
 }
 
-/// StateMissing M1 (SOURCE d680b524): the first family gets subagent files
+/// The first family gets subagent files
 /// `agents`, every file is sent at revision 1, then its root transcript is
 /// removed, `listed` is installed as the list and the index is quarantined.
 /// The rebuilt cycle runs the full prepare/finish path under the captured
@@ -2097,7 +2096,7 @@ fn assert_rootless_family_held(outcome: &HistoryOutcome) {
     }
 }
 
-/// SOURCE d680b524 (a): the list names only `R_agent-a`, `R.jsonl` is gone,
+/// The list names only `R_agent-a`, `R.jsonl` is gone,
 /// and the index is rebuilt. A sibling is not offered whether traversal
 /// decides it after agent-a (`agent-b`) or before it (`agent-0`), and each
 /// sibling counts once as held through the absent root. agent-a itself is
@@ -2503,7 +2502,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     });
 }
 
-/// The listed session's item on a page: read without an E2 fold, so it
+/// The listed session's item on a page: read without an `e2` fold, so it
 /// publishes exactly as gate off (native hours, no request-owned literal).
 impl HistoryFixture {
     /// The list as the cycle's load reads it. The returned index is reloaded
@@ -2533,9 +2532,9 @@ fn e2_assert_ordinary_body(outcome: &HistoryOutcome, session: &str) {
     }
 }
 
-/// Owner B (SOURCE Amendment 14) with the gate on: a listed family keeps
+/// With the gate on, a listed family keeps
 /// ordinary money. Its genuine change uploads its ordinary body once; an
-/// unlisted family changed on the same page uploads the E2 literal; the
+/// unlisted family changed on the same page uploads the `e2` literal; the
 /// listed file is never stamped 3 nor re-read by revision 3.
 #[test]
 fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
@@ -2969,7 +2968,7 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
     });
 }
 
-/// Contract-5 cutover, first run after upgrade (SOURCE §B; card G (b)):
+/// Contract-5 cutover, first run after upgrade:
 /// revision-3 history stamped by a permit-era build without the permit
 /// (recorded contract `""`, no capture), some carrying #825's retired
 /// `STAMPED_WITHOUT_PERMIT` bit (64), meets the always-on contract. Nothing

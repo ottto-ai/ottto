@@ -125,7 +125,7 @@ struct C1bWindow {
     retry_pending: bool,
     proven: bool,
     start: Option<C1bStart>,
-    /// Sessions whose body this window emitted as a request-owned (E2)
+    /// Sessions whose body this window emitted as a request-owned (`e2`)
     /// literal; a listed family's bodies stay on ordinary money.
     request_owned: BTreeSet<String>,
 }
@@ -368,7 +368,7 @@ fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
     });
 }
 
-/// T0/T1, the unrelated-red-window shape: an unrelated session turns the
+/// The unrelated-red-window shape: an unrelated session turns the
 /// 08:10 window red. BASE re-arms every family parsed there at each retry
 /// start; the terminal-retry re-arm owes, so BASE re-stamps the unchanged
 /// families instead of re-reading them. The fix carries the witnessed family
@@ -482,7 +482,7 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
-/// SOURCE B9: after the red window one subagent's transcript gains a request
+/// After the red window one subagent's transcript gains a request
 /// without telemetry. The walk re-parses that member at the 08:20 retry
 /// (`SourceChanged` instead of BASE's `Rearmed`), which cancels the family's
 /// carry so its other members are read in the same window. Its liveness
@@ -531,7 +531,7 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
         let family = rearm_family_sessions().len();
         // terminal-retry owe: the first retry reads under the old contract;
-        // the second re-stamps that current-contract read (E1).
+        // the second re-stamps that current-contract read.
         let base_reads = [family, 0];
         for ((window, base_window), base_reads) in fix
             .windows
@@ -635,7 +635,7 @@ fn c1b_recoverable_change_arms_listed(
     (fix, base, cancelled, held)
 }
 
-/// SOURCE B9 held path: the same change with every window on one page, so
+/// Held path: the same change with every window on one page, so
 /// the changed member is parsed on the page that ends the walk after the
 /// unchanged root was already passed. BASE reads the whole family on that
 /// terminal page and re-proves it there. Queueing the root would end the page
@@ -645,8 +645,8 @@ fn c1b_recoverable_change_arms_listed(
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
-    // Terminal-authority hold/rearm policy: E2 literal bodies bypass legacy
-    // demotion (E2 rule 5), so the family is listed (ordinary money) after
+    // Terminal-authority hold/rearm policy: `e2` literal bodies bypass legacy
+    // demotion, so the family is listed (ordinary money) after
     // the unlisted closing and red windows.
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
         return;
@@ -683,7 +683,7 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     assert!(retry.retry_pending, "the ordinary path holds the family");
 }
 
-/// SOURCE B9 held path, the remaining case: a member that disappears after
+/// Held path, the remaining case: a member that disappears after
 /// the red window yields no parse in the retry window, so nothing cancels the
 /// carry there. BASE re-reads the remaining members; the fix keeps the
 /// family's committed revisions and reads none of them, and the family takes
@@ -765,8 +765,8 @@ struct C1bHeldRun {
 /// authority family before the red window: its new revision is read there and
 /// held. `before_retry` runs between the red window and its retry.
 ///
-/// A request-owned (E2) body settles authority whatever the proof's health
-/// (E2 rule 5), so the held family is listed after the unlisted closing
+/// A request-owned (`e2`) body settles authority whatever the proof's health,
+/// so the held family is listed after the unlisted closing
 /// window: its later revisions are read on ordinary money and the legacy
 /// authority hold applies, as for a protected family in production.
 fn c1b_held_retry_chain(
@@ -820,7 +820,7 @@ fn c1b_held_retry_chain(
     }
 }
 
-/// SOURCE, SI P2 and COST: an authority-only hold beside an unrelated
+/// An authority-only hold beside an unrelated
 /// unchanged witnessed family. The red window holds the RetryPending family's
 /// new revision without marking the sweep, so the same-context retry carries
 /// the witnessed family (not read) while the held family is never carried: it
@@ -829,7 +829,7 @@ fn c1b_held_retry_chain(
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    // Terminal-authority hold/rearm policy; `e2` literal bodies bypass legacy demotion.
 
     if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
         return;
@@ -886,14 +886,14 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
     assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
-/// COST: authority debt beside another cause on an ordinary red retry,
-/// outside Fix 2's full-rearm-window exception. An unsettled mark already
+/// Authority debt beside another cause on an ordinary red retry,
+/// outside the full-rearm-window exception. An unsettled mark already
 /// left by another producer stays set; the retry carries nothing and re-reads
 /// the witnessed family as BASE does.
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    // Terminal-authority hold/rearm policy; `e2` literal bodies bypass legacy demotion.
 
     if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
         return;
@@ -959,7 +959,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    // Terminal-authority hold/rearm policy; `e2` literal bodies bypass legacy demotion.
 
     if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
         return;
@@ -1062,15 +1062,15 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
     assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
-/// SI P1: after a contract change, a full re-arm terminal with one
+/// After a contract change, a full re-arm terminal with one
 /// RetryPending family keeps the contract-5 latch (and with it C1a's and
 /// C1b's skips off) although that debt no longer marks the sweep. Once the
 /// hold is released, the next clean terminal clears it.
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
-    // Terminal-authority hold/rearm policy: E2 literal bodies bypass legacy
-    // demotion (E2 rule 5), so the held family is listed (ordinary money)
+    // Terminal-authority hold/rearm policy: `e2` literal bodies bypass legacy
+    // demotion, so the held family is listed (ordinary money)
     // after the unlisted closing window.
     if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
         return;
@@ -1216,7 +1216,7 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     // Contract-5 tagging oracle on ordinary money: a markerless single-account
-    // request-owned (E2) body keeps the D1 wire shape without row tags, so the
+    // request-owned (`e2`) body keeps the existing wire shape without row tags, so the
     // family is listed before the late identity rows arrive.
     use sha2::{Digest, Sha256};
     if !c1a_layout_supported("scoped_retry_late_identity") {
@@ -1339,10 +1339,10 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     );
     let root =
         tagged_root.expect("late identity evidence emits and ACKs the tagged root in this retry");
-    // Transferred from the deleted late-row controls (E2-054
-    // c1a_late_identity_row_reselects_and_tags_skipped_family, E2-055
-    // c1a_late_row_between_windows_equals_base, E2-065
-    // c1b_sidecar_changed_family_is_reread_like_base, E2-071
+    // Transferred from the deleted late-row controls
+    // (c1a_late_identity_row_reselects_and_tags_skipped_family,
+    // c1a_late_row_between_windows_equals_base,
+    // c1b_sidecar_changed_family_is_reread_like_base,
     // fix2_late_api_row_rereads_the_family_like_base): the late evidence is
     // taken at normal cadence behind a closed fence, nothing is left
     // RetryPending, and the re-emitted root body is the durable accepted head
@@ -1384,7 +1384,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    // Terminal-authority hold/rearm policy; `e2` literal bodies bypass legacy demotion.
 
     if !c1a_layout_supported("scoped_retry_mark_and_authority") {
         return;
@@ -1541,7 +1541,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     if case == "accepted" {
                         // BASE's terminal-retry re-arm owes; the member's own
                         // record was read under the current contract, so it
-                        // re-stamps (E1) and neither arm reads.
+                        // re-stamps and neither arm reads.
                         assert!(!reads, "exact-ACK unchanged {base}/e2");
                         assert_eq!(
                             fixture.body_trace.borrow().finalizer_bodies[session],
@@ -1599,7 +1599,7 @@ fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
         .sum()
 }
 
-// SOURCE T1: a genuine Started record must not make a later mid-walk flip
+// A genuine Started record must not make a later mid-walk flip
 // eligible for terminal clearing, even when the last page runs under B.
 #[test]
 #[serial(source_manifests)]
@@ -1655,7 +1655,7 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
     );
 }
 
-// SOURCE T2: finish the invariant/current-contract G first while F remains
+// Finish the invariant/current-contract G first while F remains
 // owed. The next debt retry carries G, but must read and ACK F's new body.
 #[test]
 #[serial(source_manifests)]

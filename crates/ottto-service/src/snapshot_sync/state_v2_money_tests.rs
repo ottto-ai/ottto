@@ -1,4 +1,4 @@
-// Lead B condition b: synthetic v1 custody -> composed rows -> mapper hydrate
+// Synthetic v1 custody -> composed rows -> mapper hydrate
 // -> real scan, identity qualification, finalization and upload encoding.
 use super::money_equivalence_tests::{
     claude_change, claude_corpus, compare_claude_uploads, corpus, finish_claude_pages, grow,
@@ -269,7 +269,7 @@ fn condition_b(class: &str) {
             );
         }
         if class == "identity_inheritance" {
-            // Preserve coverage of the original E2 path too: its invalid
+            // Preserve coverage of the original `e2` path too: its invalid
             // login inherits r1's account rather than emitting a refusal.
             assert!(pages[0]
                 .scan
@@ -476,7 +476,7 @@ classes! {
 fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload() {
     with_e2(|| {
         let mut c = corpus("v2-accepted-identity-buckets");
-        // #909 deliberately retains uniform markerless E2 bodies in D1's
+        // #909 deliberately retains uniform markerless `e2` bodies in the
         // existing wire shape. An own captured marker exercises identity rows.
         let marker = json!({"type":"attachment", "sessionId":ROOT,
             "attachment":{"type":"credential_org",
@@ -659,7 +659,7 @@ fn routed(page: &Page) -> crate::snapshots::sampled_scan::transition_fixture::Ro
     route
 }
 
-/// An E2 money row from the same v1 bytes, resident and restored cold on a
+/// An `e2` money row from the same v1 bytes, resident and restored cold on a
 /// live session: stored usage pending loads as cold heads, the page loads
 /// its families by key and the stale-family carry loads the whole kind.
 /// Both arms emit the same bodies, totals and account placement.

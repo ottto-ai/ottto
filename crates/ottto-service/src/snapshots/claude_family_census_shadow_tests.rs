@@ -1,4 +1,4 @@
-// E7-8a: the count-only per-family Claude census shadow. Every fixture is
+// The count-only per-family Claude census shadow. Every fixture is
 // synthetic and content-free, evaluates with transcript I/O denied, and checks
 // that the shadow leaves the index (including every `census_complete` bit)
 // byte-identical.
@@ -569,8 +569,7 @@ fn coverage_needs_an_attestation_of_the_current_revision() {
         evaluate_attested(&grown, &refs, &attested).incomplete,
         presence_only
     );
-    // A growth hint after the attestation re-queues a current member
-    // (Q-E1-4).
+    // A growth hint after the attestation re-queues a current member.
     let mut hinted = base.clone();
     hinted
         .traversal
@@ -884,7 +883,7 @@ fn quantum_admits_64_complete_families_and_defers_the_rest() {
     assert!(counts.incomplete.is_empty());
 }
 
-/// M4 shape: 1,000 three-member families, all 3,000 members queued, 100
+/// Live-sized shape: 1,000 three-member families, all 3,000 members queued, 100
 /// served per page in FIFO order, so many families span a served (uncapped)
 /// and a still-queued (capped) member at a page boundary.
 /// [behaviour] m4 shape drains 3000 queued members at 100 per page.
@@ -1702,12 +1701,12 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
     BTreeMap::from([(ROOT.to_string(), rows)])
 }
 
-/// R1: mid-pass, a key the merged pass already counted as observed-only moves
+/// Mid-pass, a key the merged pass already counted as observed-only moves
 /// into `files` while a post-observer settlement drops another entry, so both
 /// inventory sizes and the generation hold and no page reports a change. The
 /// union keeps the key: the cross-directory duplicate is counted either way,
 /// and the family never completes.
-/// [regress] R1 masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
+/// [regress] masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
 #[test]
 fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
     const FILLER: usize = 2 * ROOT_PASS_KEYS_PER_PAGE;

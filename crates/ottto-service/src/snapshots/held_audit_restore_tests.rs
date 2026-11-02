@@ -1,4 +1,4 @@
-//! D4: Completed restore must not widen authority/family retention by carrying
+//! Completed restore must not widen authority/family retention by carrying
 //! sampled debt solely because that different hold restored a previous entry.
 use super::*;
 /// [behaviour] Completed restore carries new sampled debt only for account holds.

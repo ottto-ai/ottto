@@ -29646,7 +29646,7 @@ X-API-Key = "otel_redacted"
         fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
             .expect("seed clean config");
         // Hold-budget damage: valid JSON whose session-identity fields an
-        // override can strictly recover (SI-718-O1); syntax damage cannot.
+        // override can strictly recover; syntax damage cannot.
         let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
         damage["files"]["excess-held"] =
             serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});

@@ -891,7 +891,7 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     assert_eq!(f.baseline.files.len(), 2);
 }
 
-// #660 D2: Codex side state that enlarges the index past `RESPONSE_BYTES`
+// #660: Codex side state that enlarges the index past `RESPONSE_BYTES`
 // must not loosen any cap. Bounded retry declines before any copy (the
 // caller's existing `None` → ordinary path), and the ordinary unbounded
 // checkpoint then settles the ACK and keeps the side state.
@@ -912,7 +912,7 @@ fn bounded_native_enlarged_by_side_state() -> SameSourceAckFixture {
     f
 }
 
-// #660 D2: the bounded checkpoint's capped read refuses the enlarged index
+// #660: the bounded checkpoint's capped read refuses the enlarged index
 // with an error: the index and progress files are byte-identical (no
 // truncation), and the durable ACK is still settled by the ordinary
 // checkpoint afterwards (no ACK or debt loss).

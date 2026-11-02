@@ -31,7 +31,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 /// Unique acquisition metadata; the Plain native input owns it while reading.
-/// M3: the one active lease, acquired chain and receipt debt move with it.
+/// The one active lease, acquired chain and receipt debt move with it.
 /// The chain lives in `owed` while debt exists, never also in `chain`.
 #[derive(Default)]
 pub(crate) struct DurableCustody {
@@ -155,7 +155,7 @@ pub(crate) use shared_value::{Shared, SharedMap};
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
-// P1-only census helpers remain until the separate persisted-format cleanup.
+// These census helpers remain until the separate persisted-format cleanup.
 #[allow(dead_code)]
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
@@ -1861,8 +1861,8 @@ pub struct SnapshotItem {
     pub telemetry_owned_complete: Option<bool>,
     /// Native resolver conflicts (two incompatible records of one response,
     /// the loser dropped) in this request-owned body. Present only when >0,
-    /// so legacy and conflict-free bodies are byte-identical. COST marks the
-    /// session's money partial from it; the daemon ships no deltas or prices.
+    /// so legacy and conflict-free bodies are byte-identical. The session's money
+    /// is marked partial from it; the daemon ships no deltas or prices.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolver_conflict_count: Option<u64>,
     /// Capability-gated class-N disclosure; bucket rows, counted once.
@@ -3210,7 +3210,7 @@ pub(in crate::snapshots) struct SideRequest {
     /// A capacity loss's reservation (U1a-2b). Always `None` for a singleton.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::snapshots) needed_charge: Option<usize>,
-    /// U1a-2a (D6(b)): `codex_parent_proof_wrap_epoch` at the last child
+    /// `codex_parent_proof_wrap_epoch` at the last child
     /// reference (a fence use) or live sweep visit. 0 is unknown (legacy,
     /// or armed before the first wrap): the sweep stamps it, never prunes
     /// it. Index-only: the ledger projection carries no epoch.
@@ -3264,7 +3264,7 @@ pub(in crate::snapshots) fn codex_parent_side_live(
         || index.codex_parent_side_requests.contains_key(p_key)
 }
 
-/// U1a-2a (row 32, D6(b)): P is referenced by a child: a child's parent
+/// P is referenced by a child: a child's parent
 /// ref or an owed proof names one of `p_ids`. Liveness without P's own
 /// request, which the request epoch prune asks about.
 pub(in crate::snapshots) fn codex_parent_side_referenced(
@@ -3282,7 +3282,7 @@ pub(in crate::snapshots) fn codex_parent_side_referenced(
 /// U1a-2a (row 32): side keys (records ∪ requests) one sweep visits.
 pub(in crate::snapshots) const CODEX_SIDE_SWEEP_KEYS: usize = 64;
 
-/// U1a-2a (D6(b)): `epoch` is more than two completed wraps behind `wrap`.
+/// `epoch` is more than two completed wraps behind `wrap`.
 /// Subtractive and checked: an epoch ahead of the clock (a restored or
 /// corrupt index) is never stale, and nothing overflows at `u64::MAX`.
 pub(in crate::snapshots) fn codex_side_epoch_stale(epoch: u64, wrap: u64) -> bool {
@@ -3358,7 +3358,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
     }
 }
 
-/// M1 durable warm-cache reuse: selects this source's store (beside
+/// Durable warm-cache reuse: selects this source's store (beside
 /// `index_path`) for the pass and binds the pass's sampled scope and
 /// identity-capture mode, which its records bind to. A freshly loaded index
 /// (absent, quarantined or undecodable) selectively cleans the store: records bind
@@ -3385,7 +3385,7 @@ pub(crate) fn begin_durable_pass(
     }
 }
 
-/// M1: after the pass's final index save, writes this source's admitted,
+/// After the pass's final index save, writes this source's admitted,
 /// still-resident copies the save kept, then collects records it no longer
 /// keeps. A store failure is never a sync failure: the store is a cache, and
 /// a missing record only means a Full read. Writes and GC require the
@@ -3616,7 +3616,7 @@ pub(crate) fn prepare_historical_replay_with_side(
     reset
 }
 
-/// U1a-2a D5′ (C15), Codex only: the side ledger's save mark for this index,
+/// Codex only: the side ledger's save mark for this index,
 /// read immediately before the call that assembles and writes the selected
 /// save. Opaque outside `snapshots`.
 #[derive(Clone, Copy, Debug)]
@@ -3767,8 +3767,8 @@ pub struct ScanIndex {
     codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     /// U1a-2a: paced side requests for unchanged parent rollouts, keyed by
     /// the parent's index key. Pacing only, never evidence; the process side
-    /// ledger holds any charge made since the last save. Decoded per entry
-    /// (D4): a malformed request is dropped and counted, never the index.
+    /// ledger holds any charge made since the last save. Decoded per entry:
+    /// a malformed request is dropped and counted, never the index.
     #[serde(default, deserialize_with = "deserialize_codex_side_requests")]
     codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// U1a-2a: side records for unchanged parent rollouts, keyed by the
@@ -3834,7 +3834,7 @@ pub struct ScanIndex {
     claude_usage_family_witnesses: SharedMap<String, ClaudeUsageFamilyWitness>,
     #[serde(default)]
     claude_usage_family_pending: UsagePending,
-    /// Slice D1: one request-census record per Claude transcript index key,
+    /// One request-census record per Claude transcript index key,
     /// bound to the candidate fingerprint and census window of the parse that
     /// produced it. Local-only and content-free (8-byte SHA-256 prefixes of
     /// provider request ids); never proof, usage or upload input, and no
@@ -3842,7 +3842,7 @@ pub struct ScanIndex {
     /// never the index.
     #[serde(default)]
     claude_request_census: ClaudeRequestCensus,
-    /// Slice D1: count-only shadow memory between complete terminals.
+    /// Count-only shadow memory between complete terminals.
     #[serde(default)]
     claude_request_census_shadow: ClaudeRequestCensusShadowState,
     /// Families whose current transcript revision could not reconstruct a
@@ -3856,26 +3856,26 @@ pub struct ScanIndex {
     /// Path-(a) absence retirement: SHA-256 of each RetryPending family root
     /// a raw-complete census retired as wholly absent, to its retirement unix
     /// seconds. A returning member of such a family re-enters its authority
-    /// path (Round 12). At most `MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES`: a full
+    /// path. At most `MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES`: a full
     /// set refuses further retirements and never evicts; only a settled proof
-    /// frees a slot (Round 13). Always written, beside its marker below.
+    /// frees a slot. Always written, beside its marker below.
     /// Decoded leniently: damage drops entries, never the index, and raises
     /// the uncertainty fence.
     #[serde(default)]
     claude_retired_family_tombstones: ClaudeRetiredFamilyTombstones,
-    /// SOURCE Round 13 marker: this index keeps the tombstone map above, so a
+    /// Marker: this index keeps the tombstone map above, so a
     /// missing or damaged map under it is lost retirement evidence. Absent on
     /// an index from before the bridge, whose empty map is safe unless a
-    /// witnessed root shows a retirement whose set an older writer dropped
-    /// (Round 14). Every save sets it. A non-boolean value decodes as set.
+    /// witnessed root shows a retirement whose set an older writer dropped.
+    /// Every save sets it. A non-boolean value decodes as set.
     #[serde(default, deserialize_with = "deserialize_fail_closed_flag")]
     claude_retired_family_tombstones_initialized: bool,
-    /// SOURCE Round 13 uncertainty fence: the marked tombstone map was lost,
+    /// Uncertainty fence: the marked tombstone map was lost,
     /// damaged or over its cap, so a retired family may have lost its
     /// tombstone. While set, every unindexed Claude member is read through
     /// the authority path (never as a new file), and every witness and
     /// authority record is kept as if its root were tombstoned. Only a
-    /// complete healthy terminal lowers it (Round 15): when every witnessed
+    /// complete healthy terminal lowers it: when every witnessed
     /// root it did not see present on disk (an indexed entry whose file is
     /// missing counts as absent) fits under the cap and its repair budget,
     /// those roots are tombstoned and the fence comes down. A non-boolean
@@ -4125,14 +4125,14 @@ pub struct ScanIndex {
     )]
     claude_history_cutoff_unix_seconds: Option<u64>,
     /// Claude only: a daemon with the history gate has loaded this index
-    /// (StateMissing M3). Without it, an index a pre-gate daemon built, or
+    /// (StateMissing). Without it, an index a pre-gate daemon built, or
     /// rebuilt only partly, gets its cutoff on the first gated load. Any
     /// stored value but `true` reads as `false` (lenient decode, fail closed).
     #[serde(default, deserialize_with = "deserialize_lenient_true")]
     claude_history_gate_loaded: bool,
     /// Claude only: this index's cutoff was recorded for history another
     /// destination received, under a claim policy other than an explicit
-    /// `full` (SOURCE ruling, cross-org move). Kept, so the hold outlives this
+    /// `full` (cross-org move). Kept, so the hold outlives this
     /// destination's own bootstrap; only an explicit `full` claim clears it.
     #[serde(default, deserialize_with = "deserialize_lenient_move_hold")]
     claude_history_move_not_full: bool,
@@ -4203,7 +4203,7 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     claude_desktop_store_inventory: Option<String>,
-    /// E2 stored copy removals (copy-family fix): what each Claude file once
+    /// `e2` stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
     /// it. Only an empty undamaged store is never written, so an absent field
@@ -4913,7 +4913,7 @@ thread_local! {
     /// since the last take. Only `ScanIndex::load` takes and counts them.
     static DROPPED_CODEX_SIDE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-/// U1a-2a (D4): the request map must be an object (the outer shape is
+/// The request map must be an object (the outer shape is
 /// unchanged); a request this binary cannot decode is dropped. It is unknown
 /// scheduling evidence: P then has no request, never a record or an
 /// admission, and an in-process ledger charge for it still hydrates at C14.
@@ -5363,7 +5363,7 @@ struct ClaudeUsageAuthorityQuarantineRecord {
     proof_correction: Option<ClaudeAuthorityProofCorrection>,
 }
 
-// Terminal verdicts before E2 get one retry; delete when the count of matching records reaches 0.
+// Terminal verdicts before `e2` get one retry; delete when the count of matching records reaches 0.
 const PRE_E2_TERMINAL_DEADLINE_CUTOFF: u64 = 1_793_167_200; // 2026-10-28T06:00Z
 fn claude_terminal_predates_e2(record: &ClaudeUsageAuthorityQuarantineRecord) -> bool {
     record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
@@ -5420,7 +5420,7 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// The account-deferred subset of `quarantined_source_session_ids`. Upload
     /// retention still uses the union; this only classifies settlement.
     account_deferred_source_session_ids: BTreeSet<String>,
-    /// Fixed-label E2 emission veto counts for this page. Diagnostic only;
+    /// Fixed-label `e2` emission veto counts for this page. Diagnostic only;
     /// never serialized, persisted, or used to decide upload eligibility.
     pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
@@ -5480,7 +5480,7 @@ impl ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
-    /// E2 (gate on): request-owned entities `e2::finish_page` withheld (held
+    /// `e2` (gate on): request-owned entities `e2::finish_page` withheld (held
     /// twin, uncertified body, unread telemetry). Their items stay on the
     /// page but never upload; the hold is not bound to an authority record,
     /// so it blocks progress and the files are read again: delayed, never
@@ -6987,7 +6987,7 @@ static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
 
 /// Content-free count of carried families whose member was parsed on the page
 /// that ends the walk after another member was already passed, so the carry
-/// stays and the family takes the ordinary path (SOURCE B9's held path).
+/// stays and the family takes the ordinary path (the held path).
 static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -7022,7 +7022,7 @@ pub(crate) fn claude_stale_family_carry_cancellation_refusals_for_test() -> usiz
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST.with(std::cell::Cell::get)
 }
 
-/// SOURCE B9 liveness: a member of a family this red retry carried is about to
+/// Liveness: a member of a family this red retry carried is about to
 /// be parsed (it changed, is new, or another gate selected it) while the
 /// family is still in the carry and no member of it has been parsed in this
 /// window yet, so its pending is still the compacted entry from an older
@@ -7040,7 +7040,7 @@ pub(crate) fn claude_stale_family_carry_cancellation_refusals_for_test() -> usiz
 /// that ends the walk, queueing a passed member would end this page without
 /// its terminal fold, which demotes the changed member's revision before the
 /// family can be re-proved; there the carry stays and the family takes the
-/// ordinary path (SOURCE B9's held path), counted content-free. Elsewhere the
+/// ordinary path (the held path), counted content-free. Elsewhere the
 /// cancel counts its members by borrowing and queues into the capacity the
 /// carry reserved for this family, so it allocates no slot and never touches
 /// the candidate queue. Should a defensive check find that funding missing,
@@ -7420,7 +7420,7 @@ const MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS: usize = 4_096;
 /// never a cycle contract, so a terminal of that traversal cannot clear the
 /// contract latch.
 const CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL: &str = "changed_within_traversal";
-// Existing contract field records that E2 already armed paced revision debt
+// Existing contract field records that `e2` already armed paced revision debt
 // during this traversal. It cannot clear the contract latch at its terminal.
 const CLAUDE_E2_IDENTITY_ADOPTION_PENDING: &str = "e2_identity_adoption_pending";
 // Cutover states; spent keeps the cutover's latch inert.
@@ -7432,14 +7432,14 @@ const CLAUDE_CONTRACT_CUTOVER_REAL: u8 = 3;
 const CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS: u64 = 3_600;
 const CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS: u64 = 86_400;
 const CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT: u8 = 8;
-/// Fix 2 cap (COST ruling, 2026-10-23): whole-index stale-pending re-arms of
+/// Cap: whole-index stale-pending re-arms of
 /// full-rearm-window families allowed per duplicate-fence backoff deadline.
 const CLAUDE_STALE_FULL_REARM_WINDOW_REARMS_PER_DEADLINE: u8 = 1;
 /// Bumped when the structural classification or the record's digests change;
 /// part of the record basis, so a bump re-arms once.
 const CLAUDE_FULL_REARM_STRUCTURAL_RECORD_VERSION: u16 = 2;
 
-/// Fix 1 classification, the one place it lives (SI ruling, 2026-10-23,
+/// The classification, the one place it lives (2026-10-23,
 /// conservative). A member's invalidity is structural only when it is a pure
 /// function of that member's own transcript bytes, so an unchanged member
 /// source fingerprint reproduces it on every re-read: a usage-bearing
@@ -7500,7 +7500,7 @@ fn held_family_scope_has_writer_shape(scope: &BTreeSet<String>) -> bool {
 pub(crate) const MAX_SCOPED_HELD_FAMILY_ROOTS: usize = 64;
 
 /// The record basis: everything outside the member bytes that the
-/// classification depends on. A D1 derivation, scan identity, record version
+/// classification depends on. A request-census derivation, scan identity, record version
 /// or identity contract change re-arms once.
 fn claude_full_rearm_record_basis(identity_contract: &str) -> String {
     claude_full_rearm_digest(
@@ -7713,7 +7713,7 @@ pub struct ClaudeDuplicateCensusCounts {
     pub full_rearm: bool,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
-    /// Slice D1 shadow, present only on a complete Claude terminal scan.
+    /// Request-census shadow, present only on a complete Claude terminal scan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_census: Option<ClaudeRequestCensusShadowCounts>,
 }
@@ -7744,7 +7744,7 @@ impl ClaudeFullRearmSuppressionCounts {
     }
 }
 
-/// E2 requests left Unknown because their family's strict sidecar read was
+/// `e2` requests left Unknown because their family's strict sidecar read was
 /// unhealthy this page (`unhealthy_root_no_fallback_requests{reason}`): no
 /// retained, creator, start or inherited account filled them. Content-free
 /// counts; nothing reads them into a decision. Absent from the line while zero.
@@ -7784,7 +7784,7 @@ impl ClaudeUnhealthyRootNoFallbackCounts {
     }
 }
 
-/// Slice D1: the request-census shadow, measured by the scan on a complete
+/// The request-census shadow, measured by the scan on a complete
 /// Claude terminal before any fold and reported beside the duplicate-census
 /// counters. Content-free counts; nothing reads them into a decision.
 /// `would_open` is whether every indexed Claude family-member key (not
@@ -8115,7 +8115,7 @@ pub struct SourceScanResult {
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
-    /// Slice D1 shadow, measured by a complete Claude terminal scan before
+    /// Request-census shadow, measured by a complete Claude terminal scan before
     /// any fold. Count-only; the usage fold copies it into its counters.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
     /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
@@ -8825,7 +8825,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
         } else {
             BTreeMap::new()
         };
-        // P1: a carried accepted entity whose durable stamp proves this body
+        // A carried accepted entity whose durable stamp proves this body
         // under the file's context is not re-sent, even while its file owes
         // a receipt (a manual-override rebuild keeps stamps, not receipts).
         let stamp_proven = entity_bodies
@@ -9588,7 +9588,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         comparison,
         evidence_rows,
     );
-    // Slice D1: report only. The shadow was measured by the scan; no fold
+    // Report only. The shadow was measured by the scan; no fold
     // input above read it.
     disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
     disposition
@@ -9765,12 +9765,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         other_evidence_cause,
     );
 
-    // SOURCE (B): only FE-published sealed prefixes are excluded. Ordinary
+    // Only FE-published sealed prefixes are excluded. Ordinary
     // EOF-recomposed Tail/Unchanged bodies keep positive proof/posture behavior
-    // while still owing their Full audit. D1 tail records used directly, without
+    // while still owing their Full audit. Request-census tail records used directly, without
     // a complete current native body, remain observation-only evidence.
     // Bind prefix provenance by exact revision as well as physical path: a
-    // logical family can differ from its index key, and D1 can be missing.
+    // logical family can differ from its index key, and the census record can be missing.
     let uncertified_revisions = index
         .files
         .values()
@@ -9952,7 +9952,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 family.map(|family| (root_session_id.clone(), family))
             })
             .collect();
-        // Path-(a) tombstone (Round 12): a retired family keeps its witness
+        // Path-(a) tombstone: a retired family keeps its witness
         // while tombstoned, so a returning member re-proves against it (or is
         // held by it) instead of being read as a fresh, unproven family.
         let tombstones = &index.claude_retired_family_tombstones;
@@ -9980,8 +9980,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // family became unowned. Retain exact witnesses for families still
         // present in the complete filesystem census; changed revisions are
         // held below until the reports can be reconstructed again.
-        // A tombstoned family keeps its witness here too (Round 12), and so
-        // does every family under the uncertainty fence (Round 13).
+        // A tombstoned family keeps its witness here too, and so
+        // does every family under the uncertainty fence.
         let tombstones = &index.claude_retired_family_tombstones;
         let uncertain = index.claude_retired_family_tombstones_uncertain;
         index
@@ -10019,9 +10019,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
 
     let mut request_groupings = BTreeMap::new();
     for item in snapshots.iter_mut() {
-        // Design item 9 ("None owners" for v1 bodies): an E2 body never
+        // "None owners" for v1 bodies: an `e2` body never
         // reaches the legacy fork-prefix exclusion. Its copies are removed
-        // once, by the E2 copy rule. The owners still feed the fence and
+        // once, by the `e2` copy rule. The owners still feed the fence and
         // re-arm decisions below (StateMissing inputs), never a v1 body.
         if item.claude_money.is_some() {
             continue;
@@ -10106,7 +10106,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.census_invalid = duplicate_census_invalid;
     // Reuse the native census join for a negative scheduling veto even when
     // an invalid family masks positive duplicate-dependent ownership outputs.
-    // Stable native copies deliberately veto every due suppression (SOURCE).
+    // Stable native copies deliberately veto every due suppression.
     let native_duplicate_request_owners = if census_complete {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in index.claude_usage_family_pending.loaded_all() {
@@ -10412,10 +10412,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .context_file_birth
                 .record_contractless(item, witness_roots_before.contains(&root_session_id));
         }
-        // E2 (gate on): a request-owned body replaces the family's exclusive
+        // `e2` (gate on): a request-owned body replaces the family's exclusive
         // reported body as a contract of its own (its literal is installed by
         // `e2::finish_page` after this fold), so it is not a demotion. Account,
-        // security and E2 twin holds are separate and still apply.
+        // security and `e2` twin holds are separate and still apply.
         let request_owned = item.claude_money.is_some();
         if witness_roots_before.contains(&root_session_id) && contractless && !request_owned {
             demoting_members_by_root
@@ -10451,7 +10451,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let Some(proven_witness_fingerprint) = proven_witness_fingerprint.as_ref() else {
             continue;
         };
-        // SOURCE U3: a prior digest cannot bind a new record after census
+        // A prior digest cannot bind a new record after census
         // pruning. Count it and keep the page's demotion hold; the family
         // stays unproven residue. Save and load drop any existing orphan.
         if current_witness.is_none() {
@@ -10815,7 +10815,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // sweep, so the latch also requires that no such debt remains.
         let sweep_fully_settled = !index.bounded_sweep_had_unsettled_upload
             && index.claude_usage_authority_pending_count() == 0;
-        // E2's revision-3 adoption is the identity upgrade's ONE paced
+        // The `e2` revision-3 adoption is the identity upgrade's ONE paced
         // pass. The contract latch must not clear fingerprints and arm a
         // second, unpaced full replay after that pass.
         let e2_identity_upgrade = identity_contract == claude_request_identity::E2_GROUPING
@@ -11047,9 +11047,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         index.retire_absent_claude_proof_corrections(&complete_families);
     }
 
-    // E2 (gate on): a request-owned body settles its family's authority like
+    // `e2` (gate on): a request-owned body settles its family's authority like
     // a reported one (it is not a demotion, above), so a legacy record or
-    // tombstone clears on the family's first E2 page, never staying red.
+    // tombstone clears on the family's first `e2` page, never staying red.
     let current_authority_by_root = snapshots.iter().fold(
         BTreeMap::<String, BTreeMap<String, bool>>::new(),
         |mut by_root, item| {
@@ -11075,7 +11075,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             // A returning member of a tombstoned family is unindexed while it
             // is held, so the complete census never lists its family. Its
             // record stays until the member re-proves or the family is
-            // retired again as absent (Round 12).
+            // retired again as absent.
             let returning = index.claude_root_tombstoned(root_session_id);
             // Preserve the existing whole-family disappearance rule even
             // when provider reports are unavailable. Its witness was pruned
@@ -11125,7 +11125,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .remove(&root_session_id);
         index.claude_usage_family_pending.discard(&root_session_id);
     }
-    // SOURCE/COST/SI Round 12: a returning family's tombstone clears once its
+    // A returning family's tombstone clears once its
     // proof settles, on the page whose members all carry the reported-usage
     // contract with no authority record left. Its bodies commit with this
     // page. Never earlier: a returning member is indexed on the page that
@@ -11483,8 +11483,8 @@ fn claude_family_members_unobserved_where(
         .count()
 }
 
-/// Fix 1 at a complete terminal (full-rearm investigation, SI and COST
-/// rulings 2026-10-23). Returns whether this terminal's due full re-arm is
+/// At a complete terminal (full-rearm investigation,
+/// 2026-10-23). Returns whether this terminal's due full re-arm is
 /// skipped because it cannot open the fence, and maintains the structural
 /// record. Cost only: the fence decision above is final, this changes only
 /// whether every family file is re-read.
@@ -11495,14 +11495,14 @@ fn claude_family_members_unobserved_where(
 /// every current-window invalid family with a structural member. A window
 /// that observed every indexed member except those of its structural
 /// families records them, digested with their members' fingerprints. A due
-/// re-arm is skipped only when that record exists under the same basis (D1
+/// re-arm is skipped only when that record exists under the same basis (census
 /// derivation, scan identity, record version, identity contract), the
 /// recorded contract is this cycle's, every recorded family is still indexed
 /// with unchanged member fingerprints, and no other structural family
 /// appeared. The basis names the contract, so a real contract change
 /// re-arms once and records the new baseline; the contract-5 latch alone
 /// never repeats a due re-arm (its re-read is the identity contract re-arm
-/// or E2's paced debt), and a mid-traversal placeholder matches no contract.
+/// or the `e2` paced debt), and a mid-traversal placeholder matches no contract.
 /// Then re-reading every file reproduces each recorded family's invalidity,
 /// so the next census is invalid again and the fence cannot open. Any change
 /// re-arms once; that window records the new set. A census closed only by
@@ -11871,9 +11871,9 @@ fn with_claude_absent_family_fallback_cursors<T>(
         .with(|cursors| use_cursors(&mut cursors.borrow_mut()))
 }
 
-/// Path-(a) absence retirement (SOURCE Round 11): the most retired family
+/// Path-(a) absence retirement: the most retired family
 /// roots one index remembers in `claude_retired_family_tombstones`. At the
-/// cap a retirement is refused and its family kept (SOURCE Round 13); no
+/// cap a retirement is refused and its family kept; no
 /// tombstone is ever evicted.
 const MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES: usize = 1024;
 
@@ -11980,20 +11980,20 @@ pub(crate) struct ClaudeAbsenceCounters {
     pub(crate) tombstone_decode_drops: u64,
     /// Tombstones cleared because the returning family re-proved.
     pub(crate) tombstones_cleared: u64,
-    /// Absent families a full tombstone set kept RetryPending (SOURCE
-    /// Round 13), one per family per raw-complete census.
+    /// Absent families a full tombstone set kept RetryPending, one per family
+    /// per raw-complete census.
     pub(crate) tombstone_capacity_refusals: u64,
-    /// Unmarked loads whose downgrade check raised the uncertainty fence
-    /// (SOURCE Round 14 d). Includes the accepted upgrade false positive of
-    /// a pre-bridge index (SOURCE Round 15), with no carve-out.
+    /// Unmarked loads whose downgrade check raised the uncertainty fence.
+    /// Includes the accepted upgrade false positive of
+    /// a pre-bridge index, with no carve-out.
     pub(crate) tombstone_fence_raised_on_upgrade: u64,
     /// Witnessed roots a fence drain tombstoned as absent while they still
     /// had an indexed member the complete walk did not observe: aged out of
-    /// the walk's window, or gone with a stale entry (SOURCE h733-2). They
+    /// the walk's window, or gone with a stale entry). They
     /// count as absent and take a slot; this exposes that slot cost.
     pub(crate) absent_family_tombstone_aged_out: u64,
     /// Fenced drains whose presence scratch was refused, so the fence stayed
-    /// up whatever the count (SOURCE h733-1: only an admitted pass lowers).
+    /// up whatever the count (only an admitted pass lowers).
     pub(crate) fence_lowering_skipped_scratch_fallback: u64,
 }
 
@@ -12447,7 +12447,7 @@ fn evict_oldest_claude_retired_family_tombstones(
     excess
 }
 
-/// Records one retired root, or refuses at the cap (SOURCE Round 13): no
+/// Records one retired root, or refuses at the cap: no
 /// tombstone is ever evicted, so the caller keeps the family's record and
 /// pending. True when `root_session_id` is tombstoned on return.
 fn tombstone_retired_claude_family(
@@ -12482,7 +12482,7 @@ fn claude_root_tombstoned_in(
 /// its scratch is not admitted (an unsupported heap layout, or a refused
 /// price): the fixed-size fallback. Without the presence scratch it cannot
 /// tell present roots from absent ones, so it never lowers the fence and
-/// inserts nothing, whatever it counts (SOURCE h733-1): zero, one, exactly
+/// inserts nothing, whatever it counts: zero, one, exactly
 /// this many, or every witness already tombstoned. The count only sizes the
 /// kept-fence alarm; the durable fence stays up until a later complete
 /// terminal is admitted.
@@ -12545,7 +12545,7 @@ fn claude_tombstone_repair_scratch_admitted(
 }
 
 /// Witnessed roots one complete traversal saw on disk, each to whether every
-/// member the walk observed is indexed with a body (SOURCE Round 15). Only
+/// member the walk observed is indexed with a body. Only
 /// `true` roots are present for the fence drain: an indexed entry whose file
 /// the walk did not see is absent (H729-1), and a member the walk saw but the
 /// index does not hold (residue, or a file it could not index) could be read
@@ -12608,8 +12608,7 @@ fn count_untombstoned_claude_witnessed_roots(
     (found, visited)
 }
 
-/// What one complete terminal's tombstone fence drain did (SOURCE Rounds 14
-/// and 15).
+/// What one complete terminal's tombstone fence drain did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeTombstoneFenceRepair {
     NotFenced,
@@ -12629,7 +12628,7 @@ pub(crate) enum ClaudeTombstoneFenceRepair {
 }
 
 /// Least time between two local alarms that a complete terminal kept the
-/// tombstone uncertainty fence up (SOURCE Round 15).
+/// tombstone uncertainty fence up.
 const CLAUDE_TOMBSTONE_FENCE_KEPT_ALARM_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
@@ -14045,7 +14044,7 @@ fn claude_api_cache_creation(
     interpreted
 }
 
-/// Borrowed compatibility inputs: the live witness and E2 use one predicate.
+/// Borrowed compatibility inputs: the live witness and `e2` use one predicate.
 #[derive(Clone, Copy)]
 pub(crate) struct ClaudeTranscriptUsageOccurrenceView<'a> {
     input_tokens: u64,
@@ -14760,7 +14759,7 @@ fn claude_account_evidence_covers_request_ids(
     covered.len() == item.claude_usage_request_ids.len()
 }
 
-/// After an account owner retags rows. E2 (gate on): the fold holds the
+/// After an account owner retags rows. `e2` (gate on): the fold holds the
 /// per-hour rows until emission, so the session rows are the body's only
 /// rows and the owner has tagged them; rebuilding from no buckets would
 /// drop them.
@@ -16580,7 +16579,7 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     event_clock_complete: bool,
     desktop_request: bool,
     effective_input_context: u64,
-    /// Page-local E2 outcomes; neither is persisted or sent.
+    /// Page-local `e2` outcomes; neither is persisted or sent.
     telemetry_attached: bool,
     e2_inherited: Option<bool>,
 }
@@ -18355,7 +18354,7 @@ crate::durable_tail_codec::durable_enum!(CodexOwnershipBoundary {
 });
 
 /// An open Codex call's provider call id, apart from its tool name, so a
-/// durable record's `L` span is the id alone (M1, SOURCE P2-5).
+/// durable record's `L` span is the id alone.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ActivityCallId {
     id: String,
@@ -18475,7 +18474,7 @@ struct SnapshotAccumulator {
     codex_sidecar_projected_next_ordinal: Option<u64>,
     codex_parent_session_ref: Option<String>,
     codex_parent_signatures: Option<CodexParentPrefix>,
-    /// U1a-2a (D6(a)): the child's chain through the signatures the proof
+    /// The child's chain through the signatures the proof
     /// arm compared (seeded when the proof arm is chosen).
     codex_parent_prefix_digest: PrefixDigest,
     /// U1a-2a: `(m, chain through s_m, owned)` when the proof arm decided.
@@ -18631,7 +18630,7 @@ struct SnapshotAccumulator {
     claude_context_curve_owned_start_proven: bool,
     claude_file_birth: ClaudeFileBirth,
     /// The original a `/branch` copy names (`fork-context-ref`); empty when
-    /// the file names two or an invalid one. E2 copy proof only.
+    /// the file names two or an invalid one. `e2` copy proof only.
     claude_fork_parent: Option<String>,
     claude_money: Option<Box<claude_request_money::e2::FileFold>>,
     tool_usage_counts: BTreeMap<String, u64>,
@@ -18686,15 +18685,15 @@ struct SnapshotAccumulator {
     // provider writes boundary, attachments, then summary as a linear chain.
     claude_compaction_link_tip: Option<(u64, String)>,
     session_start: Box<session_start::SessionStartState>,
-    /// Where the re-derived content fields were last assigned (M1 durable
+    /// Where the re-derived content fields were last assigned (durable
     /// warm-cache reuse). Offsets only, never content.
     durable_marks: crate::durable_tail_codec::DurableMarks,
 }
 
 impl SnapshotAccumulator {
     /// A count that grows with every accepted usage record (its token totals
-    /// and request count) and every Claude response record: P1-RETAIN R0's
-    /// Q-PR15 guard compares it between a retained copy's take and its
+    /// and request count) and every Claude response record: a guard
+    /// compares it between a retained copy's take and its
     /// completion. Saturating; no allocation.
     fn usage_witness(&self) -> u64 {
         let UsageTotals {
@@ -19203,7 +19202,7 @@ impl SnapshotAccumulator {
         } else if is_subagent && forked_from_id.is_some() {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
         } else if !is_subagent && forked_from_id.is_some() && self.codex_proof_decision_only {
-            // U1a-2a (row 33, D6(c)): a proof job's child reads P through the
+            // A proof job's child reads P through the
             // job's ring first (precedence: job ring → step-map ledger →
             // cap/none + installed proof → main). Same arm, same comparison.
             self.codex_parent_ledger_consulted = true;
@@ -19223,7 +19222,7 @@ impl SnapshotAccumulator {
                     .and_then(|ledgers| ledgers.lock().ok())
                     .and_then(|ledgers| ledgers.get(parent_id).cloned())
             });
-            // U1a-2a (D6(a)): an installed proof for exactly this parent. It
+            // An installed proof for exactly this parent. It
             // is consulted only after a valid ledger and only beside a
             // cap-class witness or no witness; with none, this is main.
             let proof = self
@@ -19314,7 +19313,7 @@ impl SnapshotAccumulator {
             }
             CodexOwnershipBoundary::AwaitingParentPrefix => {
                 let signature = codex_ownership_signature(value);
-                // U1a-2a (D6(a)): one lookup over the ledger or the proof.
+                // One lookup over the ledger or the proof.
                 // The proof arm chains the child's signatures (the ledger
                 // arm computes nothing new: main exactly).
                 let index = self.codex_parent_signature_index;
@@ -19706,13 +19705,13 @@ impl SnapshotAccumulator {
         }
     }
 
-    /// U1a-2a (D6(a)): an installed proof the arm did not decide on as it
+    /// An installed proof the arm did not decide on as it
     /// says (a chain mismatch, the boundary buffer's overflow, or EOF inside
     /// the proven prefix) is refused: the child ends as main reads it, under
     /// the evidence main had (`Ledger([])` + witness, or none: pending).
     /// Every record so far was inherited, as in main's `AmbiguousFork`.
     ///
-    /// R1-L3: an arm that decided, but not as the proof says, cannot occur
+    /// An arm that decided, but not as the proof says, cannot occur
     /// (`Proof::at` differs only at `matched`, and `installable` forces
     /// `owned == (matched > 0)`). Should it, records may already have been
     /// applied as owned, so the parse fails closed in every build: held
@@ -20169,7 +20168,7 @@ impl SnapshotAccumulator {
         for response in responses {
             let mut response = match response.resolve_classified(&selectors) {
                 Ok(response) => response,
-                // COST: with the E2 gate on, a resolver conflict is counted
+                // With the `e2` gate on, a resolver conflict is counted
                 // and disclosed on the body (resolver_conflict_count) and the
                 // root publishes; it is not drop residue held for retry. Gate
                 // off (dark): unchanged drop residue, still counted.
@@ -21577,7 +21576,7 @@ impl SnapshotAccumulator {
         let totals = self.accepted_usage_totals.clone();
         let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
         let mut usage_buckets: Vec<SnapshotUsageBucket> = Vec::new();
-        // E2 (gate on): the fold's grains are this body's one per-hour store
+        // `e2` (gate on): the fold's grains are this body's one per-hour store
         // until `e2::finish_page` emits them; native per-hour rows would only
         // duplicate them on the page. A withheld body never uploads.
         let request_owned_hours =
@@ -21606,7 +21605,7 @@ impl SnapshotAccumulator {
                 last_activity_at: bucket.last_activity_at,
             });
         }
-        // E2 (gate on): a file whose every response is a resolver conflict
+        // `e2` (gate on): a file whose every response is a resolver conflict
         // keeps a zero-usage carrier, so its conflict disclosure publishes
         // through the literal emitter like any request-owned body. No tokens
         // are invented; gate off, nothing changes.
@@ -22986,7 +22985,7 @@ fn codex_parent_proofs_enabled(
         && crate::heap_layout_bound::layout_supported()
 }
 
-/// U1a-2a (D6(a), rev 2 §5.2(7)): P's unique, cap-free locate for a proof
+/// P's unique, cap-free locate for a proof
 /// use: one census pass, the scan root, no-follow metadata, a regular file,
 /// `open_candidate_beneath_root`, and the opened (dev, ino) equal to the
 /// path's. Returns P's census key (its local index key) and the FD. No
@@ -23037,16 +23036,16 @@ fn codex_parent_locate(
     Ok((key.to_owned(), file))
 }
 
-/// R1-M1: the most one side fence of P reads: its admission's two sample
+/// The most one side fence of P reads: its admission's two sample
 /// windows and at most one `samples_match` (each `SAMPLE_READ_BYTES`).
 pub(in crate::snapshots) const SIDE_FENCE_READ_BYTES: u64 =
     2 * sampled_scan::codex_cursor::SAMPLE_READ_BYTES;
-/// R1-M1: a proof's install or re-fence: P's side fence, then the proof
+/// A proof's install or re-fence: P's side fence, then the proof
 /// seal's `admits` on the same FD.
 pub(in crate::snapshots) const PROOF_FENCE_READ_BYTES: u64 =
     SIDE_FENCE_READ_BYTES + sampled_scan::codex_cursor::SAMPLE_READ_BYTES;
 
-/// U1a-2a (D6(a); rev 3 §1.4, §5.3): install `candidate`'s `Proven` proof
+/// Install `candidate`'s `Proven` proof
 /// into its Codex parser at construction, every mode, only on a
 /// frozen-valid census page and only from this pass's own index (its
 /// namespace). Every P-side use check runs here, before any child byte is
@@ -23109,8 +23108,8 @@ fn install_codex_parent_proof(
 /// (`Identity`), then the proof seal's `admits` on that FD (`Seal`). It
 /// reads at most the seal's two sample windows (`SAMPLE_READ_BYTES`, charged
 /// by the caller). `None`: P is the object the proof was sealed against.
-/// `Identity(Absent)` also stands for "census unavailable" (fix round 5,
-/// R1-N3): an unavailable census locates nothing.
+/// `Identity(Absent)` also stands for "census unavailable":
+/// an unavailable census locates nothing.
 fn codex_parent_proof_refusal_now(
     census: CodexParentCensus<'_>,
     proof: &CodexParentPrefixProof,
@@ -23180,13 +23179,13 @@ fn codex_held_memo_awaits_proof_install(
             })
 }
 
-/// U1a-2a (row 33, D6(c)): slots of a proof job's signature window.
+/// Slots of a proof job's signature window.
 const CODEX_PROOF_RING_ENTRIES: usize = 64;
 /// `codex_ownership_signature` is SHA-256 hex, so every ring string has this
 /// length and each slot's allocation is fixed before it is pushed.
 const CODEX_SIGNATURE_HEX_BYTES: usize = 64;
 
-/// U1a-2a (row 33, D6(c)): a bounded window of P's physical signatures (the
+/// A bounded window of P's physical signatures (the
 /// strings `note_codex_physical_signature` pushes, equal to the ledger's),
 /// indexed by P's absolute ledger index: `entries[0]` is index `base`. Each
 /// carries P's reader's consumed offset after the row that produced it.
@@ -23265,7 +23264,7 @@ pub(in crate::snapshots) enum ChildResult {
 }
 crate::heap_layout_bound::no_heap!(true; ChildResult);
 
-/// U1a-2a (row 33, rev 2 §2.2, D6(d)): one reader of a proof job, frozen at
+/// One reader of a proof job, frozen at
 /// its open extent with the existing extent limit (a straddling row is
 /// withheld as the sealed fragment: never parsed or observed).
 pub(in crate::snapshots) struct CodexProofReader {
@@ -23364,7 +23363,7 @@ impl CodexProofReader {
     /// keeps fit it (`codex_proof_header_admitted`, after decode), and a
     /// paused skip only if its salvaged timestamp does (`RetainRoom`);
     /// otherwise nothing of it is kept (`refused`). A refused reader never
-    /// steps again (R1-L1): 0 bytes.
+    /// steps again: 0 bytes.
     fn step(&mut self, slack: usize) -> u64 {
         if self.refused() {
             return 0;
@@ -23410,14 +23409,14 @@ pub(in crate::snapshots) struct CodexProofChild {
 }
 crate::heap_layout_bound::fields!(CodexProofChild; reader, result);
 
-/// U1a-2a (row 33; rev 2 §2.1, D6(c)): a proof job's readers: P's
+/// A proof job's readers: P's
 /// ledger-only reader and 1..=4 decision-only children of the same P,
 /// lockstepped through the ring.
 pub(in crate::snapshots) struct CodexProofReaders {
     /// P's resolved session id (every child's `forked_from_id`).
     pub(in crate::snapshots) parent_id: String,
     pub(in crate::snapshots) parent: CodexProofReader,
-    /// When P's read opened: the seal's `verified` (P1's `started`).
+    /// When P's read opened: the seal's `verified`.
     pub(in crate::snapshots) started: u64,
     pub(in crate::snapshots) children: Vec<CodexProofChild>,
     ring: CodexParentRing,
@@ -23441,7 +23440,7 @@ pub(in crate::snapshots) enum CodexProofRun {
 }
 
 /// R2-B1: the readers' walked charge, with the input position and reader
-/// buffer capacities it was taken at (the E3 base of `run`'s check).
+/// buffer capacities it was taken at (the estimate base of `run`'s check).
 #[derive(Clone, Copy)]
 struct ProofWalk {
     charge: usize,
@@ -23449,7 +23448,7 @@ struct ProofWalk {
     buffers: usize,
 }
 
-/// U1a-2a (rev 11 §6.1, D6(d)): the most one reader step consumes (a capped
+/// The most one reader step consumes (a capped
 /// line and its newline, or one chunk of an overlong skip after its capped
 /// prefix). A step runs only with this much budget left, so a page never
 /// reads past its leftover and no helper peeks ahead.
@@ -23517,7 +23516,7 @@ impl CodexProofReaders {
             .min_by_key(|(_, next)| *next)
     }
 
-    /// Lockstep (rev 2 §2.3, D6(c)) within `budget`, which loses every byte
+    /// Lockstep within `budget`, which loses every byte
     /// read. The trailing undecided child steps first; when its next index
     /// is past the ring, P steps one row. Entries leave only below the
     /// trailing child. Once every child has a result, P alone continues to
@@ -23525,7 +23524,7 @@ impl CodexProofReaders {
     ///
     /// R2-B1 (rev 5/6 §5.1): before every step the readers' charge must fit
     /// `room` (`proof_room` less the rest of the job) with one more line:
-    /// an E3 estimate (the last walk, plus every byte consumed since, plus
+    /// an estimate (the last walk, plus every byte consumed since, plus
     /// the buffers' capacity growth since), walked again every
     /// `CHARGE_REFRESH_BYTES`, plus `MAX_JSONL_LINE_BYTES` and
     /// `CODEX_PROOF_LINE_RETAINED`. When it does not fit, every reader
@@ -23607,7 +23606,7 @@ impl CodexProofReaders {
     /// the next line's retained growth (`run`), or `None`: no step. From a
     /// walk `W` (with buffer capacity `B`) and `s` bytes consumed since
     /// (`s < CHARGE_REFRESH_BYTES`), the readers hold at most
-    /// `W + (W - B) + 2s + ΔB` before the next line, on E3's premise
+    /// `W + (W - B) + 2s + ΔB` before the next line, on the estimate's premise
     /// (retained growth at most twice the bytes consumed) plus one doubling
     /// of every walked non-buffer container and the measured buffer growth.
     /// The next line is charged `MAX_JSONL_LINE_BYTES` for its buffer and
@@ -23620,7 +23619,7 @@ impl CodexProofReaders {
     /// salvage, its extracted timestamp's length (`RetainRoom`, DB2). Over
     /// the slack: nothing is kept and the step is refused (`Memory`). So
     /// after every step the readers' retained state is within `room`, for
-    /// every line class. Excluded, as in main's E3 and reported apart: the
+    /// every line class. Excluded, as in main's estimate and reported apart: the
     /// transient `serde_json::Value` of a line while it is decoded, and the
     /// transient strings of a salvage's extraction (no whole-process bound
     /// is claimed).
@@ -23785,7 +23784,7 @@ fn codex_proof_child_result(
 
 #[cfg(test)]
 thread_local! {
-    /// B2-T1 seam: runs after a Codex candidate's memo lookup (which probes
+    /// Seam: runs after a Codex candidate's memo lookup (which probes
     /// its parent) and before its parse begins, so a test can change that
     /// parent between the two.
     static CODEX_BEFORE_PARSE: std::cell::RefCell<Option<CodexBeforeParseHook>> =
@@ -23809,7 +23808,7 @@ pub(in crate::snapshots) fn with_codex_before_parse<T>(
 #[cfg(test)]
 thread_local! {
     /// Stage2-pre seam: runs once the active file's reader reports EOF and
-    /// before its completion (E1, tier gate, revalidation, commit), so a test
+    /// before its completion (EOF record, tier gate, revalidation, commit), so a test
     /// can change the file inside the window that `OwnedSourceScan::step`
     /// boundaries do not expose.
     static AFTER_READER_EOF: std::cell::RefCell<Option<AfterReaderEofHook>> =
@@ -23936,7 +23935,7 @@ pub(in crate::snapshots) type PrefixDigest = [u8; 32];
 #[allow(dead_code)] // first production callers are the proof job and finish
 const CODEX_PARENT_PROOF_FORMAT: &str = "codex_parent_prefix_proof:v1";
 
-/// U1a-2a (D6(a), rev 2 §1.2): the interpretation binding of every proof,
+/// The interpretation binding of every proof,
 /// stored in its seal (`PrefixSeal.scope`): a format, parser, scan
 /// identity or join proof version bump refuses as `ScopeChanged`.
 pub(in crate::snapshots) fn codex_parent_proof_scope() -> crate::transcript_acquisition::Scope {
@@ -23948,7 +23947,7 @@ pub(in crate::snapshots) fn codex_parent_proof_scope() -> crate::transcript_acqu
     ]))
 }
 
-/// U1a-2a (D6(a), rev 2 §1.3): where the fork arm reads P's signatures.
+/// Where the fork arm reads P's signatures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum CodexParentPrefix {
     /// A validated step-map ledger: main's arm exactly.
@@ -23957,7 +23956,7 @@ pub(in crate::snapshots) enum CodexParentPrefix {
     /// child's, and P's next one differs, for the child whose chain through
     /// that record is `digest`.
     Proof { matched: u64, digest: PrefixDigest },
-    /// U1a-2a (row 33, D6(c)): a proof job's child. The driver sets P's
+    /// A proof job's child. The driver sets P's
     /// signature at the child's next index `at` from the job's ring before
     /// each child row (`None`: P's reader is exhausted there). It answers as
     /// `Ledger` would for the same signature sequence.
@@ -24028,7 +24027,7 @@ impl CodexParentPrefix {
     }
 }
 
-/// U1a-2a (D6(a), rev 3 §3.2): why a child's proof was refused. A refusal
+/// Why a child's proof was refused. A refusal
 /// installs nothing (or restores main's evidence), so the parse is main's;
 /// the record site settles the entry from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24060,7 +24059,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ProofRefusal {
 pub(in crate::snapshots) struct CodexParentPrefixProof {
     /// Resolved parent session id (the child's `forked_from_id`).
     pub(in crate::snapshots) parent: String,
-    /// P1's certificate of P's sealed prefix `[0, s)`; s covers every p_m.
+    /// The certificate of P's sealed prefix `[0, s)`; s covers every p_m.
     pub(in crate::snapshots) parent_seal: crate::transcript_acquisition::PrefixSeal,
     /// m: parent signatures matched before the deciding record.
     pub(in crate::snapshots) matched: u64,
@@ -24322,7 +24321,7 @@ fn codex_parent_proof_parents_live(
 }
 
 impl ScanIndex {
-    /// U1a-2a (row 34; rev 2 R1-M5, rev 4): the semantic decode at load,
+    /// The semantic decode at load,
     /// after the per-entry decode. Keeps a `Proven` entry only if its digest
     /// decodes; an `Owed` entry only if its cause is a
     /// `CodexParentUnresolvable` ordinal, or `CAUSE_NO_EVIDENCE` with
@@ -24402,8 +24401,7 @@ pub(in crate::snapshots) enum ProofFinish {
 
 #[allow(dead_code)] // first production callers are the record site and the proof finish
 impl ScanIndex {
-    /// U1a-2a (row 2; rev 3 §3.1, rev 5 R2-M6, rev 11 R1-M1, rev 13 R1-L4):
-    /// owe `key`'s proof against `parent`. Idempotent: an `Owed` entry for
+    /// Owe `key`'s proof against `parent`. Idempotent: an `Owed` entry for
     /// the same parent keeps its wake, outcome, attempts, backoff, `kept`
     /// and `seq` (cause and origin follow the latest owe); an unused
     /// `Proven` for the same parent is a no-op; a `Proven` that was used and
@@ -24487,7 +24485,7 @@ impl ScanIndex {
         }
     }
 
-    /// U1a-2a (row 32, rev 9/10 §2.3, rev 12 §2.7, D6(b)): the proof hook's
+    /// The proof hook's
     /// side sweep, metadata-only. It visits the next
     /// `CODEX_SIDE_SWEEP_KEYS` keys of records ∪ requests after
     /// `codex_parent_side_cursor` (key order, wrapping) and, per key:
@@ -24499,7 +24497,7 @@ impl ScanIndex {
     ///   clock and never prunes. A `Live` request that is unreferenced,
     ///   more than 2 wraps stale and holds no unproven ledger charge
     ///   (`prunable`: active and in-flight charges stay) is removed, its
-    ///   only where no pacing is lost (R2-M3, r79): it never charged an
+    ///   only where no pacing is lost: it never charged an
     ///   attempt (its key ends `Gone`), or P's same-object record covers its
     ///   need and takes its pacing first, in the cure's custody: `pace =
     ///   max(existing, {not_before, 6})` and the key turns `Removed` with
@@ -24590,7 +24588,7 @@ impl ScanIndex {
                 }
                 _ => None,
             };
-            // R2-M3 (r79): no pacing is lost. A charged request goes only
+            // No pacing is lost. A charged request goes only
             // as the cure removes one: onto P's same-object record covering
             // its need, whose pace keeps it; otherwise it is kept.
             let prune_request = prune_request.filter(|request| {
@@ -24677,7 +24675,7 @@ impl ScanIndex {
         sweep
     }
 
-    /// U1a-2a (D6(a), rev 3 §3.2): the record-site transition of a
+    /// The record-site transition of a
     /// singleton's proof entry from its parse, every mode:
     /// - admitted (used, decided as proven, no refusal) → kept, never a
     ///   publication;
@@ -24750,7 +24748,7 @@ impl ScanIndex {
         }
     }
 
-    /// U1a-2a (D6(a), rev 3 §1.6): the wake of a proof whose P-side fence
+    /// The wake of a proof whose P-side fence
     /// refused (`fenced`) on P's held `file`: P's side generation (0 when
     /// absent), P's own entry, P's stamp, lineage, and the sealed offset a
     /// stale record must cover. No stamp: `Backoff`.
@@ -24856,7 +24854,7 @@ impl ScanIndex {
         }
     }
 
-    /// U1a-2a (row 2; rev 10 §5.3, rev 11 R1-M1): a finished job's delta
+    /// A finished job's delta
     /// for `key` applies only to an `Owed` entry with the job's `seq`, in
     /// the job's (minted, non-empty) incarnation. A proof replaces the
     /// entry; an attempt records its outcome and backoff. Returns whether
@@ -24963,7 +24961,7 @@ fn minted_proof_incarnations(
     })
 }
 
-/// U1a-2a (row 2, rev 13 R1-L4): raises the high-water of the `MINTED`
+/// Raises the high-water of the `MINTED`
 /// entry whose nonce is `incarnation`. `""` (unminted) has none.
 fn raise_codex_proof_seq_high_water(incarnation: &str, seq: u64) {
     if incarnation.is_empty() {
@@ -25011,7 +25009,7 @@ impl ScanIndex {
             return false;
         }
 
-        // D62: a state v2 load never reuses the memo's nonce; first load and
+        // A state v2 load never reuses the memo's nonce; first load and
         // high-water still read the unfiltered memo.
         let v2 = state_v2::state_v2_growth_retention_active(self);
         let mut minted = minted_proof_incarnations();
@@ -25553,7 +25551,7 @@ impl ScanIndex {
     /// index write of the request is mirrored into an existing ledger entry
     /// for the key in the same step (only G7 creates entries).
     ///
-    /// D6(b): a fence is a child's reference to P, so P's request (armed,
+    /// A fence is a child's reference to P, so P's request (armed,
     /// cured or untouched here) then takes the current wrap epoch. That
     /// write is index-only and leaves the ledger stamp alone.
     pub(in crate::snapshots) fn codex_parent_side_fence(
@@ -25599,7 +25597,7 @@ impl ScanIndex {
         let ledger_stub = entry
             .filter(|entry| entry.tag == LedgerTag::Removed)
             .map(|entry| entry.stub_not_before);
-        // R1-M1: the record's sealed windows are read at most once per
+        // The record's sealed windows are read at most once per
         // fence; every later use reuses the answer.
         let mut samples: Option<bool> = None;
 
@@ -25713,7 +25711,7 @@ impl ScanIndex {
         SideFence::Refused(reason)
     }
 
-    /// D6(b): the loaded request's epoch, carried onto a ledger projection
+    /// The loaded request's epoch, carried onto a ledger projection
     /// (which has none). No request: 0, unknown.
     fn side_request_epoch(&self, p_key: &str) -> u64 {
         self.codex_parent_side_requests
@@ -25885,7 +25883,7 @@ pub(in crate::snapshots) struct SideMainParse {
     pub(in crate::snapshots) parsed: sampled_scan::codex_cursor::OpenStamp,
     pub(in crate::snapshots) verdict: SideVerdict,
     /// Applied bytes past the sealed offset: a singleton's
-    /// `CompletedNativeAcquisition.unsealed`; a P1 job's captured
+    /// `CompletedNativeAcquisition.unsealed`; a proof job's captured
     /// `eof_applied ∨ fragment`.
     pub(in crate::snapshots) unsealed: bool,
 }
@@ -26619,10 +26617,10 @@ pub(crate) struct OwnedSourceScan {
     pending_finalization: Vec<PendingIndexFinalization>,
     claude_authority_preflight: bool,
     forced_claude_family_reparses: BTreeSet<String>,
-    /// E2: forced roots selected only for path-twin co-scheduling. Their
+    /// `e2`: forced roots selected only for path-twin co-scheduling. Their
     /// owed adoption-only members keep the history gate (both or neither).
     claude_twin_only_family_reparses: BTreeSet<String>,
-    /// E7-8a: the families this Claude page's selection touched, for the
+    /// The families this Claude page's selection touched, for the
     /// count-only per-family census shadow.
     claude_family_shadow: Option<Box<claude_family_census_shadow::Touched>>,
     identified_candidates: VecDeque<CandidateFile>,
@@ -26687,7 +26685,7 @@ pub(crate) enum OwnedSourceScanStep {
         terminal_native_traversal: Option<Box<claude_native_comparison::TerminalTraversal>>,
     },
 }
-// E2 can defer paths from the priority prefix. Stable removal keeps every
+// `e2` can defer paths from the priority prefix. Stable removal keeps every
 // surviving priority path within the old prefix bound; clamp it to the page's
 // new length. Any ordinary suffix included was actually offered too, and the
 // recorder credits only contiguous owed paths. Its membership scan stays no
@@ -27810,7 +27808,7 @@ impl OwnedSourceScan {
             }
         }
         let mut claude_twin_only_family_reparses = BTreeSet::new();
-        // E2: the page's path-twin groups, built at most once per page and
+        // `e2`: the page's path-twin groups, built at most once per page and
         // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode {
@@ -27826,7 +27824,7 @@ impl OwnedSourceScan {
             });
             // Only a twin this page reads pulls its family in: every walk meets
             // each settled twin too, and pulling its family then re-read the
-            // family on every walk (R1 probe: 8 files and one upload batch per
+            // family on every walk (observed: 8 files and one upload batch per
             // walk). Outside the authority preflight a candidate still carries
             // its sidecar digest in the scan fingerprint slot, so each twin is
             // identified on a copy first: one more open per twin candidate. A
@@ -28214,7 +28212,7 @@ impl OwnedSourceScan {
                     side.end();
                 }
             }
-            // L-A1, M1: the resident bound and active charge from this same
+            // The resident bound and active charge from this same
             // walk, before any parse progress, admission or await; never
             // carried to another step.
             sampled_scan::release_cache_to_fit(
@@ -28416,7 +28414,7 @@ impl OwnedSourceScan {
                     // R2-N6: a group with more members than the page's file
                     // limit is never excluded; it goes first and takes a page
                     // of its own (it pages through the cursor like any group).
-                    // Round 3: so does a group whose probes outran a page's
+                    // So does a group whose probes outran a page's
                     // remaining singleton budget (`ProbeBudgetOrder`).
                     let fence = sampled_scan::codex_cursor::census_token(index);
                     let own_page = |group: &codex_file_join::Group| {
@@ -28847,7 +28845,7 @@ impl OwnedSourceScan {
                 // R2-N2: a group larger than the singleton budget asks for
                 // the cursor before its first header read; one that would
                 // wait (or is fenced) reads no header or probe this page.
-                // Round 3 (R2-M1): only after the unchanged decision, and
+                // Only after the unchanged decision, and
                 // never for a group with a memo entry or parked record: those
                 // reach their lookups first and leave without the slot.
                 if let Some(context) = sampling.as_ref().filter(|context| {
@@ -28936,7 +28934,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     codex_file_join::Boot::Unchanged => {
-                        // R1-L3: the accepted joined body is current, with no
+                        // The accepted joined body is current, with no
                         // job or debt: the persisted block F8 (or a previous
                         // process) set is released, as an accepted exclusive
                         // body releases it, unless this scan holds the owner
@@ -28953,7 +28951,7 @@ impl OwnedSourceScan {
                                 &boot.group.owner,
                             );
                         }
-                        // R2-M1: nothing read for a job; it does not wait.
+                        // Nothing read for a job; it does not wait.
                         if let Some(context) = sampling.as_ref() {
                             context.cache.cursor_unwait(&context.namespace, &boot.key);
                         }
@@ -29038,7 +29036,7 @@ impl OwnedSourceScan {
                     let memo_key =
                         sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
                     if let Some(entry) = context.cache.memo_lookup(&memo_key) {
-                        // The match re-reads two samples of the live member (M3).
+                        // The match re-reads two samples of the live member.
                         codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                         let hit = boot
                             .memo_digest(index, &codex_title_metadata)
@@ -29143,7 +29141,7 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // No group byte or member cap (R1-M4): a group larger than
+                // No group byte or member cap: a group larger than
                 // the singleton budget pages through the cursor; without one
                 // (unsupported layout, uncached scan) it is read in one page
                 // like main's unpaged read: each member at most
@@ -29168,7 +29166,7 @@ impl OwnedSourceScan {
                     index,
                 });
                 let Ok(mut job) = job else {
-                    // Round 4 (L1): no lease exists yet; a waiter it left is
+                    // No lease exists yet; a waiter it left is
                     // dropped like the boot-`Strict` exit's.
                     if let Some(context) = sampling.as_ref() {
                         context.cache.cursor_unwait(&context.namespace, &boot_key);
@@ -29312,7 +29310,7 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_ref() {
                     codex_page.note_page(&context.cache, &context.namespace);
                 }
-                // E2: at most one resume attempt per page, and none on a page
+                // At most one resume attempt per page, and none on a page
                 // that selected no candidates (no header inventory: no
                 // evidence for the job this page). A deferred job therefore
                 // never spins within a page.
@@ -29925,7 +29923,7 @@ impl OwnedSourceScan {
                         hook(&active);
                     }
                 });
-                // H2c/E1: retain native trailing-line behavior at a genuine
+                // Retain native trailing-line behavior at a genuine
                 // unchanged EOF. A grown read keeps this fragment withheld.
                 if source == SnapshotSource::ClaudeCode
                     && active.cursor.is_none()
@@ -29951,7 +29949,7 @@ impl OwnedSourceScan {
                     active.parser.apply_sealed_fragment();
                 }
                 if active.cursor.is_some() && active.group.is_none() {
-                    // E1 before the protected-tier gate below (R1-H1). A group
+                    // Apply the EOF record before the protected-tier gate below. A group
                     // job applies it to its live member in `member_eof`, before
                     // that member's proof ends (R2-N1).
                     sampled_scan::codex_cursor::apply_eof_record(&mut active);
@@ -30080,7 +30078,7 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     };
-                    // U1a-2a (D6(a)): the replacement parser gets the same
+                    // The replacement parser gets the same
                     // P-fenced install (never on a side read).
                     if source == SnapshotSource::Codex && active.side_origin.is_none() {
                         let side = sampling
@@ -30095,7 +30093,7 @@ impl OwnedSourceScan {
                             side,
                             sampled_scan::now_seconds(),
                         ) {
-                            // R1-M1: P's side fence and the proof seal.
+                            // P's side fence and the proof seal.
                             codex_page.charge(false, PROOF_FENCE_READ_BYTES);
                         }
                     }
@@ -30148,11 +30146,11 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                // E3: the completion step walks the finished job exactly,
+                // The completion step walks the finished job exactly,
                 // once, for the budget its retention consumes below. A group
                 // and an unsampled read keep the step-start budget. Any other
                 // sampled singleton is measured exactly at completion
-                // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
+                // (`try_lock`, so contention gives 0).
                 // A Tail/Unchanged singleton, or a grown Full with an owned
                 // finish bound (a legacy one takes the plain walk), also decides,
                 // under blocking locks, whether a release of lower-ranked
@@ -30217,7 +30215,7 @@ impl OwnedSourceScan {
                 // its retention is attempted; the finalization limit only
                 // where that release actually ran.
                 let mut released_finalization_budget = None;
-                // #631 review M1: the bytes this attempt read, taken before
+                // #631 review: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
                 if source == SnapshotSource::Codex
@@ -30323,7 +30321,7 @@ impl OwnedSourceScan {
                         .cursor
                         .as_ref()
                         .is_some_and(|meta| meta.in_generation(index));
-                    // The certificate re-reads two samples from the held FD (M3).
+                    // The certificate re-reads two samples from the held FD.
                     codex_page.charge(true, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     match sampled_scan::codex_cursor::finish_job(
                         &context.cache,
@@ -30455,7 +30453,7 @@ impl OwnedSourceScan {
                             && active.side_origin.is_none()
                     });
                 if memo_offset.is_some() {
-                    // The live witness reads two samples of the held file (M3).
+                    // The live witness reads two samples of the held file.
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                 }
                 let memo_candidate = memo_offset.and_then(|offset| {
@@ -30468,7 +30466,7 @@ impl OwnedSourceScan {
                     let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
                     // PR-1: every singleton entry is exact until a counted tail
                     // makes growth replayable, so the stamp must cover exactly
-                    // the bytes read (#631 review M1: captured after
+                    // the bytes read (#631 review: captured after
                     // `finish_job`'s check).
                     if stamp.extent() != attempt_read_end {
                         return None;
@@ -31019,7 +31017,7 @@ impl OwnedSourceScan {
                             }
                             receipts
                         });
-                // Slice D1: before `finish` consumes the parser. P1 ledger
+                // Before `finish` consumes the parser. Ledger
                 // birth: `created()` and identity of the descriptor this parse
                 // opened, taken at open (never a path); unknown is None.
                 let claude_opened_birth = (source == SnapshotSource::ClaudeCode
@@ -31060,7 +31058,7 @@ impl OwnedSourceScan {
                         twins: history_upgrade.twin_groups(),
                     }),
                 };
-                // M3 G1 and D3: ordinary plain singleton completions stage
+                // Ordinary plain singleton completions stage
                 // before publication for both durable sources. Codex must
                 // observe a store failure before ACK to enforce strict rebind.
                 // Group/member, proof, side and comparison keep their owners. The held descriptor is
@@ -31174,7 +31172,7 @@ impl OwnedSourceScan {
                 sampled_scan::test_hooks::fire(
                     sampled_scan::test_hooks::Point::BeforeNativeEffects,
                 );
-                // A committed cursor attempt counts as published only now (M4).
+                // A committed cursor attempt counts as published only now.
                 if let Some((context, publication)) =
                     sampling.as_ref().zip(cursor_publication.take())
                 {
@@ -31410,7 +31408,7 @@ impl OwnedSourceScan {
                             .defer_parent_resolution(CodexParentUnresolvable::DeferredRestart);
                     }
                 }
-                // U1a-2a (D6(a), rev 3 §3.1–§3.2): a singleton settles its
+                // A singleton settles its
                 // proof entry from this parse in every mode; a budgeted held
                 // singleton whose cause a proof cures owes one. Groups hold
                 // no proof entries.
@@ -31445,7 +31443,7 @@ impl OwnedSourceScan {
                 }
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
-                // U1a-2a (row 8): main's certified parse of P (singleton, a P1
+                // Main's certified parse of P (singleton, a proof
                 // job's certified finish, or a certified group job's live
                 // member) writes P's side record. A group member takes the
                 // joined parse's verdict: the join publishes only a complete
@@ -31502,7 +31500,7 @@ impl OwnedSourceScan {
                 // Claude response conflicts may be discovered only by native
                 // finalization. A prefix cannot publish that late loss: it
                 // would have neither a committed audit marker nor necessarily
-                // a D1 record when the record budget is exhausted.
+                // a request-census record when the record budget is exhausted.
                 if claude_grown_prefix && !parse_complete {
                     claude_request_census::invalidate_claude_request_census(index, &candidate.path);
                     census.record_unreadable(UnreadableCause::ScopeObject, 1);
@@ -32011,7 +32009,7 @@ impl OwnedSourceScan {
                     }
                 }
                 if source == SnapshotSource::ClaudeCode {
-                    // Slice D1: record only; no decision reads it. A #588
+                    // Record only; no decision reads it. A #588
                     // comparison target prepays no record, so it has none.
                     if comparison_target {
                         claude_request_census::invalidate_claude_request_census(
@@ -32445,7 +32443,7 @@ impl OwnedSourceScan {
                             }
                         }
                     }
-                    // D3 Codex: after every audit staging above (staging
+                    // Codex: after every audit staging above (staging
                     // matches the fingerprint), before this entry's save
                     // settles the degraded publication.
                     #[cfg(unix)]
@@ -32477,7 +32475,7 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            // The M3 route already decided this completion's
+                            // The staging route already decided this completion's
                             // record (receipt or no-record disposition): it is
                             // no longer a Claude post-save write offer.
                             #[cfg(unix)]
@@ -32534,7 +32532,7 @@ impl OwnedSourceScan {
                                 if let Some(active) = file_sampling.as_ref() {
                                     active.reinsertion.admitted();
                                 }
-                                // M1 selection provenance (F2): the
+                                // Selection provenance: the
                                 // fingerprint this reduction was acquired for.
                                 #[cfg(unix)]
                                 context
@@ -32881,7 +32879,7 @@ impl OwnedSourceScan {
                         continue;
                     }
                     // F4 or indexed reconciliation may already have retired the
-                    // audit entry this page. Its retained SOURCE N3 incidence is
+                    // audit entry this page. Its retained incidence is
                     // not a second ordinary file removal (and grants no ACK).
                     if source == SnapshotSource::ClaudeCode && !index.files.contains_key(index_key)
                     {
@@ -32894,9 +32892,9 @@ impl OwnedSourceScan {
                             .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
                         // A Claude member that vanished beneath its present
-                        // parent also drops its unverified audit debt (SOURCE
-                        // N2); every other removal keeps that debt. Both
-                        // retire its request-census record (SOURCE N1).
+                        // parent also drops its unverified audit debt;
+                        // every other removal keeps that debt. Both
+                        // retire its request-census record.
                         let vanished = census.claude_vanished_index_keys.contains(index_key)
                             && sampled_audit::proven_absent(Path::new(index_key), &roots);
                         let census_record =
@@ -33033,7 +33031,7 @@ impl OwnedSourceScan {
                             .and_then(|origin| origin.admission.as_ref())
                             .is_none());
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
-                // E7-8a: count-only per-family completion, from the page's
+                // Count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
                 if source == SnapshotSource::ClaudeCode {
                     claude_family_census_shadow::observe_page(
@@ -33157,7 +33155,7 @@ impl OwnedSourceScan {
                             }
                         }
                     }
-                    // SOURCE Round 15: only a complete healthy terminal lowers
+                    // Only a complete healthy terminal lowers
                     // the tombstone uncertainty fence, before the census fold
                     // prunes any witness.
                     index.drain_claude_retired_family_tombstone_fence(&traversal_snapshot);
@@ -33172,7 +33170,7 @@ impl OwnedSourceScan {
                 let census_complete = raw_census_complete
                     && !needs_clean_followup
                     && !authority_debt_withholds_census;
-                // Slice D1: prune and measure only, before any fold.
+                // Prune and measure only, before any fold.
                 let claude_request_census_shadow =
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
                         claude_request_census::settle_claude_request_census_terminal(
@@ -33384,7 +33382,7 @@ impl OwnedSourceScan {
                 snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
                 let census_complete = census_complete && index.decode_holds.is_empty();
                 if census_complete {
-                    // SOURCE/SI: only a healthy EFFECTIVE terminal can prove a
+                    // Only a healthy EFFECTIVE terminal can prove a
                     // carried file gone. A raw terminal, another file's census,
                     // or an unknown original association cannot retire its ACKs.
                     index.accepted_rebuild_incidence.retain(|key, _| {
@@ -33835,7 +33833,7 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
-            // A2: a current, source-verified census independently proves that
+            // A current, source-verified census independently proves that
             // THIS committed object shrank. Read its new body even without a
             // reusable optional record; unknown/downgrade floors remain holds.
             #[cfg(unix)]
@@ -33966,7 +33964,7 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
-            // History-upgrade gate (SOURCE P1), whatever selected the file:
+            // History-upgrade gate, whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
             // skip, the stop latch and this page's budget (reserved once per
@@ -34020,7 +34018,7 @@ impl OwnedSourceScan {
                 };
                 // A held, unchanged member owed only a proof correction is not
                 // re-read every traversal either: its bodies would be vetoed,
-                // and the correction waits for the gate (StateMissing M2).
+                // and the correction waits for the gate (StateMissing).
                 let correction_only = parse_reason
                     == Some(CandidateParseReason::AuthorityQuarantine)
                     && index.claude_authority_correction_only(&candidate);
@@ -34042,7 +34040,7 @@ impl OwnedSourceScan {
                             // A budget hold paces the upgrade page by page:
                             // the file goes back to the walk's queue as a
                             // re-read, so the next page of this walk continues
-                            // the upgrade (Design E2 item 8, the switch-on
+                            // the upgrade (the switch-on
                             // re-read). A re-read is not a census member
                             // (G1): it never holds the census, and a walk
                             // that ends first drops it for the next walk to
@@ -34272,7 +34270,7 @@ impl OwnedSourceScan {
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
                     }
-                    // E7-8a: the ordinary equality Skip attests this revision
+                    // The ordinary equality Skip attests this revision
                     // for the shadow family census. Counts only.
                     if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
                         claude_family_census_shadow::attest_equality_skip(
@@ -34326,12 +34324,12 @@ impl OwnedSourceScan {
                     .ok()
                     .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
                 let key = local_index_key(&candidate.path);
-                // Keyed per namespace (R1-M1): the digest carries the upload
+                // Keyed per namespace: the digest carries the upload
                 // context, so concurrent namespaces must not evict each other.
                 let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
                 use crate::local_resource_diagnostics::codex_memo_lifecycle;
-                // R1-M1 (PR-1) and PR-P: an owed parent must be parsed, so a
-                // held memo hit cannot hide its own ledger (PR-1) or its
+                // An owed parent must be parsed, so a
+                // held memo hit cannot hide its own ledger or its
                 // parent-side cause (event (b)). A parent that a settling
                 // witness already explains is not owed; `DeferredRestart`
                 // never settles, so quietness cannot hide a parent.
@@ -34355,7 +34353,7 @@ impl OwnedSourceScan {
                     codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther);
                 }
                 if let Some(entry) = entry.filter(|_| !bypass) {
-                    // The match re-reads two samples of the held file (M3).
+                    // The match re-reads two samples of the held file.
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
                         &codex_title_metadata,
@@ -34459,7 +34457,7 @@ impl OwnedSourceScan {
                                 pending_finalization: &mut pending_finalization,
                             },
                         );
-                        // R1-L6: the fresh path's session count, replayed.
+                        // The fresh path's session count, replayed.
                         scanned_session_count += entry.disclosure().parsed_snapshot_count;
                         pending!();
                     }
@@ -34717,7 +34715,7 @@ impl OwnedSourceScan {
                     pending!();
                 }
             };
-            // U1a-2a (D6(a)): this child's proof, P-fenced before its parse.
+            // This child's proof, P-fenced before its parse.
             // A side read is P's, never a proof consumer.
             if source == SnapshotSource::Codex && side_origin.is_none() {
                 let side = sampling
@@ -34732,14 +34730,14 @@ impl OwnedSourceScan {
                     side,
                     sampled_scan::now_seconds(),
                 ) {
-                    // R1-M1: P's side fence (its admission and at most one
+                    // P's side fence (its admission and at most one
                     // `samples_match`) and the proof seal's `admits`.
                     codex_page.charge(false, PROOF_FENCE_READ_BYTES);
                 }
             }
             let mut file_sampling = None;
             let mut retained_offset = None;
-            // Counted once the page actually reads the file (R2-M3): a fence
+            // Counted once the page actually reads the file: a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
             let mut returned_refusal = None;
@@ -34934,7 +34932,7 @@ impl OwnedSourceScan {
                             }
                         } else {
                             // Main drops optional copies rejected by eligibility;
-                            // no M3 custody return/admission or retry while OFF.
+                            // no custody return/admission or retry while OFF.
                             drop(taken);
                         }
                     }};
@@ -35060,7 +35058,7 @@ impl OwnedSourceScan {
                                 .any(|id| index.codex_parent_ownership_refs.contains(id));
                         // Audit population/deadlines never gate ordinary
                         // restore. The legacy prefix/proof paths retain their
-                        // own rules until S1. A same-process E2-held read may
+                        // own rules. A same-process `e2`-held read may
                         // reuse only its own certificate, without authority.
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
@@ -35114,10 +35112,10 @@ impl OwnedSourceScan {
                             source != SnapshotSource::ClaudeCode || artifacts_enabled,
                             index,
                         );
-                        // M1: on a RAM miss, a durable record may restore
+                        // On a RAM miss, a durable record may restore
                         // the copy (charged to the RAM cache, then taken as
                         // a retained copy); resource refusal keeps it Pending.
-                        // #814's E2 held-new flag is RAM-only in M1: a miss
+                        // #814's `e2` held-new flag is RAM-only: a miss
                         // carries it false, and a restore needs the
                         // committed index entry, so it never widens reuse.
                         #[cfg(unix)]
@@ -36860,7 +36858,7 @@ struct ParsedJsonlFile {
     codex_parent_ledger_unusable: Option<CodexParentUnresolvable>,
     /// PR-P: this file read a parent ledger (it may record a parent ref).
     codex_parent_ledger_consulted: bool,
-    /// U1a-2a (D6(a)): `(m, chain, owned)` when the proof arm decided as its
+    /// `(m, chain, owned)` when the proof arm decided as its
     /// proof says (the only way it is set at finish).
     codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
     /// U1a-2a: the proof this parse consumed (admitted iff `decided`).
@@ -36956,7 +36954,7 @@ struct OwnedJsonlParser {
     recognized_usage_drop_count: usize,
     positive_recognized_usage_count: usize,
     positive_usage_evidence: bool,
-    /// P1 ledger birth from the same open-time read as `claude_file_birth`.
+    /// Ledger birth from the same open-time read as `claude_file_birth`.
     claude_opened_birth: Option<claude_request_census::ClaudeRequestBirth>,
     // Last: parser-owned graphs are gone before the return funding releases.
     pending: Option<Box<ParserPending>>,
@@ -37040,7 +37038,7 @@ impl OwnedJsonlParser {
         if source == SnapshotSource::ClaudeCode {
             // Birth of the opened object itself; a later path lookup could
             // describe a replacement file. One read, shared by the birth rule
-            // (this open only) and the P1 ledger (first-seen birth).
+            // (this open only) and the ledger (first-seen birth).
             let opened = reader.get_ref().metadata().ok();
             accumulator.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
             claude_opened_birth = opened.as_ref().and_then(claude_opened_file_birth);
@@ -37145,7 +37143,7 @@ impl OwnedJsonlParser {
             || consumed != frozen
             || !self.reader.finished
             || self.reader.failure.is_some()
-            // E1 already applied an unterminated row: it lies beyond the
+            // An unterminated row was already applied at EOF: it lies beyond the
             // sealed newline, so later growth must keep strict identity.
             || (!self.reader.sealed_fragment()
                 && self.reader.consumed_bytes() != self.reader.last_complete_line_end())
@@ -37185,7 +37183,7 @@ impl OwnedJsonlParser {
         )
     }
 
-    /// E1: at a genuine unchanged EOF (proved by the caller), apply a
+    /// At a genuine unchanged EOF (proved by the caller), apply a
     /// withheld final record through the same line sink as every other line.
     fn apply_sealed_fragment(&mut self) -> bool {
         self.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
@@ -37292,7 +37290,7 @@ impl OwnedJsonlParser {
         )
     }
 
-    /// M3 G1: the same native finish, staging a durable record at the checked
+    /// The same native finish, staging a durable record at the checked
     /// PRE-finalization seam: after the held FD revalidated the opened object,
     /// before any finalization write. A retained copy is staged from its own
     /// reduction, otherwise from the live parser state; both use the one body
@@ -37414,7 +37412,7 @@ impl OwnedJsonlParser {
         let reduction_drop_count = recognized_usage_drop_count;
         // Present for a cursor job or Claude in-page read whose prefix
         // certificate passed (S12/FE1)
-        // or whose lossy job holds ruling 2's same-object identity proof.
+        // or whose lossy job holds the same-object identity proof.
         let sealed_prefix = bounded.sealed_prefix;
         // A cursor read withheld an unterminated final record (N2).
         let sealed_fragment = bounded.sealed_fragment.is_some();
@@ -37439,7 +37437,7 @@ impl OwnedJsonlParser {
         // whose prefix certificate passed against the held FD carries
         // `Certified` (same dev/ino, no shrink, no same-size edit, held-FD
         // samples, scope), and the held FD must still be that dev/ino and at
-        // least the frozen extent long. A lossy job (ruling 2) carries only
+        // least the frozen extent long. A lossy job carries only
         // its same-object proof, revalidated here against the held FD (no
         // shrink, same covered samples) and the selected path; it publishes
         // uncertified. Every other read keeps exact equality.
@@ -37458,7 +37456,7 @@ impl OwnedJsonlParser {
         } else {
             Some(reader)
         };
-        // M3 G1 PRE-finalization seam. The live scan-shared inputs are
+        // PRE-finalization seam. The live scan-shared inputs are
         // detached exactly as a retained copy excludes them, then restored
         // before any finalization reads them; no early exit lies between.
         if let Some(pre) = pre {
@@ -37520,7 +37518,7 @@ impl OwnedJsonlParser {
         {
             accumulator.codex_creator_evidence_conflicted = true;
         }
-        // U1a-2a (D6(a)): the proof's decision check, before any ownership
+        // The proof's decision check, before any ownership
         // outcome is read.
         accumulator.settle_codex_parent_proof_arm();
         let codex_ownership_incomplete =
@@ -37702,7 +37700,7 @@ impl OwnedJsonlParser {
     }
 }
 
-/// Native finish inputs, shared by the legacy and the M3 prepared wrapper.
+/// Native finish inputs, shared by the legacy and the prepared wrapper.
 struct FinishRequest<'a> {
     expected_opened_object_identity: &'a str,
     path: &'a Path,
@@ -37742,7 +37740,7 @@ impl<'a> PreFinalization<'a> {
 }
 
 /// Stage one durable record from the acquisition's own chain and lease.
-/// `None`: no acquired chain, so this completion is not on the M3 route and
+/// `None`: no acquired chain, so this completion is not on the prepared route and
 /// keeps the legacy behavior. The retained reduction, when present, is the
 /// view; otherwise the live state is, through the same body engine.
 #[cfg(unix)]
@@ -37820,7 +37818,7 @@ fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail
         .or_else(|| custody.owed().map(|owed| owed.chain()))
 }
 
-/// Descriptor acquisition for the already admitted M3 finish route. Use the
+/// Descriptor acquisition for the already admitted finish route. Use the
 /// existing input-kind predicate before chain/lease/debt acquisition: archive
 /// checkpoints belong to the ordinary archive owner, never physical prefixes.
 /// This does not change the single transcript-path admission boundary.
@@ -37842,7 +37840,7 @@ struct NativeFence<'a> {
     committed_index: &'a ScanIndex,
 }
 
-/// What only the native caller proves for an M3 chain: the read's actual
+/// What only the native caller proves for an acquisition chain: the read's actual
 /// mode and cause, its held descriptor, the opened object O and the
 /// committed index the binding is computed from. Never a newer accepted body.
 #[cfg(unix)]
@@ -37857,7 +37855,7 @@ struct NativeChainRequest<'a> {
 }
 
 /// Bind this completion to its one acquisition chain before the native
-/// finish: a genuine content change first releases any D3 hold on the key;
+/// finish: a genuine content change first releases any hold on the key;
 /// a carried (retained, restored or owed) chain moves with r_a, protocol and
 /// eligibility inherited; otherwise a fresh Legacy chain is captured from the
 /// actual mode, held O and committed index. Write-ahead eligibility is only a
@@ -37969,7 +37967,7 @@ struct NativeSettlement {
     strict_rebind: bool,
     /// Classified once while consuming the real e4 result, including early holds.
     publication: Option<NativePublication>,
-    /// The M3 route decided this completion's record; no post-save offer.
+    /// The prepared route decided this completion's record; no post-save offer.
     staged: bool,
 }
 
@@ -38035,7 +38033,7 @@ fn settle_native_attempt(
         None
     };
     let (publication, strict_rebind) = match preparation {
-        // Not staged (no chain or no lease). A Claude key held by D3 still
+        // Not staged (no chain or no lease). A held Claude key still
         // never publishes over its surviving A; the query counts its growth
         // and releases it if the held object itself changed.
         None if finish_loss_free
@@ -38321,7 +38319,7 @@ fn codex_strict_rebind(index: &mut ScanIndex, source: SnapshotSource, key: &str)
     }
 }
 
-/// D3's crash boundary is before the upload request can be acknowledged.
+/// The crash boundary is before the upload request can be acknowledged.
 /// Persist the binding change on the previously committed PRE entry, never on
 /// a newly parsed body/revision/extent. Retain or increase existing audit debt.
 #[cfg(unix)]
@@ -38783,7 +38781,7 @@ struct BoundedJsonlReader<R> {
     chunked_skip: Option<usize>,
     /// An overlong line is being skipped across steps. Its salvage was
     /// taken from the capped prefix when the skip first paused and `buf`
-    /// was cleared then (E4), so a pause never holds the 16 MiB prefix.
+    /// was cleared then, so a pause never holds the 16 MiB prefix.
     skipping: Option<EarlySalvage>,
     /// Resumable reads and sampled in-page Claude Full/Tail reads: never
     /// consume past this reader-relative frozen extent.
@@ -38795,13 +38793,12 @@ struct BoundedJsonlReader<R> {
     /// `Some((overflowed, early salvage))`. Those bytes were neither
     /// delivered nor counted as a line, even when nothing past the extent was
     /// visible yet. `buf` keeps them (bounded by `max_line_bytes`, the
-    /// salvage prefix when overflowed, unless E4 already took it) so a
-    /// genuine unchanged EOF can apply them with main's trailing-line rule
-    /// (E1).
+    /// salvage prefix when overflowed, unless the paused skip already took it) so a
+    /// genuine unchanged EOF can apply them with main's trailing-line rule.
     sealed_fragment: Option<(bool, Option<EarlySalvage>)>,
     /// Set by `finish_job` or the in-page grown route: the identity `finish` may
     /// accept for a grown object. `Certified` after its prefix certificate
-    /// passed (S12); `LossySameObject` (ruling 2) is not a sealed-prefix
+    /// passed (S12); `LossySameObject` is not a sealed-prefix
     /// certificate and permits only an uncertified publication.
     sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
     /// U1a-2a (fix round 2c, DM1): a proof reader's retained-growth room,
@@ -38875,7 +38872,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         self.sealed_fragment.is_some()
     }
 
-    /// E1, genuine unchanged EOF only (the caller proves it): apply the
+    /// Genuine unchanged EOF only (the caller proves it): apply the
     /// withheld final record from the bytes already buffered, exactly as a
     /// read without an extent applies its trailing line. No byte is read.
     fn apply_sealed_fragment(&mut self, mut on_value: impl FnMut(&Value)) -> bool {
@@ -38926,8 +38923,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         let result = self.read_step(on_value, on_line);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
-        // A paused overlong skip keeps no bytes (E4); a withheld final
-        // record keeps its bounded bytes (E1).
+        // A paused overlong skip keeps no bytes; a withheld final
+        // record keeps its bounded bytes.
         if self.skipping.is_none() && self.sealed_fragment.is_none() {
             self.buf.clear();
         }
@@ -39033,8 +39030,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                             // Pause the skip at a chunk boundary. The line is
                             // neither delivered nor counted until its newline.
                             // The capped prefix is final once overflowed, so
-                            // its salvage is taken now and the bytes dropped
-                            // (E4): the same envelope the newline would give.
+                            // its salvage is taken now and the bytes dropped:
+                            // the same envelope the newline would give.
                             let fresh = early.is_none();
                             let salvage = early
                                 .take()
@@ -39079,7 +39076,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             return Ok(JsonlReaderStep::Complete(*report));
         }
 
-        // M1 durable warm-cache: the line's position in the file, for the
+        // Durable warm-cache: the line's position in the file, for the
         // marks of re-derived fields. Known only on a positioned read.
         let line = self
             .acquisition
@@ -39201,7 +39198,7 @@ fn read_bounded_jsonl_lines_impl(
 }
 
 /// An overlong cursor record's salvage, taken from its capped prefix when
-/// its skip first paused (E4). `envelope` is exactly what
+/// its skip first paused. `envelope` is exactly what
 /// `oversized_codex_envelope` derives from that prefix at the newline: the
 /// prefix no longer changes once the line overflowed.
 #[derive(Debug)]
@@ -40712,7 +40709,7 @@ fn apply_codex_ledger_line(value: &Value, accumulator: &mut SnapshotAccumulator)
     if !codex_proof_header_admitted(value, accumulator) {
         return;
     }
-    // P's own parent (the finish's lineage owe, rev 5 R1-M3), from P's first
+    // P's own parent (the finish's lineage owe), from P's first
     // header only, as the classifier reads it.
     if !accumulator.codex_session_meta_seen {
         if let Some(meta) = codex_session_meta_payload(value) {
@@ -42001,7 +41998,7 @@ fn codex_model_context_window(value: &Value) -> Option<u64> {
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {
     // The digest is never uploaded; it is persisted only in the local
-    // durable-tail store (M1). Hash the complete
+    // durable-tail store. Hash the complete
     // content-free token_count record so an exact duplicated physical line is
     // idempotent without pretending that equal cumulative counters identify a
     // provider response. Native ordinals naturally participate when present.
@@ -43112,7 +43109,7 @@ impl ScanCensus {
     }
 
     /// One unreadable file: its root class, kind and key digest join the
-    /// cause's bounded sample (E2 B2), never its path.
+    /// cause's bounded sample, never its path.
     #[track_caller]
     fn record_unreadable_file(&mut self, cause: UnreadableCause, path: &Path) {
         let key = local_index_key(path);
@@ -43722,7 +43719,7 @@ impl CodexTitleMetadata {
             })
     }
 
-    /// E2 B3b: after a home's created-thread census failed, scope a rollout to
+    /// After a home's created-thread census failed, scope a rollout to
     /// its own home only when the file -> home map is exact. Its one identity
     /// has a state row in exactly one loaded home, whose created-thread census
     /// succeeded, which is the only loaded home containing the row's rollout
@@ -45724,7 +45721,7 @@ fn ensure_bounded_traversal(
             index.claude_full_rearm_progress.full_rearm_window_next = false;
         }
         let retry_can_reopen = claude_stale_rearm_can_reopen_fence(index, &stale_pending_roots);
-        // SOURCE: same-context accepted bodies do not depend on fence state,
+        // Same-context accepted bodies do not depend on fence state,
         // a future deadline, OTEL proof, or completing the blocked census.
         let scoped_retry_allowed = prior_traversal_context_matches;
         let full_rearm_window_roots =
@@ -45893,7 +45890,7 @@ fn ensure_bounded_traversal(
             BTreeSet::new()
         };
         // Capped pending credits no evidence either, but must still cancel
-        // when M1 selects a changed member. Fund both sets under C1b's budget.
+        // when a changed member is selected. Fund both sets under C1b's budget.
         let replay = if let Some(replay) = streamed_replay {
             replay
         } else {
@@ -47731,7 +47728,7 @@ fn reconcile_missing_index_entries_with_side(
             if !index.files.contains_key(key) {
                 index.drop_codex_proof_items(key, codex_side_drop);
             }
-            // Complete this item, preserving SOURCE N3 incidence. An unsafe
+            // Complete this item, preserving incidence handling. An unsafe
             // or uncertain ancestor keeps its obligation and also stops here.
             continue;
         }
@@ -48445,7 +48442,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         return None;
     };
     let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
-    // SOURCE condition 1: the sampled content plus the sidecars the account
+    // The sampled content plus the sidecars the account
     // resolver reads; a metadata-only touch leaves it unchanged.
     candidate.withheld_content_stamp = candidate.withheld_content_stamp.take().map(|content| {
         sha256_hex(&[
@@ -48832,7 +48829,7 @@ pub(crate) fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl F
     value
 }
 
-// SOURCE Amendments 7, 10 and 11: the stop latch of the one-time Claude re-read.
+// The stop latch of the one-time Claude re-read.
 // The first Claude fold whose counts report `resource_withheld()` (a family
 // over its evidence bound, or a full remembered-veto table) latches the stop:
 // Claude adoption then takes no adoption-only file (budget 0, reason
@@ -49238,7 +49235,7 @@ fn unique_checkpoint_sibling(path: &Path, kind: &str) -> PathBuf {
 /// cutoff is clamped to the clock, so it never reaches this value.
 const MALFORMED_CLAUDE_HISTORY_CUTOFF: u64 = u64::MAX;
 
-/// Lenient decode (StateMissing M3): a non-number cutoff never fails the
+/// Lenient decode: a non-number cutoff never fails the
 /// whole index decode.
 fn deserialize_lenient_claude_history_cutoff<'de, D>(
     deserializer: D,
@@ -49252,7 +49249,7 @@ where
     })
 }
 
-/// Lenient decode (StateMissing M3): any stored value but `true` is `false`,
+/// Lenient decode: any stored value but `true` is `false`,
 /// never a failed index decode.
 fn deserialize_lenient_true<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
@@ -49764,21 +49761,21 @@ impl ScanIndex {
     }
 
     /// Claude only, before scanning, every cycle. With prior history on this
-    /// Mac (SOURCE F1a), a fresh index, a replay that dropped entries or the
+    /// Mac, a fresh index, a replay that dropped entries or the
     /// first gated load of an index with no cutoff records the history
-    /// cutoff; a new file born before it (or at an unknown time) is history
-    /// (SOURCE P1). The cutoff is the last moment this destination is known
-    /// to have received history (StateMissing N1): on the first gated load of
+    /// cutoff; a new file born before it (or at an unknown time) is history.
+    /// The cutoff is the last moment this destination is known
+    /// to have received history: on the first gated load of
     /// an intact index, the newest activity clock among its accepted
     /// entities, so a session created while a pre-gate daemon was down is
     /// new, not history. A fresh index or a replay drop re-reads files this
     /// destination did receive, and an index with no accepted activity knows
     /// no better, so those record now. The first-load rule covers an index a
     /// pre-gate daemon built, rebuilt or replayed only partly, re-pairs
-    /// included (StateMissing M3, SOURCE F1b); an index a gated daemon built,
+    /// included; an index a gated daemon built,
     /// such as a fresh install's after its bootstrap, records none. A stored
     /// cutoff ahead of the clock is pulled back to now, so a forward clock
-    /// jump is not kept (L1). A fresh install records none.
+    /// jump is not kept. A fresh install records none.
     ///
     /// It also sets this cycle's `NoListPolicy`: an unverified Mac holds, a
     /// move under a claim policy other than an explicit `full` holds (and the
@@ -49843,7 +49840,7 @@ impl ScanIndex {
             .max()
     }
 
-    /// Lenient decode (StateMissing M3): a malformed stored cutoff is dropped
+    /// Lenient decode: a malformed stored cutoff is dropped
     /// with the gate marker, so the next gated load re-derives both.
     fn drop_malformed_claude_history_cutoff(&mut self) {
         if self.claude_history_cutoff_unix_seconds == Some(MALFORMED_CLAUDE_HISTORY_CUTOFF) {
@@ -49947,7 +49944,7 @@ impl ScanIndex {
             })
     }
 
-    /// StateMissing M1: a list line may name only a member (`root_stem`). On a
+    /// A list line may name only a member (`root_stem`). On a
     /// fresh or replayed index the family's members are not indexed yet when
     /// one of them is decided, so the load-time closure cannot list the root.
     /// Before the decision of any family candidate, root or subagent, whether
@@ -50125,7 +50122,7 @@ impl ScanIndex {
         }
     }
 
-    /// E2: a permissive load can succeed while one root's API or trace read
+    /// A permissive load can succeed while one root's API or trace read
     /// failed. Hold every permitted owed file of that root (including path
     /// twins and agents) without changing unrelated history or live uploads.
     pub(crate) fn hold_claude_history_for_unhealthy_telemetry_roots(
@@ -50209,7 +50206,7 @@ impl ScanIndex {
         items.retain(|item| self.claude_history_emission.permits(item, &guard));
     }
 
-    /// SOURCE h732 C2: the request-owned literal guard for `items`, from the
+    /// The request-owned literal guard for `items`, from the
     /// active row, the list and the index only.
     fn claude_literal_guard(&self, items: &[SnapshotItem]) -> claude_history_upgrade::LiteralGuard {
         claude_history_upgrade::LiteralGuard::for_items(
@@ -50335,7 +50332,7 @@ impl ScanIndex {
         {
             return false;
         }
-        // SOURCE h732 C2: a revision whose row denies the request-owned
+        // A revision whose row denies the request-owned
         // literal never stamps a listed family, or any file while the list is
         // paused, whatever this cycle decided (a covering ACK, below-floor or
         // confirmed-empty settlement of a file that was not a candidate).
@@ -50346,7 +50343,7 @@ impl ScanIndex {
             return false;
         }
         let monotone = self.active_effective_upload_body_witness_revision_monotone;
-        // SOURCE F2: no Claude file is stamped above the last revision the
+        // No Claude file is stamped above the last revision the
         // history gate is complete for.
         if monotone && allowed_active > claude_history_upgrade::max_gated_claude_revision() {
             return false;
@@ -50385,7 +50382,7 @@ impl ScanIndex {
         })
     }
 
-    /// E3 counts only (#799 page carrier): each upgrade the history gate
+    /// Counts only (#799 page carrier): each upgrade the history gate
     /// permitted this page that finalized below the active revision, by its
     /// hold.
     fn note_claude_history_not_stamped(&self) {
@@ -50412,7 +50409,7 @@ impl ScanIndex {
         }
     }
 
-    /// E3: a partial save keeps the committed entry of each `restored` key.
+    /// A partial save keeps the committed entry of each `restored` key.
     /// An upgrade the history gate permitted that stamped on this page but
     /// does not commit counts as not accepted.
     fn note_claude_history_not_accepted<'a>(
@@ -50675,7 +50672,7 @@ impl ScanIndex {
         );
     }
 
-    /// The owed correction an older (pre-E2) build persisted for a family,
+    /// The owed correction an older build persisted for a family,
     /// built from the persisted types (unchanged since 0.1.203): its terminal
     /// record bound to the retained witness, owing every indexed member at its
     /// indexed revision, as `rebind_claude_authority_proof` grants. The
@@ -51040,7 +51037,7 @@ impl ScanIndex {
             .count()
     }
 
-    /// SOURCE Round 11 guards for the path-(a) absence retirement: absence
+    /// Guards for the path-(a) absence retirement: absence
     /// retires a family only when it is positive. Refused (every family kept)
     /// while the #700 re-emission stop latch is set, while this index's
     /// history is unverified in this process (a fresh, rebuilt or quarantined
@@ -51104,7 +51101,7 @@ impl ScanIndex {
 
     /// Whether this index retired `root_session_id`'s family as absent and
     /// its return has not settled yet, or cannot rule that out: every root
-    /// while the uncertainty fence is up (SOURCE Round 13).
+    /// while the uncertainty fence is up.
     fn claude_root_tombstoned(&self, root_session_id: &str) -> bool {
         claude_root_tombstoned_in(
             &self.claude_retired_family_tombstones,
@@ -51125,12 +51122,12 @@ impl ScanIndex {
                 .is_some_and(|member| self.claude_root_tombstoned(member.root))
     }
 
-    /// SOURCE Round 13, at load: a marked index whose tombstone map is
+    /// At load, a marked index whose tombstone map is
     /// missing, damaged or over its cap raises the durable uncertainty fence.
     /// An unmarked index starts empty only when it shows no sign of a lost
-    /// set (SOURCE Round 14, downgrade): see
+    /// set (a downgrade): see
     /// `claude_tombstones_lost_without_marker`. A load never lowers the
-    /// fence (SOURCE Round 15): only a complete healthy terminal can, see
+    /// fence: only a complete healthy terminal can, see
     /// `drain_claude_retired_family_tombstone_fence`. Never fails or
     /// quarantines the index.
     fn settle_claude_retired_family_tombstone_decode(&mut self) {
@@ -51147,7 +51144,7 @@ impl ScanIndex {
             && !self.claude_retired_family_tombstones_uncertain
             && self.claude_tombstones_lost_without_marker();
         if downgraded {
-            // SOURCE Round 15: a pre-bridge index whose removed family's
+            // A pre-bridge index whose removed family's
             // witness outlived its entry raises the fence too. That upgrade
             // false positive is accepted and counted here with every real
             // downgrade; the drain bounds its cost.
@@ -51170,7 +51167,7 @@ impl ScanIndex {
         self.claude_retired_family_tombstones_initialized = true;
     }
 
-    /// SOURCE Round 14 (d): an index without the marker is either from before
+    /// An index without the marker is either from before
     /// the bridge, or was written by an older binary that dropped the marker
     /// and the set (a downgrade round trip, or the intermediate binary that
     /// knew the set but not the marker). A witnessed root with no indexed
@@ -51178,8 +51175,8 @@ impl ScanIndex {
     /// a retirement leaves behind once its set is gone, so any such root
     /// raises the fence (fail closed). A pre-bridge index holding one for
     /// another reason (a removed family whose witness no complete census has
-    /// pruned yet) fences too: the accepted upgrade false positive (SOURCE
-    /// Round 15), counted as `tombstone_fence_raised_on_upgrade`, whose cost
+    /// pruned yet) fences too: the accepted upgrade false positive,
+    /// counted as `tombstone_fence_raised_on_upgrade`, whose cost
     /// is tombstoning its absent witnessed roots at the next complete
     /// terminal.
     /// Not detectable: an older writer whose complete census already pruned
@@ -51235,7 +51232,7 @@ impl ScanIndex {
         !unindexed.is_empty()
     }
 
-    /// SOURCE Round 15 bounded drain, at a complete healthy terminal only:
+    /// Bounded drain, at a complete healthy terminal only:
     /// replaces a raised uncertainty fence with a tombstone for every
     /// witnessed root without one that this traversal did not see present on
     /// disk, when they all fit under the cap. Otherwise the fence stays.
@@ -51243,7 +51240,7 @@ impl ScanIndex {
     /// A root is present only when the walk observed a member of it and
     /// every member the walk observed is indexed and not confirmed empty
     /// (`claude_fence_present_roots`).
-    /// Indexed presence alone never waives a slot (H729-1): an indexed entry
+    /// Indexed presence alone never waives a slot: an indexed entry
     /// whose file the walk did not see counts as absent, like a partial
     /// checkpoint's restored entry of a retired root. Present roots are left
     /// to the normal path: while present each is read as an indexed file,
@@ -51251,13 +51248,13 @@ impl ScanIndex {
     /// reserve-before-retire tombstones it. So present roots, however many,
     /// never block the drain; more absent roots than free slots do.
     ///
-    /// Bounded (H729-2): the presence scratch holds one borrowed root and
+    /// Bounded: the presence scratch holds one borrowed root and
     /// flag per witnessed root the walk saw, at most the witness count, and
     /// is priced with the new entries and the aged-out probe before use. The
     /// count pass stops one past `limit`; the insert pass keeps only the
     /// entries it inserts. `limit` is the free slots when admitted.
     ///
-    /// Only an admitted pass lowers (SOURCE h733-1). A refused price has no
+    /// Only an admitted pass lowers. A refused price has no
     /// presence scratch, so it cannot tell present roots from absent ones:
     /// it counts at most `MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS` + 1
     /// untombstoned witnessed roots for the alarm, inserts nothing, counts
@@ -51265,8 +51262,8 @@ impl ScanIndex {
     /// count, so the fence stays up until a later admitted terminal.
     ///
     /// Each inserted root the walk did not observe at all, but that still
-    /// has an indexed member, counts as `absent_family_tombstone_aged_out`
-    /// (SOURCE h733-2): it aged out of the walk's window, or its entry is
+    /// has an indexed member, counts as `absent_family_tombstone_aged_out`:
+    /// it aged out of the walk's window, or its entry is
     /// stale. It still counts as absent; the count only exposes its slot.
     fn lower_claude_retired_family_tombstone_fence(
         &mut self,
@@ -51380,7 +51377,7 @@ impl ScanIndex {
         }
     }
 
-    /// The raw-complete Claude terminal's fence drain (SOURCE Round 15): runs
+    /// The raw-complete Claude terminal's fence drain: runs
     /// `lower_claude_retired_family_tombstone_fence` over this traversal's
     /// observed and residue keys and reports it. A kept fence stays durable,
     /// is published as `absent_family_tombstone_uncertain` on the retiring
@@ -51506,7 +51503,7 @@ impl ScanIndex {
                     return true;
                 }
                 // Reserve the tombstone before removing anything; a full set
-                // keeps the family RetryPending (SOURCE Round 13).
+                // keeps the family RetryPending.
                 if !tombstone_retired_claude_family(tombstones, root_session_id, retired_at) {
                     refused += 1;
                     return true;
@@ -51605,7 +51602,7 @@ impl ScanIndex {
                 ordinal += 1;
                 let absent = window_position(this).is_some_and(|position| !present[position]);
                 // Reserve the tombstone before removing anything; a full set
-                // keeps the family RetryPending (SOURCE Round 13).
+                // keeps the family RetryPending.
                 if absent
                     && tombstone_retired_claude_family(tombstones, root_session_id, retired_at)
                 {
@@ -52480,7 +52477,7 @@ impl ScanIndex {
     /// the generation. The durable exclusion marker is the active signal:
     /// there is no separate durable adoption-complete marker. A quarantine
     /// rebuild returns the same empty generation-0 index as an absent file.
-    /// It also returns what the load found (StateMissing M3): a missing or
+    /// It also returns what the load found: a missing or
     /// quarantined file is a fresh index whatever it holds.
     pub(crate) fn load_for_snapshot_source_with_origin(
         path: &Path,
@@ -52537,7 +52534,7 @@ impl ScanIndex {
             && load_origin.is_fresh(&index)
             && fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok()
         {
-            // COST ruling #3 (2026-10-23): a rebuilt index's first fence close
+            // A rebuilt index's first fence close
             // starts no backoff ramp. Its first traversal reads every file, and
             // a close still re-arms once (posture, and the contract-5 latch an
             // unrecorded contract sets), but the next due re-arm waits the
@@ -54085,7 +54082,7 @@ impl ScanIndex {
                     let mut committed = committed.clone();
                     // Account retry preserves its sampled audit obligation;
                     // authority/family-only holds keep their existing restore
-                    // semantics (E1 #870 owns that separate composition).
+                    // semantics (#870 owns that separate composition).
                     if let Some(working) = self.files.get(key).filter(|_| {
                         self.claude_account_deferred_holds.contains_key(key)
                             || self
@@ -54321,7 +54318,7 @@ impl ScanIndex {
         };
         let mut files = BTreeMap::<String, Shared<ScanIndexEntry>>::new();
         let mut safe_keys = BTreeSet::new();
-        // SOURCE Round 15: a fence this page's terminal drained exempted
+        // A fence this page's terminal drained exempted
         // present roots by their working entries. If this subset drops one
         // (a new entry the server does not hold yet), its root would be
         // unindexed and untombstoned, so the subset keeps the fence up.
@@ -54864,7 +54861,7 @@ impl ScanIndex {
                     .expect("audit entry")
                     .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
             } else {
-                // Preserve SOURCE N3 incidence handling: retiring audit debt
+                // Preserve incidence handling: retiring audit debt
                 // does not itself grant authority to prune its fingerprints.
                 self.retire_vanished_claude_audit_debt_entry(key);
             }
@@ -54888,7 +54885,7 @@ impl ScanIndex {
         true
     }
 
-    /// SOURCE N2: retire a Claude entry whose file vanished beneath its
+    /// Retire a Claude entry whose file vanished beneath its
     /// still-present parent together with its unverified audit marker.
     /// Only the page merge calls this, and only for keys the scanner settled
     /// as such a removal; `remove_file_entry` keeps audit debt for every
@@ -55383,12 +55380,12 @@ impl ScanIndex {
             );
         }
         let Some(entry) = self.files.get(&key) else {
-            // Path-(a) tombstone (Round 12): a returning member of a retired
+            // Path-(a) tombstone: a returning member of a retired
             // family is never a new file. It re-enters its family's authority
             // path: held by the same quarantine gate as an indexed member once
             // a record re-forms, and otherwise read for its first proof
             // attempt against the retained witness. Under the tombstone
-            // uncertainty fence every unindexed Claude member does (Round 13).
+            // uncertainty fence every unindexed Claude member does.
             if self.claude_retired_family_member(&candidate.path) {
                 return self.claude_returning_member_decision(candidate);
             }
@@ -55640,7 +55637,7 @@ impl ScanIndex {
         })
     }
 
-    /// StateMissing M2: this member is selected only because its family owes
+    /// This member is selected only because its family owes
     /// a proof correction (no witness change and no due retry).
     fn claude_authority_correction_only(&self, candidate: &CandidateFile) -> bool {
         self.claude_authority_correction_owed(&candidate.path)
@@ -55649,7 +55646,7 @@ impl ScanIndex {
                 .is_none()
     }
 
-    /// StateMissing M2: whether an owed proof correction still blocks a fully
+    /// Whether an owed proof correction still blocks a fully
     /// settled upload, and how many owed members wait for the history gate
     /// instead. A member whose indexed file still owes the history upgrade is
     /// held by the gate: its correction settles once the gate permits it, so
@@ -56247,7 +56244,7 @@ fn looks_like_raw_identifier(value: &str, source: &str) -> bool {
 
 /// The one state-row id a rollout path can name: its only UUID-shaped
 /// filename candidate. Codex state ids are UUIDs, so the timestamped raw
-/// reading of a modern name cannot name a state row (E2 B3b).
+/// reading of a modern name cannot name a state row.
 fn codex_rollout_thread_id(path: &Path) -> Option<String> {
     let mut ids = codex_session_id_candidates_from_path(path)
         .into_iter()
@@ -62132,7 +62129,7 @@ mod tests {
         );
     }
 
-    /// Mirrors the exact live M4 shape that the single-file synthetic fixture
+    /// Mirrors the exact shape observed live that the single-file synthetic fixture
     /// above cannot express: the oversized physical lines live in the PARENT
     /// rollout, and its subagent children start at `subagent_history_start_ordinal`
     /// 11 rather than 1. The parent is therefore a `codex_parent_ownership_refs`
@@ -66225,7 +66222,7 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let (root, parent, mut items) = claude_account_family_fixture(true);
         let occurrences = items[0]
@@ -66482,7 +66479,7 @@ mod tests {
 
     #[test]
     fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
@@ -66673,7 +66670,7 @@ mod tests {
                 .demotion_quarantined_session_count,
             7
         );
-        // SOURCE condition 6 with a local witness: the six contract-less
+        // With a local witness, the six contract-less
         // bodies carrying scalars are counted and held below, never sent.
         assert_eq!(
             disposition
@@ -66810,7 +66807,7 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let (root, parent, mut items) = claude_account_family_fixture(true);
         let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -67398,7 +67395,7 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let root = temp_dir("claude-legacy-fork-prefix");
         let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -67800,7 +67797,7 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         let (dir, root, items) = claude_account_family_fixture(true);
         // Positive request evidence needs no parent transcript or family census.
@@ -68189,7 +68186,7 @@ mod tests {
 
     #[test]
     fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         let (dir, root, items) = claude_account_family_fixture(true);
         let child_path = dir
@@ -70791,7 +70788,7 @@ mod tests {
 
     #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let root = temp_dir("claude-progressive-equal-time-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
@@ -71615,7 +71612,7 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
         let path = temp_file("claude-nonforked-paired-owned-start");
         let source_session_id = path
@@ -78949,7 +78946,7 @@ mod tests {
         .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
     }
 
-    /// [behaviour] E2 B3: an open that fails once with SQLITE_CANTOPEN and
+    /// [behaviour] An open that fails once with SQLITE_CANTOPEN and
     /// then succeeds counts its root complete, with the retry counted; any
     /// other failure is not retried.
     #[test]
@@ -78986,7 +78983,7 @@ mod tests {
         assert_eq!((attempts, retries), (1, 0));
     }
 
-    /// [behaviour] E2 B3: a state database that keeps failing SQLITE_CANTOPEN
+    /// [behaviour] A state database that keeps failing SQLITE_CANTOPEN
     /// still fails each state loader's root after the bounded retries, with
     /// main's stage, native code and created-thread ambiguity. An unreadable
     /// file models a persistent failure; the observed persistent CANTOPEN, an
@@ -80024,7 +80021,7 @@ mod tests {
         assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
     }
 
-    /// P1-RETAIN-3: the tail-cache lineage lift admits only forks whose
+    /// The tail-cache lineage lift admits only forks whose
     /// ownership boundary came from in-file header fields. A parented created
     /// thread, a ledger-resolved ordinary fork and a pre-trigger legacy
     /// subagent stay unretained even where every other reduction conjunct holds.
@@ -83481,9 +83478,9 @@ mod tests {
         );
     }
 
-    /// [regress] CX1 2026-10-31: a rollout born after its scan cycle started
+    /// [regress] 2026-10-31: a rollout born after its scan cycle started
     /// (`collected_at` = cycle start) but before the page read it lost its
-    /// creator pair, so its first body went out without one (M4: 3 of 231
+    /// creator pair, so its first body went out without one (observed live: 3 of 231
     /// Codex first admissions in 14 h).
     #[test]
     fn codex_creator_pair_survives_rollout_created_after_cycle_start() {
@@ -85872,7 +85869,7 @@ crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
 crate::heap_layout_bound::fields!(ActivityCallTool; name);
 crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
-// P2-1 (SOURCE): the retired Claude attribution capture put raw skill, plugin,
+// The retired Claude attribution capture put raw skill, plugin,
 // MCP and subagent names into `context`; no source emits them now, but the
 // shape below is bound into the pinned allowlist digest, so it stays. A context
 // holding any attribution key is class `E`: the record is refused (counted as
@@ -86429,7 +86426,7 @@ mod census_unreadable_tests {
             .unwrap()["counts"],
             json!([1, 0, 1, 0, 0, 0, 0, 0])
         );
-        // E2 B2: the OpenRead sample names the file's kind and key digest,
+        // The OpenRead sample names the file's kind and key digest,
         // never its path.
         let sample = serde_json::to_value(census.unreadable_causes).unwrap()["samples"]
             [UnreadableCause::OpenRead as usize][0]
@@ -86538,7 +86535,7 @@ const _: () = {
     assert!(size_of::<OwnedJsonlParser>() == 5312);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
-    // to M3's 856-byte active frame; parser/custody boxing is unchanged.
+    // to the 856-byte active frame; parser/custody boxing is unchanged.
     assert!(size_of::<OwnedActiveFile>() == 880);
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880

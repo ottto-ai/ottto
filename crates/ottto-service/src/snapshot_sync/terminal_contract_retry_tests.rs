@@ -147,7 +147,7 @@ fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
     });
 }
 
-// Round 2 uses both real checkpoint writers/readers. The retained identity
+// This fixture uses both real checkpoint writers/readers. The retained identity
 // fields live in ScanIndex; exact ACK/cache/refusal evidence lives in progress.
 struct RetainedRetryFixture {
     scratch: crate::test_scratch::ScratchDir,
@@ -839,7 +839,7 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
     }
 }
 
-// SOURCE's post-ACK/pre-index crash seam: the scanner's actual next delta
+// The post-ACK/pre-index crash seam: the scanner's actual next delta
 // omits the accepted retry. Both checkpoints must retain the evidence until
 // index settlement is durably adopted. No ACK body is added to uploader input.
 fn contract_ack_saved_before_index_restart(unrelated: bool) {

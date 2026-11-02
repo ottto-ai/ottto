@@ -1473,7 +1473,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
     }
 }
 
-/// [money] Lead B Q1 (2026-10-31): one file's two context bodies split across
+/// [money] One file's two context bodies split across
 /// passes, with a crash between them. The receipt waits for the second exact
 /// ACK, only the unACKed body resends, and the server receives each entity's
 /// unchanged body exactly once, so the money totals are unchanged.
@@ -1560,7 +1560,7 @@ fn split_context_ack_set_receipts_after_every_body_and_keeps_money_totals() {
     }
 }
 
-/// [regress] Strict review P1: a terminal Codex census adopted its source
+/// [regress] A terminal Codex census adopted its source
 /// context before a budget-deferred body, hiding that body's debt after restart.
 #[test]
 fn terminal_census_context_deferral_stays_owed_after_restart() {
@@ -1611,7 +1611,7 @@ fn terminal_census_context_deferral_stays_owed_after_restart() {
     assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
 }
 
-/// [regress] B1 (M4, 2026-10-31): a census page read one context file,
+/// [regress] Observed live (2026-10-31): a census page read one context file,
 /// because each file reserved three worst-case item bodies (about 1.88 MiB of
 /// the 2 MiB pass). Real-size reservation reads 40 small context files in one
 /// page, and each earns its receipt in that pass.
@@ -2047,7 +2047,7 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
     f.assert_quiet();
 }
 
-/// [behaviour] Lead B Q1: a file whose context bodies exceed the pass
+/// [behaviour] A file whose context bodies exceed the pass
 /// allowance no longer gets a one-off oversized allowance. Each pass sends at
 /// most the allowance; a pass that ACKed part of the file re-queues it owed,
 /// and the next read resends only the unACKed tail before the receipt.

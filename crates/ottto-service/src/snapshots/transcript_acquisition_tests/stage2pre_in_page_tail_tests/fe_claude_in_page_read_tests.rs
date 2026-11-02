@@ -1,20 +1,20 @@
 //! FE red-first fixtures: Claude appends while an in-page sampled `Full` or
 //! `Tail` reads. FE is the Claude twin of Stage2-pre: a reader-relative extent
-//! limit (H1c), an in-page E1 for a quiescent unterminated row (H2c), and a
+//! limit (H1c), an in-page genuine-EOF apply for a quiescent unterminated row (H2c), and a
 //! grown-read route (H3c) that publishes the sealed prefix `[0, s)` as a
 //! certificate only: no checkpoint, copy, cache insert or audit credit, the
 //! prepared debt re-staged, and the index left at the opened stamp.
 //!
 //! Tests marked RED assert FE's behavior and fail on main for the reason in
-//! their doc comment (the D1 "acquisition exceeds stable source" failure,
+//! their doc comment (the "acquisition exceeds stable source" failure,
 //! recorded as `OpenRead`, or `ScopeObject` at revalidation). Tests marked
 //! GREEN assert main's behavior, which FE must keep, and pass on main.
 //! Uses the EOF fixture seam from #670; production FE lives in snapshots.rs.
 //!
-//! SOURCE conditions pinned here (qualified YES, d680b524):
+//! Conditions pinned here (d680b524):
 //! - publish only when `s` is at least the last committed size;
-//! - a prefix never backs proof, v1, a family witness, or a verified D1
-//!   record;
+//! - a prefix never backs proof, v1, a family witness, or a verified
+//!   request-census record;
 //! - FE2: the sample-preserving-rewrite residual is accepted (SP-5 residual).
 //!
 //! Not added: #660 side reads (SP-11; #660 is not on main). Stage2-pre's
@@ -80,7 +80,7 @@ fn pending_hashes(ids: Range<usize>) -> BTreeSet<String> {
         .collect()
 }
 
-/// A D1 record holds sorted 8-byte prefixes.
+/// A request-census record holds sorted 8-byte prefixes.
 fn census_hashes(ids: Range<usize>) -> Vec<u64> {
     let mut hashes = requests(ids)
         .map(|request| claude_request_hash(&request))
@@ -262,8 +262,8 @@ fn quiescent() -> (ScanFixture, ScanIndex, SourceScanResult) {
 /// deadline); the index keeps the opened stamp; the next page re-selects the
 /// grown file and reads `Full` with body parity.
 ///
-/// Red on main: the reader passes the frozen length and fails D1
-/// ("acquisition exceeds stable source"), recorded as one `OpenRead`.
+/// Red on main: the reader passes the frozen length and fails with
+/// "acquisition exceeds stable source", recorded as one `OpenRead`.
 #[test]
 fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -305,7 +305,7 @@ fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
 /// checkpoint or cache insert), and re-stages the Tail's prepared debt
 /// unchanged; the next page reads `Full(StateMissing)` with body parity.
 ///
-/// Red on main: D1 (one `OpenRead`), and the taken copy is dropped.
+/// Red on main: the stable-source failure (one `OpenRead`), and the taken copy is dropped.
 #[test]
 fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_debt() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -339,7 +339,7 @@ fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_de
 /// the row is absent now and present on the next read.
 ///
 /// Red on main: the row's newline lies past the frozen length, so the reader
-/// fails D1 (one `OpenRead`).
+/// fails the stable-source check (one `OpenRead`).
 #[test]
 fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -423,7 +423,7 @@ fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
 /// stops at frozen with a reader-relative limit `frozen - start`.
 ///
 /// Red on main: no in-page limit is set; the reader passes frozen and fails
-/// D1 (one `OpenRead`), so the EOF hook never sees this read.
+/// the stable-source check (one `OpenRead`), so the EOF hook never sees this read.
 #[test]
 fn fe_claude_sp2c_large_prefix_tail_stops_at_frozen_with_relative_limit() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -666,7 +666,7 @@ fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
     );
 }
 
-/// SP-5 residual, Claude (RED; EXPECTED RESIDUAL per SOURCE FE2, not mutation
+/// SP-5 residual, Claude (RED; EXPECTED RESIDUAL per FE2, not mutation
 /// detection): after the reader passed them, already-read tail bytes outside
 /// both 4 KiB sample windows are truncated and regrown with a different row
 /// of the same length, plus growth. H3c accepts it as the cursor does: the
@@ -819,7 +819,7 @@ fn fe_claude_sp7b_lossy_grown_tail_is_excluded_and_refused() {
 }
 
 /// An overdue checkpoint still Tails the append without Full-audit credit.
-/// In-page grown-prefix deadline handling remains a separate full-S1 concern.
+/// In-page grown-prefix deadline handling remains a separate concern.
 #[test]
 fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -846,7 +846,7 @@ fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
 }
 
 /// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
-/// append after the open step keeps main's D1 failure (`OpenRead`).
+/// append after the open step keeps main's stable-source failure (`OpenRead`).
 #[test]
 fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -900,7 +900,7 @@ fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
     assert!(scan.sampling.is_none(), "Pi reads stay unsampled");
 }
 
-/// SOURCE, s below the last committed size (GREEN): the last page committed
+/// With s below the last committed size (GREEN): the last page committed
 /// a file ending in a complete but unterminated row (size C, main's
 /// trailing-line rule). The file is re-selected at size C and, during its
 /// in-page `Full`, the row's newline and more rows are appended. The last newline at or below frozen (= C) is the row's start,
@@ -948,8 +948,8 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
     );
 }
 
-/// D1 control (GREEN): in this fixture a quiescent sampled `Full` writes a
-/// source-verified D1 record of its requests, and a quiescent `Tail` (which
+/// Census-record control (GREEN): in this fixture a quiescent sampled `Full` writes a
+/// source-verified request-census record of its requests, and a quiescent `Tail` (which
 /// owes its audit) writes an unverified one.
 #[test]
 fn fe_claude_d1_control_quiescent_full_verified_tail_unverified() {
@@ -981,11 +981,11 @@ fn fe_claude_d1_control_quiescent_full_verified_tail_unverified() {
     );
 }
 
-/// SOURCE, D1 (RED): FE's prefix parse writes a D1 record of the prefix's
+/// Census record (RED): FE's prefix parse writes a request-census record of the prefix's
 /// requests that is never source-verified, and the next read replaces it
 /// with the grown file's requests.
 ///
-/// Red on main: D1 (one `OpenRead`); main invalidates the record.
+/// Red on main: the stable-source failure (one `OpenRead`); main invalidates the record.
 #[test]
 fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1024,10 +1024,10 @@ fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
     );
 }
 
-/// SOURCE, proof (RED): a prefix body never mints v1 or a family witness,
+/// Proof (RED): a prefix body never mints v1 or a family witness,
 /// even when the API evidence matches the prefix exactly.
 ///
-/// Red on main: D1 (one `OpenRead`), so no prefix is published.
+/// Red on main: the stable-source failure (one `OpenRead`), so no prefix is published.
 #[test]
 fn fe_claude_source_prefix_never_mints_v1_or_witness() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1065,7 +1065,7 @@ fn fe_claude_source_prefix_never_mints_v1_or_witness() {
 /// Census (RED): the published prefix enters pending as any read does: the
 /// member's request set is the prefix's, and the family stays valid.
 ///
-/// Red on main: D1 (one `OpenRead`), so nothing reaches pending.
+/// Red on main: the stable-source failure (one `OpenRead`), so nothing reaches pending.
 #[test]
 fn fe_claude_census_prefix_enters_pending() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1091,7 +1091,7 @@ fn fe_claude_census_prefix_enters_pending() {
 /// carries more requests, so pending counts `member_changed` and invalidates
 /// the family.
 ///
-/// Red on main: D1 (one `OpenRead`) on the first read.
+/// Red on main: the stable-source failure (one `OpenRead`) on the first read.
 #[test]
 fn fe_claude_census_reread_in_window_gives_member_changed() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1128,7 +1128,7 @@ fn fe_claude_census_reread_in_window_gives_member_changed() {
 /// Census (RED): proof fails closed while the API evidence reports requests
 /// beyond the published prefix (rows 6..9 were appended during the read).
 ///
-/// Red on main: D1 (one `OpenRead`), so no prefix is published.
+/// Red on main: the stable-source failure (one `OpenRead`), so no prefix is published.
 #[test]
 fn fe_claude_census_proof_fails_closed_while_api_rows_exceed_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1157,7 +1157,7 @@ fn fe_claude_census_proof_fails_closed_while_api_rows_exceed_prefix() {
     );
 }
 
-/// SOURCE (B): real FE prefix provenance, rather than ordinary D1 debt,
+/// Real FE prefix provenance, rather than ordinary census-record debt,
 /// excludes API rows beyond the published native prefix.
 #[test]
 fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
@@ -1216,7 +1216,7 @@ fn fe_claude_prefix_cannot_admit_explicit_or_file_birth_posture() {
     }
 }
 
-/// Review F1: growth after genuine-EOF E1 must not certify the row E1
+/// Growth after the genuine-EOF apply must not certify the row it
 /// applied outside the last newline. No new reader/acquisition state needed.
 #[test]
 fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
@@ -1298,10 +1298,10 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
 
 /// Source loss may be discovered by response resolution only at finish,
 /// after H3c's reader/report check. Refuse the grown body rather than publish
-/// without an indexed audit marker (even if the D1 record cannot be stored).
+/// without an indexed audit marker (even if the request-census record cannot be stored).
 #[test]
 fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
-    // Resolver conflict as drop residue is gate-off only; gate on it is a disclosed E2 conflict.
+    // Resolver conflict as drop residue is gate-off only; gate on it is a disclosed `e2` conflict.
 
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1388,7 +1388,7 @@ fn fe_claude_old_unknown_and_malformed_provenance_exclude() {
     }
 }
 
-/// Persistence must preserve the exclusion even without D1 and after key drift.
+/// Persistence must preserve the exclusion even without a census record and after key drift.
 #[test]
 fn fe_claude_prefix_provenance_round_trips_without_d1() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1423,7 +1423,7 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
 /// replays all later rows and revalidates EOF. No FE prefix is cached.
 #[test]
 fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
 
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1560,7 +1560,7 @@ fn fe_g1_grown_prefix_still_marks_prefix_after_ordinary_record() {
     }
 }
 
-/// c22 N1 (narrower): only loss-free, identity-complete D1 shapes may bind a
+/// Only loss-free, identity-complete request-census shapes may bind a
 /// recomposed body. An identity-incomplete record keeps its root excluded
 /// until a Full audit verifies it.
 #[test]
@@ -1591,7 +1591,7 @@ impl Drop for TestClock {
     }
 }
 
-/// A held N1 Tail (SOURCE N1, marker-preserving versions): Full one
+/// A held N1 Tail (marker-preserving versions): Full one
 /// interval before `due`, then an actual identity-incomplete id-less Tail
 /// just before it, which cannot reconstruct the saved witness until its
 /// hourly Full audit (the identical body can once N1 verification holds).
@@ -1704,7 +1704,7 @@ fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
     )
 }
 
-/// Option B (SOURCE rule 3): after a marker-erasing downgrade, nothing reads
+/// After a marker-erasing downgrade, nothing reads
 /// the unchanged held file again. A sampled scan re-derives its deadline from
 /// the persisted hold without reading, one interval out and once. The
 /// restored deadline survives save/reload and selects the missing-checkpoint
@@ -1712,7 +1712,7 @@ fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
 /// the verified source lets the saved witness re-prove.
 #[test]
 fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
 
     use crate::snapshots::claude_request_census::{
         identity_incomplete_hold_deadlines_restored_total as restored,
@@ -1818,7 +1818,7 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
 /// open) settle as ordinary removals, never as vanished-file retirement.
 #[test]
 fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
 
     use crate::snapshots::claude_request_census::identity_incomplete_hold_deadlines_restored_total as restored;
     use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
@@ -1977,7 +1977,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     assert_eq!(restored(), restored_before + 2);
 }
 
-/// SOURCE Option 1 condition: historical replay keeps every stem entry and
+/// Historical replay keeps every stem entry and
 /// re-sets its deadline with the prefix flag preserved, so a replay reset
 /// cannot turn an FE prefix into `None` or a clean identity. Before the next
 /// re-record, the replayed prefix still mints no positive verdict.
