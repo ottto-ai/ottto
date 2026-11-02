@@ -45,16 +45,14 @@ lifetime_counters! {
     side_proof_release_drops: ProofReleaseDrop,
 }
 
-/// Last measured side state (`set_gauges` only), never a lifetime sum.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct Gauges {
-    pub(crate) side_records: u64,
-    pub(crate) side_record_bytes: u64,
-    pub(crate) side_requests: u64,
-    pub(crate) side_request_bytes: u64,
-    pub(crate) side_ledger_entries: u64,
+// Last measured side state, in `GAUGES` slot order.
+lifetime_gauges! {
+    side_records,
+    side_record_bytes,
+    side_requests,
+    side_request_bytes,
+    side_ledger_entries,
 }
-static GAUGES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Record {
@@ -68,46 +66,15 @@ impl Record {
     pub(super) fn maximum() -> Self {
         Self {
             counts: Counts::maximum(),
-            gauges: Gauges {
-                side_records: u64::MAX,
-                side_record_bytes: u64::MAX,
-                side_requests: u64::MAX,
-                side_request_bytes: u64::MAX,
-                side_ledger_entries: u64::MAX,
-            },
+            gauges: Gauges::maximum(),
         }
     }
 }
 
-pub(crate) fn set_gauges(gauges: Gauges) {
-    let Gauges {
-        side_records,
-        side_record_bytes,
-        side_requests,
-        side_request_bytes,
-        side_ledger_entries,
-    } = gauges;
-    for (slot, value) in GAUGES.iter().zip([
-        side_records,
-        side_record_bytes,
-        side_requests,
-        side_request_bytes,
-        side_ledger_entries,
-    ]) {
-        slot.store(value, Ordering::Relaxed);
-    }
-}
 pub(crate) fn snapshot() -> Record {
-    let gauge = |i: usize| GAUGES[i].load(Ordering::Relaxed);
     Record {
         counts: Counts::totals(),
-        gauges: Gauges {
-            side_records: gauge(0),
-            side_record_bytes: gauge(1),
-            side_requests: gauge(2),
-            side_request_bytes: gauge(3),
-            side_ledger_entries: gauge(4),
-        },
+        gauges: Gauges::current(),
     }
 }
 
