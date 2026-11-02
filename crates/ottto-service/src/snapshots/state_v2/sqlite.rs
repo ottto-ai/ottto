@@ -503,8 +503,6 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
 }
 
 impl Sqlite {
-    /// Journal OFF is confined to an unpublished O_EXCL .import database. A
-    /// failed/partial import is discarded, never recovered or published.
     /// A store over a just-opened connection; only `import` differs by route.
     fn fresh(conn: Connection, path: &Path, import: bool, owner: File, owner_lock: File) -> Self {
         Self {
@@ -526,6 +524,8 @@ impl Sqlite {
             save_failure: None,
         }
     }
+    /// Journal OFF is confined to an unpublished O_EXCL .import database. A
+    /// failed/partial import is discarded, never recovered or published.
     pub(super) fn create_import(path: &Path) -> Result<Self> {
         ensure!(
             path.as_os_str()

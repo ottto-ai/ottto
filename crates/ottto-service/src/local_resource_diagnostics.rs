@@ -999,7 +999,7 @@ fn rearm_collection(rearm: claude_reread::Counts) {
         process_id: std::process::id(),
         stage: "native_collection_page",
         source: Source::from_slug("claude_code"),
-        observation: Observation::between(0, None, None),
+        observation: Observation::point(),
         counts: Counts {
             collection: CollectionCounts {
                 scanned_files: 0,

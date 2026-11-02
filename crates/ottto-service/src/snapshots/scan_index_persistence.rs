@@ -524,28 +524,10 @@ fn legacy_digest(file: &mut File) -> io::Result<String> {
     }
     Ok(hex(hash.finalize()))
 }
-/// Sibling names of one index family, derived from its root file name.
-struct FamilyNames<'a> {
-    root: &'a str,
-    stem: &'a str,
-    family: &'a str,
-    temp_prefix: String,
-}
-impl<'a> FamilyNames<'a> {
-    fn new(root: &'a str) -> Self {
-        let stem = root.strip_suffix(".json").unwrap_or(root);
-        Self {
-            root,
-            stem,
-            family: stem.strip_suffix("-v2").unwrap_or(stem),
-            temp_prefix: format!("{root}.storage-tmp-"),
-        }
-    }
-    /// This root's own storage temp: the prefix plus exactly 32 hex digits.
-    fn own_temp(&self, name: &str) -> bool {
-        name.strip_prefix(&self.temp_prefix)
-            .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-    }
+/// A storage temp name: `prefix` plus exactly 32 hex digits.
+fn temp_named(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 fn root_digest(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
@@ -1216,8 +1198,10 @@ impl LockedStore {
             !self.prior_root_seen.get(),
             "scan_index_prior_state_requires_repair"
         );
-        let names = FamilyNames::new(self.root_name.to_str()?);
-        let (root, stem, family) = (names.root, names.stem, names.family);
+        let root = self.root_name.to_str()?;
+        let stem = root.strip_suffix(".json").unwrap_or(root);
+        let family = stem.strip_suffix("-v2").unwrap_or(stem);
+        let temp_prefix = format!("{root}.storage-tmp-");
         visit_storage_directory(&self.parent, |name| {
             let text = name
                 .to_str()
@@ -1235,7 +1219,8 @@ impl LockedStore {
                         name,
                         libc::O_RDONLY | libc::O_DIRECTORY,
                     )?)?;
-                } else if text == format!("{stem}.private-labels") || names.own_temp(text) {
+                } else if text == format!("{stem}.private-labels") || temp_named(text, &temp_prefix)
+                {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 } else {
                     bail!("scan_index_prior_state_requires_repair");
@@ -1905,8 +1890,7 @@ fn orphan_slot(name: &str) -> Option<(Slot, &str)> {
     Some((Slot::Bucket { field, bucket }, digest))
 }
 fn owned_payload_temp(name: &str) -> bool {
-    name.strip_prefix(".tmp-")
-        .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    temp_named(name, ".tmp-")
 }
 impl LockedStore {
     pub(crate) fn take_read_stats(&self) -> ReadStats {
@@ -1984,8 +1968,9 @@ impl LockedStore {
             .root_name
             .to_str()
             .map_err(|_| anyhow::anyhow!("scan_index_root_name"))?;
-        let names = FamilyNames::new(root);
-        let (stem, family) = (names.stem, names.family);
+        let stem = root.strip_suffix(".json").unwrap_or(root);
+        let family = stem.strip_suffix("-v2").unwrap_or(stem);
+        let temp_prefix = format!("{root}.storage-tmp-");
         let mut temps = false;
         // Validate EVERY parent witness before any deletion. Unrecognized
         // siblings in this index family are evidence of possible prior state.
@@ -1993,7 +1978,7 @@ impl LockedStore {
             let text = name
                 .to_str()
                 .map_err(|_| anyhow::anyhow!("scan_index_prior_state_unknown"))?;
-            if names.own_temp(text) {
+            if temp_named(text, &temp_prefix) {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 temps = true;
             } else if text == format!("{stem}-upload-progress.lock") {
@@ -2071,7 +2056,10 @@ impl LockedStore {
             return Ok(());
         }
         visit_storage_directory(&self.parent, |name| {
-            if name.to_str().is_ok_and(|name| names.own_temp(name)) {
+            if name
+                .to_str()
+                .is_ok_and(|name| temp_named(name, &temp_prefix))
+            {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 unlink_at(&self.parent, name)?;
             }
