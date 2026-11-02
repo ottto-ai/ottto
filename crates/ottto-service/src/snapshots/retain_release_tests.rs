@@ -652,7 +652,7 @@ fn packet_refusal_buckets_and_budget_variants() {
             Event::RetentionRefusedWalkVisitLimit,
         ),
         (
-            walked(0, false, true, WalkStop::NoRoom),
+            walked(0, false, true, WalkStop::ByteLimit),
             admission(Some(10)),
             Event::RetentionRefusedBudgetZero,
         ),
@@ -726,6 +726,8 @@ fn packet_refusal_buckets_and_budget_variants() {
         take_walk_stop();
         assert_eq!(crate::heap_layout_bound::bound(&lock, usize::MAX), None);
         assert_eq!(take_walk_stop(), WalkStop::LockBusy);
+        assert_eq!(crate::heap_layout_bound::bound(&lock, 0), None);
+        assert_eq!(take_walk_stop(), WalkStop::ByteLimit);
     }
 
     // Only a deferred release carries a released finalization limit
@@ -1054,7 +1056,7 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
 
 /// T-R0f: an unknown resident bound (a poisoned retained lock while a Tail
 /// is active). Shape F evicts nothing at step start or completion, and its
-/// own copy is refused (granted 0, residents unmeasured: a poisoned lock files as no room; the
+/// own copy is refused (granted 0, residents unmeasured: a poisoned lock files with the visit limit; the
 /// step measure still walks the active, so it reads measured).
 /// An unsupported layout is not reachable here: every R0 test returns early
 /// without it, and a supported CI build always has it.
@@ -1084,7 +1086,10 @@ fn r0_unknown_resident_evicts_nothing() {
             }],
             "{source:?}"
         );
-        assert_eq!(run.counts.retention_refused_budget_zero, 1, "{source:?}");
+        assert_eq!(
+            run.counts.retention_refused_walk_visit_limit, 1,
+            "{source:?}"
+        );
         assert_eq!(
             (
                 run.counts.insert_entries_evicted,

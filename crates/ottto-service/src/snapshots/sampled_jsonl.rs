@@ -984,7 +984,7 @@ pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Event {
         (_, Some(WalkStop::LockBusy)) => Event::RetentionRefusedWalkLock,
         (_, Some(WalkStop::VisitLimit)) => Event::RetentionRefusedWalkVisitLimit,
         // The walk stopped at the state budget, so there is no room.
-        (_, Some(WalkStop::NoRoom)) => Event::RetentionRefusedBudgetZero,
+        (_, Some(WalkStop::ByteLimit)) => Event::RetentionRefusedBudgetZero,
         _ if view.budget == 0 => Event::RetentionRefusedBudgetZero,
         (Refusal::Release(sampled_scan::ReleaseOutcome::Race), None) => {
             Event::RetentionRefusedOverBudget

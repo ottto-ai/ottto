@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex, TryLockError};
 /// Why this thread's latest walks stopped early, for refusal counts only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WalkStop {
-    /// No lock or visit stop: the byte limit (a poisoned lock also lands here).
+    /// Nothing recorded: the visit limit, or an owned collection's summary
+    /// already lost to it (a poisoned lock also lands here).
     #[default]
-    NoRoom,
-    LockBusy,
     VisitLimit,
+    LockBusy,
+    ByteLimit,
 }
-thread_local! { static WALK_STOP: std::cell::Cell<WalkStop> = const { std::cell::Cell::new(WalkStop::NoRoom) }; }
+thread_local! { static WALK_STOP: std::cell::Cell<WalkStop> = const { std::cell::Cell::new(WalkStop::VisitLimit) }; }
 
 /// Read and reset this thread's stop; a later stop replaces an earlier one.
 pub(crate) fn take_walk_stop() -> WalkStop {
@@ -50,7 +51,11 @@ impl Counter {
     /// so wrapping a value adds bytes but no traversal work.
     pub(crate) fn charge(&mut self, bytes: usize) -> Option<()> {
         self.bytes = self.bytes.checked_add(bytes)?;
-        (self.bytes <= self.limit).then_some(())
+        if self.bytes > self.limit {
+            WALK_STOP.with(|stop| stop.set(WalkStop::ByteLimit));
+            return None;
+        }
+        Some(())
     }
 }
 pub(crate) trait HeapLayoutBound {
