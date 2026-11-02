@@ -52,13 +52,11 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// file whose uncertified writer copied an earlier session's requests, with
 /// own turns after them. RAM Tail, cold Full and a restored owner remove the
 /// same copied prefix and emit the same bodies, totals and placement, with a
-/// restart between pages. The real accepted-origin check is on: the delivered
-/// holder's accepted body is what lets the prefix go.
+/// restart between pages. The delivered holder's accepted body is what lets
+/// the prefix go.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _origin_required =
-        crate::snapshots::claude_request_money::e2::OriginAcceptanceRequired::on();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
@@ -184,5 +182,66 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             (&[false, false][..], &[0_usize, 0][..]),
             "pages 3-4 read and POST nothing (reads {reads:?}, posts {posts:?})"
         );
+    });
+}
+
+/// [regress] The server's head already covers the origin (changed there, by an
+/// operator admission): its answer settles no body, so the daemon keeps a learned
+/// head but no receipt or stamp. That is no acceptance: the copy keeps the prefix.
+#[test]
+fn server_learned_head_is_not_an_accepted_origin() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("server_learned_head_origin") {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("server_learned_head_origin");
+        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        input_clock(&holder);
+        let disk = Disk::new(&c);
+        let scanner = E2ScanFixture::default();
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let mut progress = e2_progress();
+        let (status, _, _) = upload(&warm.scan.snapshots, &mut progress, |batch| {
+            let mut response = ack(batch)?;
+            for mut entity in std::mem::take(&mut response.accepted_entities) {
+                entity.unchanged_basis = Some("usage_identical".into());
+                if entity.head_etag.is_some() {
+                    entity.head_etag = Some("3".repeat(64));
+                }
+                response.unchanged_entities.push(entity);
+            }
+            Ok(response)
+        });
+        assert!(status.is_ok());
+        assert!(progress.fresh_context_body_acks.is_empty());
+        assert!(progress.accepted_body_contexts.is_empty());
+        let acks = std::mem::take(&mut progress.fresh_context_body_acks);
+        accept_upload_context_acks_for_test(&mut warm.index, &warm.scan.snapshots, &acks);
+        assert!(!upload_context_receipt_earned_for_test(
+            &warm.index,
+            &holder
+        ));
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+
+        let path = c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        input_clock(&path);
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut page = c.raw(&scanner, prior, 100, true, &[]);
+        page.enrich(&c);
+        page.finish();
+        let copy = body(&page, COPY).expect("the copy's own turn publishes");
+        assert_eq!(
+            copy.request_count, 1,
+            "only its own turn, while the prefix waits"
+        );
+        assert_eq!(copy.removed_request_count.unwrap_or(0), 0);
     });
 }

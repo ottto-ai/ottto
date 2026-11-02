@@ -40,29 +40,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::heap_layout_bound::split_fields as money_heap_fields;
 
-// Fixtures that predate the accepted-origin rule model an origin the server
-// already holds, like `FIXTURE_BIRTH` models an ordinary transcript. A test of
-// that rule turns the real evidence check on.
-#[cfg(test)]
-thread_local! {
-    static ORIGIN_ACCEPTANCE_REQUIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-/// Test seam: the real accepted-origin check, until dropped.
-#[cfg(test)]
-pub(crate) struct OriginAcceptanceRequired(bool);
-#[cfg(test)]
-impl OriginAcceptanceRequired {
-    pub(crate) fn on() -> Self {
-        Self(ORIGIN_ACCEPTANCE_REQUIRED.with(|v| v.replace(true)))
-    }
-}
-#[cfg(test)]
-impl Drop for OriginAcceptanceRequired {
-    fn drop(&mut self) {
-        ORIGIN_ACCEPTANCE_REQUIRED.with(|v| v.set(self.0));
-    }
-}
-
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
@@ -2349,14 +2326,26 @@ fn holder_order(
     Some((birth, location_key(key)))
 }
 
-/// A copied prefix leaves the copy only when the origin's own body can hold it
-/// on the server. Without that, removing it would count those requests nowhere.
-fn origin_accepted(index: &ScanIndex, holder: &str) -> bool {
-    #[cfg(test)]
-    if !ORIGIN_ACCEPTANCE_REQUIRED.with(std::cell::Cell::get) {
-        return true;
+/// Whether an earlier holder's own body can hold a copied prefix on the server.
+/// Without that, removing the prefix would count its requests nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Accepted,
+    /// The daemon may still deliver its body: the prefix waits (`defer_prefix`).
+    Awaited,
+    /// A protected family's bodies stay frozen, whatever evidence is left from
+    /// them: never accepted, and no wait for an ACK that cannot come.
+    Protected,
+}
+
+fn origin_of(index: &ScanIndex, holder: &str) -> Origin {
+    if index.claude_family_listed(holder) {
+        Origin::Protected
+    } else if index.file_has_accepted_body(holder) {
+        Origin::Accepted
+    } else {
+        Origin::Awaited
     }
-    index.origin_body_accepted(holder)
 }
 
 /// Owner direction (PR C (a)): a /branch names its original in a
@@ -2377,7 +2366,7 @@ fn parent_proves(
     member.subagent_stem.is_none()
         && member.root != session
         && index.files.contains_key(parent)
-        && origin_accepted(index, parent)
+        && origin_of(index, parent) == Origin::Accepted
         && !index
             .claude_request_census
             .get(parent)
@@ -2469,9 +2458,13 @@ fn decide_holders(
                     // The saved removal stays recorded and applies again once
                     // the indexed holder has an accepted body. A holder no
                     // longer indexed was checked when its removal was stored.
-                    if key.is_some_and(|key| !origin_accepted(index, key)) {
-                        unaccepted.insert(hash);
-                        continue;
+                    match key.map_or(Origin::Accepted, |key| origin_of(index, key)) {
+                        Origin::Accepted => {}
+                        Origin::Awaited => {
+                            unaccepted.insert(hash);
+                            continue;
+                        }
+                        Origin::Protected => continue,
                     }
                     stored.insert(hash);
                     if key.is_none() {
@@ -2513,7 +2506,7 @@ fn decide_holders(
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey), Origin)>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2526,23 +2519,28 @@ fn decide_holders(
                         if evidence == Evidence::None {
                             return None;
                         }
-                        let accepted = origin_accepted(index, key);
-                        Some((evidence, holder_order(store, root, key)?, accepted))
+                        Some((
+                            evidence,
+                            holder_order(store, root, key)?,
+                            origin_of(index, key),
+                        ))
                     });
                     match holder {
-                        Some((evidence, holder, accepted)) if holder < file.order => match evidence
-                        {
+                        Some((evidence, holder, origin)) if holder < file.order => match evidence {
                             Evidence::Queued => file.waiting = true,
                             Evidence::Stale => {
                                 file.stale.insert(hash);
                             }
-                            Evidence::Current if !accepted => {
-                                file.unaccepted.insert(hash);
-                            }
-                            Evidence::Current => {
-                                let earliest = file.covered.entry(hash).or_insert(holder);
-                                *earliest = (*earliest).min(holder);
-                            }
+                            Evidence::Current => match origin {
+                                Origin::Accepted => {
+                                    let earliest = file.covered.entry(hash).or_insert(holder);
+                                    *earliest = (*earliest).min(holder);
+                                }
+                                Origin::Awaited => {
+                                    file.unaccepted.insert(hash);
+                                }
+                                Origin::Protected => {}
+                            },
                             Evidence::None => {}
                         },
                         _ => {}
@@ -2632,6 +2630,18 @@ fn decide_holders(
             .iter()
             .any(|hash| wanted.unaccepted.contains(hash))
         {
+            // One decision pass waited, and once per wait a copy that waits.
+            let first_pass = updates
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.pending(wanted.order.1));
+            diag(
+                "copy_prefix_origin_unaccepted_copies",
+                u64::from(first_pass),
+            );
+            diag("copy_prefix_origin_unaccepted_passes", 1);
+            record_counts(Counts::one(27, u64::from(first_pass)));
+            record_counts(Counts::one(28, 1));
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -4352,8 +4362,12 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // A prefix kept for an unaccepted origin, removed by the first read after
     // that origin's late acceptance.
     "copy_prefix_late_origin_removed",
+    // Copies waiting for an origin's first accepted body, and the decision
+    // passes they waited (at most `HOLD_PASSES` per wait).
+    "copy_prefix_origin_unaccepted_copies",
+    "copy_prefix_origin_unaccepted_passes",
 ];
-const COUNT_LEN: usize = 27;
+const COUNT_LEN: usize = 29;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(

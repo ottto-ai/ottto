@@ -333,21 +333,22 @@ impl ScanIndex {
         body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
     }
 
-    /// `key` has a body the server accepted for this destination, in any
-    /// context: a receipt of a real body, an entity stamp, or a settled
-    /// revision 3. It proves an accepted body, not each request id, and a
-    /// protected family's old evidence proves nothing: its bodies stay frozen.
-    pub(super) fn origin_body_accepted(&self, key: &str) -> bool {
+    /// The daemon's own evidence that the server accepted a body it sent for
+    /// this file, in any context: a receipt of a real body or an entity stamp.
+    /// Both descend only from an exact ACK of a sent body; no server-learned
+    /// head state reaches them. A settled revision is not evidence: it is
+    /// stamped at finalize, before any POST, and for below-floor and empty
+    /// files. It proves an accepted body, not each request id.
+    pub(super) fn file_has_accepted_body(&self, key: &str) -> bool {
         let Some(entry) = self.files.get(key) else {
             return false;
         };
         let proof = &self.upload_context_proof;
-        !self.claude_family_listed(key)
+        !self.decode_holds_file(key)
             && (entry
                 .upload_context_receipt
                 .as_ref()
                 .is_some_and(|receipt| !receipt.body_witness.is_empty())
-                || entry.effective_upload_body_witness_revision >= 3
                 || (proof.replay_generation == self.historical_replay_generation
                     && self
                         .file_snapshot_fingerprints
