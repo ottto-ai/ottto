@@ -20005,26 +20005,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn note_pi_time(&mut self, timestamp: Option<String>) {
-        let Some(timestamp) = timestamp else {
-            return;
-        };
-        if self
-            .started_at
-            .as_ref()
-            .map_or(true, |current| timestamp_is_before(&timestamp, current))
-        {
-            self.started_at = Some(timestamp.clone());
-        }
-        if self
-            .last_activity_at
-            .as_ref()
-            .map_or(true, |current| timestamp_is_after(&timestamp, current))
-        {
-            self.last_activity_at = Some(timestamp);
-        }
-    }
-
     /// Retain one Claude usage-bearing record for response-level resolution.
     /// No session-exclusive metric is mutated here; `finalize_claude_responses`
     /// admits exactly one terminal observation after the full file is read.
@@ -42090,7 +42070,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(selector) = pi_selector_from_custom(value) {
                 accumulator.set_selector(selector);
             }
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
@@ -42100,7 +42080,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["sessionId"]));
             }
             pi_content_line(value, None, accumulator);
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         Some("message") => {
             // Pi user prompts use both legacy top-level `role` and current
@@ -42127,7 +42107,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             {
                 accumulator.note_dropped_usage();
             }
-            accumulator.note_pi_time(timestamp);
+            accumulator.note_time(timestamp);
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
@@ -42143,19 +42123,19 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
                 accumulator.note_dropped_usage();
             }
-            accumulator.note_pi_time(timestamp);
+            accumulator.note_time(timestamp);
         }
         Some("model_change") => {
             accumulator
                 .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         // Pi 0.81.0+ bills summary generation on these entries and 0.86.0+
         // writes `usage` entries (e.g. cache warming); Pi's session totals add
         // each exactly once and no assistant message repeats them.
         Some("compaction" | "branch_summary" | "usage") => {
             apply_pi_entry_usage(value, accumulator);
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         _ => {}
     }
