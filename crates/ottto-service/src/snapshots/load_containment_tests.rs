@@ -363,3 +363,66 @@ fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_sel
     assert_eq!(scan_index_load_drops_for_test(), before_reload);
     assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);
 }
+
+/// [behaviour] An unreadable Repair stamp allows one rebuild, then its fresh
+/// stamp enforces the existing cooldown after restart.
+#[cfg(unix)]
+#[test]
+fn unreadable_repair_stamp_allows_one_rebuild() {
+    let scratch = crate::test_scratch::ScratchDir::new("load-containment-unreadable-stamp");
+    let path = scratch.join("index.json");
+    let support = scratch.join("support");
+    let source = SnapshotSource::ClaudeCode;
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+    note_scan_index_rebuild_paused(source, false);
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+
+    let stamp = scan_index_override_stamp_path(&support, source);
+    fs::create_dir_all(stamp.parent().unwrap()).unwrap();
+    // A self-referencing symlink is unreadable even when tests run as root,
+    // and the normal atomic stamp writer can replace it.
+    std::os::unix::fs::symlink(stamp.file_name().unwrap(), &stamp).unwrap();
+    assert_ne!(
+        fs::read(&stamp).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let mut damage = serde_json::to_value(lc_fixture()).unwrap();
+    damage["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    let damage = serde_json::to_vec(&damage).unwrap();
+    fs::write(&path, &damage).unwrap();
+    assert!(load()
+        .unwrap_err()
+        .downcast_ref::<ScanIndexRebuildLoop>()
+        .is_some());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    let fresh: ScanIndexOverrideStamp = serde_json::from_slice(&fs::read(&stamp).unwrap()).unwrap();
+    assert!(fresh.last_override_unix_seconds > 0);
+
+    // A different checkpoint has no override witness, so only the fresh
+    // source-wide stamp can enforce the cooldown after restart.
+    let next_path = scratch.join("next-index.json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    fs::write(
+        scratch.join(format!("next-index.corrupt.123.{now}.json")),
+        b"prior witness",
+    )
+    .unwrap();
+    fs::write(&next_path, &damage).unwrap();
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+    assert!(ScanIndex::load_for_snapshot_source_with_origin(&next_path, source, &support).is_err());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    note_scan_index_rebuild_paused(source, false);
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+}

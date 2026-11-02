@@ -33775,8 +33775,7 @@ impl OwnedSourceScan {
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
-            if source == SnapshotSource::ClaudeCode
-                && sampled_audit::growth_active(index)
+            if sampled_audit::growth_active(index)
                 && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
             {
                 sampled_audit::queue_growth_retry(index, &candidate);
@@ -47272,17 +47271,28 @@ fn advance_bounded_directory_traversal_with_budget(
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
     // moves its census counts or touches the Codex directory census.
+    // Except discovery of the members it adds: a path that joins this
+    // generation's census pending set was discovered by it, so pending never
+    // exceeds discovered (the status wire rejects skipped > discovered).
     let mut relisted_counts = None;
-    let restore = |counts: &mut ScanTraversalCounts, saved: Option<ScanTraversalCounts>| {
+    let mut relisted_members = 0;
+    let restore = |counts: &mut ScanTraversalCounts,
+                   saved: Option<ScanTraversalCounts>,
+                   members: &mut usize| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
             saved.listing_owed_pace_evicted = counts.listing_owed_pace_evicted;
+            saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
         }
     };
     while remaining > 0 {
-        restore(&mut traversal.counts, relisted_counts.take());
+        restore(
+            &mut traversal.counts,
+            relisted_counts.take(),
+            &mut relisted_members,
+        );
         let Some(directory) = traversal.pending_directories.pop_front() else {
             break;
         };
@@ -47556,7 +47566,7 @@ fn advance_bounded_directory_traversal_with_budget(
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
             traversal.counts.discovered_file_count += 1;
-            traversal.observed_index_keys.insert(local_index_key(&path));
+            let first_observed = traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
                 oversized_discovery::record(
@@ -47585,6 +47595,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 traversal.counts.listing_changes_without_hint +=
                     u64::from(relisting && !owed_unchanged);
                 traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
+                relisted_members += usize::from(relisting && census_member && first_observed);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
@@ -47595,7 +47606,11 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
-    restore(&mut traversal.counts, relisted_counts);
+    restore(
+        &mut traversal.counts,
+        relisted_counts,
+        &mut relisted_members,
+    );
     if walk_issues(&traversal.counts) != issues_before {
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
@@ -52780,10 +52795,7 @@ impl ScanIndex {
             }
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
-        index.settle_claude_index_load(path, load_origin);
-        if source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(&index) {
-            sampled_audit::bind_growth_claims(&mut index, path);
-        }
+        index.settle_loaded_index(path, load_origin);
         let first_load_in_process = index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::Codex && first_load_in_process {
             requeue_unindexed_codex_observed(&mut index);
@@ -52816,12 +52828,18 @@ impl ScanIndex {
     fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
         let (mut index, origin) =
             Self::load_inner_with_probe(path, source, None, SystemTime::now(), None)?;
-        index.settle_claude_index_load(path, ScanIndexLoadOrigin::from(&origin));
-        if sampled_audit::growth_active(&index) {
-            sampled_audit::bind_growth_claims(&mut index, path);
-        }
+        index.settle_loaded_index(path, ScanIndexLoadOrigin::from(&origin));
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         Ok(index)
+    }
+
+    /// The one post-load step of both load entry points. Growth-claim lineage
+    /// binds here for every v2-active source, so the two cannot drift apart.
+    fn settle_loaded_index(&mut self, path: &Path, load_origin: ScanIndexLoadOrigin) {
+        self.settle_claude_index_load(path, load_origin);
+        if sampled_audit::growth_active(self) {
+            sampled_audit::bind_growth_claims(self, path);
+        }
     }
 
     /// Both load entry points repair tombstones and retain guard (b) from
