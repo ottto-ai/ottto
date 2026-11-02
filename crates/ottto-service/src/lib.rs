@@ -49,6 +49,8 @@ pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
 pub mod net_transition;
+#[cfg(test)]
+pub(crate) mod on_proof;
 pub mod otlp_relay;
 pub(crate) mod provider_calls;
 pub mod provider_daily_reference;

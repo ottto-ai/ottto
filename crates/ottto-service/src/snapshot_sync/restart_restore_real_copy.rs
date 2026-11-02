@@ -10,6 +10,9 @@
 // clone sets of every root; `run/` holds this arm's working roots and
 // `run/support`, a support copy in its production layout (each index stays
 // in its namespace dir beside its companion storage and durable store).
+// `otel-t0/local-otel` and `otel-t1/local-otel` are the telemetry copies taken
+// with each root set: warm, restart and growth see T0's, the drain and cold
+// see T1's, so a growth page never sees telemetry newer than its transcripts.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::{
     codex_evidence, money_oracle, native_cold, Mode, RouteResult,
@@ -23,6 +26,34 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 /// index needs its first Full plus the identity contract's one re-read.
 const WARM_CAP: usize = 24;
 const GROWTH_PAGES: u64 = 6;
+/// After the last growth page, passes until one reads nothing, so every
+/// grown file is read once more before the oracle (as the next cycles would).
+const DRAIN_CAP: u64 = 12;
+
+/// Installs telemetry copy `which` (`t0` or `t1`) as the run's `local-otel`;
+/// without that copy the support copy's own telemetry stays. Counts only.
+fn telemetry(arm: &str, dir: &Path, support: &Path, which: &str) {
+    let from = dir.join(format!("otel-{which}")).join("local-otel");
+    let mut found = Vec::new();
+    files(&from, &mut found);
+    if found.is_empty() {
+        report(arm, json!({"phase": "telemetry", "which": "support"}));
+        return;
+    }
+    let to = support.join("local-otel");
+    let _ = std::fs::remove_dir_all(&to);
+    for file in &found {
+        let target = to.join(file.strip_prefix(&from).unwrap());
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(target.parent().unwrap())
+            .unwrap();
+        std::fs::copy(file, &target).unwrap();
+    }
+    report(
+        arm,
+        json!({"phase": "telemetry", "which": which, "files": found.len()}),
+    );
+}
 
 fn report(arm: &str, mut row: Value) {
     row["on_proof"] = json!(true);
@@ -83,8 +114,9 @@ struct Lane {
     /// Latest emitted body per entity, and Codex tier state for the oracle.
     bodies: BTreeMap<String, Value>,
     tier_replay: Value,
-    /// Passes, then growth Full, Tail, read bytes and appended bytes.
-    totals: [u64; 5],
+    /// Passes, then growth Full, Tail, read bytes and appended bytes, then
+    /// drain Full, Tail and read bytes.
+    totals: [u64; 8],
 }
 
 impl Lane {
@@ -201,12 +233,14 @@ impl Lane {
                         progress
                             .accepted_fingerprints
                             .extend(chunk.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        progress.fresh_context_body_acks.extend(chunk.iter().map(|item| {
-                            (
-                                item.snapshot_fingerprint.clone(),
-                                snapshot_upload_body_witness(item),
-                            )
-                        }));
+                        progress
+                            .fresh_context_body_acks
+                            .extend(chunk.iter().map(|item| {
+                                (
+                                    item.snapshot_fingerprint.clone(),
+                                    snapshot_upload_body_witness(item),
+                                )
+                            }));
                         Some(canonical(&wire))
                     })
                     .collect();
@@ -408,8 +442,11 @@ fn round(
     held: &[u64],
 ) -> bool {
     let mut quiet = true;
+    crate::on_proof::next_pass();
     for (i, lane) in lanes.iter_mut().enumerate() {
         let mut row = lane.pass(c, &c.base);
+        // Per-class holds/serves and completed-read buckets of this lane pass.
+        row["proof"] = crate::on_proof::row();
         let (full, tail) = (row["full"].as_u64().unwrap(), row["tail"].as_u64().unwrap());
         quiet &= full == 0 && tail == 0;
         lane.totals[0] += 1;
@@ -423,6 +460,11 @@ fn round(
             }
             row["appended_bytes"] = json!(appended[i]);
             row["partial_line_bytes_held"] = json!(held[i]);
+        } else if phase == "drain" {
+            let read = row["read_bytes"].as_u64().unwrap();
+            for (total, add) in lane.totals[5..].iter_mut().zip([full, tail, read]) {
+                *total += add;
+            }
         }
         row["phase"] = json!(phase);
         row["pass"] = json!(pass);
@@ -700,6 +742,7 @@ fn oracle(dir: &Path, lanes: &[Lane]) {
 }
 
 fn run(arm: &str, dir: &Path) {
+    crate::on_proof::enable();
     let _switch = if arm == "on" {
         crate::snapshots::RestartRestoreForTest::enabled()
     } else {
@@ -746,12 +789,18 @@ fn run(arm: &str, dir: &Path) {
             disk: Disk { dir: state, index },
             bodies: BTreeMap::new(),
             tier_replay: Value::Null,
-            totals: [0; 5],
+            totals: [0; 8],
         });
     }
     report(
         arm,
         json!({"phase": "load", "sources": lanes.len(), "footprint_floor": footprint()}),
+    );
+    telemetry(
+        arm,
+        dir,
+        &c.support,
+        if arm == "cold" { "t1" } else { "t0" },
     );
     let phase = if arm == "cold" { "cold" } else { "warm" };
     let mut quiet_at = None;
@@ -788,14 +837,35 @@ fn run(arm: &str, dir: &Path) {
             round(arm, "growth", page, &mut lanes, &c, &delivered, &held);
             save(dir, arm, &lanes);
         }
+        // T1 telemetry now matches the delivered transcripts; drain until a
+        // pass reads nothing, so the oracle sees what later cycles converge to.
+        telemetry(arm, dir, &c.support, "t1");
+        let mut drain_quiet_at = None;
+        for pass in 1..=DRAIN_CAP {
+            let quiet = round(arm, "drain", pass, &mut lanes, &c, &[], &[]);
+            save(dir, arm, &lanes);
+            if quiet {
+                drain_quiet_at = Some(pass);
+                break;
+            }
+        }
+        report(
+            arm,
+            json!({"phase": "drain_quiet", "drain_quiet_at_pass": drain_quiet_at, "cap": DRAIN_CAP}),
+        );
     }
+    report(
+        arm,
+        json!({"phase": "proof_end", "proof": crate::on_proof::end()}),
+    );
     for lane in &lanes {
-        let [passes, full, tail, read, appended] = lane.totals;
+        let [passes, full, tail, read, appended, drain_full, drain_tail, drain_read] = lane.totals;
         report(
             arm,
             json!({"phase": "totals", "source": lane.source.api_slug(), "passes": passes,
             "growth_full": full, "growth_tail": tail, "growth_read_bytes": read,
             "appended_bytes": appended, "read_over_appended": read as f64 / appended.max(1) as f64,
+            "drain_full": drain_full, "drain_tail": drain_tail, "drain_read_bytes": drain_read,
             "entities": lane.bodies.len()}),
         );
     }

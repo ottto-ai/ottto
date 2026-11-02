@@ -663,6 +663,10 @@ impl Context {
             .map(|mut pace| pace.admit(key, now))
             .unwrap_or((true, false));
         self.pace_evicted += usize::from(evicted);
+        #[cfg(test)]
+        if !admit {
+            crate::on_proof::hold("audit_cap_delay", key);
+        }
         if admit {
             self.audit_cap_full += 1;
         } else {

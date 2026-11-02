@@ -30021,6 +30021,13 @@ impl OwnedSourceScan {
                             plan.mode(),
                             plan.metrics().native_bytes,
                         );
+                        #[cfg(test)]
+                        crate::on_proof::completed(
+                            &local_index_key(&active.candidate.path),
+                            &format!("{:?}", plan.mode()),
+                            &format!("{:?}", active.parse_reason),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
@@ -38089,6 +38096,8 @@ fn settle_native_attempt(
                 // acquisition is borrowed again to bind or owe it.
                 Ok(fences) => match staged {
                     PrepareOutcome::Prepared(prepared) => {
+                        #[cfg(test)]
+                        crate::on_proof::written(fence.key);
                         let outcome = cache.commit_prepared(prepared, fences);
                         write_disposition(
                             cache,
@@ -38109,11 +38118,15 @@ fn settle_native_attempt(
                         )
                     }
                     PrepareOutcome::NotPersisted(reason) => {
+                        #[cfg(test)]
+                        crate::on_proof::hold(&format!("wa.{reason:?}"), fence.key);
                         let outcome =
                             cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
                         unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
                     }
                     PrepareOutcome::Degraded(reason) => {
+                        #[cfg(test)]
+                        crate::on_proof::hold(&format!("wa.degraded.{reason:?}"), fence.key);
                         let outcome =
                             cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
                         unprepared_disposition(cache, &mut acquisition, fence.source, outcome)

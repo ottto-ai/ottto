@@ -1721,6 +1721,8 @@ impl SharedCache {
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
+        #[cfg(test)]
+        let raw_key = key;
         let key = full_pace_key(source, key);
         // A held replay key keeps its Full spend in never-evicted custody.
         // The pace stamp remains the overflow fallback for unfunded keys.
@@ -1835,6 +1837,8 @@ impl SharedCache {
                 &serde_json::json!({"near_cap": {"retail_exhausted": 1}}),
             );
         }
+        #[cfg(test)]
+        on_proof_pace(raw_key, delayed, active_bound, cause);
         !delayed
     }
 
@@ -2784,6 +2788,8 @@ impl SharedCache {
         index: &mut ScanIndex,
         candidate: &CandidateFile,
     ) {
+        #[cfg(test)]
+        crate::on_proof::hold(class, &local_index_key(&candidate.path));
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
@@ -2814,6 +2820,11 @@ impl SharedCache {
         candidate: &CandidateFile,
         census: &mut ScanCensus,
     ) {
+        #[cfg(test)]
+        crate::on_proof::hold(
+            &format!("hold_exit.{reason:?}"),
+            &local_index_key(&candidate.path),
+        );
         if reason == store::Refusal::BehindAccepted {
             if let Some(mut stores) = self.durable() {
                 stores.counters.durable_held[reason as usize] += 1;
@@ -3097,6 +3108,8 @@ impl SharedCache {
                 }
             }
         }
+        #[cfg(test)]
+        on_proof_restore(key, &outcome);
         outcome
     }
 
@@ -3178,6 +3191,10 @@ impl SharedCache {
                     "resource_full_granted",
                 )
             };
+        #[cfg(test)]
+        if !full {
+            crate::on_proof::hold(&format!("resource_pending.{phase}"), key);
+        }
         if let Some(mut stores) = self.durable() {
             if full && source != SnapshotSource::Codex {
                 Counters::bump(&mut stores.counters.resource_full, phase);
@@ -3224,6 +3241,10 @@ impl SharedCache {
         } else {
             self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
         };
+        #[cfg(test)]
+        if !granted {
+            crate::on_proof::hold(&format!("resource_full_start.{phase}"), key);
+        }
         if !granted {
             return false;
         }
@@ -4289,6 +4310,8 @@ impl SharedCache {
                 },
             );
         } else {
+            #[cfg(test)]
+            crate::on_proof::hold("pass_overflow.decided", key);
             Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
         }
     }
@@ -4403,6 +4426,8 @@ impl SharedCache {
                     .insert(key.to_string(), ScopeDecision::Scope(scope.clone()));
             }
         } else {
+            #[cfg(test)]
+            crate::on_proof::hold("pass_overflow.decided", key);
             Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
         }
     }
@@ -4420,6 +4445,8 @@ impl SharedCache {
                     .selected
                     .insert(key.to_string(), source_file_fingerprint.to_string());
             } else {
+                #[cfg(test)]
+                crate::on_proof::hold("pass_overflow.selected", key);
                 Counters::bump(&mut stores.counters.ineligible, "pass_overflow.selected");
             }
         }
@@ -4435,6 +4462,8 @@ impl SharedCache {
             if stores.touched.len() < stores.pass_key_cap() || stores.touched.contains(key) {
                 stores.touched.insert(key.to_string());
             } else {
+                #[cfg(test)]
+                crate::on_proof::hold("pass_overflow.touched", key);
                 Counters::bump(&mut stores.counters.ineligible, "pass_overflow.touched");
             }
         }
@@ -5949,6 +5978,34 @@ mod restore_test {
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
             }
         }
+    }
+}
+
+/// ON-proof recorder: a delayed per-key Full pace holds the file under its cause.
+#[cfg(test)]
+fn on_proof_pace(key: &str, delayed: bool, active_bound: bool, cause: Option<usize>) {
+    if !delayed {
+        return;
+    }
+    let class = match (active_bound, cause) {
+        (true, _) => "pace.active_bound",
+        (_, None) => "pace.full",
+        (_, Some(3)) => "pace.old_binding_no_match",
+        (_, Some(4)) => "pace.upgrade_state_missing",
+        (_, Some(STALE_SELECTION_CAUSE)) => "pace.selection_cleared.stale_record_full",
+        (_, Some(_)) => "pace.stale_full",
+    };
+    crate::on_proof::hold(class, key);
+}
+
+/// ON-proof recorder: a restore serves the key's holds; a held outcome holds it.
+#[cfg(test)]
+fn on_proof_restore(key: &str, outcome: &RestoreOutcome) {
+    match outcome {
+        RestoreOutcome::Restored(..) => crate::on_proof::restored(key),
+        RestoreOutcome::FloorHeld => crate::on_proof::hold("restore.floor_held", key),
+        RestoreOutcome::Held(_) => crate::on_proof::hold("restore.held", key),
+        _ => {}
     }
 }
 
