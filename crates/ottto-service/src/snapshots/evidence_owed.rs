@@ -808,11 +808,11 @@ pub(super) fn latch_clearable(
         return None;
     }
     let mut exempt = BTreeSet::new();
-    for (root, pending) in index.claude_usage_family_pending.loaded_all() {
-        if pending.invalid || evidence_free(pending) {
+    for (root, pending) in index.claude_usage_family_pending.views() {
+        if pending.invalid() || pending.evidence_free() {
             continue;
         }
-        if pending.census_window_end == census_window_end && !owed.contains(root) {
+        if pending.window() == census_window_end && !owed.contains(root) {
             continue;
         }
         if quarantined(root) {
@@ -882,16 +882,15 @@ pub(super) fn due_only(state: &ClaudeRetryAdmission) -> ClaudeRetryAdmission {
 /// completed family proof retires pending.
 pub(super) fn owed_at_completion(
     root_session_id: &str,
-    pending: &ClaudeUsageFamilyPending,
+    pending: super::usage_pending::UsageView<'_>,
     proven: bool,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
     !proven
         && (indexed_claude_family_ids.contains(root_session_id)
             || pending
-                .member_request_id_hashes
-                .keys()
-                .chain(pending.member_occurrences.keys())
+                .hash_members()
+                .chain(pending.occurrence_members())
                 .any(|member| indexed_claude_family_ids.contains(member)))
 }
 

@@ -560,9 +560,17 @@ impl UsagePending {
     /// `all` inside a decision that loaded every family before it began (a
     /// terminal page): a cold graph refused that page when the load failed,
     /// so this cannot see Unknown.
+    #[expect(
+        dead_code,
+        reason = "the terminal streams usage now; removed with the whole-kind load"
+    )]
     pub(super) fn loaded_all(&self) -> &Families {
         self.all().expect("usage_pending_loaded_before_join")
     }
+    #[expect(
+        dead_code,
+        reason = "the terminal streams usage now; removed with the whole-kind load"
+    )]
     pub(super) fn loaded_all_mut(&mut self) -> &mut Families {
         self.all_mut().expect("usage_pending_loaded_before_join")
     }

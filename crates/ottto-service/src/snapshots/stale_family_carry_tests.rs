@@ -4212,15 +4212,16 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
 
     // An indexed family this census did not prove stays owed.
     let indexed = BTreeSet::from([root.clone()]);
+    let view = usage_pending::UsageView::Full(&invalid);
     assert!(evidence_owed::owed_at_completion(
-        &root, &invalid, false, &indexed
+        &root, view, false, &indexed
     ));
     assert!(!evidence_owed::owed_at_completion(
-        &root, &invalid, true, &indexed
+        &root, view, true, &indexed
     ));
     assert!(!evidence_owed::owed_at_completion(
         &root,
-        &invalid,
+        view,
         false,
         &BTreeSet::new()
     ));
@@ -4896,7 +4897,10 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
     assert!(!pending.is_empty());
     for (root, pending) in pending {
         assert!(evidence_owed::owed_at_completion(
-            root, pending, false, &indexed
+            root,
+            usage_pending::UsageView::Full(pending),
+            false,
+            &indexed
         ));
     }
     assert_eq!(
