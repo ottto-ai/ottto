@@ -97,10 +97,6 @@ pub(crate) const SOURCES: &[Properties] = &[
         representations: &representations(
             "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
         ),
-        #[cfg(test)]
-        encode: durable::encode_body,
-        #[cfg(test)]
-        decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::pi::verify_body,
