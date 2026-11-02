@@ -36,7 +36,6 @@ pub(super) struct LineReader {
     /// The length at open: nothing past it is read.
     end: u64,
     line: Vec<u8>,
-    parse_file: Option<[u8; 32]>,
 }
 
 impl LineReader {
@@ -56,17 +55,6 @@ impl LineReader {
         end: u64,
         capacity: usize,
     ) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        let parse_file = file.metadata().ok().map(|metadata| {
-            use sha2::{Digest, Sha256};
-            use std::os::unix::fs::MetadataExt;
-            let mut hash = Sha256::new();
-            hash.update(metadata.dev().to_le_bytes());
-            hash.update(metadata.ino().to_le_bytes());
-            hash.finalize().into()
-        });
-        #[cfg(not(unix))]
-        let parse_file = None;
         file.seek(SeekFrom::Start(offset))?;
         // Bound prefetch too: a file may grow after the length was pinned.
         let file = file.take(end.saturating_sub(offset));
@@ -77,7 +65,6 @@ impl LineReader {
             pos: offset,
             end: end.max(offset),
             line: Vec::new(),
-            parse_file,
         })
     }
 
@@ -96,23 +83,10 @@ impl LineReader {
         self.line.capacity() + self.reader.capacity()
     }
 
-    pub(super) fn record_parse_result(&self, failed: bool) {
-        if let Some(file) = self.parse_file {
-            crate::local_resource_diagnostics::jsonl::parse_result(
-                file,
-                self.pos.saturating_sub(self.line.len() as u64 + 1),
-                failed,
-            );
-        }
-    }
-
     /// The next event, or `None` when no complete line remains before the
     /// length at open.
     pub(super) fn next_event(&mut self) -> std::io::Result<Option<LineEvent<'_>>> {
-        self.line.clear();
-        if self.line.capacity() > 64 * 1024 {
-            self.line.shrink_to(64 * 1024);
-        }
+        crate::snapshots::release_line_buffer(&mut self.line);
         let remaining = self.end - self.pos;
         if remaining == 0 {
             return Ok(None);
@@ -120,8 +94,7 @@ impl LineReader {
         let read = (&mut self.reader)
             .take(remaining)
             .read_until(b'\n', &mut self.line)?;
-        // Composition decodes borrowed views, rather than owning a full JSON DOM.
-        crate::local_resource_diagnostics::jsonl::parse_peak(self.buffer_bytes(), None);
+        crate::local_resource_diagnostics::jsonl::line_buffer(self.line.capacity());
         if self.line.last() == Some(&b'\n') {
             self.pos += read as u64;
             self.line.pop();

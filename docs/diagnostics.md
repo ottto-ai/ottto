@@ -149,15 +149,13 @@ telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
 process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
-Whole-record JSONL parsing has no line-size refusal. The `jsonl_page` stage
-reports per-source/page `max_line_bytes`, `lines_over_16_mib`,
-`lines_over_64_mib`, `lines_over_256_mib`, measured `max_line_buffer_bytes`
-(capacity), and `parse_peak_estimated_bytes` (capacity plus estimated JSON DOM).
-The estimate is not RSS or an upper bound. Large line buffers are released after
-the record; byte targets yield between records. The counts-only
-`jsonl_repeat_parse_failure_alarm` fires once on the third consecutive failed
-parse at a file/offset, without changing reading or retries. Failure history
-uses fixed storage; `failure_tracking_evictions` counts replaced history.
+Whole-record JSONL parsing has no line-size refusal. `native_collection_page`
+and `context_composition_read` report nonzero `max_line_bytes`,
+`lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer capacity, not RSS or
+an upper bound). 16 MiB is only a release point: a completed record above it
+frees its line buffer; byte targets yield between records. The counts-only
+`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
+on consecutive native pages, without changing reading or retries.
 
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field

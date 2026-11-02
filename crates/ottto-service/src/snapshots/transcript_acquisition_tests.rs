@@ -4810,7 +4810,8 @@ fn native_v3_ordinary_save_then_second_restart_tails_without_a_full() {
     }
 }
 
-/// [regress] Every source publishes usage on a real line above the former 16 MiB boundary.
+/// [regress] Every source publishes usage on a real line above the former 16 MiB boundary,
+/// delivered once, with its line buffer freed.
 #[test]
 fn whole_large_usage_line_is_published_for_each_source() {
     for source in [
@@ -4833,7 +4834,7 @@ fn whole_large_usage_line_is_published_for_each_source() {
         assert_eq!(scan.snapshots[0].output_tokens, 10);
         let counts = observations
             .iter()
-            .filter(|row| row["stage"] == "jsonl_page")
+            .filter(|row| row["stage"] == "native_collection_page")
             .map(|row| &row["counts"])
             .find(|counts| counts["lines_over_16_mib"] == 1)
             .unwrap();
@@ -4842,18 +4843,7 @@ fn whole_large_usage_line_is_published_for_each_source() {
             counts["max_line_buffer_bytes"].as_u64().unwrap()
                 >= counts["max_line_bytes"].as_u64().unwrap()
         );
-        assert!(
-            counts["parse_peak_estimated_bytes"].as_u64().unwrap()
-                > counts["max_line_buffer_bytes"].as_u64().unwrap()
-        );
-        assert_eq!(counts["lines_over_64_mib"], 0);
-        assert_eq!(counts["lines_over_256_mib"], 0);
     }
-}
-
-/// [regress] A large physical record is delivered once and its allocation is released.
-#[test]
-fn whole_line_is_delivered_once_and_releases_large_buffer() {
     let mut bytes =
         format!("{{\"padding\":\"{}\"}}\n", "x".repeat(16 * 1024 * 1024 + 1)).into_bytes();
     let first_end = bytes.len() as u64;
@@ -4866,8 +4856,11 @@ fn whole_line_is_delivered_once_and_releases_large_buffer() {
     );
     assert_eq!(delivered, 1);
     assert_eq!(reader.consumed_bytes(), first_end);
-    assert!(reader.buf.is_empty());
-    assert!(reader.buf.capacity() < first_end as usize / 2);
+    assert_eq!(
+        reader.buf.capacity(),
+        0,
+        "the large record's buffer is freed"
+    );
     assert_eq!(
         reader.step(|_| delivered += 1).unwrap(),
         JsonlReaderStep::Line

@@ -982,8 +982,11 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(flatten)]
+            jsonl: jsonl::Counts,
         }
         let claude = source == "claude_code";
+        let jsonl = jsonl::take(source);
         let counts = Counts {
             line_delivery: self
                 .line_delivery
@@ -1023,6 +1026,7 @@ impl Probe {
             },
             collection: counts,
             pending,
+            jsonl,
             identity: if claude {
                 crate::snapshots::claude_request_identity::take_identity_counts()
             } else {
@@ -1047,7 +1051,7 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
-        jsonl::emit_page(source, self);
+        jsonl.alarm_on_consecutive_failures(source);
     }
 }
 
@@ -1193,6 +1197,7 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    jsonl: Option<jsonl::Scope>,
 }
 impl StageWindow {
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
@@ -1201,7 +1206,14 @@ impl StageWindow {
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            jsonl: None,
         }
+    }
+    /// A window that also scopes and reports JSONL line scalars for `source`.
+    pub(crate) fn begin_jsonl(source: &str, stage: &'static str) -> Self {
+        let mut window = Self::begin(source, stage);
+        window.jsonl = Some(jsonl::Scope::begin(source));
+        window
     }
 }
 impl Drop for StageWindow {
@@ -1209,13 +1221,20 @@ impl Drop for StageWindow {
         if std::thread::panicking() {
             return;
         }
+        #[derive(Serialize)]
+        struct Counts {
+            #[serde(flatten)]
+            jsonl: Option<jsonl::Counts>,
+        }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
             observation: self.probe.stage_observation(self.footprint.as_ref()),
-            counts: EmptyCounts {},
+            counts: Counts {
+                jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
+            },
         });
     }
 }

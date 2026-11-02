@@ -459,7 +459,7 @@ fn never_counted_records_are_recognised_at_the_top_level_only() {
 }
 
 #[test]
-/// [regress] Whole lines are retained; a frozen partial line resumes from its start.
+/// [behaviour] Whole lines are retained; a frozen partial line resumes from its start.
 fn line_reader_reads_whole_lines_to_length_at_open() {
     let dir = scratch("composition-v2-reader");
     let path = dir.join("lines.jsonl");

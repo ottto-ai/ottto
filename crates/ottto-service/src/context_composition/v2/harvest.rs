@@ -1249,6 +1249,13 @@ pub(super) fn run_source(
     roots: &[PathBuf],
     target: Option<UploadTarget>,
 ) -> SourceStats {
+    let _read_window = crate::local_resource_diagnostics::StageWindow::begin_jsonl(
+        match source {
+            Source::Claude => "claude_code",
+            Source::Codex => "codex",
+        },
+        "context_composition_read",
+    );
     let started = Instant::now();
     let cpu_started = thread_cpu_micros();
     let mut stats = run_source_inner(run, source, roots, target);

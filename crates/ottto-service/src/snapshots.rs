@@ -26912,12 +26912,7 @@ impl OwnedSourceScan {
         Self {
             native_publication: None,
             native_comparison: None,
-            resource_probe: {
-                crate::local_resource_diagnostics::jsonl::begin_page(
-                    SnapshotSource::Codex.api_slug(),
-                );
-                crate::local_resource_diagnostics::Probe::start()
-            },
+            resource_probe: crate::local_resource_diagnostics::Probe::start(),
             sampling: None,
             durable_guard: None,
             source: SnapshotSource::Codex,
@@ -27003,7 +26998,6 @@ impl OwnedSourceScan {
         recovery_priority: &[PathBuf],
         durable_cache: Option<&sampled_scan::SharedCache>,
     ) -> Self {
-        crate::local_resource_diagnostics::jsonl::begin_page(source.api_slug());
         let _jsonl_scope =
             crate::local_resource_diagnostics::jsonl::Scope::begin(source.api_slug());
         let _select_window = state_v2::state_v2_growth_retention_active(&owned_index)
@@ -36741,8 +36735,7 @@ impl OwnedJsonlParser {
             claude_opened_birth = opened.as_ref().and_then(claude_opened_file_birth);
         }
 
-        let mut reader = BoundedJsonlReader::new(reader);
-        reader.parse_file = Some(Sha256::digest(path.as_os_str().as_encoded_bytes()).into());
+        let reader = BoundedJsonlReader::new(reader);
         Ok(Self {
             pending: None,
             #[cfg(test)]
@@ -38443,6 +38436,20 @@ enum JsonlReaderStep {
     Complete(JsonlReadReport),
 }
 
+/// The line-buffer release point, and the former maximum line size. It is not
+/// an admission cap: a record of any size is read whole. Only the allocation of
+/// a completed record above it is freed; at or below it, capacity is retained.
+pub(crate) const LINE_BUFFER_RELEASE_BYTES: usize = 16 * 1024 * 1024;
+
+/// End one physical record's buffer, for every JSONL line reader.
+pub(crate) fn release_line_buffer(buf: &mut Vec<u8>) {
+    if buf.len() > LINE_BUFFER_RELEASE_BYTES {
+        *buf = Vec::new();
+    } else {
+        buf.clear();
+    }
+}
+
 // Own the existing reader/buffer/report so a caller can move work between
 // physical lines. No decoded row or transcript history crosses a step.
 // This bounds work units, not blocking I/O or individual JSON parsing time.
@@ -38461,7 +38468,6 @@ struct BoundedJsonlReader<R> {
     last_line_end: u64,
     /// Unterminated bytes at the frozen extent, awaiting unchanged-EOF proof.
     sealed_fragment: Option<()>,
-    parse_file: Option<[u8; 32]>,
     /// Set by `finish_job` or the in-page grown route: the identity `finish` may
     /// accept for a grown object. `Certified` after its prefix certificate
     /// passed (S12); `LossySameObject` is not a sealed-prefix
@@ -38482,7 +38488,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             consumed: 0,
             last_line_end: 0,
             sealed_fragment: None,
-            parse_file: None,
             sealed_prefix: None,
         }
     }
@@ -38520,27 +38525,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         let Some(()) = self.sealed_fragment.take() else {
             return false;
         };
-        let failed_before =
-            self.report.malformed_json_line_count + self.report.invalid_utf8_line_count;
-        apply_physical_line(
-            &self.buf,
-            self.buf.capacity(),
-            &mut self.report,
-            None,
-            &mut on_value,
-        );
-        if let Some(file) = self.parse_file {
-            crate::local_resource_diagnostics::jsonl::parse_result(
-                file,
-                self.acquisition
-                    .as_ref()
-                    .map_or(0, |plan| plan.start_offset())
-                    .saturating_add(self.last_line_end),
-                self.report.malformed_json_line_count + self.report.invalid_utf8_line_count
-                    > failed_before,
-            );
-        }
-        self.release_buffer();
+        apply_physical_line(&self.buf, &mut self.report, None, &mut on_value);
+        release_line_buffer(&mut self.buf);
         true
     }
 
@@ -38568,7 +38554,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         // existing buffer capacity; no logical raw row survives this return.
         // A withheld final record keeps its bytes until unchanged-EOF proof.
         if self.sealed_fragment.is_none() {
-            self.release_buffer();
+            release_line_buffer(&mut self.buf);
         }
         if let Err(error) = &result {
             // A partial physical line may already have been consumed. Resuming
@@ -38576,13 +38562,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             self.failure = Some(error.kind());
         }
         result
-    }
-
-    fn release_buffer(&mut self) {
-        self.buf.clear();
-        if self.buf.capacity() > 64 * 1024 {
-            self.buf.shrink_to(64 * 1024);
-        }
     }
 
     fn read_step(
@@ -38653,13 +38632,13 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 }
             }
         };
+        crate::local_resource_diagnostics::jsonl::line_buffer(buf.capacity());
         if reached_eof && self.extent_limit.is_some() && !buf.is_empty() && !line_complete {
             // Sealed cursor completion (S5): a record without its newline at
             // or before the frozen extent is unfinished for this read, even if
             // no byte beyond the extent is visible yet. It is never parsed,
             // counted or certified. Reads without an extent keep the normal
             // trailing-line behavior below, byte-identical to before.
-            crate::local_resource_diagnostics::jsonl::parse_peak(buf.capacity(), None);
             self.sealed_fragment = Some(());
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
@@ -38677,11 +38656,9 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             let end = plan.start_offset().saturating_add(self.consumed);
             (end.saturating_sub(len), len)
         });
-        let failed_before = report.malformed_json_line_count + report.invalid_utf8_line_count;
         crate::durable_tail_codec::with_line(line, || {
             apply_physical_line(
                 buf,
-                buf.capacity(),
                 report,
                 // An unterminated trailing line reaches money only, never LD.
                 on_line.filter(|_| line_complete).map(|tap| {
@@ -38697,16 +38674,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 &mut on_value,
             )
         });
-        if let Some(file) = self.parse_file {
-            crate::local_resource_diagnostics::jsonl::parse_result(
-                file,
-                self.acquisition
-                    .as_ref()
-                    .map_or(0, |plan| plan.start_offset())
-                    .saturating_add(line_start),
-                report.malformed_json_line_count + report.invalid_utf8_line_count > failed_before,
-            );
-        }
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
     }
@@ -38716,7 +38683,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
 /// trailing line at EOF). Shared by every read path; `deliver` is LD's tap.
 fn apply_physical_line(
     buf: &[u8],
-    buffer_bytes: usize,
     report: &mut JsonlReadReport,
     deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
@@ -38734,15 +38700,16 @@ fn apply_physical_line(
             }
             Err(_) => {
                 report.malformed_json_line_count += 1;
+                crate::local_resource_diagnostics::jsonl::parse_failure();
                 None
             }
         },
         JsonlLineText::InvalidUtf8 => {
             report.invalid_utf8_line_count += 1;
+            crate::local_resource_diagnostics::jsonl::parse_failure();
             None
         }
     };
-    crate::local_resource_diagnostics::jsonl::parse_peak(buffer_bytes, value.as_ref());
     if let Some((length, end, tap)) = deliver {
         let value = value.as_ref();
         tap(length, &line_delivery::PhysicalLine { end, value });
@@ -85137,7 +85104,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             consumed,
             last_line_end,
             sealed_fragment,
-            parse_file,
             sealed_prefix,
         } = self;
         c.add(reader.capacity())?;
@@ -85151,7 +85117,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
         consumed.heap_bound(c)?;
         last_line_end.heap_bound(c)?;
         sealed_fragment.heap_bound(c)?;
-        parse_file.heap_bound(c)?;
         sealed_prefix.heap_bound(c)?;
         acquisition.heap_bound(c)
     }
@@ -85497,7 +85462,7 @@ pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
 // the listed OFF parser-box allocation delta honest; no runtime test executes.
 #[cfg(all(unix, target_pointer_width = "64", not(test)))]
 const _: () = {
-    assert!(size_of::<OwnedJsonlParser>() == 5232);
+    assert!(size_of::<OwnedJsonlParser>() == 5200);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
     // to the 856-byte active frame; parser/custody boxing is unchanged.

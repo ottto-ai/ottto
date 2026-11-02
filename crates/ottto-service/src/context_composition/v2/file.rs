@@ -263,10 +263,6 @@ pub(super) fn read_lines(
     out: &mut LineSink,
     deadline: Instant,
 ) -> Result<ReadEnd, ReadError> {
-    let _page = crate::local_resource_diagnostics::jsonl::Page::begin(match source {
-        Source::Claude => "claude_code",
-        Source::Codex => "codex",
-    });
     let mut reader =
         LineReader::open(file, offset, end, skipping).map_err(|_| ReadError { bytes: 0 })?;
     let mut cut = false;
@@ -286,7 +282,6 @@ pub(super) fn read_lines(
                 })
             }
         };
-        let bad_before = out.stats.bad_lines;
         match event {
             None => break,
             Some(LineEvent::Line(line)) => match source {
@@ -294,7 +289,6 @@ pub(super) fn read_lines(
                 Source::Codex => codex::handle_line(out, state, line),
             },
         }
-        reader.record_parse_result(out.stats.bad_lines > bad_before);
         buffer_bytes = buffer_bytes.max(reader.buffer_bytes());
     }
     Ok(ReadEnd {

@@ -1145,9 +1145,7 @@ fn a_straddling_parent_row_pushes_no_signature() {
 fn a_job_finishes_a_record_before_yielding_at_its_budget() {
     let root = temp_root("job-budget");
     let parent = rollout(&root, PARENT);
-    let mut rows = parent_values();
-    rows[0]["padding"] = json!("x".repeat(16 * 1024 * 1024 + 1));
-    write_values(&parent, &rows);
+    write_values(&parent, &parent_values());
     let child = rollout(&root, CHILD);
     write_values(&child, &child_values());
     let reserve = codex_proof_step_reserve();
@@ -1159,7 +1157,7 @@ fn a_job_finishes_a_record_before_yielding_at_its_budget() {
 
     let mut budget = reserve;
     assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
-    assert!(job.consumed > 16 * 1024 * 1024);
+    assert!(job.consumed > reserve);
     assert_eq!(budget, 0);
 
     let mut budget = u64::MAX;

@@ -1118,7 +1118,8 @@ fn restore_rederives_the_exact_retained_copy() {
         );
         assert!(receipt.head_bytes <= HEAD_BOUND);
         assert!(receipt.named_lines as usize <= NAMED_LINES);
-        assert!(receipt.line_bytes > 0);
+        // The only named line is the title; a Pi session has none.
+        assert_eq!(receipt.line_bytes > 0, case.source != SnapshotSource::Pi);
     }
 }
 
