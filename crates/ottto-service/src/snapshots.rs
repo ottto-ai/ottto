@@ -47116,17 +47116,28 @@ fn advance_bounded_directory_traversal_with_budget(
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
     // moves its census counts or touches the Codex directory census.
+    // Except discovery of the members it adds: a path that joins this
+    // generation's census pending set was discovered by it, so pending never
+    // exceeds discovered (the status wire rejects skipped > discovered).
     let mut relisted_counts = None;
-    let restore = |counts: &mut ScanTraversalCounts, saved: Option<ScanTraversalCounts>| {
+    let mut relisted_members = 0;
+    let restore = |counts: &mut ScanTraversalCounts,
+                   saved: Option<ScanTraversalCounts>,
+                   members: &mut usize| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
             saved.listing_owed_pace_evicted = counts.listing_owed_pace_evicted;
+            saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
         }
     };
     while remaining > 0 {
-        restore(&mut traversal.counts, relisted_counts.take());
+        restore(
+            &mut traversal.counts,
+            relisted_counts.take(),
+            &mut relisted_members,
+        );
         let Some(directory) = traversal.pending_directories.pop_front() else {
             break;
         };
@@ -47400,7 +47411,7 @@ fn advance_bounded_directory_traversal_with_budget(
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
             traversal.counts.discovered_file_count += 1;
-            traversal.observed_index_keys.insert(local_index_key(&path));
+            let first_observed = traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
                 oversized_discovery::record(
@@ -47429,6 +47440,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 traversal.counts.listing_changes_without_hint +=
                     u64::from(relisting && !owed_unchanged);
                 traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
+                relisted_members += usize::from(relisting && census_member && first_observed);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
@@ -47439,7 +47451,11 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
-    restore(&mut traversal.counts, relisted_counts);
+    restore(
+        &mut traversal.counts,
+        relisted_counts,
+        &mut relisted_members,
+    );
     if walk_issues(&traversal.counts) != issues_before {
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
