@@ -8,9 +8,6 @@ use serde_json::json;
 
 const SESSION_EQUAL: &str = "1d164000-0000-4000-8000-00000000000a";
 const SESSION_PARTIAL: &str = "1d164000-0000-4000-8000-00000000000b";
-/// The response's model, and the model of a declined first attempt.
-const MODEL: &str = "claude-opus-4-8";
-const DECLINED: &str = "claude-sonnet-4-5";
 
 /// Billed kinds in order: input, output, cache read, cache write 5m and 1h.
 type Billed = [u64; 5];
@@ -19,11 +16,6 @@ fn billed(input: u64, output: u64, read: u64, write_5m: u64, write_1h: u64) -> V
     json!({"input_tokens": input, "output_tokens": output, "cache_read_input_tokens": read,
         "cache_creation_input_tokens": write_5m + write_1h,
         "cache_creation": {"ephemeral_5m_input_tokens": write_5m, "ephemeral_1h_input_tokens": write_1h}})
-}
-
-fn on(model: &str, mut usage: Value) -> Value {
-    usage["model"] = json!(model);
-    usage
 }
 
 fn counted(usage: &UsageTotals) -> Billed {
@@ -40,7 +32,6 @@ fn counted(usage: &UsageTotals) -> Billed {
 fn classes() -> Vec<(&'static str, Value, Vec<Value>, Billed)> {
     let last = billed(3, 90, 70_000, 2_000, 0);
     let last_1h = billed(1, 10, 600, 0, 100);
-    let fallback = billed(2, 60, 50_500, 500, 0);
     vec![
         (
             "top level equals the sum",
@@ -69,17 +60,6 @@ fn classes() -> Vec<(&'static str, Value, Vec<Value>, Billed)> {
             vec![billed(1, 10, 500, 0, 300), last_1h],
             [2, 20, 1_100, 0, 400],
         ),
-        (
-            // A server-side fallback: the declined first attempt on the
-            // requested model, then the fallback the top level restates.
-            "declined attempt on another model",
-            fallback.clone(),
-            vec![
-                on(DECLINED, billed(4, 30, 50_000, 1_000, 0)),
-                on(MODEL, fallback),
-            ],
-            [6, 90, 100_500, 1_500, 0],
-        ),
     ]
 }
 
@@ -88,7 +68,7 @@ fn response(session: &str, n: usize, top: &Value, iterations: &[Value], at: &str
     usage["iterations"] = json!(iterations);
     json!({"type": "assistant", "sessionId": session, "uuid": format!("u{n}"), "cwd": "/synthetic",
         "timestamp": at, "requestId": format!("req_{n}"), "message": {"id": format!("msg_{n}"),
-        "model": MODEL, "role": "assistant", "usage": usage}})
+        "model": "claude-opus-4-8", "role": "assistant", "usage": usage}})
 }
 
 /// [regress] A response whose usage sits only in `iterations[]`, in full or
@@ -113,55 +93,7 @@ fn claude_usage_takes_the_larger_of_top_level_and_iterations_per_kind() {
     }
 }
 
-/// [regress] A declined first attempt is placed on its own model and the
-/// fallback on the response's model; the response stays one request.
-#[test]
-fn claude_declined_attempt_is_placed_on_its_own_model() {
-    let dir = crate::test_scratch::ScratchDir::canonical("claude-usage-declined");
-    let path = dir.join(format!("{SESSION_PARTIAL}.jsonl"));
-    let (_, top, iterations, _) = classes().pop().unwrap();
-    let line = response(
-        SESSION_PARTIAL,
-        0,
-        &top,
-        &iterations,
-        "2026-11-02T10:00:00Z",
-    );
-    fs::write(&path, line.to_string() + "\n").unwrap();
-    let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-        &path,
-        "2026-11-02T10:05:00Z",
-        "synthetic-source".into(),
-    )
-    .unwrap()
-    .remove(0);
-    let mut rows = item
-        .usage_buckets
-        .iter()
-        .flat_map(|bucket| &bucket.model_usage)
-        .map(|row| {
-            let tokens = [row.input_tokens, row.output_tokens, row.cache_read_tokens];
-            (
-                row.model.as_str(),
-                tokens,
-                row.cache_creation_5m_tokens,
-                row.request_count,
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort();
-    assert_eq!(
-        rows,
-        [
-            (MODEL, [2, 60, 50_500], 500, 1),
-            (DECLINED, [4, 30, 50_000], 1_000, 0)
-        ]
-    );
-    assert_eq!(item.request_count, 1);
-    assert_eq!(item.input_tokens, 6);
-}
-
-/// [money] Whole emitted money, per model, equals a transcript whose top level
+/// [money] Emitted money and placement equal a transcript whose top level
 /// already states every call, so the fold adds exactly the iterations-only
 /// usage.
 /// A session with only top-level-equals-sum lines emits the top-level totals,
@@ -205,7 +137,27 @@ fn claude_iterations_fold_matches_a_complete_top_level() {
     };
     let (complete, _) = scan("complete", true);
     let (as_written, result) = scan("as-written", false);
-    sampled_scan::transition_fixture::money_oracle::assert_equivalent(&complete, &as_written);
+    // The oracle's money fields and placement, not the whole body: a top level
+    // stating the sum of two calls also states a larger single prompt, so the
+    // context watermarks rightly differ.
+    use sampled_scan::transition_fixture::money_oracle::{
+        assert_placement_equivalent, diff, FIELDS,
+    };
+    assert_eq!(complete.snapshots.len(), 2);
+    assert_placement_equivalent(&complete, &as_written);
+    let mut differences = Vec::new();
+    for (entity, body) in &complete.snapshots {
+        for field in FIELDS {
+            let other = &as_written.snapshots[entity][*field];
+            diff(
+                &format!("{entity}/{field}"),
+                &body[*field],
+                other,
+                &mut differences,
+            );
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
 
     let emitted = |session: &str| {
         let item = result
@@ -222,7 +174,7 @@ fn claude_iterations_fold_matches_a_complete_top_level() {
         ]
     };
     assert_eq!(emitted(SESSION_EQUAL), [12, 150, 3_000, 600, 0]);
-    // Top-level totals [9, 210, 122_100, 2_700, 1_784] plus the
-    // iterations-only remainder [12, 472, 1_025_411, 5_000, 300].
-    assert_eq!(emitted(SESSION_PARTIAL), [21, 682, 1_147_511, 7_700, 2_084]);
+    // Top-level totals [7, 150, 71_600, 2_200, 1_784] plus the
+    // iterations-only remainder [8, 442, 975_411, 4_000, 300].
+    assert_eq!(emitted(SESSION_PARTIAL), [15, 592, 1_047_011, 6_200, 2_084]);
 }

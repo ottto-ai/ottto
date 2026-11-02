@@ -18607,10 +18607,6 @@ struct SnapshotAccumulator {
     claude_responses: ClaudeResponseBook,
     claude_response_sequence: u64,
     claude_response_record_count: usize,
-    // By response sequence: the calls of a response that ran on another model
-    // than the response names (`claude_code_iteration_models`). Rare; drained
-    // by finalization.
-    claude_iteration_models: BTreeMap<u64, Vec<(String, UsageTotals)>>,
     // Exact provider response ids for the once-per-response Claude usage rows
     // above. Local-only; copied into SnapshotItem solely for account-evidence
     // coverage and never serialized.
@@ -18840,7 +18836,6 @@ impl SnapshotAccumulator {
             claude_responses: ClaudeResponseBook::default(),
             claude_response_sequence: 0,
             claude_response_record_count: 0,
-            claude_iteration_models: BTreeMap::new(),
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
             // Preserve parser fixtures' capture default; released scans capture Claude only.
@@ -20056,19 +20051,12 @@ impl SnapshotAccumulator {
             return;
         }
         let selector = self.claude_responses.selectors.intern(selector);
-        let iteration_models = claude_code_usage_root(value)
-            .map(|root| claude_code_iteration_models(root, model.as_deref()))
-            .unwrap_or_default();
         // The request's own usage records carry entrypoint. Missing or mixed
         // records fail closed; session-first origin is deliberately irrelevant.
         let desktop_request =
             value.get("entrypoint").and_then(Value::as_str) == Some("claude-desktop");
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             existing.desktop_request &= desktop_request;
-            if !iteration_models.is_empty() {
-                self.claude_iteration_models
-                    .insert(existing.sequence, iteration_models);
-            }
             if existing.push(
                 usage,
                 model,
@@ -20088,10 +20076,6 @@ impl SnapshotAccumulator {
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
         self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
-        if !iteration_models.is_empty() {
-            self.claude_iteration_models
-                .insert(sequence, iteration_models);
-        }
         let mut response = ClaudeResponseObservation::new(
             sequence,
             usage,
@@ -20202,38 +20186,24 @@ impl SnapshotAccumulator {
                 at,
                 effective_input_context,
             );
-            // A call that ran on another model (a declined first attempt
-            // before a fallback) is its own row on that model, priced there;
-            // the response stays one request on the model it names.
-            let extra = self
-                .claude_iteration_models
-                .remove(&response.sequence)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(model, usage)| {
-                    let mut selector = response.selector.clone();
-                    derive_claude_context_bucket(
-                        &mut selector,
-                        Some(&model),
-                        usage.effective_input_context(),
+            if !response.selector.context.contains_key("context_bucket") {
+                // Stamped only against the model's catalog line: Haiku 5.5's
+                // 100K price line or the 200K analysis line of flat 1M-window
+                // models. Models without a catalog line carry no bucket.
+                if let Some(context_bucket) = response.model.as_deref().and_then(|model| {
+                    provider_context_bucket(
+                        model,
+                        effective_input_context,
                         response.terminal_timestamp.as_deref(),
+                    )
+                }) {
+                    response.selector.insert(
+                        "context_bucket",
+                        context_bucket.to_string(),
+                        "derived_from_effective_input_volume",
                     );
-                    let placed = self.place_usage(
-                        Some(model),
-                        &usage,
-                        selector,
-                        response.terminal_timestamp.as_deref(),
-                        response.reasoning_effort.as_deref(),
-                    );
-                    (usage, placed)
-                })
-                .collect::<Vec<_>>();
-            derive_claude_context_bucket(
-                &mut response.selector,
-                response.model.as_deref(),
-                effective_input_context,
-                response.terminal_timestamp.as_deref(),
-            );
+                }
+            }
             let has_request_id = response.request_id.is_some();
             if let Some(request_id) = response.request_id.take() {
                 let selector = match shared_selectors.get(&response.selector) {
@@ -20330,28 +20300,11 @@ impl SnapshotAccumulator {
             for name in response.tool_uses.into_values() {
                 self.note_tool_usage(name);
             }
-            // The response's own model keeps what the other-model calls
-            // leave: the line total stays the parsed usage.
-            let mut usage = response.usage;
-            for (part, _) in &extra {
-                usage.input_tokens = usage.input_tokens.saturating_sub(part.input_tokens);
-                usage.output_tokens = usage.output_tokens.saturating_sub(part.output_tokens);
-                usage.cache_read_tokens = usage
-                    .cache_read_tokens
-                    .saturating_sub(part.cache_read_tokens);
-                usage.cache_creation_5m_tokens = usage
-                    .cache_creation_5m_tokens
-                    .saturating_sub(part.cache_creation_5m_tokens);
-                usage.cache_creation_1h_tokens = usage
-                    .cache_creation_1h_tokens
-                    .saturating_sub(part.cache_creation_1h_tokens);
-            }
-            usage.reasoning_output_tokens = usage.reasoning_output_tokens.min(usage.output_tokens);
-            // One native placement per response row; the money fold reuses it.
+            // One native placement per response; the money fold reuses it.
             let placed = claude_request_money::e2::timed("native.place", || {
                 self.place_usage(
                     response.model,
-                    &usage,
+                    &response.usage,
                     response.selector,
                     response.terminal_timestamp.as_deref(),
                     response.reasoning_effort.as_deref(),
@@ -20362,24 +20315,16 @@ impl SnapshotAccumulator {
                     money.observe(
                         response.sequence,
                         has_request_id,
-                        (&usage, placed.as_ref()),
-                        &extra,
+                        &response.usage,
                         at,
+                        placed.as_ref(),
                         response.reasoning_effort.as_deref(),
                     )
                 });
             }
-            for (part, placed) in extra {
-                if let Some(placed) = placed {
-                    let effort = response.reasoning_effort.clone();
-                    claude_request_money::e2::timed("native.add", || {
-                        self.add_placed_usage(placed, part, effort)
-                    });
-                }
-            }
             if let Some(placed) = placed {
                 claude_request_money::e2::timed("native.add", || {
-                    self.add_placed_usage(placed, usage, response.reasoning_effort)
+                    self.add_placed_usage(placed, response.usage, response.reasoning_effort)
                 });
             }
         }
@@ -42991,53 +42936,6 @@ fn claude_code_usage_iterations(root: &Value) -> &[Value] {
     root.get("iterations")
         .and_then(Value::as_array)
         .map_or(&[], Vec::as_slice)
-}
-
-/// The calls of a response that name another model than the response does
-/// (a refused first attempt before a server-side fallback), each with its own
-/// counters and no request of its own. Empty on ordinary responses.
-fn claude_code_iteration_models(root: &Value, model: Option<&str>) -> Vec<(String, UsageTotals)> {
-    let Some(model) = model else {
-        return Vec::new();
-    };
-    claude_code_usage_iterations(root)
-        .iter()
-        .filter_map(|iteration| {
-            let other = iteration
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|other| *other != model)?;
-            let usage = UsageTotals {
-                request_count: 0,
-                ..claude_code_usage_fields(iteration)
-            };
-            Some((other.to_string(), usage))
-        })
-        .collect()
-}
-
-/// Stamp the context bucket from the prompt size, against the model's catalog
-/// line only: Haiku 5.5's 100K price line or the 200K analysis line of flat
-/// 1M-window models. Models without a catalog line carry no bucket, and a
-/// transcript-supplied bucket stays authoritative.
-fn derive_claude_context_bucket(
-    selector: &mut SelectorCapture,
-    model: Option<&str>,
-    effective_input_context: u64,
-    timestamp: Option<&str>,
-) {
-    if selector.context.contains_key("context_bucket") {
-        return;
-    }
-    if let Some(context_bucket) =
-        model.and_then(|model| provider_context_bucket(model, effective_input_context, timestamp))
-    {
-        selector.insert(
-            "context_bucket",
-            context_bucket.to_string(),
-            "derived_from_effective_input_volume",
-        );
-    }
 }
 
 /// One usage object's own counters: a response's top level or one of its
@@ -85956,7 +85854,7 @@ crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
     N source_created_at: Option<String>,
 });
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_iteration_models, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
 crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
