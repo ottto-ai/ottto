@@ -115,7 +115,7 @@ fn top_files_withheld_sums_every_file_before_the_top_cut() {
     let extra = UPLOAD_TOP_FILES as u64 + 29;
     for n in 0..extra {
         let key = FileKey {
-            path: format!("{FILE}-{n}"),
+            path: format!("{FILE}-{n}").into(),
             kind: Kind::FilesRead,
             part: crate::composition_kinds::Part::FileTool,
         };
