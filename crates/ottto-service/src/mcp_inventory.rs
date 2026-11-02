@@ -697,13 +697,10 @@ fn plugin_servers(
     let Ok(text) = std::fs::read_to_string(file) else {
         return Vec::new();
     };
-    // Substitute inside the JSON text, so the root goes in JSON-escaped.
-    let escaped = serde_json::to_string(&root.to_string_lossy()).unwrap_or_default();
-    let escaped = escaped
-        .get(1..escaped.len().saturating_sub(1))
-        .unwrap_or("");
-    let Ok(value) = serde_json::from_str::<Value>(&text.replace("${CLAUDE_PLUGIN_ROOT}", escaped))
-    else {
+    // Claude Code substitutes the plugin root for this token; a root that is
+    // not valid inside a JSON string fails to parse and declares nothing.
+    let text = text.replace("${CLAUDE_PLUGIN_ROOT}", &root.to_string_lossy());
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return Vec::new();
     };
     mcp_servers_block(&value)
@@ -1481,11 +1478,6 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// returned unreachable with `deferred = true`, and the cycle keeps the last
 /// good inventory (see `harvest_source`).
 fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput, bool) {
-    // The agent never loads a disabled server, so it is reported without
-    // launching it.
-    if server.disabled {
-        return (unreachable_server(server), false);
-    }
     let tools = match &server.transport {
         Transport::Stdio {
             command,
