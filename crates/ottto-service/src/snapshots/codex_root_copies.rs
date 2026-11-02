@@ -3,7 +3,7 @@ use super::*;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct RootSidecar {
-    pub threads: BTreeMap<String, CodexStateThread>,
+    pub threads: BTreeMap<String, Arc<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
 }
 
@@ -84,7 +84,7 @@ fn compatible_copy(
 pub(super) fn merge_threads(
     metadata: &mut CodexTitleMetadata,
     root: &Path,
-    incoming: &BTreeMap<String, CodexStateThread>,
+    incoming: &BTreeMap<String, Arc<CodexStateThread>>,
 ) {
     for (id, row) in incoming {
         if metadata.identity_conflicts.contains(id) {
@@ -110,19 +110,24 @@ pub(super) fn merge_threads(
             metadata.state_threads.remove(id);
             continue;
         }
-        let replace = metadata.state_threads.get(id).map_or(true, |prior| {
-            (
-                row.tokens_used,
-                row.updated_at.as_deref().and_then(rfc3339_unix_nanos),
-                &row.rollout_path,
-            ) > (
-                prior.tokens_used,
-                prior.updated_at.as_deref().and_then(rfc3339_unix_nanos),
-                &prior.rollout_path,
-            )
-        });
-        if replace {
-            metadata.state_threads.insert(id.clone(), row.clone());
+        match metadata.state_threads.entry(id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(row));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let prior = entry.get();
+                if (
+                    row.tokens_used,
+                    row.updated_at.as_deref().and_then(rfc3339_unix_nanos),
+                    &row.rollout_path,
+                ) > (
+                    prior.tokens_used,
+                    prior.updated_at.as_deref().and_then(rfc3339_unix_nanos),
+                    &prior.rollout_path,
+                ) {
+                    entry.insert(Arc::clone(row));
+                }
+            }
         }
     }
 }
@@ -152,19 +157,23 @@ pub(super) fn merge_extents(
             metadata.identity_conflicts.insert(id.clone());
             continue;
         }
-        let Some(prior) = metadata.rollout_extents.get(id).copied() else {
-            metadata.rollout_extents.insert(id.clone(), *extent);
-            continue;
-        };
-        if extent.next_byte_offset >= prior.next_byte_offset
-            && extent.next_ordinal >= prior.next_ordinal
-        {
-            metadata.rollout_extents.insert(id.clone(), *extent);
-        } else if extent.next_byte_offset > prior.next_byte_offset
-            || extent.next_ordinal > prior.next_ordinal
-        {
-            metadata.rollout_extents.remove(id);
-            metadata.identity_conflicts.insert(id.clone());
+        match metadata.rollout_extents.entry(id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(*extent);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let prior = entry.get();
+                if extent.next_byte_offset >= prior.next_byte_offset
+                    && extent.next_ordinal >= prior.next_ordinal
+                {
+                    entry.insert(*extent);
+                } else if extent.next_byte_offset > prior.next_byte_offset
+                    || extent.next_ordinal > prior.next_ordinal
+                {
+                    entry.remove();
+                    metadata.identity_conflicts.insert(id.clone());
+                }
+            }
         }
         // A shorter, older copy is progress, not a different identity. These
         // maxima decorate metadata only; parser file proofs use RootSidecar.

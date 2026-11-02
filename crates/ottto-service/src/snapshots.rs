@@ -160,6 +160,9 @@ pub(crate) use claude_context_file_birth::{
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
+mod codex_log_selector;
+#[cfg(test)]
+mod codex_prepare_transient_tests;
 mod codex_root_copies;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
@@ -16905,7 +16908,7 @@ struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     /// Merged maximum for state-only fallback; never use for file binding.
     /// Registered files must use `thread_extent_for_path` and their own home.
-    state_threads: BTreeMap<String, CodexStateThread>,
+    state_threads: BTreeMap<String, Arc<CodexStateThread>>,
     /// Merged maximum for metadata summaries; never use for file binding.
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
@@ -43540,12 +43543,12 @@ impl CodexTitleMetadata {
             .max_by_key(|(root, _)| root.components().count())
         {
             return (
-                sidecar.threads.get(identity),
+                sidecar.threads.get(identity).map(AsRef::as_ref),
                 sidecar.extents.get(identity).copied(),
             );
         }
         (
-            self.state_threads.get(identity),
+            self.state_threads.get(identity).map(AsRef::as_ref),
             self.rollout_extents.get(identity).copied(),
         )
     }
@@ -43563,7 +43566,9 @@ impl CodexTitleMetadata {
         let (thread, extent) = path.map_or_else(
             || {
                 (
-                    self.state_threads.get(source_session_id.as_str()),
+                    self.state_threads
+                        .get(source_session_id.as_str())
+                        .map(AsRef::as_ref),
                     self.rollout_extents
                         .get(source_session_id.as_str())
                         .copied(),
@@ -44045,7 +44050,10 @@ fn load_codex_logs2_priority_turns(
         )?;
         let rows = statement.query_map(
             rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
-            |row| row.get::<_, String>(0),
+            |row| {
+                let body = row.get_ref(0)?.as_str()?;
+                Ok(codex_logs2_priority_turn_from_body(body))
+            },
         )?;
         let mut complete = true;
         let mut read = 0_u64;
@@ -44056,7 +44064,7 @@ fn load_codex_logs2_priority_turns(
                 continue;
             };
             read += 1;
-            turns.extend(codex_logs2_priority_turn_from_body(&body));
+            turns.extend(body);
         }
         if read == CODEX_LOGS2_MAX_ROWS as u64 {
             CapCounts::record("codex", 3, 1);
@@ -44080,12 +44088,10 @@ fn codex_logs2_priority_turn_from_body(body: &str) -> Option<String> {
     let idx = body.rfind(MARKER)?;
     let prefix = &body[..idx];
     let json_text = body[idx + MARKER.len()..].trim();
-    let value: Value = serde_json::from_str(json_text).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("response.create") {
-        return None;
-    }
-    let tier = value.get("service_tier").and_then(Value::as_str)?;
-    if !tier.eq_ignore_ascii_case("priority") {
+    let selector = serde_json::from_str::<codex_log_selector::Selector>(json_text).ok()?;
+    if selector.kind.as_deref() != Some("response.create")
+        || !selector.tier.as_deref()?.eq_ignore_ascii_case("priority")
+    {
         return None;
     }
     codex_logs2_span_field(prefix, "turn.id")
@@ -44176,23 +44182,41 @@ fn load_codex_sqlite_titles(
     }
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex title database")?;
-    let loaded = connection.read(|connection| {
+    let (loaded, conflicts) = connection.read(|connection| {
+        let mut loaded = BTreeMap::new();
+        let mut raw_ids_by_key = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
         census_rows(
             connection,
             "SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''",
             "Codex title census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
+            |row| {
+                let raw_id: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let id = record_codex_identity_key(&mut raw_ids_by_key, &mut conflicts, &raw_id);
+                if conflicts.contains(&id) || identity_conflicts.contains(&id) {
+                    loaded.remove(&id);
+                    conflicts.insert(id);
+                } else {
+                    insert_codex_sidecar_title(
+                        &mut loaded,
+                        id,
+                        Some(title),
+                        "session_index",
+                        false,
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        Ok((loaded, conflicts))
     })?;
-    let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_id, title) in loaded {
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
-        if identity_conflicts.contains(id.as_str()) {
-            titles.remove(id.as_str());
-            continue;
-        }
-        insert_codex_sidecar_title(titles, id, Some(title), "session_index", false);
+    for id in &conflicts {
+        titles.remove(id);
+    }
+    identity_conflicts.extend(conflicts);
+    for (id, title) in loaded {
+        titles.entry(id).or_insert(title);
     }
     Ok(())
 }
@@ -44200,7 +44224,7 @@ fn load_codex_sqlite_titles(
 fn load_codex_sqlite_state_threads(
     path: &Path,
     open: &mut SidecarOpenCounts,
-    state_threads: &mut BTreeMap<String, CodexStateThread>,
+    state_threads: &mut BTreeMap<String, Arc<CodexStateThread>>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
 ) -> Result<()> {
@@ -44209,7 +44233,7 @@ fn load_codex_sqlite_state_threads(
     }
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex state database")?;
-    let rows = connection.read(|connection| {
+    let (loaded, conflicts, staged_taxonomy) = connection.read(|connection| {
         let columns = sqlite_table_columns(connection, "threads")?;
         if !columns.contains("id") || !columns.contains("tokens_used") {
             return Err(anyhow::Error::new(IncompleteShape)
@@ -44228,62 +44252,65 @@ fn load_codex_sqlite_state_threads(
             sqlite_select_expr(&columns, "model", "NULL"),
             sqlite_select_expr(&columns, "rollout_path", "NULL"),
         );
+        let mut loaded = BTreeMap::new();
+        let mut raw_ids_by_key = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        let mut staged_taxonomy = *taxonomy;
         census_rows(connection, &sql, "Codex state thread census", |row| {
-            let id: String = row.get(0)?;
-            let title: Option<String> = row.get(1)?;
-            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-            let archived = row.get::<_, i64>(3)? != 0;
-            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-            let model: Option<String> = row.get(8)?;
-            let rollout_path: Option<String> = row.get(9)?;
-            Ok((
-                id,
-                CodexStateThread {
-                    title,
-                    tokens_used,
-                    archived,
-                    created_at,
-                    updated_at,
-                    model,
-                    rollout_path,
-                },
-            ))
-        })
+            let raw_id: String = row.get(0)?;
+            let thread = Arc::new(CodexStateThread {
+                title: row.get(1)?,
+                tokens_used: non_negative_i64_to_u64(row.get::<_, i64>(2)?),
+                archived: row.get::<_, i64>(3)? != 0,
+                created_at: codex_state_timestamp(row.get(6)?, row.get(4)?),
+                updated_at: codex_state_timestamp(row.get(7)?, row.get(5)?),
+                model: row.get(8)?,
+                rollout_path: row.get(9)?,
+            });
+            let conflicts_before = conflicts.len();
+            let id = record_codex_identity_key(&mut raw_ids_by_key, &mut conflicts, &raw_id);
+            if conflicts.len() != conflicts_before && !identity_conflicts.contains(&id) {
+                staged_taxonomy.state_alias_keys =
+                    staged_taxonomy.state_alias_keys.saturating_add(1);
+            }
+            if conflicts.contains(&id) || identity_conflicts.contains(&id) {
+                loaded.remove(&id);
+                conflicts.insert(id);
+                return Ok(());
+            }
+            match loaded.entry(id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(thread);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &thread => {
+                    conflicts.insert(entry.key().clone());
+                    entry.remove();
+                    staged_taxonomy.state_intra_root_row_keys =
+                        staged_taxonomy.state_intra_root_row_keys.saturating_add(1);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok((loaded, conflicts, staged_taxonomy))
     })?;
-    let mut loaded = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_id, thread) in rows {
-        let conflicts_before = identity_conflicts.len();
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
-        if identity_conflicts.len() != conflicts_before {
-            taxonomy.state_alias_keys = taxonomy.state_alias_keys.saturating_add(1);
-        }
-        if identity_conflicts.contains(id.as_str()) {
-            loaded.remove(id.as_str());
-            state_threads.remove(id.as_str());
-            continue;
-        }
-        if loaded
-            .insert(id.clone(), thread.clone())
-            .is_some_and(|existing| existing != thread)
-        {
-            loaded.remove(id.as_str());
-            state_threads.remove(id.as_str());
-            identity_conflicts.insert(id);
-            taxonomy.state_intra_root_row_keys =
-                taxonomy.state_intra_root_row_keys.saturating_add(1);
-        }
+    *taxonomy = staged_taxonomy;
+    for id in &conflicts {
+        state_threads.remove(id);
     }
+    identity_conflicts.extend(conflicts);
     for (id, thread) in loaded {
-        if let Some(existing) = state_threads
-            .insert(id.clone(), thread.clone())
-            .filter(|existing| *existing != thread)
-        {
-            taxonomy.observe_state_cross_root(codex_state_thread_field_diffs(&existing, &thread));
-            state_threads.remove(id.as_str());
-            identity_conflicts.insert(id);
+        match state_threads.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(thread);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &thread => {
+                taxonomy
+                    .observe_state_cross_root(codex_state_thread_field_diffs(entry.get(), &thread));
+                identity_conflicts.insert(entry.key().clone());
+                entry.remove();
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -44330,7 +44357,7 @@ fn load_codex_rollout_extents(
     }
     let connection =
         open_codex_sidecar_database(path, open).context("open Codex thread-history database")?;
-    let Some(rows) = connection.read(|connection| {
+    let Some((loaded, conflicts, verdict)) = connection.read(|connection| {
         let columns = sqlite_table_columns(connection, "thread_history_projection_state")?;
         if columns.is_empty() {
             return Ok(None);
@@ -44342,52 +44369,63 @@ fn load_codex_rollout_extents(
             return Err(anyhow::Error::new(IncompleteShape)
                 .context("Codex thread-history database has an incomplete projection schema"));
         }
+        let mut loaded = BTreeMap::new();
+        let mut raw_ids_by_key = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        let mut verdict: Result<()> = Ok(());
         census_rows(
             connection,
             "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
              FROM thread_history_projection_state",
             "Codex rollout-extent census",
             |row| {
-                let thread_id: String = row.get(0)?;
+                let raw_thread_id: String = row.get(0)?;
                 let next_byte_offset: i64 = row.get(1)?;
                 let next_ordinal: i64 = row.get(2)?;
-                Ok((thread_id, next_byte_offset, next_ordinal))
+                // The old collect first decoded every row before folding. A
+                // later SQLite row error must still beat a fold error.
+                if verdict.is_err() {
+                    return Ok(());
+                }
+                verdict = (|| {
+                    let thread_id = record_codex_identity_key(
+                        &mut raw_ids_by_key,
+                        &mut conflicts,
+                        &raw_thread_id,
+                    );
+                    if conflicts.contains(&thread_id) || identity_conflicts.contains(&thread_id) {
+                        loaded.remove(&thread_id);
+                        conflicts.insert(thread_id);
+                        return Ok(());
+                    }
+                    let extent = CodexRolloutExtent {
+                        next_byte_offset: u64::try_from(next_byte_offset)
+                            .context("negative Codex rollout byte offset")?,
+                        next_ordinal: u64::try_from(next_ordinal)
+                            .context("negative Codex rollout ordinal")?,
+                    };
+                    if loaded
+                        .insert(thread_id.clone(), extent)
+                        .is_some_and(|prior| prior != extent)
+                    {
+                        loaded.remove(&thread_id);
+                        conflicts.insert(thread_id);
+                    }
+                    Ok(())
+                })();
+                Ok(())
             },
-        )
-        .map(Some)
+        )?;
+        Ok(Some((loaded, conflicts, verdict)))
     })?
     else {
         return Ok(());
     };
-    let mut loaded = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_thread_id, next_byte_offset, next_ordinal) in rows {
-        let thread_id = record_codex_identity_key(
-            &mut raw_ids_by_key,
-            identity_conflicts,
-            raw_thread_id.as_str(),
-        );
-        if identity_conflicts.contains(thread_id.as_str()) {
-            loaded.remove(thread_id.as_str());
-            rollout_extents.remove(thread_id.as_str());
-            continue;
-        }
-        let next_byte_offset =
-            u64::try_from(next_byte_offset).context("negative Codex rollout byte offset")?;
-        let next_ordinal = u64::try_from(next_ordinal).context("negative Codex rollout ordinal")?;
-        let extent = CodexRolloutExtent {
-            next_byte_offset,
-            next_ordinal,
-        };
-        if loaded
-            .insert(thread_id.clone(), extent)
-            .is_some_and(|existing| existing != extent)
-        {
-            loaded.remove(thread_id.as_str());
-            rollout_extents.remove(thread_id.as_str());
-            identity_conflicts.insert(thread_id);
-        }
+    for id in &conflicts {
+        rollout_extents.remove(id);
     }
+    identity_conflicts.extend(conflicts);
+    verdict?;
     for (thread_id, extent) in loaded {
         if rollout_extents
             .insert(thread_id.clone(), extent)
@@ -44424,7 +44462,7 @@ fn load_codex_sqlite_spawn_edges(
     // `thread_spawn_edges`. The equivalent provider-native relationship lives
     // in the child row. Only the exact machine-owned source kind and wrapper
     // are eligible: ordinary user prompt text must never manufacture lineage.
-    let rows = connection.read(|connection| {
+    let (mut staged, created_in_database) = connection.read(|connection| {
         let thread_columns = sqlite_table_columns(connection, "threads")?;
         for required in ["id", "thread_source", "first_user_message"] {
             if !thread_columns.contains(required) {
@@ -44433,90 +44471,123 @@ fn load_codex_sqlite_spawn_edges(
                 )));
             }
         }
+        let mut staged = CodexTitleMetadata::default();
+        let mut raw_created_ids_by_key = BTreeMap::new();
+        let mut created_in_database = BTreeSet::new();
+        let mut parentless = BTreeSet::new();
         census_rows(
             connection,
             "SELECT id, first_user_message FROM threads \
              WHERE thread_source = 'agent_created_thread'",
             "Codex created-thread census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
+            |row| {
+                let raw_child: String = row.get(0)?;
+                let message = row.get_ref(1)?;
+                let first_user_message = match message {
+                    rusqlite::types::ValueRef::Null => None,
+                    value => Some(value.as_str()?),
+                };
+                let child = record_codex_identity_key(
+                    &mut raw_created_ids_by_key, &mut staged.identity_conflicts, &raw_child,
+                );
+                if staged.identity_conflicts.contains(&child) || identity_conflicts.contains(&child) {
+                    staged.state_created_threads.remove(&child);
+                    staged.spawn_parents.remove(&child);
+                    staged.identity_conflicts.insert(child.clone());
+                    staged.spawn_parent_conflicts.insert(child);
+                    return Ok(());
+                }
+                staged.state_created_threads.insert(child.clone());
+                created_in_database.insert(child.clone());
+                if first_user_message.map(codex_created_thread_mentions_delegation).unwrap_or(true) {
+                    parentless.insert(child.clone());
+                }
+                if let Some(parent) = first_user_message.and_then(|message| codex_created_thread_parent(&child, message)) {
+                    record_codex_spawn_parent(&mut staged.spawn_parents, &mut staged.spawn_parent_conflicts, child, parent);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(((staged, parentless), created_in_database))
     })?;
-    let mut raw_created_ids_by_key = BTreeMap::new();
-    let mut created_in_database = Vec::new();
-    for (raw_child, first_user_message) in rows {
-        let child = record_codex_identity_key(
-            &mut raw_created_ids_by_key,
-            identity_conflicts,
-            raw_child.as_str(),
-        );
-        if identity_conflicts.contains(child.as_str()) {
-            state_created_threads.remove(child.as_str());
-            spawn_parents.remove(child.as_str());
-            spawn_parent_conflicts.insert(child);
-            continue;
-        }
-        state_created_threads.insert(child.clone());
-        created_in_database.push(child.clone());
-        if first_user_message
-            .as_deref()
-            .map(codex_created_thread_mentions_delegation)
-            .unwrap_or(true)
-        {
-            parentless_ineligible.insert(child.clone());
-        }
-        if let Some(parent) = first_user_message
-            .as_deref()
-            .and_then(|message| codex_created_thread_parent(&child, message))
-        {
-            record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
-        }
+    let (created, parentless) = &mut staged;
+    for id in &created.identity_conflicts {
+        state_created_threads.remove(id);
+        spawn_parents.remove(id);
     }
+    identity_conflicts.append(&mut created.identity_conflicts);
+    state_created_threads.append(&mut created.state_created_threads);
+    for id in &created.spawn_parent_conflicts {
+        spawn_parents.remove(id);
+    }
+    spawn_parent_conflicts.append(&mut created.spawn_parent_conflicts);
+    for (child, parent) in std::mem::take(&mut created.spawn_parents) {
+        record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
+    }
+    parentless_ineligible.append(parentless);
 
-    let Some(loaded) = connection.read(|connection| {
+    let Some((mut staged, parentless)) = connection.read(|connection| {
         let columns = sqlite_table_columns(connection, "thread_spawn_edges")?;
         if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
             return Ok(None);
         }
+        let mut staged = CodexTitleMetadata::default();
+        let mut parentless = BTreeSet::new();
+        let mut raw_parent_ids_by_key = BTreeMap::new();
+        let mut raw_child_ids_by_key = BTreeMap::new();
         census_rows(
             connection,
             "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges",
             "Codex spawn-edge census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map(Some)
+            |row| {
+                let raw_parent: String = row.get(0)?;
+                let raw_child: String = row.get(1)?;
+                let parent = record_codex_identity_key(
+                    &mut raw_parent_ids_by_key,
+                    &mut staged.identity_conflicts,
+                    &raw_parent,
+                );
+                let child = record_codex_identity_key(
+                    &mut raw_child_ids_by_key,
+                    &mut staged.identity_conflicts,
+                    &raw_child,
+                );
+                if staged.identity_conflicts.contains(&child)
+                    || identity_conflicts.contains(&child)
+                    || staged.identity_conflicts.contains(&parent)
+                    || identity_conflicts.contains(&parent)
+                {
+                    staged.spawn_parents.remove(&child);
+                    staged.spawn_parent_conflicts.insert(child);
+                } else if !parent.is_empty() && !child.is_empty() && parent != child {
+                    record_codex_spawn_parent(
+                        &mut staged.spawn_parents,
+                        &mut staged.spawn_parent_conflicts,
+                        child,
+                        parent,
+                    );
+                } else if !child.is_empty() {
+                    parentless.insert(child);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Some((staged, parentless)))
     })?
     else {
         // Without the edge table, a missing edge is not evidence of no parent.
         parentless_ineligible.extend(created_in_database);
         return Ok(());
     };
-    let mut raw_parent_ids_by_key = BTreeMap::new();
-    let mut raw_child_ids_by_key = BTreeMap::new();
-    for (raw_parent, raw_child) in loaded {
-        let parent = record_codex_identity_key(
-            &mut raw_parent_ids_by_key,
-            identity_conflicts,
-            raw_parent.as_str(),
-        );
-        let child = record_codex_identity_key(
-            &mut raw_child_ids_by_key,
-            identity_conflicts,
-            raw_child.as_str(),
-        );
-        if identity_conflicts.contains(child.as_str())
-            || identity_conflicts.contains(parent.as_str())
-        {
-            spawn_parents.remove(child.as_str());
-            spawn_parent_conflicts.insert(child);
-            continue;
-        }
-        if !parent.is_empty() && !child.is_empty() && parent != child {
-            record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
-        } else if !child.is_empty() {
-            // A self or empty-parent edge is broken lineage, not its absence.
-            parentless_ineligible.insert(child);
-        }
+    identity_conflicts.append(&mut staged.identity_conflicts);
+    for id in &staged.spawn_parent_conflicts {
+        spawn_parents.remove(id);
     }
+    spawn_parent_conflicts.append(&mut staged.spawn_parent_conflicts);
+    for (child, parent) in staged.spawn_parents {
+        record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
+    }
+    parentless_ineligible.extend(parentless);
     Ok(())
 }
 
@@ -44524,8 +44595,9 @@ fn load_codex_sqlite_spawn_edges(
 /// lineage evidence. Only the strict parser above may turn it into a parent.
 fn codex_created_thread_mentions_delegation(first_user_message: &str) -> bool {
     first_user_message
-        .to_ascii_lowercase()
-        .contains("<codex_delegation")
+        .as_bytes()
+        .windows(b"<codex_delegation".len())
+        .any(|window| window.eq_ignore_ascii_case(b"<codex_delegation"))
 }
 
 fn record_codex_spawn_parent(
@@ -44661,30 +44733,34 @@ fn retry_transient_sqlite<T>(
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
-    let columns = census_rows(
+    let mut columns = BTreeSet::new();
+    census_rows(
         connection,
         &format!("PRAGMA table_info({table_name})"),
         "SQLite table census",
-        |row| row.get::<_, String>(1),
+        |row| {
+            columns.insert(row.get::<_, String>(1)?);
+            Ok(())
+        },
     )?;
-    Ok(columns.into_iter().collect())
+    Ok(columns)
 }
 
-/// Every row of one census query. Failures carry their loader stage and
-/// "prepare {label}" or "read {label} row".
-fn census_rows<T>(
+/// Fold each row while the statement owns its text. Callers stage final
+/// metadata inside CodexSqliteRead::read, publishing only after verification.
+fn census_rows(
     connection: &Connection,
     sql: &str,
     label: &str,
-    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-) -> Result<Vec<T>> {
+    fold: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+) -> Result<()> {
     use crate::codex_scan_diagnostics::LoaderStage;
     let mut statement = connection
         .prepare(sql)
         .context(LoaderStage::Prepare)
         .with_context(|| format!("prepare {label}"))?;
-    let rows = statement.query_map([], map).context(LoaderStage::Query)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
+    let mut rows = statement.query_map([], fold).context(LoaderStage::Query)?;
+    rows.try_for_each(|row| row)
         .context(LoaderStage::Row)
         .with_context(|| format!("read {label} row"))
 }
@@ -57782,21 +57858,25 @@ mod tests {
 
         let without_edge = CodexTitleMetadata::default().session_sidecar_fingerprint(child);
         let mut metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        metadata
-            .state_threads
-            .get_mut(all_local_child)
-            .expect("all-local child state row")
-            .created_at = Some("2026-08-26T15:02:00Z".to_string());
+        Arc::make_mut(
+            metadata
+                .state_threads
+                .get_mut(all_local_child)
+                .expect("all-local child state row"),
+        )
+        .created_at = Some("2026-08-26T15:02:00Z".to_string());
         // File binding reads the home's row; keep this fixture override in sync
         // with its merged row without changing the expected ownership proof.
-        metadata
-            .root_sidecars
-            .get_mut(&codex_dir)
-            .expect("loaded Codex home")
-            .threads
-            .get_mut(all_local_child)
-            .expect("all-local child home row")
-            .created_at = Some("2026-08-26T15:02:00Z".to_string());
+        Arc::make_mut(
+            metadata
+                .root_sidecars
+                .get_mut(&codex_dir)
+                .expect("loaded Codex home")
+                .threads
+                .get_mut(all_local_child)
+                .expect("all-local child home row"),
+        )
+        .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert!(metadata.state_created_threads.contains(child));
         assert!(metadata.state_created_threads.contains(all_local_child));
@@ -63352,11 +63432,11 @@ mod tests {
         for identity in [legacy, modern.to_string()] {
             metadata.state_threads.insert(
                 identity,
-                CodexStateThread {
+                Arc::new(CodexStateThread {
                     tokens_used: 900,
                     model: Some("state-model".into()),
                     ..Default::default()
-                },
+                }),
             );
         }
         assert!(metadata.identity_from_path_evidence(&path).is_none());
@@ -63427,7 +63507,7 @@ mod tests {
                 let (mut metadata, mut index, _) =
                     ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
                 for (thread, tokens_used) in metadata.state_threads.values_mut().zip(tokens) {
-                    thread.tokens_used = tokens_used;
+                    Arc::make_mut(thread).tokens_used = tokens_used;
                 }
                 index
                     .files
@@ -63510,10 +63590,10 @@ mod tests {
                 let mut metadata = CodexTitleMetadata::default();
                 metadata.state_threads.insert(
                     owner.clone(),
-                    CodexStateThread {
+                    Arc::new(CodexStateThread {
                         tokens_used: 900,
                         ..Default::default()
-                    },
+                    }),
                 );
                 assert_eq!(
                     metadata.identity_from_path_evidence(Path::new(&name)),
@@ -77793,7 +77873,7 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: child_values.first().and_then(|value| {
                     codex_session_meta_payload(value)
@@ -77801,7 +77881,7 @@ mod tests {
                         .or_else(|| string_at(value, &["timestamp"]))
                 }),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         if let Some(next_ordinal) = projected_next_ordinal {
             metadata.rollout_extents.insert(
@@ -78354,11 +78434,11 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some("2026-08-02T08:20:00Z".to_string()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
         assert!(!parsed.report.complete());
@@ -79709,12 +79789,12 @@ mod tests {
         metadata.state_created_threads.insert(key.clone());
         metadata.state_threads.insert(
             key.clone(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some(clock.at(0)),
                 rollout_path: Some(path.to_string_lossy().into_owned()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         metadata.rollout_extents.insert(
             key,
@@ -79964,11 +80044,11 @@ mod tests {
             .insert(child_id.to_string(), parent_id.to_string());
         metadata.state_threads.insert(
             child_id.to_string(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 1,
                 created_at: Some("2026-08-02T08:20:00Z".to_string()),
                 ..CodexStateThread::default()
-            },
+            }),
         );
         let created = reduced(&path, &metadata, ledger_for(parent_id, &parent));
         assert_eq!(

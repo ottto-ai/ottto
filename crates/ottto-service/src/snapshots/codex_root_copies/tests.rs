@@ -127,7 +127,7 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
             let row = &metadata.root_sidecars[root.parent().unwrap()].threads[id];
             let path = Path::new(row.rollout_path.as_deref().unwrap());
             let (bound, extent) = metadata.thread_extent_for_path(id, path);
-            assert_eq!(bound.unwrap(), row);
+            assert_eq!(bound.unwrap(), row.as_ref());
             assert!(extent.unwrap().next_byte_offset > 0);
             assert!(path.starts_with(root));
             if root == &fixture.roots[1] {

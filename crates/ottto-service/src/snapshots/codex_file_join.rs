@@ -3465,10 +3465,10 @@ pub(super) mod tests {
         for id in [owner, healthy] {
             metadata.state_threads.insert(
                 id.to_owned(),
-                CodexStateThread {
+                Arc::new(CodexStateThread {
                     tokens_used: 300,
                     ..CodexStateThread::default()
-                },
+                }),
             );
         }
         let mut items = Vec::new();

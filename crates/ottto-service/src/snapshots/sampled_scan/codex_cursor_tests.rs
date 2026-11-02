@@ -7302,10 +7302,10 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
             crate::snapshots::tests::manifest_index_entry(None),
         );
     }
-    let healthy_thread = CodexStateThread {
+    let healthy_thread = Arc::new(CodexStateThread {
         tokens_used: 10,
         ..Default::default()
-    };
+    });
 
     // Independent cold control: the observed held entry cannot be retired, and
     // only the healthy state thread exists. No residue guard is needed here.

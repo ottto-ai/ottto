@@ -1402,11 +1402,11 @@ pub(in crate::snapshots) mod tests {
         let mut metadata = CodexTitleMetadata::default();
         metadata.state_threads.insert(
             owner.into(),
-            CodexStateThread {
+            Arc::new(CodexStateThread {
                 tokens_used: 825,
                 model: Some("gpt-synthetic".into()),
                 ..Default::default()
-            },
+            }),
         );
         let mut index = ScanIndex::default();
         let mut earlier = Vec::new();
