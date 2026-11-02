@@ -85,6 +85,9 @@ struct Lane {
     tier_replay: Value,
     /// Passes, then growth Full, Tail, read bytes and appended bytes.
     totals: [u64; 5],
+    /// Q5 proof: latest emitted request rows per entity, and the pass tick.
+    reqs: BTreeMap<String, Value>,
+    tick: u64,
 }
 
 impl Lane {
@@ -115,6 +118,8 @@ impl Lane {
             index.adopt_effective_upload_body_witness_revision_monotonically();
             index.load_claude_reemission_exclusions(&c.support);
         }
+        use crate::snapshots::claude_request_money::e2::pipeline_test_observer::Q5;
+        Q5.with(|slot| *slot.borrow_mut() = claude.then(Vec::new));
         let (((mut index, scan, wires, rejected, upload_failed), records), high) = peak(|| {
             crate::local_resource_diagnostics::capture(|| {
                 // The page's prior: settlement reads it as production does.
@@ -255,6 +260,29 @@ impl Lane {
             let entity = item["source_session_id"].as_str().unwrap_or_default();
             duplicate_entities += usize::from(!entities.insert(entity.to_owned()));
             self.bodies.insert(entity.to_owned(), item.clone());
+        }
+        // Q5: the emitted entity's request rows, by its sent fingerprint.
+        let captured = Q5.with(|slot| slot.borrow_mut().take()).unwrap_or_default();
+        let mut covered = BTreeSet::new();
+        for mut row in captured.iter().cloned() {
+            let entity = row["entity"].as_str().unwrap_or_default().to_owned();
+            if entities.contains(&entity)
+                && sent.contains(row["fp"].as_str().unwrap_or_default())
+            {
+                row["tick"] = json!(self.tick);
+                row["fp"] = Value::Null;
+                covered.insert(entity.clone());
+                self.reqs.insert(entity, row);
+            }
+        }
+        for mut row in captured {
+            let entity = row["entity"].as_str().unwrap_or_default().to_owned();
+            if entities.contains(&entity) && !covered.contains(&entity) {
+                row["tick"] = json!(self.tick);
+                row["fp"] = Value::Null;
+                row["fp_miss"] = json!(1);
+                self.reqs.insert(entity, row);
+            }
         }
         let emitted = wire_items.len();
         drop(wire_items);
@@ -409,6 +437,11 @@ fn round(
 ) -> bool {
     let mut quiet = true;
     for (i, lane) in lanes.iter_mut().enumerate() {
+        lane.tick = match phase {
+            "restart" => 100,
+            "growth" => 200 + pass,
+            _ => pass,
+        };
         let mut row = lane.pass(c, &c.base);
         let (full, tail) = (row["full"].as_u64().unwrap(), row["tail"].as_u64().unwrap());
         quiet &= full == 0 && tail == 0;
@@ -450,6 +483,18 @@ fn save(dir: &Path, arm: &str, lanes: &[Lane]) {
         .open(dir.join(format!("{arm}.json")))
         .unwrap();
     serde_json::to_writer(file, &saved).unwrap();
+    let reqs: BTreeMap<_, _> = lanes
+        .iter()
+        .map(|l| (l.source.api_slug(), json!(l.reqs)))
+        .collect();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(format!("{arm}.q5.json")))
+        .unwrap();
+    serde_json::to_writer(file, &reqs).unwrap();
 }
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -699,6 +744,263 @@ fn oracle(dir: &Path, lanes: &[Lane]) {
     }
 }
 
+/// Q5 proof: one request's usage records in its T1 file, as (line end,
+/// input, output, clamped thinking), and that file's delivery boundaries.
+type Q5Record = (u64, u64, u64, u64);
+
+fn q5_file(
+    t1: &Path,
+    start: u64,
+    end: u64,
+    records: &mut BTreeMap<u64, (usize, Vec<Q5Record>)>,
+    file: usize,
+    twins: &mut u64,
+) -> (Vec<u64>, u64) {
+    let mut f = std::fs::File::open(t1).unwrap();
+    let (mut have, mut bounds) = (start, Vec::new());
+    if start > 0 {
+        bounds.push(start);
+    }
+    for page in 1..=GROWTH_PAGES {
+        let mut cut = end;
+        if page < GROWTH_PAGES {
+            let target = start + (end - start) * page / GROWTH_PAGES;
+            f.seek(SeekFrom::Start(target)).unwrap();
+            let mut line = Vec::new();
+            cut = target
+                + std::io::BufReader::new(&f)
+                    .read_until(b'\n', &mut line)
+                    .unwrap() as u64;
+        }
+        cut = line_end(&mut f, start, cut);
+        if cut > have {
+            have = cut;
+            bounds.push(cut);
+        }
+    }
+    // The last delivered extent is the end, not a read boundary.
+    bounds.pop();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    let mut reader = std::io::BufReader::new(f);
+    let (mut line, mut at) = (Vec::new(), 0u64);
+    let mut local = BTreeMap::<u64, Vec<Q5Record>>::new();
+    loop {
+        line.clear();
+        let len = reader.read_until(b'\n', &mut line).unwrap() as u64;
+        if len == 0 || at + len > have {
+            break;
+        }
+        at += len;
+        let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+        if !has(b"\"usage\"") || !has(b"equestId") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value["requestId"]
+            .as_str()
+            .or_else(|| value["request_id"].as_str())
+        else {
+            continue;
+        };
+        let Some(usage) = value.pointer("/message/usage") else {
+            continue;
+        };
+        let out = usage["output_tokens"].as_u64().unwrap_or(0);
+        let inp = usage["input_tokens"].as_u64().unwrap_or(0);
+        let think = usage["reasoning_output_tokens"]
+            .as_u64()
+            .or_else(|| usage.pointer("/output_tokens_details/thinking_tokens").and_then(Value::as_u64))
+            .unwrap_or(0)
+            .min(out);
+        let hash = crate::snapshots::claude_request_money::e2::pipeline_test_observer::q5_hash(id);
+        local.entry(hash).or_default().push((at, inp, out, think));
+    }
+    for (hash, list) in local {
+        match records.entry(hash) {
+            std::collections::btree_map::Entry::Occupied(_) => *twins += 1,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((file, list));
+            }
+        }
+    }
+    (bounds, have)
+}
+
+/// For a request's records and its file's boundaries: the max thinking
+/// before each splitting boundary (records on both sides).
+fn q5_splits(list: &[Q5Record], bounds: &[u64]) -> Vec<(u64, u64, u64)> {
+    bounds
+        .iter()
+        .filter(|b| list.iter().any(|r| r.0 <= **b) && list.iter().any(|r| r.0 > **b))
+        .map(|b| {
+            let pre = list.iter().filter(|r| r.0 <= *b);
+            let (mut i, mut o, mut t) = (0, 0, 0);
+            for r in pre {
+                i = i.max(r.1);
+                o = o.max(r.2);
+                t = t.max(r.3);
+            }
+            (i, o, t)
+        })
+        .collect()
+}
+
+/// Q5 proof (counts only): for each entity whose money differs between
+/// cold and OFF, compare per-request native occurrences and classify the
+/// differing requests by whether their T1 records straddle a delivery cut.
+fn q5(dir: &Path, lanes: &[Lane]) {
+    let Some(lane) = lanes.iter().find(|l| l.source == SnapshotSource::ClaudeCode) else {
+        return;
+    };
+    let slug = lane.source.api_slug();
+    let (Ok(q5_bytes), Ok(off_bytes)) = (
+        std::fs::read(dir.join("off.q5.json")),
+        std::fs::read(dir.join("off.json")),
+    ) else {
+        report("cold", json!({"phase": "q5", "missing_off": 1}));
+        return;
+    };
+    let off_reqs: Value = serde_json::from_slice(&q5_bytes).unwrap();
+    let off_saved: Value = serde_json::from_slice(&off_bytes).unwrap();
+    let off_bodies: BTreeMap<String, Value> =
+        serde_json::from_value(off_saved[slug]["bodies"].clone()).unwrap_or_default();
+    let off_reqs: BTreeMap<String, Value> =
+        serde_json::from_value(off_reqs[slug].clone()).unwrap_or_default();
+    // T1 records of every grown or new Claude file.
+    let growth = Growth::plan(dir, "cold", lanes);
+    let li = lanes.iter().position(|l| l.source == SnapshotSource::ClaudeCode).unwrap();
+    let (mut records, mut bounds, mut twins) = (BTreeMap::new(), Vec::new(), 0u64);
+    for (i, t1, _, start, end) in &growth.appends {
+        if *i != li {
+            continue;
+        }
+        let file = bounds.len();
+        bounds.push(q5_file(t1, *start, *end, &mut records, file, &mut twins).0);
+    }
+    // Global shape: straddling requests, and those whose later records raise
+    // thinking while input and output stay equal.
+    let (mut straddling, mut rise_n, mut rise_eq_n, mut rise_eq_sum) = (0u64, 0u64, 0u64, 0u64);
+    for (file, list) in records.values() {
+        let splits = q5_splits(list, &bounds[*file]);
+        if splits.is_empty() {
+            continue;
+        }
+        straddling += 1;
+        let (fi, fo, ft) = list.iter().fold((0, 0, 0), |(i, o, t), r| {
+            (i.max(r.1), o.max(r.2), t.max(r.3))
+        });
+        if let Some((pi, po, pt)) = splits.iter().copied().find(|(_, _, t)| *t < ft) {
+            rise_n += 1;
+            if pi == fi && po == fo {
+                rise_eq_n += 1;
+                rise_eq_sum += ft - pt;
+            }
+        }
+    }
+    report(
+        "cold",
+        json!({"phase": "q5_shape", "growth_files": bounds.len(), "requests": records.len(),
+        "twin_requests": twins, "straddling": straddling, "thinking_rises_after_cut": rise_n,
+        "rises_with_equal_input_output": rise_eq_n, "rise_tokens_equal_io": rise_eq_sum}),
+    );
+    let occ = |row: &Value| -> BTreeMap<u64, [u64; 4]> {
+        row["occ"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|r| {
+                        let n = |k: usize| r[k].as_u64().unwrap_or(0);
+                        (n(0), [n(1), n(2), n(3), n(4)])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let field = |b: &Value, f: &str| i128::from(b[f].as_u64().unwrap_or(0));
+    let mut total = BTreeMap::<&str, i128>::new();
+    let mut add = |k: &'static str, v: i128| *total.entry(k).or_default() += v;
+    let mut n = 0;
+    for (entity, cold_body) in &lane.bodies {
+        let Some(off_body) = off_bodies.get(entity) else {
+            continue;
+        };
+        if money_oracle::FIELDS.iter().all(|f| cold_body[*f] == off_body[*f]) {
+            continue;
+        }
+        n += 1;
+        let d = |f: &str| field(cold_body, f) - field(off_body, f);
+        let (cold_row, off_row) = (lane.reqs.get(entity), off_reqs.get(entity));
+        let (co, oo) = (
+            cold_row.map(occ).unwrap_or_default(),
+            off_row.map(occ).unwrap_or_default(),
+        );
+        let mut row = json!({"phase": "q5_entity", "n": n,
+            "body_d": [d("input_tokens"), d("output_tokens"), d("reasoning_output_tokens"), d("request_count")],
+            "rows": [cold_row.is_some(), off_row.is_some()],
+            "off_tick": off_row.map(|r| r["tick"].clone()),
+            "fp_miss": [cold_row.map(|r| r["fp_miss"].clone()), off_row.map(|r| r["fp_miss"].clone())],
+            "occ_n": [co.len(), oo.len()],
+            "body_rsn_minus_occ": [
+                cold_row.map(|r| i128::from(r["body"][2].as_u64().unwrap_or(0)) - co.values().map(|c| i128::from(c[2])).sum::<i128>()),
+                off_row.map(|r| i128::from(r["body"][2].as_u64().unwrap_or(0)) - oo.values().map(|c| i128::from(c[2])).sum::<i128>()),
+            ],
+            "fold": [cold_row.map(|r| r["fold"].clone()), off_row.map(|r| r["fold"].clone())],
+        });
+        add("entities", 1);
+        add("body_rsn_gap", d("reasoning_output_tokens"));
+        add("body_out_gap", d("output_tokens"));
+        add("body_in_gap", d("input_tokens"));
+        let mut c = BTreeMap::<&str, i128>::new();
+        for (hash, cv) in &co {
+            let Some(ov) = oo.get(hash) else {
+                *c.entry("only_cold_n").or_default() += 1;
+                *c.entry("only_cold_rsn").or_default() += i128::from(cv[2]);
+                continue;
+            };
+            if cv[2] == ov[2] {
+                continue;
+            }
+            let gap = i128::from(cv[2]) - i128::from(ov[2]);
+            *c.entry("rsn_diff_n").or_default() += 1;
+            *c.entry("rsn_diff_sum").or_default() += gap;
+            if cv[0] != ov[0] || cv[1] != ov[1] || cv[3] != ov[3] {
+                *c.entry("rsn_diff_other_diff_n").or_default() += 1;
+            }
+            match records.get(hash) {
+                None => *c.entry("not_in_growth_files_n").or_default() += 1,
+                Some((file, list)) => {
+                    let splits = q5_splits(list, &bounds[*file]);
+                    if splits.is_empty() {
+                        *c.entry("no_straddle_n").or_default() += 1;
+                        *c.entry("no_straddle_rsn").or_default() += gap;
+                    } else {
+                        *c.entry("straddle_n").or_default() += 1;
+                        *c.entry("straddle_rsn").or_default() += gap;
+                        if splits.iter().any(|(_, _, t)| *t == ov[2]) {
+                            *c.entry("off_equals_pre_cut_n").or_default() += 1;
+                            *c.entry("off_equals_pre_cut_rsn").or_default() += gap;
+                        }
+                    }
+                }
+            }
+        }
+        for (hash, ov) in &oo {
+            if !co.contains_key(hash) {
+                *c.entry("only_off_n").or_default() += 1;
+                *c.entry("only_off_rsn").or_default() += i128::from(ov[2]);
+            }
+        }
+        for (&k, &v) in &c {
+            add(k, v);
+        }
+        row["req"] = json!(c);
+        report("cold", row);
+    }
+    report("cold", json!({"phase": "q5_total", "totals": total}));
+}
+
 fn run(arm: &str, dir: &Path) {
     let _switch = if arm == "on" {
         crate::snapshots::RestartRestoreForTest::enabled()
@@ -747,6 +1049,8 @@ fn run(arm: &str, dir: &Path) {
             bodies: BTreeMap::new(),
             tier_replay: Value::Null,
             totals: [0; 5],
+            reqs: BTreeMap::new(),
+            tick: 0,
         });
     }
     report(
@@ -769,6 +1073,7 @@ fn run(arm: &str, dir: &Path) {
     );
     if arm == "cold" {
         oracle(dir, &lanes);
+        q5(dir, &lanes);
     } else {
         // A restart: a new owner with an empty cache over the same committed
         // checkpoint and store, which keep their production path and binding.

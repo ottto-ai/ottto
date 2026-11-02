@@ -160,7 +160,39 @@ pub(crate) fn capture_identity_counts<T>(run: impl FnOnce() -> T) -> (T, serde_j
     let counts = IDENTITY.with(|slot| slot.borrow().clone().expect("capture active"));
     (result, counts)
 }
+thread_local! {
+    /// Q5 proof (scratch): per emitted item, count-only request rows keyed
+    /// by request hash, captured before native inputs are released.
+    pub(crate) static Q5: std::cell::RefCell<Option<Vec<serde_json::Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn q5_hash(request_id: &str) -> u64 {
+    claude_request_hash(request_id)
+}
 pub(crate) fn before_release(items: &[SnapshotItem]) {
+    Q5.with(|slot| {
+        if let Some(rows) = slot.borrow_mut().as_mut() {
+            for item in items {
+                let occ: Vec<serde_json::Value> = item
+                    .claude_usage_occurrences
+                    .iter()
+                    .map(|(id, o)| {
+                        let c = o.q5_counts();
+                        serde_json::json!([claude_request_hash(id), c[0], c[1], c[2], c[3]])
+                    })
+                    .collect();
+                rows.push(serde_json::json!({
+                    "entity": item.source_session_id,
+                    "fp": item.snapshot_fingerprint,
+                    "body": [item.input_tokens, item.output_tokens,
+                             item.reasoning_output_tokens, item.request_count],
+                    "ids": item.claude_usage_request_ids.len(),
+                    "occ": occ,
+                    "fold": item.claude_money.as_deref().map(|f| f.q5_counts().to_vec()),
+                }));
+            }
+        }
+    });
     RELEASED.with(|counts| {
         if let Some(mut page) = counts.get() {
             // Observe final native bodies before the caller's history veto,

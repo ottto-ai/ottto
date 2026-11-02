@@ -912,6 +912,26 @@ pub(crate) struct FileFold {
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
 }
+#[cfg(test)]
+impl FileFold {
+    /// Q5 proof (scratch, counts only): responses, copied, side requests,
+    /// side reasoning, side output, root fallbacks, disclosed, removed
+    /// reasoning, removed requests, held.
+    pub(crate) fn q5_counts(&self) -> [u64; 10] {
+        [
+            self.responses,
+            self.copied,
+            self.side_requests,
+            self.side.reasoning,
+            self.side.output,
+            self.root_fallbacks,
+            self.disclosed,
+            self.entity.removed.reasoning,
+            self.entity.removed_requests,
+            u64::from(self.entity.held),
+        ]
+    }
+}
 money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for

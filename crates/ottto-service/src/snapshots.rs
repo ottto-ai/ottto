@@ -14094,6 +14094,19 @@ fn claude_api_cache_creation(
     interpreted
 }
 
+#[cfg(test)]
+impl ClaudeTranscriptUsageOccurrence {
+    /// Q5 proof (scratch, counts only): input, output, reasoning, requests.
+    pub(crate) fn q5_counts(&self) -> [u64; 4] {
+        [
+            self.usage.input_tokens,
+            self.usage.output_tokens,
+            self.usage.reasoning_output_tokens,
+            self.usage.request_count,
+        ]
+    }
+}
+
 /// Borrowed compatibility inputs: the live witness and `e2` use one predicate.
 #[derive(Clone, Copy)]
 pub(crate) struct ClaudeTranscriptUsageOccurrenceView<'a> {
