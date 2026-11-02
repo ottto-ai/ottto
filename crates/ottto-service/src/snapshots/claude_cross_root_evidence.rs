@@ -50,7 +50,7 @@ impl RequestRootJoins {
         // Whole-vs-streamed fixtures exercise every missing-local-row caller.
         #[cfg(test)]
         assert!(self.0.contains_key(request), "request outside page demand");
-        self.0.get(request).copied().flatten()
+        self.0.get(request).copied().unwrap_or(Some(None))
     }
 }
 

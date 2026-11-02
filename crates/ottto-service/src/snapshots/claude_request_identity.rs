@@ -4439,9 +4439,8 @@ pub(crate) struct ScanEvidence<'a> {
     /// The request roots of this pass's whole corpus, from the cross-root
     /// evidence the strict read built root by root.
     cross_request_roots: Option<&'a super::claude_cross_root_evidence::RequestRootJoins>,
-    /// Without cross-root evidence: the request roots of the loaded rows,
-    /// built on the first request without rows of its own, so a pass whose
-    /// requests all have their own rows never pays for it.
+    /// Test-only reachable fallback for the whole-corpus oracle: request roots
+    /// of the loaded rows, built on the first request without rows of its own.
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
