@@ -3772,19 +3772,6 @@ fn with_source_cadence<T>(
     Some(apply(cadence))
 }
 
-fn record_finished_snapshot_cadence(
-    cadence: &mut SourceCadence,
-    now: Instant,
-    accepted: u64,
-    retryable_deferral: bool,
-) {
-    if retryable_deferral {
-        cadence.record_scan_failure(now);
-    } else {
-        cadence.record_scan_success(now, accepted);
-    }
-}
-
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
 ///
 /// The tier arithmetic — including the server's requested minimum interval — lives
@@ -9056,18 +9043,13 @@ fn finish_sync_source(
         eprintln!("local state maintenance deferred for {}", source.api_slug());
     }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
-    // quiet cycle lets it fall to idle and then cold. A conflict pass has still
-    // durably committed its accepted siblings, but remains a source failure so
-    // it returns to the retry cadence instead of advertising a clean terminal
-    // scan. The sweep marker is stamped only for fully settled scans.
+    // quiet cycle lets it fall to idle and then cold. A conflict pass durably
+    // committed its accepted siblings and each held entity waits on its own
+    // quarantine clock, so it is not a source failure; the failure ladder is
+    // for upload errors. The sweep marker is stamped only for settled scans,
+    // and the status below still reports the held entities.
     with_source_cadence(source, |cadence| {
-        let now = Instant::now();
-        record_finished_snapshot_cadence(
-            cadence,
-            now,
-            accepted,
-            deferred_entity_count.is_some() && !resolved_permanent_rejections,
-        );
+        cadence.record_scan_success(Instant::now(), accepted)
     });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
