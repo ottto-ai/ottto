@@ -1283,7 +1283,7 @@ fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
         } else {
             "transition-codex-tier-v2"
         });
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         // The session id in the file name is what lets each header's creator
         // pair reach the row as account evidence.
         let files = [ROOT, SECOND].map(|session| {
