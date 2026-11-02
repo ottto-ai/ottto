@@ -5557,6 +5557,15 @@ impl SharedCache {
         }
     }
 
+    /// After a source's local copy is erased. With restart restore on, the next
+    /// `durable_begin_pass` sees no slot and drops this source's retirements. Key
+    /// custody and pacing stay: they are source+key state, never cleared here.
+    pub(crate) fn durable_forget_source(&self, source: SnapshotSource) {
+        if let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) {
+            *stores.slot(source) = None;
+        }
+    }
+
     /// A post-save pass in a process that does not hold the state-directory
     /// lock: nothing is written or collected, and the admitted keys are
     /// dropped (they would never be written).

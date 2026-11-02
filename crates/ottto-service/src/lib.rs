@@ -2289,11 +2289,7 @@ fn status_from_state_with_relay_finding(
     }
     status.sources = state.sources.clone();
     for health in &mut status.sources {
-        let source = match health.source {
-            SourceKind::Codex => snapshots::SnapshotSource::Codex,
-            SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
-            SourceKind::Pi => snapshots::SnapshotSource::Pi,
-        };
+        let source = snapshot_sync::snapshot_source_of_kind(&health.source);
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
     }
@@ -2924,11 +2920,7 @@ fn local_health_source_for_status(
     projection_revision: u64,
     events: &[LocalHealthEventV1],
 ) -> LocalHealthSourceV1 {
-    let snapshot_source = match source.source {
-        SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
-        SourceKind::Codex => snapshots::SnapshotSource::Codex,
-        SourceKind::Pi => snapshots::SnapshotSource::Pi,
-    };
+    let snapshot_source = snapshot_sync::snapshot_source_of_kind(&source.source);
     if let Some((reason, since)) = projected_scan_index_refusal(events, snapshot_source) {
         return scan_index_refused_source(&source.source, projection_revision, since, reason);
     }
