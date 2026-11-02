@@ -295,16 +295,17 @@ fn basis_token(basis: &str) -> Option<&'static str> {
     }
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
-    digest(key, json!(["claude_accepted_identity_buckets:v2", session]))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex(&digest(
+        key,
+        json!(["claude_accepted_identity_buckets:v2", session]),
+    ))
+}
+fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The domain of the local `session_context` change detector.
 const SESSION_CONTEXT_DOMAIN: &str = "claude_session_context:v1";
-/// Hex length of the key tag leading a `session_context` digest.
-pub(super) const SESSION_CONTEXT_TAG_HEX: usize = 16;
 
 // The cycle's attribution key, for a parser that sees lines without its context.
 // Outer `None`: not bound yet this process. Fixtures start keyed, as their
@@ -342,11 +343,6 @@ pub(crate) fn bind_session_context_key(
     context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> bool {
     let key = context.map(|context| FingerprintKey(context.accepted_fingerprint_key()));
-    // Fixtures without attribution keep their key; `set_test_session_context_key` removes it.
-    #[cfg(test)]
-    if key.is_none() {
-        return false;
-    }
     with_session_context_key(|bound| {
         let changed = bound.as_ref().is_some_and(|previous| *previous != key);
         *bound = Some(key);
@@ -354,42 +350,21 @@ pub(crate) fn bind_session_context_key(
     })
 }
 #[cfg(test)]
-pub(crate) fn set_test_session_context_key(key: Option<[u8; 32]>) {
-    with_session_context_key(|bound| {
-        *bound = Some(key.map(|key| FingerprintKey(Zeroizing::new(key))))
-    });
-}
-#[cfg(test)]
-pub(crate) fn unbind_test_session_context_key() {
+pub(super) fn unbind_test_session_context_key() {
     with_session_context_key(|bound| *bound = None);
 }
 
-/// The key's tag then the sentence's HMAC-SHA-256, each cut to fit one 32-byte
-/// class H value, so a digest names the key it was made under. `None` without a key.
+/// The sentence's HMAC-SHA-256 under the bound key; `None` without one.
 pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
     let key = with_session_context_key(|bound| bound.clone().flatten())?;
-    let tag = digest(&key, json!([SESSION_CONTEXT_DOMAIN]));
-    let value = digest(&key, json!([SESSION_CONTEXT_DOMAIN, sentence]));
-    Some(
-        tag[..SESSION_CONTEXT_TAG_HEX / 2]
-            .iter()
-            .chain(&value[..32 - SESSION_CONTEXT_TAG_HEX / 2])
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    Some(hex(&digest(
+        &key,
+        json!([SESSION_CONTEXT_DOMAIN, sentence]),
+    )))
 }
 
 pub(super) fn session_context_key_bound() -> bool {
     with_session_context_key(|bound| matches!(bound, Some(Some(_))))
-}
-
-/// Whether a stored digest was made under the bound key: never one under an
-/// earlier key or the earlier unkeyed scheme.
-pub(super) fn session_context_digest_is_current(stored: &str) -> bool {
-    session_context_digest("").is_some_and(|current| {
-        stored.len() == current.len()
-            && stored.get(..SESSION_CONTEXT_TAG_HEX) == current.get(..SESSION_CONTEXT_TAG_HEX)
-    })
 }
 
 fn truncated(digest: [u8; 32]) -> [u8; 16] {

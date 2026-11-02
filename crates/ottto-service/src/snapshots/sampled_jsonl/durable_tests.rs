@@ -986,31 +986,6 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert_eq!(occurrences(&body, &keyed).len(), 1);
 }
 
-/// A record whose digest came from another key or no key at all restores as
-/// not current, so the file is read again instead of comparing across keys.
-#[test]
-fn context_digest_from_another_key_is_not_current_after_decode() {
-    let scratch = Scratch::new("org-key");
-    let path = scratch.write("t.jsonl", &claude_org_lines());
-    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    let current = || {
-        decode(&body, SnapshotSource::ClaudeCode)
-            .unwrap()
-            .context_digest_is_current()
-    };
-    assert!(current());
-    crate::snapshots::claude_request_identity::set_test_session_context_key(Some([7; 32]));
-    assert!(!current());
-    crate::snapshots::claude_request_identity::set_test_session_context_key(None);
-    assert!(!current());
-}
-
 /// Other E content still refuses; the approved mid-file skill label now persists.
 /// [format] e content refuses and approved mid file skills persist.
 #[test]
@@ -1693,7 +1668,7 @@ const H_AUDIT: &[(&str, &str)] = &[
     ),
     (
         "OrgMarkers.context_digest",
-        "HMAC-SHA-256(attribution key, claude_session_context:v1): 8-byte key tag || 24 bytes over the lowercased email",
+        "HMAC-SHA-256(attribution key, claude_session_context:v1, lowercased email)",
     ),
     (
         "OwnedRequest.configuration_witness",

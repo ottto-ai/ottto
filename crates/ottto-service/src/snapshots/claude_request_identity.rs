@@ -40,11 +40,9 @@ mod accepted;
 mod budget;
 pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::digest_hex;
-pub(crate) use accepted::AcceptedBuckets;
 #[cfg(test)]
-pub(crate) use accepted::{
-    session_context_digest, set_test_session_context_key, unbind_test_session_context_key,
-};
+pub(crate) use accepted::session_context_digest;
+pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -2870,8 +2868,8 @@ pub(crate) struct OrgMarkers {
     context_changed: bool,
     /// Response positions of the first non-blank `session_context` email and
     /// of the first later `session_context` naming a different one. Without a
-    /// key, the second is the first sentence after a marker: it could not be
-    /// compared, and the first stays unset so no email qualifies.
+    /// key, the second is the first later sentence or the first after a marker:
+    /// it could not be compared, so it counts as different.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
     /// Status-coverage key of the folder holding this file, bound when the
@@ -2900,30 +2898,24 @@ pub(crate) fn note_marker_line(
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
             let state = markers.get_or_insert_with(Box::default);
-            // No key, no field: a sentence that cannot be compared explains no
-            // organization change and qualifies no email.
-            let Some(digest) = accepted::session_context_digest(&text) else {
-                state.context_digest = None;
-                if !state.entries.is_empty() {
-                    state.context_flip_position.get_or_insert(response_position);
-                }
-                return;
-            };
-            let tag = &digest[..accepted::SESSION_CONTEXT_TAG_HEX];
-            match state.context_digest.as_deref() {
-                Some(previous) if previous == digest => {}
-                Some(previous) if previous.starts_with(tag) => {
-                    state.context_flip_position.get_or_insert(response_position);
-                    state.context_changed = true;
-                    state.context_digest = Some(digest);
-                }
-                // Another key or the earlier scheme says nothing about this
-                // sentence: start over from it, as neither a change nor a first.
-                Some(_) => state.context_digest = Some(digest),
+            match accepted::session_context_digest(&text) {
+                // No key, no field: a sentence that cannot be compared explains
+                // no organization change and ends any earlier email.
                 None => {
-                    state.context_changed = !state.entries.is_empty();
+                    state.context_digest = None;
+                    if state.context_position.is_some() || !state.entries.is_empty() {
+                        state.context_flip_position.get_or_insert(response_position);
+                    }
+                }
+                Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
+                    if state.context_digest.is_some() && state.context_flip_position.is_none() {
+                        state.context_flip_position = Some(response_position);
+                    }
+                    state.context_changed =
+                        state.context_digest.is_some() || !state.entries.is_empty();
                     state.context_digest = Some(digest);
                 }
+                Some(_) => {}
             }
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
@@ -2995,14 +2987,6 @@ impl OrgMarkers {
         (precedes && !self.overflowed)
             .then_some(self.home.as_ref())
             .flatten()
-    }
-
-    /// False for a stored digest from another key or the earlier scheme, or any
-    /// without a key: such a record is read again, never resumed.
-    pub(crate) fn context_digest_is_current(&self) -> bool {
-        self.context_digest
-            .as_deref()
-            .map_or(true, accepted::session_context_digest_is_current)
     }
 
     /// Without a key: a sentence that could not be compared came at or before

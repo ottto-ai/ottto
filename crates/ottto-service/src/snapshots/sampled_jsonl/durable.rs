@@ -438,15 +438,6 @@ impl Decoded {
             || self.reduction.accumulator.provider_skills.is_empty()
                 && self.reduction.accumulator.activity_skills.is_empty()
     }
-
-    /// A stored `session_context` digest compares under the bound key.
-    pub(in crate::snapshots) fn context_digest_is_current(&self) -> bool {
-        self.reduction
-            .accumulator
-            .claude_org_markers
-            .as_deref()
-            .map_or(true, |markers| markers.context_digest_is_current())
-    }
 }
 
 impl CachedJsonlReduction {

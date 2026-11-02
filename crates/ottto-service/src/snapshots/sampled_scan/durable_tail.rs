@@ -4172,9 +4172,6 @@ impl SharedCache {
                 "skill_label_consent_off",
             )));
         }
-        if !decoded.context_digest_is_current() {
-            return Err(Failure::Ineligible(store::Ineligible::Scope));
-        }
         let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
         let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
         let acquired = record
