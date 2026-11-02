@@ -1303,6 +1303,8 @@ mod application_cases {
             let mut control = KindCx::default();
             control.binding = Some(c.binding());
             control.presence = expected;
+            control.layout = actual.layout;
+            control.layout_recorded = actual.layout_recorded;
             // Baseline enumeration consumes the hydrated ordinal inventory;
             // both projections refer to this same committed store's windows.
             control.account_ids = actual.account_ids.clone();
